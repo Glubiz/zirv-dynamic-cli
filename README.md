@@ -56,12 +56,6 @@ zirv run build.yaml
 zirv run deploy.yaml
 ```
 
-4. Use the `--list` flag to view available commands in a YAML file:
-
-```bash
-zirv run build.yaml --list
-```
-
 ## Installation
 
 Build and install **zirv** using Cargo:
