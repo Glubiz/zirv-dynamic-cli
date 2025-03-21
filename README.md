@@ -52,8 +52,8 @@ commands:
 3. Run the commands using **zirv**:
 
 ```bash
-zirv run build.yaml
-zirv run deploy.yaml
+zirv build
+zirv deploy
 ```
 
 ## Installation
