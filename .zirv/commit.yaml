@@ -1,6 +1,0 @@
-name: Commit
-description: Commit the changes
-commands:
-  - command: git add .
-  - command: git cm init
-  - command: git po
