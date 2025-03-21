@@ -1,0 +1,12 @@
+name: "Test"
+description: "This is to test the command"
+commands:
+  - command: "zirv pre-test"
+  - command: "ls"
+    options:
+      proceed_on_failure: false
+      operating_system: "windows"
+  - command: "cargo test -- --test-threads=1"
+    options:
+      proceed_on_failure: true
+      delay_ms: 500
