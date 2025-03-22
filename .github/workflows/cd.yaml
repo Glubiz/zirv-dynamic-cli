@@ -2,7 +2,7 @@ name: CD Pipeline
 
 on:
   workflow_run:
-    workflows: ["CI Pipeline"]  # Replace with the exact name of your CI workflow.
+    workflows: ["CI Pipeline"]
     types:
       - completed
   workflow_dispatch: {}
@@ -31,17 +31,17 @@ jobs:
       - name: Rename Binary for Release
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            mv target/release/mycli.exe mycli-${{ matrix.os }}.exe;
+            mv target/release/zirv.exe zirv-${{ matrix.os }}.exe;
           else
-            mv target/release/mycli mycli-${{ matrix.os }};
+            mv target/release/zirv zirv-${{ matrix.os }};
           fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mycli-${{ matrix.os }}
+          name: zirv-${{ matrix.os }}
           path: |
-            mycli-${{ matrix.os }}*
+            zirv-${{ matrix.os }}*
 
   release:
     name: Create and Upload Release Assets
@@ -51,19 +51,19 @@ jobs:
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
-          name: mycli-windows-latest
+          name: zirv-windows-latest
           path: artifacts
 
       - name: Download Linux Artifact
         uses: actions/download-artifact@v4
         with:
-          name: mycli-ubuntu-latest
+          name: zirv-ubuntu-latest
           path: artifacts
 
       - name: Download macOS Artifact
         uses: actions/download-artifact@v4
         with:
-          name: mycli-macos-latest
+          name: zirv-macos-latest
           path: artifacts
 
       - name: Create GitHub Release
@@ -72,27 +72,27 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
-          body: "Release of mycli binaries for Windows, Linux, and macOS."
+          body: "Release of zirv binaries for Windows, Linux, and macOS."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Windows Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/mycli-windows-latest.exe
+          files: artifacts/zirv-windows-latest.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Linux Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/mycli-ubuntu-latest
+          files: artifacts/zirv-ubuntu-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload macOS Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/mycli-macos-latest
+          files: artifacts/zirv-macos-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
