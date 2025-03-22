@@ -77,9 +77,10 @@ pub async fn run(path: &std::path::Path, cli_params: &[String]) -> Result<(), Bo
             println!("Description: {}", desc);
         }
 
+        // On Windows, use PowerShell for improved handling of quotes.
         let mut command = if std::env::consts::OS.to_lowercase() == "windows" {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg(&cmd_item.command);
+            let mut cmd = Command::new("powershell");
+            cmd.arg("-Command").arg(&cmd_item.command);
             cmd
         } else {
             let mut cmd = Command::new("sh");
