@@ -1,5 +1,3 @@
-use std::io::Cursor;
-
 use clap::Parser;
 use help::show_help;
 use serde::Deserialize;
@@ -88,26 +86,24 @@ enum OperatingSystem {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Get the CLI arguments.
+    // Parse CLI arguments.
     let cli = File::parse();
 
+    // Check for built-in commands before attempting to find a script file.
+    if cli.name == "help" || cli.name == "h" {
+        show_help(&mut std::io::stdout())?;
+        return Ok(());
+    } else if cli.name == "version" || cli.name == "v" {
+        get_version(&mut std::io::stdout())?;
+        return Ok(());
+    }
+
+    // For all other commands, attempt to find a script file.
     match find_script_file(&cli.name) {
         Ok(path) => run_yaml(&path, &cli.params).await,
         Err(e) => {
-            if cli.name == "help" || cli.name == "h" {
-                let mut buffer = Cursor::new(Vec::new());
-                show_help(&mut buffer)?;
-
-                return Ok(());
-            } else if cli.name == "version" || cli.name == "v" {
-                let mut buffer = Cursor::new(Vec::new());
-                get_version(&mut buffer)?;
-
-                return Ok(());
-            }
-
             eprintln!("Error: {}", e);
-            return Ok(());
+            Ok(())
         }
     }
 }
