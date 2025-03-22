@@ -8,9 +8,11 @@ mod help;
 mod run;
 mod shortcuts;
 mod utils;
+mod version;
 
 use run::run as run_yaml;
 use utils::find_script_file;
+use version::get_version;
 
 /// Represents a YAML script.
 #[derive(Debug, Deserialize, Parser)]
@@ -95,6 +97,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if cli.name == "help" || cli.name == "h" {
                 let mut buffer = Cursor::new(Vec::new());
                 show_help(&mut buffer)?;
+
+                return Ok(());
+            } else if cli.name == "version" || cli.name == "v" {
+                let mut buffer = Cursor::new(Vec::new());
+                get_version(&mut buffer)?;
 
                 return Ok(());
             }
