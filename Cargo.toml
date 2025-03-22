@@ -16,6 +16,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.34+deprecated"
 serde_json = "1.0.68"
 toml = "0.8.20"
+dirs = "6.0.0"
 tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "time", "process"] }
 
 [dev-dependencies]

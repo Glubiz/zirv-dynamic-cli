@@ -1,4 +1,0 @@
-name: "Pre-Test"
-description: "This is to test the pre command"
-commands:
-  - command: "echo 'Hello, World!'"

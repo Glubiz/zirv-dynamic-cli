@@ -58,5 +58,19 @@ pub fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::
         }
     }
 
+    // Fallback to root directory
+    let root = if let Some(home) = dirs::home_dir() {
+        home.join(".zirv")
+    } else {
+        PathBuf::from("~/.zirv")
+    };
+
+    for ext in &extensions {
+        let path = root.join(format!("{}.{}", base_name, ext));
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
     Err(format!("No script or shortcut found for '{}'", base_name).into())
 }

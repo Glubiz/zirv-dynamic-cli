@@ -1,12 +1,15 @@
-name: "Test"
-description: "This is to test the command"
+name: "Test & Format Check"
+description: "This command runs tests, checks code formatting, and lints the code"
 commands:
-  - command: "zirv pre-test"
-  - command: "ls"
+  - command: cargo test --verbose -- --test-threads=1
+    description: "Run tests with a single thread"
     options:
       proceed_on_failure: false
-      operating_system: "windows"
-  - command: "cargo test -- --test-threads=1"
+  - command: cargo fmt -- --check
+    description: "Check code formatting"
     options:
-      proceed_on_failure: true
-      delay_ms: 500
+      proceed_on_failure: false
+  - command: cargo clippy --all-targets -- -D warnings
+    description: "Run clippy lint"
+    options:
+      proceed_on_failure: false
