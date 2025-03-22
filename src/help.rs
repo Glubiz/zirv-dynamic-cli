@@ -1,14 +1,17 @@
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 
 use crate::{shortcuts::Shortcuts, Script};
 
-pub fn show_help() -> Result<(), Box<dyn std::error::Error>> {
+/// Writes the help information into the given writer.
+/// This function is a refactored version of show_help() that writes to the provided writer,
+/// making it easier to test the output.
+pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = PathBuf::from(".zirv");
     if !base_dir.exists() {
-        println!("No .zirv directory found.");
+        writeln!(writer, "No .zirv directory found.")?;
         return Ok(());
     }
-    println!("Available Scripts:");
+    writeln!(writer, "Available Scripts:")?;
 
     let extensions = ["yaml", "yml", "json", "toml"];
 
@@ -33,29 +36,24 @@ pub fn show_help() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     let file_name = path.file_name().unwrap().to_string_lossy();
-
-                    println!("-------------------------------------------------");
-                    println!("File: {}", file_name);
-
-                    println!("  Name: {}", script.name);
-
+                    writeln!(writer, "-------------------------------------------------")?;
+                    writeln!(writer, "File: {}", file_name)?;
+                    writeln!(writer, "  Name: {}", script.name)?;
                     if let Some(desc) = script.description {
-                        println!("  Description: {}", desc);
+                        writeln!(writer, "  Description: {}", desc)?;
                     }
-
                     if let Some(params) = &script.params {
-                        println!("  Required Parameters:");
+                        writeln!(writer, "  Required Parameters:")?;
                         for param in params {
-                            println!("    {}", param);
+                            writeln!(writer, "    {}", param)?;
                         }
                     }
-
                     if !script.commands.is_empty() {
-                        println!("  Commands:");
+                        writeln!(writer, "  Commands:")?;
                         for (i, cmd) in script.commands.iter().enumerate() {
-                            println!("    {}. {}", i + 1, cmd.command);
+                            writeln!(writer, "    {}. {}", i + 1, cmd.command)?;
                             if let Some(d) = &cmd.description {
-                                println!("       Description: {}", d);
+                                writeln!(writer, "       Description: {}", d)?;
                             }
                         }
                     }
@@ -66,19 +64,148 @@ pub fn show_help() -> Result<(), Box<dyn std::error::Error>> {
 
     // List shortcuts if present.
     let shortcuts_path = base_dir.join(".shortcuts.yaml");
-
     if shortcuts_path.exists() {
-        println!("\nAvailable Shortcuts:");
-
+        writeln!(writer, "\nAvailable Shortcuts:")?;
         let content = fs::read_to_string(shortcuts_path)?;
         let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
-
         for (key, value) in shortcuts.shortcuts {
-            println!("  {} -> {}", key, value);
+            writeln!(writer, "  {} -> {}", key, value)?;
         }
+        writeln!(writer, "  h -> help")?;
+    }
+    Ok(())
+}
 
-        println!("  h -> help");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs::{create_dir_all, write};
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    /// Helper function to create a temporary .zirv directory with optional files.
+    fn setup_zirv_dir(temp_dir: &Path) -> PathBuf {
+        let zirv_dir = temp_dir.join(".zirv");
+        create_dir_all(&zirv_dir).unwrap();
+        zirv_dir
     }
 
-    Ok(())
+    /// Test that when no .zirv directory exists, the help output indicates that.
+    #[test]
+    fn test_show_help_no_zirv() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a temporary directory WITHOUT a .zirv folder.
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+
+        let original_dir = env::current_dir()?;
+        env::set_current_dir(&temp_path)?;
+
+        let mut buffer = Cursor::new(Vec::new());
+        show_help(&mut buffer)?;
+        let output = String::from_utf8(buffer.into_inner())?;
+
+        assert!(
+            output.contains("No .zirv directory found."),
+            "Output should indicate missing .zirv folder."
+        );
+
+        env::set_current_dir(original_dir)?;
+
+        Ok(())
+    }
+
+    /// Test that a local script file is listed correctly.
+    #[test]
+    fn test_show_help_with_script() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        // Create a dummy script file (YAML) in .zirv.
+        let script_content = r#"
+name: "Test Script"
+description: "A dummy script for testing."
+params: []
+commands: []
+        "#;
+        let script_file = zirv_dir.join("test.yaml");
+        write(&script_file, script_content)?;
+
+        let original_dir = env::current_dir()?;
+        env::set_current_dir(&temp_path)?;
+
+        let mut buffer = Cursor::new(Vec::new());
+        show_help(&mut buffer)?;
+        let output = String::from_utf8(buffer.into_inner())?;
+
+        assert!(output.contains("File:"), "Output should contain 'File:'");
+
+        assert!(
+            output.contains("Test Script"),
+            "Output should contain the script name 'Test Script'"
+        );
+
+        assert!(
+            output.contains("Description:"),
+            "Output should contain 'Description:'"
+        );
+
+        env::set_current_dir(original_dir)?;
+
+        Ok(())
+    }
+
+    /// Test that shortcuts are listed in the help output.
+    #[test]
+    fn test_show_help_with_shortcuts() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        // Create a dummy script file.
+        let script_content = r#"
+name: "Test Script"
+description: "A dummy script for testing shortcuts."
+params: []
+commands: []
+        "#;
+        let script_file = zirv_dir.join("test.yaml");
+        write(&script_file, script_content)?;
+
+        // Create a shortcuts file mapping "t" to "test.yaml".
+        let shortcuts_content = r#"
+shortcuts:
+  t: "test.yaml"
+        "#;
+        let shortcuts_file = zirv_dir.join(".shortcuts.yaml");
+        write(&shortcuts_file, shortcuts_content)?;
+
+        let original_dir = env::current_dir()?;
+        env::set_current_dir(&temp_path)?;
+
+        let mut buffer = Cursor::new(Vec::new());
+        show_help(&mut buffer)?;
+        let output = String::from_utf8(buffer.into_inner())?;
+
+        assert!(
+            output.contains("Available Shortcuts:"),
+            "Output should list shortcuts"
+        );
+
+        assert!(
+            output.contains("t -> test.yaml"),
+            "Output should contain the shortcut mapping 't -> test.yaml'"
+        );
+
+        assert!(
+            output.contains("h -> help"),
+            "Output should include a help shortcut"
+        );
+
+        env::set_current_dir(original_dir)?;
+
+        Ok(())
+    }
 }

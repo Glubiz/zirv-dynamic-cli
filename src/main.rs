@@ -1,3 +1,5 @@
+use std::io::Cursor;
+
 use clap::Parser;
 use help::show_help;
 use serde::Deserialize;
@@ -91,7 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(path) => run_yaml(&path, &cli.params).await,
         Err(e) => {
             if cli.name == "help" || cli.name == "h" {
-                show_help()?;
+                let mut buffer = Cursor::new(Vec::new());
+                show_help(&mut buffer)?;
 
                 return Ok(());
             }

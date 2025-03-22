@@ -173,7 +173,7 @@ mod tests {
     use tempfile::tempdir;
 
     /// Helper function: writes the given script content into a file under a temporary `.zirv` directory,
-    /// changes the current directory to that temporary directory, runs the run_script function with provided parameters,
+    /// changes the current directory to that temporary directory, runs the run() function with provided parameters,
     /// then restores the original directory.
     async fn run_script_with_content(
         filename: &str,
@@ -184,7 +184,7 @@ mod tests {
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path();
 
-        // Create a .zirv directory inside the temp directory.
+        // Create the .zirv directory.
         let zirv_path = temp_path.join(".zirv");
         create_dir_all(&zirv_path)?;
 
@@ -192,22 +192,20 @@ mod tests {
         let file_path = zirv_path.join(filename);
         write(&file_path, content)?;
 
-        // Save the original current directory.
+        // Save original directory.
         let original_dir = env::current_dir()?;
-        // Change the current directory to the temporary directory.
         env::set_current_dir(temp_path)?;
 
         let result = run(&file_path, params).await;
 
-        // Restore the original current directory.
+        // Restore original directory.
         env::set_current_dir(original_dir)?;
-        // TempDir is automatically cleaned up.
+
         result
     }
 
     #[tokio::test]
     async fn test_run_success() {
-        // Test a script that simply echoes "hello".
         let yaml = r#"
 name: "Test Script"
 description: "A test script that echoes hello"
@@ -218,19 +216,19 @@ commands:
       interactive: false
 "#;
         let res = run_script_with_content("test_success.yaml", yaml, &[]).await;
+
         assert!(res.is_ok(), "Expected script to succeed");
     }
 
     #[tokio::test]
     async fn test_run_param_substitution() {
-        // Script expects one parameter: commit_message.
         let yaml = r#"
 name: "Commit Script"
-description: "A script that commits with a message"
+description: "A script that echoes a commit message"
 params:
   - "commit_message"
 commands:
-  - command: "echo Commit message is: ${commit_message}"
+  - command: "echo Commit message: ${commit_message}"
     description: "Echo the commit message"
     options:
       proceed_on_failure: false
@@ -238,6 +236,7 @@ commands:
 "#;
         let params = vec!["My test commit".to_string()];
         let res = run_script_with_content("test_commit.yaml", yaml, &params).await;
+
         assert!(
             res.is_ok(),
             "Expected script with parameter substitution to succeed"
@@ -246,20 +245,20 @@ commands:
 
     #[tokio::test]
     async fn test_run_param_mismatch() {
-        // Script expects one parameter but none are provided.
         let yaml = r#"
 name: "Commit Script"
-description: "A script that commits with a message"
+description: "A script that expects one parameter but none provided"
 params:
   - "commit_message"
 commands:
-  - command: "echo Commit message is: ${commit_message}"
+  - command: "echo Commit message: ${commit_message}"
     options:
       proceed_on_failure: false
       interactive: false
 "#;
-        let params: Vec<String> = vec![]; // No parameters provided.
+        let params: Vec<String> = vec![];
         let res = run_script_with_content("test_commit_mismatch.yaml", yaml, &params).await;
+
         assert!(
             res.is_err(),
             "Expected script to fail due to parameter mismatch"
@@ -268,19 +267,19 @@ commands:
 
     #[tokio::test]
     async fn test_run_os_mismatch() {
-        // Test a script with an operating_system option that does not match the current OS.
         let yaml = r#"
 name: "OS Mismatch Script"
 description: "A script that should skip the command due to OS mismatch"
 commands:
-  - command: "echo should not run"
+  - command: "echo This should not run"
     options:
       proceed_on_failure: false
       interactive: false
       operating_system: "macos"
 "#;
         let res = run_script_with_content("test_os_mismatch.yaml", yaml, &[]).await;
-        // Since the command is skipped, the script should succeed.
+
+        // Command should be skipped, so the script should succeed.
         assert!(
             res.is_ok(),
             "Expected script to succeed by skipping mismatched command"
@@ -289,14 +288,12 @@ commands:
 
     #[tokio::test]
     async fn test_run_failure_stops() {
-        // Determine the appropriate failing command for the current OS.
         let fail_command = if cfg!(windows) {
             "cmd /C exit 1"
         } else {
             "sh -c 'exit 1'"
         };
 
-        // Test that a failing command stops execution when proceed_on_failure is false.
         let yaml = format!(
             r#"
 name: "Fail Script"
@@ -309,21 +306,20 @@ commands:
 "#,
             fail_command
         );
+
         let res = run_script_with_content("test_fail.yaml", &yaml, &[]).await;
+
         assert!(res.is_err(), "Expected script to fail and stop execution");
     }
 
     #[tokio::test]
     async fn test_run_failure_proceed() {
-        // Determine the appropriate failing command for the current OS.
         let fail_command = if cfg!(windows) {
             "cmd /C exit 1"
         } else {
             "sh -c 'exit 1'"
         };
 
-        // Test that a failing command is skipped when proceed_on_failure is true,
-        // and the script continues to run subsequent commands.
         let yaml = format!(
             r#"
 name: "Proceed Script"
@@ -340,14 +336,15 @@ commands:
 "#,
             fail_command
         );
+
         let res = run_script_with_content("test_proceed.yaml", &yaml, &[]).await;
+
         assert!(res.is_ok(), "Expected script to continue despite a failure");
     }
 
-    /// Test that secret substitution works correctly when the required secret is provided.
     #[tokio::test]
     async fn test_secret_substitution_success() -> Result<(), Box<dyn std::error::Error>> {
-        // Set the required secret environment variable.
+        // Set the required secret.
         env::set_var("COMMIT_PASSWORD", "secret_value");
 
         let yaml = r#"
@@ -366,20 +363,15 @@ commands:
       interactive: false
 "#;
         let params = vec!["My commit message".to_string()];
-
         let res = run_script_with_content("commit.yaml", yaml, &params).await;
-        assert!(
-            res.is_ok(),
-            "Expected script to succeed with secret substitution"
-        );
+
+        assert!(res.is_ok(), "Expected script to succeed");
 
         Ok(())
     }
 
-    /// Test that the script run fails when the required secret is missing.
     #[tokio::test]
     async fn test_secret_missing_failure() -> Result<(), Box<dyn std::error::Error>> {
-        // Ensure the secret is not set.
         env::remove_var("COMMIT_PASSWORD");
 
         let yaml = r#"
@@ -399,6 +391,7 @@ commands:
 "#;
         let params = vec!["My commit message".to_string()];
         let res = run_script_with_content("commit.yaml", yaml, &params).await;
+
         assert!(res.is_err(), "Expected failure due to missing secret");
 
         Ok(())
