@@ -75,6 +75,18 @@ commands:
       proceed_on_failure: false
 ```
 
+## Example: `secret.yaml`
+
+```yaml
+name: "Secret Command"
+description: "This command is secret"
+secrets:
+  - name: "some_secret"
+    env_var: "SOME_SECRET"
+commands:
+  - command: "echo 'This is a secret ${some_secret}'"
+```
+
 3. Run the commands using **zirv**:
 
 ```bash
@@ -111,6 +123,94 @@ shortcuts:
 ```
 
 Now you can run `zirv t` to run the `test.yaml` script.
+
+## Configuration Format Examples
+
+The configuration for **zirv** can be defined in YAML, JSON, or TOML formats. The structure is based on our configuration schema from main.rs:
+
+**Common Fields:**
+- name (string)
+- description (string)
+- params (optional list of strings)
+- commands (list)
+  - command (string)
+  - description (optional string)
+  - options:
+    - interactive (optional bool)
+    - operating_system (optional string)
+    - proceed_on_failure (bool)
+    - delay_ms (optional number)
+- secrets (optional list)
+  - name (string)
+  - env_var (string)
+
+### YAML Example
+```yaml
+name: "Example Config"
+description: "This is an example configuration."
+params:
+  - "param1"
+commands:
+  - command: "echo 'Hello World'"
+    description: "Prints Hello World"
+    options:
+      interactive: true
+      operating_system: "linux"
+      proceed_on_failure: false
+      delay_ms: 2000
+secrets:
+  - name: "api_key"
+    env_var: "API_KEY"
+```
+
+### JSON Example
+```json
+{
+  "name": "Example Config",
+  "description": "This is an example configuration.",
+  "params": [
+    "param1"
+  ],
+  "commands": [
+    {
+      "command": "echo 'Hello World'",
+      "description": "Prints Hello World",
+      "options": {
+        "interactive": true,
+        "operating_system": "linux",
+        "proceed_on_failure": false,
+        "delay_ms": 2000
+      }
+    }
+  ],
+  "secrets": [
+    {
+      "name": "api_key",
+      "env_var": "API_KEY"
+    }
+  ]
+}
+```
+
+### TOML Example
+```toml
+name = "Example Config"
+description = "This is an example configuration."
+params = ["param1"]
+
+[[commands]]
+command = "echo 'Hello World'"
+description = "Prints Hello World"
+[commands.options]
+interactive = true
+operating_system = "linux"
+proceed_on_failure = false
+delay_ms = 2000
+
+[[secrets]]
+name = "api_key"
+env_var = "API_KEY"
+```
 
 ## Help
 
