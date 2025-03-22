@@ -112,6 +112,12 @@ shortcuts:
 
 Now you can run `zirv t` to run the `test.yaml` script.
 
+## Help
+
+```bash
+zirv help
+```
+
 ## Installation
 
 Build and install **zirv** using Cargo:
