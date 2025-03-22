@@ -1,0 +1,4 @@
+shortcuts:
+  t: "test.yaml"
+  b: "build.yaml"
+  c: "commit.yaml"

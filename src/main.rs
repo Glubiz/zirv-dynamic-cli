@@ -1,11 +1,11 @@
-use std::path::PathBuf;
-
 use clap::Parser;
 use serde::Deserialize;
 
-mod yaml;
+mod shortcuts;
 mod utils;
+mod yaml;
 
+use utils::find_script_file;
 use yaml::run as run_yaml;
 
 /// Represents a YAML script.
@@ -77,17 +77,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_path = find_script_file(&cli.name)?;
     
     run_yaml(&file_path, &cli.params).await
-}
-
-/// Finds the script file by checking for .yaml, .json, or .toml extensions in the "zirv" directory.
-fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let base_dir = PathBuf::from(".zirv");
-    let extensions = ["yaml", "yml", "json", "toml"];
-    for ext in &extensions {
-        let path = base_dir.join(format!("{}.{}", base_name, ext));
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-    Err(format!("No script file found for '{}'", base_name).into())
 }
