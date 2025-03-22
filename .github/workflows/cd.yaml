@@ -1,13 +1,16 @@
 name: CD Pipeline
 
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
+  workflow_run:
+    workflows: ["CI Pipeline"]  # Replace with the exact name of your CI workflow.
+    types:
+      - completed
+  workflow_dispatch: {}
 
 jobs:
   build:
     name: Build Binaries
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -39,7 +42,7 @@ jobs:
           name: mycli-${{ matrix.os }}
           path: |
             mycli-${{ matrix.os }}*
-  
+
   release:
     name: Create and Upload Release Assets
     runs-on: ubuntu-latest
