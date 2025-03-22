@@ -29,11 +29,12 @@ jobs:
         run: cargo build --release
 
       - name: Rename Binary for Release
+        shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            mv target/release/zirv.exe zirv-${{ matrix.os }}.exe;
+            mv target/release/mycli.exe mycli-${{ matrix.os }}.exe;
           else
-            mv target/release/zirv zirv-${{ matrix.os }};
+            mv target/release/mycli mycli-${{ matrix.os }};
           fi
 
       - name: Upload Artifact
