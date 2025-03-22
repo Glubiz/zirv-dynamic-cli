@@ -49,30 +49,40 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Get version from Cargo.toml
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
-          name: zirv-windows-latest
+          name: mycli-windows-latest
           path: artifacts
 
       - name: Download Linux Artifact
         uses: actions/download-artifact@v4
         with:
-          name: zirv-ubuntu-latest
+          name: mycli-ubuntu-latest
           path: artifacts
 
       - name: Download macOS Artifact
         uses: actions/download-artifact@v4
         with:
-          name: zirv-macos-latest
+          name: mycli-macos-latest
           path: artifacts
 
       - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: Release v${{ steps.get_version.outputs.version }}
           body: "Release of zirv binaries for Windows, Linux, and macOS."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,20 +90,20 @@ jobs:
       - name: Upload Windows Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/zirv-windows-latest.exe
+          files: artifacts/mycli-windows-latest.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Linux Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/zirv-ubuntu-latest
+          files: artifacts/mycli-ubuntu-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload macOS Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/zirv-macos-latest
+          files: artifacts/mycli-macos-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
