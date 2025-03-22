@@ -82,6 +82,36 @@ zirv build
 zirv deploy
 ```
 
+4. Pass parameters to the script:
+
+```bash
+zirv commit "Fix bug #123"
+```
+
+5. Chain scripts together:
+
+```yaml
+name: "Build and Deploy"
+description: "Builds the application and deploys it to the server"
+commands:
+    - command: "zirv build"
+    - command: "deploy"
+        options:
+        proceed_on_failure: false
+```
+
+6. Shortcuts:
+By adding a file named `.shortcuts.yaml` to the `.zirv` directory, you can define shortcuts for your scripts:
+
+```yaml
+shortcuts:
+  t: "test.yaml"
+  b: "build.yaml"
+  c: "commit.yaml"
+```
+
+Now you can run `zirv t` to run the `test.yaml` script.
+
 ## Installation
 
 Build and install **zirv** using Cargo:
