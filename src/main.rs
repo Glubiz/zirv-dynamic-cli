@@ -28,8 +28,19 @@ struct Script {
     description: Option<String>,
     /// Optional list of expected parameter names (in order).
     params: Option<Vec<String>>,
+    /// Optional list of secret definitions.
+    secrets: Option<Vec<SecretDefinition>>,
     /// A list of commands to execute.
     commands: Vec<CommandItem>,
+}
+
+/// Represents a secret definition in the script.
+#[derive(Debug, Deserialize, Clone)]
+struct SecretDefinition {
+    /// The placeholder name to be substituted (e.g. "commit_password").
+    name: String,
+    /// The environment variable name where the secret value is stored (e.g. "COMMIT_PASSWORD").
+    env_var: String,
 }
 
 /// Represents a single command in the YAML script.

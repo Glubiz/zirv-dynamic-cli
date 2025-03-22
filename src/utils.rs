@@ -74,3 +74,16 @@ pub fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::
 
     Err(format!("No script or shortcut found for '{}'", base_name).into())
 }
+
+#[cfg(test)]
+mod tests {
+
+    use crate::utils::operating_system;
+
+    #[test]
+    fn test_convert_os() {
+        assert_eq!(operating_system(crate::OperatingSystem::Linux), "linux");
+        assert_eq!(operating_system(crate::OperatingSystem::Windows), "windows");
+        assert_eq!(operating_system(crate::OperatingSystem::MacOS), "macos");
+    }
+}

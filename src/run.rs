@@ -7,8 +7,7 @@ use tokio::time::{sleep, Duration};
 use crate::utils::{operating_system, substitute_params};
 use crate::Script;
 
-/// Reads and executes a YAML script from the given path.
-/// If a `pre` script is specified, it is executed before the current script.
+/// Reads and executes a YAML/JSON/TOML script from the given path.
 /// Commands with an `operating_system` option that does not match the current OS are skipped.
 pub async fn run(
     path: &std::path::Path,
@@ -16,7 +15,7 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read file content.
     let content = fs::read_to_string(path)?;
-    // Determine extension.
+    // Determine file extension.
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
@@ -35,7 +34,6 @@ pub async fn run(
     };
 
     println!("\nRunning script: {}", script.name);
-
     if let Some(desc) = script.description {
         println!("Description: {}", desc);
     }
@@ -50,26 +48,62 @@ pub async fn run(
             )
             .into());
         }
-        let map = expected_params
-            .into_iter()
-            .zip(cli_params.iter().cloned())
-            .collect();
+
+        Some(
+            expected_params
+                .into_iter()
+                .zip(cli_params.iter().cloned())
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    // Build a secret map if the script defines expected secrets.
+    let secret_map: Option<HashMap<String, String>> = if let Some(secret_defs) = script.secrets {
+        let mut map = HashMap::new();
+        for secret in secret_defs {
+            // Try to read the secret from the environment.
+            match std::env::var(&secret.env_var) {
+                Ok(val) => {
+                    map.insert(secret.name, val);
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "Secret '{}' not found in environment variable '{}'",
+                        secret.name, secret.env_var
+                    )
+                    .into());
+                }
+            }
+        }
         Some(map)
     } else {
         None
     };
 
+    // Combine parameters and secrets (secrets can override params if same key exists).
+    let combined_map: HashMap<String, String> = match (param_map, secret_map) {
+        (Some(params), Some(secrets)) => {
+            let mut map = params;
+            map.extend(secrets);
+            map
+        }
+        (Some(params), None) => params,
+        (None, Some(secrets)) => secrets,
+        (None, None) => HashMap::new(),
+    };
+
     // Process each command.
     for mut cmd_item in script.commands {
-        // If parameters exist, substitute them in the command.
-        if let Some(ref params) = param_map {
-            cmd_item.command = substitute_params(&cmd_item.command, params);
+        // Substitute placeholders in the command.
+        if !combined_map.is_empty() {
+            cmd_item.command = substitute_params(&cmd_item.command, &combined_map);
         }
 
-        // If options are provided, check the operating_system option.
+        // Check operating_system option.
         if let Some(ref opts) = cmd_item.options {
             if let Some(ref os) = opts.operating_system {
-                // Compare lowercased OS names.
                 if operating_system(os.to_owned()) != std::env::consts::OS.to_lowercase() {
                     println!("\nSkipping command '{}' due to operating_system mismatch (requires '{:?}', current OS is '{}').",
                              cmd_item.command, os, std::env::consts::OS);
@@ -79,13 +113,11 @@ pub async fn run(
         }
 
         println!("\nExecuting command: '{}'", cmd_item.command);
-
-        // Print description if available.
-        if let Some(desc) = cmd_item.description {
+        if let Some(desc) = cmd_item.description.clone() {
             println!("Description: {}", desc);
         }
 
-        // On Windows, use PowerShell for improved handling of quotes.
+        // Wrap command in a shell for correct resolution.
         let mut command = if std::env::consts::OS.to_lowercase() == "windows" {
             let mut cmd = Command::new("powershell");
             cmd.arg("-Command").arg(&cmd_item.command);
@@ -96,7 +128,7 @@ pub async fn run(
             cmd
         };
 
-        // If interactive option is set, inherit I/O.
+        // Interactive I/O if specified.
         if let Some(ref opts) = cmd_item.options {
             if opts.interactive {
                 command
@@ -107,27 +139,24 @@ pub async fn run(
         }
 
         let status = command.status().await?;
-
         if !status.success() {
             eprintln!(
                 "\nCommand '{}' failed with status: {:?}",
                 cmd_item.command, status
             );
-            // Check proceed_on_failure option.
+
             let proceed = cmd_item
                 .options
                 .as_ref()
                 .map(|o| o.proceed_on_failure)
                 .unwrap_or(false);
-
             if !proceed {
-                return Err(format!("\nCommand '{}' failed", cmd_item.command).into());
+                return Err(format!("Command '{}' failed", cmd_item.command).into());
             } else {
                 println!("\nContinuing despite failure as proceed_on_failure is true.");
             }
         }
 
-        // Apply delay if specified.
         if let Some(delay) = cmd_item.options.as_ref().and_then(|o| o.delay_ms) {
             sleep(Duration::from_millis(delay)).await;
         }
@@ -313,5 +342,65 @@ commands:
         );
         let res = run_script_with_content("test_proceed.yaml", &yaml, &[]).await;
         assert!(res.is_ok(), "Expected script to continue despite a failure");
+    }
+
+    /// Test that secret substitution works correctly when the required secret is provided.
+    #[tokio::test]
+    async fn test_secret_substitution_success() -> Result<(), Box<dyn std::error::Error>> {
+        // Set the required secret environment variable.
+        env::set_var("COMMIT_PASSWORD", "secret_value");
+
+        let yaml = r#"
+name: "Commit Changes"
+description: "Commits changes with a provided commit message and secret password"
+params:
+  - "commit_message"
+secrets:
+  - name: "commit_password"
+    env_var: "COMMIT_PASSWORD"
+commands:
+  - command: "echo ${commit_message} ${commit_password} > output.txt"
+    description: "Write substituted output to file"
+    options:
+      proceed_on_failure: false
+      interactive: false
+"#;
+        let params = vec!["My commit message".to_string()];
+
+        let res = run_script_with_content("commit.yaml", yaml, &params).await;
+        assert!(
+            res.is_ok(),
+            "Expected script to succeed with secret substitution"
+        );
+
+        Ok(())
+    }
+
+    /// Test that the script run fails when the required secret is missing.
+    #[tokio::test]
+    async fn test_secret_missing_failure() -> Result<(), Box<dyn std::error::Error>> {
+        // Ensure the secret is not set.
+        env::remove_var("COMMIT_PASSWORD");
+
+        let yaml = r#"
+name: "Commit Changes"
+description: "Fails due to missing secret"
+params:
+  - "commit_message"
+secrets:
+  - name: "commit_password"
+    env_var: "COMMIT_PASSWORD"
+commands:
+  - command: "echo ${commit_message} ${commit_password}"
+    description: "This command should not execute"
+    options:
+      proceed_on_failure: false
+      interactive: false
+"#;
+        let params = vec!["My commit message".to_string()];
+        let res = run_script_with_content("commit.yaml", yaml, &params).await;
+        assert!(res.is_err(), "Expected failure due to missing secret");
+
+        Ok(())
     }
 }
