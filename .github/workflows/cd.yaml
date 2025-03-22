@@ -62,6 +62,22 @@ jobs:
           VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Create Tag
+        id: create_tag
+        shell: bash
+        run: |
+          TAG="v${{ steps.get_version.outputs.version }}"
+          echo "Creating tag $TAG"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          # Create tag only if it doesn't exist
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
