@@ -1,5 +1,8 @@
 name: CD Pipeline
 
+permissions:
+  contents: write
+
 on:
   workflow_run:
     workflows: ["CI Pipeline"]
