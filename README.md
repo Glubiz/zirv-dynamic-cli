@@ -30,23 +30,49 @@ build tools, Git, and more by executing commands defined in YAML files. All YAML
 ### Example: `build.yaml`
 
 ```yaml
+name: Build
+description: Build the application.
 commands:
-  - name: compile
-    run: cargo build --release
-    proceed_on_failure: false
-  - name: test
-    run: cargo test
-    delay_ms: 500
+  - command: cargo build --release
+    options:
+        proceed_on_failure: false
+  - command: cargo test
+    options:
+        proceed_on_failure: false
 ```
 
 ### Example: `deploy.yaml`
 
 ```yaml
-pre: build.yaml
+name: Deploy
+description: Deploy the application to the server.
 commands:
-  - name: deploy
-    run: scp target/release/app user@server:/path/to/deploy
-    operating_system: linux
+  - command: scp target/release/app user@server:/path/to/deploy
+    options:
+      proceed_on_failure: false
+      operating_system: linux
+```
+
+### Example: `commit.yaml`
+
+```yaml
+name: "Commit Changes"
+description: "Commits changes with a provided commit message"
+params:
+  - "commit_message"
+commands:
+  - command: "git add ."
+    description: "Stage all changes"
+    options:
+      proceed_on_failure: false
+  - command: "git commit -m \"${commit_message}\""
+    description: "Commit changes with a message"
+    options:
+      proceed_on_failure: false
+  - command: "git push origin"
+    description: "Push the commit to the remote repository"
+    options:
+      proceed_on_failure: false
 ```
 
 3. Run the commands using **zirv**:

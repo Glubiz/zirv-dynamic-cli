@@ -1,0 +1,20 @@
+name: "Commit Changes"
+description: "Commits changes with a provided commit message"
+params:
+  - "commit_message"
+commands:
+  - command: "git add ."
+    description: "Stage all changes"
+    options:
+      proceed_on_failure: false
+      interactive: false
+  - command: "git commit -m \"${commit_message}\""
+    description: "Commit changes with a message"
+    options:
+      proceed_on_failure: false
+      interactive: false
+  - command: "git push origin"
+    description: "Push the commit to the remote repository"
+    options:
+      proceed_on_failure: false
+      interactive: false

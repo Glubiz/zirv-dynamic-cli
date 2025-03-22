@@ -1,29 +1,63 @@
+use std::collections::HashMap;
 use std::fs;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
-use crate::utils::operating_system;
+use crate::utils::{operating_system, substitute_params};
 use crate::Script;
 
 /// Reads and executes a YAML script from the given path.
 /// If a `pre` script is specified, it is executed before the current script.
 /// Commands with an `operating_system` option that does not match the current OS are skipped.
-pub async fn run(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!(".zirv/{}.yaml", name);
-
-    // Read the YAML file.
+pub async fn run(path: &std::path::Path, cli_params: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // Read file content.
     let content = fs::read_to_string(path)?;
-    let script: Script = serde_yaml::from_str(&content)?;
+    // Determine extension.
+    let ext = path.extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Parse the script.
+    let script: Script = if ext == "yaml" || ext == "yml" {
+        serde_yaml::from_str(&content)?
+    } else if ext == "json" {
+        serde_json::from_str(&content)?
+    } else if ext == "toml" {
+        toml::from_str(&content)?
+    } else {
+        return Err(format!("Unsupported file extension: {}", ext).into());
+    };
 
     println!("\nRunning script: {}", script.name);
 
-    if script.description.is_some() {
-        println!("{}", script.description.unwrap());
+    if let Some(desc) = script.description {
+        println!("Description: {}", desc);
     }
 
+    // Build a parameter map if the script defines expected parameters.
+    let param_map: Option<HashMap<String, String>> = if let Some(expected_params) = script.params {
+        if expected_params.len() != cli_params.len() {
+            return Err(format!(
+                "Expected {} parameters, but got {}",
+                expected_params.len(),
+                cli_params.len()
+            ).into());
+        }
+        let map = expected_params.into_iter().zip(cli_params.iter().cloned()).collect();
+        Some(map)
+    } else {
+        None
+    };
+
     // Process each command.
-    for cmd_item in script.commands {
+    for mut cmd_item in script.commands {
+        // If parameters exist, substitute them in the command.
+        if let Some(ref params) = param_map {
+            cmd_item.command = substitute_params(&cmd_item.command, params);
+        }
+
         // If options are provided, check the operating_system option.
         if let Some(ref opts) = cmd_item.options {
             if let Some(ref os) = opts.operating_system {
@@ -90,6 +124,7 @@ pub async fn run(name: String) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,13 +133,14 @@ mod tests {
     use tempfile::tempdir;
 
     /// Helper function: writes the given script content into a file under a temporary `.zirv` directory,
-    /// changes the current directory to that temp directory, runs the run() function, then restores the original directory.
-    async fn run_script_with_content(filename: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// changes the current directory to that temporary directory, runs the run_script function with provided parameters,
+    /// then restores the original directory.
+    async fn run_script_with_content(filename: &str, content: &str, params: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // Create a temporary directory.
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path();
 
-        // Create a .zirv directory inside temp_dir.
+        // Create a .zirv directory inside the temp directory.
         let zirv_path = temp_path.join(".zirv");
         create_dir_all(&zirv_path)?;
 
@@ -117,13 +153,11 @@ mod tests {
         // Change the current directory to the temporary directory.
         env::set_current_dir(temp_path)?;
 
-        // Run the script (strip ".yaml" extension if provided).
-        let name = filename.strip_suffix(".yaml").unwrap_or(filename).to_string();
-        let result = run(name).await;
+        let result = run(&file_path, params).await;
 
         // Restore the original current directory.
         env::set_current_dir(original_dir)?;
-        // TempDir is dropped here, cleaning up.
+        // TempDir is automatically cleaned up.
         result
     }
 
@@ -139,16 +173,55 @@ commands:
       proceed_on_failure: false
       interactive: false
 "#;
-        let res = run_script_with_content("test_success.yaml", yaml).await;
+        let res = run_script_with_content("test_success.yaml", yaml, &[]).await;
         assert!(res.is_ok(), "Expected script to succeed");
     }
 
     #[tokio::test]
+    async fn test_run_param_substitution() {
+        // Script expects one parameter: commit_message.
+        let yaml = r#"
+name: "Commit Script"
+description: "A script that commits with a message"
+params:
+  - "commit_message"
+commands:
+  - command: "echo Commit message is: ${commit_message}"
+    description: "Echo the commit message"
+    options:
+      proceed_on_failure: false
+      interactive: false
+"#;
+        let params = vec!["My test commit".to_string()];
+        let res = run_script_with_content("test_commit.yaml", yaml, &params).await;
+        assert!(res.is_ok(), "Expected script with parameter substitution to succeed");
+    }
+
+    #[tokio::test]
+    async fn test_run_param_mismatch() {
+        // Script expects one parameter but none are provided.
+        let yaml = r#"
+name: "Commit Script"
+description: "A script that commits with a message"
+params:
+  - "commit_message"
+commands:
+  - command: "echo Commit message is: ${commit_message}"
+    options:
+      proceed_on_failure: false
+      interactive: false
+"#;
+        let params: Vec<String> = vec![]; // No parameters provided.
+        let res = run_script_with_content("test_commit_mismatch.yaml", yaml, &params).await;
+        assert!(res.is_err(), "Expected script to fail due to parameter mismatch");
+    }
+
+    #[tokio::test]
     async fn test_run_os_mismatch() {
-        // Test a script with an operating_system that does not match.
+        // Test a script with an operating_system option that does not match the current OS.
         let yaml = r#"
 name: "OS Mismatch Script"
-description: "A script that should be skipped due to OS mismatch"
+description: "A script that should skip the command due to OS mismatch"
 commands:
   - command: "echo should not run"
     options:
@@ -156,9 +229,9 @@ commands:
       interactive: false
       operating_system: "linux"
 "#;
-        let res = run_script_with_content("test_os_mismatch.yaml", yaml).await;
-        // The command should be skipped, so the script runs (returns Ok(())).
-        assert!(res.is_ok(), "Expected script to succeed by skipping mismatched commands");
+        let res = run_script_with_content("test_os_mismatch.yaml", yaml, &[]).await;
+        // Since the command is skipped, the script should succeed.
+        assert!(res.is_ok(), "Expected script to succeed by skipping mismatched command");
     }
 
     #[tokio::test]
@@ -173,14 +246,14 @@ commands:
         // Test that a failing command stops execution when proceed_on_failure is false.
         let yaml = format!(r#"
 name: "Fail Script"
-description: "A script that fails and stops"
+description: "A script that fails and stops execution"
 commands:
   - command: "{}"
     options:
       proceed_on_failure: false
       interactive: false
 "#, fail_command);
-        let res = run_script_with_content("test_fail.yaml", &yaml).await;
+        let res = run_script_with_content("test_fail.yaml", &yaml, &[]).await;
         assert!(res.is_err(), "Expected script to fail and stop execution");
     }
 
@@ -197,7 +270,7 @@ commands:
         // and the script continues to run subsequent commands.
         let yaml = format!(r#"
 name: "Proceed Script"
-description: "A script that fails but continues"
+description: "A script that fails but continues execution"
 commands:
   - command: "{}"
     options:
@@ -208,8 +281,7 @@ commands:
       proceed_on_failure: false
       interactive: false
 "#, fail_command);
-        let res = run_script_with_content("test_proceed.yaml", &yaml).await;
-        // The script should succeed because the failure is ignored.
+        let res = run_script_with_content("test_proceed.yaml", &yaml, &[]).await;
         assert!(res.is_ok(), "Expected script to continue despite a failure");
     }
 }

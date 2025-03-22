@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use serde::Deserialize;
 
@@ -11,6 +13,9 @@ use yaml::run as run_yaml;
 struct File {
     /// A descriptive name for the script.
     name: String,
+    /// Optional parameters (positional arguments) that will be mapped to the script's expected params.
+    #[arg(num_args = 0..)]
+    params: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19,6 +24,8 @@ struct Script {
     name: String,
     // A description of what the script does.
     description: Option<String>,
+    /// Optional list of expected parameter names (in order).
+    params: Option<Vec<String>>,
     /// A list of commands to execute.
     commands: Vec<CommandItem>,
 }
@@ -66,6 +73,21 @@ enum OperatingSystem {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get the CLI arguments.
     let cli = File::parse();
+
+    let file_path = find_script_file(&cli.name)?;
     
-    run_yaml(cli.name).await
+    run_yaml(&file_path, &cli.params).await
+}
+
+/// Finds the script file by checking for .yaml, .json, or .toml extensions in the "zirv" directory.
+fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let base_dir = PathBuf::from(".zirv");
+    let extensions = ["yaml", "yml", "json", "toml"];
+    for ext in &extensions {
+        let path = base_dir.join(format!("{}.{}", base_name, ext));
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!("No script file found for '{}'", base_name).into())
 }
