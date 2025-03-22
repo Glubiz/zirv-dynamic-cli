@@ -40,7 +40,7 @@ pub fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::
     }
 
     // If not found, try to load the shortcuts file.
-    let shortcuts_path = base_dir.join("shortcuts.yaml");
+    let shortcuts_path = base_dir.join(".shortcuts.yaml");
     if shortcuts_path.exists() {
         let content = std::fs::read_to_string(shortcuts_path)?;
         let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
