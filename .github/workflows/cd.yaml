@@ -72,7 +72,6 @@ jobs:
           echo "Creating tag $TAG"
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          # Create tag only if it doesn't exist
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG already exists."
           else
@@ -80,51 +79,39 @@ jobs:
             git push origin "$TAG"
           fi
 
+      - name: Fetch Tags
+        run: git fetch --tags
+
+      - name: Download Artifacts
+        run: |
+          mkdir -p artifacts
+
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
           name: zirv-windows-latest
           path: artifacts
-
       - name: Download Linux Artifact
         uses: actions/download-artifact@v4
         with:
           name: zirv-ubuntu-latest
           path: artifacts
-
       - name: Download macOS Artifact
         uses: actions/download-artifact@v4
         with:
           name: zirv-macos-latest
           path: artifacts
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release and Upload Assets
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ steps.get_version.outputs.version }}
           name: Release v${{ steps.get_version.outputs.version }}
           body: "Release of zirv binaries for Windows, Linux, and macOS."
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Windows Binary to Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: artifacts/zirv-windows-latest.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Linux Binary to Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: artifacts/zirv-ubuntu-latest
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload macOS Binary to Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: artifacts/zirv-macos-latest
+          files: |
+            artifacts/zirv-windows-latest.exe
+            artifacts/zirv-ubuntu-latest
+            artifacts/zirv-macos-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
