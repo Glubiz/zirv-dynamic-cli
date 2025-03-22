@@ -21,8 +21,6 @@ pub fn substitute_params(command: &str, params: &HashMap<String, String>) -> Str
     result
 }
 
-
-
 /// Attempts to find a script file for the given command name in the .zirv directory.
 /// First, it looks for a file named "{command}.yaml" (or .yml, .json, .toml). If not found,
 /// it then loads .zirv/shortcuts.yaml to see if there is a mapping for that command.
@@ -59,6 +57,6 @@ pub fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::
             }
         }
     }
-    
+
     Err(format!("No script or shortcut found for '{}'", base_name).into())
 }

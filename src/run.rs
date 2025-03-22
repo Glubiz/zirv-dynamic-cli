@@ -10,11 +10,15 @@ use crate::Script;
 /// Reads and executes a YAML script from the given path.
 /// If a `pre` script is specified, it is executed before the current script.
 /// Commands with an `operating_system` option that does not match the current OS are skipped.
-pub async fn run(path: &std::path::Path, cli_params: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    path: &std::path::Path,
+    cli_params: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     // Read file content.
     let content = fs::read_to_string(path)?;
     // Determine extension.
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
@@ -43,9 +47,13 @@ pub async fn run(path: &std::path::Path, cli_params: &[String]) -> Result<(), Bo
                 "Expected {} parameters, but got {}",
                 expected_params.len(),
                 cli_params.len()
-            ).into());
+            )
+            .into());
         }
-        let map = expected_params.into_iter().zip(cli_params.iter().cloned()).collect();
+        let map = expected_params
+            .into_iter()
+            .zip(cli_params.iter().cloned())
+            .collect();
         Some(map)
     } else {
         None
@@ -69,7 +77,7 @@ pub async fn run(path: &std::path::Path, cli_params: &[String]) -> Result<(), Bo
                 }
             }
         }
-        
+
         println!("\nExecuting command: '{}'", cmd_item.command);
 
         // Print description if available.
@@ -91,18 +99,23 @@ pub async fn run(path: &std::path::Path, cli_params: &[String]) -> Result<(), Bo
         // If interactive option is set, inherit I/O.
         if let Some(ref opts) = cmd_item.options {
             if opts.interactive {
-                command.stdin(Stdio::inherit())
-                       .stdout(Stdio::inherit())
-                       .stderr(Stdio::inherit());
+                command
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit());
             }
         }
 
         let status = command.status().await?;
 
         if !status.success() {
-            eprintln!("\nCommand '{}' failed with status: {:?}", cmd_item.command, status);
+            eprintln!(
+                "\nCommand '{}' failed with status: {:?}",
+                cmd_item.command, status
+            );
             // Check proceed_on_failure option.
-            let proceed = cmd_item.options
+            let proceed = cmd_item
+                .options
                 .as_ref()
                 .map(|o| o.proceed_on_failure)
                 .unwrap_or(false);
@@ -110,15 +123,12 @@ pub async fn run(path: &std::path::Path, cli_params: &[String]) -> Result<(), Bo
             if !proceed {
                 return Err(format!("\nCommand '{}' failed", cmd_item.command).into());
             } else {
-
                 println!("\nContinuing despite failure as proceed_on_failure is true.");
             }
         }
 
         // Apply delay if specified.
-        if let Some(delay) = cmd_item.options
-            .as_ref()
-            .and_then(|o| o.delay_ms) {
+        if let Some(delay) = cmd_item.options.as_ref().and_then(|o| o.delay_ms) {
             sleep(Duration::from_millis(delay)).await;
         }
     }
@@ -136,7 +146,11 @@ mod tests {
     /// Helper function: writes the given script content into a file under a temporary `.zirv` directory,
     /// changes the current directory to that temporary directory, runs the run_script function with provided parameters,
     /// then restores the original directory.
-    async fn run_script_with_content(filename: &str, content: &str, params: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run_script_with_content(
+        filename: &str,
+        content: &str,
+        params: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Create a temporary directory.
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path();
@@ -195,7 +209,10 @@ commands:
 "#;
         let params = vec!["My test commit".to_string()];
         let res = run_script_with_content("test_commit.yaml", yaml, &params).await;
-        assert!(res.is_ok(), "Expected script with parameter substitution to succeed");
+        assert!(
+            res.is_ok(),
+            "Expected script with parameter substitution to succeed"
+        );
     }
 
     #[tokio::test]
@@ -214,7 +231,10 @@ commands:
 "#;
         let params: Vec<String> = vec![]; // No parameters provided.
         let res = run_script_with_content("test_commit_mismatch.yaml", yaml, &params).await;
-        assert!(res.is_err(), "Expected script to fail due to parameter mismatch");
+        assert!(
+            res.is_err(),
+            "Expected script to fail due to parameter mismatch"
+        );
     }
 
     #[tokio::test]
@@ -232,7 +252,10 @@ commands:
 "#;
         let res = run_script_with_content("test_os_mismatch.yaml", yaml, &[]).await;
         // Since the command is skipped, the script should succeed.
-        assert!(res.is_ok(), "Expected script to succeed by skipping mismatched command");
+        assert!(
+            res.is_ok(),
+            "Expected script to succeed by skipping mismatched command"
+        );
     }
 
     #[tokio::test]
@@ -245,7 +268,8 @@ commands:
         };
 
         // Test that a failing command stops execution when proceed_on_failure is false.
-        let yaml = format!(r#"
+        let yaml = format!(
+            r#"
 name: "Fail Script"
 description: "A script that fails and stops execution"
 commands:
@@ -253,7 +277,9 @@ commands:
     options:
       proceed_on_failure: false
       interactive: false
-"#, fail_command);
+"#,
+            fail_command
+        );
         let res = run_script_with_content("test_fail.yaml", &yaml, &[]).await;
         assert!(res.is_err(), "Expected script to fail and stop execution");
     }
@@ -269,7 +295,8 @@ commands:
 
         // Test that a failing command is skipped when proceed_on_failure is true,
         // and the script continues to run subsequent commands.
-        let yaml = format!(r#"
+        let yaml = format!(
+            r#"
 name: "Proceed Script"
 description: "A script that fails but continues execution"
 commands:
@@ -281,7 +308,9 @@ commands:
     options:
       proceed_on_failure: false
       interactive: false
-"#, fail_command);
+"#,
+            fail_command
+        );
         let res = run_script_with_content("test_proceed.yaml", &yaml, &[]).await;
         assert!(res.is_ok(), "Expected script to continue despite a failure");
     }
