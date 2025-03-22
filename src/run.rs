@@ -228,7 +228,7 @@ commands:
     options:
       proceed_on_failure: false
       interactive: false
-      operating_system: "linux"
+      operating_system: "macos"
 "#;
         let res = run_script_with_content("test_os_mismatch.yaml", yaml, &[]).await;
         // Since the command is skipped, the script should succeed.
