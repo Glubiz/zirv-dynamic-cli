@@ -59,5 +59,6 @@ pub fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::
             }
         }
     }
+    
     Err(format!("No script or shortcut found for '{}'", base_name).into())
 }

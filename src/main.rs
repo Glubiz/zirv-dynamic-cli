@@ -1,6 +1,8 @@
 use clap::Parser;
+use help::show_help;
 use serde::Deserialize;
 
+mod help;
 mod shortcuts;
 mod utils;
 mod run;
@@ -74,7 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get the CLI arguments.
     let cli = File::parse();
 
-    let file_path = find_script_file(&cli.name)?;
-    
-    run_yaml(&file_path, &cli.params).await
+    match find_script_file(&cli.name) {
+        Ok(path) => run_yaml(&path, &cli.params).await,
+        Err(e) => {
+            if cli.name == "help" || cli.name == "h" {
+                show_help()?;
+
+                return Ok(());
+            }
+
+            eprintln!("Error: {}", e);
+            return Ok(());
+        }
+    }
 }
