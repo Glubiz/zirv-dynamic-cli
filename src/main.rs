@@ -3,10 +3,10 @@ use serde::Deserialize;
 
 mod shortcuts;
 mod utils;
-mod yaml;
+mod run;
 
 use utils::find_script_file;
-use yaml::run as run_yaml;
+use run::run as run_yaml;
 
 /// Represents a YAML script.
 #[derive(Debug, Deserialize, Parser)]
