@@ -144,6 +144,13 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
                 writeln!(writer, "  {} -> {}", key, value)?;
             }
         }
+    } else {
+        // If no .zirv directory is found, prompt the user to create one.
+        writeln!(
+            writer,
+            "No scripts found. Please create a .zirv directory in {:?}.",
+            root
+        )?;
     }
 
     Ok(())
