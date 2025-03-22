@@ -1,4 +1,4 @@
-use std::{fs, io::Write, path::PathBuf};
+use std::{env, fs, io::Write, path::PathBuf};
 
 use crate::{shortcuts::Shortcuts, Script};
 
@@ -7,73 +7,145 @@ use crate::{shortcuts::Shortcuts, Script};
 /// making it easier to test the output.
 pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = PathBuf::from(".zirv");
-    if !base_dir.exists() {
-        writeln!(writer, "No .zirv directory found.")?;
-        return Ok(());
-    }
-    writeln!(writer, "Available Scripts:")?;
 
-    let extensions = ["yaml", "yml", "json", "toml"];
+    if base_dir.exists() {
+        writeln!(writer, "\nAvailable Scripts:")?;
 
-    for entry in fs::read_dir(&base_dir)? {
-        let entry = entry?;
-        let path = entry.path();
+        let extensions = ["yaml", "yml", "json", "toml"];
 
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if extensions.contains(&ext) && path.file_name().unwrap() != ".shortcuts.yaml" {
-                    let content = fs::read_to_string(&path)?;
+        for entry in fs::read_dir(&base_dir)? {
+            let entry = entry?;
+            let path = entry.path();
 
-                    // Parse the script.
-                    let script: Script = if ext == "yaml" || ext == "yml" {
-                        serde_yaml::from_str(&content)?
-                    } else if ext == "json" {
-                        serde_json::from_str(&content)?
-                    } else if ext == "toml" {
-                        toml::from_str(&content)?
-                    } else {
-                        return Err(format!("Unsupported file extension: {}", ext).into());
-                    };
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    if extensions.contains(&ext) && path.file_name().unwrap() != ".shortcuts.yaml" {
+                        let content = fs::read_to_string(&path)?;
 
-                    let file_name = path.file_name().unwrap().to_string_lossy();
-                    writeln!(writer, "-------------------------------------------------")?;
-                    writeln!(writer, "File: {}", file_name)?;
-                    writeln!(writer, "  Name: {}", script.name)?;
-                    if let Some(desc) = script.description {
-                        writeln!(writer, "  Description: {}", desc)?;
-                    }
-                    if let Some(params) = &script.params {
-                        writeln!(writer, "  Required Parameters:")?;
-                        for param in params {
-                            writeln!(writer, "    {}", param)?;
+                        // Parse the script.
+                        let script: Script = if ext == "yaml" || ext == "yml" {
+                            serde_yaml::from_str(&content)?
+                        } else if ext == "json" {
+                            serde_json::from_str(&content)?
+                        } else if ext == "toml" {
+                            toml::from_str(&content)?
+                        } else {
+                            return Err(format!("Unsupported file extension: {}", ext).into());
+                        };
+
+                        let file_name = path.file_name().unwrap().to_string_lossy();
+                        writeln!(writer, "-------------------------------------------------")?;
+                        writeln!(writer, "File: {}", file_name)?;
+                        writeln!(writer, "  Name: {}", script.name)?;
+                        if let Some(desc) = script.description {
+                            writeln!(writer, "  Description: {}", desc)?;
                         }
-                    }
-                    if !script.commands.is_empty() {
-                        writeln!(writer, "  Commands:")?;
-                        for (i, cmd) in script.commands.iter().enumerate() {
-                            writeln!(writer, "    {}. {}", i + 1, cmd.command)?;
-                            if let Some(d) = &cmd.description {
-                                writeln!(writer, "       Description: {}", d)?;
+                        if let Some(params) = &script.params {
+                            writeln!(writer, "  Required Parameters:")?;
+                            for param in params {
+                                writeln!(writer, "    {}", param)?;
+                            }
+                        }
+                        if !script.commands.is_empty() {
+                            writeln!(writer, "  Commands:")?;
+                            for (i, cmd) in script.commands.iter().enumerate() {
+                                writeln!(writer, "    {}. {}", i + 1, cmd.command)?;
+                                if let Some(d) = &cmd.description {
+                                    writeln!(writer, "       Description: {}", d)?;
+                                }
                             }
                         }
                     }
                 }
             }
         }
+
+        // List shortcuts if present.
+        let shortcuts_path = base_dir.join(".shortcuts.yaml");
+        if shortcuts_path.exists() {
+            writeln!(writer, "\nAvailable Shortcuts:")?;
+            let content = fs::read_to_string(shortcuts_path)?;
+            let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
+            for (key, value) in shortcuts.shortcuts {
+                writeln!(writer, "  {} -> {}", key, value)?;
+            }
+            writeln!(writer, "  h -> help")?;
+            writeln!(writer, "  v -> version")?;
+        }
     }
 
-    // List shortcuts if present.
-    let shortcuts_path = base_dir.join(".shortcuts.yaml");
-    if shortcuts_path.exists() {
-        writeln!(writer, "\nAvailable Shortcuts:")?;
-        let content = fs::read_to_string(shortcuts_path)?;
-        let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
-        for (key, value) in shortcuts.shortcuts {
-            writeln!(writer, "  {} -> {}", key, value)?;
+    // List global commands
+    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE"))?;
+    let root = PathBuf::from(home).join(".zirv");
+
+    if root.exists() {
+        writeln!(writer, "\nGlobal Base Scripts:")?;
+        writeln!(
+            writer,
+            "Global scripts are overwritten by above mentioned scripts if they share name."
+        )?;
+
+        let extensions = ["yaml", "yml", "json", "toml"];
+
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    if extensions.contains(&ext) && path.file_name().unwrap() != ".shortcuts.yaml" {
+                        let content = fs::read_to_string(&path)?;
+
+                        // Parse the script.
+                        let script: Script = if ext == "yaml" || ext == "yml" {
+                            serde_yaml::from_str(&content)?
+                        } else if ext == "json" {
+                            serde_json::from_str(&content)?
+                        } else if ext == "toml" {
+                            toml::from_str(&content)?
+                        } else {
+                            return Err(format!("Unsupported file extension: {}", ext).into());
+                        };
+
+                        let file_name = path.file_name().unwrap().to_string_lossy();
+                        writeln!(writer, "-------------------------------------------------")?;
+                        writeln!(writer, "File: {}", file_name)?;
+                        writeln!(writer, "  Name: {}", script.name)?;
+                        if let Some(desc) = script.description {
+                            writeln!(writer, "  Description: {}", desc)?;
+                        }
+                        if let Some(params) = &script.params {
+                            writeln!(writer, "  Required Parameters:")?;
+                            for param in params {
+                                writeln!(writer, "    {}", param)?;
+                            }
+                        }
+                        if !script.commands.is_empty() {
+                            writeln!(writer, "  Commands:")?;
+                            for (i, cmd) in script.commands.iter().enumerate() {
+                                writeln!(writer, "    {}. {}", i + 1, cmd.command)?;
+                                if let Some(d) = &cmd.description {
+                                    writeln!(writer, "       Description: {}", d)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        writeln!(writer, "  h -> help")?;
-        writeln!(writer, "  v -> version")?;
+
+        // List shortcuts if present.
+        let shortcuts_path = root.join(".shortcuts.yaml");
+        if shortcuts_path.exists() {
+            writeln!(writer, "\nGlobal Shortcuts:")?;
+            let content = fs::read_to_string(shortcuts_path)?;
+            let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
+            for (key, value) in shortcuts.shortcuts {
+                writeln!(writer, "  {} -> {}", key, value)?;
+            }
+        }
     }
+
     Ok(())
 }
 
@@ -91,30 +163,6 @@ mod tests {
         let zirv_dir = temp_dir.join(".zirv");
         create_dir_all(&zirv_dir).unwrap();
         zirv_dir
-    }
-
-    /// Test that when no .zirv directory exists, the help output indicates that.
-    #[test]
-    fn test_show_help_no_zirv() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a temporary directory WITHOUT a .zirv folder.
-        let temp_dir = tempdir()?;
-        let temp_path = temp_dir.path().to_path_buf();
-
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
-
-        let mut buffer = Cursor::new(Vec::new());
-        show_help(&mut buffer)?;
-        let output = String::from_utf8(buffer.into_inner())?;
-
-        assert!(
-            output.contains("No .zirv directory found."),
-            "Output should indicate missing .zirv folder."
-        );
-
-        env::set_current_dir(original_dir)?;
-
-        Ok(())
     }
 
     /// Test that a local script file is listed correctly.
