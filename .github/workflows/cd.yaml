@@ -32,9 +32,9 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            mv target/release/mycli.exe mycli-${{ matrix.os }}.exe;
+            mv target/release/zirv.exe zirv-${{ matrix.os }}.exe;
           else
-            mv target/release/mycli mycli-${{ matrix.os }};
+            mv target/release/zirv zirv-${{ matrix.os }};
           fi
 
       - name: Upload Artifact
