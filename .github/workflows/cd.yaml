@@ -62,19 +62,19 @@ jobs:
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
-          name: mycli-windows-latest
+          name: zirv-windows-latest
           path: artifacts
 
       - name: Download Linux Artifact
         uses: actions/download-artifact@v4
         with:
-          name: mycli-ubuntu-latest
+          name: zirv-ubuntu-latest
           path: artifacts
 
       - name: Download macOS Artifact
         uses: actions/download-artifact@v4
         with:
-          name: mycli-macos-latest
+          name: zirv-macos-latest
           path: artifacts
 
       - name: Create GitHub Release
@@ -90,20 +90,20 @@ jobs:
       - name: Upload Windows Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/mycli-windows-latest.exe
+          files: artifacts/zirv-windows-latest.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Linux Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/mycli-ubuntu-latest
+          files: artifacts/zirv-ubuntu-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload macOS Binary to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/mycli-macos-latest
+          files: artifacts/zirv-macos-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
