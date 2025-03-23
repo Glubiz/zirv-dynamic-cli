@@ -56,12 +56,31 @@ pub fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::
     }
 
     // 3. Fallback: use HOME or USERPROFILE.
-    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE"))?;
-    let root = PathBuf::from(home).join(".zirv");
+    let home_dir = PathBuf::from(env::var("HOME").or_else(|_| env::var("USERPROFILE"))?);
+
+    let root = home_dir.join(".zirv");
     for ext in &extensions {
         let path = root.join(format!("{}.{}", base_name, ext));
         if path.exists() {
             return Ok(path.canonicalize()?);
+        }
+    }
+
+    let shortcuts_path = root.join(".shortcuts.yaml");
+    if shortcuts_path.exists() {
+        let content = std::fs::read_to_string(&shortcuts_path)?;
+        let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
+        if let Some(mapped_file) = shortcuts.shortcuts.get(base_name) {
+            let path = root.join(mapped_file);
+            if path.exists() {
+                return Ok(path.canonicalize()?);
+            }
+            for ext in &extensions {
+                let path = root.join(format!("{}.{}", mapped_file, ext));
+                if path.exists() {
+                    return Ok(path.canonicalize()?);
+                }
+            }
         }
     }
 
