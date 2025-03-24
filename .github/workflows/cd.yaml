@@ -31,21 +31,30 @@ jobs:
       - name: Build CLI Program
         run: cargo build --release
 
-      - name: Rename Binary for Release
+      - name: Rename and Package Binary for Release
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             mv target/release/zirv.exe zirv-${{ matrix.os }}.exe;
           else
             mv target/release/zirv zirv-${{ matrix.os }};
+            chmod +x zirv-${{ matrix.os }};
+            tar -czvf zirv-${{ matrix.os }}.tar.gz zirv-${{ matrix.os }};
           fi
 
-      - name: Upload Artifact
+      - name: Upload Windows Artifact
+        if: ${{ matrix.os == 'windows-latest' }}
         uses: actions/upload-artifact@v4
         with:
-          name: zirv-${{ matrix.os }}
-          path: |
-            zirv-${{ matrix.os }}*
+          name: zirv-windows-latest
+          path: zirv-windows-latest.exe
+
+      - name: Upload Non-Windows Artifact
+        if: ${{ matrix.os != 'windows-latest' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zirv-${{ matrix.os }}-latest
+          path: zirv-${{ matrix.os }}.tar.gz
 
   release:
     name: Create and Upload Release Assets
@@ -82,20 +91,18 @@ jobs:
       - name: Fetch Tags
         run: git fetch --tags
 
-      - name: Download Artifacts
-        run: |
-          mkdir -p artifacts
-
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
           name: zirv-windows-latest
           path: artifacts
+
       - name: Download Linux Artifact
         uses: actions/download-artifact@v4
         with:
           name: zirv-ubuntu-latest
           path: artifacts
+
       - name: Download macOS Artifact
         uses: actions/download-artifact@v4
         with:
@@ -111,7 +118,7 @@ jobs:
           body: "Release of zirv binaries for Windows, Linux, and macOS."
           files: |
             artifacts/zirv-windows-latest.exe
-            artifacts/zirv-ubuntu-latest
-            artifacts/zirv-macos-latest
+            artifacts/zirv-ubuntu-latest.tar.gz
+            artifacts/zirv-macos-latest.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
