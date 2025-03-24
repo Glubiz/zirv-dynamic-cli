@@ -24,7 +24,15 @@ build tools, Git, and more by executing commands defined in YAML files. All YAML
 
 ## Usage
 
-1. Create a `.zirv` directory at the root of your project.
+1. Create a `.zirv` directory at the root of your project and in you home folder. Alternatively you could call `zirv init` to create it automatically.
+
+`zirv init` will create the following structure:
+
+```
+.zirv
+├── .shortcuts.yaml
+```
+
 2. Add YAML files to define your commands. For example:
 
 ### Example: `build.yaml`
