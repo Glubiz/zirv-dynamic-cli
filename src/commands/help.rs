@@ -1,6 +1,6 @@
 use std::{env, fs, io::Write, path::PathBuf};
 
-use crate::{shortcuts::Shortcuts, Script};
+use crate::structs::{script::Script, shortcuts::Shortcuts};
 
 /// Writes the help information into the given writer.
 /// This function is a refactored version of show_help() that writes to the provided writer,
@@ -69,8 +69,9 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             for (key, value) in shortcuts.shortcuts {
                 writeln!(writer, "  {} -> {}", key, value)?;
             }
-            writeln!(writer, "  h -> help")?;
+            writeln!(writer, "  i -> init")?;
             writeln!(writer, "  v -> version")?;
+            writeln!(writer, "  h -> help")?;
         }
     }
 

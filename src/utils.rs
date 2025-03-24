@@ -1,13 +1,6 @@
-use crate::{shortcuts::Shortcuts, OperatingSystem};
 use std::{collections::HashMap, env, path::PathBuf};
 
-pub fn operating_system(op: OperatingSystem) -> String {
-    match op {
-        OperatingSystem::Linux => "linux".to_string(),
-        OperatingSystem::Windows => "windows".to_string(),
-        OperatingSystem::MacOS => "macos".to_string(),
-    }
-}
+use crate::structs::shortcuts::Shortcuts;
 
 /// Substitutes parameter placeholders in the command string.
 /// Placeholders are of the form `${param_name}`.
@@ -95,15 +88,6 @@ mod tests {
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::path::PathBuf;
     use tempfile::tempdir;
-
-    // --- Tests for operating_system ---
-
-    #[test]
-    fn test_operating_system() {
-        assert_eq!(operating_system(OperatingSystem::Linux), "linux");
-        assert_eq!(operating_system(OperatingSystem::Windows), "windows");
-        assert_eq!(operating_system(OperatingSystem::MacOS), "macos");
-    }
 
     // --- Tests for substitute_params ---
 

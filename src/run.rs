@@ -4,8 +4,9 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
-use crate::utils::{operating_system, substitute_params};
-use crate::Script;
+use crate::structs::os::operating_system;
+use crate::structs::script::Script;
+use crate::utils::substitute_params;
 
 /// Reads and executes a YAML/JSON/TOML script from the given path.
 /// Commands with an `operating_system` option that does not match the current OS are skipped.
