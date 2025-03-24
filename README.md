@@ -228,4 +228,4 @@ cargo build --release
 
 Then add the resulting binary to your PATH.
 
-**Alternatively, you can download precompiled executables from our GitHub Releases page: [GitHub Releases](https://github.com/zirv-dynamic-cli/releases).**
+**Alternatively, you can download precompiled executables from our GitHub Releases page: [GitHub Releases](https://github.com/Glubiz/zirv-dynamic-cli/releases).**
