@@ -118,7 +118,7 @@ jobs:
           body: "Release of zirv binaries for Windows, Linux, and macOS."
           files: |
             artifacts/zirv-windows-latest.exe
-            artifacts/zirv-ubuntu-latest
-            artifacts/zirv-macos-latest
+            artifacts/zirv-ubuntu-latest.tar.gz
+            artifacts/zirv-macos-latest.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
