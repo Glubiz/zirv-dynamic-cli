@@ -42,18 +42,18 @@ jobs:
             tar -czvf zirv-${{ matrix.os }}.tar.gz zirv-${{ matrix.os }};
           fi
 
-      - name: Upload Windows Artifact
+      - name: Upload Artifact for Windows
         if: ${{ matrix.os == 'windows-latest' }}
         uses: actions/upload-artifact@v4
         with:
-          name: zirv-windows-latest
-          path: zirv-windows-latest.exe
+          name: zirv-${{ matrix.os }}
+          path: zirv-${{ matrix.os }}.exe
 
-      - name: Upload Non-Windows Artifact
+      - name: Upload Artifact for Non-Windows
         if: ${{ matrix.os != 'windows-latest' }}
         uses: actions/upload-artifact@v4
         with:
-          name: zirv-${{ matrix.os }}-latest
+          name: zirv-${{ matrix.os }}
           path: zirv-${{ matrix.os }}.tar.gz
 
   release:
@@ -118,7 +118,7 @@ jobs:
           body: "Release of zirv binaries for Windows, Linux, and macOS."
           files: |
             artifacts/zirv-windows-latest.exe
-            artifacts/zirv-ubuntu-latest.tar.gz
-            artifacts/zirv-macos-latest.tar.gz
+            artifacts/zirv-ubuntu-latest
+            artifacts/zirv-macos-latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
