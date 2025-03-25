@@ -33,7 +33,7 @@ build tools, Git, and more by executing commands defined in YAML files. All YAML
 ├── .shortcuts.yaml
 ```
 
-2. Add YAML files to define your commands. For example:
+2. Add YAML files by calling `zirv create` to define your commands. For example:
 
 ### Example: `build.yaml`
 
