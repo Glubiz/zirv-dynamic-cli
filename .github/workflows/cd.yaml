@@ -160,4 +160,8 @@ jobs:
         env:
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
-          ./scripts/update_chocolatey.ps1 -Version v${{ steps.get_version.outputs.version }} -ArtifactPath artifacts\zirv-windows-latest.exe
+          # Set default push source so choco knows where to push the package
+          choco config set --name='defaultPushSource' --value='https://push.chocolatey.org/'
+          # Call the update script with the version without a leading "v"
+          ./scripts/update_chocolatey.ps1 -Version ${{ steps.get_version.outputs.version }} -ArtifactPath artifacts\zirv-windows-latest.exe
+        
