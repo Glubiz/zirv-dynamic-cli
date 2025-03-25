@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package >
+  <metadata>
+    <id>zirv</id>
+    <version>0.6.2</version>
+    <title>Zirv CLI</title>
+    <authors>Jonathan Solskov</authors>
+    <owners>Zirv</owners>
+    <description>Zirv is a dynamic CLI tool.</description>
+    <tags>cli tool zirv</tags>
+    <projectUrl>https://github.com/yourusername/zirv-dynamic-cli</projectUrl>
+  </metadata>
+  <files>
+    <file src="zirv-windows-latest.exe" target="tools" />
+  </files>
+</package>

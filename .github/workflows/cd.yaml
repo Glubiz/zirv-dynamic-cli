@@ -64,7 +64,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # Fetch full history and tags
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -122,3 +122,19 @@ jobs:
             artifacts/zirv-macos-latest.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew Formula
+        if: success()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
+        run: |
+          ./scripts/update_homebrew.sh v${{ steps.get_version.outputs.version }} artifacts/zirv-macos-latest.tar.gz
+
+      - name: Update Chocolatey Package
+        if: success()
+        shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          ./scripts/update_chocolatey.ps1 -Version v${{ steps.get_version.outputs.version }} -ArtifactPath artifacts/zirv-windows-latest.exe
