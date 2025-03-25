@@ -1,5 +1,7 @@
 use clap::Parser;
-use commands::{help::show_help, init::init_zirv, version::get_version};
+use commands::{
+    create::create_script_interactive, help::show_help, init::init_zirv, version::get_version,
+};
 
 mod commands;
 mod run;
@@ -24,6 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     } else if cli.name == "init" || cli.name == "i" {
         init_zirv()?;
+        return Ok(());
+    } else if cli.name == "create" || cli.name == "c" {
+        create_script_interactive()?;
         return Ok(());
     }
 
