@@ -5,15 +5,15 @@ param(
     [string]$ArtifactPath
 )
 
-# Determine the repository root (assuming this script is in the 'scripts' folder)
+# Determine repository root (assuming this script is in the 'scripts' folder)
 $repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
-# Define the package folder relative to the repository root (where your nuspec is located)
+# Define the package folder relative to the repository root (where your nuspec file is located)
 $packageFolder = Join-Path $repoRoot "chocolatey\zirv"
 
 Write-Host "Repository Root: $repoRoot"
 Write-Host "Package Folder: $packageFolder"
 
-# Path to the nuspec file
+# Define path for the nuspec file
 $nuspecPath = Join-Path $packageFolder "zirv.nuspec"
 
 # Update the nuspec file using XML to ensure valid XML structure
@@ -21,25 +21,29 @@ $nuspecPath = Join-Path $packageFolder "zirv.nuspec"
 $nuspec.package.metadata.version = $Version
 $nuspec.Save($nuspecPath)
 
+# Ensure the Windows executable is present in the package folder.
+# The nuspec file references "zirv-windows-latest.exe", so it must be present here.
+$winExePath = Join-Path $packageFolder "zirv-windows-latest.exe"
+if (-not (Test-Path $winExePath)) {
+    Write-Host "Copying Windows artifact from '$ArtifactPath' to '$winExePath'"
+    if (Test-Path $ArtifactPath) {
+         Copy-Item $ArtifactPath -Destination $winExePath
+    }
+    else {
+         Write-Error "Artifact not found at provided path: $ArtifactPath"
+         exit 1
+    }
+}
+
 # Pack the Chocolatey package with output forced to $packageFolder
 choco pack $nuspecPath -o $packageFolder
 
 # Define the expected path for the generated .nupkg file
 $packageFile = Join-Path $packageFolder "zirv.$Version.nupkg"
 
-# If the file is not found in the package folder, search the repository recursively
 if (-not (Test-Path $packageFile)) {
-    Write-Host "Package not found in $packageFolder. Searching repository root..."
-    $pkg = Get-ChildItem -Path $repoRoot -Filter "zirv.$Version.nupkg" -Recurse | Select-Object -First 1
-    if ($pkg) {
-        Write-Host "Found package at $($pkg.FullName). Moving to $packageFolder..."
-        Move-Item $pkg.FullName -Destination $packageFolder
-        $packageFile = Join-Path $packageFolder "zirv.$Version.nupkg"
-    }
-    else {
-        Write-Error "File not found: 'zirv.$Version.nupkg' in repository."
-        exit 1
-    }
+    Write-Error "File not found: '$packageFile'."
+    exit 1
 }
 
 Write-Host "Package file located at: $packageFile"
