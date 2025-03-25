@@ -164,3 +164,4 @@ jobs:
           ./scripts/update_chocolatey.ps1 -Version ${{ steps.get_version.outputs.version }} -ArtifactPath artifacts\zirv-windows-latest.exe
         
         
+        
