@@ -12,7 +12,17 @@ commands:
 #  - command: example
 #    description: Step description
 #    options:
-#      proceed_on_failure: false
+#      interactive: bool
+#      operating_system: linux|windows|macos
+#      proceed_on_failure: bool
+#      delay_ms: int
+#  - command: example2
+#    description: Step 2 description
+#    options:
+#      interactive: bool
+#      operating_system: linux|windows|macos
+#      proceed_on_failure: bool
+#      delay_ms: int
 "#;
 
 #[derive(Serialize, Deserialize, Debug, Default)]

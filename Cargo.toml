@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
