@@ -5,19 +5,29 @@ param(
     [string]$ArtifactPath
 )
 
-# Load the nuspec file as XML
-[xml]$nuspec = Get-Content "chocolatey/zirv/zirv.nuspec"
+# Define the package folder relative to the repository root
+$packageFolder = "chocolatey\zirv"
 
-# Update the version node
+# Change directory into the package folder so the nuspec is in context
+Push-Location $packageFolder
+
+# Update the nuspec file using XML (ensuring valid XML structure)
+[xml]$nuspec = Get-Content "zirv.nuspec"
 $nuspec.package.metadata.version = $Version
+$nuspec.Save("zirv.nuspec")
 
-# Optionally update other fields (e.g., URL, checksum, etc.)
+Pop-Location
 
-# Save the updated nuspec file
-$nuspec.Save("chocolatey/zirv/zirv.nuspec")
+# Pack the Chocolatey package; force output to the package folder
+choco pack "$packageFolder\zirv.nuspec" -o "$packageFolder"
 
-# Now pack the package
-choco pack "chocolatey/zirv/zirv.nuspec" -o "chocolatey/zirv/"
+# Define the expected path for the generated .nupkg file
+$packagePath = Join-Path $packageFolder "zirv.$Version.nupkg"
 
-# Push the package (ensure your .nupkg file name matches)
-choco push "chocolatey/zirv/zirv.$Version.nupkg" --api-key $env:CHOCOLATEY_API_KEY --source "https://push.chocolatey.org/"
+if (-not (Test-Path $packagePath)) {
+    Write-Error "File not found: '$packagePath'."
+    exit 1
+}
+
+# Push the package to Chocolatey (ensure the push source is set)
+choco push $packagePath --api-key $env:CHOCOLATEY_API_KEY --source "https://push.chocolatey.org/"
