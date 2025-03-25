@@ -70,6 +70,7 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
                 writeln!(writer, "  {} -> {}", key, value)?;
             }
             writeln!(writer, "  i -> init")?;
+            writeln!(writer, "  c -> create")?;
             writeln!(writer, "  v -> version")?;
             writeln!(writer, "  h -> help")?;
         }
