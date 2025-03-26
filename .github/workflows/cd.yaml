@@ -148,9 +148,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
         run: |
-          echo "Debug: Version from get_version is '${{ steps.get_version.outputs.version }}'"
           chmod +x ./scripts/update_homebrew.sh
           ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" artifacts/zirv-macos-latest.tar.gz
+        
 
   update-chocolatey:
     name: Update Chocolatey Package
