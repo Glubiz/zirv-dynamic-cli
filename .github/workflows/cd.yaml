@@ -139,6 +139,7 @@ jobs:
         run: |
           chmod +x ./scripts/update_homebrew.sh
           ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" artifacts/zirv-macos-latest.tar.gz
+        
 
   update-homebrew:
     name: Update Homebrew Formula

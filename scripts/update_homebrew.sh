@@ -9,6 +9,9 @@ fi
 VERSION=$1
 ARTIFACT_PATH_INPUT=$2
 
+# Ensure the artifacts directory exists (create it if missing)
+mkdir -p artifacts
+
 echo "Looking for artifact at provided path: '$ARTIFACT_PATH_INPUT'"
 # List the artifacts folder for debugging
 echo "Contents of artifacts folder:"
@@ -34,7 +37,7 @@ echo "Using artifact file: $ARTIFACT_PATH"
 # Compute the SHA256 checksum of the artifact
 CHECKSUM=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
 
-# Directly reference the Homebrew formula file
+# Directly reference the Homebrew formula file (adjust path as needed)
 FORMULA="homebrew/zirv/zirv.rb"
 
 if [ ! -f "$FORMULA" ]; then
