@@ -136,13 +136,21 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
+      - name: Get version from Cargo.toml (Homebrew)
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
       - name: Update Homebrew Formula
+        if: success()
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
         run: |
+          echo "Debug: Version from get_version is '${{ steps.get_version.outputs.version }}'"
           chmod +x ./scripts/update_homebrew.sh
-          ./scripts/update_homebrew.sh ${{ steps.get_version.outputs.version }} artifacts/zirv-macos-latest.tar.gz
+          ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" artifacts/zirv-macos-latest.tar.gz
 
   update-chocolatey:
     name: Update Chocolatey Package
