@@ -8,12 +8,12 @@ on:
     workflows: ["CI Pipeline"]
     types:
       - completed
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build Binaries
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -57,14 +57,16 @@ jobs:
           path: zirv-${{ matrix.os }}.tar.gz
 
   release:
-    name: Create and Upload Release Assets and Update Homebrew
+    name: Create and Upload GitHub Release
     runs-on: ubuntu-latest
     needs: build
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0  # Fetch full history and tags
+          fetch-depth: 0
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -123,48 +125,51 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update Homebrew Formula
-        if: success()
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
-        run: |
-          chmod +x ./scripts/update_homebrew.sh
-          ./scripts/update_homebrew.sh v${{ steps.get_version.outputs.version }} artifacts/zirv-macos-latest.tar.gz
-
-  update-chocolatey:
-    name: Update Chocolatey Package
-    runs-on: windows-latest
+  update-homebrew:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
     needs: release
+    environment:
+      name: homebrew-release  # This environment should be set up with manual approval.
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
+      - name: Update Homebrew Formula
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
+        run: |
+          chmod +x ./scripts/update_homebrew.sh
+          ./scripts/update_homebrew.sh ${{ steps.get_version.outputs.version }} artifacts/zirv-macos-latest.tar.gz
 
-      - name: Get version from Cargo.toml
-        id: get_version
+  update-chocolatey:
+    name: Update Chocolatey Package
+    runs-on: windows-latest
+    needs: release
+    environment:
+      name: chocolatey-release  # This environment should be set up with manual approval.
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Get version from Cargo.toml (Chocolatey)
+        id: get_version_choco
         shell: bash
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
           name: zirv-windows-latest
           path: artifacts
-
       - name: Update Chocolatey Package
         shell: pwsh
         env:
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
           choco config set --name='defaultPushSource' --value='https://push.chocolatey.org/'
-          ./scripts/update_chocolatey.ps1 -Version ${{ steps.get_version.outputs.version }} -ArtifactPath artifacts\zirv-windows-latest.exe
-        
-        
-        
-        
-        
-        
+          ./scripts/update_chocolatey.ps1 -Version ${{ steps.get_version_choco.outputs.version }} -ArtifactPath artifacts\zirv-windows-latest.exe
