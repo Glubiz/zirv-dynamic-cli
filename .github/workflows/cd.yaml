@@ -142,6 +142,11 @@ jobs:
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: List artifacts directory
+        run: |
+          echo "Listing artifacts directory contents:"
+          find artifacts -type f
+        
       - name: Update Homebrew Formula
         if: success()
         shell: bash
@@ -150,6 +155,7 @@ jobs:
         run: |
           chmod +x ./scripts/update_homebrew.sh
           ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" artifacts/zirv-macos-latest.tar.gz
+        
         
 
   update-chocolatey:
