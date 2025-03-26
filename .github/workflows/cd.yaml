@@ -57,7 +57,7 @@ jobs:
           path: zirv-${{ matrix.os }}.tar.gz
 
   release:
-    name: Create and Upload GitHub Release
+    name: Create and Upload Release Assets and Update Homebrew
     runs-on: ubuntu-latest
     needs: build
     outputs:
@@ -66,7 +66,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # Fetch full history and tags
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -93,6 +93,9 @@ jobs:
       - name: Fetch Tags
         run: git fetch --tags
 
+      - name: Create artifacts directory
+        run: mkdir -p artifacts
+
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
@@ -111,6 +114,9 @@ jobs:
           name: zirv-macos-latest
           path: artifacts
 
+      - name: List artifacts directory contents
+        run: find artifacts -type f || echo "No files found"
+
       - name: Create GitHub Release and Upload Assets
         id: create_release
         uses: softprops/action-gh-release@v1
@@ -124,6 +130,15 @@ jobs:
             artifacts/zirv-macos-latest.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew Formula
+        if: success()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
+        run: |
+          chmod +x ./scripts/update_homebrew.sh
+          ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" artifacts/zirv-macos-latest.tar.gz
 
   update-homebrew:
     name: Update Homebrew Formula
