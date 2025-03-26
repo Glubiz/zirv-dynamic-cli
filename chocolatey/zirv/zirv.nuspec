@@ -1,16 +1,35 @@
-<?xml version="1.0"?>
-<package >
+<?xml version="1.0" encoding="utf-8"?>
+<package>
   <metadata>
     <id>zirv</id>
     <version>0.6.2</version>
     <title>Zirv CLI</title>
     <authors>Jonathan Solskov</authors>
     <owners>Zirv</owners>
-    <description>Zirv is a dynamic CLI tool.</description>
+    <description><![CDATA[
+Zirv is a dynamic CLI tool that empowers your developers with an each way to share cli automations. It offers the platform to streamline tasks and improve productivity.
+
+For detailed documentation, please visit the project homepage.
+    ]]></description>
+    <summary><![CDATA[
+Zirv CLI is a powerful command-line tool designed for software engineers. It simplifies workflow automation and provides robust functionality for developers.
+    ]]></summary>
+    <releaseNotes><![CDATA[
+- Initial release of Zirv CLI.
+- Added core features that enables ways of defining flows in yaml and json.
+- For complete release notes, please visit https://github.com/Glubiz/zirv-dynamic-cli/releases.
+    ]]></releaseNotes>
+    <iconUrl>https://www.zirv.io/logo.png</iconUrl>
+    <licenseUrl>https://github.com/Glubiz/zirv-dynamic-cli/tree/main/chocolatey/zirv/LICENSE.txt</licenseUrl>
+    <projectUrl>https://github.com/Glubiz/zirv-dynamic-cli</projectUrl>
+    <packageSourceUrl>https://github.com/Glubiz/zirv-dynamic-cli</packageSourceUrl>
+    <docsUrl>https://github.com/Glubiz/zirv-dynamic-cli</docsUrl>
+    <bugTrackerUrl>https://github.com/Glubiz/zirv-dynamic-cli/issues</bugTrackerUrl>
     <tags>cli tool zirv</tags>
-    <projectUrl>https://github.com/yourusername/zirv-dynamic-cli</projectUrl>
   </metadata>
   <files>
     <file src="zirv-windows-latest.exe" target="tools" />
+    <file src="LICENSE.txt" target="tools" />
+    <file src="VERIFICATION.txt" target="tools" />
   </files>
 </package>

@@ -1,0 +1,32 @@
+Chocolatey Package Verification Checklist for zirv
+
+1. Package Metadata:
+   - Verify the nuspec file is correctly configured.
+   - Ensure the version number matches the intended release.
+
+2. Files and Structure:
+   - Confirm inclusion of the compiled binary.
+   - Verify the package contains necessary files (e.g., LICENSE.txt, README.md, verification.txt).
+   - Confirm proper Chocolatey folder structure (e.g., tools folder, scripts).
+
+3. Licensing:
+   - Ensure LICENSE.txt is present and correct.
+   - Confirm license information is accurately reflected in the nuspec file.
+
+4. Installation:
+   - Test installation via Chocolatey.
+   - Verify the zirv command is added to the system PATH.
+   - Run basic commands (e.g., `zirv help`, `zirv build`) to verify operational functionality.
+
+5. Uninstallation:
+   - Verify that the package uninstalls cleanly without leaving residual files.
+
+6. Scripts and Automation:
+   - Confirm that Chocolatey install/uninstall scripts (e.g., chocolateyInstall.ps1, chocolateyUninstall.ps1) are in place and working.
+   - Validate any additional automation or custom scripts required by Chocolatey.
+
+7. Additional Checks:
+   - Perform a checksum validation of the package contents.
+   - Recheck for any platform-specific issues (e.g., OS compatibility listed under command options).
+
+Follow this checklist to ensure all aspects of the Chocolatey package meet the required standards before release.
