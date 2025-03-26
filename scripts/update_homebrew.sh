@@ -12,7 +12,7 @@ ARTIFACT_PATH_INPUT=$2
 echo "Looking for artifact at provided path: '$ARTIFACT_PATH_INPUT'"
 # List the artifacts folder for debugging
 echo "Contents of artifacts folder:"
-find artifacts -type f
+find artifacts -type f || echo "No files found"
 
 # Check if the file exists at the provided path
 if [ -f "$ARTIFACT_PATH_INPUT" ]; then
@@ -34,15 +34,15 @@ echo "Using artifact file: $ARTIFACT_PATH"
 # Compute the SHA256 checksum of the artifact
 CHECKSUM=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
 
-# Set the path to your Homebrew formula.
-# Adjust the path if your formula is stored elsewhere.
-FORMULA="zirv.rb"
+# Directly reference the Homebrew formula file
+FORMULA="homebrew/zirv/zirv.rb"
 
 if [ ! -f "$FORMULA" ]; then
     echo "Error: Formula file '$FORMULA' not found!"
     exit 1
 fi
 
+echo "Found formula file: $FORMULA"
 echo "Updating formula $FORMULA to version $VERSION"
 echo "Using artifact checksum: $CHECKSUM"
 
@@ -53,7 +53,7 @@ sed -i "s|\(url\s*=\s*\"*\)[^\"]*\(\"*\)|\1https://github.com/Glubiz/zirv-dynami
 # Update SHA256
 sed -i "s/\(sha256\s*=\s*\"*\)[^\"]*\(\"*\)/\1$CHECKSUM\2/" "$FORMULA"
 
-# Commit the changes
+# Commit the changes (if any)
 git add "$FORMULA"
 git commit -m "Update zirv formula to version $VERSION" || echo "No changes to commit"
 git push origin main
