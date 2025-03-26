@@ -13,6 +13,18 @@ $packageFolder = Join-Path $repoRoot "chocolatey\zirv"
 Write-Host "Repository Root: $repoRoot"
 Write-Host "Package Folder: $packageFolder"
 
+# Copy the Windows artifact into the package folder so it can be included in the package.
+$windowsArtifactSource = Join-Path $repoRoot $ArtifactPath
+$windowsArtifactDestination = Join-Path $packageFolder "zirv-windows-latest.exe"
+if (Test-Path $windowsArtifactSource) {
+    Write-Host "Copying Windows artifact from '$windowsArtifactSource' to '$windowsArtifactDestination'"
+    Copy-Item $windowsArtifactSource -Destination $windowsArtifactDestination -Force
+} else {
+    Write-Host "Windows artifact not found at '$windowsArtifactSource'"
+    # Optionally, you could exit if this artifact is required.
+    # exit 1
+}
+
 # Path to the nuspec file
 $nuspecPath = Join-Path $packageFolder "zirv.nuspec"
 
@@ -25,15 +37,14 @@ Write-Host "Updated nuspec version to $Version"
 # Pack the Chocolatey package with output forced to $packageFolder
 choco pack $nuspecPath -o $packageFolder
 
-# Expected package file name
+# Define the expected package file name
 $expectedFile = "zirv.$Version.nupkg"
 $packageFile = Join-Path $packageFolder $expectedFile
 
-# Check if the package file exists in the expected folder
 if (-not (Test-Path $packageFile)) {
     Write-Host "Package file not found in package folder: $packageFile"
     
-    # First, check if it exists in the repository root
+    # Search in repository root
     $rootFile = Join-Path $repoRoot $expectedFile
     if (Test-Path $rootFile) {
         Write-Host "Found package in repository root: $rootFile. Moving to package folder..."
