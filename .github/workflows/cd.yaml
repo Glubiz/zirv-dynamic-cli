@@ -131,6 +131,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Debug HOMEBREW_TOKEN
+        run: |
+          if [ -z "${HOMEBREW_TOKEN:-}" ]; then
+            echo "HOMEBREW_TOKEN is not set!"
+          else
+            echo "HOMEBREW_TOKEN is set."
+          fi
+        shell: bash
+        env:
+          HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
+
       - name: Update Homebrew Formula
         if: success()
         shell: bash
@@ -166,16 +177,7 @@ jobs:
         run: |
           echo "Listing artifacts directory contents:"
           find artifacts -type f || echo "No files found"
-      - name: Debug HOMEBREW_TOKEN
-        run: |
-          if [ -z "${HOMEBREW_TOKEN:-}" ]; then
-            echo "HOMEBREW_TOKEN is not set!"
-          else
-            echo "HOMEBREW_TOKEN is set."
-          fi
-        shell: bash
-        env:
-          HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
+      
       - name: Update Homebrew Formula
         if: success()
         shell: bash
