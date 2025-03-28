@@ -9,9 +9,6 @@ fi
 VERSION=$1
 ARTIFACT_PATH_INPUT=$2
 
-# Ensure the artifacts directory exists (create it if missing)
-mkdir -p artifacts
-
 echo "Looking for artifact at provided path: '$ARTIFACT_PATH_INPUT'"
 # List the artifacts folder for debugging
 echo "Contents of artifacts folder:"
@@ -37,7 +34,7 @@ echo "Using artifact file: $ARTIFACT_PATH"
 # Compute the SHA256 checksum of the artifact
 CHECKSUM=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
 
-# Directly reference the Homebrew formula file (adjust path as needed)
+# Directly reference the Homebrew formula file in its known location
 FORMULA="homebrew/zirv/zirv.rb"
 
 if [ ! -f "$FORMULA" ]; then
@@ -55,6 +52,10 @@ sed -i "s/\(version\s*=\s*\"*\)[^\"]*\(\"*\)/\1$VERSION\2/" "$FORMULA"
 sed -i "s|\(url\s*=\s*\"*\)[^\"]*\(\"*\)|\1https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v$VERSION/zirv-macos-latest.tar.gz\2|" "$FORMULA"
 # Update SHA256
 sed -i "s/\(sha256\s*=\s*\"*\)[^\"]*\(\"*\)/\1$CHECKSUM\2/" "$FORMULA"
+
+# Configure Git identity so that commits will succeed
+git config --global user.email "ci@github.com"
+git config --global user.name "GitHub Actions"
 
 # Commit the changes (if any)
 git add "$FORMULA"
