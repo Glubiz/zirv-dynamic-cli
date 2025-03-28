@@ -17,7 +17,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_file: zirv-ubuntu-latest.tar.gz
+          - os: windows-latest
+            artifact_file: zirv-windows-latest.exe
+          - os: macos-latest
+            artifact_file: zirv-macos-latest.tar.gz
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -28,7 +34,7 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Build CLI Program (default build)
+      - name: Build CLI Program
         run: cargo build --release
 
       - name: Rename and Package Binary for Release
@@ -37,10 +43,10 @@ jobs:
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             mv target/release/zirv.exe zirv-${{ matrix.os }}.exe;
           elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            # Ensure both macOS targets are installed
+            # Ensure both targets are installed
             rustup target add x86_64-apple-darwin
             rustup target add aarch64-apple-darwin
-            # Build for Intel and ARM
+            # Build universal binaries for both architectures
             cargo build --release --target x86_64-apple-darwin
             cargo build --release --target aarch64-apple-darwin
             # Create a universal binary using lipo
@@ -49,30 +55,21 @@ jobs:
               target/aarch64-apple-darwin/release/zirv \
               -output zirv
             chmod +x zirv
-            # Package the universal binary into a tarball (the tarball retains its name)
+            # Package the universal binary (the tarball name remains as expected)
             tar -czvf zirv-macos-latest.tar.gz zirv
             rm zirv
           else
-            # For Linux, rename and package normally.
+            # For Linux
             mv target/release/zirv zirv-${{ matrix.os }};
             chmod +x zirv-${{ matrix.os }};
-            tar -czvf zirv-${{ matrix.os }}.tar.gz zirv-${{ matrix.os }};
+            tar -czvf zirv-ubuntu-latest.tar.gz zirv-${{ matrix.os }};
           fi
 
-      - name: Upload Artifact for Windows
-        if: ${{ matrix.os == 'windows-latest' }}
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: zirv-${{ matrix.os }}
-          path: zirv-${{ matrix.os }}.exe
-
-      - name: Upload Artifact for Non-Windows
-        if: ${{ matrix.os != 'windows-latest' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: zirv-${{ matrix.os }}
-          path: |
-            if [[ "${{ matrix.os }}" == "macos-latest" ]]; then echo zirv-macos-latest.tar.gz; else echo zirv-${{ matrix.os }}.tar.gz; fi
+          path: ${{ matrix.artifact_file }}
 
   release:
     name: Create and Upload Release Assets and Update Homebrew
@@ -120,11 +117,11 @@ jobs:
           name: zirv-windows-latest
           path: artifacts
 
-      #- name: Download Linux Artifact
-      #  uses: actions/download-artifact@v4
-      #  with:
-      #    name: zirv-ubuntu-latest
-      #    path: artifacts
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zirv-ubuntu-latest
+          path: artifacts
 
       - name: Download macOS Artifact
         uses: actions/download-artifact@v4
@@ -144,8 +141,8 @@ jobs:
           body: "Release of zirv binaries for Windows, Linux, and macOS."
           files: |
             artifacts/zirv-windows-latest.exe
+            artifacts/zirv-ubuntu-latest.tar.gz
             artifacts/zirv-macos-latest.tar.gz
-    #        artifacts/zirv-ubuntu-latest.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
