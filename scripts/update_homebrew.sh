@@ -10,15 +10,15 @@ VERSION=$1
 ARTIFACT_PATH_INPUT=$2
 
 echo "Looking for artifact at provided path: '$ARTIFACT_PATH_INPUT'"
-# List the artifacts folder for debugging
-echo "Contents of artifacts folder:"
+# Ensure artifacts directory exists
+mkdir -p artifacts
+echo "Contents of artifacts directory:"
 find artifacts -type f || echo "No files found"
 
-# Check if the file exists at the provided path
+# Check if the artifact exists at the provided path
 if [ -f "$ARTIFACT_PATH_INPUT" ]; then
     ARTIFACT_PATH="$ARTIFACT_PATH_INPUT"
 else
-    # Check if the artifact exists inside a folder named as the artifact (without .tar.gz)
     BASE=$(basename "$ARTIFACT_PATH_INPUT" .tar.gz)
     ALT_PATH="artifacts/$BASE/$BASE.tar.gz"
     if [ -f "$ALT_PATH" ]; then
@@ -34,11 +34,15 @@ echo "Using artifact file: $ARTIFACT_PATH"
 # Compute the SHA256 checksum of the artifact
 CHECKSUM=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
 
-# Directly reference the Homebrew formula file in its known location
-FORMULA="homebrew/zirv/zirv.rb"
+# Define a temporary directory for the tap repository
+TAP_DIR=$(mktemp -d)
+echo "Cloning Homebrew tap repository into: $TAP_DIR"
+git clone https://github.com/Glubiz/homebrew-tap.git "$TAP_DIR"
 
+# The formula file is assumed to be in the Formula folder of the tap repository.
+FORMULA="$TAP_DIR/Formula/zirv.rb"
 if [ ! -f "$FORMULA" ]; then
-    echo "Error: Formula file '$FORMULA' not found!"
+    echo "Error: Formula file '$FORMULA' not found in the tap repository!"
     exit 1
 fi
 
@@ -46,18 +50,24 @@ echo "Found formula file: $FORMULA"
 echo "Updating formula $FORMULA to version $VERSION"
 echo "Using artifact checksum: $CHECKSUM"
 
-# Update version (assuming the formula uses syntax like: version "..."
+# Update the formula file with the new version, URL, and checksum.
 sed -i "s/\(version\s*=\s*\"*\)[^\"]*\(\"*\)/\1$VERSION\2/" "$FORMULA"
-# Update URL (adjust this regex and URL as needed)
 sed -i "s|\(url\s*=\s*\"*\)[^\"]*\(\"*\)|\1https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v$VERSION/zirv-macos-latest.tar.gz\2|" "$FORMULA"
-# Update SHA256
 sed -i "s/\(sha256\s*=\s*\"*\)[^\"]*\(\"*\)/\1$CHECKSUM\2/" "$FORMULA"
 
-# Configure Git identity so that commits will succeed
-git config --global user.email "ci@github.com"
-git config --global user.name "GitHub Actions"
+# Configure git identity for the tap repository
+git -C "$TAP_DIR" config user.email "ci@github.com"
+git -C "$TAP_DIR" config user.name "GitHub Actions"
 
-# Commit the changes (if any)
-git add "$FORMULA"
-git commit -m "Update zirv formula to version $VERSION" || echo "No changes to commit"
-git push origin main
+# Commit and push changes, if any.
+cd "$TAP_DIR"
+git add Formula/zirv.rb
+if git diff-index --quiet HEAD --; then
+    echo "No changes to commit in the formula."
+else
+    git commit -m "Update zirv formula to version $VERSION"
+    git push origin main
+fi
+
+# Clean up the temporary tap repository clone
+rm -rf "$TAP_DIR"
