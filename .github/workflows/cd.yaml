@@ -37,9 +37,11 @@ jobs:
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             mv target/release/zirv.exe zirv-${{ matrix.os }}.exe;
           else
-            mv target/release/zirv zirv-${{ matrix.os }};
-            chmod +x zirv-${{ matrix.os }};
-            tar -czvf zirv-${{ matrix.os }}.tar.gz zirv-${{ matrix.os }};
+            # Copy the built binary (named "zirv") so that the tarball contains the expected name.
+            cp target/release/zirv zirv
+            chmod +x zirv
+            tar -czvf zirv-${{ matrix.os }}.tar.gz zirv
+            rm zirv
           fi
 
       - name: Upload Artifact for Windows
@@ -130,13 +132,13 @@ jobs:
             artifacts/zirv-macos-latest.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        
+
   update-homebrew-macos:
     name: Update Homebrew Formula
     runs-on: ubuntu-latest
     needs: release
     environment:
-      name: homebrew-release
+      name: homebrew-release   # This environment should be configured with manual approval.
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -157,7 +159,6 @@ jobs:
         run: |
           echo "Listing artifacts directory contents:"
           find artifacts -type f || echo "No files found"
-      
       - name: Update Homebrew Formula
         if: success()
         shell: bash
@@ -167,49 +168,12 @@ jobs:
           chmod +x ./scripts/update_homebrew.sh
           ./scripts/update_homebrew.sh "${{ steps.get_version_homebrew.outputs.version }}" artifacts/zirv-macos-latest.tar.gz
 
-  update-homebrew-linux:
-    name: Update Homebrew Formula
-    runs-on: ubuntu-latest
-    needs: release
-    environment:
-      name: homebrew-release
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-      - name: Get version from Cargo.toml (for Homebrew)
-        id: get_version_homebrew
-        shell: bash
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-      - name: Download linux Artifact for Homebrew
-        uses: actions/download-artifact@v4
-        with:
-          name: zirv-linux-latest
-          path: artifacts
-      - name: List artifacts directory contents
-        run: |
-          echo "Listing artifacts directory contents:"
-          find artifacts -type f || echo "No files found"
-      
-      - name: Update Homebrew Formula
-        if: success()
-        shell: bash
-        env:
-          HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
-        run: |
-          chmod +x ./scripts/update_homebrew.sh
-          ./scripts/update_homebrew.sh "${{ steps.get_version_homebrew.outputs.version }}" artifacts/zirv-linux-latest.tar.gz
-        
-
   update-chocolatey:
     name: Update Chocolatey Package
     runs-on: windows-latest
     needs: release
     environment:
-      name: chocolatey-release
+      name: chocolatey-release   # This environment should be configured with manual approval.
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
