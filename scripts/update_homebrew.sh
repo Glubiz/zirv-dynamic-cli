@@ -35,12 +35,21 @@ echo "Using artifact file: $ARTIFACT_PATH"
 CHECKSUM=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
 echo "Computed checksum: $CHECKSUM"
 
+# Ensure HOMEBREW_TOKEN is set for authentication
+if [ -z "${HOMEBREW_TOKEN:-}" ]; then
+  echo "Error: HOMEBREW_TOKEN is not set!"
+  exit 1
+fi
+
 # Clone the Homebrew tap repository into a temporary folder
 TAP_DIR=$(mktemp -d)
 echo "Cloning Homebrew tap repository into: $TAP_DIR"
 git clone https://github.com/Glubiz/homebrew-tap.git "$TAP_DIR"
 
-# Define the formula file location (inside the Formula folder of your tap repo)
+# Set remote URL with authentication token
+git -C "$TAP_DIR" remote set-url origin "https://${HOMEBREW_TOKEN}@github.com/Glubiz/homebrew-tap.git"
+
+# The formula file is expected to be in the Formula folder.
 FORMULA="$TAP_DIR/Formula/zirv.rb"
 if [ ! -f "$FORMULA" ]; then
     echo "Error: Formula file '$FORMULA' not found in the tap repository!"
@@ -54,7 +63,6 @@ echo "Updating formula to version $VERSION with checksum $CHECKSUM"
 sed -i "s/^ *version *\"[^\"]*\"/  version \"$VERSION\"/" "$FORMULA"
 
 # Update the URL to point to the new release asset.
-# Adjust the URL pattern if necessary.
 sed -i "s|^ *url *\"[^\"]*\"|  url \"https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v$VERSION/zirv-macos-latest.tar.gz\"|" "$FORMULA"
 
 # Update the SHA256 value
