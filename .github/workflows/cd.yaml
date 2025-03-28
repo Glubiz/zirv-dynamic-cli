@@ -28,33 +28,32 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Build CLI Program
+      - name: Build CLI Program (default build)
         run: cargo build --release
 
       - name: Rename and Package Binary for Release
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            # For Windows, simply rename the exe
             mv target/release/zirv.exe zirv-${{ matrix.os }}.exe;
           elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            # For macOS, build a universal binary:
-            # Add ARM target if not already installed
+            # Ensure both macOS targets are installed
+            rustup target add x86_64-apple-darwin
             rustup target add aarch64-apple-darwin
-            # Build for Intel (x86_64) and ARM (aarch64)
+            # Build for Intel and ARM
             cargo build --release --target x86_64-apple-darwin
             cargo build --release --target aarch64-apple-darwin
-            # Create a universal binary using lipo.
+            # Create a universal binary using lipo
             lipo -create \
               target/x86_64-apple-darwin/release/zirv \
               target/aarch64-apple-darwin/release/zirv \
               -output zirv
             chmod +x zirv
-            # Package the universal binary into a tarball
+            # Package the universal binary into a tarball (the tarball retains its name)
             tar -czvf zirv-macos-latest.tar.gz zirv
             rm zirv
           else
-            # For Linux, use the standard build.
+            # For Linux, rename and package normally.
             mv target/release/zirv zirv-${{ matrix.os }};
             chmod +x zirv-${{ matrix.os }};
             tar -czvf zirv-${{ matrix.os }}.tar.gz zirv-${{ matrix.os }};
