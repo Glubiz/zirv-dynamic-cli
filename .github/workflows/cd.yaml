@@ -167,12 +167,14 @@ jobs:
           echo "Listing artifacts directory contents:"
           find artifacts -type f || echo "No files found"
       - name: Update Homebrew Formula
+        if: success()
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
+          HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
         run: |
           chmod +x ./scripts/update_homebrew.sh
-          ./scripts/update_homebrew.sh "${{ steps.get_version_homebrew.outputs.version }}" artifacts/zirv-macos-latest.tar.gz 
+          ./scripts/update_homebrew.sh "${{ steps.get_version_homebrew.outputs.version }}" artifacts/zirv-macos-latest.tar.gz
+        
 
   update-chocolatey:
     name: Update Chocolatey Package
