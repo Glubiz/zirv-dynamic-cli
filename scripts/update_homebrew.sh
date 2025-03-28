@@ -59,14 +59,12 @@ fi
 echo "Found formula file: $FORMULA"
 echo "Updating formula to version $VERSION with checksum $CHECKSUM"
 
-# Update the version in the formula file
-sed -i "s/^ *version *\"[^\"]*\"/  version \"$VERSION\"/" "$FORMULA"
-
-# Update the URL to point to the new release asset.
-sed -i "s|^ *url *\"[^\"]*\"|  url \"https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v$VERSION/zirv-macos-latest.tar.gz\"|" "$FORMULA"
-
-# Update the SHA256 value
-sed -i "s/^ *sha256 *\"[^\"]*\"/  sha256 \"$CHECKSUM\"/" "$FORMULA"
+# Update the version line (assumes the formula file uses 4 spaces indentation)
+sed -i "s/^ *version *\"[^\"]*\"/    version \"$VERSION\"/" "$FORMULA"
+# Update the URL line
+sed -i "s|^ *url *\"[^\"]*\"|    url \"https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v$VERSION/zirv-macos-latest.tar.gz\"|" "$FORMULA"
+# Update the SHA256 line
+sed -i "s/^ *sha256 *\"[^\"]*\"/    sha256 \"$CHECKSUM\"/" "$FORMULA"
 
 echo "Updated formula file contents:"
 cat "$FORMULA"
@@ -75,7 +73,6 @@ cat "$FORMULA"
 git -C "$TAP_DIR" config user.email "ci@github.com"
 git -C "$TAP_DIR" config user.name "GitHub Actions"
 
-# Commit and push changes, if any.
 cd "$TAP_DIR"
 git add Formula/zirv.rb
 if git diff-index --quiet HEAD --; then
@@ -85,5 +82,4 @@ else
     git push origin main
 fi
 
-# Clean up the temporary tap repository clone
 rm -rf "$TAP_DIR"
