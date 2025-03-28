@@ -120,11 +120,11 @@ jobs:
           name: zirv-windows-latest
           path: artifacts
 
-      - name: Download Linux Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: zirv-ubuntu-latest
-          path: artifacts
+      #- name: Download Linux Artifact
+      #  uses: actions/download-artifact@v4
+      #  with:
+      #    name: zirv-ubuntu-latest
+      #    path: artifacts
 
       - name: Download macOS Artifact
         uses: actions/download-artifact@v4
@@ -144,8 +144,8 @@ jobs:
           body: "Release of zirv binaries for Windows, Linux, and macOS."
           files: |
             artifacts/zirv-windows-latest.exe
-            artifacts/zirv-ubuntu-latest.tar.gz
             artifacts/zirv-macos-latest.tar.gz
+    #        artifacts/zirv-ubuntu-latest.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
