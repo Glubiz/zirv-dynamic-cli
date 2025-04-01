@@ -228,6 +228,16 @@ zirv help
 
 ## Installation
 
+**MacOS:**
+
+You can install **zirv** using Homebrew:
+
+```bash
+brew tap glubiz/homebrew-tap
+brew install zirv
+```
+
+***Linux/Windows:**
 Build and install **zirv** using Cargo:
 
 ```bash
