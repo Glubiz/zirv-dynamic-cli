@@ -1,12 +1,46 @@
 Chocolatey Package Verification Checklist for zirv
 
+VERIFICATION
+Verification is intended to assist the Chocolatey moderators and community
+in verifying that this package's contents are trustworthy.
+
+Binary Verification:
+---------------------
+The executable included in this package can be verified in the following ways:
+
+1. Official Source:
+   The official zirv binary can be downloaded from the GitHub Releases page:
+   https://github.com/Glubiz/zirv-dynamic-cli/releases
+
+2. Checksum Verification:
+   - Download the official release from the GitHub page linked above
+   - Use the following PowerShell command to generate a checksum:
+     Get-FileHash -Algorithm SHA256 path\to\downloaded\zirv.exe
+   - Compare this checksum with the one from the package binary:
+     Get-FileHash -Algorithm SHA256 "$env:ChocolateyInstall\lib\zirv\tools\zirv.exe"
+   - The checksums should match exactly
+
+3. Build from Source:
+   You can also build the binary from source:
+   - Clone the repository: git clone https://github.com/Glubiz/zirv-dynamic-cli.git
+   - Build with Cargo: cargo build --release
+   - The resulting binary can be found in target/release/zirv.exe
+
+Note for Package Maintainers:
+-----------------------------
+When updating this package, ensure that:
+- The SHA256 checksum in the chocolateyinstall.ps1 script matches the official release
+- This verification file is updated with the correct release version and download URL
+
+Additional Package Information:
+------------------------------
 1. Package Metadata:
    - Verify the nuspec file is correctly configured.
    - Ensure the version number matches the intended release.
 
 2. Files and Structure:
    - Confirm inclusion of the compiled binary.
-   - Verify the package contains necessary files (e.g., LICENSE.txt, README.md, verification.txt).
+   - Verify the package contains necessary files (e.g., LICENSE.txt, README.md).
    - Confirm proper Chocolatey folder structure (e.g., tools folder, scripts).
 
 3. Licensing:
@@ -20,13 +54,3 @@ Chocolatey Package Verification Checklist for zirv
 
 5. Uninstallation:
    - Verify that the package uninstalls cleanly without leaving residual files.
-
-6. Scripts and Automation:
-   - Confirm that Chocolatey script is in place and working.
-   - Validate any additional automation or custom scripts required by Chocolatey.
-
-7. Additional Checks:
-   - Perform a checksum validation of the package contents.
-   - Recheck for any platform-specific issues (e.g., OS compatibility listed under command options).
-
-Follow this checklist to ensure all aspects of the Chocolatey package meet the required standards before release.
