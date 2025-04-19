@@ -106,8 +106,12 @@ pub async fn run(
         if let Some(ref opts) = cmd_item.options {
             if let Some(ref os) = opts.operating_system {
                 if operating_system(os.to_owned()) != std::env::consts::OS.to_lowercase() {
-                    println!("\nSkipping command '{}' due to operating_system mismatch (requires '{:?}', current OS is '{}').",
-                             cmd_item.command, os, std::env::consts::OS);
+                    println!(
+                        "\nSkipping command '{}' for OS '{:?}', current OS is '{}'",
+                        cmd_item.command,
+                        os,
+                        std::env::consts::OS
+                    );
                     continue;
                 }
             }
