@@ -237,7 +237,14 @@ brew tap glubiz/homebrew-tap
 brew install zirv
 ```
 
-***Linux/Windows:**
+**Windows:**
+Build and install **zirv** using Chocolatey:
+
+```bash
+choco install zirv
+```
+
+**Linux / MacOS / Windows:**
 Build and install **zirv** using Cargo:
 
 ```bash
