@@ -1,6 +1,5 @@
 # Zirv CLI
-
-[![Build Status](https://github.com/Glubiz/zirv-dynamic-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Glubiz/zirv-dynamic-cli/actions)
+![Zirv CLI](https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/assets/logo.png)
 [![Release](https://img.shields.io/github/v/release/Glubiz/zirv-dynamic-cli)](https://github.com/Glubiz/zirv-dynamic-cli/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -75,10 +74,10 @@ Run:
 ```bash
 zirv init
 ```
-Creates a `.zirv/` directory with a sample script. This directory is where you will define your scripts. The .zirv directory is created in the current working directory or in the HOME directory depending on the commandline interactions.
+Creates a `.zirv/` directory with a sample script. This directory is where you will define your scripts. The `.zirv/` directory is created in the current working directory or in the HOME directory depending on the commandline interactions.
 
 ### Running Scripts
-Place your script files in .zirv/ (e.g., build.yaml):
+Place your script files in `.zirv/` (e.g., `build.yaml`):
   
 ```yaml
 name: Build
