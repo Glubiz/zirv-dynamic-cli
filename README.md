@@ -240,4 +240,4 @@ Contributions are welcome! Please fork the repository and submit a pull request 
 Licensed under the [MIT License](LICENSE).
 
 ## Contact
-Tweet @ [@Glubiz](https://twitter.com/Glubiz)
+Tweet [@Glubiz](https://twitter.com/Glubiz)
