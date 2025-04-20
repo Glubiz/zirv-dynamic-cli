@@ -1,188 +1,182 @@
-# zirv
+# Zirv CLI
 
-**zirv** is a CLI tool that helps developer teams standardize interactions with their application,
-build tools, Git, and more by executing commands defined in YAML files. All YAML files are placed in a 
-`.zirv` directory at the project root.
+[![Build Status](https://github.com/Glubiz/zirv-dynamic-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Glubiz/zirv-dynamic-cli/actions)
+[![Release](https://img.shields.io/github/v/release/Glubiz/zirv-dynamic-cli)](https://github.com/Glubiz/zirv-dynamic-cli/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+> **Zirv CLI** is a cross-platform command-line interface for developers to automate and streamline workflows with YAML, JSON, or TOML scripts.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Initialize a Project](#initialize-a-project)
+  - [Running Scripts](#running-scripts)
+  - [Passing Parameters](#passing-parameters)
+  - [Chaining Scripts](#chaining-scripts)
+- [Configuration](#configuration)
+  - [Directory Structure](#directory-structure)
+  - [Schema Examples](#schema-examples)
+- [Shortcuts](#shortcuts)
+- [Supported Platforms](#supported-platforms)
+- [Contribution](#contribution)
+- [License](#license)
+- [Contact](#contact)
+
+---
 
 ## Features
 
-- **YAML-Driven Scripts:**  
-  Define scripts in YAML files (e.g., `build.yaml`, `test.yaml`) in the `.zirv` folder.
-  
-- **Command Options:**  
-  Each command can include additional options:
-  - `interactive` (bool): If true, runs the command interactively (ideal for commands like `docker exec -it {id} bash`).
-  - `operating_system` (string, optional): Specifies the OS on which the command should run. Commands are only executed if this value matches the current OS (e.g., `"linux"`, `"windows"`, `"macos"`).
-  - `proceed_on_failure` (bool): If false, a command failure aborts the script; if true, the script continues.
-  - `delay_ms` (optional, u64): Delay in milliseconds after the command finishes.
-  
-- **Chaining:**  
-  YAML files can chain other YAML files using the `pre` field, allowing you to run pre‑build or pre‑deployment steps.
+- **YAML-Driven Scripts**: Define commands in `.zirv/` files with metadata (name, description, params, secrets).  
+- **Flexible Options**: Interactive modes, OS filters, failure-handling flags, delays, and secret support.  
+- **Modular Workflows**: Chain or nest scripts via `pre` or direct script calls.  
+- **Cross-Platform**: Compatible with Windows, macOS, and Linux; script blocks can target specific OS.  
+- **Multi-Format**: Supports YAML, JSON, and TOML—extendable to your preferred format.  
 
-- **Extensibility:**  
-  Easily extend the YAML schema with additional options as your needs evolve.
+---
+
+## Installation
+
+Choose one of the following methods:
+
+### Homebrew (macOS)
+
+```bash
+brew tap glubiz/homebrew-tap
+brew install zirv
+```
+
+### Chocolatey (Windows)
+
+```bash
+choco install zirv
+```
+
+### Cargo (All Platforms)
+  
+```bash
+# Build from source
+cargo build --release
+# Add `target/release` to your PATH
+```
+
+### Precompiled Binaries
+Download the latest release from the [GitHub Releases]:
+https://github.com/Glubiz/zirv-dynamic-cli/releases
 
 ## Usage
 
-1. Create a `.zirv` directory at the root of your project and in you home folder. Alternatively you could call `zirv init` to create it automatically.
+### Initialize a Project
 
-`zirv init` will create the following structure:
-
+Run:
+```bash
+zirv init
 ```
-.zirv
-├── .shortcuts.yaml
-```
+Creates a `.zirv/` directory with a sample script. This directory is where you will define your scripts. The .zirv directory is created in the current working directory or in the HOME directory depending on the commandline interactions.
 
-2. Add YAML files by calling `zirv create` to define your commands. For example:
-
-### Example: `build.yaml`
-
+### Running Scripts
+Place your script files in .zirv/ (e.g., build.yaml):
+  
 ```yaml
 name: Build
 description: Build the application.
 commands:
   - command: cargo build --release
     options:
-        proceed_on_failure: false
+      proceed_on_failure: false
   - command: cargo test
     options:
-        proceed_on_failure: false
+      proceed_on_failure: false
 ```
 
-### Example: `deploy.yaml`
+Execute the script with:
+```bash
+zirv build
+```
+
+### Passing Parameters
+If a script declares parameters;
+
+```yaml
+name: Commit Changes
+params:
+  - commit_message
+commands:
+  - command: git add .
+  - command: git commit -m "${commit_message}"
+  - command: git push origin
+```
+
+Run with:
+```bash
+zirv commit "Your commit message here"
+```
+
+### Chaining Scripts
+You can chain scripts by calling one script from another. For example, if you have a script `build.yaml` and want to call it from `deploy.yaml`:
 
 ```yaml
 name: Deploy
-description: Deploy the application to the server.
+description: Deploy the application.
 commands:
-  - command: scp target/release/app user@server:/path/to/deploy
+  - command: zirv test
     options:
       proceed_on_failure: false
-      operating_system: linux
-```
-
-### Example: `commit.yaml`
-
-```yaml
-name: "Commit Changes"
-description: "Commits changes with a provided commit message"
-params:
-  - "commit_message"
-commands:
-  - command: "git add ."
-    description: "Stage all changes"
-    options:
-      proceed_on_failure: false
-  - command: "git commit -m \"${commit_message}\""
-    description: "Commit changes with a message"
-    options:
-      proceed_on_failure: false
-  - command: "git push origin"
-    description: "Push the commit to the remote repository"
+  - command: zirv build
     options:
       proceed_on_failure: false
 ```
 
-## Example: `secret.yaml`
-
-```yaml
-name: "Secret Command"
-description: "This command is secret"
-secrets:
-  - name: "some_secret"
-    env_var: "SOME_SECRET"
-commands:
-  - command: "echo 'This is a secret ${some_secret}'"
-```
-
-3. Run the commands using **zirv**:
-
+Run the `deploy` script with:
 ```bash
-zirv build
 zirv deploy
 ```
 
-4. Pass parameters to the script:
+## Configuration
+### Directory Structure
+The `.zirv/` directory contains your scripts and a configuration file. The structure is as follows:
 
-```bash
-zirv commit "Fix bug #123"
+```
+.zirv/
+├── .shortcuts.yaml
+├── ...command files
 ```
 
-5. Chain scripts together:
+### Schema Examples
+Supported schemas are YAML, JSON, and TOML. Below are examples of each:
 
+#### YAML Example
 ```yaml
-name: "Build and Deploy"
-description: "Builds the application and deploys it to the server"
-commands:
-    - command: "zirv build"
-    - command: "deploy"
-        options:
-        proceed_on_failure: false
-```
-
-6. Shortcuts:
-By adding a file named `.shortcuts.yaml` to the `.zirv` directory, you can define shortcuts for your scripts:
-
-```yaml
-shortcuts:
-  t: "test.yaml"
-  b: "build.yaml"
-  c: "commit.yaml"
-```
-
-Now you can run `zirv t` to run the `test.yaml` script.
-
-## Configuration Format Examples
-
-The configuration for **zirv** can be defined in YAML, JSON, or TOML formats. The structure is based on our configuration schema from main.rs:
-
-**Common Fields:**
-- name (string)
-- description (string)
-- params (optional list of strings)
-- commands (list)
-  - command (string)
-  - description (optional string)
-  - options:
-    - interactive (optional bool)
-    - operating_system (optional string)
-    - proceed_on_failure (bool)
-    - delay_ms (optional number)
-- secrets (optional list)
-  - name (string)
-  - env_var (string)
-
-### YAML Example
-```yaml
-name: "Example Config"
-description: "This is an example configuration."
+name: Example Config
+description: An example script.
 params:
-  - "param1"
+  - param1
 commands:
-  - command: "echo 'Hello World'"
-    description: "Prints Hello World"
+  - command: echo 'Hello World'
+    description: Prints greeting
     options:
       interactive: true
-      operating_system: "linux"
+      operating_system: linux
       proceed_on_failure: false
       delay_ms: 2000
 secrets:
-  - name: "api_key"
-    env_var: "API_KEY"
+  - name: api_key
+    env_var: API_KEY
 ```
 
-### JSON Example
+#### JSON Example
 ```json
 {
   "name": "Example Config",
-  "description": "This is an example configuration.",
-  "params": [
-    "param1"
-  ],
+  "description": "An example script.",
+  "params": ["param1"],
   "commands": [
     {
       "command": "echo 'Hello World'",
-      "description": "Prints Hello World",
+      "description": "Prints greeting",
       "options": {
         "interactive": true,
         "operating_system": "linux",
@@ -200,57 +194,52 @@ secrets:
 }
 ```
 
-### TOML Example
+#### TOML Example
 ```toml
 name = "Example Config"
-description = "This is an example configuration."
+description = "An example script."
 params = ["param1"]
 
 [[commands]]
 command = "echo 'Hello World'"
-description = "Prints Hello World"
-[commands.options]
-interactive = true
-operating_system = "linux"
-proceed_on_failure = false
-delay_ms = 2000
+description = "Prints greeting"
+options.interactive = true
+options.operating_system = "linux"
+options.proceed_on_failure = false
+options.delay_ms = 2000
 
 [[secrets]]
-name = "api_key"
+name = "api"
 env_var = "API_KEY"
 ```
 
-## Help
+## Shortcuts
+Shortcuts are defined in `.shortcuts.yaml` and allow you to create aliases for your scripts. For example:
 
-```bash
-zirv help
+```yaml
+shortcuts:
+  b: build.yaml
+  t: test.yaml
+  c: commit.yaml
 ```
+Run zirv b instead of zirv build.yaml.
+This will execute the `build.yaml` script.
 
-## Installation
+## Supported Platforms
+- Windows
+- macOS
+- Linux
 
-**MacOS:**
+Commands can target specific operating systems using the `operating_system` option in the script configuration.
+- `windows`: Windows OS
+- `linux`: Linux OS
+- `macos`: macOS
 
-You can install **zirv** using Homebrew:
+## Contribution
+Contributions are welcome! Please fork the repository and submit a pull request with your changes. For major changes, please open an issue first to discuss what you would like to change.
 
-```bash
-brew tap glubiz/homebrew-tap
-brew install zirv
-```
+## License
+Licensed under the [MIT License](LICENSE).
 
-**Windows:**
-Build and install **zirv** using Chocolatey:
-
-```bash
-choco install zirv
-```
-
-**Linux / MacOS / Windows:**
-Build and install **zirv** using Cargo:
-
-```bash
-cargo build --release
-```
-
-Then add the resulting binary to your PATH.
-
-**Alternatively, you can download precompiled executables from our GitHub Releases page: [GitHub Releases](https://github.com/Glubiz/zirv-dynamic-cli/releases).**
+## Contact
+Tweet @ [@Glubiz](https://twitter.com/Glubiz)
