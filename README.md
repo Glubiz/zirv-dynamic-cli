@@ -1,5 +1,4 @@
 # Zirv CLI
-![Zirv CLI](https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/assets/logo.png)
 [![Release](https://img.shields.io/github/v/release/Glubiz/zirv-dynamic-cli)](https://github.com/Glubiz/zirv-dynamic-cli/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
