@@ -1,73 +1,90 @@
+<#
+.SYNOPSIS
+  Updates the Zirv Chocolatey package with a new version and Windows binary.
+
+.PARAMETER Version
+  The new version string (e.g. "0.6.2").
+
+.PARAMETER ArtifactPath
+  Relative path to the Windows executable produced by the CI (e.g. "artifacts\zirv-windows-latest.exe").
+
+.EXAMPLE
+  ./scripts/update_chocolatey.ps1 -Version 0.6.2 -ArtifactPath artifacts\zirv-windows-latest.exe
+#>
+
 param(
     [Parameter(Mandatory = $true)]
     [string]$Version,
+
     [Parameter(Mandatory = $true)]
     [string]$ArtifactPath
 )
 
-# Determine the repository root (assuming this script is in the 'scripts' folder)
-$repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
-# Define the package folder relative to the repository root (where your nuspec file resides)
-$packageFolder = Join-Path $repoRoot "chocolatey\zirv"
+# Determine the repository root (assuming this script lives in scripts\)
+$repoRoot       = (Resolve-Path "$PSScriptRoot\..").Path
+$packageFolder  = Join-Path $repoRoot "chocolatey\zirv"
+$toolsFolder    = Join-Path $packageFolder "tools"
 
-Write-Host "Repository Root: $repoRoot"
-Write-Host "Package Folder: $packageFolder"
+Write-Host "Repository Root:      $repoRoot"
+Write-Host "Package Folder:       $packageFolder"
+Write-Host "Chocolatey Tools Dir: $toolsFolder"
 
-# Copy the Windows artifact into the package folder so it can be included in the package.
-$windowsArtifactSource = Join-Path $repoRoot $ArtifactPath
-$windowsArtifactDestination = Join-Path $packageFolder "zirv-windows-latest.exe"
+# Ensure the tools directory exists
+if (-not (Test-Path $toolsFolder)) {
+    Write-Host "Creating tools folder at '$toolsFolder'"
+    New-Item -ItemType Directory -Path $toolsFolder | Out-Null
+}
+
+# Copy (and rename) the Windows artifact into tools\zirv.exe
+$windowsArtifactSource      = Join-Path $repoRoot $ArtifactPath
+$windowsArtifactDestination = Join-Path $toolsFolder "zirv.exe"
+
 if (Test-Path $windowsArtifactSource) {
-    Write-Host "Copying Windows artifact from '$windowsArtifactSource' to '$windowsArtifactDestination'"
+    Write-Host "Copying Windows artifact..."
     Copy-Item $windowsArtifactSource -Destination $windowsArtifactDestination -Force
-} else {
-    Write-Host "Windows artifact not found at '$windowsArtifactSource'"
-    # Optionally, you could exit if this artifact is required.
-    # exit 1
+    Write-Host "  Source:      $windowsArtifactSource"
+    Write-Host "  Destination: $windowsArtifactDestination"
+}
+else {
+    Write-Error "Windows artifact not found at '$windowsArtifactSource'"
+    exit 1
 }
 
 # Path to the nuspec file
 $nuspecPath = Join-Path $packageFolder "zirv.nuspec"
 
-# Update the nuspec file using XML to ensure valid XML structure
+# Load and update the nuspec XML
 [xml]$nuspec = Get-Content $nuspecPath
+
+Write-Host "Updating nuspec version to $Version"
 $nuspec.package.metadata.version = $Version
 $nuspec.Save($nuspecPath)
-Write-Host "Updated nuspec version to $Version"
 
-# Pack the Chocolatey package with output forced to $packageFolder
-choco pack $nuspecPath -o $packageFolder
+# Pack the Chocolatey package
+Write-Host "Packing the Chocolatey package..."
+choco pack $nuspecPath -o $packageFolder | Write-Host
 
-# Define the expected package file name
-$expectedFile = "zirv.$Version.nupkg"
-$packageFile = Join-Path $packageFolder $expectedFile
+# Locate the resulting .nupkg
+$expectedPackageName = "zirv.$Version.nupkg"
+$packageFile        = Join-Path $packageFolder $expectedPackageName
 
 if (-not (Test-Path $packageFile)) {
-    Write-Host "Package file not found in package folder: $packageFile"
-    
-    # Search in repository root
-    $rootFile = Join-Path $repoRoot $expectedFile
-    if (Test-Path $rootFile) {
-        Write-Host "Found package in repository root: $rootFile. Moving to package folder..."
-        Move-Item $rootFile -Destination $packageFolder
-        $packageFile = Join-Path $packageFolder $expectedFile
-    } else {
-        Write-Host "Package file not found at expected path in repository root: $rootFile"
-        Write-Host "Searching repository recursively for $expectedFile..."
-        $pkg = Get-ChildItem -Path $repoRoot -Filter $expectedFile -Recurse | Select-Object -First 1
-        if ($pkg) {
-            Write-Host "Found package at $($pkg.FullName). Moving to package folder..."
-            Move-Item $pkg.FullName -Destination $packageFolder
-            $packageFile = Join-Path $packageFolder $expectedFile
-        }
+    Write-Host "Package not found at expected path: $packageFile"
+    # Try finding it elsewhere
+    $found = Get-ChildItem -Path $packageFolder -Filter "zirv.$Version.nupkg" -Recurse | Select-Object -First 1
+    if ($found) {
+        Write-Host "Found package at $($found.FullName)"
+        $packageFile = $found.FullName
     }
-    
-    if (-not (Test-Path $packageFile)) {
-        Write-Error "File not found: '$packageFile'."
+    else {
+        Write-Error "Package file 'zirv.$Version.nupkg' not found anywhere under $packageFolder"
         exit 1
     }
 }
 
-Write-Host "Package file located at: $packageFile"
+Write-Host "Pushing package: $packageFile"
+choco push $packageFile `
+    --api-key $env:CHOCOLATEY_API_KEY `
+    --source "https://push.chocolatey.org/"
 
-# Push the package to Chocolatey
-choco push $packageFile --api-key $env:CHOCOLATEY_API_KEY --source "https://push.chocolatey.org/"
+Write-Host "Done."
