@@ -180,7 +180,7 @@ jobs:
           HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
         run: |
           chmod +x ./scripts/update_homebrew.sh
-          ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" "artifacts\zirv-${{ steps.get_version.outputs.version }}-macos.tar.gz"
+          ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" "artifacts/zirv-${{ steps.get_version.outputs.version }}-macos.tar.gz"
 
   update-chocolatey:
     name: Update Chocolatey Package
@@ -214,15 +214,9 @@ jobs:
         env:
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
-          # First, configure push destination
           choco config set --name='defaultPushSource' --value='https://push.chocolatey.org/'
 
-          # Grab the version from the workflow output
-          $ver = '${{ steps.get_version.outputs.version }}'
-
-          # Build the filename we just uploaded
-          $artifact = "artifacts\zirv-$ver-windows.exe"
-          Write-Host "Using artifact: $artifact"
-
-          # Call your script with both parameters on one line
-          ./scripts/update_chocolatey.ps1 -Version $ver -ArtifactPath $artifact
+          ./scripts/update_chocolatey.ps1 `
+            -Version $ver `
+            -ArtifactPath "artifacts/zirv-$ver-windows.exe"
+  
