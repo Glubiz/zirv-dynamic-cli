@@ -58,13 +58,29 @@ if [ ! -f "$FORMULA" ]; then
     exit 1
 fi
 
-echo "Updating $FORMULA"
-# Update URL, version, checksum
+echo "Updating $FORMULA to v$VERSION with new URL and checksum"
+
 RELEASE_URL="https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v${VERSION}/${BASENAME}"
 
-sed -i "s|^ *url \\".*\\"|  url \"${RELEASE_URL}\"|" "$FORMULA"
-sed -i "s|^ *version \\".*\\"|  version \"${VERSION}\"|" "$FORMULA"
-sed -i "s|^ *sha256 \\".*\\"|  sha256 \"${CHECKSUM}\"|" "$FORMULA"
+# 1) Update the URL line
+#    - single‑quoted sed program
+#    - close quote, insert shell var, reopen quote
+sed -i \
+    's|^ *url *".*"|  url "'"${RELEASE_URL}"'"|' \
+    "$FORMULA"
+
+# 2) Update the version line
+sed -i \
+    's|^ *version *".*"|  version "'"${VERSION}"'"|' \
+    "$FORMULA"
+
+# 3) Update the sha256 line
+sed -i \
+    's|^ *sha256 *".*"|  sha256 "'"${CHECKSUM}"'"|' \
+    "$FORMULA"
+
+echo "Formula after update:"
+sed -n '1,10p; /sha256/,/end/p; 1q' "$FORMULA"
 
 # Commit and push
 cd "$TAP_DIR"
