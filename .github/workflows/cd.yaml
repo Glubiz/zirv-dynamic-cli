@@ -202,8 +202,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get version from Cargo.toml
-        id: get_version
+      - name: Get version from Cargo.toml (Chocolatey)
+        id: get_version_choco
         shell: bash
         run: |
           VERSION=$(grep '^version' Cargo.toml \
@@ -222,9 +222,17 @@ jobs:
         env:
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
+          # configure push source
           choco config set --name='defaultPushSource' --value='https://push.chocolatey.org/'
 
-          ./scripts/update_chocolatey.ps1 `
-            -Version $ver `
-            -ArtifactPath "artifacts/zirv-$ver-windows.exe"
+          # grab the version that we exported
+          $ver = '${{ steps.get_version_choco.outputs.version }}'
+          Write-Host "Releasing version: $ver"
+
+          # construct the artifact filename
+          $artifact = "artifacts/zirv-$ver-windows.exe"
+          Write-Host "Using artifact: $artifact"
+
+          # call your script
+          ./scripts/update_chocolatey.ps1 -Version $ver -ArtifactPath $artifact
   
