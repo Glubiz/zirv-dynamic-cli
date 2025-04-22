@@ -1,85 +1,54 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <version> <artifact_path>"
-    exit 1
-fi
-
-VERSION=$1
-ARTIFACT_PATH_INPUT=$2
-
-echo "Looking for artifact at provided path: '$ARTIFACT_PATH_INPUT'"
-# Ensure the artifacts directory exists
-mkdir -p artifacts
-echo "Contents of artifacts directory:"
-find artifacts -type f || echo "No files found"
-
-# Check if the artifact exists at the provided path
-if [ -f "$ARTIFACT_PATH_INPUT" ]; then
-    ARTIFACT_PATH="$ARTIFACT_PATH_INPUT"
-else
-    BASE=$(basename "$ARTIFACT_PATH_INPUT" .tar.gz)
-    ALT_PATH="artifacts/$BASE/$BASE.tar.gz"
-    if [ -f "$ALT_PATH" ]; then
-        ARTIFACT_PATH="$ALT_PATH"
-    else
-        echo "Error: Artifact not found at '$ARTIFACT_PATH_INPUT' or '$ALT_PATH'"
-        exit 1
-    fi
-fi
-
-echo "Using artifact file: $ARTIFACT_PATH"
-
-# Compute the SHA256 checksum of the artifact
-CHECKSUM=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
-echo "Computed checksum: $CHECKSUM"
-
-# Ensure HOMEBREW_TOKEN is set for authentication
-if [ -z "${HOMEBREW_TOKEN:-}" ]; then
-  echo "Error: HOMEBREW_TOKEN is not set!"
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 <version>"
   exit 1
 fi
 
-# Clone the Homebrew tap repository into a temporary folder
-TAP_DIR=$(mktemp -d)
-echo "Cloning Homebrew tap repository into: $TAP_DIR"
-git clone https://github.com/Glubiz/homebrew-tap.git "$TAP_DIR"
+VERSION=$1
+REPO="Glubiz/zirv-dynamic-cli"
+TAP_REPO="Glubiz/homebrew-tap"
+FORMULA_PATH="Formula/zirv.rb"
+TMPDIR=$(mktemp -d)
+RELEASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}/zirv-macos-latest.tar.gz"
+TARBALL="${TMPDIR}/zirv-macos-latest.tar.gz"
 
-# Set remote URL with authentication token
-git -C "$TAP_DIR" remote set-url origin "https://${HOMEBREW_TOKEN}@github.com/Glubiz/homebrew-tap.git"
+echo "• Downloading release asset for version ${VERSION}"
+curl -L -o "${TARBALL}" "${RELEASE_URL}"
 
-# The formula file is expected to be in the Formula folder.
-FORMULA="$TAP_DIR/Formula/zirv.rb"
-if [ ! -f "$FORMULA" ]; then
-    echo "Error: Formula file '$FORMULA' not found in the tap repository!"
-    exit 1
-fi
+echo "• Computing SHA256 checksum"
+CHECKSUM=$(shasum -a 256 "${TARBALL}" | awk '{print $1}')
+echo "  → ${CHECKSUM}"
 
-echo "Found formula file: $FORMULA"
-echo "Updating formula to version $VERSION with checksum $CHECKSUM"
+echo "• Cloning your Homebrew tap"
+git clone "https://${HOMEBREW_TOKEN}@github.com/${TAP_REPO}.git" "${TMPDIR}/tap"
+cd "${TMPDIR}/tap"
 
-# Update the version line (assumes the formula file uses 4 spaces indentation)
-sed -i "s/^ *version *\"[^\"]*\"/    version \"$VERSION\"/" "$FORMULA"
-# Update the URL line
-sed -i "s|^ *url *\"[^\"]*\"|    url \"https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v$VERSION/zirv-macos-latest.tar.gz\"|" "$FORMULA"
-# Update the SHA256 line
-sed -i "s/^ *sha256 *\"[^\"]*\"/    sha256 \"$CHECKSUM\"/" "$FORMULA"
+echo "• Updating ${FORMULA_PATH}"
+# Update URL
+sed -i '' "s|^ *url .*|  url \"${RELEASE_URL}\"|" "${FORMULA_PATH}"
+# Update SHA256
+sed -i '' "s|^ *sha256 .*|  sha256 \"${CHECKSUM}\"|" "${FORMULA_PATH}"
+# Update version
+sed -i '' "s|^ *version .*|  version \"${VERSION}\"|" "${FORMULA_PATH}"
 
-echo "Updated formula file contents:"
-cat "$FORMULA"
+echo "• Preview of updated formula:"
+sed -n '1,20p' "${FORMULA_PATH}"
+echo "  …"
+sed -n '$(wc -l < "${FORMULA_PATH}")-20,$ p' "${FORMULA_PATH}"
 
-# Configure git identity for the tap repository
-git -C "$TAP_DIR" config user.email "ci@github.com"
-git -C "$TAP_DIR" config user.name "GitHub Actions"
-
-cd "$TAP_DIR"
-git add Formula/zirv.rb
+echo "• Committing and pushing back to ${TAP_REPO}"
+git config user.name  "GitHub Actions"
+git config user.email "ci@github.com"
+git add "${FORMULA_PATH}"
 if git diff-index --quiet HEAD --; then
-    echo "No changes to commit in the formula."
+  echo "  No changes detected in formula; aborting commit."
 else
-    git commit -m "Update zirv formula to version $VERSION"
-    git push origin main
+  git commit -m "zirv: bump to v${VERSION}"
+  git push origin main
+  echo "  ✅ Pushed updated formula"
 fi
 
-rm -rf "$TAP_DIR"
+# Cleanup
+rm -rf "${TMPDIR}"
