@@ -165,13 +165,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Get version from Cargo.toml
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' Cargo.toml \
+            | head -n1 \
+            | sed -E 's/version *= *"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Update Homebrew Formula
         shell: bash
         env:
           HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
         run: |
           chmod +x ./scripts/update_homebrew.sh
-          ./scripts/update_homebrew.sh "${{ needs.build.outputs.version }}"
+          ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" "artifacts\zirv-${{ steps.get_version.outputs.version }}-macos.tar.gz"
 
   update-chocolatey:
     name: Update Chocolatey Package
@@ -180,15 +189,40 @@ jobs:
     environment:
       name: chocolatey-release
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v3
         with:
           fetch-depth: 0
 
-      - name: Update Chocolatey
+      - name: Get version from Cargo.toml
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' Cargo.toml \
+            | head -n1 \
+            | sed -E 's/version *= *"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zirv-windows
+          path: artifacts
+
+      - name: Update Chocolatey Package
         shell: pwsh
         env:
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
-          ./scripts/update_chocolatey.ps1 `
-            -Version ${{ needs.build.outputs.version }} `
-            -ArtifactPath "artifacts\zirv-${{ needs.build.outputs.version }}-windows.exe"
+          # First, configure push destination
+          choco config set --name='defaultPushSource' --value='https://push.chocolatey.org/'
+
+          # Grab the version from the workflow output
+          $ver = '${{ steps.get_version.outputs.version }}'
+
+          # Build the filename we just uploaded
+          $artifact = "artifacts\zirv-$ver-windows.exe"
+          Write-Host "Using artifact: $artifact"
+
+          # Call your script with both parameters on one line
+          ./scripts/update_chocolatey.ps1 -Version $ver -ArtifactPath $artifact
