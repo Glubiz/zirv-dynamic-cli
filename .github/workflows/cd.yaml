@@ -165,6 +165,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Download macOS Artifact for Homebrew
+        uses: actions/download-artifact@v4
+        with:
+          name: zirv-macos
+          path: artifacts
+
       - name: Get version from Cargo.toml
         id: get_version
         shell: bash
@@ -180,7 +186,9 @@ jobs:
           HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
         run: |
           chmod +x ./scripts/update_homebrew.sh
-          ./scripts/update_homebrew.sh "${{ steps.get_version.outputs.version }}" "artifacts/zirv-${{ steps.get_version.outputs.version }}-macos.tar.gz"
+          ./scripts/update_homebrew.sh \
+            "${{ steps.get_version.outputs.version }}" \
+            "artifacts/zirv-${{ steps.get_version.outputs.version }}-macos.tar.gz"
 
   update-chocolatey:
     name: Update Chocolatey Package
