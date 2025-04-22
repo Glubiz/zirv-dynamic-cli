@@ -6,10 +6,11 @@
   The new version string (e.g. "0.6.2").
 
 .PARAMETER ArtifactPath
-  Relative path to the Windows executable produced by the CI (e.g. "artifacts\zirv-windows-latest.exe").
+  Relative path to the Windows executable produced by the CI 
+  (e.g. "artifacts\zirv-0.6.2-windows.exe").
 
 .EXAMPLE
-  ./scripts/update_chocolatey.ps1 -Version 0.6.2 -ArtifactPath artifacts\zirv-windows-latest.exe
+  ./scripts/update_chocolatey.ps1 -Version 0.6.2 -ArtifactPath artifacts\zirv-0.6.2-windows.exe
 #>
 
 param(
@@ -64,7 +65,7 @@ $nuspec.Save($nuspecPath)
 Write-Host "Packing the Chocolatey package..."
 choco pack $nuspecPath -o $packageFolder | Write-Host
 
-# Locate the resulting .nupkg
+# The only change: include $Version in the expected package name
 $expectedPackageName = "zirv.$Version.nupkg"
 $packageFile        = Join-Path $packageFolder $expectedPackageName
 
@@ -77,7 +78,7 @@ if (-not (Test-Path $packageFile)) {
         $packageFile = $found.FullName
     }
     else {
-        Write-Error "Package file 'zirv.$Version.nupkg' not found anywhere under $packageFolder"
+        Write-Error "Package file 'zirv.$Version.nupkg' not found under $packageFolder"
         exit 1
     }
 }

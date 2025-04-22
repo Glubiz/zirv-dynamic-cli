@@ -19,194 +19,176 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_file: zirv-ubuntu-latest.tar.gz
+            suffix: linux
+            ext: tar.gz
           - os: windows-latest
-            artifact_file: zirv-windows-latest.exe
+            suffix: windows
+            ext: exe
           - os: macos-latest
-            artifact_file: zirv-macos-latest.tar.gz
+            suffix: macos
+            ext: tar.gz
+
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Set Up Rust Toolchain
+      - name: Get version
+        id: get_version
+        shell: bash
+        run: |
+          VER=$(grep '^version' Cargo.toml \
+            | head -n1 \
+            | sed -E 's/version *= *"([^"]+)".*/\1/')
+          echo "version=$VER" >> $GITHUB_OUTPUT
+
+      - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           override: true
 
-      - name: Build CLI Program
+      - name: Build release
         run: cargo build --release
 
-      - name: Rename and Package Binary for Release
+      - name: Package artifact
         shell: bash
         run: |
+          V=${{ steps.get_version.outputs.version }}
+          SUF=${{ matrix.suffix }}
+          EXT=${{ matrix.ext }}
+
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            mv target/release/zirv.exe zirv-${{ matrix.os }}.exe;
-          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            # Ensure both targets are installed
-            rustup target add x86_64-apple-darwin
-            rustup target add aarch64-apple-darwin
-            # Build universal binaries for both architectures
-            cargo build --release --target x86_64-apple-darwin
-            cargo build --release --target aarch64-apple-darwin
-            # Create a universal binary using lipo
-            lipo -create \
-              target/x86_64-apple-darwin/release/zirv \
-              target/aarch64-apple-darwin/release/zirv \
-              -output zirv
-            chmod +x zirv
-            # Package the universal binary (the tarball name remains as expected)
-            tar -czvf zirv-macos-latest.tar.gz zirv
-            rm zirv
+            # Rename the .exe
+            mv target/release/zirv.exe zirv-${V}-windows.exe
+
           else
-            # For Linux
-            mv target/release/zirv zirv-${{ matrix.os }};
-            chmod +x zirv-${{ matrix.os }};
-            tar -czvf zirv-ubuntu-latest.tar.gz zirv-${{ matrix.os }};
+            # For macOS or Linux, produce a tarball containing 'zirv'
+            if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+              # Build universal for Intel & ARM
+              rustup target add x86_64-apple-darwin
+              rustup target add aarch64-apple-darwin
+              cargo build --release --target x86_64-apple-darwin
+              cargo build --release --target aarch64-apple-darwin
+              lipo -create \
+                target/x86_64-apple-darwin/release/zirv \
+                target/aarch64-apple-darwin/release/zirv \
+                -output zirv
+            else
+              # Linux
+              cp target/release/zirv zirv
+            fi
+
+            chmod +x zirv
+            tar -czvf zirv-${V}-${SUF}.tar.gz zirv
+            rm zirv
           fi
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zirv-${{ matrix.os }}
-          path: ${{ matrix.artifact_file }}
+          name: zirv-${{ matrix.suffix }}
+          path: |
+            ${{ matrix.os == 'windows-latest' && format('zirv-{0}-windows.exe', steps.get_version.outputs.version) || format('zirv-{0}-{1}.tar.gz', steps.get_version.outputs.version, matrix.suffix) }}
 
   release:
-    name: Create and Upload Release Assets and Update Homebrew
+    name: Create GitHub Release & Upload Assets
     runs-on: ubuntu-latest
     needs: build
     outputs:
-      version: ${{ steps.get_version.outputs.version }}
+      version: ${{ needs.build.outputs.version }}
+
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0  # Fetch full history and tags
+          fetch-depth: 0
 
-      - name: Get version from Cargo.toml
-        id: get_version
-        shell: bash
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: Fetch version
+        run: echo "Version is ${{ needs.build.outputs.version }}"
 
       - name: Create Tag
-        id: create_tag
+        id: tag
         shell: bash
         run: |
-          TAG="v${{ steps.get_version.outputs.version }}"
-          echo "Creating tag $TAG"
+          TAG="v${{ needs.build.outputs.version }}"
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists."
+            echo "Tag $TAG already exists"
           else
             git tag "$TAG"
             git push origin "$TAG"
           fi
 
-      - name: Fetch Tags
-        run: git fetch --tags
-
-      - name: Create artifacts directory
-        run: mkdir -p artifacts
-
-      - name: Download Windows Artifact
+      - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
-          name: zirv-windows-latest
+          name: zirv-windows
           path: artifacts
 
-      - name: Download Linux Artifact
+      - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
-          name: zirv-ubuntu-latest
+          name: zirv-linux
           path: artifacts
 
-      - name: Download macOS Artifact
+      - name: Download macOS artifact
         uses: actions/download-artifact@v4
         with:
-          name: zirv-macos-latest
+          name: zirv-macos
           path: artifacts
 
-      - name: List artifacts directory contents
-        run: find artifacts -type f || echo "No files found"
-
-      - name: Create GitHub Release and Upload Assets
-        id: create_release
+      - name: Create Release with Assets
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ steps.get_version.outputs.version }}
-          name: Release v${{ steps.get_version.outputs.version }}
-          body: "Release of zirv binaries for Windows, Linux, and macOS."
+          tag_name: v${{ needs.build.outputs.version }}
+          name: Release v${{ needs.build.outputs.version }}
+          body: "Release of zirv v${{ needs.build.outputs.version }}"
           files: |
-            artifacts/zirv-windows-latest.exe
-            artifacts/zirv-ubuntu-latest.tar.gz
-            artifacts/zirv-macos-latest.tar.gz
+            artifacts/zirv-${{ needs.build.outputs.version }}-windows.exe
+            artifacts/zirv-${{ needs.build.outputs.version }}-linux.tar.gz
+            artifacts/zirv-${{ needs.build.outputs.version }}-macos.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  update-homebrew-macos:
-    name: Update Homebrew Formula
+  update-homebrew:
+    name: Update Homebrew Tap
     runs-on: ubuntu-latest
     needs: release
     environment:
-      name: homebrew-release   # Configure this environment with manual approval.
+      name: homebrew-release
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 0
-      - name: Get version from Cargo.toml (for Homebrew)
-        id: get_version_homebrew
-        shell: bash
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-      - name: Download macOS Artifact for Homebrew
-        uses: actions/download-artifact@v4
-        with:
-          name: zirv-macos-latest
-          path: artifacts
-      - name: List artifacts directory contents
-        run: |
-          echo "Listing artifacts directory contents:"
-          find artifacts -type f || echo "No files found"
+
       - name: Update Homebrew Formula
-        if: success()
         shell: bash
         env:
           HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
         run: |
           chmod +x ./scripts/update_homebrew.sh
-          ./scripts/update_homebrew.sh "${{ steps.get_version_homebrew.outputs.version }}" artifacts/zirv-macos-latest.tar.gz
+          ./scripts/update_homebrew.sh "${{ needs.build.outputs.version }}"
 
   update-chocolatey:
     name: Update Chocolatey Package
     runs-on: windows-latest
     needs: release
     environment:
-      name: chocolatey-release   # Configure this environment with manual approval.
+      name: chocolatey-release
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 0
-      - name: Get version from Cargo.toml (Chocolatey)
-        id: get_version_choco
-        shell: bash
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -n 1 | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-      - name: Download Windows Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: zirv-windows-latest
-          path: artifacts
-      - name: Update Chocolatey Package
+
+      - name: Update Chocolatey
         shell: pwsh
         env:
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
-          choco config set --name='defaultPushSource' --value='https://push.chocolatey.org/'
-          ./scripts/update_chocolatey.ps1 -Version ${{ steps.get_version_choco.outputs.version }} -ArtifactPath artifacts\zirv-windows-latest.exe
+          ./scripts/update_chocolatey.ps1 `
+            -Version ${{ needs.build.outputs.version }} `
+            -ArtifactPath "artifacts\zirv-${{ needs.build.outputs.version }}-windows.exe"
