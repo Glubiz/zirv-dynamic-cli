@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use crate::structs::os::operating_system;
 use crate::structs::script::Script;
@@ -350,7 +350,9 @@ commands:
     #[tokio::test]
     async fn test_secret_substitution_success() -> Result<(), Box<dyn std::error::Error>> {
         // Set the required secret.
-        env::set_var("COMMIT_PASSWORD", "secret_value");
+        unsafe {
+            env::set_var("COMMIT_PASSWORD", "secret_value");
+        }
 
         let yaml = r#"
 name: "Commit Changes"
@@ -377,7 +379,10 @@ commands:
 
     #[tokio::test]
     async fn test_secret_missing_failure() -> Result<(), Box<dyn std::error::Error>> {
-        env::remove_var("COMMIT_PASSWORD");
+        unsafe {
+            // Remove the secret from the environment to simulate a missing secret.
+            env::remove_var("COMMIT_PASSWORD");
+        }
 
         let yaml = r#"
 name: "Commit Changes"

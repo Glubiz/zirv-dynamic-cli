@@ -245,8 +245,10 @@ shortcuts:
             .ok()
             .or_else(|| env::var("USERPROFILE").ok());
 
-        env::set_var("HOME", fake_home_dir.path());
-        env::set_var("USERPROFILE", fake_home_dir.path());
+        unsafe {
+            env::set_var("HOME", fake_home_dir.path());
+            env::set_var("USERPROFILE", fake_home_dir.path());
+        }
         env::set_current_dir(temp_path)?;
 
         let found = find_script_file("test")?;
@@ -255,12 +257,14 @@ shortcuts:
 
         env::set_current_dir(original_dir)?;
 
-        if let Some(home) = original_home {
-            env::set_var("HOME", home.clone());
-            env::set_var("USERPROFILE", home);
-        } else {
-            env::remove_var("HOME");
-            env::remove_var("USERPROFILE");
+        unsafe {
+            if let Some(home) = original_home {
+                env::set_var("HOME", home.clone());
+                env::set_var("USERPROFILE", home);
+            } else {
+                env::remove_var("HOME");
+                env::remove_var("USERPROFILE");
+            }
         }
 
         Ok(())
@@ -284,8 +288,10 @@ shortcuts:
             .ok()
             .or_else(|| env::var("USERPROFILE").ok());
 
-        env::set_var("HOME", fake_home.path());
-        env::set_var("USERPROFILE", fake_home.path());
+        unsafe {
+            env::set_var("HOME", fake_home.path());
+            env::set_var("USERPROFILE", fake_home.path());
+        }
         env::set_current_dir(temp_path)?;
 
         let res = find_script_file("nosuchfile");
@@ -293,12 +299,14 @@ shortcuts:
 
         env::set_current_dir(original_dir)?;
 
-        if let Some(home) = original_home {
-            env::set_var("HOME", home.clone());
-            env::set_var("USERPROFILE", home);
-        } else {
-            env::remove_var("HOME");
-            env::remove_var("USERPROFILE");
+        unsafe {
+            if let Some(home) = original_home {
+                env::set_var("HOME", home.clone());
+                env::set_var("USERPROFILE", home);
+            } else {
+                env::remove_var("HOME");
+                env::remove_var("USERPROFILE");
+            }
         }
 
         Ok(())

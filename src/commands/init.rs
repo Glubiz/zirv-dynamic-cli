@@ -96,21 +96,26 @@ mod tests {
         let original_home = env::var("HOME").ok();
         let original_userprofile = env::var("USERPROFILE").ok();
 
-        env::set_var("HOME", fake_home);
-        env::set_var("USERPROFILE", fake_home);
+        unsafe {
+            env::set_var("HOME", fake_home);
+            env::set_var("USERPROFILE", fake_home);
+        }
 
         let result = test();
 
-        if let Some(home) = original_home {
-            env::set_var("HOME", home);
-        } else {
-            env::remove_var("HOME");
+        unsafe {
+            if let Some(home) = original_home {
+                env::set_var("HOME", home);
+            } else {
+                env::remove_var("HOME");
+            }
+            if let Some(up) = original_userprofile {
+                env::set_var("USERPROFILE", up);
+            } else {
+                env::remove_var("USERPROFILE");
+            }
         }
-        if let Some(up) = original_userprofile {
-            env::set_var("USERPROFILE", up);
-        } else {
-            env::remove_var("USERPROFILE");
-        }
+
         result
     }
 
