@@ -77,8 +77,8 @@ pub async fn run(
     ) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
         // pick shell
         let mut child = if cfg!(windows) {
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(cmd_str);
+            let mut c = Command::new("powershell");
+            c.arg("-Command").arg(cmd_str);
             c
         } else {
             let mut c = Command::new("sh");
@@ -116,10 +116,6 @@ pub async fn run(
         // OS filter
         if let Some(os) = &step.options.operating_system {
             if operating_system(os.clone()) != std::env::consts::OS.to_lowercase() {
-                println!(
-                    "Skipping '{}' on OS {:?}",
-                    step.command, step.options.operating_system
-                );
                 continue;
             }
         }
@@ -137,26 +133,29 @@ pub async fn run(
 
         if let Err(err) = first {
             eprintln!("Step error: {:?}", err);
-            // on_failure chain
-            for fb in &step.options.on_failure {
-                let fb_cmd = substitute_params(&fb.command, &context);
-                let _ = invoke(&fb_cmd, fb).await.map_err(|e| {
-                    eprintln!("  on_failure `{}` errored: {:?}", fb_cmd, e);
-                });
-            }
 
-            // retry once
-            match invoke(&cmd_str, step).await {
-                Ok(Some((k, v))) => {
-                    context.insert(k, v);
+            if let Some(commands) = &step.options.on_failure {
+                // on_failure chain
+                for fb in commands {
+                    let fb_cmd = substitute_params(&fb.command, &context);
+                    let _ = invoke(&fb_cmd, fb).await.map_err(|e| {
+                        eprintln!("  on_failure `{}` errored: {:?}", fb_cmd, e);
+                    });
                 }
-                Ok(None) => {
-                    // success on retry
-                }
-                Err(err2) => {
-                    eprintln!("Retry also failed: {:?}", err2);
-                    if !step.options.proceed_on_failure {
-                        return Err(err2);
+    
+                // retry once
+                match invoke(&cmd_str, step).await {
+                    Ok(Some((k, v))) => {
+                        context.insert(k, v);
+                    }
+                    Ok(None) => {
+                        // success on retry
+                    }
+                    Err(err2) => {
+                        eprintln!("Retry also failed: {:?}", err2);
+                        if !step.options.proceed_on_failure {
+                            return Err(err2);
+                        }
                     }
                 }
             }

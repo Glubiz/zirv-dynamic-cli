@@ -46,7 +46,7 @@ pub struct CommandOptions {
     pub proceed_on_failure: bool,
     /// Define a set of commands that should be executed if this command fails.
     #[serde(default)]
-    pub on_failure: Vec<CommandItem>,
+    pub on_failure: Option<Vec<CommandItem>>,
     /// Optional delay in milliseconds after executing this command.
     #[serde(default)]
     pub delay_ms: Option<u64>,
