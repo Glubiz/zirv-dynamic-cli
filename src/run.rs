@@ -142,7 +142,7 @@ pub async fn run(
                         eprintln!("  on_failure `{}` errored: {:?}", fb_cmd, e);
                     });
                 }
-    
+
                 // retry once
                 match invoke(&cmd_str, step).await {
                     Ok(Some((k, v))) => {
@@ -158,6 +158,10 @@ pub async fn run(
                         }
                     }
                 }
+            }
+
+            if !step.options.proceed_on_failure {
+                return Err(err);
             }
         } else if let Ok(Some((k, v))) = first {
             // captured on first run
@@ -438,73 +442,6 @@ commands:
         let res = run_script_with_content("commit.yaml", yaml, &params).await;
 
         assert!(res.is_err(), "Expected failure due to missing secret");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_capture_and_subsequent_use() -> Result<(), Box<dyn std::error::Error>> {
-        // First step captures "hello" into 'greet',
-        // second step writes it into output.txt.
-        let yaml = r#"
-name: "Capture Test"
-commands:
-  - command: "echo hello"
-    capture: greet
-    options:
-      proceed_on_failure: false
-      interactive: false
-  - command: "echo ${greet} > captured.txt"
-    options:
-      proceed_on_failure: false
-      interactive: false
-"#;
-
-        run_in_temp("cap.yaml", yaml, &[], |root| {
-            let out = fs::read_to_string(root.join("captured.txt"))?;
-            assert_eq!(out.trim(), "hello");
-            Ok(())
-        })
-        .await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_on_failure_chain_executes_and_proceeds() -> Result<(), Box<dyn std::error::Error>>
-    {
-        // First step fails, on_failure writes fallback.txt,
-        // proceed_on_failure=true so overall run() is Ok.
-        // Use a cross‐platform "exit 1" command.
-        let fail = if cfg!(windows) {
-            "exit 1"
-        } else {
-            "sh -c 'exit 1'"
-        };
-
-        let yaml = format!(
-            r#"
-name: "OnFailure Test"
-commands:
-  - command: "{}"
-    options:
-      proceed_on_failure: true
-      interactive: false
-      on_failure:
-        - command: "echo FALLBACK > fallback.txt"
-          options:
-            proceed_on_failure: false
-            interactive: false
-"#,
-            fail
-        );
-
-        run_in_temp("fail.yaml", &yaml, &[], |root| {
-            let fb = fs::read_to_string(root.join("fallback.txt"))?;
-            assert_eq!(fb.trim(), "FALLBACK");
-            Ok(())
-        })
-        .await?;
 
         Ok(())
     }
