@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
@@ -23,3 +23,12 @@ hashbrown = "0.15.3"
 
 [dev-dependencies]
 tempfile = "3.19.1"
+
+[profile.release]
+opt-level       = "z"
+lto             = true
+codegen-units   = 1
+debug           = false
+debug-assertions = false
+panic           = "abort"
+strip           = "symbols"
