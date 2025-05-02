@@ -1,169 +1,173 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fs;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{Duration, sleep};
 
 use crate::structs::os::operating_system;
-use crate::structs::script::Script;
+use crate::structs::script::{CommandItem, Script};
 use crate::utils::substitute_params;
 
 /// Reads and executes a YAML/JSON/TOML script from the given path.
-/// Commands with an `operating_system` option that does not match the current OS are skipped.
+/// Supports `capture` (capture stdout into a variable) and
+/// `on_failure` (run fallback commands then retry once).
 pub async fn run(
     path: &std::path::Path,
     cli_params: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Read file content.
+    // Load file
     let content = fs::read_to_string(path)?;
-    // Determine file extension.
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    // Parse the script.
-    let script: Script = if ext == "yaml" || ext == "yml" {
-        serde_yaml::from_str(&content)?
-    } else if ext == "json" {
-        serde_json::from_str(&content)?
-    } else if ext == "toml" {
-        toml::from_str(&content)?
-    } else {
-        return Err(format!("Unsupported file extension: {}", ext).into());
+    let script: Script = match ext.as_str() {
+        "yaml" | "yml" => serde_yaml::from_str(&content)?,
+        "json" => serde_json::from_str(&content)?,
+        "toml" => toml::from_str(&content)?,
+        other => return Err(format!("Unsupported extension: {}", other).into()),
     };
 
     println!("\nRunning script: {}", script.name);
-    if let Some(desc) = script.description {
+    if let Some(desc) = &script.description {
         println!("Description: {}", desc);
     }
 
-    // Build a parameter map if the script defines expected parameters.
-    let param_map: Option<HashMap<String, String>> = if let Some(expected_params) = script.params {
-        if expected_params.len() != cli_params.len() {
-            return Err(format!(
-                "Expected {} parameters, but got {}",
-                expected_params.len(),
-                cli_params.len()
-            )
-            .into());
-        }
+    // Build initial context from params + secrets
+    let mut context: HashMap<String, String> = {
+        // params
+        let params = if let Some(names) = &script.params {
+            if names.len() != cli_params.len() {
+                return Err(format!(
+                    "Expected {} parameters, got {}",
+                    names.len(),
+                    cli_params.len()
+                )
+                .into());
+            }
 
-        Some(
-            expected_params
-                .into_iter()
+            names
+                .iter()
+                .cloned()
                 .zip(cli_params.iter().cloned())
-                .collect(),
-        )
-    } else {
-        None
-    };
-
-    // Build a secret map if the script defines expected secrets.
-    let secret_map: Option<HashMap<String, String>> = if let Some(secret_defs) = script.secrets {
-        let mut map = HashMap::new();
-        for secret in secret_defs {
-            // Try to read the secret from the environment.
-            match std::env::var(&secret.env_var) {
-                Ok(val) => {
-                    map.insert(secret.name, val);
-                }
-                Err(_) => {
-                    return Err(format!(
-                        "Secret '{}' not found in environment variable '{}'",
-                        secret.name, secret.env_var
-                    )
-                    .into());
-                }
-            }
-        }
-        Some(map)
-    } else {
-        None
-    };
-
-    // Combine parameters and secrets (secrets can override params if same key exists).
-    let combined_map: HashMap<String, String> = match (param_map, secret_map) {
-        (Some(params), Some(secrets)) => {
-            let mut map = params;
-            map.extend(secrets);
-            map
-        }
-        (Some(params), None) => params,
-        (None, Some(secrets)) => secrets,
-        (None, None) => HashMap::new(),
-    };
-
-    // Process each command.
-    for mut cmd_item in script.commands {
-        // Substitute placeholders in the command.
-        if !combined_map.is_empty() {
-            cmd_item.command = substitute_params(&cmd_item.command, &combined_map);
-        }
-
-        // Check operating_system option.
-        if let Some(ref opts) = cmd_item.options {
-            if let Some(ref os) = opts.operating_system {
-                if operating_system(os.to_owned()) != std::env::consts::OS.to_lowercase() {
-                    println!(
-                        "\nSkipping command '{}' for OS '{:?}', current OS is '{}'",
-                        cmd_item.command,
-                        os,
-                        std::env::consts::OS
-                    );
-                    continue;
-                }
-            }
-        }
-
-        println!("\nExecuting command: '{}'", cmd_item.command);
-        if let Some(desc) = cmd_item.description.clone() {
-            println!("Description: {}", desc);
-        }
-
-        // Wrap command in a shell for correct resolution.
-        let mut command = if std::env::consts::OS.to_lowercase() == "windows" {
-            let mut cmd = Command::new("powershell");
-            cmd.arg("-Command").arg(&cmd_item.command);
-            cmd
+                .collect()
         } else {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(&cmd_item.command);
-            cmd
+            HashMap::new()
         };
 
-        // Interactive I/O if specified.
-        if let Some(ref opts) = cmd_item.options {
-            if opts.interactive {
-                command
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit());
+        // secrets
+        let mut map = params;
+        if let Some(secret_defs) = &script.secrets {
+            for sd in secret_defs {
+                let val = std::env::var(&sd.env_var).map_err(|_| {
+                    format!("Secret '{}' not found in env '{}'", sd.name, sd.env_var)
+                })?;
+                map.insert(sd.name.clone(), val);
+            }
+        }
+        map
+    };
+
+    // Helper to run a single invocation of a step
+    async fn invoke(
+        cmd_str: &str,
+        step: &CommandItem,
+    ) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
+        // pick shell
+        let mut child = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(cmd_str);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(cmd_str);
+            c
+        };
+
+        // interactive I/O
+        if step.options.interactive {
+            child
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        }
+
+        // decide capture vs status
+        if let Some(var) = &step.capture {
+            let out = child.output().await?;
+            if !out.status.success() {
+                return Err(format!("`{}` failed", cmd_str).into());
+            }
+            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Ok(Some((var.clone(), val)))
+        } else {
+            let status = child.status().await?;
+            if !status.success() {
+                return Err(format!("`{}` failed", cmd_str).into());
+            }
+            Ok(None)
+        }
+    }
+
+    // Main loop over steps
+    for step in &script.commands {
+        // OS filter
+        if let Some(os) = &step.options.operating_system {
+            if operating_system(os.clone()) != std::env::consts::OS.to_lowercase() {
+                println!(
+                    "Skipping '{}' on OS {:?}",
+                    step.command, step.options.operating_system
+                );
+                continue;
             }
         }
 
-        let status = command.status().await?;
-        if !status.success() {
-            eprintln!(
-                "\nCommand '{}' failed with status: {:?}",
-                cmd_item.command, status
-            );
+        // substitute
+        let cmd_str = substitute_params(&step.command, &context);
 
-            let proceed = cmd_item
-                .options
-                .as_ref()
-                .map(|o| o.proceed_on_failure)
-                .unwrap_or(false);
-            if !proceed {
-                return Err(format!("Command '{}' failed", cmd_item.command).into());
-            } else {
-                println!("\nContinuing despite failure as proceed_on_failure is true.");
-            }
+        println!("\n> {}", cmd_str);
+        if let Some(d) = &step.description {
+            println!("  # {}", d);
         }
 
-        if let Some(delay) = cmd_item.options.as_ref().and_then(|o| o.delay_ms) {
-            sleep(Duration::from_millis(delay)).await;
+        // first attempt
+        let first = invoke(&cmd_str, step).await;
+
+        if let Err(err) = first {
+            eprintln!("Step error: {:?}", err);
+            // on_failure chain
+            for fb in &step.options.on_failure {
+                let fb_cmd = substitute_params(&fb.command, &context);
+                let _ = invoke(&fb_cmd, fb).await.map_err(|e| {
+                    eprintln!("  on_failure `{}` errored: {:?}", fb_cmd, e);
+                });
+            }
+
+            // retry once
+            match invoke(&cmd_str, step).await {
+                Ok(Some((k, v))) => {
+                    context.insert(k, v);
+                }
+                Ok(None) => {
+                    // success on retry
+                }
+                Err(err2) => {
+                    eprintln!("Retry also failed: {:?}", err2);
+                    if !step.options.proceed_on_failure {
+                        return Err(err2);
+                    }
+                }
+            }
+        } else if let Ok(Some((k, v))) = first {
+            // captured on first run
+            context.insert(k, v);
+        }
+
+        // optional delay
+        if let Some(d) = step.options.delay_ms {
+            sleep(Duration::from_millis(d)).await;
         }
     }
 
@@ -176,6 +180,38 @@ mod tests {
     use std::env;
     use std::fs::{create_dir_all, write};
     use tempfile::tempdir;
+
+    /// Run the script in a freshly-created tempdir (with `.zirv`),
+    /// but *return* the tempdir so we can inspect files *after* run().
+    async fn run_in_temp<F>(
+        filename: &str,
+        content: &str,
+        params: &[String],
+        test_body: F,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnOnce(&std::path::Path) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        let tmp = tempdir()?;
+        let root = tmp.path();
+        // make .zirv
+        let zirv = root.join(".zirv");
+        fs::create_dir_all(&zirv)?;
+        // write script
+        let script = zirv.join(filename);
+        fs::write(&script, content)?;
+        // cd into root
+        let old = env::current_dir()?;
+        env::set_current_dir(root)?;
+        // run
+        let res = run(&script, params).await;
+        // restore cwd
+        env::set_current_dir(old)?;
+        // let test_body inspect root
+        test_body(root)?;
+        // propagate run() result
+        res
+    }
 
     /// Helper function: writes the given script content into a file under a temporary `.zirv` directory,
     /// changes the current directory to that temporary directory, runs the run() function with provided parameters,
@@ -404,6 +440,112 @@ commands:
 
         assert!(res.is_err(), "Expected failure due to missing secret");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_capture_and_subsequent_use() -> Result<(), Box<dyn std::error::Error>> {
+        // First step captures "hello" into 'greet',
+        // second step writes it into output.txt.
+        let yaml = r#"
+name: "Capture Test"
+commands:
+  - command: "echo hello"
+    capture: greet
+    options:
+      proceed_on_failure: false
+      interactive: false
+  - command: "echo ${greet} > captured.txt"
+    options:
+      proceed_on_failure: false
+      interactive: false
+"#;
+
+        run_in_temp("cap.yaml", yaml, &[], |root| {
+            let out = fs::read_to_string(root.join("captured.txt"))?;
+            assert_eq!(out.trim(), "hello");
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_on_failure_chain_executes_and_proceeds() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // First step fails, on_failure writes fallback.txt,
+        // proceed_on_failure=true so overall run() is Ok.
+        // Use a cross‐platform "exit 1" command.
+        let fail = if cfg!(windows) {
+            "exit 1"
+        } else {
+            "sh -c 'exit 1'"
+        };
+
+        let yaml = format!(
+            r#"
+name: "OnFailure Test"
+commands:
+  - command: "{}"
+    options:
+      proceed_on_failure: true
+      interactive: false
+      on_failure:
+        - command: "echo FALLBACK > fallback.txt"
+          options:
+            proceed_on_failure: false
+            interactive: false
+"#,
+            fail
+        );
+
+        run_in_temp("fail.yaml", &yaml, &[], |root| {
+            let fb = fs::read_to_string(root.join("fallback.txt"))?;
+            assert_eq!(fb.trim(), "FALLBACK");
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_on_failure_chain_executes_and_bails() -> Result<(), Box<dyn std::error::Error>> {
+        // First step fails, on_failure writes fallback2.txt,
+        // proceed_on_failure=false so run() returns Err.
+        let fail = if cfg!(windows) {
+            "exit 1"
+        } else {
+            "sh -c 'exit 1'"
+        };
+
+        let yaml = format!(
+            r#"
+name: "OnFailure Bail"
+commands:
+  - command: "{}"
+    options:
+      proceed_on_failure: false
+      interactive: false
+      on_failure:
+        - command: "echo BAILBACK > fallback2.txt"
+          options:
+            proceed_on_failure: false
+            interactive: false
+"#,
+            fail
+        );
+
+        let res = run_in_temp("fail2.yaml", &yaml, &[], |root| {
+            // fallback2.txt should still be created
+            let fb = fs::read_to_string(root.join("fallback2.txt"))?;
+            assert_eq!(fb.trim(), "BAILBACK");
+            Ok(())
+        })
+        .await;
+
+        assert!(res.is_err(), "Expected run() to Err after retry");
         Ok(())
     }
 }

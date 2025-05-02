@@ -30,10 +30,12 @@ pub struct SecretDefinition {
 pub struct CommandItem {
     /// The shell command to execute.
     pub command: String,
+    /// Optional argument defines varable names to capture from the command output.
+    pub capture: Option<String>,
     /// An optional description of what the command does.
     pub description: Option<String>,
     /// Optional options that control the behavior of the command.
-    pub options: Option<CommandOptions>,
+    pub options: CommandOptions,
 }
 
 /// A set of options that control how a command is executed.
@@ -42,6 +44,9 @@ pub struct CommandOptions {
     /// If true, the script continues even if this command fails.
     #[serde(default)]
     pub proceed_on_failure: bool,
+    /// Define a set of commands that should be executed if this command fails.
+    #[serde(default)]
+    pub on_failure: Vec<CommandItem>,
     /// Optional delay in milliseconds after executing this command.
     #[serde(default)]
     pub delay_ms: Option<u64>,

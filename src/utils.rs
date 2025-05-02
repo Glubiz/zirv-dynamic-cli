@@ -1,4 +1,5 @@
-use std::{collections::HashMap, env, path::PathBuf};
+use hashbrown::HashMap;
+use std::{env, path::PathBuf};
 
 use crate::structs::shortcuts::Shortcuts;
 
@@ -83,7 +84,7 @@ pub fn find_script_file(base_name: &str) -> Result<PathBuf, Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
     use std::env;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::path::PathBuf;

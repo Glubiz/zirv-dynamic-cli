@@ -13,7 +13,9 @@
 - [Usage](#usage)
   - [Initialize a Project](#initialize-a-project)
   - [Running Scripts](#running-scripts)
-  - [Passing Parameters](#passing-parameters)
+  - [Passing Parameters & Secrets](#passing-parameters--secrets)
+  - [Capture Output](#capture-output)
+  - [Failure Hooks](#failure-hooks)
   - [Chaining Scripts](#chaining-scripts)
 - [Configuration](#configuration)
   - [Directory Structure](#directory-structure)
@@ -29,10 +31,11 @@
 ## Features
 
 - **YAML-Driven Scripts**: Define commands in `.zirv/` files with metadata (name, description, params, secrets).  
-- **Flexible Options**: Interactive modes, OS filters, failure-handling flags, delays, and secret support.  
-- **Modular Workflows**: Chain or nest scripts via `pre` or direct script calls.  
-- **Cross-Platform**: Compatible with Windows, macOS, and Linux; script blocks can target specific OS.  
-- **Multi-Format**: Supports YAML, JSON, and TOML—extendable to your preferred format.  
+- **Capture Output**: Use `capture: var_name` on any step to grab its stdout into `${var_name}` for later substitution.  
+- **Failure Hooks**: On a step failure you can declare an `on_failure` sub-chain of commands, then retry the original step once.  
+- **Flexible Options**: Interactive mode, OS filters, `proceed_on_failure`, delays, and secret support.  
+- **Multi-Format**: Supports YAML, JSON, and TOML—extendable.  
+- **Cross-Platform**: Compatible with Windows, macOS, and Linux.
 
 ---
 
@@ -113,6 +116,36 @@ Run with:
 zirv commit "Your commit message here"
 ```
 
+### Capture Output
+To capture the output of a command, use the `capture` option:
+
+```yaml
+name: Capture Test
+commands:
+  - command: "echo hello"
+    capture: greeting
+    options:
+      proceed_on_failure: false
+  - command: "echo Got: ${greeting}"
+```
+
+First step stores `hello` in the variable `${greeting}`, which is then used in the second step to print `Got: hello`.
+
+### Failure Hooks
+Declare a failure hook for a command using `on_failure`:
+
+```yaml
+name: OnFailure Demo
+commands:
+  - command: "sh -c 'exit 1'"
+    options:
+      proceed_on_failure: true     # continue even if retry also fails
+      on_failure:
+        - command: "echo 'Fallback action'"
+```
+
+This will execute the fallback command if the first command fails. The original command will be retried once.
+
 ### Chaining Scripts
 You can chain scripts by calling one script from another. For example, if you have a script `build.yaml` and want to call it from `deploy.yaml`:
 
@@ -153,13 +186,20 @@ description: An example script.
 params:
   - param1
 commands:
-  - command: echo 'Hello World'
+  - command: "echo Welcome, ${user}"
+    capture: welcome_msg
+    options:
+      interactive: false
+
+  - command: echo ${welcome_msg}
     description: Prints greeting
     options:
       interactive: true
       operating_system: linux
       proceed_on_failure: false
       delay_ms: 2000
+      on_failure:
+        - command: "echo 'Attempting fallback...'"
 secrets:
   - name: api_key
     env_var: API_KEY
@@ -173,13 +213,25 @@ secrets:
   "params": ["param1"],
   "commands": [
     {
-      "command": "echo 'Hello World'",
+      "command": "echo Welcome, ${user}",
+      "capture": "welcome_msg",
+      "options": {
+        "interactive": false
+      }
+    },
+    {
+      "command": "echo ${welcome_msg}",
       "description": "Prints greeting",
       "options": {
         "interactive": true,
         "operating_system": "linux",
         "proceed_on_failure": false,
-        "delay_ms": 2000
+        "delay_ms": 2000,
+        "on_failure": [
+          {
+            "command": "echo 'Attempting fallback...'"
+          }
+        ]
       }
     }
   ],
@@ -199,12 +251,19 @@ description = "An example script."
 params = ["param1"]
 
 [[commands]]
-command = "echo 'Hello World'"
-description = "Prints greeting"
+command = "echo Welcome, ${user}"
+capture = "welcome_msg"
+options.interactive = false
+
+[[commands]]
+command = "echo Token is ${token}"
 options.interactive = true
 options.operating_system = "linux"
 options.proceed_on_failure = false
 options.delay_ms = 2000
+
+[[commands.options.on_failure]]
+command = "echo 'Attempting fallback...'"
 
 [[secrets]]
 name = "api"
