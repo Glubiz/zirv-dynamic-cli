@@ -1,0 +1,5 @@
+name: "Test no options"
+description: "Script to test no options being provided"
+commands:
+  - command: "echo hello"
+    description: "Print hello"

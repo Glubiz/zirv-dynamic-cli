@@ -1,3 +1,6 @@
 shortcuts:
-  t: test.yaml
   gc: commit.yaml
+  t: test.yaml
+  tc: test-capture.yaml
+  tno: test-no_options.yaml
+  tof: test-on_failure.yaml

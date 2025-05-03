@@ -1,0 +1,8 @@
+name: "Test Capture"
+description: "Script to test capture functionality"
+commands:
+  - command: "echo hello"
+    capture: greeting
+    options:
+      proceed_on_failure: false
+  - command: "echo Got: ${greeting}"

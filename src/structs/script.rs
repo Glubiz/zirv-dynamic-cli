@@ -35,11 +35,11 @@ pub struct CommandItem {
     /// An optional description of what the command does.
     pub description: Option<String>,
     /// Optional options that control the behavior of the command.
-    pub options: CommandOptions,
+    pub options: Option<CommandOptions>,
 }
 
 /// A set of options that control how a command is executed.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct CommandOptions {
     /// If true, the script continues even if this command fails.
     #[serde(default)]

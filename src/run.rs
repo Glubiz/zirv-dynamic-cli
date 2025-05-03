@@ -5,7 +5,7 @@ use tokio::process::Command;
 use tokio::time::{Duration, sleep};
 
 use crate::structs::os::operating_system;
-use crate::structs::script::{CommandItem, Script};
+use crate::structs::script::{CommandOptions, Script};
 use crate::utils::substitute_params;
 
 /// Reads and executes a YAML/JSON/TOML script from the given path.
@@ -73,7 +73,8 @@ pub async fn run(
     // Helper to run a single invocation of a step
     async fn invoke(
         cmd_str: &str,
-        step: &CommandItem,
+        options: &CommandOptions,
+        capture: &Option<String>,
     ) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
         // pick shell
         let mut child = if cfg!(windows) {
@@ -87,7 +88,7 @@ pub async fn run(
         };
 
         // interactive I/O
-        if step.options.interactive {
+        if options.interactive {
             child
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
@@ -95,7 +96,7 @@ pub async fn run(
         }
 
         // decide capture vs status
-        if let Some(var) = &step.capture {
+        if let Some(var) = &capture {
             let out = child.output().await?;
             if !out.status.success() {
                 return Err(format!("`{}` failed", cmd_str).into());
@@ -113,8 +114,10 @@ pub async fn run(
 
     // Main loop over steps
     for step in &script.commands {
+        let options = step.options.clone().unwrap_or_default();
+
         // OS filter
-        if let Some(os) = &step.options.operating_system {
+        if let Some(os) = &options.operating_system {
             if operating_system(os.clone()) != std::env::consts::OS.to_lowercase() {
                 continue;
             }
@@ -129,22 +132,27 @@ pub async fn run(
         }
 
         // first attempt
-        let first = invoke(&cmd_str, step).await;
+        let first = invoke(&cmd_str, &options, &step.capture).await;
 
         if let Err(err) = first {
             eprintln!("Step error: {:?}", err);
 
-            if let Some(commands) = &step.options.on_failure {
+            if let Some(commands) = &options.on_failure {
                 // on_failure chain
-                for fb in commands {
-                    let fb_cmd = substitute_params(&fb.command, &context);
-                    let _ = invoke(&fb_cmd, fb).await.map_err(|e| {
-                        eprintln!("  on_failure `{}` errored: {:?}", fb_cmd, e);
-                    });
+                for fallback in commands {
+                    let fallback_options = fallback.options.clone().unwrap_or_default();
+
+                    let fallback_cmd = substitute_params(&fallback.command, &context);
+
+                    let _ = invoke(&fallback_cmd, &fallback_options, &fallback.capture)
+                        .await
+                        .map_err(|e| {
+                            eprintln!("  on_failure `{}` errored: {:?}", fallback_cmd, e);
+                        });
                 }
 
                 // retry once
-                match invoke(&cmd_str, step).await {
+                match invoke(&cmd_str, &options, &step.capture).await {
                     Ok(Some((k, v))) => {
                         context.insert(k, v);
                     }
@@ -153,14 +161,14 @@ pub async fn run(
                     }
                     Err(err2) => {
                         eprintln!("Retry also failed: {:?}", err2);
-                        if !step.options.proceed_on_failure {
+                        if !options.proceed_on_failure {
                             return Err(err2);
                         }
                     }
                 }
             }
 
-            if !step.options.proceed_on_failure {
+            if !options.proceed_on_failure {
                 return Err(err);
             }
         } else if let Ok(Some((k, v))) = first {
@@ -169,7 +177,7 @@ pub async fn run(
         }
 
         // optional delay
-        if let Some(d) = step.options.delay_ms {
+        if let Some(d) = options.delay_ms {
             sleep(Duration::from_millis(d)).await;
         }
     }
