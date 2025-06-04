@@ -1,6 +1,8 @@
 use std::{env, fs, io::Write, path::PathBuf};
 
-use crate::structs::{script::Script, shortcuts::Shortcuts};
+use crate::script_runner::script::Script;
+
+use super::create::Shortcuts;
 
 /// Writes the help information into the given writer.
 /// This function is a refactored version of show_help() that writes to the provided writer,
@@ -44,15 +46,6 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
                             writeln!(writer, "  Required Parameters:")?;
                             for param in params {
                                 writeln!(writer, "    {}", param)?;
-                            }
-                        }
-                        if !script.commands.is_empty() {
-                            writeln!(writer, "  Commands:")?;
-                            for (i, cmd) in script.commands.iter().enumerate() {
-                                writeln!(writer, "    {}. {}", i + 1, cmd.command)?;
-                                if let Some(d) = &cmd.description {
-                                    writeln!(writer, "       Description: {}", d)?;
-                                }
                             }
                         }
                     }
@@ -120,15 +113,6 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
                             writeln!(writer, "  Required Parameters:")?;
                             for param in params {
                                 writeln!(writer, "    {}", param)?;
-                            }
-                        }
-                        if !script.commands.is_empty() {
-                            writeln!(writer, "  Commands:")?;
-                            for (i, cmd) in script.commands.iter().enumerate() {
-                                writeln!(writer, "    {}. {}", i + 1, cmd.command)?;
-                                if let Some(d) = &cmd.description {
-                                    writeln!(writer, "       Description: {}", d)?;
-                                }
                             }
                         }
                     }
