@@ -7,21 +7,21 @@ use super::command::Command;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
-pub enum CommandContent {
+pub enum CommandTypes {
     /// A command defined in the script.
     Command(Command),
     /// A set of commands that should be executed together.
     Commands(Vec<Command>),
 }
 
-impl CommandContent {
+impl CommandTypes {
     pub async fn execute(
         &self,
         context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
         match self {
-            CommandContent::Command(cmd) => cmd.clone().execute(context).await,
-            CommandContent::Commands(cmds) => {
+            CommandTypes::Command(cmd) => cmd.clone().execute(context).await,
+            CommandTypes::Commands(cmds) => {
                 let num_cmds = cmds.len();
                 if num_cmds == 0 {
                     return Ok(None);

@@ -4,7 +4,7 @@ use super::operating_system::OperatingSystem;
 
 /// A set of options that control how a command is executed.
 #[derive(Debug, Deserialize, Clone, Default)]
-pub struct CommandOptions {
+pub struct Options {
     /// If true, the script continues even if this command fails.
     #[serde(default)]
     pub proceed_on_failure: bool,

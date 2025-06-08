@@ -2,35 +2,35 @@ name: "Test concurrency"
 description: "This script is designed to test the concurrency feature of Zirv by running multiple commands in parallel."
 commands:
   # First group - should be an array of commands
-  - - command: "echo Task 1 is running"
-    - command: "echo Task 2 is running"
-    - command: "echo Task 3 is running"
-    - command: "echo Task 4 is running"
-    - command: "echo Task 5 is running"
-    - command: "echo Task 6 is running"
-    - command: "echo Task 7 is running"
-    - command: "echo Task 8 is running"
-    - command: "echo Task 9 is running"
-    - command: "echo Task 10 is running"
+  - - command: echo "Task 1 is running"
+    - command: echo "Task 2 is running"
+    - command: echo "Task 3 is running"
+    - command: echo "Task 4 is running"
+    - command: echo "Task 5 is running"
+    - command: echo "Task 6 is running"
+    - command: echo "Task 7 is running"
+    - command: echo "Task 8 is running"
+    - command: echo "Task 9 is running"
+    - command: echo "Task 10 is running"
     
   
   # Second group - should be an array of commands
-  - - command: "echo Task A is running"
-    - command: "echo Task B is running"
-    - command: "echo Task C is running"
+  - - command: echo "Task A is running"
+    - command: echo "Task B is running"
+    - command: echo "Task C is running"
 
   # Third group - should be an array of commands
-  - - command: "echo Task X is running"
-    - command: "echo Task Y is running"
-    - command: "echo Task Z is running"
+  - - command: echo "Task X is running"
+    - command: echo "Task Y is running"
+    - command: echo "Task Z is running"
 
   # Fourth group - should be an array of commands
-  - - command: "echo Task Alpha is running"
-    - command: "echo Task Beta is running"
-    - command: "echo Task Gamma is running"
+  - - command: echo "Task Alpha is running"
+    - command: echo "Task Beta is running"
+    - command: echo "Task Gamma is running"
 
   # Fifth group - should be an array of commands
-  - - command: "echo Task One is running"
-    - command: "echo Task Two is running"
-    - command: "echo Task Three is running"
-    - command: "echo Task Four is running"
+  - - command: echo "Task One is running"
+    - command: echo "Task Two is running"
+    - command: echo "Task Three is running"
+    - command: echo "Task Four is running"

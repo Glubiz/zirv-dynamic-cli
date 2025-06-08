@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename = "os")]
 pub enum OperatingSystem {
     #[serde(rename = "linux")]
     Linux,

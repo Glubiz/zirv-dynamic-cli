@@ -4,7 +4,7 @@ use std::process::Stdio;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, sleep};
 
-use super::command_options::CommandOptions;
+use super::options::Options;
 
 /// Represents a single command in the YAML script.
 #[derive(Debug, Deserialize, Clone)]
@@ -16,7 +16,7 @@ pub struct Command {
     /// An optional description of what the command does.
     pub description: Option<String>,
     /// Optional options that control the behavior of the command.
-    pub options: Option<CommandOptions>,
+    pub options: Option<Options>,
 }
 
 impl Command {
@@ -44,10 +44,9 @@ impl Command {
                     return Ok(Some(
                         "Command failed but proceeding due to options".to_string(),
                     ));
-                } else {
-                    return Err(format!("Command '{}' failed: {}", self.command, e));
                 }
             }
+            return Err(format!("Command '{}' failed: {}", self.command, e));
         }
 
         if let Some(options) = &self.options {

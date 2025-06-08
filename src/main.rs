@@ -18,18 +18,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = Input::parse();
 
     // Check for built-in commands before attempting to find a script file.
-    if input.command == "help" || input.command == "h" {
-        show_help(&mut std::io::stdout())?;
-        return Ok(());
-    } else if input.command == "version" || input.command == "v" {
-        get_version(&mut std::io::stdout())?;
-        return Ok(());
-    } else if input.command == "init" || input.command == "i" {
-        init_zirv()?;
-        return Ok(());
-    } else if input.command == "create" || input.command == "c" {
-        create_script_interactive()?;
-        return Ok(());
+    match input.command.as_str() {
+        "help" | "h" => {
+            show_help(&mut std::io::stdout())?;
+            return Ok(());
+        }
+        "version" | "v" => {
+            get_version(&mut std::io::stdout())?;
+            return Ok(());
+        }
+        "init" | "i" => {
+            init_zirv()?;
+            return Ok(());
+        }
+        "create" | "c" => {
+            create_script_interactive()?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     // For all other commands, attempt to find a script file.
@@ -40,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match execute(&script, &input.params).await {
         Ok(_) => Ok(()),
         Err(e) => {
-            eprintln!("Error executing script: {}", e);
+            eprintln!("{}", e);
             Err(e.into())
         }
     }

@@ -1,0 +1,18 @@
+name: "Test Params"
+description: "This script is designed to test the parameters feature of Zirv by running commands with various parameters."
+params:
+  - "test_param1"
+  - "test_param2"
+commands:
+  - command: "echo ${test_param1}"
+    description: "Prints the first test parameter"
+    options:
+      proceed_on_failure: false
+  - command: "echo ${test_param2}"
+    description: "Prints the second test parameter"
+    options:
+      proceed_on_failure: false
+  - command: "echo Combined: ${test_param1} and ${test_param2}"
+    description: "Prints both parameters combined"
+    options:
+      proceed_on_failure: false

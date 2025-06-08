@@ -2,9 +2,9 @@ use hashbrown::HashMap;
 use script::Script;
 
 mod command;
-mod command_content;
-mod command_options;
+mod command_types;
 mod operating_system;
+mod options;
 pub mod script;
 mod secret;
 
@@ -59,4 +59,43 @@ fn build_context(
     };
 
     Ok(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::script_runner::{command::Command, command_types::CommandTypes};
+
+    #[tokio::test]
+    async fn test_build_context() {
+        let script = Script {
+            name: "Test Script".to_string(),
+            description: Some("A script for testing".to_string()),
+            params: Some(vec!["param1".to_string(), "param2".to_string()]),
+            secrets: Some(vec![secret::Secret {
+                name: "commit_password".to_string(),
+                env_var: "COMMIT_PASSWORD".to_string(),
+            }]),
+            commands: vec![CommandTypes::Command(Command {
+                command: "echo 'Hello World'".to_string(),
+                capture: None,
+                description: Some("Prints Hello World".to_string()),
+                options: None,
+            })],
+        };
+
+        unsafe {
+            std::env::set_var("COMMIT_PASSWORD", "secret123");
+        }
+
+        let context = build_context(&script, &["value1".to_string(), "value2".to_string()])
+            .expect("Failed to build context");
+
+        assert_eq!(context.get("param1"), Some(&"value1".to_string()));
+        assert_eq!(context.get("param2"), Some(&"value2".to_string()));
+        assert_eq!(
+            context.get("commit_password"),
+            Some(&"secret123".to_string())
+        );
+    }
 }
