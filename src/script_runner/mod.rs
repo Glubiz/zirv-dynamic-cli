@@ -3,6 +3,7 @@ use script::Script;
 
 mod command;
 mod command_types;
+mod fallback_command;
 mod operating_system;
 mod options;
 pub mod script;

@@ -40,6 +40,17 @@ impl Command {
 
         if let Err(e) = invoke {
             if let Some(options) = &self.options {
+                if let Some(commands) = &options.fallback {
+                    for cmd in commands {
+                        if let Err(fallback_error) = cmd.invoke().await {
+                            return Err(format!(
+                                "Command '{}' failed and fallback '{}' also failed: {}",
+                                self.command, cmd.command, fallback_error
+                            ));
+                        }
+                    }
+                }
+
                 if options.proceed_on_failure {
                     return Ok(Some(
                         "Command failed but proceeding due to options".to_string(),
