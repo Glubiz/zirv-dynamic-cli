@@ -1,10 +1,12 @@
 shortcuts:
-  gc: commit.yaml
-  tno: test-no_options.yaml
-  tof: test-on_failure.yaml
-  t: test.yaml
   tf: test-fail.yaml
-  ts: test-secret.yaml
   tp: test-params.yaml
-  tc: test-capture.yaml
+  gc: commit.yaml
+  tfp: test-fallback-proceed-on-failure.yaml
+  tfb: test-fallback.yaml
+  t: test.yaml
+  tno: test-no_options.yaml
   tcc: test-concurrentcy.yaml
+  tc: test-capture.yaml
+  tof: test-on_failure.yaml
+  ts: test-secret.yaml
