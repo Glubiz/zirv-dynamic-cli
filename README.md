@@ -32,7 +32,7 @@
 
 - **YAML-Driven Scripts**: Define commands in `.zirv/` files with metadata (name, description, params, secrets).  
 - **Capture Output**: Use `capture: var_name` on any step to grab its stdout into `${var_name}` for later substitution.  
-- **Failure Hooks**: On a step failure you can declare an `on_failure` sub-chain of commands, then retry the original step once.  
+- **Failure Hooks**: On a step failure you can declare an `fallback` sub-chain of commands, then retry the original step once.  
 - **Flexible Options**: Interactive mode, OS filters, `proceed_on_failure`, delays, and secret support.  
 - **Multi-Format**: Supports YAML, JSON, and TOML—extendable.  
 - **Cross-Platform**: Compatible with Windows, macOS, and Linux.
@@ -132,7 +132,7 @@ commands:
 First step stores `hello` in the variable `${greeting}`, which is then used in the second step to print `Got: hello`.
 
 ### Failure Hooks
-Declare a failure hook for a command using `on_failure`:
+Declare a failure hook for a command using `fallback`:
 
 ```yaml
 name: OnFailure Demo
@@ -140,7 +140,7 @@ commands:
   - command: "sh -c 'exit 1'"
     options:
       proceed_on_failure: true     # continue even if retry also fails
-      on_failure:
+      fallback:
         - command: "echo 'Fallback action'"
 ```
 
@@ -165,6 +165,21 @@ Run the `deploy` script with:
 ```bash
 zirv deploy
 ```
+
+### Multithreading
+You can run commands in parallel by nesting lists. For example:
+
+```yaml
+name: Parallel Commands
+commands:
+  - - command: "echo 'Running Task A'"
+    - command: "echo 'Running Task B'"
+  - - command: "echo 'Running Task 1'"
+    - command: "echo 'Running Task 2'"
+```
+
+This will run "Task A" and "Task B" in one thread, and "Task 1" and "Task 2" in another thread, allowing for concurrent execution.
+One thing to note is that the max number of threads is limited to 4, however this can be changed in the source code if needed.
 
 ## Configuration
 ### Directory Structure
@@ -195,10 +210,10 @@ commands:
     description: Prints greeting
     options:
       interactive: true
-      operating_system: linux
+      os: linux
       proceed_on_failure: false
       delay_ms: 2000
-      on_failure:
+      fallback:
         - command: "echo 'Attempting fallback...'"
 secrets:
   - name: api_key
@@ -224,10 +239,10 @@ secrets:
       "description": "Prints greeting",
       "options": {
         "interactive": true,
-        "operating_system": "linux",
+        "os": "linux",
         "proceed_on_failure": false,
         "delay_ms": 2000,
-        "on_failure": [
+        "fallback": [
           {
             "command": "echo 'Attempting fallback...'"
           }
@@ -258,11 +273,11 @@ options.interactive = false
 [[commands]]
 command = "echo Token is ${token}"
 options.interactive = true
-options.operating_system = "linux"
+options.os = "linux"
 options.proceed_on_failure = false
 options.delay_ms = 2000
 
-[[commands.options.on_failure]]
+[[commands.options.fallback]]
 command = "echo 'Attempting fallback...'"
 
 [[secrets]]
@@ -287,7 +302,7 @@ This will execute the `build.yaml` script.
 - macOS
 - Linux
 
-Commands can target specific operating systems using the `operating_system` option in the script configuration.
+Commands can target specific operating systems using the `os` option in the script configuration.
 - `windows`: Windows OS
 - `linux`: Linux OS
 - `macos`: macOS
