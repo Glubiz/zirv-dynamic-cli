@@ -4,40 +4,50 @@ use commands::{
 };
 
 mod commands;
-mod run;
-mod structs;
+mod input;
+mod script_runner;
 mod utils;
 
-use run::run as run_yaml;
-use structs::file::File;
-use utils::find_script_file;
+use input::Input;
+use script_runner::execute;
+use utils::file_to_script;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI arguments.
-    let cli = File::parse();
+    let input = Input::parse();
 
     // Check for built-in commands before attempting to find a script file.
-    if cli.name == "help" || cli.name == "h" {
-        show_help(&mut std::io::stdout())?;
-        return Ok(());
-    } else if cli.name == "version" || cli.name == "v" {
-        get_version(&mut std::io::stdout())?;
-        return Ok(());
-    } else if cli.name == "init" || cli.name == "i" {
-        init_zirv()?;
-        return Ok(());
-    } else if cli.name == "create" || cli.name == "c" {
-        create_script_interactive()?;
-        return Ok(());
+    match input.command.as_str() {
+        "help" | "h" => {
+            show_help(&mut std::io::stdout())?;
+            return Ok(());
+        }
+        "version" | "v" => {
+            get_version(&mut std::io::stdout())?;
+            return Ok(());
+        }
+        "init" | "i" => {
+            init_zirv()?;
+            return Ok(());
+        }
+        "create" | "c" => {
+            create_script_interactive()?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     // For all other commands, attempt to find a script file.
-    match find_script_file(&cli.name) {
-        Ok(path) => run_yaml(&path, &cli.params).await,
+    let file_path = input.get_file_path()?;
+
+    let script = file_to_script(&file_path)?;
+
+    match execute(&script, &input.params).await {
+        Ok(_) => Ok(()),
         Err(e) => {
-            eprintln!("Error: {}", e);
-            Ok(())
+            eprintln!("{}", e);
+            Err(e.into())
         }
     }
 }

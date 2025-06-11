@@ -1,0 +1,10 @@
+name: "Test Fallback Proceed on Failure"
+description: "Test script to check fallback behavior when proceed_on_failure is set to true."
+commands:
+  - command: echo "hello"
+  - command: exit 1
+    options:
+      proceed_on_failure: false
+      fallback:
+        - command: echo "Fallback command executed"
+  - command: echo "This should not run if the previous command fails"

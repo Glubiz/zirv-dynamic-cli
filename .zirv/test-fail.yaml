@@ -1,0 +1,9 @@
+name: "Test Fail"
+description: "This script is designed to test the failure handling of Zirv by running commands that are expected to fail."
+commands:
+  - command: "echo hello"
+    description: "Prints hello"
+  - command: "exit 1"
+    description: "This command is expected to fail"
+  - command: "echo This should not run if the previous command fails"
+    description: "This command should not run if the previous command fails"
