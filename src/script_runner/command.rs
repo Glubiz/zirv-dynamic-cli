@@ -1,8 +1,10 @@
 use hashbrown::HashMap;
 use serde::Deserialize;
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, sleep};
+
+use crate::script_runner::Shell;
 
 use super::options::Options;
 
@@ -22,6 +24,7 @@ pub struct Command {
 impl Command {
     pub async fn execute(
         &mut self,
+        shell: &mut Child,
         context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
         // OS filter
@@ -36,7 +39,7 @@ impl Command {
         // Substitute parameters in the command string
         self.substitute_params(context);
 
-        let invoke = self.invoke(&self.command, context).await;
+        let invoke = self.invoke(shell, &self.command, context).await;
 
         if let Err(e) = invoke {
             if let Some(options) = &self.options {
@@ -71,20 +74,10 @@ impl Command {
 
     async fn invoke(
         &self,
+        shell: &mut Child,
         command: &str,
         context: &mut HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Pick shell based on the OS
-        let mut shell = if cfg!(windows) {
-            let mut c = TokioCommand::new("powershell");
-            c.arg("-Command").arg(command);
-            c
-        } else {
-            let mut c = TokioCommand::new("sh");
-            c.arg("-c").arg(command);
-            c
-        };
-
         println!("Executing command: {}", command);
         if let Some(description) = &self.description {
             println!("Description: {}", description);

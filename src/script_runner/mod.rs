@@ -1,3 +1,5 @@
+use std::{io::Error, process::{Child, Command}};
+
 use hashbrown::HashMap;
 use script::Script;
 
@@ -8,6 +10,20 @@ mod operating_system;
 mod options;
 pub mod script;
 mod secret;
+
+pub enum Shell {
+    Parrent(Command),
+    Child(Child),
+}
+
+impl Shell {
+    fn into_child(self) -> Result<Child, Error> {
+        match self {
+            Shell::Parrent(mut cmd)   => cmd.spawn(),
+            Shell::Child(ch) => Ok(ch),
+        }
+    }
+}
 
 pub async fn execute(script: &Script, params: &[String]) -> Result<(), String> {
     // Build the context from script parameters and secrets
