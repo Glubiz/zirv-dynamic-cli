@@ -27,7 +27,7 @@ impl FallbackCommand {
 
         println!("Executing command: {}", &self.command);
         if let Some(description) = &self.description {
-            println!("Description: {}", description);
+            println!("Description: {description}");
         }
 
         if let Some(options) = &self.options {

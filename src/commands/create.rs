@@ -65,19 +65,19 @@ pub fn create_script_interactive() -> Result<(), Box<dyn std::error::Error>> {
     // Create the target directory if it doesn't exist.
     if !target_dir.exists() {
         fs::create_dir_all(&target_dir)?;
-        println!("Created directory: {:?}", target_dir);
+        println!("Created directory: {target_dir:?}");
     } else {
-        println!("Directory already exists: {:?}", target_dir);
+        println!("Directory already exists: {target_dir:?}");
     }
 
     // Create the new YAML script file.
-    let file_name = format!("{}.yaml", name);
+    let file_name = format!("{name}.yaml");
     let script_path = target_dir.join(&file_name);
     if script_path.exists() {
-        println!("Script file already exists: {:?}", script_path);
+        println!("Script file already exists: {script_path:?}");
     } else {
         fs::write(&script_path, DEFAULT_TEMPLATE)?;
-        println!("Created script file: {:?}", script_path);
+        println!("Created script file: {script_path:?}");
     }
 
     // If a shortcut key was provided, update (or create) the .shortcuts.yaml file.
@@ -94,7 +94,7 @@ pub fn create_script_interactive() -> Result<(), Box<dyn std::error::Error>> {
             .insert(shortcut.clone(), file_name.clone());
         let yaml_string = serde_yaml::to_string(&shortcuts)?;
         fs::write(&shortcuts_path, yaml_string)?;
-        println!("Updated shortcuts file: {:?}", shortcuts_path);
+        println!("Updated shortcuts file: {shortcuts_path:?}");
     }
 
     Ok(())

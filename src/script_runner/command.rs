@@ -85,9 +85,9 @@ impl Command {
             c
         };
 
-        println!("Executing command: {}", command);
+        println!("Executing command: {command}");
         if let Some(description) = &self.description {
-            println!("Description: {}", description);
+            println!("Description: {description}");
         }
 
         if let Some(options) = &self.options {
@@ -102,7 +102,7 @@ impl Command {
         if let Some(var) = &self.capture {
             let out = shell.output().await?;
             if !out.status.success() {
-                return Err(format!("`{}` failed", command).into());
+                return Err(format!("`{command}` failed").into());
             }
 
             let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -114,7 +114,7 @@ impl Command {
             let status = shell.status().await?;
 
             if !status.success() {
-                return Err(format!("`{}` failed", command).into());
+                return Err(format!("`{command}` failed").into());
             }
 
             Ok(())
@@ -123,7 +123,7 @@ impl Command {
 
     fn substitute_params(&mut self, params: &HashMap<String, String>) -> &Self {
         for (key, value) in params {
-            let placeholder = format!("${{{}}}", key);
+            let placeholder = format!("${{{key}}}");
             self.command = self.command.replace(&placeholder, value);
         }
 

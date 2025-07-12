@@ -32,20 +32,20 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
                         } else if ext == "toml" {
                             toml::from_str(&content)?
                         } else {
-                            return Err(format!("Unsupported file extension: {}", ext).into());
+                            return Err(format!("Unsupported file extension: {ext}").into());
                         };
 
                         let file_name = path.file_name().unwrap().to_string_lossy();
                         writeln!(writer, "-------------------------------------------------")?;
-                        writeln!(writer, "File: {}", file_name)?;
+                        writeln!(writer, "File: {file_name}")?;
                         writeln!(writer, "  Name: {}", script.name)?;
                         if let Some(desc) = script.description {
-                            writeln!(writer, "  Description: {}", desc)?;
+                            writeln!(writer, "  Description: {desc}")?;
                         }
                         if let Some(params) = &script.params {
                             writeln!(writer, "  Required Parameters:")?;
                             for param in params {
-                                writeln!(writer, "    {}", param)?;
+                                writeln!(writer, "    {param}")?;
                             }
                         }
                     }
@@ -60,7 +60,7 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             let content = fs::read_to_string(shortcuts_path)?;
             let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
             for (key, value) in shortcuts.shortcuts {
-                writeln!(writer, "  {} -> {}", key, value)?;
+                writeln!(writer, "  {key} -> {value}")?;
             }
             writeln!(writer, "  i -> init")?;
             writeln!(writer, "  c -> create")?;
@@ -79,6 +79,7 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             writer,
             "Global scripts are overwritten by above mentioned scripts if they share name."
         )?;
+        writeln!(writer, "Home Directory: {root:?}")?;
 
         let extensions = ["yaml", "yml", "json", "toml"];
 
@@ -99,20 +100,20 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
                         } else if ext == "toml" {
                             toml::from_str(&content)?
                         } else {
-                            return Err(format!("Unsupported file extension: {}", ext).into());
+                            return Err(format!("Unsupported file extension: {ext}").into());
                         };
 
                         let file_name = path.file_name().unwrap().to_string_lossy();
                         writeln!(writer, "-------------------------------------------------")?;
-                        writeln!(writer, "File: {}", file_name)?;
+                        writeln!(writer, "File: {file_name}")?;
                         writeln!(writer, "  Name: {}", script.name)?;
                         if let Some(desc) = script.description {
-                            writeln!(writer, "  Description: {}", desc)?;
+                            writeln!(writer, "  Description: {desc}")?;
                         }
                         if let Some(params) = &script.params {
                             writeln!(writer, "  Required Parameters:")?;
                             for param in params {
-                                writeln!(writer, "    {}", param)?;
+                                writeln!(writer, "    {param}")?;
                             }
                         }
                     }
@@ -127,15 +128,14 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             let content = fs::read_to_string(shortcuts_path)?;
             let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
             for (key, value) in shortcuts.shortcuts {
-                writeln!(writer, "  {} -> {}", key, value)?;
+                writeln!(writer, "  {key} -> {value}")?;
             }
         }
     } else {
         // If no .zirv directory is found, prompt the user to create one.
         writeln!(
             writer,
-            "No scripts found. Please create a .zirv directory in {:?}.",
-            root
+            "No scripts found. Please create a .zirv directory in {root:?}."
         )?;
     }
 

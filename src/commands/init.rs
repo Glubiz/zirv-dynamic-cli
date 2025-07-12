@@ -25,16 +25,13 @@ where
 
     if !home_zirv.exists() {
         fs::create_dir_all(&home_zirv)?;
-        println!("Created .zirv in home directory: {:?}", home_zirv);
+        println!("Created .zirv in home directory: {home_zirv:?}");
     }
     // Create default .shortcuts.yaml in home folder if not present.
     let home_shortcuts = home_zirv.join(".shortcuts.yaml");
     if !home_shortcuts.exists() {
         fs::write(&home_shortcuts, DEFAULT_SHORTCUTS)?;
-        println!(
-            "Created default .shortcuts.yaml in home directory: {:?}",
-            home_shortcuts
-        );
+        println!("Created default .shortcuts.yaml in home directory: {home_shortcuts:?}");
     }
 
     // Get the current directory.
@@ -45,14 +42,13 @@ where
         let init_current = confirm_fn()?;
         if init_current {
             fs::create_dir_all(&current_zirv)?;
-            println!("Created .zirv in current directory: {:?}", current_zirv);
-            // Create default .shortcuts.yaml in current directory.
+            println!("Created .zirv in current directory: {current_zirv:?}");
+            // Create default .shortcuts.yaml in current dicurrent_zirvrect
             let current_shortcuts = current_zirv.join(".shortcuts.yaml");
             if !current_shortcuts.exists() {
                 fs::write(&current_shortcuts, DEFAULT_SHORTCUTS)?;
                 println!(
-                    "Created default .shortcuts.yaml in current directory: {:?}",
-                    current_shortcuts
+                    "Created default .shortcuts.yaml in current directory: {current_shortcuts:?}"
                 );
             }
         } else {

@@ -59,7 +59,7 @@ impl CommandTypes {
                         for mut cmd in cmd_group {
                             match futures::executor::block_on(cmd.execute(&mut local_context)) {
                                 Ok(output) => group_results.push(output),
-                                Err(e) => return Err(format!("Command execution failed: {}", e)),
+                                Err(e) => return Err(format!("Command execution failed: {e}")),
                             }
                         }
 
