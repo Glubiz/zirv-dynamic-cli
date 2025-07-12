@@ -43,7 +43,7 @@ impl Input {
                     return Ok(path.canonicalize()?);
                 }
                 for ext in &extensions {
-                    let path = base_dir.join(format!("{}.{}", mapped_file, ext));
+                    let path = base_dir.join(format!("{mapped_file}.{ext}"));
                     if path.exists() {
                         return Ok(path.canonicalize()?);
                     }
@@ -70,7 +70,7 @@ impl Input {
                     return Ok(path.canonicalize()?);
                 }
                 for ext in &extensions {
-                    let path = root.join(format!("{}.{}", mapped_file, ext));
+                    let path = root.join(format!("{mapped_file}.{ext}"));
                     if path.exists() {
                         return Ok(path.canonicalize()?);
                     }

@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match execute(&script, &input.params).await {
         Ok(_) => Ok(()),
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("{e}");
             Err(e.into())
         }
     }

@@ -15,7 +15,7 @@ pub fn file_to_script(path: &PathBuf) -> Result<Script, Box<dyn std::error::Erro
         "yaml" | "yml" => serde_yaml::from_str(&content)?,
         "json" => serde_json::from_str(&content)?,
         "toml" => toml::from_str(&content)?,
-        other => return Err(format!("Unsupported extension: {}", other).into()),
+        other => return Err(format!("Unsupported extension: {other}").into()),
     };
 
     Ok(script)
