@@ -79,6 +79,7 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             writer,
             "Global scripts are overwritten by above mentioned scripts if they share name."
         )?;
+        writeln!(writer, "Home Directory: {root:?}")?;
 
         let extensions = ["yaml", "yml", "json", "toml"];
 
