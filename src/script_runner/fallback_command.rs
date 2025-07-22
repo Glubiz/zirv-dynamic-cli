@@ -1,11 +1,11 @@
 use std::process::Stdio;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
 
 use crate::script_runner::options::Options;
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct FallbackCommand {
     pub command: String,
     pub description: Option<String>,

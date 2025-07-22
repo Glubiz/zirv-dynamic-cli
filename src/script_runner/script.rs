@@ -1,9 +1,9 @@
 use hashbrown::HashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{command_types::CommandTypes, secret::Secret};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Script {
     /// A descriptive name for the script.
     pub name: String,

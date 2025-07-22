@@ -179,8 +179,8 @@ Run the `deploy` script with:
 zirv deploy
 ```
 
-### Multithreading
-You can run commands in parallel by nesting lists. For example:
+### Concurrent Shells
+You can open multiple terminals at once by nesting lists. For example:
 
 ```yaml
 name: Parallel Commands
@@ -191,8 +191,7 @@ commands:
     - command: "echo 'Running Task 2'"
 ```
 
-This will run "Task A" and "Task B" in one thread, and "Task 1" and "Task 2" in another thread, allowing for concurrent execution.
-One thing to note is that the max number of threads is limited to 4, however this can be changed in the source code if needed.
+Each nested list spawns its own shell window.  Every window executes the commands listed in that group and stays open until they finish.
 
 ## Configuration
 ### Directory Structure
