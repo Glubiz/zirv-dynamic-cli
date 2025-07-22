@@ -11,14 +11,14 @@ keywords = ["cli", "yaml", "automation", "developer"]
 categories = ["development-tools"]
 
 [dependencies]
-clap = { version = "4.5.40", features = ["derive"] }
+clap = { version = "4.5.41", features = ["derive"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_yaml = "0.9.33"
-serde_json = "1.0.68"
-toml = "0.8.23"
+serde_json = "1.0.141"
+toml = "0.9.2"
 dirs = "6.0.0"
 dialoguer = "0.11.0"
-tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "time", "process"] }
+tokio = { version = "1.46.1", features = ["macros", "rt-multi-thread", "time", "process"] }
 hashbrown = { version = "0.15.4", features = ["serde"] }
 futures = "0.3.30"
 
