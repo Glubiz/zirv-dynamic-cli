@@ -1,11 +1,13 @@
-use std::thread;
+use std::fs::File;
+use std::io::Write;
+use std::process::Command as StdCommand;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::{command::Command, script::Script};
 use hashbrown::HashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::command::Command;
-
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum CommandTypes {
     /// A command defined in the script.
@@ -22,69 +24,90 @@ impl CommandTypes {
         match self {
             CommandTypes::Command(cmd) => cmd.clone().execute(context).await,
             CommandTypes::Commands(cmds) => {
-                let num_cmds = cmds.len();
-                if num_cmds == 0 {
+                if cmds.is_empty() {
                     return Ok(None);
                 }
 
-                // Determine number of threads to create
-                let num_threads = if num_cmds < 4 { num_cmds } else { 4 };
-                let mut handles = Vec::new();
-                let mut results = Vec::with_capacity(num_cmds);
-
-                // Group commands for thread allocation
-                let mut command_groups: Vec<Vec<Command>> = Vec::with_capacity(num_threads);
-                for _ in 0..num_threads {
-                    command_groups.push(Vec::new());
-                }
-
-                // Distribute commands across groups
-                for (i, cmd) in cmds.iter().enumerate() {
-                    let group_index = i % num_threads;
-                    command_groups[group_index].push(cmd.clone());
-                }
-
-                // Spawn threads for each group
-                for cmd_group in command_groups {
-                    if cmd_group.is_empty() {
-                        continue;
-                    }
-
-                    let context_clone = context.clone();
-
-                    handles.push(thread::spawn(move || {
-                        let mut group_results = Vec::new();
-                        let mut local_context = context_clone;
-
-                        for mut cmd in cmd_group {
-                            match futures::executor::block_on(cmd.execute(&mut local_context)) {
-                                Ok(output) => group_results.push(output),
-                                Err(e) => return Err(format!("Command execution failed: {e}")),
-                            }
-                        }
-
-                        Ok(group_results)
-                    }));
-                }
-
-                // Collect results from all threads
-                for handle in handles {
-                    match handle.join() {
-                        Ok(group_result) => match group_result {
-                            Ok(outputs) => results.extend(outputs),
-                            Err(e) => return Err(e),
-                        },
-                        Err(_) => {
-                            return Err("Thread panicked during command execution".to_string());
-                        }
+                // Substitute parameters for each command before spawning the shell
+                let mut substituted = cmds.clone();
+                for cmd in &mut substituted {
+                    for (key, value) in context.iter() {
+                        let placeholder = format!("${{{key}}}");
+                        cmd.command = cmd.command.replace(&placeholder, value);
                     }
                 }
 
-                // Combine all outputs
-                let combined_results: Vec<String> = results.into_iter().flatten().collect();
+                let temp_script = Script {
+                    name: "zirv_concurrency".to_string(),
+                    description: None,
+                    params: None,
+                    secrets: None,
+                    commands: substituted.into_iter().map(CommandTypes::Command).collect(),
+                };
 
-                Ok(Some(combined_results.join(",")))
+                let yaml = serde_yaml::to_string(&temp_script).map_err(|e| e.to_string())?;
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!("zirv_{timestamp}.yaml"));
+                let mut file = File::create(&path).map_err(|e| e.to_string())?;
+                file.write_all(yaml.as_bytes()).map_err(|e| e.to_string())?;
+
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let exec_cmd = format!("{} {}", exe.display(), path.display());
+                spawn_terminal(&exec_cmd)?;
+                Ok(None)
             }
+        }
+    }
+}
+
+fn spawn_terminal(command: &str) -> Result<(), String> {
+    if cfg!(target_os = "windows") {
+        StdCommand::new("cmd")
+            .args(["/C", "start", "cmd", "/K", command])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else if cfg!(target_os = "macos") {
+        StdCommand::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "tell application \"Terminal\" to do script \"{}\"",
+                command.replace('"', "\\\"")
+            ))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        // Try gnome-terminal, x-terminal-emulator, then xterm
+        if StdCommand::new("gnome-terminal")
+            .arg("--")
+            .arg("bash")
+            .arg("-c")
+            .arg(format!("{command}; exec bash"))
+            .spawn()
+            .is_ok()
+            || StdCommand::new("x-terminal-emulator")
+                .arg("-e")
+                .arg("bash")
+                .arg("-c")
+                .arg(format!("{command}; exec bash"))
+                .spawn()
+                .is_ok()
+        {
+            Ok(())
+        } else {
+            StdCommand::new("xterm")
+                .arg("-hold")
+                .arg("-e")
+                .arg("bash")
+                .arg("-c")
+                .arg(format!("{command}; exec bash"))
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }
     }
 }

@@ -1,5 +1,5 @@
 use hashbrown::HashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, sleep};
@@ -7,7 +7,7 @@ use tokio::time::{Duration, sleep};
 use super::options::Options;
 
 /// Represents a single command in the YAML script.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Command {
     /// The shell command to execute.
     pub command: String,

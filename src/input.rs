@@ -23,6 +23,11 @@ pub struct Input {
 
 impl Input {
     pub fn get_file_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let cmd_path = PathBuf::from(&self.command);
+        if cmd_path.exists() {
+            return Ok(cmd_path.canonicalize()?);
+        }
+
         let base_dir = PathBuf::from(".zirv");
         let extensions = ["yaml", "yml", "json", "toml"];
 
