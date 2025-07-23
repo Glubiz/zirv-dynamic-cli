@@ -193,6 +193,15 @@ commands:
 
 Each nested list spawns its own shell window.  Every window executes the commands listed in that group and stays open until they finish.
 
+The built-in `cd` command updates the working directory for any following
+commands in the same window, allowing scripts like:
+
+```yaml
+commands:
+  - - command: "cd backend"
+    - command: "cargo run"
+```
+
 ## Configuration
 ### Directory Structure
 The `.zirv/` directory contains your scripts and a configuration file. The structure is as follows:

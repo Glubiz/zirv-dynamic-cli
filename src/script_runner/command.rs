@@ -36,6 +36,31 @@ impl Command {
         // Substitute parameters in the command string
         self.substitute_params(context);
 
+        if let Some(rest) = self.command.trim_start().strip_prefix("cd ") {
+            let dir = rest.trim();
+
+            let mut path = std::path::PathBuf::new();
+            if let Some(cwd) = context.get("cwd") {
+                path.push(cwd);
+            } else if let Ok(cwd) = std::env::current_dir() {
+                path.push(cwd);
+            }
+
+            if std::path::Path::new(dir).is_absolute() {
+                path = std::path::PathBuf::from(dir);
+            } else {
+                path.push(dir);
+            }
+
+            if let Ok(p) = path.canonicalize() {
+                context.insert("cwd".to_string(), p.to_string_lossy().to_string());
+            } else {
+                return Err(format!("Failed to change directory to {dir}"));
+            }
+
+            return Ok(None);
+        }
+
         let invoke = self.invoke(&self.command, context).await;
 
         if let Err(e) = invoke {
