@@ -55,7 +55,29 @@ impl CommandTypes {
                 file.write_all(yaml.as_bytes()).map_err(|e| e.to_string())?;
 
                 let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                let exec_cmd = format!("{} {}", exe.display(), path.display());
+                let cwd = context.get("cwd").cloned().unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        .to_string_lossy()
+                        .to_string()
+                });
+
+                let exec_cmd = if cfg!(windows) {
+                    format!(
+                        "cd /d \"{}\" && \"{}\" \"{}\"",
+                        cwd,
+                        exe.display(),
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "cd \"{}\" && \"{}\" \"{}\"",
+                        cwd,
+                        exe.display(),
+                        path.display()
+                    )
+                };
+
                 spawn_terminal(&exec_cmd)?;
                 Ok(None)
             }

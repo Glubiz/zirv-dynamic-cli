@@ -110,6 +110,10 @@ impl Command {
             c
         };
 
+        if let Some(cwd) = context.get("cwd") {
+            shell.current_dir(cwd);
+        }
+
         println!("Executing command: {command}");
         if let Some(description) = &self.description {
             println!("Description: {description}");
