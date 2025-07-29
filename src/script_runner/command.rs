@@ -101,8 +101,8 @@ impl Command {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Pick shell based on the OS
         let mut shell = if cfg!(windows) {
-            let mut c = TokioCommand::new("powershell");
-            c.arg("-Command").arg(command);
+            let mut c = TokioCommand::new("cmd");
+            c.arg("/C").arg(command);
             c
         } else {
             let mut c = TokioCommand::new("sh");
