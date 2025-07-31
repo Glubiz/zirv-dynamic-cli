@@ -19,22 +19,37 @@ pub struct Script {
 
 impl Script {
     pub async fn run(&self, context: &mut HashMap<String, String>) -> Result<(), String> {
-        // Execution loop
+        // Spawned task handles for concurrent command groups
+        let mut handles = Vec::new();
+
         for step in &self.commands {
-            match step.execute(context).await {
-                Ok(output) => {
-                    if output.is_some() {
-                        // If the command returns output, you can handle it here
-                        println!("Command output: {}", output.unwrap());
+            match step {
+                CommandTypes::Command(cmd) => {
+                    // Run sequential command and propagate errors immediately
+                    if let Err(e) = cmd.clone().execute(context).await {
+                        return Err(format!(
+                            "Error executing command in script '{}': {}",
+                            self.name, e
+                        ));
                     }
                 }
-                Err(e) => {
-                    return Err(format!(
-                        "Error executing command in script '{}': {}",
-                        self.name, e
-                    ));
+                CommandTypes::Commands(cmds) => {
+                    // Each command group runs in its own context and task
+                    let cmds_clone = cmds.clone();
+                    let mut ctx_clone = context.clone();
+                    handles.push(tokio::spawn(async move {
+                        for mut c in cmds_clone {
+                            c.execute(&mut ctx_clone).await?;
+                        }
+                        Ok::<(), String>(())
+                    }));
                 }
             }
+        }
+
+        // Await all concurrent groups and surface any errors
+        for handle in handles {
+            handle.await.map_err(|e| e.to_string())??;
         }
 
         Ok(())

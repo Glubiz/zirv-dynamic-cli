@@ -13,7 +13,7 @@ pub struct FallbackCommand {
 }
 
 impl FallbackCommand {
-    pub async fn invoke(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn invoke(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Pick shell based on the OS
         let mut shell = if cfg!(windows) {
             let mut c = TokioCommand::new("cmd");

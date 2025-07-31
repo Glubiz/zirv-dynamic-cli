@@ -98,7 +98,7 @@ impl Command {
         &self,
         command: &str,
         context: &mut HashMap<String, String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Pick shell based on the OS
         let mut shell = if cfg!(windows) {
             let mut c = TokioCommand::new("cmd");
@@ -129,7 +129,10 @@ impl Command {
         }
 
         if let Some(var) = &self.capture {
-            let out = shell.output().await?;
+            let out = shell
+                .output()
+                .await
+                .map_err(|e| format!("Failed to spawn `{command}`: {e}"))?;
             if !out.status.success() {
                 return Err(format!("`{command}` failed").into());
             }
@@ -140,7 +143,10 @@ impl Command {
 
             Ok(())
         } else {
-            let status = shell.status().await?;
+            let status = shell
+                .status()
+                .await
+                .map_err(|e| format!("Failed to spawn `{command}`: {e}"))?;
 
             if !status.success() {
                 return Err(format!("`{command}` failed").into());
