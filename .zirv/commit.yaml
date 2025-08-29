@@ -3,6 +3,7 @@ description: "Commits changes with a provided commit message"
 params:
   - "commit_message"
 commands:
+  - command: cargo fmt
   - command: zirv t
     description: "Run tests, check code formatting, and run clippy lint"
     options:
