@@ -25,12 +25,11 @@ impl Command {
         context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
         // OS filter
-        if let Some(options) = &self.options {
-            if let Some(os) = &options.operating_system {
-                if !os.is_current() {
-                    return Ok(Some("Command skipped due to OS filter".to_string()));
-                }
-            }
+        if let Some(options) = &self.options
+            && let Some(os) = &options.operating_system
+            && !os.is_current()
+        {
+            return Ok(Some("Command skipped due to OS filter".to_string()));
         }
 
         // Substitute parameters in the command string
@@ -85,10 +84,10 @@ impl Command {
             return Err(format!("Command '{}' failed: {}", self.command, e));
         }
 
-        if let Some(options) = &self.options {
-            if let Some(d) = options.delay_ms {
-                sleep(Duration::from_millis(d)).await;
-            }
+        if let Some(options) = &self.options
+            && let Some(d) = options.delay_ms
+        {
+            sleep(Duration::from_millis(d)).await;
         }
 
         Ok(None)
@@ -119,13 +118,13 @@ impl Command {
             println!("Description: {description}");
         }
 
-        if let Some(options) = &self.options {
-            if options.interactive {
-                shell
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit());
-            }
+        if let Some(options) = &self.options
+            && options.interactive
+        {
+            shell
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
         }
 
         if let Some(var) = &self.capture {
