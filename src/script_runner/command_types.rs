@@ -20,9 +20,10 @@ impl CommandTypes {
     pub async fn execute(
         &self,
         context: &mut HashMap<String, String>,
+        tx: Option<tokio::sync::mpsc::Sender<super::UiEvent>>,
     ) -> Result<Option<String>, String> {
         match self {
-            CommandTypes::Command(cmd) => cmd.clone().execute(context).await,
+            CommandTypes::Command(cmd) => cmd.clone().execute(context, tx).await,
             CommandTypes::Commands(cmds) => {
                 if cmds.is_empty() {
                     return Ok(None);

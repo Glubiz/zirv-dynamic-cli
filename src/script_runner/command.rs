@@ -23,6 +23,7 @@ impl Command {
     pub async fn execute(
         &mut self,
         context: &mut HashMap<String, String>,
+        tx: Option<tokio::sync::mpsc::Sender<super::UiEvent>>,
     ) -> Result<Option<String>, String> {
         // OS filter
         if let Some(options) = &self.options {
@@ -61,7 +62,7 @@ impl Command {
             return Ok(None);
         }
 
-        let invoke = self.invoke(&self.command, context).await;
+        let invoke = self.invoke(&self.command, context, tx.clone()).await;
 
         if let Err(e) = invoke {
             if let Some(options) = &self.options {
@@ -98,7 +99,8 @@ impl Command {
         &self,
         command: &str,
         context: &mut HashMap<String, String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        tx: Option<tokio::sync::mpsc::Sender<super::UiEvent>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Pick shell based on the OS
         let mut shell = if cfg!(windows) {
             let mut c = TokioCommand::new("powershell");
@@ -114,9 +116,25 @@ impl Command {
             shell.current_dir(cwd);
         }
 
-        println!("Executing command: {command}");
-        if let Some(description) = &self.description {
-            println!("Description: {description}");
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(super::UiEvent::CommandStart {
+                    command: command.to_string(),
+                })
+                .await;
+            if let Some(description) = &self.description {
+                let _ = tx
+                    .send(super::UiEvent::Log {
+                        line: format!("Description: {description}"),
+                        is_error: false,
+                    })
+                    .await;
+            }
+        } else {
+            println!("Executing command: {command}");
+            if let Some(description) = &self.description {
+                println!("Description: {description}");
+            }
         }
 
         if let Some(options) = &self.options {
@@ -133,14 +151,35 @@ impl Command {
             if !out.status.success() {
                 return Err(format!("`{command}` failed").into());
             }
-
             let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-
             context.insert(var.clone(), val);
-
             Ok(())
         } else {
-            let status = shell.status().await?;
+            shell.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut child = shell.spawn()?;
+
+            let stdout_lines = child
+                .stdout
+                .take()
+                .map(|out| tokio::spawn(read_lines(out, tx.clone(), false)));
+            let stderr_lines = child
+                .stderr
+                .take()
+                .map(|err| tokio::spawn(read_lines(err, tx.clone(), true)));
+
+            let status = child.wait().await?;
+
+            if let Some(handle) = stdout_lines {
+                let _ = handle.await;
+            }
+            if let Some(handle) = stderr_lines {
+                let _ = handle.await;
+            }
+
+            let code = status.code().unwrap_or_default();
+            if let Some(tx) = &tx {
+                let _ = tx.send(super::UiEvent::CommandEnd { status: code }).await;
+            }
 
             if !status.success() {
                 return Err(format!("`{command}` failed").into());
@@ -157,6 +196,25 @@ impl Command {
         }
 
         self
+    }
+}
+
+/// Read lines asynchronously from the given reader and send them as log events.
+async fn read_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    tx: Option<tokio::sync::mpsc::Sender<super::UiEvent>>,
+    is_error: bool,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(tx) = &tx {
+            let _ = tx.send(super::UiEvent::Log { line, is_error }).await;
+        } else if is_error {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
     }
 }
 

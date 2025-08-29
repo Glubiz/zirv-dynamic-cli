@@ -6,10 +6,11 @@ use commands::{
 mod commands;
 mod input;
 mod script_runner;
+mod ui;
 mod utils;
 
 use input::Input;
-use script_runner::execute;
+use ui::run;
 use utils::file_to_script;
 
 #[tokio::main]
@@ -43,11 +44,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let script = file_to_script(&file_path)?;
 
-    match execute(&script, &input.params).await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!("{e}");
-            Err(e.into())
-        }
-    }
+    run(&script, &input.params).await
 }
