@@ -5,7 +5,7 @@ use crate::script_runner::script::Script;
 use super::create::Shortcuts;
 
 /// Writes the help information into the given writer.
-/// This function is a refactored version of show_help() that writes to the provided writer,
+/// This function is a refactored version of show_help() that writes to the provided writer
 /// making it easier to test the output.
 pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = PathBuf::from(".zirv");
