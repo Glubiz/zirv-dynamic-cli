@@ -19,35 +19,35 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             let entry = entry?;
             let path = entry.path();
 
-            if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if extensions.contains(&ext) && path.file_name().unwrap() != ".shortcuts.yaml" {
-                        let content = fs::read_to_string(&path)?;
+            if path.is_file()
+                && let Some(ext) = path.extension().and_then(|s| s.to_str())
+                && extensions.contains(&ext)
+                && path.file_name().unwrap() != ".shortcuts.yaml"
+            {
+                let content = fs::read_to_string(&path)?;
 
-                        // Parse the script.
-                        let script: Script = if ext == "yaml" || ext == "yml" {
-                            serde_yaml::from_str(&content)?
-                        } else if ext == "json" {
-                            serde_json::from_str(&content)?
-                        } else if ext == "toml" {
-                            toml::from_str(&content)?
-                        } else {
-                            return Err(format!("Unsupported file extension: {ext}").into());
-                        };
+                // Parse the script.
+                let script: Script = if ext == "yaml" || ext == "yml" {
+                    serde_yaml::from_str(&content)?
+                } else if ext == "json" {
+                    serde_json::from_str(&content)?
+                } else if ext == "toml" {
+                    toml::from_str(&content)?
+                } else {
+                    return Err(format!("Unsupported file extension: {ext}").into());
+                };
 
-                        let file_name = path.file_name().unwrap().to_string_lossy();
-                        writeln!(writer, "-------------------------------------------------")?;
-                        writeln!(writer, "File: {file_name}")?;
-                        writeln!(writer, "  Name: {}", script.name)?;
-                        if let Some(desc) = script.description {
-                            writeln!(writer, "  Description: {desc}")?;
-                        }
-                        if let Some(params) = &script.params {
-                            writeln!(writer, "  Required Parameters:")?;
-                            for param in params {
-                                writeln!(writer, "    {param}")?;
-                            }
-                        }
+                let file_name = path.file_name().unwrap().to_string_lossy();
+                writeln!(writer, "-------------------------------------------------")?;
+                writeln!(writer, "File: {file_name}")?;
+                writeln!(writer, "  Name: {}", script.name)?;
+                if let Some(desc) = script.description {
+                    writeln!(writer, "  Description: {desc}")?;
+                }
+                if let Some(params) = &script.params {
+                    writeln!(writer, "  Required Parameters:")?;
+                    for param in params {
+                        writeln!(writer, "    {param}")?;
                     }
                 }
             }
@@ -87,35 +87,35 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             let entry = entry?;
             let path = entry.path();
 
-            if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if extensions.contains(&ext) && path.file_name().unwrap() != ".shortcuts.yaml" {
-                        let content = fs::read_to_string(&path)?;
+            if path.is_file()
+                && let Some(ext) = path.extension().and_then(|s| s.to_str())
+                && extensions.contains(&ext)
+                && path.file_name().unwrap() != ".shortcuts.yaml"
+            {
+                let content = fs::read_to_string(&path)?;
 
-                        // Parse the script.
-                        let script: Script = if ext == "yaml" || ext == "yml" {
-                            serde_yaml::from_str(&content)?
-                        } else if ext == "json" {
-                            serde_json::from_str(&content)?
-                        } else if ext == "toml" {
-                            toml::from_str(&content)?
-                        } else {
-                            return Err(format!("Unsupported file extension: {ext}").into());
-                        };
+                // Parse the script.
+                let script: Script = if ext == "yaml" || ext == "yml" {
+                    serde_yaml::from_str(&content)?
+                } else if ext == "json" {
+                    serde_json::from_str(&content)?
+                } else if ext == "toml" {
+                    toml::from_str(&content)?
+                } else {
+                    return Err(format!("Unsupported file extension: {ext}").into());
+                };
 
-                        let file_name = path.file_name().unwrap().to_string_lossy();
-                        writeln!(writer, "-------------------------------------------------")?;
-                        writeln!(writer, "File: {file_name}")?;
-                        writeln!(writer, "  Name: {}", script.name)?;
-                        if let Some(desc) = script.description {
-                            writeln!(writer, "  Description: {desc}")?;
-                        }
-                        if let Some(params) = &script.params {
-                            writeln!(writer, "  Required Parameters:")?;
-                            for param in params {
-                                writeln!(writer, "    {param}")?;
-                            }
-                        }
+                let file_name = path.file_name().unwrap().to_string_lossy();
+                writeln!(writer, "-------------------------------------------------")?;
+                writeln!(writer, "File: {file_name}")?;
+                writeln!(writer, "  Name: {}", script.name)?;
+                if let Some(desc) = script.description {
+                    writeln!(writer, "  Description: {desc}")?;
+                }
+                if let Some(params) = &script.params {
+                    writeln!(writer, "  Required Parameters:")?;
+                    for param in params {
+                        writeln!(writer, "    {param}")?;
                     }
                 }
             }

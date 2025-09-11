@@ -30,13 +30,13 @@ impl FallbackCommand {
             println!("Description: {description}");
         }
 
-        if let Some(options) = &self.options {
-            if options.interactive {
-                shell
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit());
-            }
+        if let Some(options) = &self.options
+            && options.interactive
+        {
+            shell
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
         }
 
         let status = shell.status().await?;
