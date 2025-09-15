@@ -7,9 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum CommandTypes {
-    /// A command defined in the script.
     Command(Command),
-    /// A set of commands that should be executed together.
     Commands(Vec<Command>),
 }
 
@@ -25,7 +23,6 @@ impl CommandTypes {
                     return Ok(None);
                 }
 
-                // Substitute parameters for each command before spawning the shell
                 let mut substituted = cmds.clone();
                 for cmd in &mut substituted {
                     for (key, value) in context.iter() {
@@ -34,72 +31,101 @@ impl CommandTypes {
                     }
                 }
 
-                let command_str = substituted
-                    .iter()
-                    .map(|c| c.command.clone())
-                    .collect::<Vec<String>>()
+                let joined = substituted
+                    .into_iter()
+                    .map(|c| c.command)
+                    .collect::<Vec<_>>()
                     .join(" && ");
 
-                spawn_terminal(&command_str)?;
+                let cwd = context.get("cwd").cloned().unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        .to_string_lossy()
+                        .to_string()
+                });
+
+                if cfg!(target_os = "windows") {
+                    let full_cmd = format!("cd /d \"{}\" && {}", cwd, joined);
+                    spawn_terminal_windows(&full_cmd)
+                } else if cfg!(target_os = "macos") {
+                    let full_cmd = format!("cd '{}' ; {}", escape_single_quotes(&cwd), joined);
+                    spawn_terminal_macos(&full_cmd)
+                } else {
+                    spawn_terminal_linux(&cwd, &joined)
+                }?;
+
                 Ok(None)
             }
         }
     }
 }
 
-fn spawn_terminal(command: &str) -> Result<(), String> {
-    if cfg!(target_os = "windows") {
-        // Run the entire chain inside the new cmd window:
-        // cmd /C start "" cmd /K <command>
-        // - Empty title "" avoids the first quoted token being treated as the title.
-        // - Pass tokens separately to avoid mis-parsing.
-        StdCommand::new("cmd")
-            .args([
-                "/C", "start", "", // window title
-                "cmd", "/K",
-                command, // full chained command, e.g. `cd src && dir && echo done`
-            ])
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    } else if cfg!(target_os = "macos") {
-        StdCommand::new("osascript")
-            .arg("-e")
-            .arg(format!(
-                "tell application \"Terminal\" to do script \"{}\"",
-                command.replace('"', "\\\"")
-            ))
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    } else {
-        // Try common Linux terminals
-        if StdCommand::new("gnome-terminal")
-            .arg("--")
-            .arg("bash")
-            .arg("-c")
-            .arg(format!("{command}; exec bash"))
-            .spawn()
-            .is_ok()
-            || StdCommand::new("x-terminal-emulator")
-                .arg("-e")
-                .arg("bash")
-                .arg("-c")
-                .arg(format!("{command}; exec bash"))
-                .spawn()
-                .is_ok()
-        {
-            Ok(())
-        } else {
-            StdCommand::new("xterm")
-                .arg("-hold")
-                .arg("-e")
-                .arg("bash")
-                .arg("-c")
-                .arg(format!("{command}; exec bash"))
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        }
+fn spawn_terminal_windows(command: &str) -> Result<(), String> {
+    StdCommand::new("cmd")
+        .args(["/C", "start", "", "cmd", "/K", command])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn spawn_terminal_macos(command: &str) -> Result<(), String> {
+    let applescript_cmd = format!(
+        r#"tell application "Terminal"
+activate
+do script "{}"
+end tell"#,
+        escape_for_applescript(command)
+    );
+
+    StdCommand::new("osascript")
+        .arg("-e")
+        .arg(applescript_cmd)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn spawn_terminal_linux(cwd: &str, joined: &str) -> Result<(), String> {
+    let fallback_cmd = format!(
+        "cd '{}' ; {} ; exec bash",
+        escape_single_quotes(cwd),
+        joined
+    );
+
+    if StdCommand::new("gnome-terminal")
+        .args([
+            "--working-directory",
+            cwd,
+            "--",
+            "bash",
+            "-lc",
+            &format!("{} ; exec bash", joined),
+        ])
+        .spawn()
+        .is_ok()
+    {
+        return Ok(());
     }
+
+    if StdCommand::new("x-terminal-emulator")
+        .args(["-e", "bash", "-lc", &fallback_cmd])
+        .spawn()
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    StdCommand::new("xterm")
+        .args(["-hold", "-e", "bash", "-lc", &fallback_cmd])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn escape_for_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn escape_single_quotes(s: &str) -> String {
+    s.replace('\'', r#"'\''"#)
 }
