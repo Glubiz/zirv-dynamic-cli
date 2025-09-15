@@ -45,8 +45,7 @@ impl CommandTypes {
                 });
 
                 if cfg!(target_os = "windows") {
-                    let full_cmd = format!("cd /d \"{}\" && {}", cwd, joined);
-                    spawn_terminal_windows(&full_cmd)
+                    spawn_terminal_windows(&joined, &cwd)
                 } else if cfg!(target_os = "macos") {
                     let full_cmd = format!("cd '{}' ; {}", escape_single_quotes(&cwd), joined);
                     spawn_terminal_macos(&full_cmd)
@@ -60,9 +59,9 @@ impl CommandTypes {
     }
 }
 
-fn spawn_terminal_windows(command: &str) -> Result<(), String> {
+fn spawn_terminal_windows(command: &str, working_dir: &str) -> Result<(), String> {
     StdCommand::new("cmd")
-        .args(["/C", "start", "", "cmd", "/K", command])
+        .args(["/C", "start", "", "/D", working_dir, "cmd", "/K", command])
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())

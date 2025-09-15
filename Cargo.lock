@@ -966,7 +966,7 @@ checksum = "ced3678a2879b30306d323f4542626697a464a97c0a07c9aebf7ebca65cd4dde"
 
 [[package]]
 name = "zirv"
-version = "2.0.6"
+version = "2.0.7"
 dependencies = [
  "clap",
  "dialoguer",
