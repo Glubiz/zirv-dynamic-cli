@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "2.0.7"
+version = "2.0.8"
 edition = "2024"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
@@ -11,11 +11,11 @@ keywords = ["cli", "yaml", "automation", "developer"]
 categories = ["development-tools"]
 
 [dependencies]
-clap = { version = "4.5.47", features = ["derive"] }
-serde = { version = "1.0.223", features = ["derive"] }
+clap = { version = "4.5.48", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34-deprecated"
 serde_json = "1.0.145"
-toml = "0.9.5"
+toml = "0.9.7"
 dirs = "6.0.0"
 dialoguer = "0.12.0"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "time", "process"] }
@@ -24,7 +24,7 @@ futures = "0.3.31"
 slab = "0.4.11"
 
 [dev-dependencies]
-tempfile = "3.22.0"
+tempfile = "3.23.0"
 
 [profile.release]
 opt-level       = "z"
