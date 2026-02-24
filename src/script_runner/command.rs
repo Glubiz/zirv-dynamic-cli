@@ -21,10 +21,9 @@ pub struct Command {
 
 impl Command {
     pub async fn execute(
-        &mut self,
+        &self,
         context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
-        // OS filter
         if let Some(options) = &self.options
             && let Some(os) = &options.operating_system
             && !os.is_current()
@@ -32,10 +31,9 @@ impl Command {
             return Ok(Some("Command skipped due to OS filter".to_string()));
         }
 
-        // Substitute parameters in the command string
-        self.substitute_params(context);
+        let command = self.substituted_command(context);
 
-        if let Some(rest) = self.command.trim_start().strip_prefix("cd ") {
+        if let Some(rest) = command.trim_start().strip_prefix("cd ") {
             let dir = rest.trim();
 
             let mut path = std::path::PathBuf::new();
@@ -60,7 +58,7 @@ impl Command {
             return Ok(None);
         }
 
-        let invoke = self.invoke(&self.command, context).await;
+        let invoke = self.invoke(&command, context).await;
 
         if let Err(e) = invoke {
             if let Some(options) = &self.options {
@@ -69,7 +67,7 @@ impl Command {
                         if let Err(fallback_error) = cmd.invoke().await {
                             return Err(format!(
                                 "Command '{}' failed and fallback '{}' also failed: {}",
-                                self.command, cmd.command, fallback_error
+                                command, cmd.command, fallback_error
                             ));
                         }
                     }
@@ -81,7 +79,7 @@ impl Command {
                     ));
                 }
             }
-            return Err(format!("Command '{}' failed: {}", self.command, e));
+            return Err(format!("Command '{}' failed: {}", command, e));
         }
 
         if let Some(options) = &self.options
@@ -98,7 +96,6 @@ impl Command {
         command: &str,
         context: &mut HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Pick shell based on the OS
         let mut shell = if cfg!(windows) {
             let mut c = TokioCommand::new("powershell");
             c.arg("-Command").arg(command);
@@ -149,13 +146,13 @@ impl Command {
         }
     }
 
-    fn substitute_params(&mut self, params: &HashMap<String, String>) -> &Self {
+    fn substituted_command(&self, params: &HashMap<String, String>) -> String {
+        let mut command = self.command.clone();
         for (key, value) in params {
             let placeholder = format!("${{{key}}}");
-            self.command = self.command.replace(&placeholder, value);
+            command = command.replace(&placeholder, value);
         }
-
-        self
+        command
     }
 }
 
@@ -165,8 +162,8 @@ mod tests {
     use hashbrown::HashMap;
 
     #[tokio::test]
-    async fn test_sustitute_params() {
-        let mut command = Command {
+    async fn test_substituted_command() {
+        let command = Command {
             command: "echo ${name} is ${age} years old".to_string(),
             capture: None,
             description: None,
@@ -177,8 +174,8 @@ mod tests {
         params.insert("name".to_string(), "Alice".to_string());
         params.insert("age".to_string(), "30".to_string());
 
-        command.substitute_params(&params);
+        let result = command.substituted_command(&params);
 
-        assert_eq!(command.command, "echo Alice is 30 years old");
+        assert_eq!(result, "echo Alice is 30 years old");
     }
 }

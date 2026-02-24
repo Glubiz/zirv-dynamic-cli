@@ -17,7 +17,7 @@ impl CommandTypes {
         context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
         match self {
-            CommandTypes::Command(cmd) => cmd.clone().execute(context).await,
+            CommandTypes::Command(cmd) => cmd.execute(context).await,
             CommandTypes::Commands(cmds) => {
                 if cmds.is_empty() {
                     return Ok(None);
