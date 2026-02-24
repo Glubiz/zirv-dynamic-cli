@@ -1,67 +1,64 @@
-use std::{env, fs, io::Write, path::PathBuf};
+use std::{fs, io::Write, path::Path, path::PathBuf};
 
-use crate::script_runner::script::Script;
+use crate::utils::{
+    SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir, parse_script_content,
+};
 
-use super::create::Shortcuts;
+fn write_scripts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
 
-/// Writes the help information into the given writer.
-/// This function is a refactored version of show_help() that writes to the provided writer
-/// making it easier to test the output.
-pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
-    let base_dir = PathBuf::from(".zirv");
+        if path.is_file()
+            && let Some(ext) = path.extension().and_then(|s| s.to_str())
+            && SUPPORTED_EXTENSIONS.contains(&ext)
+            && path.file_name().unwrap() != ".shortcuts.yaml"
+        {
+            let content = fs::read_to_string(&path)?;
+            let script = parse_script_content(&content, ext)?;
 
-    if base_dir.exists() {
-        writeln!(writer, "\nAvailable Scripts:")?;
-
-        let extensions = ["yaml", "yml", "json", "toml"];
-
-        for entry in fs::read_dir(&base_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file()
-                && let Some(ext) = path.extension().and_then(|s| s.to_str())
-                && extensions.contains(&ext)
-                && path.file_name().unwrap() != ".shortcuts.yaml"
-            {
-                let content = fs::read_to_string(&path)?;
-
-                // Parse the script.
-                let script: Script = if ext == "yaml" || ext == "yml" {
-                    serde_yaml::from_str(&content)?
-                } else if ext == "json" {
-                    serde_json::from_str(&content)?
-                } else if ext == "toml" {
-                    toml::from_str(&content)?
-                } else {
-                    return Err(format!("Unsupported file extension: {ext}").into());
-                };
-
-                let file_name = path.file_name().unwrap().to_string_lossy();
-                writeln!(writer, "-------------------------------------------------")?;
-                writeln!(writer, "File: {file_name}")?;
-                writeln!(writer, "  Name: {}", script.name)?;
-                if let Some(desc) = script.description {
-                    writeln!(writer, "  Description: {desc}")?;
-                }
-                if let Some(params) = &script.params {
-                    writeln!(writer, "  Required Parameters:")?;
-                    for param in params {
-                        writeln!(writer, "    {param}")?;
-                    }
+            let file_name = path.file_name().unwrap().to_string_lossy();
+            writeln!(writer, "-------------------------------------------------")?;
+            writeln!(writer, "File: {file_name}")?;
+            writeln!(writer, "  Name: {}", script.name)?;
+            if let Some(desc) = script.description {
+                writeln!(writer, "  Description: {desc}")?;
+            }
+            if let Some(params) = &script.params {
+                writeln!(writer, "  Required Parameters:")?;
+                for param in params {
+                    writeln!(writer, "    {param}")?;
                 }
             }
         }
+    }
 
-        // List shortcuts if present.
+    Ok(())
+}
+
+fn write_shortcuts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let shortcuts_path = dir.join(".shortcuts.yaml");
+    if shortcuts_path.exists() {
+        let content = fs::read_to_string(shortcuts_path)?;
+        let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
+        for (key, value) in shortcuts.shortcuts {
+            writeln!(writer, "  {key} -> {value}")?;
+        }
+    }
+    Ok(())
+}
+
+pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
+    let base_dir = PathBuf::from(SCRIPT_DIR_NAME);
+
+    if base_dir.exists() {
+        writeln!(writer, "\nAvailable Scripts:")?;
+        write_scripts(writer, &base_dir)?;
+
         let shortcuts_path = base_dir.join(".shortcuts.yaml");
         if shortcuts_path.exists() {
             writeln!(writer, "\nAvailable Shortcuts:")?;
-            let content = fs::read_to_string(shortcuts_path)?;
-            let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
-            for (key, value) in shortcuts.shortcuts {
-                writeln!(writer, "  {key} -> {value}")?;
-            }
+            write_shortcuts(writer, &base_dir)?;
             writeln!(writer, "  i -> init")?;
             writeln!(writer, "  c -> create")?;
             writeln!(writer, "  v -> version")?;
@@ -69,9 +66,7 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // List global commands
-    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE"))?;
-    let root = PathBuf::from(home).join(".zirv");
+    let root = home_dir()?.join(SCRIPT_DIR_NAME);
 
     if root.exists() {
         writeln!(writer, "\nGlobal Base Scripts:")?;
@@ -80,59 +75,14 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             "Global scripts are overwritten by above mentioned scripts if they share name."
         )?;
         writeln!(writer, "Home Directory: {root:?}")?;
+        write_scripts(writer, &root)?;
 
-        let extensions = ["yaml", "yml", "json", "toml"];
-
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file()
-                && let Some(ext) = path.extension().and_then(|s| s.to_str())
-                && extensions.contains(&ext)
-                && path.file_name().unwrap() != ".shortcuts.yaml"
-            {
-                let content = fs::read_to_string(&path)?;
-
-                // Parse the script.
-                let script: Script = if ext == "yaml" || ext == "yml" {
-                    serde_yaml::from_str(&content)?
-                } else if ext == "json" {
-                    serde_json::from_str(&content)?
-                } else if ext == "toml" {
-                    toml::from_str(&content)?
-                } else {
-                    return Err(format!("Unsupported file extension: {ext}").into());
-                };
-
-                let file_name = path.file_name().unwrap().to_string_lossy();
-                writeln!(writer, "-------------------------------------------------")?;
-                writeln!(writer, "File: {file_name}")?;
-                writeln!(writer, "  Name: {}", script.name)?;
-                if let Some(desc) = script.description {
-                    writeln!(writer, "  Description: {desc}")?;
-                }
-                if let Some(params) = &script.params {
-                    writeln!(writer, "  Required Parameters:")?;
-                    for param in params {
-                        writeln!(writer, "    {param}")?;
-                    }
-                }
-            }
-        }
-
-        // List shortcuts if present.
         let shortcuts_path = root.join(".shortcuts.yaml");
         if shortcuts_path.exists() {
             writeln!(writer, "\nGlobal Shortcuts:")?;
-            let content = fs::read_to_string(shortcuts_path)?;
-            let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
-            for (key, value) in shortcuts.shortcuts {
-                writeln!(writer, "  {key} -> {value}")?;
-            }
+            write_shortcuts(writer, &root)?;
         }
     } else {
-        // If no .zirv directory is found, prompt the user to create one.
         writeln!(
             writer,
             "No scripts found. Please create a .zirv directory in {root:?}."

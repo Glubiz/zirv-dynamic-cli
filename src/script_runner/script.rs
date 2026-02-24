@@ -22,12 +22,10 @@ impl Script {
         // Execution loop
         for step in &self.commands {
             match step.execute(context).await {
-                Ok(output) => {
-                    if output.is_some() {
-                        // If the command returns output, you can handle it here
-                        println!("Command output: {}", output.unwrap());
-                    }
+                Ok(Some(output)) => {
+                    println!("Command output: {output}");
                 }
+                Ok(None) => {}
                 Err(e) => {
                     return Err(format!(
                         "Error executing command in script '{}': {}",
