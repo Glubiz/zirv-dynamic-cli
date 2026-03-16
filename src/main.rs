@@ -6,6 +6,7 @@ use commands::{
 mod commands;
 mod input;
 mod script_runner;
+mod output;
 mod utils;
 
 use input::Input;
