@@ -8,6 +8,7 @@ const DEFAULT_TEMPLATE: &str = r#"name: "Name"
 description: "Description"
 #params:
 #  - "commit_message"
+#  - "optional_param?"
 commands:
 #  - command: example
 #    description: Step description

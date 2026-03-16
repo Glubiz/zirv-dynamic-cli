@@ -29,18 +29,29 @@ fn build_context(
     let context: HashMap<String, String> = {
         // params
         let params = if let Some(names) = &script.params {
-            if names.len() != cli_params.len() {
+            let required_count = names.iter().filter(|n| !n.ends_with('?')).count();
+            let total_count = names.len();
+
+            if cli_params.len() < required_count || cli_params.len() > total_count {
+                let expected = if required_count == total_count {
+                    format!("{required_count}")
+                } else {
+                    format!("{required_count} to {total_count}")
+                };
                 return Err(format!(
-                    "Expected {} parameters, got {}",
-                    names.len(),
+                    "Expected {expected} parameters, got {}",
                     cli_params.len()
                 ));
             }
 
             names
                 .iter()
-                .cloned()
-                .zip(cli_params.iter().cloned())
+                .enumerate()
+                .map(|(i, name)| {
+                    let clean_name = name.strip_suffix('?').unwrap_or(name).to_string();
+                    let value = cli_params.get(i).cloned().unwrap_or_default();
+                    (clean_name, value)
+                })
                 .collect()
         } else {
             HashMap::new()
@@ -98,5 +109,61 @@ mod tests {
             context.get("commit_password"),
             Some(&"secret123".to_string())
         );
+    }
+
+    fn make_script(params: Vec<String>) -> Script {
+        Script {
+            name: "Test".to_string(),
+            description: None,
+            params: Some(params),
+            secrets: None,
+            commands: vec![CommandTypes::Command(Command {
+                command: "echo test".to_string(),
+                capture: None,
+                description: None,
+                options: None,
+            })],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_optional_param_provided() {
+        let script = make_script(vec!["required".to_string(), "optional?".to_string()]);
+        let context = build_context(&script, &["a".to_string(), "b".to_string()]).unwrap();
+        assert_eq!(context.get("required"), Some(&"a".to_string()));
+        assert_eq!(context.get("optional"), Some(&"b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_optional_param_omitted() {
+        let script = make_script(vec!["required".to_string(), "optional?".to_string()]);
+        let context = build_context(&script, &["a".to_string()]).unwrap();
+        assert_eq!(context.get("required"), Some(&"a".to_string()));
+        assert_eq!(context.get("optional"), Some(&String::new()));
+    }
+
+    #[tokio::test]
+    async fn test_optional_param_too_few() {
+        let script = make_script(vec!["required".to_string(), "optional?".to_string()]);
+        let result = build_context(&script, &[]);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_optional_param_too_many() {
+        let script = make_script(vec!["required".to_string(), "optional?".to_string()]);
+        let result = build_context(
+            &script,
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_all_optional() {
+        let script = make_script(vec!["a?".to_string(), "b?".to_string()]);
+        let context = build_context(&script, &[]).unwrap();
+        assert_eq!(context.get("a"), Some(&String::new()));
+        assert_eq!(context.get("b"), Some(&String::new()));
     }
 }
