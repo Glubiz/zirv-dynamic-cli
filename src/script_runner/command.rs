@@ -32,6 +32,7 @@ impl Command {
         }
 
         let command = self.substituted_command(context);
+        self.check_unresolved_placeholders(context)?;
 
         if let Some(rest) = command.trim_start().strip_prefix("cd ") {
             let dir = rest.trim();
@@ -110,11 +111,6 @@ impl Command {
             shell.current_dir(cwd);
         }
 
-        println!("Executing command: {command}");
-        if let Some(description) = &self.description {
-            println!("Description: {description}");
-        }
-
         if let Some(options) = &self.options
             && options.interactive
         {
@@ -127,7 +123,8 @@ impl Command {
         if let Some(var) = &self.capture {
             let out = shell.output().await?;
             if !out.status.success() {
-                return Err(format!("`{command}` failed").into());
+                let code = out.status.code().unwrap_or(1);
+                return Err(format!("`{command}` failed with exit code {code}").into());
             }
 
             let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -139,14 +136,15 @@ impl Command {
             let status = shell.status().await?;
 
             if !status.success() {
-                return Err(format!("`{command}` failed").into());
+                let code = status.code().unwrap_or(1);
+                return Err(format!("`{command}` failed with exit code {code}").into());
             }
 
             Ok(())
         }
     }
 
-    fn substituted_command(&self, params: &HashMap<String, String>) -> String {
+    pub fn substituted_command(&self, params: &HashMap<String, String>) -> String {
         let mut command = self.command.clone();
         for (key, value) in params {
             let placeholder = format!("${{{key}}}");
@@ -154,12 +152,65 @@ impl Command {
         }
         command
     }
+
+    pub fn check_unresolved_placeholders(
+        &self,
+        context: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        let substituted = self.substituted_command(context);
+        let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
+        let unresolved: Vec<&str> = re
+            .captures_iter(&substituted)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "Unresolved placeholders in '{}': {}",
+            self.command,
+            unresolved.join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hashbrown::HashMap;
+
+    #[tokio::test]
+    async fn test_unresolved_placeholder_detected() {
+        let command = Command {
+            command: "echo ${name} ${typo}".to_string(),
+            capture: None,
+            description: None,
+            options: None,
+        };
+
+        let mut context = HashMap::new();
+        context.insert("name".to_string(), "Alice".to_string());
+
+        let result = command.check_unresolved_placeholders(&context);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("typo"));
+    }
+
+    #[tokio::test]
+    async fn test_no_unresolved_placeholders() {
+        let command = Command {
+            command: "echo ${name}".to_string(),
+            capture: None,
+            description: None,
+            options: None,
+        };
+
+        let mut context = HashMap::new();
+        context.insert("name".to_string(), "Alice".to_string());
+
+        let result = command.check_unresolved_placeholders(&context);
+        assert!(result.is_ok());
+    }
 
     #[tokio::test]
     async fn test_substituted_command() {

@@ -18,19 +18,36 @@ pub struct Script {
 }
 
 impl Script {
-    pub async fn run(&self, context: &mut HashMap<String, String>) -> Result<(), String> {
-        // Execution loop
-        for step in &self.commands {
+    pub async fn run(
+        &self,
+        context: &mut HashMap<String, String>,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        let total = self.commands.len();
+        for (index, step) in self.commands.iter().enumerate() {
+            let cmd_display = step.display(context);
+            if dry_run {
+                crate::output::dry_run(index, total, &cmd_display);
+                continue;
+            }
+            crate::output::step(index, total, &cmd_display);
+            if let Some(desc) = step.description() {
+                crate::output::step_description(&desc);
+            }
             match step.execute(context).await {
                 Ok(Some(output)) => {
-                    println!("Command output: {output}");
+                    crate::output::skipped(&output);
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    return Err(format!(
-                        "Error executing command in script '{}': {}",
-                        self.name, e
+                    crate::output::error(format!(
+                        "step {}/{} in script '{}': {}",
+                        index + 1,
+                        total,
+                        self.name,
+                        e
                     ));
+                    return Err(e);
                 }
             }
         }
@@ -62,7 +79,7 @@ mod tests {
 
         let mut context = HashMap::new();
 
-        let result = script.run(&mut context).await;
+        let result = script.run(&mut context, false).await;
         assert!(result.is_ok());
     }
 
@@ -91,7 +108,7 @@ mod tests {
 
         let mut context = HashMap::new();
 
-        let result = script.run(&mut context).await;
+        let result = script.run(&mut context, false).await;
         assert!(result.is_ok());
     }
 
@@ -119,7 +136,7 @@ mod tests {
             "my_secret_password".to_string(),
         );
 
-        let result = script.run(&mut context).await;
+        let result = script.run(&mut context, false).await;
         assert!(result.is_ok());
     }
 
@@ -142,7 +159,7 @@ mod tests {
         context.insert("param1".to_string(), "value1".to_string());
         context.insert("param2".to_string(), "value2".to_string());
 
-        let result = script.run(&mut context).await;
+        let result = script.run(&mut context, false).await;
         assert!(result.is_ok());
     }
 
@@ -158,7 +175,7 @@ mod tests {
 
         let mut context = HashMap::new();
 
-        let result = script.run(&mut context).await;
+        let result = script.run(&mut context, false).await;
         assert!(result.is_ok());
     }
 }

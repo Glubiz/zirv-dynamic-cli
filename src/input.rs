@@ -11,6 +11,8 @@ pub struct Input {
     /// Optional parameters (positional arguments) that will be mapped to the script's expected params.
     #[arg(num_args = 0..)]
     pub params: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 fn find_script_in_dir(
@@ -27,7 +29,7 @@ fn find_script_in_dir(
     let shortcuts_path = dir.join(".shortcuts.yaml");
     if shortcuts_path.exists() {
         let content = std::fs::read_to_string(&shortcuts_path)?;
-        let shortcuts: Shortcuts = serde_yaml::from_str(&content)?;
+        let shortcuts: Shortcuts = serde_yml::from_str(&content)?;
         if let Some(mapped_file) = shortcuts.shortcuts.get(name) {
             let path = dir.join(mapped_file);
             if path.exists() {

@@ -9,15 +9,9 @@ mod options;
 pub mod script;
 mod secret;
 
-pub async fn execute(script: &Script, params: &[String]) -> Result<(), String> {
-    // Build the context from script parameters and secrets
+pub async fn execute(script: &Script, params: &[String], dry_run: bool) -> Result<(), String> {
     let mut context = build_context(script, params)?;
-
-    // Execution loop
-    script.run(&mut context).await?;
-
-    // Placeholder for the main execution logic
-    // This function will orchestrate the execution of commands, handling files, etc.
+    script.run(&mut context, dry_run).await?;
     Ok(())
 }
 
@@ -31,6 +25,27 @@ fn build_context(
         let params = if let Some(names) = &script.params {
             let required_count = names.iter().filter(|n| !n.ends_with('?')).count();
             let total_count = names.len();
+
+            // Validate ordering: optional params must come after required
+            let mut seen_optional = false;
+            for name in names {
+                let is_optional = name.ends_with('?');
+                if seen_optional && !is_optional {
+                    return Err(
+                        "Optional parameters must come after all required parameters".to_string(),
+                    );
+                }
+                seen_optional = is_optional;
+            }
+
+            // Validate no duplicate param names
+            let mut seen_names = std::collections::HashSet::new();
+            for name in names {
+                let clean = name.strip_suffix('?').unwrap_or(name);
+                if !seen_names.insert(clean) {
+                    return Err(format!("Duplicate parameter name: '{clean}'"));
+                }
+            }
 
             if cli_params.len() < required_count || cli_params.len() > total_count {
                 let expected = if required_count == total_count {
@@ -165,5 +180,33 @@ mod tests {
         let context = build_context(&script, &[]).unwrap();
         assert_eq!(context.get("a"), Some(&String::new()));
         assert_eq!(context.get("b"), Some(&String::new()));
+    }
+
+    #[tokio::test]
+    async fn test_optional_before_required_rejected() {
+        let script = make_script(vec!["optional?".to_string(), "required".to_string()]);
+        let result = build_context(&script, &["a".to_string(), "b".to_string()]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Optional parameters must come after all required parameters")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_param_names_rejected() {
+        let script = make_script(vec!["name".to_string(), "name".to_string()]);
+        let result = build_context(&script, &["a".to_string(), "b".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Duplicate parameter name"));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_optional_param_names_rejected() {
+        let script = make_script(vec!["name".to_string(), "name?".to_string()]);
+        let result = build_context(&script, &["a".to_string(), "b".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Duplicate parameter name"));
     }
 }

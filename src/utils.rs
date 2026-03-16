@@ -25,7 +25,7 @@ pub fn parse_script_content(
     ext: &str,
 ) -> Result<Script, Box<dyn std::error::Error>> {
     let script: Script = match ext {
-        "yaml" | "yml" => serde_yaml::from_str(content)?,
+        "yaml" | "yml" => serde_yml::from_str(content)?,
         "json" => serde_json::from_str(content)?,
         "toml" => toml::from_str(content)?,
         other => return Err(format!("Unsupported extension: {other}").into()),

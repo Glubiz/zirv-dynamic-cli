@@ -25,9 +25,9 @@ impl FallbackCommand {
             c
         };
 
-        println!("Executing command: {}", &self.command);
+        crate::output::warn(format!("fallback: {}", &self.command));
         if let Some(description) = &self.description {
-            println!("Description: {description}");
+            crate::output::step_description(description);
         }
 
         if let Some(options) = &self.options

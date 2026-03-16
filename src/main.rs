@@ -5,6 +5,7 @@ use commands::{
 
 mod commands;
 mod input;
+mod output;
 mod script_runner;
 mod utils;
 
@@ -13,41 +14,59 @@ use script_runner::execute;
 use utils::file_to_script;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse CLI arguments.
+async fn main() {
     let input = Input::parse();
 
-    // Check for built-in commands before attempting to find a script file.
     match input.command.as_str() {
         "help" | "h" => {
-            show_help(&mut std::io::stdout())?;
-            return Ok(());
+            if let Err(e) = show_help(&mut std::io::stdout()) {
+                output::error(e);
+                std::process::exit(1);
+            }
+            return;
         }
         "version" | "v" => {
-            get_version(&mut std::io::stdout())?;
-            return Ok(());
+            if let Err(e) = get_version(&mut std::io::stdout()) {
+                output::error(e);
+                std::process::exit(1);
+            }
+            return;
         }
         "init" | "i" => {
-            init_zirv()?;
-            return Ok(());
+            if let Err(e) = init_zirv() {
+                output::error(e);
+                std::process::exit(1);
+            }
+            return;
         }
         "create" | "c" => {
-            create_script_interactive()?;
-            return Ok(());
+            if let Err(e) = create_script_interactive() {
+                output::error(e);
+                std::process::exit(1);
+            }
+            return;
         }
         _ => {}
     }
 
-    // For all other commands, attempt to find a script file.
-    let file_path = input.get_file_path()?;
-
-    let script = file_to_script(&file_path)?;
-
-    match execute(&script, &input.params).await {
-        Ok(_) => Ok(()),
+    let file_path = match input.get_file_path() {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("{e}");
-            Err(e.into())
+            output::error(e);
+            std::process::exit(1);
         }
+    };
+
+    let script = match file_to_script(&file_path) {
+        Ok(s) => s,
+        Err(e) => {
+            output::error(e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = execute(&script, &input.params, input.dry_run).await {
+        output::error(&e);
+        std::process::exit(1);
     }
 }

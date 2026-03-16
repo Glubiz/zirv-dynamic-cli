@@ -73,14 +73,14 @@ pub fn create_script_interactive() -> Result<(), Box<dyn std::error::Error>> {
         let shortcuts_path = target_dir.join(".shortcuts.yaml");
         let mut shortcuts: Shortcuts = if shortcuts_path.exists() {
             let content = fs::read_to_string(&shortcuts_path)?;
-            serde_yaml::from_str(&content).unwrap_or_default()
+            serde_yml::from_str(&content).unwrap_or_default()
         } else {
             Shortcuts::default()
         };
         shortcuts
             .shortcuts
             .insert(shortcut.clone(), file_name.clone());
-        let yaml_string = serde_yaml::to_string(&shortcuts)?;
+        let yaml_string = serde_yml::to_string(&shortcuts)?;
         fs::write(&shortcuts_path, yaml_string)?;
         println!("Updated shortcuts file: {shortcuts_path:?}");
     }
