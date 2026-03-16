@@ -1,52 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <version> <artifact_path>"
+if [ "$#" -ne 3 ]; then
+    echo "Usage: $0 <version> <macos_artifact_path> <linux_artifact_path>"
     exit 1
 fi
 
 VERSION=$1
-ARTIFACT_INPUT=$2
-BASENAME=$(basename "$ARTIFACT_INPUT")
+MACOS_ARTIFACT_INPUT=$2
+LINUX_ARTIFACT_INPUT=$3
+MACOS_BASENAME=$(basename "$MACOS_ARTIFACT_INPUT")
+LINUX_BASENAME=$(basename "$LINUX_ARTIFACT_INPUT")
 
 # Normalize Windows backslashes
-ARTIFACT_INPUT=${ARTIFACT_INPUT//\\//}
+MACOS_ARTIFACT_INPUT=${MACOS_ARTIFACT_INPUT//\\//}
+LINUX_ARTIFACT_INPUT=${LINUX_ARTIFACT_INPUT//\\//}
 
-echo "Looking for artifact matching: '$BASENAME'"
-# Ensure artifacts directory exists
 mkdir -p artifacts
 
-echo "Contents of artifacts directory:"
-find artifacts -type f || echo "(empty)"
+find_artifact() {
+    local INPUT=$1
+    local BASENAME=$2
 
-# First, check if the direct path exists
-if [ -f "$ARTIFACT_INPUT" ]; then
-    ARTIFACT_PATH="$ARTIFACT_INPUT"
-else
-    # Otherwise, search recursively under artifacts/ for the filename
+    if [ -f "$INPUT" ]; then
+        echo "$INPUT"
+        return
+    fi
+
     FOUND=$(find artifacts -type f -name "$BASENAME" -print -quit || true)
     if [ -n "$FOUND" ]; then
-        ARTIFACT_PATH="$FOUND"
-    else
-        echo "Error: Artifact '$BASENAME' not found under artifacts/"
-        exit 1
+        echo "$FOUND"
+        return
     fi
-fi
 
-echo "Using artifact file: $ARTIFACT_PATH"
+    echo "Error: Artifact '$BASENAME' not found under artifacts/" >&2
+    exit 1
+}
 
-# Compute checksum
-CHECKSUM=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
-echo "Computed checksum: $CHECKSUM"
+MACOS_PATH=$(find_artifact "$MACOS_ARTIFACT_INPUT" "$MACOS_BASENAME")
+LINUX_PATH=$(find_artifact "$LINUX_ARTIFACT_INPUT" "$LINUX_BASENAME")
 
-# Ensure token
+echo "Using macOS artifact: $MACOS_PATH"
+echo "Using Linux artifact: $LINUX_PATH"
+
+MACOS_CHECKSUM=$(sha256sum "$MACOS_PATH" | awk '{print $1}')
+LINUX_CHECKSUM=$(sha256sum "$LINUX_PATH" | awk '{print $1}')
+
+echo "macOS checksum: $MACOS_CHECKSUM"
+echo "Linux checksum: $LINUX_CHECKSUM"
+
 if [ -z "${HOMEBREW_TOKEN:-}" ]; then
   echo "Error: HOMEBREW_TOKEN is not set!"
   exit 1
 fi
 
-# Clone tap and update formula
 TAP_DIR=$(mktemp -d)
 
 echo "Cloning homebrew-tap into $TAP_DIR"
@@ -58,31 +65,39 @@ if [ ! -f "$FORMULA" ]; then
     exit 1
 fi
 
-echo "Updating $FORMULA to v$VERSION with new URL and checksum"
+MACOS_URL="https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v${VERSION}/${MACOS_BASENAME}"
+LINUX_URL="https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v${VERSION}/${LINUX_BASENAME}"
 
-RELEASE_URL="https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v${VERSION}/${BASENAME}"
+echo "Writing updated formula"
 
-# 1) Update the URL line
-#    - single‑quoted sed program
-#    - close quote, insert shell var, reopen quote
-sed -i \
-    's|^ *url *".*"|  url "'"${RELEASE_URL}"'"|' \
-    "$FORMULA"
+cat > "$FORMULA" << RUBY
+class Zirv < Formula
+  desc "Dynamic CLI tool to streamline tasks and boost productivity"
+  homepage "https://github.com/Glubiz/zirv-dynamic-cli"
+  license "MIT"
+  version "${VERSION}"
 
-# 2) Update the version line
-sed -i \
-    's|^ *version *".*"|  version "'"${VERSION}"'"|' \
-    "$FORMULA"
+  if OS.mac?
+    url "${MACOS_URL}"
+    sha256 "${MACOS_CHECKSUM}"
+  elsif OS.linux?
+    url "${LINUX_URL}"
+    sha256 "${LINUX_CHECKSUM}"
+  end
 
-# 3) Update the sha256 line
-sed -i \
-    's|^ *sha256 *".*"|  sha256 "'"${CHECKSUM}"'"|' \
-    "$FORMULA"
+  def install
+    bin.install "zirv"
+  end
+
+  test do
+    system "#{bin}/zirv", "--version"
+  end
+end
+RUBY
 
 echo "Formula after update:"
-sed -n '1,10p; /sha256/,/end/p; 1q' "$FORMULA"
+cat "$FORMULA"
 
-# Commit and push
 cd "$TAP_DIR"
 git config user.email "ci@github.com"
 git config user.name "GitHub Actions"
