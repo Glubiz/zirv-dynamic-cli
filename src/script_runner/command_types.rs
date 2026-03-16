@@ -12,6 +12,27 @@ pub enum CommandTypes {
 }
 
 impl CommandTypes {
+    pub fn display(&self, context: &HashMap<String, String>) -> String {
+        match self {
+            CommandTypes::Command(cmd) => cmd.substituted_command(context),
+            CommandTypes::Commands(cmds) => {
+                let joined = cmds
+                    .iter()
+                    .map(|c| c.command.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" && ");
+                format!("[multi-shell] {joined}")
+            }
+        }
+    }
+
+    pub fn description(&self) -> Option<String> {
+        match self {
+            CommandTypes::Command(cmd) => cmd.description.clone(),
+            CommandTypes::Commands(_) => None,
+        }
+    }
+
     pub async fn execute(
         &self,
         context: &mut HashMap<String, String>,

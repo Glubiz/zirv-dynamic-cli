@@ -110,11 +110,6 @@ impl Command {
             shell.current_dir(cwd);
         }
 
-        println!("Executing command: {command}");
-        if let Some(description) = &self.description {
-            println!("Description: {description}");
-        }
-
         if let Some(options) = &self.options
             && options.interactive
         {
@@ -146,7 +141,7 @@ impl Command {
         }
     }
 
-    fn substituted_command(&self, params: &HashMap<String, String>) -> String {
+    pub fn substituted_command(&self, params: &HashMap<String, String>) -> String {
         let mut command = self.command.clone();
         for (key, value) in params {
             let placeholder = format!("${{{key}}}");

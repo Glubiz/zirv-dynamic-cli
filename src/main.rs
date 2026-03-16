@@ -5,8 +5,8 @@ use commands::{
 
 mod commands;
 mod input;
-mod script_runner;
 mod output;
+mod script_runner;
 mod utils;
 
 use input::Input;
@@ -44,10 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let script = file_to_script(&file_path)?;
 
-    match execute(&script, &input.params).await {
+    match execute(&script, &input.params, false).await {
         Ok(_) => Ok(()),
         Err(e) => {
-            eprintln!("{e}");
+            output::error(&e);
             Err(e.into())
         }
     }
