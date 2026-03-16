@@ -32,6 +32,7 @@ impl Command {
         }
 
         let command = self.substituted_command(context);
+        self.check_unresolved_placeholders(context)?;
 
         if let Some(rest) = command.trim_start().strip_prefix("cd ") {
             let dir = rest.trim();
@@ -149,12 +150,65 @@ impl Command {
         }
         command
     }
+
+    pub fn check_unresolved_placeholders(
+        &self,
+        context: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        let substituted = self.substituted_command(context);
+        let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
+        let unresolved: Vec<&str> = re
+            .captures_iter(&substituted)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "Unresolved placeholders in '{}': {}",
+            self.command,
+            unresolved.join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hashbrown::HashMap;
+
+    #[tokio::test]
+    async fn test_unresolved_placeholder_detected() {
+        let command = Command {
+            command: "echo ${name} ${typo}".to_string(),
+            capture: None,
+            description: None,
+            options: None,
+        };
+
+        let mut context = HashMap::new();
+        context.insert("name".to_string(), "Alice".to_string());
+
+        let result = command.check_unresolved_placeholders(&context);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("typo"));
+    }
+
+    #[tokio::test]
+    async fn test_no_unresolved_placeholders() {
+        let command = Command {
+            command: "echo ${name}".to_string(),
+            capture: None,
+            description: None,
+            options: None,
+        };
+
+        let mut context = HashMap::new();
+        context.insert("name".to_string(), "Alice".to_string());
+
+        let result = command.check_unresolved_placeholders(&context);
+        assert!(result.is_ok());
+    }
 
     #[tokio::test]
     async fn test_substituted_command() {
