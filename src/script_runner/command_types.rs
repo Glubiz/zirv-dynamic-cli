@@ -52,6 +52,21 @@ impl CommandTypes {
                     }
                 }
 
+                let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
+                for cmd in &substituted {
+                    let unresolved: Vec<&str> = re
+                        .captures_iter(&cmd.command)
+                        .map(|c| c.get(1).unwrap().as_str())
+                        .collect();
+                    if !unresolved.is_empty() {
+                        return Err(format!(
+                            "Unresolved placeholders in '{}': {}",
+                            cmd.command,
+                            unresolved.join(", ")
+                        ));
+                    }
+                }
+
                 let joined = substituted
                     .into_iter()
                     .map(|c| c.command)

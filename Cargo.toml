@@ -23,6 +23,7 @@ tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time", "
 hashbrown = { version = "0.16.1", features = ["serde"] }
 futures = "0.3.32"
 slab = "0.4.12"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
