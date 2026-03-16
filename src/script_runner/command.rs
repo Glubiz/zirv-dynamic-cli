@@ -123,7 +123,8 @@ impl Command {
         if let Some(var) = &self.capture {
             let out = shell.output().await?;
             if !out.status.success() {
-                return Err(format!("`{command}` failed").into());
+                let code = out.status.code().unwrap_or(1);
+                return Err(format!("`{command}` failed with exit code {code}").into());
             }
 
             let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -135,7 +136,8 @@ impl Command {
             let status = shell.status().await?;
 
             if !status.success() {
-                return Err(format!("`{command}` failed").into());
+                let code = status.code().unwrap_or(1);
+                return Err(format!("`{command}` failed with exit code {code}").into());
             }
 
             Ok(())
