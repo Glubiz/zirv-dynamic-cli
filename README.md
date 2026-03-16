@@ -10,6 +10,7 @@
 
 - [Features](#features)
 - [Installation](#installation)
+- [Upgrading](#upgrading)
 - [Usage](#usage)
   - [Initialize a Project](#initialize-a-project)
   - [Running Scripts](#running-scripts)
@@ -65,7 +66,7 @@ curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/instal
 To install a specific version:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- 2.3.0
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- 2.4.0
 ```
 
 ### Cargo (All Platforms)
@@ -78,6 +79,34 @@ cargo build --release
 ### Precompiled Binaries
 Download the latest release from the [GitHub Releases]:
 https://github.com/Glubiz/zirv-dynamic-cli/releases
+
+## Upgrading
+
+### Homebrew
+
+```bash
+brew upgrade zirv
+```
+
+### Chocolatey
+
+```bash
+choco upgrade zirv
+```
+
+### Install Script
+
+Re-run the install script to get the latest version:
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh
+```
+
+### Cargo
+
+```bash
+cargo build --release
+```
 
 ## Usage
 
