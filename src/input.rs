@@ -11,6 +11,8 @@ pub struct Input {
     /// Optional parameters (positional arguments) that will be mapped to the script's expected params.
     #[arg(num_args = 0..)]
     pub params: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 fn find_script_in_dir(
