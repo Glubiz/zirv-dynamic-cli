@@ -40,7 +40,7 @@ fn write_shortcuts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn s
     let shortcuts_path = dir.join(".shortcuts.yaml");
     if shortcuts_path.exists() {
         let content = fs::read_to_string(shortcuts_path)?;
-        let shortcuts: Shortcuts = serde_yml::from_str(&content)?;
+        let shortcuts: Shortcuts = serde_yaml_ng::from_str(&content)?;
         for (key, value) in shortcuts.shortcuts {
             writeln!(writer, "  {key} -> {value}")?;
         }

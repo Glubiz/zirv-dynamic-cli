@@ -10,6 +10,7 @@
 
 - [Features](#features)
 - [Installation](#installation)
+- [Upgrading](#upgrading)
 - [Usage](#usage)
   - [Initialize a Project](#initialize-a-project)
   - [Running Scripts](#running-scripts)
@@ -43,7 +44,7 @@
 
 Choose one of the following methods:
 
-### Homebrew (macOS)
+### Homebrew (macOS & Linux)
 
 ```bash
 brew tap glubiz/homebrew-tap
@@ -56,23 +57,21 @@ brew install zirv
 choco install zirv
 ```
 
-### Download from Releases
-#### Linux
-Download the latest release from the [GitHub Releases]:
+### Install Script (macOS & Linux)
+
 ```bash
-VERSION="1.0.0" && \
-curl -L -o zirv.tar.gz "https://github.com/Glubiz/zirv-dynamic-cli/releases/download/${VERSION}/zirv-${VERSION}-linux.tar.gz" && \
-tar -xzf zirv.tar.gz && \
-sudo mv zirv /usr/local/bin/zirv && \
-rm zirv.tar.gz && \
-echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.bashrc && \
-source ~/.bashrc
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh
+```
+
+To install a specific version:
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- 2.4.0
 ```
 
 ### Cargo (All Platforms)
-  
+
 ```bash
-# Build from source
 cargo build --release
 # Add `target/release` to your PATH
 ```
@@ -80,6 +79,34 @@ cargo build --release
 ### Precompiled Binaries
 Download the latest release from the [GitHub Releases]:
 https://github.com/Glubiz/zirv-dynamic-cli/releases
+
+## Upgrading
+
+### Homebrew
+
+```bash
+brew upgrade zirv
+```
+
+### Chocolatey
+
+```bash
+choco upgrade zirv
+```
+
+### Install Script
+
+Re-run the install script to get the latest version:
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh
+```
+
+### Cargo
+
+```bash
+cargo build --release
+```
 
 ## Usage
 
