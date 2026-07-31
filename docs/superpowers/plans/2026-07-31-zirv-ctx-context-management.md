@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Command family is `zirv ctx <verb>`, implemented as `src/commands/ctx/` with **one submodule per verb**, following the existing `src/commands/` pattern. Built-ins resolve before YAML scripts; a repo-local `.zirv/ctx.yaml` script is shadowed (accepted, documented).
-- Verbs (exactly these eight): `score`, `loop`, `exec`, `wrap`, `handoff`, `resume`, `hook`, `status`.
+- Verbs (exactly these nine): `score`, `loop`, `exec`, `wrap`, `handoff`, `resume`, `hook`, `status`, `usage`.
 - Scoring is **pure and deterministic**: same events in, same verdict out. No ML, no learned scoring, no clock or filesystem reads inside the engine.
 - Signal set: token gate (floor **100000**, ceiling **160000**), tool-failure rate, repetition loops (**>= 3** identical `(tool, input_hash)` in the window), capability-gated marker signal (default marker text **`[zirv]`**).
 - Verdict thresholds: score **>= 40 `advise`**, **>= 60 `compact`**, **>= 80 `restart`**. Below the token floor the verdict is always `healthy`. At or above the ceiling the verdict is at least `compact`; at or above the ceiling **with score >= 60** it is `restart`.
@@ -22,7 +22,10 @@
 - `wrap` injects **only** when both preconditions hold: turn boundary reached **and** user idle (input buffer untouched, PTY output-quiet for a **3s** debounce). On any supervision failure `wrap` degrades to **pure passthrough**; a wrapped session must never be worse than an unwrapped one.
 - Injection is **verified**: after sending the compaction command, wrap confirms a compaction event appears in the transcript within a timeout, else it logs and retreats to advisory. No blind keystroke retries.
 - The release profile is `panic = "abort"`. Terminal raw-mode restore must happen in **explicit error arms**, never relying on unwind-time `Drop`. No `unwrap`/`expect` on any `wrap` hot path.
-- Hooks **never block** the agent's stop. `zirv ctx hook <event>` always exits 0, even on internal error.
+- Hooks **never block** the agent's stop. `zirv ctx hook <event>` always exits 0, even on internal error. The same rule covers the statusline: `zirv ctx usage tee` always exits 0 and always emits a statusline, chained output when it can and a built-in fallback line otherwise.
+- Usage pacing keeps a subscription window at or below **`pace_max_percent`, default 99**. Data layers in priority order: **collector (server-authoritative) > estimator (approximation) > none**; a fresher lower-priority layer never overrides a fresh collector reading, and the estimator is always labeled an approximation.
+- **A pause is never an exit.** At or above `pace_max_percent`, `loop` and `exec` wait until the window's `resets_at` plus jitter (configured fallback delay when the reset is unknown) and then continue. The wait is bounded **per window** (its own length plus slack, so five hours or seven days, never one global clock), with an optional absolute override. A limit hit mid-run is **parked and relaunched without consuming the restart budget**. Every pacing decision is appended to the decision log once per pause, not once per check.
+- No test may consume real Claude usage or make an API call. Pacing tests drive fixture statusline JSON, synthetic transcripts, and the existing `tests/fixtures/fake-agent.sh`.
 - Config layering, lowest to highest: `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`, then `ZIRV_CTX_*` environment variables, then command-line flags.
 - All supervisor decisions are appended as JSONL to the state dir for post-hoc audit.
 - CI runs `cargo test --verbose -- --test-threads=1`, `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings` on Linux; CD runs `cargo build --release` on Linux, macOS **and Windows**. Every unix-only module needs a compiling Windows counterpart that returns a clear `Err`.
@@ -78,10 +81,13 @@ Everything else reuses existing dependencies: `serde_json` for transcript parsin
 | `run_loop.rs` | Verb `zirv ctx loop` (`loop` is a Rust keyword, so the module is `run_loop`) |
 | `exec.rs` | Verb `zirv ctx exec` |
 | `wrap.rs` | Verb `zirv ctx wrap` (PTY supervisor) |
+| `usage.rs` | Verb `zirv ctx usage` and its `tee` statusline hook (Phase E) |
+| `window.rs` | Usage-window state file (collector) and the transcript-sum estimator (Phase E) |
+| `pace.rs` | Pure pacing gate, limit-hit matcher, and the shared wait helper (Phase E) |
 
 **Modified:** `src/main.rs` (intercept `ctx` before `Input::parse`), `src/commands/mod.rs` (declare `ctx`), `src/commands/help.rs` (exclude `ctx.toml`), `Cargo.toml` (deps, version), `README.md`, `CLAUDE.md`.
 
-**New test fixtures (data files, not cargo test targets):** `tests/fixtures/README.md`, `tests/fixtures/claude-real-session.jsonl`, `tests/fixtures/claude-real-session.expected.json`, `tests/fixtures/fake-agent.sh`, `tests/fixtures/fake-model.sh`, `tests/fixtures/stub-tui.sh`.
+**New test fixtures (data files, not cargo test targets):** `tests/fixtures/README.md`, `tests/fixtures/claude-real-session.jsonl`, `tests/fixtures/claude-real-session.expected.json`, `tests/fixtures/fake-agent.sh`, `tests/fixtures/fake-model.sh`, `tests/fixtures/stub-tui.sh`, `tests/fixtures/statusline-with-limits.json`, `tests/fixtures/statusline-no-limits.json`, `tests/fixtures/fake-statusline.sh`.
 
 ---
 
@@ -9963,7 +9969,3795 @@ git commit -m "feat(ctx): wrap degrades to pure passthrough on any supervision f
 
 ---
 
-# Release
+# Phase E: Usage pacing
+
+Ships in the same 2.5.0, after Phase C and before Task D1. Autonomous loops must never die mid-run because a subscription usage window ran dry, so supervised work is paced to keep a window at or below `pace_max_percent`.
+
+Every task here builds only on `docs/superpowers/notes/2026-07-31-claude-usage-window-facts.md`. Two facts in that file are **BLOCKED** and get the Task A9 treatment (verify first, ship docs-verified with an empirical follow-up, never guess):
+
+- whether the subscription limiter weights token classes identically: the estimator is labeled an approximation, never overrides fresher collector data, and is **off by default** until the operator sets a token budget;
+- the machine-readable shape of a limit-hit: the matcher ships against the three documented strings only, with a follow-up to confirm empirically.
+
+Facts these tasks rely on, all verified in that notes file: no local usage state exists and no headless query exists (so the statusline is the only collector); statusline fields are `rate_limits.five_hour.used_percentage` / `.resets_at` and `rate_limits.seven_day.*`, subscriber-only and each window independently absent; every assistant transcript event carries `usage`; subagent turns live in separate `<session>/subagents/*.jsonl` files that a machine-wide sum must walk.
+
+### Task E1: Usage state file and the `zirv ctx usage tee` statusline hook
+
+**Files:**
+- Create: `src/commands/ctx/window.rs`
+- Create: `src/commands/ctx/usage.rs`
+- Create: `tests/fixtures/statusline-with-limits.json`
+- Create: `tests/fixtures/statusline-no-limits.json`
+- Create: `tests/fixtures/fake-statusline.sh`
+- Modify: `src/commands/ctx/state.rs:61-89` (add `usage()`)
+- Modify: `src/commands/ctx/mod.rs:3-19` (declare `usage`, `window`), `:37-55` (`CtxVerb::Usage`), `:69-78` (dispatch arm)
+
+**Interfaces:**
+- Consumes, all already implemented and read from the tree: `CtxResult` (`mod.rs:23`), `StateDir::{from_root, resolve, root}` and `state::now_secs` (`state.rs:15,41,47,57`), `EnvLookup` and `env_from_process` (`config.rs:14,18`), the verb convention `pub fn run<W: Write>(args, w) -> CtxResult<i32>` plus a `run_with(args, w, repo, env)` seam (as in `status.rs:16,72`).
+- Produces:
+  - `state.rs`: `pub fn usage(&self) -> PathBuf` returning `<root>/usage.json`
+  - `window.rs`: `pub struct Window { pub used_percentage: f64, pub resets_at: u64, pub observed_at: u64 }` (`Debug, Clone, Copy, PartialEq, Serialize, Deserialize`); `pub struct UsageWindows { pub five_hour: Option<Window>, pub seven_day: Option<Window> }` (`Debug, Clone, Default, PartialEq, Serialize, Deserialize`, `#[serde(default)]`); `pub fn parse_statusline(json: &str, observed_at: u64) -> Option<UsageWindows>`; `pub fn load(state: &StateDir) -> UsageWindows`; `pub fn store(state: &StateDir, windows: &UsageWindows) -> CtxResult<()>`; `pub fn merge(existing: UsageWindows, fresh: UsageWindows) -> UsageWindows`; `pub fn age_secs(window: &Window, now: u64) -> u64`
+  - `usage.rs`: `pub struct UsageArgs { pub action: Option<UsageAction> }`; `pub enum UsageAction { Tee { command: Vec<String> } }`; `pub fn run_tee<W: Write>(w: &mut W, stdin_text: &str, command: &[String], state: Option<&StateDir>, now: u64) -> i32`; `pub fn fallback_line(json: &str) -> String`
+
+- [ ] **Step 1: Write the fixtures**
+
+Create `tests/fixtures/statusline-with-limits.json` (shape copied from the documented fields in the notes file):
+
+```json
+{
+  "hook_event_name": "Status",
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "cwd": "/home/testuser/repo",
+  "model": { "id": "claude-fable-5", "display_name": "Fable 5" },
+  "workspace": { "current_dir": "/home/testuser/repo" },
+  "context_window": { "used_percentage": 42 },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 87.5, "resets_at": 1785000000 },
+    "seven_day": { "used_percentage": 31, "resets_at": 1785400000 }
+  }
+}
+```
+
+Create `tests/fixtures/statusline-no-limits.json` (a non-subscriber or pre-first-response session, which the notes file records as normal):
+
+```json
+{
+  "hook_event_name": "Status",
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "cwd": "/home/testuser/repo",
+  "model": { "id": "claude-fable-5", "display_name": "Fable 5" },
+  "workspace": { "current_dir": "/home/testuser/repo" },
+  "context_window": { "used_percentage": 42 }
+}
+```
+
+Create `tests/fixtures/fake-statusline.sh` and `chmod +x` it:
+
+```sh
+#!/bin/sh
+# Stands in for the user's real statusline script during tee tests.
+#   FAKE_STATUSLINE_MODE=ok|fail|silent   (default ok)
+# ok      echoes a recognizable line built from the JSON it received on stdin
+# fail    exits non-zero without printing, so the fallback path is exercised
+# silent  exits 0 printing nothing
+set -eu
+input=$(cat)
+case "${FAKE_STATUSLINE_MODE:-ok}" in
+  fail) exit 7 ;;
+  silent) exit 0 ;;
+  *)
+    [ -z "${FAKE_STATUSLINE_LOG:-}" ] || printf '%s' "$input" > "$FAKE_STATUSLINE_LOG"
+    printf 'CHAINED-OK bytes=%s\n' "$(printf '%s' "$input" | wc -c | tr -d ' ')"
+    ;;
+esac
+```
+
+Run: `chmod +x tests/fixtures/fake-statusline.sh && printf '{"a":1}' | ./tests/fixtures/fake-statusline.sh`
+Expected: a line starting `CHAINED-OK bytes=`.
+
+- [ ] **Step 2: Write the failing state-file test**
+
+Add to the existing `mod tests` in `src/commands/ctx/state.rs`:
+
+```rust
+    #[test]
+    fn the_usage_file_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.usage(), tmp.path().join("usage.json"));
+    }
+```
+
+- [ ] **Step 3: Run it and see it fail**
+
+Run: `cargo test ctx::state 2>&1 | tail -20`
+Expected: FAIL to compile, `no method named usage found for struct StateDir`.
+
+- [ ] **Step 4: Add the accessor**
+
+In `src/commands/ctx/state.rs`, next to `logs()`:
+
+```rust
+    /// Machine-wide usage-window state, shared by every session that runs the
+    /// statusline tee. One file, not per-session: the windows are per account.
+    pub fn usage(&self) -> PathBuf {
+        self.0.join("usage.json")
+    }
+```
+
+- [ ] **Step 5: Run it and see it pass**
+
+Run: `cargo test ctx::state 2>&1 | tail -20`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 6: Write the failing window tests**
+
+Create `src/commands/ctx/window.rs` containing only this test module:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::ctx::state::StateDir;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn documented_rate_limit_fields_are_parsed() {
+        let json = std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+        let windows = parse_statusline(&json, 1_784_999_000).expect("rate_limits present");
+
+        let five = windows.five_hour.expect("five_hour");
+        assert_eq!(five.used_percentage, 87.5);
+        assert_eq!(five.resets_at, 1_785_000_000);
+        assert_eq!(five.observed_at, 1_784_999_000);
+
+        let seven = windows.seven_day.expect("seven_day");
+        assert_eq!(seven.used_percentage, 31.0, "integer percentages parse as floats");
+        assert_eq!(seven.resets_at, 1_785_400_000);
+    }
+
+    #[test]
+    fn a_statusline_without_rate_limits_yields_nothing_to_persist() {
+        let json = std::fs::read_to_string(fixture("statusline-no-limits.json")).expect("fixture");
+        assert_eq!(
+            parse_statusline(&json, 1_784_999_000),
+            None,
+            "non-subscriber and pre-first-response sessions are normal, not errors"
+        );
+    }
+
+    #[test]
+    fn each_window_may_be_independently_absent() {
+        let only_five = "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":10,\"resets_at\":5}}}";
+        let windows = parse_statusline(only_five, 1).expect("five_hour present");
+        assert!(windows.five_hour.is_some());
+        assert!(windows.seven_day.is_none());
+    }
+
+    #[test]
+    fn a_window_missing_resets_at_is_still_usable_for_its_percentage() {
+        let json = "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":99.9}}}";
+        let five = parse_statusline(json, 7).expect("parsed").five_hour.expect("five");
+        assert_eq!(five.used_percentage, 99.9);
+        assert_eq!(five.resets_at, 0, "zero means unknown, callers use the fallback delay");
+    }
+
+    #[test]
+    fn garbage_input_parses_to_nothing_rather_than_erroring() {
+        assert_eq!(parse_statusline("not json at all", 1), None);
+        assert_eq!(parse_statusline("", 1), None);
+        assert_eq!(parse_statusline("{\"rate_limits\":\"nope\"}", 1), None);
+    }
+
+    #[test]
+    fn state_round_trips_through_the_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        assert_eq!(load(&state), UsageWindows::default(), "absent file is empty state");
+
+        let windows = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 50.0,
+                resets_at: 100,
+                observed_at: 10,
+            }),
+            seven_day: None,
+        };
+        store(&state, &windows).expect("store");
+        assert_eq!(load(&state), windows);
+    }
+
+    #[test]
+    fn a_corrupt_state_file_reads_as_empty_instead_of_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(state.root()).expect("mkdir");
+        std::fs::write(state.usage(), "{ this is not json").expect("write");
+        assert_eq!(load(&state), UsageWindows::default());
+    }
+
+    #[test]
+    fn store_leaves_no_partial_file_behind() {
+        // Concurrent live sessions all write this file, so the write is atomic:
+        // a temp file plus rename, never a truncate-then-write.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        store(&state, &UsageWindows::default()).expect("store");
+        let strays: Vec<_> = std::fs::read_dir(state.root())
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "usage.json")
+            .collect();
+        assert!(strays.is_empty(), "temp file was not cleaned up: {strays:?}");
+    }
+
+    #[test]
+    fn merging_keeps_the_newest_observation_per_window() {
+        let old = UsageWindows {
+            five_hour: Some(Window { used_percentage: 10.0, resets_at: 100, observed_at: 10 }),
+            seven_day: Some(Window { used_percentage: 20.0, resets_at: 200, observed_at: 10 }),
+        };
+        let fresh = UsageWindows {
+            five_hour: Some(Window { used_percentage: 90.0, resets_at: 300, observed_at: 50 }),
+            seven_day: None,
+        };
+
+        let merged = merge(old, fresh);
+        assert_eq!(merged.five_hour.expect("five").used_percentage, 90.0);
+        assert_eq!(
+            merged.seven_day.expect("seven").used_percentage,
+            20.0,
+            "an absent window in a fresh reading must not erase what is known"
+        );
+    }
+
+    #[test]
+    fn merging_never_moves_a_window_backwards_in_time() {
+        let newer = UsageWindows {
+            five_hour: Some(Window { used_percentage: 90.0, resets_at: 300, observed_at: 50 }),
+            seven_day: None,
+        };
+        let stale = UsageWindows {
+            five_hour: Some(Window { used_percentage: 5.0, resets_at: 100, observed_at: 10 }),
+            seven_day: None,
+        };
+        let merged = merge(newer, stale);
+        assert_eq!(
+            merged.five_hour.expect("five").used_percentage,
+            90.0,
+            "a late-arriving stale sample must not win"
+        );
+    }
+
+    #[test]
+    fn age_is_measured_from_the_observation() {
+        let window = Window { used_percentage: 1.0, resets_at: 0, observed_at: 100 };
+        assert_eq!(age_secs(&window, 160), 60);
+        assert_eq!(age_secs(&window, 90), 0, "clock skew reads as fresh, not negative");
+    }
+}
+```
+
+- [ ] **Step 7: Run them and see them fail**
+
+Run: `cargo test ctx::window 2>&1 | tail -20`
+Expected: FAIL. First `module window not found` until `mod.rs` declares it, then `cannot find function parse_statusline`.
+
+- [ ] **Step 8: Write the window implementation**
+
+Add `pub mod usage;` and `pub mod window;` to the module list in `src/commands/ctx/mod.rs` (alphabetical: after `supervise`, `term`, then `usage`, `window`). Then put this above the test module in `src/commands/ctx/window.rs`:
+
+```rust
+// Consumed by the usage verb and the pacing gate in later tasks of this plan.
+#![allow(dead_code)]
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::CtxResult;
+use super::state::StateDir;
+
+/// One subscription window as last reported by the collector. `resets_at` is a
+/// unix epoch second; `0` means the field was absent and callers must fall back.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Window {
+    pub used_percentage: f64,
+    pub resets_at: u64,
+    pub observed_at: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UsageWindows {
+    pub five_hour: Option<Window>,
+    pub seven_day: Option<Window>,
+}
+
+/// A window needs a percentage to be useful. `resets_at` may be absent, and `0`
+/// is the documented "unknown" marker callers fall back on.
+fn window_at(node: Option<&Value>, observed_at: u64) -> Option<Window> {
+    let node = node?;
+    let used_percentage = node.get("used_percentage").and_then(Value::as_f64)?;
+    Some(Window {
+        used_percentage,
+        resets_at: node.get("resets_at").and_then(Value::as_u64).unwrap_or(0),
+        observed_at,
+    })
+}
+
+/// Reads the documented statusline `rate_limits` block. `None` means there was
+/// nothing to persist, which is the normal case for non-subscribers and for the
+/// first statusline of a session, so it is never an error.
+pub fn parse_statusline(json: &str, observed_at: u64) -> Option<UsageWindows> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let limits = value.get("rate_limits")?;
+    if !limits.is_object() {
+        return None;
+    }
+
+    let windows = UsageWindows {
+        five_hour: window_at(limits.get("five_hour"), observed_at),
+        seven_day: window_at(limits.get("seven_day"), observed_at),
+    };
+    if windows.five_hour.is_none() && windows.seven_day.is_none() {
+        return None;
+    }
+    Some(windows)
+}
+
+/// Never fails: an absent or corrupt file reads as "nothing known", because a
+/// statusline hook must not break on a half-written state file.
+pub fn load(state: &StateDir) -> UsageWindows {
+    std::fs::read_to_string(state.usage())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic: every live session's statusline writes this file, so a reader must
+/// never observe a truncated one.
+pub fn store(state: &StateDir, windows: &UsageWindows) -> CtxResult<()> {
+    let target = state.usage();
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = target.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&temp, serde_json::to_string(windows)?)?;
+    std::fs::rename(&temp, &target)?;
+    Ok(())
+}
+
+fn newer(existing: Option<Window>, fresh: Option<Window>) -> Option<Window> {
+    match (existing, fresh) {
+        (Some(existing), Some(fresh)) if fresh.observed_at >= existing.observed_at => Some(fresh),
+        (Some(existing), Some(_)) => Some(existing),
+        (None, fresh) => fresh,
+        (existing, None) => existing,
+    }
+}
+
+/// Per-window merge. Each window may be independently absent from any given
+/// statusline payload, so an absent window never erases a known one.
+pub fn merge(existing: UsageWindows, fresh: UsageWindows) -> UsageWindows {
+    UsageWindows {
+        five_hour: newer(existing.five_hour, fresh.five_hour),
+        seven_day: newer(existing.seven_day, fresh.seven_day),
+    }
+}
+
+pub fn age_secs(window: &Window, now: u64) -> u64 {
+    now.saturating_sub(window.observed_at)
+}
+```
+
+- [ ] **Step 9: Run them and see them pass**
+
+Run: `cargo test ctx::window 2>&1 | tail -20`
+Expected: PASS, 11 tests.
+
+- [ ] **Step 10: Write the failing tee tests**
+
+Create `src/commands/ctx/usage.rs` containing only this test module:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::ctx::state::StateDir;
+    use crate::commands::ctx::window;
+
+    fn fixture(name: &str) -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn statusline_script() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            fixture("fake-statusline.sh").display().to_string(),
+        ]
+    }
+
+    #[test]
+    fn tee_persists_the_windows_and_chains_the_original_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let json = std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+
+        let mut out = Vec::new();
+        let code = run_tee(&mut out, &json, &statusline_script(), Some(&state), 1_784_999_000);
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains("CHAINED-OK"), "chained output must reach the terminal: {printed}");
+
+        let stored = window::load(&state);
+        assert_eq!(stored.five_hour.expect("five_hour").used_percentage, 87.5);
+        assert_eq!(stored.seven_day.expect("seven_day").resets_at, 1_785_400_000);
+    }
+
+    #[test]
+    fn the_chained_command_receives_the_original_json_on_stdin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log = tmp.path().join("seen.json");
+        let json = std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+
+        // SAFETY: CI runs tests single-threaded.
+        unsafe {
+            std::env::set_var("FAKE_STATUSLINE_LOG", &log);
+        }
+        let mut out = Vec::new();
+        run_tee(&mut out, &json, &statusline_script(), None, 1);
+        unsafe {
+            std::env::remove_var("FAKE_STATUSLINE_LOG");
+        }
+
+        let seen = std::fs::read_to_string(&log).expect("chained command ran");
+        assert_eq!(seen, json, "the payload must pass through byte for byte");
+    }
+
+    #[test]
+    fn a_payload_without_rate_limits_still_chains_and_writes_no_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let json = std::fs::read_to_string(fixture("statusline-no-limits.json")).expect("fixture");
+
+        let mut out = Vec::new();
+        let code = run_tee(&mut out, &json, &statusline_script(), Some(&state), 1);
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&out).contains("CHAINED-OK"));
+        assert!(!state.usage().exists(), "nothing to record means no file: {:?}", state.usage());
+    }
+
+    #[test]
+    fn a_failing_chained_command_still_produces_a_statusline() {
+        let json = std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+        unsafe {
+            std::env::set_var("FAKE_STATUSLINE_MODE", "fail");
+        }
+        let mut out = Vec::new();
+        let code = run_tee(&mut out, &json, &statusline_script(), None, 1);
+        unsafe {
+            std::env::remove_var("FAKE_STATUSLINE_MODE");
+        }
+
+        assert_eq!(code, 0, "a broken statusline script must not break the statusline");
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(!printed.trim().is_empty(), "fallback line expected");
+        assert!(printed.contains("Fable 5"), "fallback names the model: {printed}");
+    }
+
+    #[test]
+    fn a_missing_chained_binary_falls_back_instead_of_erroring() {
+        let json = std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+        let mut out = Vec::new();
+        let code = run_tee(
+            &mut out,
+            &json,
+            &["/nonexistent/statusline".to_string()],
+            None,
+            1,
+        );
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&out).contains("Fable 5"));
+    }
+
+    #[test]
+    fn no_chained_command_means_the_fallback_is_the_statusline() {
+        let json = std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+        let mut out = Vec::new();
+        let code = run_tee(&mut out, &json, &[], None, 1);
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains("Fable 5"));
+        assert!(printed.contains("42"), "context percentage carries through: {printed}");
+    }
+
+    #[test]
+    fn an_unwritable_state_dir_never_breaks_the_statusline() {
+        let json = std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+        let state = StateDir::from_root(PathBuf::from("/proc/nonexistent/zirv-ctx"));
+        let mut out = Vec::new();
+        let code = run_tee(&mut out, &json, &statusline_script(), Some(&state), 1);
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&out).contains("CHAINED-OK"));
+    }
+
+    #[test]
+    fn garbage_on_stdin_is_passed_through_untouched() {
+        let mut out = Vec::new();
+        let code = run_tee(&mut out, "this is not json", &statusline_script(), None, 1);
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&out).contains("CHAINED-OK"));
+    }
+
+    #[test]
+    fn the_fallback_line_is_plain_and_has_no_em_dash() {
+        let json = std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+        let line = fallback_line(&json);
+        assert_eq!(line.lines().count(), 1);
+        assert!(!line.contains('\u{2014}'));
+        assert_eq!(fallback_line("garbage").lines().count(), 1, "always exactly one line");
+    }
+
+    #[test]
+    fn tee_parses_as_a_subcommand_with_a_trailing_command() {
+        let cli = crate::commands::ctx::CtxCli::try_parse_from([
+            "zirv ctx",
+            "usage",
+            "tee",
+            "--",
+            "bash",
+            "~/.claude/statusline-command.sh",
+        ])
+        .expect("usage tee should parse");
+        match cli.verb {
+            crate::commands::ctx::CtxVerb::Usage(args) => match args.action {
+                Some(UsageAction::Tee { command }) => assert_eq!(
+                    command,
+                    vec![
+                        "bash".to_string(),
+                        "~/.claude/statusline-command.sh".to_string()
+                    ]
+                ),
+                other => panic!("expected Tee, got {other:?}"),
+            },
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+}
+```
+
+- [ ] **Step 11: Run them and see them fail**
+
+Run: `cargo test ctx::usage 2>&1 | tail -20`
+Expected: FAIL to compile, `cannot find function run_tee`.
+
+- [ ] **Step 12: Write the tee implementation**
+
+Above the test module in `src/commands/ctx/usage.rs`:
+
+```rust
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+use clap::Parser;
+use serde_json::Value;
+
+use super::config::{EnvLookup, env_from_process};
+use super::state::{StateDir, now_secs};
+use super::{CtxResult, window};
+
+#[derive(Debug, clap::Args)]
+pub struct UsageArgs {
+    #[command(subcommand)]
+    pub action: Option<UsageAction>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum UsageAction {
+    /// Statusline wrapper: record usage windows, then run the original command.
+    Tee {
+        /// The original statusline command, after `--`.
+        //
+        // `allow_hyphen_values` + `last` without `trailing_var_arg`, matching
+        // `ExecArgs::command`: adding `trailing_var_arg` trips a clap debug
+        // assertion that aborts the process instead of erroring.
+        #[arg(allow_hyphen_values = true, last = true)]
+        command: Vec<String>,
+    },
+}
+
+/// Last-resort statusline: enough context to keep the line useful when the
+/// chained command is missing or broken.
+pub fn fallback_line(json: &str) -> String {
+    let value: Value = serde_json::from_str(json).unwrap_or(Value::Null);
+    let model = value
+        .get("model")
+        .and_then(|m| m.get("display_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("claude");
+    let context = value
+        .get("context_window")
+        .and_then(|c| c.get("used_percentage"))
+        .and_then(Value::as_f64);
+
+    match context {
+        Some(percent) => format!("{model} | context {}%", percent.round() as i64),
+        None => format!("{model}"),
+    }
+}
+
+/// Never returns non-zero and never returns without emitting a statusline:
+/// Claude Code shows whatever this prints, so a silent failure would look like
+/// a broken terminal to the user.
+pub fn run_tee<W: Write>(
+    w: &mut W,
+    stdin_text: &str,
+    command: &[String],
+    state: Option<&StateDir>,
+    now: u64,
+) -> i32 {
+    // Persisting is best-effort and happens first, so a broken statusline
+    // script cannot cost us the reading.
+    if let (Some(state), Some(fresh)) = (state, window::parse_statusline(stdin_text, now)) {
+        let merged = window::merge(window::load(state), fresh);
+        let _ = window::store(state, &merged);
+    }
+
+    let chained = run_chained(stdin_text, command);
+    match chained {
+        Some(output) if !output.trim().is_empty() => {
+            let _ = write!(w, "{output}");
+        }
+        _ => {
+            let _ = writeln!(w, "{}", fallback_line(stdin_text));
+        }
+    }
+    0
+}
+
+/// `None` when there is no command, it could not start, or it failed.
+fn run_chained(stdin_text: &str, command: &[String]) -> Option<String> {
+    let (program, rest) = command.split_first()?;
+    let mut child = Command::new(program)
+        .args(rest)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .ok()?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(stdin_text.as_bytes());
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn read_stdin() -> String {
+    let mut buffer = String::new();
+    let _ = std::io::stdin().read_to_string(&mut buffer);
+    buffer
+}
+
+pub fn run_with<W: Write>(
+    args: &UsageArgs,
+    w: &mut W,
+    repo: &std::path::Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    match &args.action {
+        Some(UsageAction::Tee { command }) => {
+            let state = StateDir::resolve(env).ok();
+            Ok(run_tee(w, &read_stdin(), command, state.as_ref(), now_secs()))
+        }
+        // The human-readable report arrives in Task E5.
+        None => {
+            let _ = repo;
+            Err("zirv ctx usage reporting is not implemented yet".into())
+        }
+    }
+}
+
+pub fn run<W: Write>(args: &UsageArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_with(args, w, &repo, &env)
+}
+```
+
+The `use clap::Parser;` import is only needed by the test that calls `CtxCli::try_parse_from`; if clippy flags it as unused in the non-test build, move it into the test module instead.
+
+Wire the verb in `src/commands/ctx/mod.rs`: add to `CtxVerb`
+
+```rust
+    /// Report usage windows, or tee the statusline to record them.
+    Usage(usage::UsageArgs),
+```
+
+and to the dispatch match
+
+```rust
+        CtxVerb::Usage(a) => usage::run(a, &mut out),
+```
+
+- [ ] **Step 13: Run them and see them pass**
+
+Run: `cargo test ctx::usage -- --test-threads=1 2>&1 | tail -20`
+Expected: PASS, 10 tests. If `an_unwritable_state_dir_never_breaks_the_statusline` fails on macOS because `/proc` does not exist, that is still an unwritable path and the assertion holds; if the path happens to be creatable in your environment, point it at `/dev/null/zirv-ctx` instead.
+
+- [ ] **Step 14: Verify against the real statusline by hand**
+
+Run:
+
+```bash
+cargo build
+T=$(ls -t ~/.claude/projects/*/*.jsonl | head -1)
+printf '{"model":{"display_name":"Fable 5"},"context_window":{"used_percentage":42},"cwd":"%s"}' "$PWD" \
+  | ZIRV_CTX_STATE_DIR=/tmp/zirv-usage-probe ./target/debug/zirv ctx usage tee -- bash ~/.claude/statusline-command.sh
+echo "exit=$?"
+cat /tmp/zirv-usage-probe/usage.json 2>/dev/null || echo "no rate_limits in that payload, as expected"
+```
+
+Expected: the real statusline renders exactly as it does today, `exit=0`, and no `usage.json` (the synthetic payload carries no `rate_limits`). This is the safety property that matters: the tee is transparent.
+
+- [ ] **Step 15: Commit**
+
+```bash
+git add tests/fixtures/statusline-with-limits.json tests/fixtures/statusline-no-limits.json tests/fixtures/fake-statusline.sh src/commands/ctx/window.rs src/commands/ctx/usage.rs src/commands/ctx/state.rs src/commands/ctx/mod.rs
+git commit -m "feat(ctx): collect usage windows through a transparent statusline tee"
+```
+
+---
+
+### Task E2: Transcript-sum estimator
+
+**Files:**
+- Modify: `src/commands/ctx/window.rs`
+
+**Interfaces:**
+- Consumes: `Window`, `UsageWindows` (E1); `crate::utils::home_dir()` (`src/utils.rs:16`, already reused by `config.rs:250`).
+- Produces:
+  - `pub const FIVE_HOUR_SECS: u64 = 18_000;` and `pub const SEVEN_DAY_SECS: u64 = 604_800;`
+  - `pub fn parse_iso8601_utc(ts: &str) -> Option<u64>`
+  - `pub fn usage_tokens_of(usage: &serde_json::Value, count_cache_reads: bool) -> u64`
+  - `pub struct TokenSums { pub five_hour: u64, pub seven_day: u64, pub oldest_in_five_hour: u64, pub oldest_in_seven_day: u64, pub files_scanned: usize, pub events_counted: usize }` (`Debug, Clone, Copy, PartialEq, Default`)
+  - `pub fn sum_file(jsonl: &str, now: u64, count_cache_reads: bool, into: &mut TokenSums)`
+  - `pub fn projects_root() -> CtxResult<PathBuf>` returning `~/.claude/projects`
+  - `pub fn sum_transcripts(projects_root: &Path, now: u64, count_cache_reads: bool) -> TokenSums`
+  - `pub fn estimate_windows(sums: &TokenSums, now: u64, five_hour_budget: u64, seven_day_budget: u64) -> UsageWindows`
+
+Deliberate choices, both forced by the BLOCKED fact that class weighting is undocumented:
+
+1. `cache_read_input_tokens` is **excluded by default**. It is the dominant class in a cached session (verified: 108427 of 108886 tokens in one real event) and is discounted by the API, so including it would overestimate wildly. The flag exists so an operator who learns otherwise can switch it on.
+2. Estimator percentages are only produced when the operator has configured a budget. Nothing in the notes file tells us a plan's real token allowance, so inventing one would be a guess dressed as data.
+
+- [ ] **Step 1: Write the failing timestamp and token tests**
+
+Add to the `mod tests` in `src/commands/ctx/window.rs`:
+
+```rust
+    #[test]
+    fn real_transcript_timestamps_parse_to_unix_seconds() {
+        // Exact format observed in ~/.claude/projects/**/*.jsonl.
+        assert_eq!(
+            parse_iso8601_utc("2026-07-31T14:15:15.968Z"),
+            Some(1_785_507_315),
+        );
+        assert_eq!(parse_iso8601_utc("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(parse_iso8601_utc("1970-01-02T00:00:01.000Z"), Some(86_401));
+        // Leap-year handling, since the window arithmetic depends on it.
+        assert_eq!(parse_iso8601_utc("2024-02-29T00:00:00.000Z"), Some(1_709_164_800));
+    }
+
+    #[test]
+    fn malformed_timestamps_are_skipped_not_guessed() {
+        assert_eq!(parse_iso8601_utc(""), None);
+        assert_eq!(parse_iso8601_utc("yesterday"), None);
+        assert_eq!(parse_iso8601_utc("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_iso8601_utc("2026-07-31"), None);
+    }
+
+    #[test]
+    fn cache_reads_are_excluded_by_default_and_optional() {
+        // The usage block of a real cached assistant event.
+        let usage = serde_json::json!({
+            "input_tokens": 2,
+            "cache_creation_input_tokens": 457,
+            "cache_read_input_tokens": 108_427,
+            "output_tokens": 577
+        });
+        assert_eq!(
+            usage_tokens_of(&usage, false),
+            1036,
+            "input + cache_creation + output, cache reads excluded"
+        );
+        assert_eq!(usage_tokens_of(&usage, true), 109_463);
+        assert_eq!(usage_tokens_of(&serde_json::json!({}), false), 0);
+    }
+```
+
+- [ ] **Step 2: Run them and see them fail**
+
+Run: `cargo test ctx::window 2>&1 | tail -20`
+Expected: FAIL to compile, `cannot find function parse_iso8601_utc`.
+
+- [ ] **Step 3: Write the timestamp and token implementation**
+
+Append to `src/commands/ctx/window.rs`:
+
+```rust
+use std::path::{Path, PathBuf};
+
+pub const FIVE_HOUR_SECS: u64 = 5 * 3600;
+pub const SEVEN_DAY_SECS: u64 = 7 * 24 * 3600;
+
+/// Days from the unix epoch for a civil date, valid for any year in range.
+/// Howard Hinnant's `days_from_civil`, which is why no date crate is needed.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Parses the exact shape claude writes: `2026-07-31T14:15:15.968Z`. Fractional
+/// seconds and the offset suffix are ignored; anything else returns `None` so a
+/// malformed line is skipped rather than counted at the wrong time.
+pub fn parse_iso8601_utc(ts: &str) -> Option<u64> {
+    let bytes = ts.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+
+    let field = |from: usize, to: usize| ts.get(from..to)?.parse::<i64>().ok();
+    let year = field(0, 4)?;
+    let month = field(5, 7)?;
+    let day = field(8, 10)?;
+    let hour = field(11, 13)?;
+    let minute = field(14, 16)?;
+    let second = field(17, 19)?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    let total = days * 86_400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(total).ok()
+}
+
+/// Cache reads are excluded by default: they are the dominant class in a cached
+/// session and are discounted by the API, and the notes file records that the
+/// limiter's real weighting is undocumented.
+pub fn usage_tokens_of(usage: &Value, count_cache_reads: bool) -> u64 {
+    let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let mut total = field("input_tokens") + field("cache_creation_input_tokens") + field("output_tokens");
+    if count_cache_reads {
+        total += field("cache_read_input_tokens");
+    }
+    total
+}
+```
+
+- [ ] **Step 4: Run them and see them pass**
+
+Run: `cargo test ctx::window 2>&1 | tail -20`
+Expected: PASS, 14 tests. If `real_transcript_timestamps_parse_to_unix_seconds` is off by exactly 86400, check the `day - 1` term in `days_from_civil`.
+
+- [ ] **Step 5: Write the failing walk tests**
+
+Add to the same `mod tests`:
+
+```rust
+    /// Builds a transcript whose assistant events sit at given ages in seconds.
+    fn transcript_with_ages(now: u64, ages: &[u64], tokens: u64) -> String {
+        let mut text = String::new();
+        for age in ages {
+            let at = now - age;
+            text.push_str(&format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"usage\":{{\"input_tokens\":{tokens},\"cache_read_input_tokens\":999999}}}}}}\n",
+                iso_of(at)
+            ));
+        }
+        text
+    }
+
+    /// Inverse of `parse_iso8601_utc`, for building fixtures only.
+    fn iso_of(unix: u64) -> String {
+        let days = (unix / 86_400) as i64;
+        let secs = unix % 86_400;
+        let (year, month, day) = civil_from_days_for_tests(days);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
+    }
+
+    fn civil_from_days_for_tests(days: i64) -> (i64, i64, i64) {
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
+    #[test]
+    fn the_fixture_timestamp_helper_round_trips() {
+        for unix in [0_u64, 1_785_507_315, 1_709_164_800] {
+            assert_eq!(parse_iso8601_utc(&iso_of(unix)), Some(unix), "round trip {unix}");
+        }
+    }
+
+    #[test]
+    fn only_events_inside_each_window_are_summed() {
+        let now = 1_785_507_315;
+        // 1h ago (both windows), 6h ago (7d only), 8d ago (neither).
+        let jsonl = transcript_with_ages(now, &[3600, 21_600, 691_200], 100);
+
+        let mut sums = TokenSums::default();
+        sum_file(&jsonl, now, false, &mut sums);
+
+        assert_eq!(sums.five_hour, 100, "one event within 5h");
+        assert_eq!(sums.seven_day, 200, "two events within 7d");
+        assert_eq!(sums.events_counted, 2);
+    }
+
+    #[test]
+    fn the_oldest_counted_event_is_tracked_for_reset_estimation() {
+        let now = 1_785_507_315;
+        let jsonl = transcript_with_ages(now, &[3600, 7200], 10);
+        let mut sums = TokenSums::default();
+        sum_file(&jsonl, now, false, &mut sums);
+        assert_eq!(sums.oldest_in_five_hour, now - 7200);
+        assert_eq!(sums.oldest_in_seven_day, now - 7200);
+    }
+
+    #[test]
+    fn non_assistant_and_malformed_lines_are_ignored() {
+        let now = 1_785_507_315;
+        let mut jsonl = String::new();
+        jsonl.push_str("{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n");
+        jsonl.push_str("not json\n\n");
+        jsonl.push_str("{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n");
+        jsonl.push_str(&transcript_with_ages(now, &[60], 7));
+
+        let mut sums = TokenSums::default();
+        sum_file(&jsonl, now, false, &mut sums);
+        assert_eq!(sums.five_hour, 7, "the event with no timestamp cannot be placed");
+        assert_eq!(sums.events_counted, 1);
+    }
+
+    #[test]
+    fn the_walk_includes_subagent_files() {
+        let now = 1_785_507_315;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        let session_dir = projects.join("-home-testuser-repo");
+        std::fs::create_dir_all(session_dir.join("subagents")).expect("mkdir");
+
+        std::fs::write(
+            session_dir.join("main.jsonl"),
+            transcript_with_ages(now, &[600], 100),
+        )
+        .expect("write main");
+        std::fs::write(
+            session_dir.join("subagents").join("sub.jsonl"),
+            transcript_with_ages(now, &[600], 25),
+        )
+        .expect("write subagent");
+        // A non-transcript file must not be parsed.
+        std::fs::write(session_dir.join("notes.txt"), "ignore me").expect("write txt");
+
+        let sums = sum_transcripts(&projects, now, false);
+        assert_eq!(sums.files_scanned, 2, "main plus subagent, not the txt");
+        assert_eq!(
+            sums.five_hour, 125,
+            "subagent turns live in their own files and must be counted"
+        );
+    }
+
+    #[test]
+    fn an_absent_projects_root_sums_to_zero() {
+        let sums = sum_transcripts(std::path::Path::new("/nonexistent/projects"), 100, false);
+        assert_eq!(sums, TokenSums::default());
+    }
+
+    #[test]
+    fn percentages_need_a_configured_budget() {
+        let now = 1_785_507_315;
+        let sums = TokenSums {
+            five_hour: 500,
+            seven_day: 2000,
+            oldest_in_five_hour: now - 3600,
+            oldest_in_seven_day: now - 86_400,
+            files_scanned: 1,
+            events_counted: 4,
+        };
+
+        assert_eq!(
+            estimate_windows(&sums, now, 0, 0),
+            UsageWindows::default(),
+            "no budget means no honest percentage"
+        );
+
+        let windows = estimate_windows(&sums, now, 1000, 8000);
+        let five = windows.five_hour.expect("five_hour");
+        assert_eq!(five.used_percentage, 50.0);
+        assert_eq!(five.observed_at, now);
+        assert_eq!(
+            five.resets_at,
+            now - 3600 + FIVE_HOUR_SECS,
+            "a rolling window frees up when its oldest counted event ages out"
+        );
+
+        let seven = windows.seven_day.expect("seven_day");
+        assert_eq!(seven.used_percentage, 25.0);
+        assert_eq!(seven.resets_at, now - 86_400 + SEVEN_DAY_SECS);
+    }
+
+    #[test]
+    fn percentages_are_capped_at_one_hundred() {
+        let now = 1_000_000;
+        let sums = TokenSums {
+            five_hour: 5000,
+            seven_day: 0,
+            oldest_in_five_hour: now - 60,
+            oldest_in_seven_day: 0,
+            files_scanned: 1,
+            events_counted: 1,
+        };
+        let five = estimate_windows(&sums, now, 1000, 0).five_hour.expect("five");
+        assert_eq!(five.used_percentage, 100.0);
+    }
+
+    #[test]
+    fn a_window_with_no_events_reports_zero_and_resets_now() {
+        let now = 1_000_000;
+        let windows = estimate_windows(&TokenSums::default(), now, 1000, 1000);
+        let five = windows.five_hour.expect("five");
+        assert_eq!(five.used_percentage, 0.0);
+        assert_eq!(five.resets_at, now, "nothing to wait for");
+    }
+```
+
+- [ ] **Step 6: Run them and see them fail**
+
+Run: `cargo test ctx::window 2>&1 | tail -20`
+Expected: FAIL to compile, `cannot find type TokenSums`.
+
+- [ ] **Step 7: Write the walk implementation**
+
+Append to `src/commands/ctx/window.rs`:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenSums {
+    pub five_hour: u64,
+    pub seven_day: u64,
+    /// Unix second of the oldest event counted in each window, or `0` when the
+    /// window counted nothing. Used to estimate when the window frees up.
+    pub oldest_in_five_hour: u64,
+    pub oldest_in_seven_day: u64,
+    pub files_scanned: usize,
+    pub events_counted: usize,
+}
+
+fn note_oldest(slot: &mut u64, at: u64) {
+    if *slot == 0 || at < *slot {
+        *slot = at;
+    }
+}
+
+/// Accumulates one transcript's assistant usage into the trailing windows.
+/// Events without a parseable timestamp cannot be placed in a window and are
+/// skipped rather than counted at the wrong time.
+pub fn sum_file(jsonl: &str, now: u64, count_cache_reads: bool, into: &mut TokenSums) {
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(at) = row
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_utc)
+        else {
+            continue;
+        };
+        let age = now.saturating_sub(at);
+        if age > SEVEN_DAY_SECS {
+            continue;
+        }
+
+        let Some(usage) = row.get("message").and_then(|m| m.get("usage")) else {
+            continue;
+        };
+        let tokens = usage_tokens_of(usage, count_cache_reads);
+
+        into.events_counted += 1;
+        into.seven_day += tokens;
+        note_oldest(&mut into.oldest_in_seven_day, at);
+        if age <= FIVE_HOUR_SECS {
+            into.five_hour += tokens;
+            note_oldest(&mut into.oldest_in_five_hour, at);
+        }
+    }
+}
+
+pub fn projects_root() -> CtxResult<PathBuf> {
+    Ok(crate::utils::home_dir()?.join(".claude").join("projects"))
+}
+
+/// Walks every transcript under the projects root, including the `subagents/`
+/// subdirectories, because subagent turns live in their own files and still
+/// spend the account's budget.
+pub fn sum_transcripts(projects_root: &Path, now: u64, count_cache_reads: bool) -> TokenSums {
+    let mut sums = TokenSums::default();
+    let mut stack = vec![projects_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            sums.files_scanned += 1;
+            sum_file(&text, now, count_cache_reads, &mut sums);
+        }
+    }
+    sums
+}
+
+fn estimated_window(used: u64, budget: u64, oldest: u64, span: u64, now: u64) -> Option<Window> {
+    if budget == 0 {
+        return None;
+    }
+    let percent = ((used as f64 / budget as f64) * 100.0).clamp(0.0, 100.0);
+    let resets_at = if oldest == 0 { now } else { oldest + span };
+    Some(Window {
+        used_percentage: percent,
+        resets_at,
+        observed_at: now,
+    })
+}
+
+/// Percentages only exist once the operator configures a budget: the notes file
+/// records that a plan's real token allowance is undocumented, so a default
+/// would be a guess presented as data.
+pub fn estimate_windows(
+    sums: &TokenSums,
+    now: u64,
+    five_hour_budget: u64,
+    seven_day_budget: u64,
+) -> UsageWindows {
+    UsageWindows {
+        five_hour: estimated_window(
+            sums.five_hour,
+            five_hour_budget,
+            sums.oldest_in_five_hour,
+            FIVE_HOUR_SECS,
+            now,
+        ),
+        seven_day: estimated_window(
+            sums.seven_day,
+            seven_day_budget,
+            sums.oldest_in_seven_day,
+            SEVEN_DAY_SECS,
+            now,
+        ),
+    }
+}
+```
+
+`TokenSums` derives `Eq` while `Window` cannot (it holds an `f64`), which is why the two structs have different derive lists.
+
+- [ ] **Step 8: Run them and see them pass**
+
+Run: `cargo test ctx::window -- --test-threads=1 2>&1 | tail -20`
+Expected: PASS, 23 tests.
+
+- [ ] **Step 9: Sanity-check the estimator against this machine's real transcripts**
+
+Run:
+
+```bash
+cargo build
+python3 - <<'PY'
+import glob, json, os, time
+now = int(time.time())
+five = seven = files = 0
+for path in glob.glob(os.path.expanduser('~/.claude/projects/**/*.jsonl'), recursive=True):
+    files += 1
+    for line in open(path, errors='ignore'):
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get('type') != 'assistant':
+            continue
+        ts = row.get('timestamp')
+        if not ts:
+            continue
+        at = int(time.mktime(time.strptime(ts[:19], '%Y-%m-%dT%H:%M:%S')) - time.timezone)
+        usage = (row.get('message') or {}).get('usage') or {}
+        tokens = sum(int(usage.get(k) or 0) for k in ('input_tokens', 'cache_creation_input_tokens', 'output_tokens'))
+        age = now - at
+        if age <= 7 * 86400:
+            seven += tokens
+            if age <= 5 * 3600:
+                five += tokens
+print(f'files={files} five_hour={five} seven_day={seven}')
+PY
+```
+
+Expected: plausible non-zero sums (a working day is typically tens to hundreds of thousands). Record the numbers in the commit message: this is the only cross-check available, since no API reports the true figure.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/commands/ctx/window.rs
+git commit -m "feat(ctx): estimate usage windows by summing transcript token usage"
+```
+
+---
+
+### Task E3: Pacing gate and configuration
+
+**Files:**
+- Create: `src/commands/ctx/pace.rs`
+- Modify: `src/commands/ctx/config.rs:119-128` (add `pace`), `:130-134` (`EnvKind`), `:136-189` (`ENV_MAP`), `:223-231` (`env_value`)
+- Modify: `src/commands/ctx/mod.rs:3-19` (declare `pace`)
+
+**Interfaces:**
+- Consumes: `UsageWindows`, `Window`, `age_secs` (E1); `CtxConfig`, `EnvKind`, `ENV_MAP`, `env_value` (`config.rs`, all as implemented).
+- Produces:
+  - `config.rs`: `pub struct PaceConfig { pub enabled: bool, pub max_percent: f64, pub collector_max_age_secs: u64, pub estimator: bool, pub five_hour_budget_tokens: u64, pub seven_day_budget_tokens: u64, pub count_cache_reads: bool, pub jitter_secs: u64, pub fallback_delay_secs: u64, pub wait_slack_secs: u64, pub max_wait_secs: Option<u64> }` with `Default` (`enabled: true`, `max_percent: 99.0`, `collector_max_age_secs: 900`, `estimator: true`, budgets `0`, `count_cache_reads: false`, `jitter_secs: 30`, `fallback_delay_secs: 900`, `wait_slack_secs: 3600`, `max_wait_secs: None`), plus `CtxConfig.pace: PaceConfig` and two new `EnvKind` variants `Float` and `Bool`
+  - `pace.rs`: `pub enum Source { Collector, Estimator, None }`; `pub enum PaceDecision { Proceed { source: Source, worst_percent: f64 }, WaitUntil { reset_at: Option<u64>, window: &'static str, percent: f64, source: Source }, Unknown }`; `pub fn decide(collector: &UsageWindows, estimator: Option<&UsageWindows>, now: u64, cfg: &PaceConfig) -> PaceDecision`; `pub fn window_length(window: &str) -> u64`; `pub fn wait_cap(window: &str, cfg: &PaceConfig) -> u64`; `pub fn wait_deadline(decision: &PaceDecision, now: u64, cfg: &PaceConfig, seed: u64) -> Option<u64>`; `pub fn apply_jitter(until: u64, jitter_secs: u64, seed: u64) -> u64`; `pub fn describe(decision: &PaceDecision) -> String`
+
+**The safety valve is scaled to the window, not to a fixed clock.** A seven-day window that trips genuinely needs up to seven days of waiting; a global six-hour cap would resume every six hours and burn tokens against an exhausted week, which is the opposite of what pacing is for. So the cap is `window_length + wait_slack_secs` (5h plus 1h, or 7d plus 1h), and `max_wait_secs` exists only as an explicit absolute override for an operator who would rather proceed sooner.
+
+- [ ] **Step 1: Write the failing config tests**
+
+Add to the existing `mod tests` in `src/commands/ctx/config.rs`:
+
+```rust
+    #[test]
+    fn pacing_defaults_match_the_spec() {
+        let pace = PaceConfig::default();
+        assert!(pace.enabled, "pacing is on by default");
+        assert_eq!(pace.max_percent, 99.0);
+        assert_eq!(pace.collector_max_age_secs, 900);
+        assert!(pace.estimator);
+        assert_eq!(
+            (pace.five_hour_budget_tokens, pace.seven_day_budget_tokens),
+            (0, 0),
+            "no invented budget: the estimator stays quiet until an operator sets one"
+        );
+        assert!(!pace.count_cache_reads);
+        assert_eq!(pace.jitter_secs, 30);
+        assert_eq!(pace.fallback_delay_secs, 900);
+        assert_eq!(pace.wait_slack_secs, 3600);
+        assert_eq!(
+            pace.max_wait_secs, None,
+            "no global cap by default: the cap is scaled to the window that tripped"
+        );
+    }
+
+    #[test]
+    fn pacing_reads_from_the_repo_config_file() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[pace]\nenabled = false\nmax_percent = 80.5\nfive_hour_budget_tokens = 500000\ncount_cache_reads = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.pace.enabled);
+        assert_eq!(cfg.pace.max_percent, 80.5);
+        assert_eq!(cfg.pace.five_hour_budget_tokens, 500_000);
+        assert!(cfg.pace.count_cache_reads);
+        assert_eq!(cfg.pace.fallback_delay_secs, 900, "untouched keys keep defaults");
+    }
+
+    #[test]
+    fn pacing_env_overrides_cover_floats_and_bools() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE", "false"),
+            ("ZIRV_CTX_PACE_MAX_PERCENT", "75"),
+            ("ZIRV_CTX_FIVE_HOUR_BUDGET", "1000"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.pace.enabled);
+        assert_eq!(cfg.pace.max_percent, 75.0, "an integer literal must load as a float");
+        assert_eq!(cfg.pace.five_hour_budget_tokens, 1000);
+    }
+
+    #[test]
+    fn a_non_numeric_percent_is_rejected_with_the_variable_named() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PACE_MAX_PERCENT", "loads")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad float");
+        let msg = err.to_string();
+        assert!(msg.contains("ZIRV_CTX_PACE_MAX_PERCENT"), "got {msg}");
+    }
+
+    #[test]
+    fn a_non_boolean_flag_is_rejected() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PACE", "yes-please")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad bool");
+        assert!(err.to_string().contains("ZIRV_CTX_PACE"));
+    }
+```
+
+- [ ] **Step 2: Run them and see them fail**
+
+Run: `cargo test ctx::config 2>&1 | tail -20`
+Expected: FAIL to compile, `cannot find type PaceConfig`.
+
+- [ ] **Step 3: Extend the config**
+
+In `src/commands/ctx/config.rs`, add the struct next to `HandoffConfig`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaceConfig {
+    pub enabled: bool,
+    /// A supervised window is kept at or below this percentage.
+    pub max_percent: f64,
+    /// Collector readings older than this are treated as stale.
+    pub collector_max_age_secs: u64,
+    pub estimator: bool,
+    /// `0` disables the estimator for that window: a plan's real allowance is
+    /// undocumented, so there is no honest default.
+    pub five_hour_budget_tokens: u64,
+    pub seven_day_budget_tokens: u64,
+    pub count_cache_reads: bool,
+    pub jitter_secs: u64,
+    /// Used when a window's `resets_at` is unknown.
+    pub fallback_delay_secs: u64,
+    /// Head-room added to a window's own length to form the default safety cap,
+    /// so a slightly wrong `resets_at` still resolves.
+    pub wait_slack_secs: u64,
+    /// Absolute override for the safety cap. `None` scales the cap to the window
+    /// that tripped (5h or 7d, plus `wait_slack_secs`), which is what the spec's
+    /// wait-until-reset semantics require: a global cap would resume early and
+    /// spend tokens against a window that is still exhausted.
+    pub max_wait_secs: Option<u64>,
+}
+
+impl Default for PaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_percent: 99.0,
+            collector_max_age_secs: 900,
+            estimator: true,
+            five_hour_budget_tokens: 0,
+            seven_day_budget_tokens: 0,
+            count_cache_reads: false,
+            jitter_secs: 30,
+            fallback_delay_secs: 900,
+            wait_slack_secs: 3600,
+            max_wait_secs: None,
+        }
+    }
+}
+```
+
+Add the field to `CtxConfig`:
+
+```rust
+    pub pace: PaceConfig,
+```
+
+Extend `EnvKind` and `env_value`:
+
+```rust
+#[derive(Debug, Clone, Copy)]
+enum EnvKind {
+    Int,
+    Float,
+    Bool,
+    Str,
+}
+```
+
+```rust
+fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
+    match kind {
+        EnvKind::Str => Ok(toml::Value::String(raw.to_string())),
+        EnvKind::Int => raw
+            .parse::<i64>()
+            .map(toml::Value::Integer)
+            .map_err(|_| format!("expected an integer, got '{raw}'").into()),
+        EnvKind::Float => raw
+            .parse::<f64>()
+            .map(toml::Value::Float)
+            .map_err(|_| format!("expected a number, got '{raw}'").into()),
+        EnvKind::Bool => raw
+            .parse::<bool>()
+            .map(toml::Value::Boolean)
+            .map_err(|_| format!("expected true or false, got '{raw}'").into()),
+    }
+}
+```
+
+Append to `ENV_MAP`:
+
+```rust
+    ("ZIRV_CTX_PACE", &["pace", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_PACE_MAX_PERCENT",
+        &["pace", "max_percent"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_PACE_FALLBACK_SECS",
+        &["pace", "fallback_delay_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_MAX_WAIT_SECS",
+        &["pace", "max_wait_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_SLACK_SECS",
+        &["pace", "wait_slack_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_JITTER_SECS",
+        &["pace", "jitter_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FIVE_HOUR_BUDGET",
+        &["pace", "five_hour_budget_tokens"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SEVEN_DAY_BUDGET",
+        &["pace", "seven_day_budget_tokens"],
+        EnvKind::Int,
+    ),
+```
+
+A TOML float field accepts an integer literal only if it arrives as `Value::Float`, which is why `ZIRV_CTX_PACE_MAX_PERCENT=75` needs `EnvKind::Float` rather than `Int`.
+
+- [ ] **Step 4: Run them and see them pass**
+
+Run: `cargo test ctx::config 2>&1 | tail -20`
+Expected: PASS, 10 tests.
+
+- [ ] **Step 5: Write the failing gate tests**
+
+Create `src/commands/ctx/pace.rs` containing only this test module:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::ctx::config::PaceConfig;
+    use crate::commands::ctx::window::{UsageWindows, Window};
+
+    const NOW: u64 = 1_785_507_315;
+
+    fn window(percent: f64, resets_at: u64, observed_at: u64) -> Option<Window> {
+        Some(Window {
+            used_percentage: percent,
+            resets_at,
+            observed_at,
+        })
+    }
+
+    fn collector(percent: f64) -> UsageWindows {
+        UsageWindows {
+            five_hour: window(percent, NOW + 600, NOW - 10),
+            seven_day: None,
+        }
+    }
+
+    #[test]
+    fn a_healthy_fresh_collector_reading_proceeds() {
+        let decision = decide(&collector(42.0), None, NOW, &PaceConfig::default());
+        assert_eq!(
+            decision,
+            PaceDecision::Proceed {
+                source: Source::Collector,
+                worst_percent: 42.0
+            }
+        );
+    }
+
+    #[test]
+    fn at_the_ceiling_the_gate_waits_for_the_reset() {
+        let decision = decide(&collector(99.0), None, NOW, &PaceConfig::default());
+        assert_eq!(
+            decision,
+            PaceDecision::WaitUntil {
+                reset_at: Some(NOW + 600),
+                window: "five_hour",
+                percent: 99.0,
+                source: Source::Collector
+            },
+            "the default ceiling is inclusive"
+        );
+    }
+
+    #[test]
+    fn just_below_the_ceiling_still_proceeds() {
+        let decision = decide(&collector(98.9), None, NOW, &PaceConfig::default());
+        assert!(matches!(decision, PaceDecision::Proceed { .. }));
+    }
+
+    #[test]
+    fn the_worst_window_decides() {
+        let both = UsageWindows {
+            five_hour: window(10.0, NOW + 100, NOW),
+            seven_day: window(99.5, NOW + 90_000, NOW),
+        };
+        let decision = decide(&both, None, NOW, &PaceConfig::default());
+        assert_eq!(
+            decision,
+            PaceDecision::WaitUntil {
+                reset_at: Some(NOW + 90_000),
+                window: "seven_day",
+                percent: 99.5,
+                source: Source::Collector
+            }
+        );
+    }
+
+    #[test]
+    fn a_stale_collector_reading_is_ignored_in_favour_of_the_estimator() {
+        let stale = UsageWindows {
+            five_hour: window(5.0, NOW + 600, NOW - 100_000),
+            seven_day: None,
+        };
+        let estimated = UsageWindows {
+            five_hour: window(99.9, NOW + 300, NOW),
+            seven_day: None,
+        };
+        let decision = decide(&stale, Some(&estimated), NOW, &PaceConfig::default());
+        assert_eq!(
+            decision,
+            PaceDecision::WaitUntil {
+                reset_at: Some(NOW + 300),
+                window: "five_hour",
+                percent: 99.9,
+                source: Source::Estimator
+            }
+        );
+    }
+
+    #[test]
+    fn a_fresh_collector_reading_always_beats_the_estimator() {
+        let estimated = UsageWindows {
+            five_hour: window(100.0, NOW + 300, NOW),
+            seven_day: None,
+        };
+        let decision = decide(&collector(20.0), Some(&estimated), NOW, &PaceConfig::default());
+        assert_eq!(
+            decision,
+            PaceDecision::Proceed {
+                source: Source::Collector,
+                worst_percent: 20.0
+            },
+            "server-authoritative data wins even when the approximation disagrees"
+        );
+    }
+
+    #[test]
+    fn nothing_known_is_unknown_not_zero() {
+        let decision = decide(&UsageWindows::default(), None, NOW, &PaceConfig::default());
+        assert_eq!(decision, PaceDecision::Unknown);
+
+        let empty_estimate = UsageWindows::default();
+        assert_eq!(
+            decide(&UsageWindows::default(), Some(&empty_estimate), NOW, &PaceConfig::default()),
+            PaceDecision::Unknown,
+            "an estimator with no configured budget contributes nothing"
+        );
+    }
+
+    #[test]
+    fn disabling_the_estimator_leaves_a_stale_collector_unknown() {
+        // Stale and below the ceiling, so it carries no information at all.
+        let stale = UsageWindows {
+            five_hour: window(50.0, NOW + 600, NOW - 100_000),
+            seven_day: None,
+        };
+        let estimated = UsageWindows {
+            five_hour: window(99.9, NOW + 300, NOW),
+            seven_day: None,
+        };
+        let cfg = PaceConfig {
+            estimator: false,
+            ..PaceConfig::default()
+        };
+        assert_eq!(decide(&stale, Some(&estimated), NOW, &cfg), PaceDecision::Unknown);
+    }
+
+    #[test]
+    fn a_stale_full_window_keeps_binding_until_its_reset_arrives() {
+        // Staleness must not clear a park: the percentage is old, but a window
+        // cannot free up before its own reset, and resuming here would spend
+        // tokens against a window that is still exhausted.
+        let stale_but_full = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW - 100_000),
+            seven_day: None,
+        };
+        assert_eq!(
+            decide(&stale_but_full, None, NOW, &PaceConfig::default()),
+            PaceDecision::WaitUntil {
+                reset_at: Some(NOW + 600),
+                window: "five_hour",
+                percent: 100.0,
+                source: Source::Collector
+            }
+        );
+    }
+
+    #[test]
+    fn a_stale_full_window_stops_binding_once_its_reset_has_passed() {
+        let expired = UsageWindows {
+            five_hour: window(100.0, NOW - 1, NOW - 100_000),
+            seven_day: None,
+        };
+        assert_eq!(
+            decide(&expired, None, NOW, &PaceConfig::default()),
+            PaceDecision::Unknown,
+            "after the reset the old percentage says nothing about the new window"
+        );
+    }
+
+    #[test]
+    fn a_stale_full_window_still_loses_to_a_fresh_reading() {
+        let mixed = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW - 100_000),
+            seven_day: window(10.0, NOW + 90_000, NOW),
+        };
+        // The stale-but-full five hour window is the worse of the two and still
+        // binds, so the gate waits on it rather than on the fresh healthy one.
+        assert!(matches!(
+            decide(&mixed, None, NOW, &PaceConfig::default()),
+            PaceDecision::WaitUntil { window: "five_hour", .. }
+        ));
+    }
+
+    #[test]
+    fn pacing_disabled_always_proceeds() {
+        let cfg = PaceConfig {
+            enabled: false,
+            ..PaceConfig::default()
+        };
+        assert_eq!(
+            decide(&collector(100.0), None, NOW, &cfg),
+            PaceDecision::Proceed {
+                source: Source::None,
+                worst_percent: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn jitter_is_bounded_and_deterministic_for_a_seed() {
+        for seed in [0_u64, 1, 12_345, u64::MAX] {
+            let jittered = apply_jitter(NOW, 30, seed);
+            assert!(
+                (NOW..NOW + 30).contains(&jittered),
+                "seed {seed} produced {jittered}"
+            );
+            assert_eq!(jittered, apply_jitter(NOW, 30, seed), "same seed, same answer");
+        }
+        assert_eq!(apply_jitter(NOW, 0, 7), NOW, "zero jitter is exact");
+    }
+
+    #[test]
+    fn a_known_reset_becomes_a_jittered_deadline() {
+        let decision = decide(&collector(99.0), None, NOW, &PaceConfig::default());
+        let deadline = wait_deadline(&decision, NOW, &PaceConfig::default(), 7).expect("a deadline");
+        assert!(
+            (NOW + 600..NOW + 630).contains(&deadline),
+            "reset plus jitter, got {deadline}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_reset_uses_the_configured_fallback_delay() {
+        let unknown = UsageWindows {
+            five_hour: window(99.5, 0, NOW),
+            seven_day: None,
+        };
+        let decision = decide(&unknown, None, NOW, &PaceConfig::default());
+        assert_eq!(
+            decision,
+            PaceDecision::WaitUntil {
+                reset_at: None,
+                window: "five_hour",
+                percent: 99.5,
+                source: Source::Collector
+            },
+            "resets_at of zero means unknown, not epoch"
+        );
+        let deadline = wait_deadline(&decision, NOW, &PaceConfig::default(), 0).expect("deadline");
+        assert_eq!(deadline, NOW + 900);
+    }
+
+    #[test]
+    fn a_reset_already_in_the_past_uses_the_fallback_too() {
+        let past = UsageWindows {
+            five_hour: window(99.5, NOW - 5, NOW),
+            seven_day: None,
+        };
+        let decision = decide(&past, None, NOW, &PaceConfig::default());
+        let deadline = wait_deadline(&decision, NOW, &PaceConfig::default(), 0).expect("deadline");
+        assert_eq!(deadline, NOW + 900, "a stale reset must not resolve instantly");
+    }
+
+    #[test]
+    fn the_cap_is_scaled_to_the_window_that_tripped() {
+        let cfg = PaceConfig::default();
+        assert_eq!(window_length("five_hour"), 18_000);
+        assert_eq!(window_length("seven_day"), 604_800);
+        assert_eq!(
+            window_length("something_new"),
+            18_000,
+            "an unknown window name must not buy a week-long wait"
+        );
+
+        assert_eq!(wait_cap("five_hour", &cfg), 18_000 + 3600);
+        assert_eq!(wait_cap("seven_day", &cfg), 604_800 + 3600);
+    }
+
+    #[test]
+    fn a_seven_day_trip_may_wait_days_not_hours() {
+        // The reset is five days out. A global six-hour valve would resume long
+        // before the week reset and spend tokens against an exhausted window.
+        let exhausted_week = UsageWindows {
+            five_hour: None,
+            seven_day: window(100.0, NOW + 432_000, NOW),
+        };
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        let decision = decide(&exhausted_week, None, NOW, &cfg);
+        assert_eq!(
+            wait_deadline(&decision, NOW, &cfg, 0),
+            Some(NOW + 432_000),
+            "the real reset sits inside the seven-day cap, so it is honoured exactly"
+        );
+    }
+
+    #[test]
+    fn a_five_hour_trip_is_capped_near_five_hours() {
+        // A bogus reset a year out must not park a supervisor for a year.
+        let bogus = UsageWindows {
+            five_hour: window(100.0, NOW + 31_000_000, NOW),
+            seven_day: None,
+        };
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        let decision = decide(&bogus, None, NOW, &cfg);
+        assert_eq!(
+            wait_deadline(&decision, NOW, &cfg, 0),
+            Some(NOW + 18_000 + 3600),
+            "capped at the window length plus slack"
+        );
+    }
+
+    #[test]
+    fn an_absolute_override_replaces_the_per_window_cap() {
+        let far = UsageWindows {
+            five_hour: None,
+            seven_day: window(99.5, NOW + 500_000, NOW),
+        };
+        let cfg = PaceConfig {
+            max_wait_secs: Some(60),
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        assert_eq!(wait_cap("seven_day", &cfg), 60, "the override wins outright");
+        let decision = decide(&far, None, NOW, &cfg);
+        assert_eq!(wait_deadline(&decision, NOW, &cfg, 0), Some(NOW + 60));
+    }
+
+    #[test]
+    fn proceeding_and_unknown_have_no_deadline() {
+        let cfg = PaceConfig::default();
+        assert_eq!(wait_deadline(&PaceDecision::Unknown, NOW, &cfg, 0), None);
+        assert_eq!(
+            wait_deadline(
+                &PaceDecision::Proceed { source: Source::Collector, worst_percent: 1.0 },
+                NOW,
+                &cfg,
+                0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn descriptions_are_one_line_and_name_the_source() {
+        let waiting = decide(&collector(99.0), None, NOW, &PaceConfig::default());
+        let text = describe(&waiting);
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("five_hour"));
+        assert!(text.contains("collector"));
+        assert!(!text.contains('\u{2014}'));
+
+        assert!(describe(&PaceDecision::Unknown).contains("unknown"));
+        assert!(
+            describe(&PaceDecision::Unknown).contains("approximation")
+                || describe(&PaceDecision::Unknown).contains("no usage data"),
+            "be honest when nothing is known: {}",
+            describe(&PaceDecision::Unknown)
+        );
+    }
+
+    #[test]
+    fn the_documented_limit_strings_are_matched() {
+        // Exactly the three shapes recorded in
+        // docs/superpowers/notes/2026-07-31-claude-usage-window-facts.md.
+        assert!(is_limit_hit("You've hit your session limit · resets 3:45pm"));
+        assert!(is_limit_hit("You've hit your weekly limit · resets Mon 12:00am"));
+        assert!(is_limit_hit("You've hit your Opus limit · resets 3:45pm"));
+        assert!(is_limit_hit("  WARNING: you've HIT YOUR SESSION LIMIT now  "));
+    }
+
+    #[test]
+    fn only_the_documented_patterns_ship() {
+        assert_eq!(
+            LIMIT_HIT_PATTERNS.len(),
+            3,
+            "the notes file documents three strings; anything else needs verifying first"
+        );
+        // Plausible but unverified phrasings stay out until observed for real.
+        assert!(!is_limit_hit("You've hit your Sonnet limit · resets 3:45pm"));
+        assert!(!is_limit_hit("You've hit your usage limit"));
+    }
+
+    #[test]
+    fn ordinary_output_is_not_a_limit_hit() {
+        for line in [
+            "",
+            "rate limit headers look fine",
+            "hit the ground running",
+            "your session is limited to one file",
+            "error: 429 too many requests",
+        ] {
+            assert!(!is_limit_hit(line), "false positive on {line:?}");
+        }
+    }
+}
+```
+
+- [ ] **Step 6: Run them and see them fail**
+
+Run: `cargo test ctx::pace 2>&1 | tail -20`
+Expected: FAIL. `module pace not found` until `mod.rs` declares it, then `cannot find function decide`.
+
+- [ ] **Step 7: Write the gate implementation**
+
+Add `pub mod pace;` to `src/commands/ctx/mod.rs` (alphabetically after `mod log;`, before `resume`). Then put this above the test module in `src/commands/ctx/pace.rs`:
+
+```rust
+// Consumed by the supervisors in Task E4 and the usage verb in Task E5.
+#![allow(dead_code)]
+
+use super::config::PaceConfig;
+use super::window::{FIVE_HOUR_SECS, SEVEN_DAY_SECS, UsageWindows, Window, age_secs};
+
+/// Which data layer the decision rests on. Ordered by authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Collector,
+    Estimator,
+    None,
+}
+
+impl Source {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Source::Collector => "collector",
+            Source::Estimator => "estimator",
+            Source::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaceDecision {
+    Proceed {
+        source: Source,
+        worst_percent: f64,
+    },
+    WaitUntil {
+        /// `None` when the window's reset time is unknown, which is when the
+        /// configured fallback delay applies.
+        reset_at: Option<u64>,
+        window: &'static str,
+        percent: f64,
+        source: Source,
+    },
+    Unknown,
+}
+
+/// Exactly the three strings documented in
+/// `docs/superpowers/notes/2026-07-31-claude-usage-window-facts.md`, matched
+/// case-insensitively on whole phrases. Deliberately narrow on both sides: a
+/// false positive parks a healthy run, and an unverified guess is not a fact.
+///
+/// Candidates NOT shipped, pending empirical verification (see the follow-up in
+/// that notes file). Add one only after observing it in real output:
+///   "hit your sonnet limit"   plausible by symmetry with the Opus variant,
+///                             but no documented occurrence
+///   "hit your usage limit"    invented phrasing, no source at all
+pub const LIMIT_HIT_PATTERNS: &[&str] = &[
+    "hit your session limit",
+    "hit your weekly limit",
+    "hit your opus limit",
+];
+
+pub fn is_limit_hit(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    LIMIT_HIT_PATTERNS
+        .iter()
+        .any(|pattern| lowered.contains(pattern))
+}
+
+/// Whether a collector window may drive the decision.
+///
+/// A fresh observation always may. A stale one still may when it reported a full
+/// window whose reset has not arrived: the percentage is out of date, but a
+/// window cannot free up before its own reset time, so letting staleness clear
+/// the park would resume straight into an exhausted window. A stale reading
+/// below the ceiling is simply unknown and defers to the estimator.
+fn binding<'a>(window: &'a Option<Window>, now: u64, cfg: &PaceConfig) -> Option<&'a Window> {
+    let window = window.as_ref()?;
+    if age_secs(window, now) <= cfg.collector_max_age_secs {
+        return Some(window);
+    }
+    if window.used_percentage >= cfg.max_percent && window.resets_at > now {
+        return Some(window);
+    }
+    None
+}
+
+/// The window closest to its limit, with its name.
+fn worst<'a>(
+    five_hour: Option<&'a Window>,
+    seven_day: Option<&'a Window>,
+) -> Option<(&'static str, &'a Window)> {
+    let candidates = [("five_hour", five_hour), ("seven_day", seven_day)];
+    candidates
+        .into_iter()
+        .filter_map(|(name, window)| window.map(|w| (name, w)))
+        .max_by(|a, b| {
+            a.1.used_percentage
+                .partial_cmp(&b.1.used_percentage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Collector first when fresh, estimator second, nothing third. A fresher
+/// lower-priority layer never overrides a fresh collector reading.
+pub fn decide(
+    collector: &UsageWindows,
+    estimator: Option<&UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> PaceDecision {
+    if !cfg.enabled {
+        return PaceDecision::Proceed {
+            source: Source::None,
+            worst_percent: 0.0,
+        };
+    }
+
+    let collector_worst = worst(
+        binding(&collector.five_hour, now, cfg),
+        binding(&collector.seven_day, now, cfg),
+    );
+
+    let (source, picked) = match collector_worst {
+        Some(found) => (Source::Collector, Some(found)),
+        None if cfg.estimator => (
+            Source::Estimator,
+            estimator.and_then(|windows| worst(windows.five_hour.as_ref(), windows.seven_day.as_ref())),
+        ),
+        None => (Source::None, None),
+    };
+
+    let Some((name, window)) = picked else {
+        return PaceDecision::Unknown;
+    };
+
+    if window.used_percentage < cfg.max_percent {
+        return PaceDecision::Proceed {
+            source,
+            worst_percent: window.used_percentage,
+        };
+    }
+
+    PaceDecision::WaitUntil {
+        reset_at: if window.resets_at == 0 {
+            None
+        } else {
+            Some(window.resets_at)
+        },
+        window: name,
+        percent: window.used_percentage,
+        source,
+    }
+}
+
+/// Deterministic spread so several supervisors on one machine do not all wake
+/// in the same second. Not cryptographic, just decorrelating.
+pub fn apply_jitter(until: u64, jitter_secs: u64, seed: u64) -> u64 {
+    if jitter_secs == 0 {
+        return until;
+    }
+    let mixed = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    until + (mixed >> 33) % jitter_secs
+}
+
+/// How long the named window itself lasts. An unrecognized name is treated as
+/// the shorter window, so a future adapter cannot accidentally buy itself a
+/// week-long wait.
+pub fn window_length(window: &str) -> u64 {
+    match window {
+        "seven_day" => SEVEN_DAY_SECS,
+        _ => FIVE_HOUR_SECS,
+    }
+}
+
+/// Safety cap for waiting on a window: its own length plus head room, unless an
+/// operator set an absolute override. Scaling to the window is the point: a
+/// seven-day trip legitimately needs days, and a fixed cap would resume early
+/// and spend tokens against a window that has not reset.
+pub fn wait_cap(window: &str, cfg: &PaceConfig) -> u64 {
+    cfg.max_wait_secs
+        .unwrap_or_else(|| window_length(window) + cfg.wait_slack_secs)
+}
+
+/// Concrete wake-up time for a waiting decision: the reset when it is known and
+/// still ahead, the fallback delay otherwise, jittered, and capped by
+/// `wait_cap` for the window that tripped.
+pub fn wait_deadline(
+    decision: &PaceDecision,
+    now: u64,
+    cfg: &PaceConfig,
+    seed: u64,
+) -> Option<u64> {
+    let PaceDecision::WaitUntil {
+        reset_at, window, ..
+    } = decision
+    else {
+        return None;
+    };
+
+    let target = match reset_at {
+        Some(at) if *at > now => *at,
+        _ => now + cfg.fallback_delay_secs,
+    };
+    let jittered = apply_jitter(target, cfg.jitter_secs, seed);
+    Some(jittered.min(now + wait_cap(window, cfg)))
+}
+
+pub fn describe(decision: &PaceDecision) -> String {
+    match decision {
+        PaceDecision::Proceed {
+            source,
+            worst_percent,
+        } => format!(
+            "usage {worst_percent:.1}% of the limit ({} data), proceeding",
+            source.as_str()
+        ),
+        PaceDecision::WaitUntil {
+            reset_at,
+            window,
+            percent,
+            source,
+        } => {
+            let reset = match reset_at {
+                Some(at) => format!("resets at unix {at}"),
+                None => "reset time unknown".to_string(),
+            };
+            format!(
+                "{window} window at {percent:.1}% ({} data, {reset}), waiting before the next run",
+                source.as_str()
+            )
+        }
+        PaceDecision::Unknown => {
+            "usage state unknown (no fresh collector reading and no configured estimator budget), proceeding without pacing".to_string()
+        }
+    }
+}
+```
+
+- [ ] **Step 8: Run them and see them pass**
+
+Run: `cargo test ctx::pace 2>&1 | tail -20`
+Expected: PASS, 25 tests.
+
+- [ ] **Step 9: Check formatting and lints**
+
+Run: `cargo fmt -- --check && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Expected: clean. If clippy objects to `fresh`'s lifetime elision, keep the explicit `'a`: the borrow must outlive the returned reference.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/commands/ctx/pace.rs src/commands/ctx/config.rs src/commands/ctx/mod.rs
+git commit -m "feat(ctx): deterministic usage pacing gate with layered data sources"
+```
+
+---
+
+### Task E4: Supervisor integration and the limit-hit circuit breaker
+
+**Files:**
+- Modify: `src/commands/ctx/pace.rs` (add `wait_for_window`)
+- Modify: `src/commands/ctx/supervise.rs:25-31` (add `spawn_tapped`, `OutputTap`)
+- Modify: `src/commands/ctx/exec.rs:154-160` (spawn), `:178-200` (outcome arms), `:246-260` (restart tail)
+- Modify: `src/commands/ctx/run_loop.rs:96-135` (cycle body)
+- Modify: `tests/fixtures/fake-agent.sh` (add a `limit` mode)
+
+**Interfaces:**
+- Consumes: `decide`, `wait_deadline`, `describe`, `is_limit_hit`, `Source`, `PaceDecision` (E3); `window::{load, sum_transcripts, estimate_windows, projects_root}` (E1/E2); `StateDir`, `now_secs`, `log::{append, Decision}` (implemented); `supervise::{spawn, supervise_child, Tick, Outcome, Watcher, terminate}` (`supervise.rs:12-116`, as implemented); `exec::EXIT_ROT_EXHAUSTED`/`EXIT_TIMEOUT` (`exec.rs:16,18`); `run_loop::EXIT_FAILED` (`run_loop.rs:13`).
+- Produces:
+  - `pace.rs`: `pub struct PaceOutcome { pub waited_secs: u64, pub source: Source }`; `pub fn wait_for_window<W: Write>(w: &mut W, state: &StateDir, cfg: &PaceConfig, verb: &'static str, session: &str, now_fn: &dyn Fn() -> u64, sleep_fn: &dyn Fn(std::time::Duration)) -> PaceOutcome`; `pub fn current_windows(state: &StateDir, cfg: &PaceConfig, now: u64) -> (UsageWindows, Option<UsageWindows>)`
+  - `supervise.rs`: `pub struct OutputTap { rx: std::sync::mpsc::Receiver<String> }` with `pub fn try_lines(&self) -> Vec<String>`; `pub fn spawn_tapped(command: Command) -> CtxResult<(Child, OutputTap)>`
+  - `exec.rs`: a `limit` branch that parks and relaunches without incrementing `restarts`
+  - `run_loop.rs`: a pacing gate before each cycle and a `limit-park` action that is not a cycle failure
+
+`spawn` keeps inheriting stdout and stderr for every other caller; only the pacing-aware path uses `spawn_tapped`, which pipes the child's output, forwards every byte onward unchanged, and copies whole lines to a channel for matching. Output passthrough is a hard requirement: the operator must still see the agent's output exactly as before.
+
+- [ ] **Step 1: Write the failing tap tests**
+
+Add to the `mod tests` in `src/commands/ctx/supervise.rs`:
+
+```rust
+    #[test]
+    fn a_tapped_child_still_reports_its_exit_code() {
+        let (mut child, _tap) = spawn_tapped(sh("printf hello\\n; exit 4")).expect("spawn");
+        let outcome = supervise_child(
+            &mut child,
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(20),
+            &mut || Tick::Continue,
+        )
+        .expect("supervise");
+        assert_eq!(outcome, Outcome::Exited(4));
+    }
+
+    #[test]
+    fn tapped_lines_reach_the_matcher() {
+        let (mut child, tap) = spawn_tapped(sh("printf 'one\\ntwo\\n'; exit 0")).expect("spawn");
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.len() < 2 && Instant::now() < deadline {
+            seen.extend(tap.try_lines());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
+        assert!(seen.iter().any(|l| l.contains("one")), "got {seen:?}");
+        assert!(seen.iter().any(|l| l.contains("two")), "got {seen:?}");
+    }
+
+    #[test]
+    fn stderr_is_tapped_too_because_notices_can_land_there() {
+        let (mut child, tap) = spawn_tapped(sh("printf 'oops\\n' >&2; exit 0")).expect("spawn");
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.is_empty() && Instant::now() < deadline {
+            seen.extend(tap.try_lines());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
+        assert!(seen.iter().any(|l| l.contains("oops")), "got {seen:?}");
+    }
+
+    #[test]
+    fn try_lines_is_empty_when_nothing_was_written() {
+        let (mut child, tap) = spawn_tapped(sh("exit 0")).expect("spawn");
+        let _ = child.wait();
+        // Drain whatever arrived; a silent child must not block or panic.
+        let _ = tap.try_lines();
+        assert!(tap.try_lines().is_empty());
+    }
+```
+
+- [ ] **Step 2: Run them and see them fail**
+
+Run: `cargo test ctx::supervise 2>&1 | tail -20`
+Expected: FAIL to compile, `cannot find function spawn_tapped`.
+
+- [ ] **Step 3: Write the tap**
+
+Add to `src/commands/ctx/supervise.rs`:
+
+```rust
+/// Whole lines of a supervised child's output, for matching against known
+/// notices. The bytes are always forwarded onward first: tapping must never
+/// change what the operator sees.
+pub struct OutputTap {
+    rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl OutputTap {
+    pub fn try_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(line) = self.rx.try_recv() {
+            lines.push(line);
+        }
+        lines
+    }
+}
+
+/// Like `spawn`, but the child's stdout and stderr are piped so they can be
+/// matched. Each stream is forwarded to this process's corresponding stream
+/// unchanged, line by line.
+pub fn spawn_tapped(mut command: Command) -> CtxResult<(Child, OutputTap)> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    if let Some(stdout) = child.stdout.take() {
+        forward(stdout, tx.clone(), false);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward(stderr, tx, true);
+    }
+
+    Ok((child, OutputTap { rx }))
+}
+
+fn forward<R: std::io::Read + Send + 'static>(
+    stream: R,
+    tx: std::sync::mpsc::Sender<String>,
+    is_stderr: bool,
+) {
+    use std::io::BufRead;
+
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stream);
+        for line in reader.lines().map_while(Result::ok) {
+            if is_stderr {
+                let mut sink = std::io::stderr();
+                let _ = writeln!(sink, "{line}");
+            } else {
+                let mut sink = std::io::stdout();
+                let _ = writeln!(sink, "{line}");
+                let _ = sink.flush();
+            }
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+}
+```
+
+`use std::io::Write;` is already needed by `forward`; add it to the module imports if it is not there.
+
+- [ ] **Step 4: Run them and see them pass**
+
+Run: `cargo test ctx::supervise -- --test-threads=1 2>&1 | tail -20`
+Expected: PASS, 14 tests.
+
+- [ ] **Step 5: Write the failing wait-helper tests**
+
+Add to the `mod tests` in `src/commands/ctx/pace.rs`:
+
+```rust
+    use crate::commands::ctx::state::StateDir;
+    use crate::commands::ctx::window;
+    use std::cell::RefCell;
+
+    /// Fake clock: `now` advances by whatever the code sleeps, so a test can
+    /// observe pacing without waiting for real time.
+    struct FakeClock {
+        now: RefCell<u64>,
+        slept: RefCell<Vec<u64>>,
+    }
+
+    impl FakeClock {
+        fn new(start: u64) -> Self {
+            Self {
+                now: RefCell::new(start),
+                slept: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    fn state_with(collector: UsageWindows) -> (tempfile::TempDir, StateDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        window::store(&state, &collector).expect("store");
+        (tmp, state)
+    }
+
+    #[test]
+    fn a_healthy_window_does_not_wait() {
+        let (_tmp, state) = state_with(collector(10.0));
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig::default(),
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+        );
+
+        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.source, Source::Collector);
+        assert!(clock.slept.borrow().is_empty(), "no sleeping when healthy");
+    }
+
+    #[test]
+    fn an_exhausted_window_waits_past_the_reset_then_proceeds() {
+        // Observed just now, at the ceiling, resetting in 10 minutes.
+        let exhausted = UsageWindows {
+            five_hour: window(99.5, NOW + 600, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+        );
+
+        assert!(outcome.waited_secs >= 600, "waited {}", outcome.waited_secs);
+        assert!(!clock.slept.borrow().is_empty(), "it must actually sleep");
+        assert!(
+            *clock.now.borrow() >= NOW + 600,
+            "the clock advanced past the reset"
+        );
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains("five_hour"), "explain the pause: {printed}");
+        assert!(printed.contains("waiting"), "got {printed}");
+    }
+
+    #[test]
+    fn waiting_is_recorded_in_the_decision_log() {
+        let exhausted = UsageWindows {
+            five_hour: window(100.0, NOW + 120, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig {
+                jitter_secs: 0,
+                ..PaceConfig::default()
+            },
+            "exec",
+            "sess-1",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(log.contains("\"verb\":\"exec\""), "got {log}");
+        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+        assert!(log.contains("sess-1"), "got {log}");
+        assert_eq!(
+            log.lines().filter(|l| l.contains("pace-wait")).count(),
+            1,
+            "one audit line per pause, not one per sleep chunk: {log}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_override_bounds_the_total_wait() {
+        let far = UsageWindows {
+            five_hour: window(100.0, NOW + 10_000_000, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(far);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let cfg = PaceConfig {
+            max_wait_secs: Some(120),
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        assert!(
+            outcome.waited_secs <= 150,
+            "bounded by the override, waited {}",
+            outcome.waited_secs
+        );
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("proceeding"),
+            "after the cap it proceeds rather than exiting: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_bogus_five_hour_reset_is_bounded_by_the_window_not_by_six_hours() {
+        // With no override, the cap comes from the window: 5h plus 1h slack.
+        let bogus = UsageWindows {
+            five_hour: window(100.0, NOW + 10_000_000, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(bogus);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig {
+                jitter_secs: 0,
+                ..PaceConfig::default()
+            },
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        assert!(
+            (18_000..=21_700).contains(&outcome.waited_secs),
+            "expected roughly the five-hour cap, waited {}",
+            outcome.waited_secs
+        );
+    }
+
+    #[test]
+    fn an_exhausted_week_waits_for_the_real_reset_rather_than_resuming_early() {
+        // Five days out. This is the case a fixed six-hour valve got wrong: it
+        // would resume roughly twenty times before the week actually reset.
+        let exhausted_week = UsageWindows {
+            five_hour: None,
+            seven_day: window(100.0, NOW + 432_000, NOW),
+        };
+        let (_tmp, state) = state_with(exhausted_week);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig {
+                jitter_secs: 0,
+                ..PaceConfig::default()
+            },
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        assert!(
+            outcome.waited_secs >= 432_000,
+            "it must wait out the week, waited {}",
+            outcome.waited_secs
+        );
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            !printed.contains("proceeding anyway"),
+            "the real reset arrived inside the cap, so no valve message: {printed}"
+        );
+    }
+
+    #[test]
+    fn unknown_usage_proceeds_without_waiting() {
+        let (_tmp, state) = state_with(UsageWindows::default());
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig::default(),
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.source, Source::None);
+    }
+
+    #[test]
+    fn pacing_disabled_skips_the_gate_entirely() {
+        let exhausted = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig {
+                enabled: false,
+                ..PaceConfig::default()
+            },
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+        assert_eq!(outcome.waited_secs, 0);
+        assert!(String::from_utf8_lossy(&out).is_empty(), "silent when disabled");
+    }
+
+    #[test]
+    fn the_estimator_is_only_consulted_when_a_budget_is_set() {
+        let (_tmp, state) = state_with(UsageWindows::default());
+        let cfg = PaceConfig::default();
+        let (collector_windows, estimated) = current_windows(&state, &cfg, NOW);
+        assert_eq!(collector_windows, UsageWindows::default());
+        assert!(
+            estimated.is_none(),
+            "with both budgets at zero there is nothing to estimate against"
+        );
+
+        let with_budget = PaceConfig {
+            five_hour_budget_tokens: 1000,
+            ..PaceConfig::default()
+        };
+        let (_, estimated) = current_windows(&state, &with_budget, NOW);
+        assert!(estimated.is_some(), "a configured budget turns the estimator on");
+    }
+```
+
+- [ ] **Step 6: Run them and see them fail**
+
+Run: `cargo test ctx::pace 2>&1 | tail -20`
+Expected: FAIL to compile, `cannot find function wait_for_window`.
+
+- [ ] **Step 7: Write the wait helper**
+
+Append to `src/commands/ctx/pace.rs`:
+
+```rust
+use std::io::Write;
+use std::time::Duration;
+
+use super::state::{StateDir, now_secs};
+use super::{log, window as usage_window};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaceOutcome {
+    pub waited_secs: u64,
+    pub source: Source,
+}
+
+/// Longest single sleep, so a supervisor rechecks state (a live session may have
+/// refreshed the collector) rather than sleeping blind for hours.
+const SLEEP_CHUNK_SECS: u64 = 30;
+
+/// Reads the collector file and, only when a budget is configured, the
+/// estimator. Walking every transcript is not free, so it is skipped whenever
+/// its result could not be used.
+pub fn current_windows(
+    state: &StateDir,
+    cfg: &PaceConfig,
+    now: u64,
+) -> (UsageWindows, Option<UsageWindows>) {
+    let collector = usage_window::load(state);
+
+    let budgeted = cfg.five_hour_budget_tokens > 0 || cfg.seven_day_budget_tokens > 0;
+    if !cfg.estimator || !budgeted {
+        return (collector, None);
+    }
+
+    let estimated = usage_window::projects_root()
+        .ok()
+        .map(|root| usage_window::sum_transcripts(&root, now, cfg.count_cache_reads))
+        .map(|sums| {
+            usage_window::estimate_windows(
+                &sums,
+                now,
+                cfg.five_hour_budget_tokens,
+                cfg.seven_day_budget_tokens,
+            )
+        });
+    (collector, estimated)
+}
+
+/// Blocks until the window has room, then returns. Never exits the process and
+/// never returns an error: pacing failing closed would be worse than pacing not
+/// happening, so every unknown proceeds.
+pub fn wait_for_window<W: Write>(
+    w: &mut W,
+    state: &StateDir,
+    cfg: &PaceConfig,
+    verb: &'static str,
+    session: &str,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
+) -> PaceOutcome {
+    if !cfg.enabled {
+        return PaceOutcome {
+            waited_secs: 0,
+            source: Source::None,
+        };
+    }
+
+    let started = now_fn();
+    let mut announced: Option<(String, Option<u64>)> = None;
+
+    loop {
+        let now = now_fn();
+        let (collector, estimated) = current_windows(state, cfg, now);
+        let decision = decide(&collector, estimated.as_ref(), now, cfg);
+
+        let source = match &decision {
+            PaceDecision::Proceed { source, .. } => *source,
+            PaceDecision::WaitUntil { source, .. } => *source,
+            PaceDecision::Unknown => Source::None,
+        };
+
+        let Some(deadline) = wait_deadline(&decision, now, cfg, std::process::id() as u64 ^ now)
+        else {
+            return PaceOutcome {
+                waited_secs: now.saturating_sub(started),
+                source,
+            };
+        };
+
+        // The safety valve, scaled to the window that tripped: a seven-day trip
+        // may legitimately wait days, a five-hour trip may not.
+        let cap = match &decision {
+            PaceDecision::WaitUntil { window, .. } => wait_cap(window, cfg),
+            _ => 0,
+        };
+        if now.saturating_sub(started) >= cap {
+            let _ = writeln!(
+                w,
+                "zirv ctx {verb}: usage still high after waiting {}s (cap {cap}s), proceeding anyway",
+                now.saturating_sub(started)
+            );
+            return PaceOutcome {
+                waited_secs: now.saturating_sub(started),
+                source,
+            };
+        }
+
+        // Announce once per distinct decision, not once per sleep chunk: a
+        // seven-day park would otherwise write thousands of identical audit
+        // lines and scroll the operator's terminal for days.
+        let fingerprint = match &decision {
+            PaceDecision::WaitUntil {
+                window, reset_at, ..
+            } => Some(((*window).to_string(), *reset_at)),
+            _ => None,
+        };
+        if announced != fingerprint {
+            announced = fingerprint;
+            let _ = writeln!(w, "zirv ctx {verb}: {}", describe(&decision));
+            let _ = log::append(
+                state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session,
+                    verb,
+                    verdict: "paced",
+                    score: 0,
+                    action: "pace-wait",
+                    detail: &describe(&decision),
+                },
+            );
+        }
+
+        let remaining = deadline.saturating_sub(now).min(cap);
+        if remaining == 0 {
+            return PaceOutcome {
+                waited_secs: now.saturating_sub(started),
+                source,
+            };
+        }
+        sleep_fn(Duration::from_secs(remaining.min(SLEEP_CHUNK_SECS)));
+    }
+}
+```
+
+The `describe` line is written before sleeping so the operator immediately sees why a supervisor went quiet.
+
+- [ ] **Step 8: Run them and see them pass**
+
+Run: `cargo test ctx::pace -- --test-threads=1 2>&1 | tail -20`
+Expected: PASS, 34 tests. If `an_exhausted_window_waits_past_the_reset_then_proceeds` loops forever, the fake clock is not advancing: the `sleep_fn` closure must add the slept seconds to `clock.now`. `an_exhausted_week_waits_for_the_real_reset_rather_than_resuming_early` drives about 14000 fake-clock iterations at the 30s chunk, which is fast because nothing really sleeps; if it is slow, check that `current_windows` is not walking transcripts (with no budget configured the estimator must be skipped entirely).
+
+- [ ] **Step 9: Add a limit-hit mode to the fake agent**
+
+In `tests/fixtures/fake-agent.sh`, extend the mode documentation and the final `case` so a run can emit the documented notice and exit non-zero:
+
+```sh
+#   limit    writes a healthy transcript, prints the documented limit-hit
+#            notice on stdout, then exits 1 the way an exhausted window would
+```
+
+and in the trailing `case "$mode"` block, before the `*)` arm:
+
+```sh
+  limit)
+    printf "You've hit your session limit · resets 3:45pm\n"
+    exit 1
+    ;;
+```
+
+Run: `FAKE_AGENT_MODE=limit HOME=$(mktemp -d) sh tests/fixtures/fake-agent.sh -p x --session-id 11111111-2222-4333-8444-555555555555; echo "exit=$?"`
+Expected: the notice line and `exit=1`.
+
+- [ ] **Step 10: Write the failing exec integration tests**
+
+Add to the `mod tests` in `src/commands/ctx/exec.rs`:
+
+```rust
+    use crate::commands::ctx::window::{self, UsageWindows, Window};
+
+    fn store_collector(state_dir: &std::path::Path, percent: f64, resets_in: u64) {
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.to_path_buf());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: percent,
+                    resets_at: now + resets_in,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state");
+    }
+
+    #[test]
+    fn a_limit_hit_parks_and_relaunches_without_spending_the_restart_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "99999999-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        // A reset one second out plus no jitter keeps the park short; the point
+        // is that it parks and relaunches, not how long it waits.
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_FALLBACK_SECS".to_string(), "1".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+
+        // First child hits the limit, second runs clean.
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            // Zero budget: a limit hit must park even with no restarts allowed,
+            // because a park is not a restart.
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "the relaunched child finished cleanly, so exec exits with its code"
+        );
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"limit-park\""), "got {log}");
+        assert!(
+            !log.contains("\"action\":\"give-up\""),
+            "a park must not consume the restart budget: {log}"
+        );
+        assert_eq!(
+            transcripts_in(&home).len(),
+            2,
+            "the relaunch is a new session with its own transcript"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_window_delays_the_first_spawn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "aaaaaaaa-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        store_collector(&state, 100.0, 1);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+        };
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), 0, "a pause is never an exit");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "it should have waited before spawning"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    #[test]
+    fn a_healthy_window_adds_no_delay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "bbbbbbbb-2222-4333-8444-555555555555";
+        let env = base_env(&state);
+        store_collector(&state, 5.0, 3600);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
+        assert!(!log.contains("pace-wait"), "nothing to wait for: {log}");
+    }
+```
+
+- [ ] **Step 11: Run them and see them fail**
+
+Run: `cargo test ctx::exec -- --test-threads=1 2>&1 | tail -25`
+Expected: FAIL. `a_limit_hit_parks_and_relaunches_without_spending_the_restart_budget` gets exit `1` (the limit-hit child's own code) with no `limit-park` log line, because `exec` does not yet look for the notice.
+
+- [ ] **Step 12: Wire pacing into `exec`**
+
+In `src/commands/ctx/exec.rs`:
+
+1. Add `use super::pace;` to the imports. `PaceConfig` is reached as `cfg.pace` from the already-loaded `CtxConfig`, so it needs no import.
+2. Add a real-clock pair once, above the loop, so the gate can be called from both places. `now_secs` is already imported directly at `exec.rs:10`, so use the bare symbol rather than a `state::` path:
+
+```rust
+    let now_fn = now_secs;
+    let sleep_fn = |d: Duration| std::thread::sleep(d);
+```
+
+3. Immediately before `let mut child = supervise::spawn(command)?;`, gate the spawn and switch to the tapped spawn:
+
+```rust
+        pace::wait_for_window(
+            w,
+            &state,
+            &cfg.pace,
+            "exec",
+            session.as_str(),
+            &now_fn,
+            &sleep_fn,
+        );
+
+        let (mut child, tap) = supervise::spawn_tapped(command)?;
+```
+
+4. Add a `limit_hit` flag next to `rotted`, and pass the tap into `supervise_run` so its tick checks the output first:
+
+```rust
+        let mut limit_hit = false;
+```
+
+In `supervise_run`, add `tap: &supervise::OutputTap` and `limit_hit: &mut bool` parameters, and put this at the top of the tick closure, before the signal and transcript checks:
+
+```rust
+        if tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+            *limit_hit = true;
+            return Tick::Stop("limit");
+        }
+```
+
+A trip is authoritative regardless of the other layers, which is why it is checked before scoring.
+
+5. In the outcome handling, branch on `limit_hit` before the rot/timeout reason is computed, park, and relaunch without touching `restarts`:
+
+```rust
+        if limit_hit {
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: session.as_str(),
+                    verb: "exec",
+                    verdict: "limit",
+                    score: 100,
+                    action: "limit-park",
+                    detail: "agent reported a usage limit; parking until the window resets",
+                },
+            );
+            writeln!(
+                w,
+                "zirv ctx exec: the agent reported a usage limit, parking until the window resets"
+            )?;
+
+            pace::wait_for_window(
+                w,
+                &state,
+                &cfg.pace,
+                "exec",
+                session.as_str(),
+                &now_fn,
+                &sleep_fn,
+            );
+
+            let Some(prompt_text) = prompt.clone() else {
+                writeln!(
+                    w,
+                    "zirv ctx exec: usage limit hit and the original prompt is unknown, so it cannot relaunch. Pass --prompt to enable parking."
+                )?;
+                return Ok(EXIT_ROT_EXHAUSTED);
+            };
+
+            // A park is not a restart: the budget is for rot, not for waiting.
+            session = SessionId::new_v4();
+            transcript = derive_transcript(&session);
+            command = adapter.headless_cmd(&prompt_text, &session, &[]);
+            command.current_dir(repo);
+            for (key, value) in &turn_env {
+                command.env(key, value);
+            }
+            continue;
+        }
+```
+
+Place this immediately after the `match outcome { Outcome::Exited(code) => return Ok(code), ... }` block, so a child that exited on its own is still reported normally. Note that a limit-hit child is stopped by the tick, so it reaches this branch rather than the `Exited` arm.
+
+- [ ] **Step 13: Run them and see them pass**
+
+Run: `cargo test ctx::exec -- --test-threads=1 2>&1 | tail -25`
+Expected: PASS, 16 tests.
+
+- [ ] **Step 14: Write the failing loop integration tests**
+
+Add to the `mod tests` in `src/commands/ctx/run_loop.rs`:
+
+```rust
+    use crate::commands::ctx::window::{self, UsageWindows, Window};
+
+    fn store_collector(state_dir: &std::path::Path, percent: f64, resets_in: u64) {
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.to_path_buf());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: percent,
+                    resets_at: now + resets_in,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state");
+    }
+
+    #[test]
+    fn each_cycle_passes_the_pacing_gate_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        store_collector(&state, 100.0, 1);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "2");
+        }
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = run_with(&args_for(1), &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+
+        assert_eq!(code.expect("runs"), 0, "a pause is never an exit");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1), "it waited");
+        assert_eq!(transcripts_in(&home).len(), 1, "the cycle still ran");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    #[test]
+    fn a_limit_hit_cycle_is_parked_and_is_not_a_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_FALLBACK_SECS".to_string(), "1".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_TURNS", "2");
+        }
+        let mut args = args_for(2);
+        // One failure would end the loop, so this proves a park is not a failure.
+        args.max_failures = Some(1);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "a usage limit is not a cycle failure: the window just needed time"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"limit-park\""), "got {log}");
+        assert!(!log.contains("\"action\":\"give-up\""), "got {log}");
+        assert_eq!(transcripts_in(&home).len(), 2, "both cycles ran");
+    }
+```
+
+- [ ] **Step 15: Run them and see them fail**
+
+Run: `cargo test ctx::run_loop -- --test-threads=1 2>&1 | tail -25`
+Expected: FAIL. `each_cycle_passes_the_pacing_gate_first` finds no `pace-wait` line, and `a_limit_hit_cycle_is_parked_and_is_not_a_failure` exits `75` because the limit-hit cycle counts as a failure.
+
+- [ ] **Step 16: Wire pacing into `loop`**
+
+In `src/commands/ctx/run_loop.rs`:
+
+1. Add `use super::pace;` and the clock pair above the loop, exactly as in `exec`. `now_secs` is already imported directly at `run_loop.rs:8`:
+
+```rust
+    let now_fn = now_secs;
+    let sleep_fn = |d: Duration| std::thread::sleep(d);
+```
+
+2. After `cycle += 1;` and before the session id is generated:
+
+```rust
+        pace::wait_for_window(
+            w,
+            &state,
+            &cfg.pace,
+            "loop",
+            "loop",
+            &now_fn,
+            &sleep_fn,
+        );
+```
+
+The session id does not exist yet at gate time, so the log entry uses `"loop"` as its session, matching the existing `give-up` entry.
+
+3. Switch the cycle to the tapped spawn and add the limit check to the tick:
+
+```rust
+        let (mut child, tap) = supervise::spawn_tapped(command)?;
+        let mut watcher = Watcher::new(transcript.clone());
+        let mut rotted = false;
+        let mut limit_hit = false;
+```
+
+and at the top of the existing tick closure:
+
+```rust
+                if tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+                    limit_hit = true;
+                    return Tick::Stop("limit");
+                }
+```
+
+4. Extend the outcome mapping so a limit hit is hygiene, not failure, exactly like rot:
+
+```rust
+        let (action, failed) = match outcome {
+            // A usage limit is the window's fault, not the cycle's: park and
+            // let the next cycle do the work.
+            Outcome::StoppedByTick(_) if limit_hit => ("limit-park", false),
+            // Rot is hygiene, not failure: the next cycle is the restart.
+            Outcome::StoppedByTick(_) if rotted => ("rot-kill", false),
+            Outcome::StoppedByTick(reason) => (reason, true),
+            Outcome::TimedOut => ("timeout-kill", true),
+            Outcome::Exited(0) => ("ok", false),
+            Outcome::Exited(_) => ("nonzero-exit", true),
+        };
+```
+
+5. When `limit_hit`, wait for the window before the next cycle rather than falling through to the interval sleep:
+
+```rust
+        if limit_hit {
+            pace::wait_for_window(
+                w,
+                &state,
+                &cfg.pace,
+                "loop",
+                session.as_str(),
+                &now_fn,
+                &sleep_fn,
+            );
+        }
+```
+
+Place it immediately after the `log::append` for the cycle outcome and before `handle_cycle_outcome`.
+
+- [ ] **Step 17: Run them and see them pass**
+
+Run: `cargo test ctx::run_loop -- --test-threads=1 2>&1 | tail -25`
+Expected: PASS, 12 tests.
+
+- [ ] **Step 18: Run the whole suite and the lints**
+
+Run: `cargo test --verbose -- --test-threads=1 2>&1 | tail -15`
+Expected: PASS.
+Run: `cargo fmt -- --check && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Expected: clean.
+
+- [ ] **Step 19: Verify output passthrough survived the tap**
+
+Run:
+
+```bash
+cargo build
+WORK=$(mktemp -d) && cd "$WORK"
+HOME="$WORK/home" FAKE_AGENT_MODE=healthy FAKE_AGENT_TURNS=2 \
+ZIRV_CTX_AGENT_BIN="$OLDPWD/tests/fixtures/fake-agent.sh" \
+ZIRV_CTX_STATE_DIR="$WORK/state" \
+  "$OLDPWD/target/debug/zirv" ctx loop --prompt probe --cycles 1 --interval-secs 0
+```
+
+Expected: the cycle line appears and the run exits 0. The fake agent prints nothing, so to check passthrough specifically:
+
+```bash
+ZIRV_CTX_STATE_DIR="$WORK/state" "$OLDPWD/target/debug/zirv" ctx exec --agent claude \
+  --prompt probe --max-restarts 0 -- sh -c 'printf "AGENT SAYS HELLO\n"; exit 0'
+```
+
+Expected: `AGENT SAYS HELLO` appears on the terminal. If it does not, `spawn_tapped` is swallowing output and the forward threads are wrong.
+
+- [ ] **Step 20: Record the empirical follow-up**
+
+Append to `docs/superpowers/notes/2026-07-31-claude-usage-window-facts.md`, under the limit-hit section:
+
+```markdown
+- FOLLOW-UP (opened with Phase E, task E4): the matcher in `src/commands/ctx/pace.rs`
+  (`LIMIT_HIT_PATTERNS`) ships with exactly the three strings documented above and
+  nothing else. Two plausible phrasings ("hit your sonnet limit", "hit your usage
+  limit") are listed as commented-out candidates in that constant's doc comment
+  and are deliberately NOT matched. Confirm empirically the next time a window is
+  genuinely exhausted: capture the exact stdout/stderr line and the exit code of
+  `claude -p` under an exhausted window, then promote the observed string into the
+  list and record the exit code here. Until then a limit hit is detected by output
+  text alone, never by exit code.
+```
+
+- [ ] **Step 21: Commit**
+
+```bash
+git add src/commands/ctx/pace.rs src/commands/ctx/supervise.rs src/commands/ctx/exec.rs src/commands/ctx/run_loop.rs tests/fixtures/fake-agent.sh docs/superpowers/notes/2026-07-31-claude-usage-window-facts.md
+git commit -m "feat(ctx): pace supervised runs against usage windows and park on limit hits"
+```
+
+---
+
+### Task E5: `zirv ctx usage` report and documentation
+
+**Files:**
+- Modify: `src/commands/ctx/usage.rs`
+- Modify: `README.md` (usage pacing section)
+- Modify: `src/commands/ctx/status.rs:16-70` (one usage line in the status report)
+
+**Interfaces:**
+- Consumes: `window::{load, UsageWindows, Window, age_secs}` (E1); `pace::{current_windows, decide, describe, wait_cap, PaceDecision, Source}` (E3/E4); `CtxConfig` (`config.rs`); `StateDir` (`state.rs`).
+- Produces: `pub fn report<W: Write>(w: &mut W, collector: &UsageWindows, estimator: Option<&UsageWindows>, now: u64, cfg: &PaceConfig) -> CtxResult<()>` and a working `run_with` for the no-subcommand case.
+
+- [ ] **Step 1: Write the failing report tests**
+
+Add to the `mod tests` in `src/commands/ctx/usage.rs`:
+
+```rust
+    use crate::commands::ctx::config::PaceConfig;
+    use crate::commands::ctx::window::{UsageWindows, Window};
+
+    const NOW: u64 = 1_785_507_315;
+
+    fn collector_at(percent: f64, age: u64) -> UsageWindows {
+        UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: percent,
+                resets_at: NOW + 1800,
+                observed_at: NOW - age,
+            }),
+            seven_day: None,
+        }
+    }
+
+    #[test]
+    fn the_report_names_each_window_and_its_freshness() {
+        let mut out = Vec::new();
+        report(&mut out, &collector_at(63.0, 42), None, NOW, &PaceConfig::default())
+            .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("five_hour"), "got {text}");
+        assert!(text.contains("63"), "got {text}");
+        assert!(text.contains("42s ago"), "freshness must be visible: {text}");
+        assert!(text.contains("seven_day"), "absent windows are still listed: {text}");
+        assert!(!text.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn an_absent_window_says_so_rather_than_showing_zero() {
+        let mut out = Vec::new();
+        report(&mut out, &UsageWindows::default(), None, NOW, &PaceConfig::default())
+            .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("not reported"),
+            "no data must never look like 0%: {text}"
+        );
+        assert!(
+            text.contains("statusline") || text.contains("zirv ctx usage tee"),
+            "tell the user how to start collecting: {text}"
+        );
+    }
+
+    #[test]
+    fn a_stale_collector_reading_is_labeled_stale() {
+        let mut out = Vec::new();
+        report(&mut out, &collector_at(50.0, 100_000), None, NOW, &PaceConfig::default())
+            .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("stale"), "got {text}");
+    }
+
+    #[test]
+    fn estimator_output_is_labeled_an_approximation() {
+        let estimated = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 12.5,
+                resets_at: NOW + 600,
+                observed_at: NOW,
+            }),
+            seven_day: None,
+        };
+        let mut out = Vec::new();
+        report(
+            &mut out,
+            &UsageWindows::default(),
+            Some(&estimated),
+            NOW,
+            &PaceConfig::default(),
+        )
+        .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("approximation"), "got {text}");
+        assert!(text.contains("12.5"), "got {text}");
+    }
+
+    #[test]
+    fn the_report_ends_with_the_pacing_verdict() {
+        let mut out = Vec::new();
+        report(&mut out, &collector_at(99.5, 10), None, NOW, &PaceConfig::default())
+            .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("waiting") || text.contains("would wait"), "got {text}");
+        assert!(text.contains("99"), "got {text}");
+    }
+
+    #[test]
+    fn the_report_explains_the_per_window_wait_bound() {
+        let mut out = Vec::new();
+        report(&mut out, &collector_at(50.0, 10), None, NOW, &PaceConfig::default())
+            .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("wait bound"), "got {text}");
+        assert!(text.contains("21600"), "five hours plus slack: {text}");
+        assert!(text.contains("608400"), "seven days plus slack: {text}");
+        assert!(text.contains("own length plus slack"), "got {text}");
+    }
+
+    #[test]
+    fn the_report_flags_an_absolute_wait_override() {
+        let cfg = PaceConfig {
+            max_wait_secs: Some(7200),
+            ..PaceConfig::default()
+        };
+        let mut out = Vec::new();
+        report(&mut out, &collector_at(50.0, 10), None, NOW, &cfg).expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("7200"), "got {text}");
+        assert!(text.contains("override in effect"), "got {text}");
+    }
+
+    #[test]
+    fn the_report_says_when_pacing_is_switched_off() {
+        let cfg = PaceConfig {
+            enabled: false,
+            ..PaceConfig::default()
+        };
+        let mut out = Vec::new();
+        report(&mut out, &collector_at(99.9, 10), None, NOW, &cfg).expect("report");
+        assert!(String::from_utf8_lossy(&out).contains("pacing is disabled"));
+    }
+
+    #[test]
+    fn the_verb_reports_without_a_subcommand() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &UsageArgs { action: None },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("report runs with no state at all");
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&out).contains("not reported"));
+    }
+```
+
+- [ ] **Step 2: Run them and see them fail**
+
+Run: `cargo test ctx::usage 2>&1 | tail -20`
+Expected: FAIL to compile, `cannot find function report`.
+
+- [ ] **Step 3: Write the report**
+
+Add to `src/commands/ctx/usage.rs`:
+
+```rust
+use super::config::{CtxConfig, PaceConfig};
+use super::pace::{self, PaceDecision};
+use super::window::{UsageWindows, Window, age_secs};
+
+fn line_for(
+    w: &mut impl Write,
+    name: &str,
+    window: Option<&Window>,
+    now: u64,
+    cfg: &PaceConfig,
+    label: &str,
+) -> CtxResult<()> {
+    match window {
+        Some(found) => {
+            let age = age_secs(found, now);
+            let freshness = if age > cfg.collector_max_age_secs {
+                format!("{age}s ago, stale")
+            } else {
+                format!("{age}s ago")
+            };
+            let reset = if found.resets_at == 0 {
+                "reset time unknown".to_string()
+            } else {
+                format!("resets at unix {}", found.resets_at)
+            };
+            writeln!(
+                w,
+                "  {name}: {:.1}% used ({label}, observed {freshness}, {reset})",
+                found.used_percentage
+            )?;
+        }
+        None => writeln!(w, "  {name}: not reported")?,
+    }
+    Ok(())
+}
+
+pub fn report<W: Write>(
+    w: &mut W,
+    collector: &UsageWindows,
+    estimator: Option<&UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> CtxResult<()> {
+    writeln!(w, "collector (server-authoritative, from the statusline tee):")?;
+    line_for(w, "five_hour", collector.five_hour.as_ref(), now, cfg, "collector")?;
+    line_for(w, "seven_day", collector.seven_day.as_ref(), now, cfg, "collector")?;
+
+    if collector.five_hour.is_none() && collector.seven_day.is_none() {
+        writeln!(
+            w,
+            "  no readings yet. Wire your statusline through `zirv ctx usage tee -- <your statusline command>`; Claude reports these fields only for Pro and Max sessions, after the first response."
+        )?;
+    }
+
+    match estimator {
+        Some(windows) => {
+            writeln!(w, "\nestimator (approximation from local transcripts):")?;
+            line_for(w, "five_hour", windows.five_hour.as_ref(), now, cfg, "approximation")?;
+            line_for(w, "seven_day", windows.seven_day.as_ref(), now, cfg, "approximation")?;
+            writeln!(
+                w,
+                "  token class weighting is undocumented, so treat these as an approximation, never ground truth."
+            )?;
+        }
+        None => {
+            writeln!(w, "\nestimator: off (set pace.five_hour_budget_tokens or pace.seven_day_budget_tokens to enable it)")?;
+        }
+    }
+
+    writeln!(w, "\npacing:")?;
+    if !cfg.enabled {
+        writeln!(w, "  pacing is disabled (pace.enabled = false)")?;
+        return Ok(());
+    }
+    writeln!(w, "  ceiling {:.1}%", cfg.max_percent)?;
+    writeln!(
+        w,
+        "  wait bound: five_hour up to {}s, seven_day up to {}s{}",
+        pace::wait_cap("five_hour", cfg),
+        pace::wait_cap("seven_day", cfg),
+        if cfg.max_wait_secs.is_some() {
+            " (absolute override in effect)"
+        } else {
+            " (each window's own length plus slack)"
+        }
+    )?;
+    let decision = pace::decide(collector, estimator, now, cfg);
+    let verb = match decision {
+        PaceDecision::WaitUntil { .. } => "would wait:",
+        _ => "verdict:",
+    };
+    writeln!(w, "  {verb} {}", pace::describe(&decision))?;
+    Ok(())
+}
+```
+
+Replace the `None` arm of `run_with`:
+
+```rust
+        None => {
+            let cfg = CtxConfig::load(repo, env)?;
+            let state = StateDir::resolve(env)?;
+            let now = now_secs();
+            let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now);
+            report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
+            Ok(0)
+        }
+```
+
+- [ ] **Step 4: Run them and see them pass**
+
+Run: `cargo test ctx::usage -- --test-threads=1 2>&1 | tail -20`
+Expected: PASS, 19 tests.
+
+- [ ] **Step 5: Write the failing status-line test**
+
+Add to the `mod tests` in `src/commands/ctx/status.rs`:
+
+```rust
+    #[test]
+    fn status_mentions_the_usage_windows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        crate::commands::ctx::window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 77.0,
+                    resets_at: 1_785_509_000,
+                    observed_at: crate::commands::ctx::state::now_secs(),
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("usage"), "got {text}");
+        assert!(text.contains("77"), "got {text}");
+    }
+```
+
+- [ ] **Step 6: Run it and see it fail**
+
+Run: `cargo test ctx::status 2>&1 | tail -20`
+Expected: FAIL, the status output has no usage line.
+
+- [ ] **Step 7: Add the usage line to `status`**
+
+In `src/commands/ctx/status.rs::run_with`, after the supervised-sessions block and before the handoff block:
+
+```rust
+    let windows = crate::commands::ctx::window::load(&state);
+    let describe = |name: &str, window: Option<&crate::commands::ctx::window::Window>| match window {
+        Some(found) => format!("{name} {:.0}%", found.used_percentage),
+        None => format!("{name} unknown"),
+    };
+    writeln!(
+        w,
+        "\nusage windows: {}, {} (see `zirv ctx usage` for detail)",
+        describe("five_hour", windows.five_hour.as_ref()),
+        describe("seven_day", windows.seven_day.as_ref())
+    )?;
+```
+
+- [ ] **Step 8: Run it and see it pass**
+
+Run: `cargo test ctx::status 2>&1 | tail -20`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 9: Document usage pacing in the README**
+
+Phase E lands before Task D1, so the `## Context Management (zirv ctx)` section may not exist yet. If it does not, create it now with just the heading, the TOC entry `- [Context Management (zirv ctx)](#context-management-zirv-ctx)` after `- [Shortcuts](#shortcuts)`, and this verb table row; D1 then **extends** that section rather than replacing it:
+
+```markdown
+| `zirv ctx usage` | Show usage-window state, or `usage tee` to collect it from the statusline |
+```
+
+Add this subsection at the end of that section (D1 places "### Configuration" above it):
+
+```markdown
+### Usage pacing
+
+Long autonomous runs die if a subscription window (5 hour rolling, 7 day) runs
+dry mid-task. `zirv ctx loop` and `zirv ctx exec` consult a pacing gate before
+every spawn and every restart, and wait instead of exiting when a window is at
+or above `pace.max_percent` (default 99).
+
+Three data layers, best available wins:
+
+1. **Collector**, server-authoritative. Claude Code's statusline input carries
+   `rate_limits.five_hour` and `rate_limits.seven_day` for Pro and Max sessions
+   after the first response. Wire your statusline through the tee and every live
+   session keeps machine-wide state fresh:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "zirv ctx usage tee -- bash ~/.claude/statusline-command.sh"
+     }
+   }
+   ```
+
+   The tee records the fields, then runs your original command unchanged. It
+   always exits 0 and always prints a statusline, so a failure here can never
+   leave you looking at a blank one.
+
+2. **Estimator**, an approximation. When no fresh collector reading exists, zirv
+   sums token usage across local transcripts (including subagent files) over the
+   trailing window. It is off until you set a budget, because a plan's real token
+   allowance is undocumented and a made-up default would read as data:
+
+   ```toml
+   [pace]
+   five_hour_budget_tokens = 0   # set to enable the 5h estimate
+   seven_day_budget_tokens = 0   # set to enable the 7d estimate
+   count_cache_reads = false     # cache reads are discounted, so excluded
+   ```
+
+3. **Circuit breaker**, authoritative on trip. If the agent prints a documented
+   limit-hit notice, that is treated as 100% no matter what the other layers say:
+   the run is parked until the window resets and then relaunched, **without
+   consuming the restart budget**.
+
+Full pacing configuration:
+
+```toml
+[pace]
+enabled = true
+max_percent = 99.0
+collector_max_age_secs = 900
+estimator = true
+jitter_secs = 30
+fallback_delay_secs = 900    # used when a window's reset time is unknown
+wait_slack_secs = 3600       # head room added to the window's own length
+# max_wait_secs = 7200       # optional absolute override, see below
+```
+
+#### How long a pause can last
+
+The wait is bounded per window, not by one global clock: at most the window's own
+length plus `wait_slack_secs`, so a five-hour trip is bounded near six hours and
+a seven-day trip is allowed to wait out the week. That distinction matters,
+because resuming a seven-day window every few hours would spend tokens against a
+window that has not reset, which is exactly what pacing exists to prevent.
+
+When a window's reset time is known and lands inside that bound, the pause ends
+at the reset (plus jitter) and not before. Set `max_wait_secs` only if you would
+rather a supervisor give up waiting and proceed after a fixed time; it replaces
+the per-window bound entirely and is unset by default.
+
+A pause is announced once, not once per check, and appears in the decision log as
+a single `pace-wait` entry. Parks and relaunches are logged too. Check the
+current picture, including how fresh each reading is, with `zirv ctx usage`.
+```
+
+- [ ] **Step 10: Verify the docs against reality**
+
+Run: `cargo run --quiet -- ctx usage 2>&1 | tail -20`
+Expected: the three-section report. With no statusline tee wired yet it says `not reported` and names the tee command, which is the honest answer rather than a fabricated percentage.
+
+Run: `cargo run --quiet -- ctx --help 2>&1 | tail -20`
+Expected: nine verbs, matching the README table.
+
+Run: `grep -n '\u{2014}' README.md src/commands/ctx/usage.rs src/commands/ctx/pace.rs src/commands/ctx/window.rs`
+Expected: no output.
+
+- [ ] **Step 11: Run the full pipeline as CI does**
+
+Run: `cargo test --verbose -- --test-threads=1 2>&1 | tail -15`
+Expected: PASS.
+Run: `cargo fmt -- --check && cargo clippy --all-targets -- -D warnings 2>&1 | tail -10`
+Expected: clean.
+Run: `cargo build --release 2>&1 | tail -5`
+Expected: success.
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add src/commands/ctx/usage.rs src/commands/ctx/status.rs README.md
+git commit -m "feat(ctx): zirv ctx usage report and pacing documentation"
+```
+
+---
 
 ### Task D1: Version bump to 2.5.0 and documentation
 
@@ -10044,7 +13838,7 @@ In `src/commands/help.rs::show_help`, add the line to the built-in block that al
             writeln!(writer, "  c -> create")?;
             writeln!(writer, "  v -> version")?;
             writeln!(writer, "  h -> help")?;
-            writeln!(writer, "  ctx -> context management (score, loop, exec, wrap, handoff, resume, hook, status)")?;
+            writeln!(writer, "  ctx -> context management (score, loop, exec, wrap, handoff, resume, hook, status, usage)")?;
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -10054,7 +13848,9 @@ Expected: PASS.
 
 - [ ] **Step 5: Document `zirv ctx` in the README**
 
-Add `- [Context Management (zirv ctx)](#context-management-zirv-ctx)` to the table of contents after `- [Shortcuts](#shortcuts)`, change the pinned install example from `2.4.0` to `2.5.0`, and add this section just before `## Supported Platforms`:
+Task E5 may already have created `## Context Management (zirv ctx)` with its TOC entry, the `usage` verb row and the "### Usage pacing" subsection. **Extend that section, do not replace it:** keep the usage row and the pacing subsection, and add everything below around them. If the section does not exist yet, add `- [Context Management (zirv ctx)](#context-management-zirv-ctx)` to the table of contents after `- [Shortcuts](#shortcuts)`.
+
+Change the pinned install example from `2.4.0` to `2.5.0`, and place this section just before `## Supported Platforms`:
 
 ```markdown
 ## Context Management (zirv ctx)
@@ -10076,6 +13872,7 @@ logged.
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|notify>` | Agent hook entrypoints |
 | `zirv ctx status` | Shows supervised sessions, recent decisions and handoffs |
+| `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 
 ### Signals and verdicts
 
@@ -10204,6 +14001,7 @@ Add to the Architecture list:
   - `score.rs` / `handoff.rs` / `resume.rs` / `hook.rs` / `status.rs` — One module per verb
   - `run_loop.rs` / `exec.rs` / `wrap.rs` — The three supervisors (`loop` is a keyword)
   - `signal.rs` / `supervise.rs` / `term.rs` — Turn-signal sockets, process primitives, raw mode
+  - `usage.rs` / `window.rs` / `pace.rs` — Usage pacing: statusline tee, window state and estimator, the gate
 ```
 
 Add to Conventions:
@@ -10279,6 +14077,12 @@ Run after the plan is written, before execution starts. Findings below were fixe
 | State dir | A3 |
 | Error handling (`Result` everywhere, `panic = "abort"`, passthrough degradation, verified injection, bounded restarts, decision log) | A3, B2, B3, B5, C1, C4, C6 |
 | Testing strategy (all five categories) | A5 (fixtures), A7/A10 (adapters), A11/A12 (engine), B1 to B5 (loop/exec), C2 to C6 (wrap), A18 (handoff) |
+| Usage pacing: collector layer (statusline `rate_limits`, tee into shared state, chain unchanged) | E1 |
+| Usage pacing: estimator layer (trailing sums over `projects/**/*.jsonl` including `subagents/`, labeled an approximation, never overrides collector) | E2 |
+| Usage pacing: `pace_max_percent` default 99, best-available-wins gate, decision-log entries | E3 |
+| Usage pacing: `loop` before each cycle and `exec` before each spawn and restart, wait-not-exit, jitter, fallback delay when unknown | E4 |
+| Usage pacing: circuit breaker (documented limit strings, authoritative on trip, park and relaunch without consuming the restart budget) | E4 |
+| Usage pacing: `zirv ctx usage` window state, honest about staleness and absence | E5 |
 | Migration and rollout | D1 |
 | Versioning 2.5.0 | D1 |
 | Dependencies (`portable-pty`, `uuid`) | A1 header, plus `libc` justified in Global Constraints |
@@ -10310,5 +14114,21 @@ Run after the plan is written, before execution starts. Findings below were fixe
 - **A16's `run_notify` aliased `run_stop`,** silently assuming codex's notify payload uses claude's field names. A renamed field would have parsed as an empty `transcript_path` and dropped every codex turn signal with no diagnostic. There is now a real mapping, `notify_payload_to_hook`, driven by `NOTIFY_TRANSCRIPT_KEYS`, which errors when no known field is present and logs a `notify-unmapped` decision instead of scoring nothing. A9 gained a notify-recorder step that captures the real payload, and A10 gained a step that replaces the explicitly marked `CODEX_NOTIFY_SAMPLE` placeholder and the key list with verified values, plus an end-to-end check that the decision log does not say `notify-unmapped`. `HookPayload` gained `Serialize` for the round trip.
 - **The multi-word `agent_bin` split moved from C5 to A8** and now applies to `headless_cmd`, `interactive_cmd` and `distiller_cmd` through a shared `base()`, so exec restarts and handoff distillation work with `ZIRV_CTX_AGENT_BIN="sh /tmp/stub.sh"` and not just wrap relaunches. Struct fields are `program` plus `bin_args`; A6's scaffold is marked as such, A9's codex interface mirrors it, and C5 now references A8 instead of introducing the behavior.
 - **`HandoffConfig.last_assistant_texts` was dead config** and `last_user_messages` misdescribed what it limited, since `structural_context` applies one limit to user messages, assistant texts and tool errors alike. The two fields collapsed into one, `tail_items` (default 5), documented as such, asserted in A2's defaults test, exposed in the README config example, and read at all three call sites (A19, B2, C5).
+
+**Phase E review pass (usage pacing), against the real Phase A and B code on this branch:**
+
+- **Spec coverage:** every claim in the spec's "Usage pacing" section maps to a task in the table above. Both BLOCKED facts from the verified notes file are handled the Task A9 way rather than guessed: the estimator ships off by default (budgets `0`) and labeled an approximation everywhere it surfaces, and the limit-hit matcher ships against the three documented strings with an empirical follow-up appended to the notes file in E4 Step 20.
+- **Placeholder scan:** no TBD, no "add error handling", no "similar to task N". Every step carries real code, a real command and an expected RED or GREEN. The one intentionally provisional item is the E4 matcher, and it is provisional in the notes file with a written follow-up rather than in the code as a hole.
+- **Type consistency against the implemented tree, verified by reading it:** `StateDir::{from_root, resolve, root, logs}` and `now_secs` exist at `state.rs:15,41,47,57,70`; `log::{append, Decision}` at `log.rs:14,25`; `supervise::{spawn, supervise_child, Tick, Outcome, Watcher}` at `supervise.rs:12-116`; `EnvLookup` and `env_from_process` at `config.rs:14,18`; `crate::utils::home_dir` at `utils.rs:16`. E4's edits cite the real line ranges in `exec.rs` and `run_loop.rs`, and use the bare `now_secs` symbol because both files import it directly rather than via a `state::` path.
+- **Real-code mismatches caught while writing Phase E, each fixed in the task text:** `supervise::spawn` inherits stdout and stderr (`supervise.rs:25-31`), so a limit-hit matcher is impossible without a new capture path; E4 adds `spawn_tapped` plus `OutputTap` and keeps `spawn` untouched for every other caller, with a manual passthrough check in E4 Step 19. `ExecArgs::command` uses `allow_hyphen_values` + `last` **without** `trailing_var_arg` (`exec.rs:40`, from commit d3f0ede, where the third attribute tripped a clap debug assertion that aborts the process); `UsageAction::Tee` copies that exact combination and says why. `config.rs`'s `EnvKind` had only `Int` and `Str`, so E3 adds `Float` and `Bool` with tests for both, including the case where `ZIRV_CTX_PACE_MAX_PERCENT=75` must load as a float rather than an integer.
+- **Ordering fix:** Phase E lands before D1, but E5 documents pacing in the README section D1 creates. E5 now creates the heading and TOC entry when absent, and D1 explicitly extends rather than replaces it and carries the `usage` row in its verb table and the built-in help line.
+- **Two deliberate judgment calls, both recorded in the task text:** cache-read tokens are excluded from the estimator by default (verified as the dominant class at 108427 of 108886 tokens in one real event, and API-discounted), with `count_cache_reads` to flip it; and estimator percentages exist only once an operator sets a budget, because no source documents a plan's real allowance and a default would be a guess presented as data.
+- **No test touches the network or spends usage:** fixtures are `statusline-with-limits.json`, `statusline-no-limits.json`, `fake-statusline.sh`, synthetic transcripts built in-test, and the existing `fake-agent.sh` with a new `limit` mode. Timing is driven by an injected fake clock in the `pace` tests, so the gate's waiting behavior is asserted without real sleeping.
+
+**Phase E second review pass, two findings, both fixed:**
+
+- **The safety valve was a global six hours,** which quietly broke the spec's wait-until-reset semantics for the seven-day window: an exhausted week would resume roughly every six hours and spend tokens against a window that had not reset. The cap is now scaled to the window that tripped, `window_length + wait_slack_secs` (5h or 7d, plus 1h), via `pace::window_length` and `pace::wait_cap`, and `max_wait_secs` became `Option<u64>` defaulting to `None`, meaning it is now an explicit absolute override rather than an always-on ceiling. `wait_deadline` reads the window name it already carries in `PaceDecision::WaitUntil`, so no signature changed. Tests moved with it: `the_deadline_is_capped_by_max_wait` split into `the_cap_is_scaled_to_the_window_that_tripped`, `a_seven_day_trip_may_wait_days_not_hours`, `a_five_hour_trip_is_capped_near_five_hours` and `an_absolute_override_replaces_the_per_window_cap` in E3, plus `an_absolute_override_bounds_the_total_wait`, `a_bogus_five_hour_reset_is_bounded_by_the_window_not_by_six_hours` and `an_exhausted_week_waits_for_the_real_reset_rather_than_resuming_early` in E4; the defaults test now asserts `None` and `wait_slack_secs`. E5 reports the per-window bound and flags an override, and the README gained a "How long a pause can last" subsection.
+- **Writing the seven-day test surfaced a second problem in my own design:** `wait_for_window` logged and printed on every 30-second chunk, so a five-day park would have written about 14000 identical audit lines. It now announces once per distinct decision (window plus reset time) and re-announces only when that changes, asserted by a `pace-wait` line count in `waiting_is_recorded_in_the_decision_log`.
+- **`LIMIT_HIT_PATTERNS` carried five strings when the notes file documents three.** It now ships exactly the documented session, weekly and Opus phrasings; "hit your sonnet limit" (plausible by symmetry, undocumented) and "hit your usage limit" (invented) are commented candidates in the constant's doc comment, `only_the_documented_patterns_ship` pins the count at three and asserts both candidates do **not** match, and E4's follow-up note in the notes file says to promote a candidate only after observing it.
 
 **4. Ordering.** `hook notify` (A16) depends on codex's real notify contract, so codex verification (A9) is sequenced before it. Fixtures (A5) precede the parser that reads them (A7). Supervision primitives (B1) precede both supervisors. `term.rs` (C1) precedes the PTY pump (C2).
