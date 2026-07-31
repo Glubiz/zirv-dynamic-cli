@@ -135,7 +135,9 @@ Thin one-liners registered in each agent's own config:
 |---|---|---|
 | Claude `settings.json` Stop | turn end + score | `zirv ctx hook stop` |
 | Claude `settings.json` UserPromptSubmit | marker instruction | `zirv ctx hook prompt` |
-| Claude `settings.json` PreCompact | compaction focus instructions | `zirv ctx hook pre-compact` |
+| Claude `settings.json` PreCompact | records compaction events, advisory only | `zirv ctx hook pre-compact` |
+
+PreCompact cannot inject instructions into a compaction (its output honors only decision/reason/advisory fields), so compaction focus instructions are delivered exclusively by `wrap` as arguments to the injected `/compact <focus>` command.
 | Codex `config.toml` notify | turn end + score | `zirv ctx hook notify` |
 
 `zirv ctx hook stop` scores the session and (a) forwards the verdict to the owning wrap/exec socket when one exists, (b) otherwise emits a non-blocking advisory. It never blocks the agent's stop: blocking was the canary's misfire pain and is retired. The legacy `canary-check.sh` is removed from settings once `ctx` is installed.
