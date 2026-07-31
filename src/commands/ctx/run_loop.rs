@@ -1,8 +1,3 @@
-// EXIT_FAILED is consumed by the backoff/failure-cap logic added in the next
-// task of this plan, so it is dead code module-wide until then, matching
-// config.rs/state.rs/log.rs/event.rs/handoff.rs/exec.rs.
-#![allow(dead_code)]
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
