@@ -13,6 +13,7 @@ fn write_scripts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std
             && let Some(ext) = path.extension().and_then(|s| s.to_str())
             && SUPPORTED_EXTENSIONS.contains(&ext)
             && path.file_name().unwrap() != ".shortcuts.yaml"
+            && path.file_name().unwrap() != crate::commands::ctx::config::CTX_CONFIG_FILE
         {
             let content = fs::read_to_string(&path)?;
             let script = parse_script_content(&content, ext)?;
@@ -197,6 +198,36 @@ shortcuts:
         );
 
         env::set_current_dir(original_dir)?;
+
+        Ok(())
+    }
+
+    /// `.zirv/ctx.toml` is a ctx config file, not a script. Parsing it as a
+    /// Script used to make `zirv help` fail for the whole directory.
+    #[test]
+    fn test_show_help_ignores_ctx_config() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        write(
+            zirv_dir.join("test.yaml"),
+            "name: \"Test Script\"\ncommands: []\n",
+        )?;
+        write(zirv_dir.join("ctx.toml"), "[score]\nwindow = 4\n")?;
+
+        let original_dir = env::current_dir()?;
+        env::set_current_dir(&temp_path)?;
+
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer);
+
+        env::set_current_dir(original_dir)?;
+
+        result?;
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(output.contains("Test Script"));
+        assert!(!output.contains("ctx.toml"));
 
         Ok(())
     }

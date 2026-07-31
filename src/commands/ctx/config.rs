@@ -1,1 +1,366 @@
-// filled in by a later task
+// Consumed by verb entry points added in a later task of this plan; nothing
+// calls this yet, so dead_code is silenced module-wide until then.
+#![allow(dead_code)]
+
+use std::path::Path;
+
+use serde::Deserialize;
+
+use super::CtxResult;
+
+pub const DEFAULT_MARKER: &str = "[zirv]";
+pub const CTX_CONFIG_FILE: &str = "ctx.toml";
+
+pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Wraps process env access so callers can pass a closure in tests instead of
+/// mutating global state.
+pub fn env_from_process() -> impl Fn(&str) -> Option<String> {
+    |key: &str| std::env::var(key).ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScoreConfig {
+    pub window: usize,
+    pub min_turns: usize,
+    pub token_floor: u64,
+    pub token_ceiling: u64,
+    pub weight_tool_failure: f64,
+    pub weight_repetition: f64,
+    pub weight_marker: f64,
+    pub repetition_threshold: usize,
+    pub advise_at: u32,
+    pub compact_at: u32,
+    pub restart_at: u32,
+    pub marker: String,
+}
+
+impl Default for ScoreConfig {
+    fn default() -> Self {
+        Self {
+            window: 10,
+            min_turns: 10,
+            token_floor: 100_000,
+            token_ceiling: 160_000,
+            weight_tool_failure: 40.0,
+            weight_repetition: 30.0,
+            weight_marker: 30.0,
+            repetition_threshold: 3,
+            advise_at: 40,
+            compact_at: 60,
+            restart_at: 80,
+            marker: DEFAULT_MARKER.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WrapConfig {
+    pub debounce_ms: u64,
+    pub inject_timeout_ms: u64,
+}
+
+impl Default for WrapConfig {
+    fn default() -> Self {
+        Self {
+            debounce_ms: 3000,
+            inject_timeout_ms: 20_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SuperviseConfig {
+    pub max_restarts: u32,
+    pub poll_ms: u64,
+    pub interval_secs: u64,
+    pub max_cycle_secs: u64,
+    pub max_failures: u32,
+    pub backoff_base_secs: u64,
+    pub on_failure: Option<String>,
+}
+
+impl Default for SuperviseConfig {
+    fn default() -> Self {
+        Self {
+            max_restarts: 2,
+            poll_ms: 2000,
+            interval_secs: 900,
+            max_cycle_secs: 3600,
+            max_failures: 5,
+            backoff_base_secs: 60,
+            on_failure: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandoffConfig {
+    pub model: String,
+    /// How many trailing items of each kind the handoff context keeps: user
+    /// messages, assistant texts and tool errors. One knob, because
+    /// `structural_context` applies one limit to all three.
+    pub tail_items: usize,
+}
+
+impl Default for HandoffConfig {
+    fn default() -> Self {
+        Self {
+            model: "haiku".to_string(),
+            tail_items: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CtxConfig {
+    pub agent: Option<String>,
+    pub agent_bin: Option<String>,
+    pub score: ScoreConfig,
+    pub wrap: WrapConfig,
+    pub supervise: SuperviseConfig,
+    pub handoff: HandoffConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EnvKind {
+    Int,
+    Str,
+}
+
+const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
+    ("ZIRV_CTX_AGENT", &["agent"], EnvKind::Str),
+    ("ZIRV_CTX_AGENT_BIN", &["agent_bin"], EnvKind::Str),
+    ("ZIRV_CTX_WINDOW", &["score", "window"], EnvKind::Int),
+    ("ZIRV_CTX_MIN_TURNS", &["score", "min_turns"], EnvKind::Int),
+    (
+        "ZIRV_CTX_TOKEN_FLOOR",
+        &["score", "token_floor"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_TOKEN_CEILING",
+        &["score", "token_ceiling"],
+        EnvKind::Int,
+    ),
+    ("ZIRV_CTX_MARKER", &["score", "marker"], EnvKind::Str),
+    (
+        "ZIRV_CTX_DEBOUNCE_MS",
+        &["wrap", "debounce_ms"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_INJECT_TIMEOUT_MS",
+        &["wrap", "inject_timeout_ms"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MAX_RESTARTS",
+        &["supervise", "max_restarts"],
+        EnvKind::Int,
+    ),
+    ("ZIRV_CTX_POLL_MS", &["supervise", "poll_ms"], EnvKind::Int),
+    (
+        "ZIRV_CTX_INTERVAL_SECS",
+        &["supervise", "interval_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MAX_CYCLE_SECS",
+        &["supervise", "max_cycle_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MAX_FAILURES",
+        &["supervise", "max_failures"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_ON_FAILURE",
+        &["supervise", "on_failure"],
+        EnvKind::Str,
+    ),
+    ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
+];
+
+fn merge(base: &mut toml::Table, over: toml::Table) {
+    for (key, value) in over {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge(existing, incoming);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+fn insert_path(table: &mut toml::Table, path: &[&str], value: toml::Value) {
+    let Some((head, rest)) = path.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        table.insert((*head).to_string(), value);
+        return;
+    }
+    let entry = table
+        .entry((*head).to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !entry.is_table() {
+        *entry = toml::Value::Table(toml::Table::new());
+    }
+    if let Some(child) = entry.as_table_mut() {
+        insert_path(child, rest, value);
+    }
+}
+
+fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
+    match kind {
+        EnvKind::Str => Ok(toml::Value::String(raw.to_string())),
+        EnvKind::Int => raw
+            .parse::<i64>()
+            .map(toml::Value::Integer)
+            .map_err(|_| format!("expected an integer, got '{raw}'").into()),
+    }
+}
+
+fn read_layer(path: &Path, into: &mut toml::Table) -> CtxResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let layer: toml::Table =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    merge(into, layer);
+    Ok(())
+}
+
+impl CtxConfig {
+    /// Layers `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`, then
+    /// `ZIRV_CTX_*`. Flags are applied by each verb after loading.
+    pub fn load(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
+        let mut merged = toml::Table::new();
+
+        if let Ok(home) = crate::utils::home_dir() {
+            read_layer(
+                &home
+                    .join(crate::utils::SCRIPT_DIR_NAME)
+                    .join(CTX_CONFIG_FILE),
+                &mut merged,
+            )?;
+        }
+        read_layer(
+            &repo
+                .join(crate::utils::SCRIPT_DIR_NAME)
+                .join(CTX_CONFIG_FILE),
+            &mut merged,
+        )?;
+
+        for (var, path, kind) in ENV_MAP {
+            if let Some(raw) = env(var) {
+                let value = env_value(&raw, *kind).map_err(|e| format!("{var}: {e}"))?;
+                insert_path(&mut merged, path, value);
+            }
+        }
+
+        toml::Value::Table(merged)
+            .try_into()
+            .map_err(|e| format!("invalid ctx config: {e}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn defaults_match_the_spec() {
+        let cfg = ScoreConfig::default();
+        assert_eq!(cfg.window, 10);
+        assert_eq!(cfg.min_turns, 10);
+        assert_eq!(cfg.token_floor, 100_000);
+        assert_eq!(cfg.token_ceiling, 160_000);
+        assert_eq!(cfg.advise_at, 40);
+        assert_eq!(cfg.compact_at, 60);
+        assert_eq!(cfg.restart_at, 80);
+        assert_eq!(cfg.marker, "[zirv]");
+        assert_eq!(cfg.repetition_threshold, 3);
+        assert_eq!(
+            cfg.weight_tool_failure + cfg.weight_repetition + cfg.weight_marker,
+            100.0,
+            "weights must sum to 100 so an all-signals session can reach restart"
+        );
+        assert_eq!(WrapConfig::default().debounce_ms, 3000);
+        assert_eq!(SuperviseConfig::default().max_restarts, 2);
+        assert_eq!(HandoffConfig::default().model, "haiku");
+        assert_eq!(HandoffConfig::default().tail_items, 5);
+    }
+
+    #[test]
+    fn repo_file_overrides_defaults_and_env_overrides_repo() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[score]\nwindow = 4\ntoken_floor = 50000\nmarker = \"[repo]\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.window, 4);
+        assert_eq!(cfg.score.token_floor, 50_000);
+        assert_eq!(cfg.score.marker, "[repo]");
+        assert_eq!(
+            cfg.score.token_ceiling, 160_000,
+            "untouched keys keep defaults"
+        );
+
+        let env = env_map(&[("ZIRV_CTX_WINDOW", "7"), ("ZIRV_CTX_MARKER", "[env]")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.window, 7);
+        assert_eq!(cfg.score.marker, "[env]");
+        assert_eq!(cfg.score.token_floor, 50_000, "repo layer still applies");
+    }
+
+    #[test]
+    fn numeric_looking_marker_stays_a_string() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_MARKER", "42")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.marker, "42");
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected_loudly() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "[score]\nwindwo = 4\n").expect("write");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("typo must not be silently ignored");
+        assert!(err.to_string().contains("windwo"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_files_are_not_an_error() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.window, 10);
+    }
+}
