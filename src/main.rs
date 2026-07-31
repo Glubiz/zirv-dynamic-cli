@@ -1,4 +1,5 @@
 use clap::Parser;
+use commands::ctx;
 use commands::{
     create::create_script_interactive, help::show_help, init::init_zirv, version::get_version,
 };
@@ -15,6 +16,11 @@ use utils::file_to_script;
 
 #[tokio::main]
 async fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("ctx") {
+        std::process::exit(ctx::dispatch(&argv[1..]));
+    }
+
     let input = Input::parse();
 
     match input.command.as_str() {
