@@ -87,6 +87,7 @@ pub fn run_with<W: Write>(
     let max_failures = args.max_failures.unwrap_or(cfg.supervise.max_failures);
 
     let mut cycle = 0u32;
+    let mut failures = 0u32;
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -161,26 +162,93 @@ pub fn run_with<W: Write>(
             max_failures,
             cycle,
             interval,
+            &mut failures,
         )? {
             return Ok(code);
         }
     }
 }
 
+/// Exponential backoff on consecutive failures, capped at four intervals so a
+/// broken loop still checks in occasionally.
+pub fn backoff_for(failures: u32, base: Duration, interval: Duration) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let cap = interval.saturating_mul(4);
+    let shift = (failures - 1).min(16);
+    let scaled = base.saturating_mul(1u32 << shift);
+    if scaled > cap { cap } else { scaled }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_cycle_outcome<W: Write>(
-    _args: &LoopArgs,
-    _cfg: &CtxConfig,
-    _state: &StateDir,
-    _w: &mut W,
-    _repo: &Path,
-    _failed: bool,
-    _max_failures: u32,
-    _cycle: u32,
+    args: &LoopArgs,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    w: &mut W,
+    repo: &Path,
+    failed: bool,
+    max_failures: u32,
+    cycle: u32,
     interval: Duration,
+    failures: &mut u32,
 ) -> CtxResult<Option<i32>> {
-    if !interval.is_zero() {
-        std::thread::sleep(interval);
+    if !failed {
+        *failures = 0;
+        if !interval.is_zero() {
+            std::thread::sleep(interval);
+        }
+        return Ok(None);
+    }
+
+    *failures += 1;
+    writeln!(
+        w,
+        "zirv ctx loop: cycle {cycle} failed ({}/{max_failures} consecutive)",
+        *failures
+    )?;
+
+    if *failures >= max_failures {
+        let on_failure = args
+            .on_failure
+            .clone()
+            .or_else(|| cfg.supervise.on_failure.clone());
+        let detail = match &on_failure {
+            Some(command) => {
+                let code = supervise::run_shell(command, repo)?;
+                format!("on_failure exited {code}")
+            }
+            None => "no on_failure command configured".to_string(),
+        };
+        let _ = log::append(
+            state,
+            &log::Decision {
+                ts: now_secs(),
+                session: "loop",
+                verb: "loop",
+                verdict: "n/a",
+                score: 0,
+                action: "give-up",
+                detail: &detail,
+            },
+        );
+        writeln!(
+            w,
+            "zirv ctx loop: giving up after {} consecutive failures, exiting {EXIT_FAILED}",
+            *failures
+        )?;
+        return Ok(Some(EXIT_FAILED));
+    }
+
+    let wait = backoff_for(
+        *failures,
+        Duration::from_secs(cfg.supervise.backoff_base_secs),
+        interval,
+    );
+    if !wait.is_zero() {
+        writeln!(w, "zirv ctx loop: backing off {}s", wait.as_secs())?;
+        std::thread::sleep(wait);
     }
     Ok(None)
 }
@@ -344,5 +412,124 @@ mod tests {
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect_err("nothing to do");
         assert!(err.to_string().contains("cycles"), "got {err}");
+    }
+
+    #[test]
+    fn backoff_doubles_and_is_capped() {
+        let base = Duration::from_secs(60);
+        let interval = Duration::from_secs(900);
+        assert_eq!(backoff_for(0, base, interval), Duration::ZERO);
+        assert_eq!(backoff_for(1, base, interval), Duration::from_secs(60));
+        assert_eq!(backoff_for(2, base, interval), Duration::from_secs(120));
+        assert_eq!(backoff_for(3, base, interval), Duration::from_secs(240));
+        assert_eq!(
+            backoff_for(20, base, interval),
+            Duration::from_secs(3600),
+            "capped at four intervals"
+        );
+    }
+
+    #[test]
+    fn backoff_never_overflows_on_absurd_failure_counts() {
+        let capped = backoff_for(u32::MAX, Duration::from_secs(60), Duration::from_secs(900));
+        assert_eq!(capped, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn repeated_failures_run_on_failure_and_exit_nonzero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let env = base_env(&state);
+        let marker = tmp.path().join("on-failure-ran");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "fail");
+            std::env::set_var("FAKE_AGENT_TURNS", "2");
+        }
+        let mut args = args_for(5);
+        args.max_failures = Some(2);
+        args.on_failure = Some(format!("touch {}", marker.display()));
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+
+        assert_eq!(code.expect("runs"), EXIT_FAILED);
+        assert!(marker.exists(), "the on_failure hook must run");
+        assert_eq!(
+            transcripts_in(&home).len(),
+            2,
+            "it stopped at the failure cap instead of running all 5 cycles"
+        );
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"give-up\""), "got {log}");
+    }
+
+    #[test]
+    fn a_successful_cycle_resets_the_failure_count() {
+        let mut failures = 3u32;
+        let mut out = Vec::new();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut args = args_for(1);
+        args.interval_secs = Some(0);
+
+        let code = handle_cycle_outcome(
+            &args,
+            &cfg,
+            &state,
+            &mut out,
+            tmp.path(),
+            false,
+            5,
+            1,
+            Duration::ZERO,
+            &mut failures,
+        )
+        .expect("handled");
+        assert_eq!(code, None, "keep looping");
+        assert_eq!(failures, 0, "a green cycle clears the streak");
+    }
+
+    #[test]
+    fn a_failure_below_the_cap_keeps_looping() {
+        let mut failures = 0u32;
+        let mut out = Vec::new();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut args = args_for(1);
+        args.on_failure = None;
+
+        let code = handle_cycle_outcome(
+            &args,
+            &cfg,
+            &state,
+            &mut out,
+            tmp.path(),
+            true,
+            5,
+            1,
+            Duration::ZERO,
+            &mut failures,
+        )
+        .expect("handled");
+        assert_eq!(code, None);
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn a_zero_interval_disables_backoff_entirely() {
+        assert_eq!(
+            backoff_for(3, Duration::from_secs(60), Duration::ZERO),
+            Duration::ZERO,
+            "tests and one-shot loops must not sleep"
+        );
     }
 }
