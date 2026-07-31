@@ -1,13 +1,16 @@
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::event::NormalizedEvent;
 use super::rot::Verdict;
 use super::signal::TurnSignal;
+use super::supervise::Watcher;
 use super::term::{RawGuard, STDIN_FD, window_size};
 use super::{CtxResult, adapters};
 
@@ -34,9 +37,6 @@ pub enum PumpEvent {
     PtyClosed,
 }
 
-/// Wired into `pump` by Task C4; nothing outside this module's tests
-/// constructs or calls it yet, so the whole type is allowed dead code here.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct InjectionState {
     pub last_turn: u64,
@@ -54,7 +54,6 @@ impl Default for InjectionState {
     }
 }
 
-#[allow(dead_code)]
 impl InjectionState {
     pub fn new() -> Self {
         Self {
@@ -87,8 +86,6 @@ impl InjectionState {
 /// Both spec preconditions, and nothing else: a turn boundary has been reported
 /// and the user is idle. Everything about which verdict deserves which action
 /// lives in the escalation ladder, not here.
-/// Wired into `pump` by Task C4; nothing outside this module's tests calls it yet.
-#[allow(dead_code)]
 pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> bool {
     !state.degraded
         && state.last_turn > 0
@@ -97,6 +94,70 @@ pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> b
         && state
             .cooldown_until_turn
             .is_none_or(|turn| state.last_turn > turn)
+}
+
+/// Sent as arguments to the adapter's compaction command. PreCompact hooks
+/// cannot add instructions to a compaction, so this is the only channel for them.
+pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance criteria, the file paths touched so far, any unresolved errors or failing tests, and the exact next step. Drop resolved tangents and full file dumps.";
+
+pub const TRANSCRIPT_ENV: &str = "ZIRV_CTX_TRANSCRIPT";
+pub const SOCKET_PATH_FILE: &str = "socket-path";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Advise,
+    Compact,
+    Restart,
+}
+
+/// Advisories only print, so they need no injection window. Compaction and
+/// restart type into the agent, so both preconditions apply.
+pub fn action_for(state: &InjectionState, now: Instant, debounce: Duration) -> Action {
+    if state.degraded {
+        return Action::None;
+    }
+    match state.verdict {
+        Verdict::Healthy => Action::None,
+        Verdict::Advise => Action::Advise,
+        Verdict::Compact if may_inject(state, now, debounce) => Action::Compact,
+        Verdict::Restart if may_inject(state, now, debounce) => Action::Restart,
+        _ => Action::None,
+    }
+}
+
+pub fn advisory_line(score: u32, tokens: u64) -> String {
+    format!(
+        "zirv ctx: context health is slipping (score {score}, {tokens} tokens in context). A /compact soon will keep instruction-following sharp."
+    )
+}
+
+pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
+    // A TUI submits on carriage return, not newline.
+    write!(sink, "{compact_command} {COMPACT_FOCUS}\r")?;
+    sink.flush()?;
+    Ok(())
+}
+
+/// Watches the transcript for the compaction the injection was supposed to
+/// cause. No blind keystroke retries: either it is recorded or wrap retreats.
+pub fn verify_compaction(
+    watcher: &mut Watcher,
+    adapter: &dyn AgentAdapter,
+    deadline: Instant,
+) -> CtxResult<bool> {
+    while Instant::now() < deadline {
+        if let Some(jsonl) = watcher.read_if_changed()?
+            && adapter
+                .parse_events(&jsonl)
+                .iter()
+                .any(|event| matches!(event, NormalizedEvent::Compaction))
+        {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(false)
 }
 
 pub fn run_with<W: Write>(
@@ -113,11 +174,44 @@ pub fn run_with<W: Write>(
     let cfg = CtxConfig::load(repo, env)?;
     // Selection happens here so an unknown or unverified agent fails before the
     // terminal is touched.
-    let _adapter = adapters::select(
+    let adapter = adapters::select(
         args.agent.as_deref().or(cfg.agent.as_deref()),
         &args.command,
         cfg.agent_bin.as_deref(),
     )?;
+
+    let state_dir = super::state::StateDir::resolve(env)?;
+    let session = super::event::SessionId::new_v4();
+
+    let mut supervision = InjectionState::new();
+    supervision.degraded = args.no_supervise;
+
+    let server = if args.no_supervise {
+        None
+    } else {
+        match super::signal::SignalServer::bind(&state_dir.socket_for(session.as_str())) {
+            Ok(server) => {
+                // Publish the path so `zirv ctx status` and tests can find it.
+                let _ = std::fs::create_dir_all(state_dir.root());
+                let _ = std::fs::write(
+                    state_dir.root().join(SOCKET_PATH_FILE),
+                    server.path().display().to_string(),
+                );
+                Some(server)
+            }
+            Err(_) => {
+                supervision.degraded = true;
+                None
+            }
+        }
+    };
+
+    let transcript = env(TRANSCRIPT_ENV).map(PathBuf::from).unwrap_or_else(|| {
+        adapter.transcript_path(&super::event::SessionRef {
+            id: session.clone(),
+            cwd: repo.to_path_buf(),
+        })
+    });
 
     let (cols, rows) = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
     let pair = native_pty_system().openpty(PtySize {
@@ -132,6 +226,20 @@ pub fn run_with<W: Write>(
         command.arg(arg);
     }
     command.cwd(repo);
+
+    if let Some(server) = server.as_ref() {
+        let setup = adapter.register_turn_signal(
+            &super::event::SessionRef {
+                id: session.clone(),
+                cwd: repo.to_path_buf(),
+            },
+            server.path(),
+        );
+        for (key, value) in setup.env {
+            command.env(key, value);
+        }
+    }
+
     let mut child = pair.slave.spawn_command(command)?;
 
     let mut reader = pair.master.try_clone_reader()?;
@@ -193,7 +301,23 @@ pub fn run_with<W: Write>(
     // still passes bytes through.
     let mut raw = RawGuard::enter(STDIN_FD).ok();
 
-    let exit = pump(&mut child, &rx, &pair);
+    let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
+    let inject_timeout = Duration::from_millis(cfg.wrap.inject_timeout_ms);
+
+    let exit = pump(
+        &mut child,
+        &rx,
+        &pair,
+        &mut supervision,
+        server.as_ref(),
+        adapter.as_ref(),
+        &writer,
+        &transcript,
+        &state_dir,
+        &session,
+        debounce,
+        inject_timeout,
+    );
 
     if let Some(guard) = raw.as_mut() {
         let _ = guard.restore();
@@ -208,10 +332,20 @@ pub fn run_with<W: Write>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pump(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     rx: &mpsc::Receiver<PumpEvent>,
     pair: &portable_pty::PtyPair,
+    supervision: &mut InjectionState,
+    server: Option<&super::signal::SignalServer>,
+    adapter: &dyn AgentAdapter,
+    writer: &std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    transcript: &Path,
+    state_dir: &super::state::StateDir,
+    session: &super::event::SessionId,
+    debounce: Duration,
+    inject_timeout: Duration,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
 
@@ -226,6 +360,68 @@ fn pump(
             if event == PumpEvent::PtyClosed {
                 let status = child.wait()?;
                 return Ok(status.exit_code() as i32);
+            }
+            supervision.on_event(event, Instant::now());
+        }
+
+        if let Some(server) = server
+            && let Some(signal) = server.try_recv()
+        {
+            supervision.on_turn(&signal);
+        }
+
+        match action_for(supervision, Instant::now(), debounce) {
+            Action::None => {}
+            Action::Advise => {
+                let mut stderr = std::io::stderr();
+                let _ = writeln!(stderr, "\r\n{}\r", advisory_line(supervision.score, 0));
+                // Advise once per turn.
+                supervision.cooldown_until_turn = Some(supervision.last_turn);
+            }
+            Action::Compact => {
+                let injected = writer
+                    .lock()
+                    .map_err(|_| "pty writer poisoned".to_string())
+                    .and_then(|mut sink| {
+                        let command = adapter.compact_command().unwrap_or("/compact");
+                        inject_compact(&mut *sink, command).map_err(|e| e.to_string())
+                    });
+
+                // Arm the cooldown before verifying so a failed verification
+                // cannot turn into a retry loop.
+                supervision.cooldown_until_turn = Some(supervision.last_turn);
+
+                let verified = injected.is_ok()
+                    && verify_compaction(
+                        &mut Watcher::new(transcript.to_path_buf()),
+                        adapter,
+                        Instant::now() + inject_timeout,
+                    )
+                    .unwrap_or(false);
+
+                if !verified {
+                    supervision.degraded = true;
+                }
+                let _ = super::log::append(
+                    state_dir,
+                    &super::log::Decision {
+                        ts: super::state::now_secs(),
+                        session: session.as_str(),
+                        verb: "wrap",
+                        verdict: "compact",
+                        score: supervision.score,
+                        action: if verified {
+                            "inject"
+                        } else {
+                            "inject-unverified"
+                        },
+                        detail: &transcript.display().to_string(),
+                    },
+                );
+            }
+            Action::Restart => {
+                // Task C5.
+                supervision.cooldown_until_turn = Some(supervision.last_turn);
             }
         }
 
@@ -538,5 +734,230 @@ mod tests {
         assert_eq!(state.verdict, Verdict::Restart);
         assert_eq!(state.score, 91);
         assert_eq!(state.last_turn, 9);
+    }
+
+    use crate::commands::ctx::adapters::claude::ClaudeAdapter;
+    use crate::commands::ctx::supervise::Watcher;
+
+    #[test]
+    fn the_ladder_maps_verdicts_to_actions() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+
+        state.verdict = Verdict::Healthy;
+        assert_eq!(action_for(&state, now, DEBOUNCE), Action::None);
+
+        state.verdict = Verdict::Advise;
+        assert_eq!(action_for(&state, now, DEBOUNCE), Action::Advise);
+
+        state.verdict = Verdict::Compact;
+        assert_eq!(action_for(&state, now, DEBOUNCE), Action::Compact);
+
+        state.verdict = Verdict::Restart;
+        assert_eq!(action_for(&state, now, DEBOUNCE), Action::Restart);
+    }
+
+    #[test]
+    fn an_advisory_needs_no_injection_window() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.verdict = Verdict::Advise;
+        state.on_event(PumpEvent::Input(1), now);
+        assert_eq!(
+            action_for(&state, now, DEBOUNCE),
+            Action::Advise,
+            "advice is written to the terminal, never typed into the agent"
+        );
+    }
+
+    #[test]
+    fn compaction_and_restart_respect_the_injection_window() {
+        let now = Instant::now();
+        for verdict in [Verdict::Compact, Verdict::Restart] {
+            let mut state = ready_state(now);
+            state.verdict = verdict;
+            state.on_event(PumpEvent::Input(1), now);
+            assert_eq!(
+                action_for(&state, now, DEBOUNCE),
+                Action::None,
+                "{verdict:?} must wait for an idle user"
+            );
+        }
+    }
+
+    #[test]
+    fn a_degraded_supervisor_still_advises_but_never_injects() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.degraded = true;
+        state.verdict = Verdict::Advise;
+        assert_eq!(action_for(&state, now, DEBOUNCE), Action::None);
+    }
+
+    #[test]
+    fn the_advisory_line_is_one_line_and_plain() {
+        let line = advisory_line(47, 138_000);
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains("47"));
+        assert!(line.contains("138000") || line.contains("138"));
+        assert!(
+            !line.contains('\u{2014}'),
+            "no em dashes in user-facing copy"
+        );
+    }
+
+    #[test]
+    fn the_injected_command_carries_focus_instructions_and_ends_with_a_carriage_return() {
+        let mut sink: Vec<u8> = Vec::new();
+        inject_compact(&mut sink, "/compact").expect("inject");
+        let text = String::from_utf8(sink).expect("utf8");
+        assert!(text.starts_with("/compact "), "got {text:?}");
+        assert!(text.contains(COMPACT_FOCUS));
+        assert!(
+            text.ends_with('\r'),
+            "a TUI submits on carriage return: {text:?}"
+        );
+        assert_eq!(text.matches('\r').count(), 1, "exactly one submit");
+        assert!(!text.contains('\n'), "no stray newline: {text:?}");
+    }
+
+    #[test]
+    fn the_focus_text_names_what_to_preserve() {
+        for needle in ["task", "file", "error", "next step"] {
+            assert!(
+                COMPACT_FOCUS.to_lowercase().contains(needle),
+                "focus text should mention {needle}: {COMPACT_FOCUS}"
+            );
+        }
+        assert!(!COMPACT_FOCUS.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn verification_succeeds_when_a_compaction_event_appears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n",
+        )
+        .expect("write");
+
+        let mut watcher = Watcher::new(path.clone());
+        let _ = watcher.read_if_changed();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            use std::io::Write as _;
+            writeln!(
+                file,
+                "{{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"content\":\"x\"}}"
+            )
+            .expect("append");
+        });
+
+        let adapter = ClaudeAdapter::new(None);
+        let verified = verify_compaction(
+            &mut watcher,
+            &adapter,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("verify");
+        writer.join().expect("writer thread");
+        assert!(verified);
+    }
+
+    #[test]
+    fn verification_gives_up_at_the_deadline_instead_of_retrying() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n",
+        )
+        .expect("write");
+        let mut watcher = Watcher::new(path);
+        let adapter = ClaudeAdapter::new(None);
+
+        let started = Instant::now();
+        let verified = verify_compaction(
+            &mut watcher,
+            &adapter,
+            Instant::now() + Duration::from_millis(300),
+        )
+        .expect("verify");
+        assert!(!verified);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_compact_verdict_at_an_idle_turn_boundary_injects_into_the_tui() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log = tmp.path().join("injected.log");
+        let transcript = tmp.path().join("t.jsonl");
+        // A transcript that scores `compact`: marker misses plus tool failures
+        // at 165k tokens, which is above the ceiling but below the restart score.
+        let mut text = String::new();
+        for i in 0..12 {
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n");
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"r\",\"is_error\":true}]}}\n");
+            let block = if i < 2 { "[zirv] ok" } else { "sloppy" };
+            text.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{block}\"}}],\"usage\":{{\"input_tokens\":165000}}}}}}\n"
+            ));
+        }
+        std::fs::write(&transcript, &text).expect("write");
+
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("STUB_TUI_LOG", log.display().to_string()),
+                ("STUB_TUI_TRANSCRIPT", transcript.display().to_string()),
+                ("ZIRV_CTX_TRANSCRIPT", transcript.display().to_string()),
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                (
+                    "ZIRV_CTX_STATE_DIR",
+                    tmp.path().join("state").display().to_string(),
+                ),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        // A turn boundary is what unlocks injection, and the hook is what
+        // reports one, so drive it exactly the way the real hook does.
+        let socket =
+            std::fs::read_to_string(tmp.path().join("state/socket-path")).unwrap_or_default();
+        assert!(
+            !socket.trim().is_empty(),
+            "wrap must publish its socket path"
+        );
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Compact),
+        )
+        .expect("send turn signal");
+
+        let seen = read_until(&mut h.reader, "compacted", Duration::from_secs(15));
+        assert!(seen.contains("compacted"), "got {seen:?}");
+
+        let injected = std::fs::read_to_string(&log).expect("injection log");
+        assert!(injected.contains("/compact"), "got {injected:?}");
+        assert!(
+            injected.contains("Preserve"),
+            "focus text was sent: {injected:?}"
+        );
+        assert_eq!(
+            injected.lines().count(),
+            1,
+            "cooldown prevents a second injection"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        let _ = h.child.wait();
     }
 }
