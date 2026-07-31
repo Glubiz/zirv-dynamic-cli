@@ -4,8 +4,10 @@
 #![allow(dead_code)]
 
 use std::io::Write;
+use std::process::Stdio;
 
 use super::CtxResult;
+use super::adapters::AgentAdapter;
 use super::event::StructuralContext;
 
 // TODO(A19): this placeholder Args/run pair is replaced by the real verb
@@ -152,10 +154,216 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
     }
 }
 
+pub const DISTILL_PROMPT_VERSION: &str = "v1";
+
+fn bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        return "(none)\n".to_string();
+    }
+    items.iter().map(|i| format!("- {i}\n")).collect()
+}
+
+pub fn distill_prompt(ctx: &StructuralContext) -> String {
+    format!(
+        "You are writing a handoff note ({DISTILL_PROMPT_VERSION}) so a fresh session can \
+continue this work with no other context. Answer with markdown only, using exactly these \
+sections in this order: {sections}. Use `## ` headings. Task and Next step are single lines; \
+the rest are bullet lists. Be concrete: real file paths, real commands, real error text. Do \
+not invent progress that is not evidenced below.\n\n\
+### Recent user requests\n{requests}\n\
+### Recent assistant replies\n{replies}\n\
+### Files the session touched\n{files}\n\
+### Unresolved tool errors\n{errors}",
+        sections = SECTIONS.join(", "),
+        requests = bullets(&ctx.user_messages),
+        replies = bullets(&ctx.assistant_texts),
+        files = bullets(&ctx.files_touched),
+        errors = bullets(&ctx.tool_errors),
+    )
+}
+
+/// Runs a fresh, cheap model over the context. The rotted session is never
+/// asked to summarize itself.
+pub fn distill(
+    adapter: &dyn AgentAdapter,
+    model: &str,
+    ctx: &StructuralContext,
+) -> CtxResult<Handoff> {
+    let mut command = adapter.distiller_cmd(model);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = command.spawn()?;
+    {
+        let stdin = child.stdin.as_mut().ok_or("distiller stdin unavailable")?;
+        stdin.write_all(distill_prompt(ctx).as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "distiller exited with status {}",
+            output.status.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    let handoff = parse_markdown(&String::from_utf8_lossy(&output.stdout));
+    if !handoff.is_usable() {
+        return Err("distiller produced no usable Task and Next step".into());
+    }
+    Ok(handoff)
+}
+
+/// Never fails: a restart always has something to stand on.
+pub fn distill_or_structural(
+    adapter: &dyn AgentAdapter,
+    model: &str,
+    ctx: &StructuralContext,
+) -> (Handoff, &'static str) {
+    match distill(adapter, model, ctx) {
+        Ok(handoff) => (handoff, "distilled"),
+        Err(_) => (structural(ctx), "structural"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ctx::adapters::claude::ClaudeAdapter;
     use crate::commands::ctx::event::StructuralContext;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn fake_model_adapter() -> ClaudeAdapter {
+        ClaudeAdapter::new(Some(fixture("fake-model.sh").to_str().expect("utf8 path")))
+    }
+
+    fn ctx_sample() -> StructuralContext {
+        StructuralContext {
+            user_messages: vec!["ship the webhook".to_string()],
+            assistant_texts: vec!["[zirv] wrote the route".to_string()],
+            files_touched: vec!["src/routes/webhook.rs".to_string()],
+            tool_errors: vec!["401 from the provider".to_string()],
+        }
+    }
+
+    #[test]
+    fn the_prompt_carries_the_context_and_asks_for_the_documented_sections() {
+        let prompt = distill_prompt(&ctx_sample());
+        for section in SECTIONS {
+            assert!(
+                prompt.contains(section),
+                "prompt must name '{section}': {prompt}"
+            );
+        }
+        assert!(prompt.contains("ship the webhook"));
+        assert!(prompt.contains("src/routes/webhook.rs"));
+        assert!(prompt.contains("401 from the provider"));
+        assert!(
+            prompt.contains(DISTILL_PROMPT_VERSION),
+            "version the template"
+        );
+    }
+
+    #[test]
+    fn distillation_parses_a_well_formed_answer() {
+        let adapter = fake_model_adapter();
+        let handoff = distill(&adapter, "haiku", &ctx_sample()).expect("distills");
+        assert_eq!(handoff.task, "Ship the webhook");
+        assert_eq!(
+            handoff.next_step,
+            "Add a failing test for an invalid signature"
+        );
+        assert_eq!(handoff.done.len(), 2);
+        assert!(handoff.is_usable());
+    }
+
+    #[test]
+    fn the_distiller_receives_the_prompt_on_stdin() {
+        let log = tempfile::NamedTempFile::new().expect("tempfile");
+        // SAFETY: CI runs tests single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var("FAKE_MODEL_PROMPT_LOG", log.path());
+        }
+        let adapter = fake_model_adapter();
+        distill(&adapter, "haiku", &ctx_sample()).expect("distills");
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_PROMPT_LOG");
+        }
+
+        let seen = std::fs::read_to_string(log.path()).expect("log");
+        assert!(seen.contains("ship the webhook"), "got: {seen}");
+    }
+
+    #[test]
+    fn a_failing_distiller_is_an_error() {
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "fail");
+        }
+        let adapter = fake_model_adapter();
+        let result = distill(&adapter, "haiku", &ctx_sample());
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+        let err = result.expect_err("non-zero exit must surface");
+        assert!(err.to_string().contains("4"), "report the exit code: {err}");
+    }
+
+    #[test]
+    fn an_unusable_answer_is_an_error_so_callers_can_fall_back() {
+        for mode in ["garbage", "partial"] {
+            unsafe {
+                std::env::set_var("FAKE_MODEL_MODE", mode);
+            }
+            let adapter = fake_model_adapter();
+            let result = distill(&adapter, "haiku", &ctx_sample());
+            unsafe {
+                std::env::remove_var("FAKE_MODEL_MODE");
+            }
+            assert!(
+                result.is_err(),
+                "mode {mode} should not produce a usable handoff"
+            );
+        }
+    }
+
+    #[test]
+    fn distill_or_structural_falls_back_and_reports_which_path_it_took() {
+        let adapter = fake_model_adapter();
+        let (handoff, source) = distill_or_structural(&adapter, "haiku", &ctx_sample());
+        assert_eq!(source, "distilled");
+        assert_eq!(handoff.task, "Ship the webhook");
+
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "garbage");
+        }
+        let (handoff, source) = distill_or_structural(&adapter, "haiku", &ctx_sample());
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+        assert_eq!(source, "structural");
+        assert_eq!(
+            handoff.task, "ship the webhook",
+            "from the last user prompt"
+        );
+        assert!(handoff.is_usable());
+    }
+
+    #[test]
+    fn a_missing_distiller_binary_falls_back_instead_of_panicking() {
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/model-binary"));
+        let (handoff, source) = distill_or_structural(&adapter, "haiku", &ctx_sample());
+        assert_eq!(source, "structural");
+        assert!(handoff.is_usable());
+    }
 
     fn sample() -> Handoff {
         Handoff {
