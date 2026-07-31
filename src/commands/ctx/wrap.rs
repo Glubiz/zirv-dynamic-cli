@@ -1,11 +1,13 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::rot::Verdict;
+use super::signal::TurnSignal;
 use super::term::{RawGuard, STDIN_FD, window_size};
 use super::{CtxResult, adapters};
 
@@ -30,6 +32,71 @@ pub enum PumpEvent {
     Output(usize),
     Input(usize),
     PtyClosed,
+}
+
+/// Wired into `pump` by Task C4; nothing outside this module's tests
+/// constructs or calls it yet, so the whole type is allowed dead code here.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct InjectionState {
+    pub last_turn: u64,
+    pub verdict: Verdict,
+    pub score: u32,
+    pub user_typed_since_turn: bool,
+    pub last_output: Instant,
+    pub cooldown_until_turn: Option<u64>,
+    pub degraded: bool,
+}
+
+impl Default for InjectionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
+impl InjectionState {
+    pub fn new() -> Self {
+        Self {
+            last_turn: 0,
+            verdict: Verdict::Healthy,
+            score: 0,
+            user_typed_since_turn: false,
+            last_output: Instant::now(),
+            cooldown_until_turn: None,
+            degraded: false,
+        }
+    }
+
+    pub fn on_event(&mut self, event: PumpEvent, now: Instant) {
+        match event {
+            PumpEvent::Output(_) => self.last_output = now,
+            PumpEvent::Input(_) => self.user_typed_since_turn = true,
+            PumpEvent::PtyClosed => {}
+        }
+    }
+
+    pub fn on_turn(&mut self, signal: &TurnSignal) {
+        self.last_turn = signal.turn;
+        self.verdict = signal.verdict;
+        self.score = signal.score;
+        self.user_typed_since_turn = false;
+    }
+}
+
+/// Both spec preconditions, and nothing else: a turn boundary has been reported
+/// and the user is idle. Everything about which verdict deserves which action
+/// lives in the escalation ladder, not here.
+/// Wired into `pump` by Task C4; nothing outside this module's tests calls it yet.
+#[allow(dead_code)]
+pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> bool {
+    !state.degraded
+        && state.last_turn > 0
+        && !state.user_typed_since_turn
+        && now.duration_since(state.last_output) >= debounce
+        && state
+            .cooldown_until_turn
+            .is_none_or(|turn| state.last_turn > turn)
 }
 
 pub fn run_with<W: Write>(
@@ -360,5 +427,116 @@ mod tests {
             !seen.contains("panicked"),
             "no panic on the hot path: {seen:?}"
         );
+    }
+
+    use crate::commands::ctx::rot::Verdict;
+    use crate::commands::ctx::signal::TurnSignal;
+
+    fn turn_signal(turn: u64, verdict: Verdict) -> TurnSignal {
+        TurnSignal {
+            session_id: "s".to_string(),
+            turn,
+            score: 64,
+            verdict,
+        }
+    }
+
+    fn ready_state(now: Instant) -> InjectionState {
+        let mut state = InjectionState::new();
+        state.on_turn(&turn_signal(3, Verdict::Compact));
+        state.last_output = now - Duration::from_secs(10);
+        state
+    }
+
+    const DEBOUNCE: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn a_fresh_state_never_injects() {
+        let now = Instant::now();
+        let state = InjectionState::new();
+        assert!(
+            !may_inject(&state, now, DEBOUNCE),
+            "no turn boundary seen yet"
+        );
+    }
+
+    #[test]
+    fn an_idle_user_at_a_turn_boundary_may_be_injected_into() {
+        let now = Instant::now();
+        assert!(may_inject(&ready_state(now), now, DEBOUNCE));
+    }
+
+    #[test]
+    fn typing_after_the_turn_blocks_injection() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.on_event(PumpEvent::Input(1), now);
+        assert!(
+            !may_inject(&state, now, DEBOUNCE),
+            "the user is mid-thought"
+        );
+    }
+
+    #[test]
+    fn recent_output_blocks_injection_until_the_debounce_passes() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.on_event(PumpEvent::Output(120), now);
+        assert!(!may_inject(&state, now, DEBOUNCE));
+        assert!(
+            may_inject(&state, now + Duration::from_secs(4), DEBOUNCE),
+            "quiet for longer than the debounce"
+        );
+    }
+
+    #[test]
+    fn a_new_turn_clears_the_typing_flag() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.on_event(PumpEvent::Input(1), now);
+        state.on_turn(&turn_signal(4, Verdict::Compact));
+        state.last_output = now - Duration::from_secs(10);
+        assert!(may_inject(&state, now, DEBOUNCE));
+        assert_eq!(state.last_turn, 4);
+    }
+
+    #[test]
+    fn the_cooldown_blocks_until_a_later_turn_arrives() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.cooldown_until_turn = Some(3);
+        assert!(
+            !may_inject(&state, now, DEBOUNCE),
+            "same turn as the cooldown"
+        );
+
+        state.on_turn(&turn_signal(4, Verdict::Compact));
+        state.last_output = now - Duration::from_secs(10);
+        assert!(
+            may_inject(&state, now, DEBOUNCE),
+            "a later turn releases it"
+        );
+    }
+
+    #[test]
+    fn a_degraded_supervisor_never_injects() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.degraded = true;
+        assert!(!may_inject(&state, now, DEBOUNCE));
+    }
+
+    #[test]
+    fn the_state_records_the_latest_verdict_and_score() {
+        let mut state = InjectionState::new();
+        state.on_turn(&TurnSignal {
+            session_id: "s".to_string(),
+            turn: 9,
+            score: 91,
+            verdict: Verdict::Restart,
+        });
+        assert_eq!(state.verdict, Verdict::Restart);
+        assert_eq!(state.score, 91);
+        assert_eq!(state.last_turn, 9);
     }
 }
