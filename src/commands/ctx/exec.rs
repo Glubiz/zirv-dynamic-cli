@@ -38,7 +38,7 @@ pub struct ExecArgs {
     #[arg(long)]
     pub timeout_secs: Option<u64>,
     /// The headless agent command, after `--`.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, last = true)]
+    #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
 }
 

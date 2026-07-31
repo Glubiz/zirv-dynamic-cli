@@ -119,6 +119,75 @@ mod tests {
         assert!(matches!(cli.verb, CtxVerb::Loop(_)));
     }
 
+    /// `exec`'s own flags come before `--`, the headless agent command after.
+    /// This exercises real argv parsing (not a struct literal), which is the
+    /// only way clap's `trailing_var_arg` + `last` debug assertion is checked:
+    /// a bad attribute combination on `ExecArgs::command` panics here instead
+    /// of surfacing as a normal parse error, taking the whole process down.
+    #[test]
+    fn exec_verb_parses_own_flags_before_the_separator_and_command_after() {
+        let cli = CtxCli::try_parse_from([
+            "zirv ctx",
+            "exec",
+            "--agent",
+            "claude",
+            "--max-restarts",
+            "2",
+            "--",
+            "claude",
+            "-p",
+            "hi",
+        ])
+        .expect("exec should parse flags before -- and a command after it");
+        match cli.verb {
+            CtxVerb::Exec(args) => {
+                assert_eq!(args.agent, Some("claude".to_string()));
+                assert_eq!(args.max_restarts, Some(2));
+                assert_eq!(
+                    args.command,
+                    vec!["claude".to_string(), "-p".to_string(), "hi".to_string()]
+                );
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
+    /// The trailing command can itself contain flag-shaped tokens (`--session-id`,
+    /// `-p`) that must land in `command` verbatim, not be consumed as `exec`'s
+    /// own flags: they appear after the `--` separator.
+    #[test]
+    fn exec_verb_preserves_hyphen_values_inside_the_trailing_command() {
+        let cli = CtxCli::try_parse_from([
+            "zirv ctx",
+            "exec",
+            "--timeout-secs",
+            "30",
+            "--",
+            "claude",
+            "--session-id",
+            "abc",
+            "-p",
+            "hi",
+        ])
+        .expect("hyphen-prefixed values after -- must not be reparsed as exec flags");
+        match cli.verb {
+            CtxVerb::Exec(args) => {
+                assert_eq!(args.timeout_secs, Some(30));
+                assert_eq!(
+                    args.command,
+                    vec![
+                        "claude".to_string(),
+                        "--session-id".to_string(),
+                        "abc".to_string(),
+                        "-p".to_string(),
+                        "hi".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
     #[test]
     fn unknown_verb_exits_two() {
         let code = dispatch(&["ctx".to_string(), "nope".to_string()]);
