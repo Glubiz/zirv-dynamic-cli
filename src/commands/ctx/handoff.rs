@@ -4,24 +4,15 @@
 #![allow(dead_code)]
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use super::CtxResult;
 use super::adapters::AgentAdapter;
+use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::StructuralContext;
-
-// TODO(A19): this placeholder Args/run pair is replaced by the real verb
-// wiring once `store`, `latest_for_repo` and `run_with` land; kept here so the
-// crate keeps compiling between A17/A18 and A19.
-#[derive(Debug, clap::Args)]
-pub struct HandoffArgs {
-    #[arg(num_args = 0.., allow_hyphen_values = true)]
-    pub rest: Vec<String>,
-}
-
-pub fn run<W: Write>(_args: &HandoffArgs, _w: &mut W) -> CtxResult<i32> {
-    Err("zirv ctx handoff is not implemented yet".into())
-}
+use super::state::{StateDir, now_secs, repo_slug};
+use super::{adapters, log};
 
 pub const SECTIONS: [&str; 6] = [
     "Task",
@@ -227,6 +218,121 @@ pub fn distill_or_structural(
         Ok(handoff) => (handoff, "distilled"),
         Err(_) => (structural(ctx), "structural"),
     }
+}
+
+#[derive(Debug, clap::Args)]
+pub struct HandoffArgs {
+    /// Transcript to distill.
+    #[arg(long)]
+    pub transcript: PathBuf,
+    /// Adapter name: claude or codex.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Session id recorded in the stored file name.
+    #[arg(long)]
+    pub session_id: Option<String>,
+    /// Print the handoff markdown instead of the stored path.
+    #[arg(long, default_value_t = false)]
+    pub stdout: bool,
+    /// Skip the model call and extract mechanically.
+    #[arg(long, default_value_t = false)]
+    pub no_model: bool,
+}
+
+pub fn store(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    handoff: &Handoff,
+) -> CtxResult<PathBuf> {
+    let dir = state.handoffs().join(repo_slug(repo));
+    std::fs::create_dir_all(&dir)?;
+
+    let short: String = session
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let path = dir.join(format!("{}-{}.md", now_secs(), short));
+    std::fs::write(&path, handoff.to_markdown())?;
+    Ok(path)
+}
+
+pub fn latest_for_repo(state: &StateDir, repo: &Path) -> CtxResult<Option<(PathBuf, Handoff)>> {
+    let dir = state.handoffs().join(repo_slug(repo));
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("md"))
+        .collect();
+    names.sort();
+
+    let Some(path) = names.pop() else {
+        return Ok(None);
+    };
+    let handoff = parse_markdown(&std::fs::read_to_string(&path)?);
+    Ok(Some((path, handoff)))
+}
+
+pub fn run_with<W: Write>(
+    args: &HandoffArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let adapter = adapters::select(
+        args.agent.as_deref().or(cfg.agent.as_deref()),
+        &[],
+        cfg.agent_bin.as_deref(),
+    )?;
+    let jsonl = std::fs::read_to_string(&args.transcript)
+        .map_err(|e| format!("{}: {e}", args.transcript.display()))?;
+    let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+
+    let (handoff, source) = if args.no_model {
+        (structural(&ctx), "structural")
+    } else {
+        distill_or_structural(adapter.as_ref(), &cfg.handoff.model, &ctx)
+    };
+
+    if args.stdout {
+        write!(w, "{}", handoff.to_markdown())?;
+        return Ok(0);
+    }
+
+    let state = StateDir::resolve(env)?;
+    let session = args
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let path = store(&state, repo, &session, &handoff)?;
+
+    let _ = log::append(
+        &state,
+        &log::Decision {
+            ts: now_secs(),
+            session: &session,
+            verb: "handoff",
+            verdict: "n/a",
+            score: 0,
+            action: source,
+            detail: &path.display().to_string(),
+        },
+    );
+
+    writeln!(w, "{}", path.display())?;
+    Ok(0)
+}
+
+pub fn run<W: Write>(args: &HandoffArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_with(args, w, &repo, &env)
 }
 
 #[cfg(test)]
@@ -470,5 +576,151 @@ mod tests {
             ..StructuralContext::default()
         };
         assert!(!structural(&ctx).to_markdown().contains('\u{2014}'));
+    }
+
+    use crate::commands::ctx::state::StateDir;
+
+    fn transcript_with(dir: &std::path::Path, prompt: &str) -> std::path::PathBuf {
+        let path = dir.join("t.jsonl");
+        let mut text = String::new();
+        text.push_str(&format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{prompt}\"}}}}\n"
+        ));
+        text.push_str("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"Read\",\"input\":{\"file_path\":\"/work/src/lib.rs\"}}],\"usage\":{\"input_tokens\":9}}}\n");
+        text.push_str("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[zirv] read it\"}],\"usage\":{\"input_tokens\":9}}}\n");
+        std::fs::write(&path, text).expect("write");
+        path
+    }
+
+    #[test]
+    fn storing_writes_markdown_under_the_repo_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = std::path::Path::new("/work/my-repo");
+
+        let path = store(&state, repo, "11111111-2222", &sample()).expect("store");
+        assert!(path.starts_with(state.handoffs().join("-work-my-repo")));
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("md"));
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("## Task"));
+        assert!(text.contains("Wire the payments webhook"));
+    }
+
+    #[test]
+    fn latest_for_repo_returns_the_newest_handoff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = std::path::Path::new("/work/my-repo");
+        state.ensure().expect("ensure");
+
+        let dir = state.handoffs().join("-work-my-repo");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("1700000000-aaaa.md"),
+            "## Task\nold\n\n## Next step\nold step\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join("1700000900-bbbb.md"),
+            "## Task\nnew\n\n## Next step\nnew step\n",
+        )
+        .expect("write");
+
+        let (path, handoff) = latest_for_repo(&state, repo)
+            .expect("lookup")
+            .expect("some");
+        assert!(path.ends_with("1700000900-bbbb.md"));
+        assert_eq!(handoff.task, "new");
+    }
+
+    #[test]
+    fn latest_for_repo_is_none_when_nothing_was_stored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        assert!(
+            latest_for_repo(&state, std::path::Path::new("/work/other"))
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn latest_for_repo_does_not_leak_across_repos() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        store(&state, std::path::Path::new("/work/a"), "s", &sample()).expect("store");
+        assert!(
+            latest_for_repo(&state, std::path::Path::new("/work/b"))
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_verb_stores_a_handoff_and_prints_its_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_with(tmp.path(), "ship the webhook");
+        let state = tmp.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                fixture("fake-model.sh").display().to_string(),
+            ),
+        ]
+        .into();
+
+        let args = HandoffArgs {
+            transcript,
+            agent: None,
+            session_id: Some("11111111-2222".to_string()),
+            stdout: false,
+            no_model: false,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8").trim().to_string();
+        assert!(
+            printed.ends_with(".md"),
+            "should print the stored path: {printed}"
+        );
+        let text = std::fs::read_to_string(&printed).expect("stored file");
+        assert!(
+            text.contains("Ship the webhook"),
+            "the distilled task: {text}"
+        );
+    }
+
+    #[test]
+    fn no_model_skips_distillation_and_uses_the_structural_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_with(tmp.path(), "ship the webhook");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+
+        let args = HandoffArgs {
+            transcript,
+            agent: None,
+            session_id: None,
+            stdout: true,
+            no_model: true,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("ship the webhook"), "structural task: {text}");
+        assert!(
+            text.contains("/work/src/lib.rs"),
+            "files from tool calls: {text}"
+        );
     }
 }
