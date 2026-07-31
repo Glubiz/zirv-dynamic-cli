@@ -117,9 +117,10 @@ impl AgentAdapter for CodexAdapter {
         cmd
     }
 
-    /// `codex exec` reads its prompt from stdin when none is given as an
-    /// argument (verified via `codex exec --help`), so the distillation
-    /// prompt never hits an argv length limit.
+    /// Verified via `codex exec --help` (quoted verbatim in the notes file):
+    /// `-m, --model <MODEL>` is a real flag, and the prompt is read from
+    /// stdin when none is given as an argument, so the distillation prompt
+    /// never hits an argv length limit.
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("exec").arg("--model").arg(model);
@@ -245,8 +246,9 @@ mod tests {
         assert_eq!(args, vec!["--last".to_string()]);
     }
 
-    /// Verified via `codex exec --help`: the prompt is read from stdin when
-    /// omitted, so the distiller never needs an argv prompt.
+    /// Verified via `codex exec --help` (quoted verbatim in the notes file):
+    /// `-m, --model <MODEL>` is a real flag, and the prompt is read from
+    /// stdin when omitted, so the distiller never needs an argv prompt.
     #[test]
     fn distiller_cmd_uses_exec_with_a_cheap_model_and_reads_stdin() {
         let adapter = CodexAdapter::new(None);

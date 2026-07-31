@@ -26,6 +26,118 @@ session id: 019fb964-0989-7073-9e93-dec46e692346
 
 verified: `codex exec --json <prompt>` streams a *different* JSONL schema to stdout: `{"type":"thread.started","thread_id":"..."}`, `{"type":"turn.started"}`, `{"type":"item.completed","item":{...}}`, `{"type":"error","message":"..."}`, `{"type":"turn.failed","error":{...}}`. This is NOT the same schema as the persisted rollout file (see below) -- it is a live event stream, not the transcript. The adapter parses the rollout file on disk, not this stream, so this is recorded for completeness only.
 
+### Verbatim `codex exec --help` (re-run 2026-07-31, unchanged from the original capture)
+
+This is quoted in full, not paraphrased, so the flags `distiller_cmd` relies on (`-m`/`--model`) are auditable directly rather than taken on trust:
+
+```
+$ codex exec --help
+Run Codex non-interactively
+
+Usage: codex exec [OPTIONS] [PROMPT]
+       codex exec [OPTIONS] <COMMAND> [ARGS]
+
+Commands:
+  resume  Resume a previous session by id or pick the most recent with --last
+  review  Run a code review against the current repository
+  help    Print this message or the help of the given subcommand(s)
+
+Arguments:
+  [PROMPT]
+          Initial instructions for the agent. If not provided as an argument (or if `-` is used),
+          instructions are read from stdin. If stdin is piped and a prompt is also provided, stdin
+          is appended as a `<stdin>` block
+
+Options:
+  -c, --config <key=value>
+          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.
+          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed
+          as TOML. If it fails to parse as TOML, the raw string is used as a literal.
+          
+          Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
+          shell_environment_policy.inherit=all`
+
+      --enable <FEATURE>
+          Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
+
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+
+      --strict-config
+          Error out when config.toml contains fields that are not recognized by this version of
+          Codex
+
+  -i, --image <FILE>...
+          Optional image(s) to attach to the initial prompt
+
+  -m, --model <MODEL>
+          Model the agent should use
+
+      --oss
+          Use open-source provider
+
+      --local-provider <OSS_PROVIDER>
+          Specify which local provider to use (lmstudio or ollama). If not specified with --oss,
+          will use config default or show selection
+
+  -p, --profile <CONFIG_PROFILE_V2>
+          Layer $CODEX_HOME/<name>.config.toml on top of the base user config
+
+  -s, --sandbox <SANDBOX_MODE>
+          Select the sandbox policy to use when executing model-generated shell commands
+          
+          [possible values: read-only, workspace-write, danger-full-access]
+
+      --dangerously-bypass-approvals-and-sandbox
+          Skip all confirmation prompts and execute commands without sandboxing. EXTREMELY
+          DANGEROUS. Intended solely for running in environments that are externally sandboxed
+
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+          Intended only for automation that already vets hook sources
+
+  -C, --cd <DIR>
+          Tell the agent to use the specified directory as its working root
+
+      --add-dir <DIR>
+          Additional directories that should be writable alongside the primary workspace
+
+      --skip-git-repo-check
+          Allow running Codex outside a Git repository
+
+      --ephemeral
+          Run without persisting session files to disk
+
+      --ignore-user-config
+          Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`
+
+      --ignore-rules
+          Do not load user or project execpolicy `.rules` files
+
+      --output-schema <FILE>
+          Path to a JSON Schema file describing the model's final response shape
+
+      --color <COLOR>
+          Specifies color settings for use in the output
+          
+          [default: auto]
+          [possible values: always, never, auto]
+
+      --json
+          Print events to stdout as JSONL
+
+  -o, --output-last-message <FILE>
+          Specifies file where the last message from the agent should be written
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+verified: the `-m, --model <MODEL>` flag ("Model the agent should use") is real on `codex exec` -- confirmed above and independently reconfirmed with `codex exec --help 2>&1 | grep -B1 -A6 -- '-m, --model'` on the same install, both returning the identical block. It is also present on top-level `codex --help` with the same description. `distiller_cmd`'s `.arg("--model")` is backed by this flag, not an assumption.
+
 ## Session id handling
 
 verified: `codex exec --help` has **no `--session-id` (or any session-id) flag**. Codex always mints its own session id (UUID-shaped, e.g. `019fb964-0989-7073-9e93-dec46e692346`) and reports it only in the stdout preamble and inside the rollout file's `session_meta` event. The only session-id-accepting subcommands are `codex exec resume <SESSION_ID> [PROMPT]` and `codex resume <SESSION_ID>` (interactive) -- both **resume an existing** session, neither lets a caller pre-assign an id for a new one.
