@@ -1,8 +1,3 @@
-// Consumed by the `score` verb added in a later task of this plan; nothing
-// calls this yet outside tests, so dead_code is silenced module-wide until
-// then.
-#![allow(dead_code)]
-
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +154,9 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// For human-readable output in a later verb (`hook`/`status`); the JSON
+    /// path uses `Serialize` instead, so nothing calls this yet.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Verdict::Healthy => "healthy",
