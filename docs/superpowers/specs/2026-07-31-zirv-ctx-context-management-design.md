@@ -36,8 +36,9 @@ zirv ctx exec      # supervise one headless run (kill / distill / restart)
 zirv ctx wrap      # supervise an interactive TUI via PTY
 zirv ctx handoff   # distill a handoff from a transcript via a fresh model call
 zirv ctx resume    # start a clean interactive session with the latest handoff injected
-zirv ctx hook      # thin entrypoints for agent hooks (stop, prompt, pre-compact, notify)
+zirv ctx hook      # thin entrypoints for agent hooks (stop, prompt, pre-compact, notify, statusline tee)
 zirv ctx status    # show supervised sessions, scores, last handoffs
+zirv ctx usage     # show current usage-window state (collector + estimator)
 ```
 
 Core layers, each agent-agnostic:
@@ -126,6 +127,18 @@ Supervises a single headless run. Tails the transcript as it grows, scoring peri
 - Handoff format (markdown): Task, Done, Remaining, Next step, Files touched, Gotchas learned.
 - Fallback: if distillation fails, a structural handoff is extracted mechanically (last N user messages + files touched from tool calls). A restart always has something to stand on.
 - Handoffs are stored under the state dir keyed by repo + session; `zirv ctx resume` launches a fresh interactive session with the latest handoff for the current repo injected as the initial prompt.
+
+## Usage pacing
+
+Autonomous loops must never die mid-run because a subscription usage window (Claude: 5-hour rolling and 7-day) ran dry. zirv paces supervised work so a window reaches at most a configured percentage (`pace_max_percent`, default 99).
+
+Three data layers, best available wins (facts verified 2026-07-31 on this machine):
+
+1. **Collector (server-authoritative)**: Claude Code's statusline input JSON documents `rate_limits.five_hour.used_percentage` / `.resets_at` and `rate_limits.seven_day.*` (Pro/Max, present after the first API response of a session; each window may be independently absent). The user's `statusLine.command` is wired to `zirv ctx usage tee`, which persists any `rate_limits` fields to a shared state file under the state dir, then chains to the original statusline script unchanged. Every live interactive or wrapped session passively keeps machine-wide window state fresh. No such data is persisted by Claude Code itself, and no headless query exists (both verified).
+2. **Estimator (approximation)**: when collector data is stale or absent, sum `usage.*` token fields across all local transcripts (including `subagents/` files) over the trailing window against a configured token budget. Every assistant event carries usage (verified). Whether the subscription limiter weights these token classes identically is unverified; the estimator is labeled an approximation and never overrides fresher collector data.
+3. **Circuit breaker (authoritative on trip)**: supervisors match the documented limit-hit message shapes ("You've hit your session limit · resets ...", weekly, and per-model variants) on headless agent output. A trip is treated as 100% regardless of the other layers. The exact machine-readable shape/exit code is not documented and cannot be verified without exhausting a window; the matcher ships docs-verified with a follow-up to confirm empirically.
+
+Pacing behavior: `loop` consults the gate before each cycle, `exec` before each spawn and each restart. At or above `pace_max_percent`, the supervisor waits until the window's `resets_at` (plus jitter; configured fallback delay when unknown) and then continues. A pause is never an exit; a limit-hit mid-run is parked and relaunched after reset without consuming the restart budget. Every pacing decision is appended to the decision log.
 
 ## Hooks integration
 
