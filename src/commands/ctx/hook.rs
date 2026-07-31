@@ -236,7 +236,12 @@ pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> Ctx
         return Ok(0);
     };
 
-    run_stop(w, &serde_json::to_string(&mapped)?, env)
+    // Same rule as every other branch here: a hook must exit 0 even if this
+    // serialization step somehow failed, so `?` is not an option.
+    let Ok(raw) = serde_json::to_string(&mapped) else {
+        return Ok(0);
+    };
+    run_stop(w, &raw, env)
 }
 
 pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
