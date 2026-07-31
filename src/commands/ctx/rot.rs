@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use hashbrown::HashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::config::ScoreConfig;
 use super::event::{Capabilities, NormalizedEvent};
@@ -146,6 +146,88 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
         repetition_hits,
         max_repeat,
         marker_miss_rate,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Healthy,
+    Advise,
+    Compact,
+    Restart,
+}
+
+impl Verdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Verdict::Healthy => "healthy",
+            Verdict::Advise => "advise",
+            Verdict::Compact => "compact",
+            Verdict::Restart => "restart",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Score {
+    pub score: u32,
+    pub verdict: Verdict,
+    pub signals: Signals,
+    pub context_tokens: u64,
+}
+
+/// Zero below the threshold, then a linear ramp that saturates at
+/// `2 * threshold - 1` identical calls.
+pub fn repetition_component(max_repeat: usize, threshold: usize) -> f64 {
+    if threshold == 0 || max_repeat < threshold {
+        return 0.0;
+    }
+    (((max_repeat + 1 - threshold) as f64) / threshold as f64).clamp(0.0, 1.0)
+}
+
+/// The token gate is a gate, not a vote: below the floor nothing escalates, at
+/// or above the ceiling the verdict is at least `compact`, and at the ceiling a
+/// compact-level score becomes a restart.
+pub fn verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig) -> Verdict {
+    if tokens < cfg.token_floor {
+        return Verdict::Healthy;
+    }
+
+    let base = if score >= cfg.restart_at {
+        Verdict::Restart
+    } else if score >= cfg.compact_at {
+        Verdict::Compact
+    } else if score >= cfg.advise_at {
+        Verdict::Advise
+    } else {
+        Verdict::Healthy
+    };
+
+    if tokens < cfg.token_ceiling {
+        return base;
+    }
+    if score >= cfg.compact_at {
+        return Verdict::Restart;
+    }
+    base.max(Verdict::Compact)
+}
+
+pub fn score_events(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig) -> Score {
+    let signals = signals(events, caps, cfg);
+    let tokens = context_tokens(events);
+
+    let raw = cfg.weight_tool_failure * signals.tool_failure_rate
+        + cfg.weight_repetition
+            * repetition_component(signals.max_repeat, cfg.repetition_threshold)
+        + cfg.weight_marker * signals.marker_miss_rate.unwrap_or(0.0);
+    let score = raw.round().clamp(0.0, 100.0) as u32;
+
+    Score {
+        score,
+        verdict: verdict_for(score, tokens, cfg),
+        signals,
+        context_tokens: tokens,
     }
 }
 
@@ -407,5 +489,271 @@ mod tests {
         let s = signals(&events, full_caps(), &cfg);
         assert_eq!(s.marker_miss_rate, Some(1.0));
         assert_eq!(s.tool_failure_rate, 1.0);
+    }
+
+    #[test]
+    fn repetition_component_ramps_from_the_threshold() {
+        assert_eq!(repetition_component(0, 3), 0.0);
+        assert_eq!(repetition_component(2, 3), 0.0);
+        assert!((repetition_component(3, 3) - 1.0 / 3.0).abs() < 1e-9);
+        assert!((repetition_component(4, 3) - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(repetition_component(5, 3), 1.0);
+        assert_eq!(repetition_component(50, 3), 1.0, "clamped");
+        assert_eq!(
+            repetition_component(5, 0),
+            0.0,
+            "a zero threshold disables the signal"
+        );
+    }
+
+    #[test]
+    fn thresholds_map_scores_to_verdicts_above_the_floor() {
+        let cfg = ScoreConfig::default();
+        let tokens = 120_000;
+        assert_eq!(verdict_for(0, tokens, &cfg), Verdict::Healthy);
+        assert_eq!(verdict_for(39, tokens, &cfg), Verdict::Healthy);
+        assert_eq!(verdict_for(40, tokens, &cfg), Verdict::Advise);
+        assert_eq!(verdict_for(59, tokens, &cfg), Verdict::Advise);
+        assert_eq!(verdict_for(60, tokens, &cfg), Verdict::Compact);
+        assert_eq!(verdict_for(79, tokens, &cfg), Verdict::Compact);
+        assert_eq!(verdict_for(80, tokens, &cfg), Verdict::Restart);
+        assert_eq!(verdict_for(100, tokens, &cfg), Verdict::Restart);
+    }
+
+    #[test]
+    fn below_the_token_floor_the_verdict_is_always_healthy() {
+        let cfg = ScoreConfig::default();
+        assert_eq!(verdict_for(100, 99_999, &cfg), Verdict::Healthy);
+        assert_eq!(verdict_for(0, 0, &cfg), Verdict::Healthy);
+        assert_eq!(
+            verdict_for(100, 100_000, &cfg),
+            Verdict::Restart,
+            "floor is inclusive"
+        );
+    }
+
+    #[test]
+    fn at_the_ceiling_the_verdict_is_at_least_compact() {
+        let cfg = ScoreConfig::default();
+        assert_eq!(verdict_for(0, 160_000, &cfg), Verdict::Compact);
+        assert_eq!(verdict_for(45, 200_000, &cfg), Verdict::Compact);
+    }
+
+    #[test]
+    fn at_the_ceiling_a_compact_level_score_escalates_to_restart() {
+        let cfg = ScoreConfig::default();
+        assert_eq!(verdict_for(60, 160_000, &cfg), Verdict::Restart);
+        assert_eq!(verdict_for(70, 170_000, &cfg), Verdict::Restart);
+        assert_eq!(verdict_for(59, 170_000, &cfg), Verdict::Compact);
+    }
+
+    #[test]
+    fn verdicts_are_ordered_for_escalation_comparisons() {
+        assert!(Verdict::Restart > Verdict::Compact);
+        assert!(Verdict::Compact > Verdict::Advise);
+        assert!(Verdict::Advise > Verdict::Healthy);
+    }
+
+    #[test]
+    fn verdict_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&Verdict::Restart).expect("serialize"),
+            "\"restart\""
+        );
+        assert_eq!(Verdict::Compact.as_str(), "compact");
+    }
+
+    #[test]
+    fn a_tool_failure_spike_alone_reaches_advise() {
+        let cfg = ScoreConfig::default();
+        let events = turns(12, "", "[zirv] ok", true, 120_000);
+        let result = score_events(&events, full_caps(), &cfg);
+        assert_eq!(result.signals.tool_failure_rate, 1.0);
+        assert_eq!(result.score, 40);
+        assert_eq!(result.verdict, Verdict::Advise);
+    }
+
+    #[test]
+    fn tool_failures_plus_repetition_reach_compact() {
+        let cfg = ScoreConfig::default();
+        // Same tool and input every turn, every result an error, marker intact.
+        let events = looping_turns(12, "", "[zirv] ok", true, 120_000);
+        let result = score_events(&events, full_caps(), &cfg);
+        // 40 (failures) + 30 (repetition maxed) + 0 (marker clean) = 70
+        assert_eq!(result.signals.max_repeat, 10, "window bounded");
+        assert_eq!(result.signals.marker_miss_rate, Some(0.0));
+        assert_eq!(result.score, 70);
+        assert_eq!(result.verdict, Verdict::Compact);
+    }
+
+    #[test]
+    fn all_three_signals_together_reach_restart() {
+        let cfg = ScoreConfig::default();
+        let mut events = looping_turns(2, "", "[zirv] ok", true, 120_000);
+        events.extend(looping_turns(10, "", "sloppy", true, 120_000));
+        let result = score_events(&events, full_caps(), &cfg);
+        assert_eq!(result.score, 100);
+        assert_eq!(result.verdict, Verdict::Restart);
+    }
+
+    #[test]
+    fn without_the_marker_signal_behavior_alone_caps_at_seventy() {
+        let cfg = ScoreConfig::default();
+        let caps = Capabilities {
+            marker_signal: false,
+            token_usage: true,
+            turn_signal: true,
+        };
+        let mut events = looping_turns(2, "", "[zirv] ok", true, 120_000);
+        events.extend(looping_turns(10, "", "sloppy", true, 120_000));
+        let result = score_events(&events, caps, &cfg);
+        assert_eq!(result.score, 70, "weights are not redistributed");
+        assert_eq!(
+            result.verdict,
+            Verdict::Compact,
+            "never restart on behavior alone"
+        );
+    }
+
+    #[test]
+    fn without_the_marker_signal_the_ceiling_still_forces_a_restart() {
+        let cfg = ScoreConfig::default();
+        let caps = Capabilities {
+            marker_signal: false,
+            token_usage: true,
+            turn_signal: true,
+        };
+        let events = looping_turns(12, "", "sloppy", true, 175_000);
+        let result = score_events(&events, caps, &cfg);
+        assert_eq!(result.score, 70);
+        assert_eq!(result.context_tokens, 175_000);
+        assert_eq!(result.verdict, Verdict::Restart);
+    }
+
+    #[test]
+    fn scoring_is_deterministic() {
+        let cfg = ScoreConfig::default();
+        let mut events = looping_turns(2, "", "[zirv] ok", true, 165_000);
+        events.extend(looping_turns(10, "", "sloppy", true, 165_000));
+        let first = score_events(&events, full_caps(), &cfg);
+        for _ in 0..20 {
+            assert_eq!(score_events(&events, full_caps(), &cfg), first);
+        }
+    }
+
+    #[test]
+    fn an_empty_transcript_is_healthy() {
+        let result = score_events(&[], full_caps(), &ScoreConfig::default());
+        assert_eq!(result.score, 0);
+        assert_eq!(result.verdict, Verdict::Healthy);
+        assert_eq!(result.context_tokens, 0);
+        assert_eq!(result.signals.turns, 0);
+    }
+
+    #[test]
+    fn compaction_drops_the_reported_context_size() {
+        let cfg = ScoreConfig::default();
+        let mut events = turns(12, "", "[zirv] ok", false, 170_000);
+        events.push(NormalizedEvent::Compaction);
+        events.extend(turn_with(
+            "{\"command\":\"post\"}",
+            "",
+            "[zirv] ok",
+            false,
+            12_000,
+        ));
+        let result = score_events(&events, full_caps(), &cfg);
+        assert_eq!(result.context_tokens, 12_000);
+        assert_eq!(
+            result.verdict,
+            Verdict::Healthy,
+            "post-compaction sessions are healthy again"
+        );
+    }
+
+    // The eight cases from ~/.claude/hooks/canary-check.test.sh, ported. The
+    // canary's warn tier maps to `advise` and its block tier to `restart`, but
+    // the verdicts below follow zirv's own gate rules, which weight the noisy
+    // marker signal far lower than the canary did. Case 7 (the stop_hook_active
+    // guard) is not a scoring case and is covered in Task A15.
+    #[test]
+    fn ported_canary_case_1_bimodal_healthy() {
+        let events = turns(12, "", "[zirv] ok", false, 120_000);
+        let result = score_events(&events, full_caps(), &ScoreConfig::default());
+        assert_eq!(result.signals.marker_miss_rate, Some(0.0));
+        assert_eq!(result.verdict, Verdict::Healthy);
+    }
+
+    #[test]
+    fn ported_canary_case_2_young_sloppy_session() {
+        let mut events = turns(1, "", "[zirv] ok", false, 120_000);
+        events.extend(turns(7, "", "sloppy", false, 120_000));
+        let result = score_events(&events, full_caps(), &ScoreConfig::default());
+        assert_eq!(result.signals.marker_miss_rate, None);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.verdict, Verdict::Healthy);
+    }
+
+    #[test]
+    fn ported_canary_case_3_sustained_misses_below_the_floor() {
+        let mut events = turns(2, "", "[zirv] ok", false, 90_000);
+        events.extend(turns(10, "", "sloppy", false, 90_000));
+        let result = score_events(&events, full_caps(), &ScoreConfig::default());
+        assert_eq!(
+            result.signals.marker_miss_rate,
+            Some(1.0),
+            "signal still reported"
+        );
+        assert_eq!(result.score, 30);
+        assert_eq!(result.verdict, Verdict::Healthy, "the floor gate wins");
+    }
+
+    #[test]
+    fn ported_canary_case_4_sustained_misses_above_the_ceiling() {
+        let mut events = turns(2, "", "[zirv] ok", false, 170_000);
+        events.extend(turns(10, "", "sloppy", false, 170_000));
+        let result = score_events(&events, full_caps(), &ScoreConfig::default());
+        assert_eq!(result.score, 30);
+        assert_eq!(
+            result.verdict,
+            Verdict::Compact,
+            "marker misses alone never restart"
+        );
+    }
+
+    #[test]
+    fn ported_canary_case_5_egregious_but_low_context_is_never_escalated() {
+        let mut events = looping_turns(2, "", "[zirv] ok", true, 40_000);
+        events.extend(looping_turns(10, "", "sloppy", true, 40_000));
+        let result = score_events(&events, full_caps(), &ScoreConfig::default());
+        assert_eq!(result.score, 100, "every signal is firing");
+        assert_eq!(
+            result.verdict,
+            Verdict::Healthy,
+            "and it still must not intervene"
+        );
+    }
+
+    #[test]
+    fn ported_canary_case_6_marker_never_loaded() {
+        let events = turns(12, "", "no marker at all", false, 170_000);
+        let result = score_events(&events, full_caps(), &ScoreConfig::default());
+        assert_eq!(result.signals.marker_miss_rate, None);
+        assert_eq!(result.score, 0);
+        assert_eq!(
+            result.verdict,
+            Verdict::Compact,
+            "the ceiling gate still applies"
+        );
+    }
+
+    #[test]
+    fn ported_canary_case_8_half_missing_stays_below_advise() {
+        let mut events = turns(6, "", "[zirv] ok", false, 120_000);
+        events.extend(turns(4, "", "sloppy", false, 120_000));
+        let result = score_events(&events, full_caps(), &ScoreConfig::default());
+        assert_eq!(result.signals.marker_miss_rate, Some(0.4));
+        assert_eq!(result.score, 12);
+        assert_eq!(result.verdict, Verdict::Healthy);
     }
 }
