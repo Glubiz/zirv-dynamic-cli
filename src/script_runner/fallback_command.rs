@@ -25,7 +25,7 @@ impl FallbackCommand {
             c
         };
 
-        crate::output::warn(format!("fallback: {}", &self.command));
+        crate::output::warn(format!("fallback: {}", self.command));
         if let Some(description) = &self.description {
             crate::output::step_description(description);
         }
@@ -42,7 +42,7 @@ impl FallbackCommand {
         let status = shell.status().await?;
 
         if !status.success() {
-            return Err(format!("`{}` failed", &self.command).into());
+            return Err(format!("`{}` failed", self.command).into());
         }
 
         Ok(())
