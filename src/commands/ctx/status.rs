@@ -79,8 +79,10 @@ pub fn run<W: Write>(args: &StatusArgs, w: &mut W) -> CtxResult<i32> {
 mod tests {
     use super::*;
     use crate::commands::ctx::handoff::Handoff;
+    use crate::commands::ctx::log;
+    #[cfg(unix)]
+    use crate::commands::ctx::signal;
     use crate::commands::ctx::state::{STATE_ENV, StateDir};
-    use crate::commands::ctx::{log, signal};
 
     fn env_for(state: &std::path::Path) -> std::collections::HashMap<String, String> {
         [(STATE_ENV.to_string(), state.display().to_string())].into()
