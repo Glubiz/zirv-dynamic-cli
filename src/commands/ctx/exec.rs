@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{SessionId, SessionRef};
 use super::rot::Verdict;
+use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick, Watcher};
 use super::{CtxResult, adapters, handoff, log, score};
@@ -57,6 +58,12 @@ pub fn extract_prompt(command: &[String]) -> Option<String> {
         return Some(next.clone());
     }
     None
+}
+
+/// Compaction of a headless run is pointless (there is no TUI to type into), so
+/// only a restart verdict acts.
+pub fn should_stop_for_signal(signal: &TurnSignal) -> bool {
+    signal.verdict == Verdict::Restart
 }
 
 fn build_command(command: &[String], repo: &Path) -> CtxResult<Command> {
@@ -111,7 +118,45 @@ pub fn run_with<W: Write>(
     let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(cfg.supervise.max_cycle_secs));
     let poll = Duration::from_millis(cfg.supervise.poll_ms);
 
+    let socket_path = state.socket_for(session.as_str());
+    let server = match signal::SignalServer::bind(&socket_path) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            // Turn signals only accelerate detection; polling is the floor.
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: session.as_str(),
+                    verb: "exec",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "no-socket",
+                    detail: &e.to_string(),
+                },
+            );
+            None
+        }
+    };
+    let turn_env = server
+        .as_ref()
+        .map(|server| {
+            adapter
+                .register_turn_signal(
+                    &SessionRef {
+                        id: session.clone(),
+                        cwd: repo.to_path_buf(),
+                    },
+                    server.path(),
+                )
+                .env
+        })
+        .unwrap_or_default();
+
     let mut command = build_command(&args.command, repo)?;
+    for (key, value) in &turn_env {
+        command.env(key, value);
+    }
     let mut restarts = 0;
 
     loop {
@@ -129,6 +174,7 @@ pub fn run_with<W: Write>(
             args.agent.as_deref().or(cfg.agent.as_deref()),
             repo,
             env,
+            server.as_ref(),
             &mut rotted,
         )?;
 
@@ -143,6 +189,19 @@ pub fn run_with<W: Write>(
         } else {
             EXIT_TIMEOUT
         };
+
+        let _ = log::append(
+            &state,
+            &log::Decision {
+                ts: now_secs(),
+                session: session.as_str(),
+                verb: "exec",
+                verdict: reason,
+                score: 0,
+                action: "kill",
+                detail: &transcript.display().to_string(),
+            },
+        );
 
         let Some(prompt_text) = prompt.clone() else {
             writeln!(
@@ -215,6 +274,9 @@ pub fn run_with<W: Write>(
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
         command = adapter.headless_cmd(&combined, &session, &[]);
         command.current_dir(repo);
+        for (key, value) in &turn_env {
+            command.env(key, value);
+        }
     }
 }
 
@@ -228,9 +290,17 @@ fn supervise_run(
     agent: Option<&str>,
     repo: &Path,
     env: EnvLookup<'_>,
+    server: Option<&signal::SignalServer>,
     rotted: &mut bool,
 ) -> CtxResult<Outcome> {
     let mut tick = || {
+        if let Some(server) = server
+            && let Some(received) = server.try_recv()
+            && should_stop_for_signal(&received)
+        {
+            *rotted = true;
+            return Tick::Stop("rot");
+        }
         // A scoring failure must never kill a healthy run.
         match watcher.read_if_changed() {
             Ok(Some(_)) => {}
@@ -608,5 +678,133 @@ mod tests {
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect_err("nothing to supervise");
         assert!(err.to_string().contains("command"), "got {err}");
+    }
+
+    use crate::commands::ctx::rot::Verdict;
+    use crate::commands::ctx::signal::TurnSignal;
+
+    fn signal_with(verdict: Verdict, score: u32) -> TurnSignal {
+        TurnSignal {
+            session_id: "s".to_string(),
+            turn: 4,
+            score,
+            verdict,
+        }
+    }
+
+    #[test]
+    fn only_a_restart_signal_stops_the_run() {
+        assert!(should_stop_for_signal(&signal_with(Verdict::Restart, 95)));
+        assert!(!should_stop_for_signal(&signal_with(Verdict::Compact, 65)));
+        assert!(!should_stop_for_signal(&signal_with(Verdict::Advise, 45)));
+        assert!(!should_stop_for_signal(&signal_with(Verdict::Healthy, 0)));
+    }
+
+    #[test]
+    fn a_hanging_child_is_killed_at_the_deadline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "55555555-2222-4333-8444-555555555555";
+        let env = base_env(&state);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(1),
+            command: fake_agent_command(session),
+        };
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), EXIT_TIMEOUT);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the deadline must not wait for the child"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"verdict\":\"timeout\""), "got {log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_child_is_told_where_the_socket_is() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "66666666-2222-4333-8444-555555555555";
+        let env = base_env(&state);
+        let marker = tmp.path().join("socket-env.txt");
+
+        // A child that records the socket env it inherited, then exits.
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "printf '%s' \"$ZIRV_CTX_SOCKET\" > {}; exit 0",
+                marker.display()
+            ),
+        ];
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(30),
+            command,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+
+        let seen = std::fs::read_to_string(&marker).expect("marker written");
+        assert!(seen.ends_with(".sock"), "socket path exported: {seen}");
+        assert!(seen.contains("66666666"), "per-session socket: {seen}");
+    }
+
+    #[test]
+    fn an_unbindable_socket_does_not_stop_the_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let session = "77777777-2222-4333-8444-555555555555";
+        // A state dir path long enough that the socket path exceeds the limit.
+        let long_state = tmp.path().join("x".repeat(120));
+        let mut env = base_env(&long_state);
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(30),
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0, "polling still supervises the run");
     }
 }
