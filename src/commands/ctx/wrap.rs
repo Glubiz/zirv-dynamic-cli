@@ -434,9 +434,14 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         adapter.capabilities().system_prompt,
     );
+    // Stripping the user's own --append-system-prompt (see
+    // merge_command_line_prompt) can empty the argv even though args.command
+    // itself was not empty at the top of this function, e.g. `wrap -- --
+    // append-system-prompt foo` with nothing else. That must be an error, not
+    // a panic on a hot path where release is panic = "abort".
     let (program, rest) = launch_command
         .split_first()
-        .expect("checked non-empty above");
+        .ok_or("no command to wrap; pass it after --")?;
 
     let mut supervision = InjectionState::new();
     supervision.degraded = args.no_supervise;
@@ -935,6 +940,27 @@ mod tests {
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("nothing to wrap");
+        assert!(err.to_string().contains("command"), "got {err}");
+    }
+
+    /// N1: `merge_command_line_prompt` strips the user's own
+    /// `--append-system-prompt` and its value out of the passthrough argv.
+    /// When that flag pair was the *entire* wrapped command, the argv is
+    /// empty after the merge even though `args.command` itself was not empty
+    /// at the top of `run_with`. This must be a returned error, not a panic:
+    /// release is `panic = "abort"` and this is a supervisor hot path.
+    #[test]
+    fn a_prompt_flag_that_empties_the_argv_after_merging_is_an_error_not_a_panic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let args = WrapArgs {
+            agent: None,
+            no_supervise: true,
+            command: vec!["--append-system-prompt".to_string(), "foo".to_string()],
+            simple: false,
+        };
+        let mut out = Vec::new();
+        let err =
+            run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("nothing left to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
