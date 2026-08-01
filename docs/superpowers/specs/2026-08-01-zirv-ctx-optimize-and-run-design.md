@@ -1,8 +1,8 @@
-# zirv ctx: optimize and run (2.6.0)
+# zirv ctx: optimize and run
 
 Date: 2026-08-01
-Status: Draft, decisions approved by Jonathan; pending spec review
-Target release: zirv 2.6.0 (after the 2.5.0 context-management release merges)
+Status: Approved; ships in the same 2.5.0 release/PR as the context-management work (Jonathan's call, 2026-08-01)
+Target release: zirv 2.5.0 (PR #12)
 
 ## Feature 1: `zirv ctx optimize`
 
@@ -66,4 +66,4 @@ When an agent is started through zirv (`zirv ctx wrap`, `zirv ctx exec`, `zirv c
 
 - Verify claude `--append-system-prompt` interactive behavior and codex injection surface against the installed CLIs (record in notes files, BLOCKED lines where applicable).
 - Decide the exact shipped-default prompt text with Jonathan during plan review.
-- Versioning: 2.5.0 -> 2.6.0 (minor).
+- Versioning: stays 2.5.0 (unreleased branch, one minor bump for the whole release).
