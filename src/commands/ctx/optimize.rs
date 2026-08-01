@@ -760,9 +760,358 @@ pub fn friction_findings(evidence: &Evidence, cfg: &OptimizeConfig) -> Vec<Findi
     findings
 }
 
+pub const OPTIMIZE_PROMPT_VERSION: &str = "v1";
+
+/// Every surface contributes at most this many statement lines to the prompt,
+/// so one enormous CLAUDE.md cannot crowd out the others.
+const DEFAULT_EXCERPT_LINES: usize = 40;
+
+pub fn judgment_prompt(surfaces: &[Surface], evidence: &Evidence, excerpt_lines: usize) -> String {
+    let mut prompt = format!(
+        "You are reviewing the instruction files that steer an AI coding agent in one \
+repository ({OPTIMIZE_PROMPT_VERSION}). Find contradictions between or within these layers, \
+including cases where a configured hook contradicts a written instruction, and propose concrete \
+rewrites.\n\n\
+Answer with zero or more blocks in exactly this format and nothing else:\n\n\
+### FINDING\n\
+kind: contradiction\n\
+severity: high | warning | info\n\
+title: one line\n\
+evidence: path:line, path:line\n\
+detail: one paragraph\n\
+diff:\n\
+```diff\n\
+a unified diff that git apply accepts\n\
+```\n\n\
+The diff is optional. Do not invent files or line numbers that are not shown below. Report \
+nothing rather than guessing.\n\n"
+    );
+
+    for surface in surfaces {
+        prompt.push_str(&format!(
+            "## {} ({})\n",
+            surface.path.display(),
+            surface.layer.label()
+        ));
+        for line in surface.text.lines().take(excerpt_lines) {
+            prompt.push_str(line);
+            prompt.push('\n');
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("## Evidence from recent sessions\n");
+    prompt.push_str(&format!(
+        "- sessions sampled: {}\n- turns: {}\n- tool failure rate: {:.2}\n- sessions that rotted: {}\n",
+        evidence.sessions_sampled, evidence.turns, evidence.tool_failure_rate, evidence.rot_sessions
+    ));
+    for (error, count) in evidence.repeated_errors.iter().take(5) {
+        prompt.push_str(&format!("- repeated error ({count}x): {error}\n"));
+    }
+    for (phrase, count) in evidence.corrections.iter().take(5) {
+        prompt.push_str(&format!(
+            "- user correction opening \"{phrase}\" ({count}x)\n"
+        ));
+    }
+    for (action, count) in evidence.supervisor_events.iter().take(5) {
+        prompt.push_str(&format!("- supervisor intervention {action} ({count}x)\n"));
+    }
+
+    prompt
+}
+
+fn severity_from(raw: &str) -> Severity {
+    match raw.trim().to_lowercase().as_str() {
+        "high" => Severity::High,
+        "info" => Severity::Info,
+        // Anything unrecognised lands in the middle rather than being dropped
+        // or promoted: the model does not get to invent a severity scale.
+        _ => Severity::Warning,
+    }
+}
+
+/// Parses the block format the prompt asks for. A block without a title is
+/// discarded: a finding nobody can read is worse than no finding.
+pub fn parse_judgment(markdown: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    for block in markdown.split("### FINDING").skip(1) {
+        let mut severity = Severity::Warning;
+        let mut title = String::new();
+        let mut detail = String::new();
+        let mut evidence: Vec<String> = Vec::new();
+        let mut diff = String::new();
+        let mut in_diff = false;
+
+        for line in block.lines() {
+            if in_diff {
+                if line.trim_start().starts_with("```") {
+                    in_diff = false;
+                    continue;
+                }
+                diff.push_str(line);
+                diff.push('\n');
+                continue;
+            }
+            if line.trim_start().starts_with("```") {
+                in_diff = true;
+                continue;
+            }
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim().to_lowercase().as_str() {
+                "severity" => severity = severity_from(value),
+                "title" => title = value.to_string(),
+                "detail" => detail = value.to_string(),
+                "evidence" => {
+                    evidence = value
+                        .split(',')
+                        .map(|item| item.trim().to_string())
+                        .filter(|item| !item.is_empty())
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+
+        if title.is_empty() {
+            continue;
+        }
+        findings.push(Finding {
+            kind: "contradiction",
+            severity,
+            title,
+            evidence,
+            detail,
+            proposed_diff: if diff.trim().is_empty() {
+                None
+            } else {
+                Some(diff)
+            },
+        });
+    }
+
+    findings
+}
+
+pub fn render_report(findings: &[Finding], evidence: &Evidence, model_used: bool) -> String {
+    let mut report = String::from("# zirv ctx optimize report\n\n");
+
+    report.push_str(&format!(
+        "Analysed {} recent sessions ({} turns, {:.0}% tool failures, {} rotted).\n",
+        evidence.sessions_sampled,
+        evidence.turns,
+        evidence.tool_failure_rate * 100.0,
+        evidence.rot_sessions
+    ));
+    if !model_used {
+        report.push_str(
+            "Deterministic checks only: no model call was made, so contradictions were not \
+             reviewed.\n",
+        );
+    }
+    report.push_str("\nThis report changes nothing. Apply a diff by hand or with `git apply`.\n\n");
+
+    if findings.is_empty() {
+        report.push_str("No findings.\n");
+        return report;
+    }
+
+    let mut ordered: Vec<&Finding> = findings.iter().collect();
+    // Most severe first, then a stable tiebreak so two runs read the same.
+    ordered.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+
+    for finding in ordered {
+        report.push_str(&format!(
+            "## [{}] {}\n\n{}\n\n",
+            finding.severity.as_str(),
+            finding.title,
+            finding.detail
+        ));
+        if !finding.evidence.is_empty() {
+            report.push_str("Evidence:\n");
+            for item in &finding.evidence {
+                report.push_str(&format!("- {item}\n"));
+            }
+            report.push('\n');
+        }
+        if let Some(diff) = &finding.proposed_diff {
+            report.push_str("Proposed change:\n\n```diff\n");
+            report.push_str(diff);
+            if !diff.ends_with('\n') {
+                report.push('\n');
+            }
+            report.push_str("```\n\n");
+        }
+    }
+
+    report
+}
+
+use std::io::Write;
+use std::time::Duration;
+
+use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::state::{now_secs, repo_slug};
+use super::{CtxResult, adapters, handoff, window};
+
+/// Long enough for a careful answer over a few excerpted files, short enough
+/// that a wedged model does not own the terminal.
+const JUDGMENT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How far back in the decision log to read for supervisor interventions.
+const LOG_LINES_SAMPLED: usize = 500;
+
+#[derive(Debug, clap::Args)]
+pub struct OptimizeArgs {
+    /// Adapter name: claude or codex. Defaults to config, then claude.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Skip the judgment model call and report deterministic findings only.
+    #[arg(long, default_value_t = false)]
+    pub no_model: bool,
+    /// How many recent sessions to sample for evidence.
+    #[arg(long)]
+    pub sessions: Option<usize>,
+    /// Write the report here as well as to stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+fn on_path(program: &str) -> bool {
+    // An absolute or relative path is checked directly; a bare name is looked
+    // up the way a shell would.
+    if program.contains('/') {
+        return Path::new(program).exists();
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return true;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(program).exists())
+}
+
+pub fn run_with<W: Write>(
+    args: &OptimizeArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let home = crate::utils::home_dir().ok();
+    let surfaces = collect_surfaces(home.as_deref(), repo, cfg.optimize.max_surface_bytes);
+
+    let sample = args.sessions.unwrap_or(cfg.optimize.sessions_sampled);
+    let transcripts = window::projects_root()
+        .ok()
+        .map(|root| newest_transcripts(&root, sample))
+        .unwrap_or_default();
+    // Both sources: the transcripts and zirv's own record of what it had to do.
+    let state_for_evidence = StateDir::resolve(env).ok();
+    let evidence = collect_evidence(
+        &transcripts,
+        state_for_evidence.as_ref(),
+        &cfg.score,
+        LOG_LINES_SAMPLED,
+    );
+
+    let mut findings = lint_redundancy(&surfaces);
+    findings.extend(lint_dead_references(&surfaces, repo, &on_path));
+    findings.extend(friction_findings(&evidence, &cfg.optimize));
+
+    // One model call, and only if the caller wants one. A dead model degrades
+    // the report; it never fails the run.
+    let mut model_used = false;
+    if !args.no_model {
+        let model = if cfg.optimize.model.is_empty() {
+            cfg.handoff.model.clone()
+        } else {
+            cfg.optimize.model.clone()
+        };
+        match adapters::select(
+            args.agent.as_deref().or(cfg.agent.as_deref()),
+            &[],
+            cfg.agent_bin.as_deref(),
+        ) {
+            Ok(adapter) => {
+                let prompt = judgment_prompt(&surfaces, &evidence, DEFAULT_EXCERPT_LINES);
+                match handoff::run_model(adapter.as_ref(), &model, &prompt, JUDGMENT_TIMEOUT) {
+                    Ok(answer) => {
+                        findings.extend(parse_judgment(&answer));
+                        model_used = true;
+                    }
+                    Err(e) => {
+                        writeln!(w, "zirv ctx optimize: judgment pass skipped ({e})")?;
+                    }
+                }
+            }
+            Err(e) => {
+                writeln!(w, "zirv ctx optimize: judgment pass skipped ({e})")?;
+            }
+        }
+    }
+
+    let report = render_report(&findings, &evidence, model_used);
+    write!(w, "{report}")?;
+
+    let stored = store_report(env, repo, &report);
+    if let Some(path) = &args.out {
+        std::fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+
+    if let Ok(state) = StateDir::resolve(env) {
+        let detail = stored
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "report not stored".to_string());
+        let _ = log::append(
+            &state,
+            &log::Decision {
+                ts: now_secs(),
+                session: "optimize",
+                verb: "optimize",
+                verdict: if model_used {
+                    "analysed"
+                } else {
+                    "deterministic"
+                },
+                score: findings.len() as u32,
+                action: "report",
+                detail: &detail,
+            },
+        );
+    }
+
+    Ok(0)
+}
+
+/// Best effort: a report the operator can already read on stdout is not worth
+/// failing over a state dir that cannot be written.
+fn store_report(env: EnvLookup<'_>, repo: &Path, report: &str) -> Option<PathBuf> {
+    let state = StateDir::resolve(env).ok()?;
+    let dir = state.optimize_reports().join(repo_slug(repo));
+    super::state::create_private_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}-report.md", now_secs()));
+    super::state::write_private(&path, report).ok()?;
+    Some(path)
+}
+
+pub fn run<W: Write>(args: &OptimizeArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_with(args, w, &repo, &env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     /// A repo tree with every surface kind the collector knows about.
     fn fixture_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -1453,5 +1802,420 @@ mod tests {
             friction_findings(&evidence, &cfg).is_empty(),
             "two compactions across five sessions is ordinary"
         );
+    }
+
+    use crate::commands::ctx::adapters::claude::ClaudeAdapter;
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn fake_optimizer() -> ClaudeAdapter {
+        ClaudeAdapter::new(Some(
+            fixture("fake-optimizer.sh").to_str().expect("utf8 path"),
+        ))
+    }
+
+    #[test]
+    fn the_judgment_prompt_is_bounded_and_versioned() {
+        let (_tmp, home, repo) = fixture_tree();
+        let mut surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        surfaces.push(surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/big.md",
+            &(1..=200)
+                .map(|i| format!("- rule number {i}\n"))
+                .collect::<String>(),
+        ));
+
+        let prompt = judgment_prompt(&surfaces, &Evidence::default(), 5);
+
+        assert!(
+            prompt.contains(OPTIMIZE_PROMPT_VERSION),
+            "version the template"
+        );
+        assert!(prompt.contains("contradiction"), "name the job: {prompt}");
+        assert!(prompt.contains("### FINDING"), "specify the answer format");
+        assert!(
+            prompt.contains("rule number 5") && !prompt.contains("rule number 6"),
+            "each surface is excerpted to the line budget"
+        );
+        assert!(
+            prompt.len() < 60_000,
+            "the prompt must stay bounded, got {} bytes",
+            prompt.len()
+        );
+    }
+
+    #[test]
+    fn the_judgment_prompt_carries_the_evidence_summary() {
+        let evidence = Evidence {
+            sessions_sampled: 4,
+            turns: 30,
+            tool_failure_rate: 0.4,
+            repeated_errors: vec![("boom: permission denied".to_string(), 6)],
+            corrections: vec![("no,".to_string(), 5)],
+            rot_sessions: 1,
+            supervisor_events: vec![("rot-kill".to_string(), 3)],
+        };
+        let prompt = judgment_prompt(&[], &evidence, 5);
+        assert!(prompt.contains("permission denied"), "got {prompt}");
+        assert!(prompt.contains('4'), "the sample size is stated: {prompt}");
+        assert!(
+            prompt.contains("rot-kill"),
+            "what zirv had to do is part of the evidence the model sees: {prompt}"
+        );
+    }
+
+    #[test]
+    fn findings_parse_out_of_the_model_answer() {
+        let answer = std::process::Command::new("sh")
+            .arg(fixture("fake-optimizer.sh"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run fake optimizer");
+        let findings = parse_judgment(&String::from_utf8_lossy(&answer.stdout));
+
+        assert_eq!(findings.len(), 2, "got {findings:?}");
+        assert_eq!(findings[0].kind, "contradiction");
+        assert_eq!(findings[0].severity, Severity::High);
+        assert!(findings[0].title.contains("Commit message rules"));
+        assert_eq!(
+            findings[0].evidence,
+            vec!["/repo/CLAUDE.md:4", "/home/CLAUDE.md:2"]
+        );
+        let diff = findings[0].proposed_diff.clone().expect("a diff");
+        assert!(
+            diff.starts_with("--- a/repo/CLAUDE.md"),
+            "fences stripped: {diff}"
+        );
+        assert!(!diff.contains("```"), "fences stripped: {diff}");
+        assert_eq!(findings[1].severity, Severity::Warning);
+        assert_eq!(
+            findings[1].proposed_diff, None,
+            "not every finding has a diff"
+        );
+    }
+
+    #[test]
+    fn a_model_answer_with_no_findings_parses_to_nothing() {
+        assert!(parse_judgment("Everything looks fine to me.").is_empty());
+        assert!(parse_judgment("").is_empty());
+    }
+
+    #[test]
+    fn a_finding_missing_its_title_is_dropped_rather_than_half_reported() {
+        let answer = "### FINDING\nkind: contradiction\nseverity: high\ndetail: something\n";
+        assert!(
+            parse_judgment(answer).is_empty(),
+            "a finding needs a title to be useful"
+        );
+    }
+
+    #[test]
+    fn an_unknown_severity_falls_back_to_warning() {
+        let answer = "### FINDING\nkind: contradiction\nseverity: catastrophic\ntitle: T\n";
+        assert_eq!(parse_judgment(answer)[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn the_report_groups_by_severity_and_states_its_basis() {
+        let findings = vec![
+            Finding {
+                kind: "redundancy",
+                severity: Severity::Info,
+                title: "Stated twice".to_string(),
+                evidence: vec!["/repo/CLAUDE.md:1".to_string()],
+                detail: "detail one".to_string(),
+                proposed_diff: Some("--- a\n+++ b\n".to_string()),
+            },
+            Finding {
+                kind: "dead-reference",
+                severity: Severity::High,
+                title: "Hook program missing".to_string(),
+                evidence: vec!["/home/.claude/settings.json".to_string()],
+                detail: "detail two".to_string(),
+                proposed_diff: None,
+            },
+        ];
+        let report = render_report(&findings, &Evidence::default(), true);
+
+        let high = report
+            .find("Hook program missing")
+            .expect("high finding present");
+        let info = report.find("Stated twice").expect("info finding present");
+        assert!(high < info, "most severe first:\n{report}");
+
+        assert!(
+            report.contains("```diff"),
+            "diffs are fenced for git apply: {report}"
+        );
+        assert!(report.contains("/repo/CLAUDE.md:1"), "evidence is shown");
+        assert!(!report.contains('\u{2014}'), "no em dashes in the report");
+    }
+
+    #[test]
+    fn a_clean_report_says_so_and_a_model_free_run_admits_it() {
+        let clean = render_report(&[], &Evidence::default(), true);
+        assert!(clean.to_lowercase().contains("no findings"), "got {clean}");
+
+        let deterministic = render_report(&[], &Evidence::default(), false);
+        assert!(
+            deterministic
+                .to_lowercase()
+                .contains("deterministic checks only"),
+            "a --no-model run must not look like a full analysis: {deterministic}"
+        );
+    }
+
+    fn verb_env(state: &Path, bin: &Path) -> std::collections::HashMap<String, String> {
+        [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT_BIN".to_string(), bin.display().to_string()),
+        ]
+        .into()
+    }
+
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, String)> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    found.push((path, text));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn the_verb_prints_a_report_and_stores_a_copy() {
+        let (tmp, home, repo) = fixture_tree();
+        let state = tmp.path().join("state");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+
+        // SAFETY: CI runs tests single-threaded.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: false,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(code, 0, "findings are not failures");
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("# zirv ctx optimize report"),
+            "got {printed}"
+        );
+        assert!(
+            printed.contains("Commit message rules"),
+            "the model findings are included: {printed}"
+        );
+
+        let stored: Vec<PathBuf> = std::fs::read_dir(
+            state
+                .join("optimize")
+                .join(crate::commands::ctx::state::repo_slug(&repo)),
+        )
+        .expect("report dir")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+        assert_eq!(stored.len(), 1, "one report per run: {stored:?}");
+        assert!(
+            std::fs::read_to_string(&stored[0])
+                .expect("read")
+                .contains("optimize report")
+        );
+    }
+
+    #[test]
+    fn the_verb_never_modifies_an_analysed_file() {
+        let (tmp, home, repo) = fixture_tree();
+        let state = tmp.path().join("state");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+        let before_repo = tree_snapshot(&repo);
+        let before_home = tree_snapshot(&home);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: false,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(before_repo, tree_snapshot(&repo), "optimize is report-only");
+        assert_eq!(
+            before_home,
+            tree_snapshot(&home),
+            "and that includes the global layer"
+        );
+    }
+
+    #[test]
+    fn a_failing_model_still_reports_the_deterministic_findings() {
+        let (tmp, home, repo) = fixture_tree();
+        let state = tmp.path().join("state");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_OPTIMIZER_MODE", "fail");
+        }
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: false,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("FAKE_OPTIMIZER_MODE");
+        }
+
+        assert_eq!(code, 0, "a dead model is not a failed analysis");
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("always run tests"),
+            "redundancy still found: {printed}"
+        );
+        assert!(
+            printed.to_lowercase().contains("deterministic checks only"),
+            "and the report admits the judgment pass did not happen: {printed}"
+        );
+    }
+
+    #[test]
+    fn no_model_skips_the_call_entirely() {
+        let (tmp, home, repo) = fixture_tree();
+        let state = tmp.path().join("state");
+        let log = tmp.path().join("prompt.log");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_OPTIMIZER_PROMPT_LOG", &log);
+        }
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: true,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("FAKE_OPTIMIZER_PROMPT_LOG");
+        }
+
+        assert!(!log.exists(), "--no-model must not spawn the model at all");
+    }
+
+    #[test]
+    fn every_run_is_recorded_in_the_decision_log() {
+        let (tmp, home, repo) = fixture_tree();
+        let state = tmp.path().join("state");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: true,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"verb\":\"optimize\""), "got {log}");
+        assert!(log.contains("\"action\":\"report\""), "got {log}");
+    }
+
+    #[test]
+    fn an_explicit_out_path_receives_the_report() {
+        let (tmp, home, repo) = fixture_tree();
+        let state = tmp.path().join("state");
+        let out_path = tmp.path().join("report.md");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: true,
+            sessions: Some(0),
+            out: Some(out_path.clone()),
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        assert!(
+            std::fs::read_to_string(&out_path)
+                .expect("out file")
+                .contains("optimize report")
+        );
+    }
+
+    #[test]
+    fn the_verb_parses_with_its_flags() {
+        let cli = crate::commands::ctx::CtxCli::try_parse_from([
+            "zirv ctx",
+            "optimize",
+            "--no-model",
+            "--sessions",
+            "3",
+        ])
+        .expect("optimize should parse");
+        match cli.verb {
+            crate::commands::ctx::CtxVerb::Optimize(args) => {
+                assert!(args.no_model);
+                assert_eq!(args.sessions, Some(3));
+            }
+            other => panic!("expected Optimize, got {other:?}"),
+        }
     }
 }

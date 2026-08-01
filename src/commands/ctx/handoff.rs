@@ -171,18 +171,16 @@ not invent progress that is not evidenced below.\n\n\
 
 const DISTILL_POLL: Duration = Duration::from_millis(25);
 
-/// Runs a fresh, cheap model over the context. The rotted session is never
-/// asked to summarize itself.
-///
-/// Bounded by `timeout`, because `wrap` calls this from its pump: a model call
-/// that never answers would otherwise freeze the user's own terminal with no
-/// way out but killing the wrapper.
-pub fn distill(
+/// Runs one fresh model call and returns its stdout. The child is bounded on
+/// every axis that can hang a supervisor: stdin is closed so the model starts
+/// answering, stdout is drained on its own thread so a full pipe cannot wedge
+/// the child, and the wait has a deadline after which the child is killed.
+pub fn run_model(
     adapter: &dyn AgentAdapter,
     model: &str,
-    ctx: &StructuralContext,
+    prompt: &str,
     timeout: Duration,
-) -> CtxResult<Handoff> {
+) -> CtxResult<String> {
     let mut command = adapter.distiller_cmd(model);
     command
         .stdin(Stdio::piped())
@@ -191,15 +189,13 @@ pub fn distill(
 
     let mut child = command.spawn()?;
     {
-        let stdin = child.stdin.as_mut().ok_or("distiller stdin unavailable")?;
-        stdin.write_all(distill_prompt(ctx).as_bytes())?;
+        let stdin = child.stdin.as_mut().ok_or("model stdin unavailable")?;
+        stdin.write_all(prompt.as_bytes())?;
     }
     // The model waits for end of input before it answers.
     drop(child.stdin.take());
 
-    // Drained on its own thread: a child blocked writing into a full pipe
-    // never exits, which would turn every long answer into a timeout.
-    let mut stdout = child.stdout.take().ok_or("distiller stdout unavailable")?;
+    let mut stdout = child.stdout.take().ok_or("model stdout unavailable")?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buffer = Vec::new();
@@ -215,21 +211,33 @@ pub fn distill(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("distiller did not answer within {}s", timeout.as_secs()).into());
+            return Err(format!("model did not answer within {}s", timeout.as_secs()).into());
         }
         std::thread::sleep(DISTILL_POLL);
     };
 
     if !status.success() {
-        return Err(format!(
-            "distiller exited with status {}",
-            status.code().unwrap_or(-1)
-        )
-        .into());
+        return Err(format!("model exited with status {}", status.code().unwrap_or(-1)).into());
     }
 
     let answer = rx.recv_timeout(timeout).unwrap_or_default();
-    let handoff = parse_markdown(&String::from_utf8_lossy(&answer));
+    Ok(String::from_utf8_lossy(&answer).to_string())
+}
+
+/// Runs a fresh, cheap model over the context. The rotted session is never
+/// asked to summarize itself.
+///
+/// Bounded by `timeout`, because `wrap` calls this from its pump: a model call
+/// that never answers would otherwise freeze the user's own terminal with no
+/// way out but killing the wrapper.
+pub fn distill(
+    adapter: &dyn AgentAdapter,
+    model: &str,
+    ctx: &StructuralContext,
+    timeout: Duration,
+) -> CtxResult<Handoff> {
+    let answer = run_model(adapter, model, &distill_prompt(ctx), timeout)?;
+    let handoff = parse_markdown(&answer);
     if !handoff.is_usable() {
         return Err("distiller produced no usable Task and Next step".into());
     }
@@ -545,6 +553,47 @@ mod tests {
             handoff.is_usable(),
             "a restart still has something to stand on"
         );
+    }
+
+    #[test]
+    fn run_model_returns_the_raw_answer() {
+        let adapter = fake_model_adapter();
+        let answer = run_model(&adapter, "haiku", "anything", Duration::from_secs(30))
+            .expect("the fake model answers");
+        assert!(
+            answer.contains("## Task"),
+            "raw markdown, unparsed: {answer}"
+        );
+    }
+
+    #[test]
+    fn run_model_reports_a_non_zero_exit() {
+        // SAFETY: CI runs tests single-threaded.
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "fail");
+        }
+        let adapter = fake_model_adapter();
+        let result = run_model(&adapter, "haiku", "anything", Duration::from_secs(30));
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+        let err = result.expect_err("non-zero exit surfaces");
+        assert!(err.to_string().contains('4'), "report the exit code: {err}");
+    }
+
+    #[test]
+    fn run_model_gives_up_at_the_timeout() {
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "hang");
+        }
+        let adapter = fake_model_adapter();
+        let started = Instant::now();
+        let result = run_model(&adapter, "haiku", "anything", Duration::from_millis(300));
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+        assert!(result.is_err(), "a hung model must not block a run");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

@@ -58,6 +58,8 @@ pub enum CtxVerb {
     Wrap(wrap::WrapArgs),
     /// Report usage windows, or tee the statusline to record them.
     Usage(usage::UsageArgs),
+    /// Analyse the configuration surfaces that steer every session.
+    Optimize(optimize::OptimizeArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -122,6 +124,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Exec(a) => exec::run(a, &mut out),
         CtxVerb::Wrap(a) => wrap::run(a, &mut out),
         CtxVerb::Usage(a) => usage::run(a, &mut out),
+        CtxVerb::Optimize(a) => optimize::run(a, &mut out),
     };
 
     match result {

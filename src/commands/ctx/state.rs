@@ -115,6 +115,10 @@ impl StateDir {
         self.0.join("handoffs")
     }
 
+    pub fn optimize_reports(&self) -> PathBuf {
+        self.0.join("optimize")
+    }
+
     /// Short on purpose: unix socket paths are capped near 104 bytes on macOS.
     pub fn sockets(&self) -> PathBuf {
         self.0.join("s")
