@@ -134,7 +134,9 @@ use super::adapters::AgentAdapter;
 /// of a passthrough argv, returning the cleaned argv and the extracted text.
 /// `None` when the adapter has no such flag, or the flag never appears: both
 /// mean there is nothing to merge. A repeated flag keeps its last value, the
-/// same choice the underlying CLI itself makes.
+/// same choice the underlying CLI itself makes. The real CLI accepts both the
+/// two-token form (`--flag value`) and the single-token `--flag=value` form;
+/// both are stripped here.
 pub fn extract_user_prompt_flag(
     adapter: &dyn AgentAdapter,
     argv: &[String],
@@ -151,6 +153,12 @@ pub fn extract_user_prompt_flag(
             if let Some(value) = iter.next() {
                 extracted = Some(value);
             }
+            continue;
+        }
+        if let Some((name, value)) = arg.split_once('=')
+            && name == flag
+        {
+            extracted = Some(value.to_string());
             continue;
         }
         cleaned.push(arg);
@@ -574,6 +582,32 @@ mod tests {
         assert_eq!(extracted, Some("always answer in Danish".to_string()));
     }
 
+    /// N2: the real CLI honors `--append-system-prompt=<text>` (one argv
+    /// token) as well as the two-token space-separated form. Only stripping
+    /// the two-token form meant this form reached the agent unmodified
+    /// alongside zirv's own occurrence, silently dropping the user's text.
+    #[test]
+    fn extract_user_prompt_flag_strips_the_equals_bound_form_too() {
+        let adapter = ClaudeAdapter::new(None);
+        let argv = vec![
+            "claude".to_string(),
+            "--append-system-prompt=always answer in Danish".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        let (cleaned, extracted) = extract_user_prompt_flag(&adapter, &argv);
+        assert_eq!(
+            cleaned,
+            vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string()
+            ],
+            "the single equals-bound token is removed, everything else stays"
+        );
+        assert_eq!(extracted, Some("always answer in Danish".to_string()));
+    }
+
     #[test]
     fn extract_user_prompt_flag_is_a_noop_without_the_flag() {
         let adapter = ClaudeAdapter::new(None);
@@ -630,6 +664,33 @@ mod tests {
         assert!(
             default_at < cli_at,
             "the command-line layer is last:\n{}",
+            merged.text
+        );
+    }
+
+    /// N2: the equals-bound form must merge exactly like the two-token form,
+    /// not pass through untouched alongside zirv's own occurrence.
+    #[test]
+    fn merge_command_line_prompt_strips_and_merges_the_equals_bound_form() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let argv = vec![
+            "claude".to_string(),
+            "--append-system-prompt=always answer in Danish".to_string(),
+        ];
+
+        let (cleaned, merged) = merge_command_line_prompt(&adapter, &argv, composed);
+
+        assert_eq!(cleaned, vec!["claude".to_string()], "the flag is stripped");
+        let merged = merged.expect("still composed");
+        assert_eq!(
+            merged.sources,
+            vec![PromptSource::Default, PromptSource::CommandLine]
+        );
+        assert!(
+            merged.text.contains("always answer in Danish"),
+            "the user's own text must survive: {}",
             merged.text
         );
     }
