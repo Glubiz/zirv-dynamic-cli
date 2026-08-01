@@ -62,6 +62,8 @@ pub struct Capabilities {
     pub marker_signal: bool,
     pub token_usage: bool,
     pub turn_signal: bool,
+    /// Whether this agent has a verified per-run system-prompt mechanism.
+    pub system_prompt: bool,
 }
 
 /// Raw material for handoffs, extracted per-agent because it needs fields the

@@ -631,6 +631,7 @@ pub fn evidence_from_transcripts(paths: &[PathBuf], cfg: &ScoreConfig) -> Eviden
             marker_signal: true,
             token_usage: true,
             turn_signal: true,
+            system_prompt: false,
         };
         if rot::score_events(&events, caps, cfg).verdict == Verdict::Restart {
             evidence.rot_sessions += 1;

@@ -118,6 +118,12 @@ impl AgentAdapter for CodexAdapter {
         cmd
     }
 
+    fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
+        // No verified per-run mechanism (see
+        // docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md).
+        Vec::new()
+    }
+
     /// Verified via `codex exec --help` (quoted verbatim in the notes file):
     /// `-m, --model <MODEL>` is a real flag, and the prompt is read from
     /// stdin when none is given as an argument, so the distillation prompt
@@ -156,6 +162,7 @@ impl AgentAdapter for CodexAdapter {
             marker_signal: false,
             token_usage: false,
             turn_signal: false,
+            system_prompt: false,
         }
     }
 
@@ -183,6 +190,16 @@ mod tests {
     fn codex_has_no_marker_signal() {
         let caps = CodexAdapter::new(None).capabilities();
         assert!(!caps.marker_signal, "the spec gives codex no marker signal");
+    }
+
+    #[test]
+    fn codex_ships_without_injection_until_a_mechanism_is_verified() {
+        let adapter = CodexAdapter::new(None);
+        assert!(
+            adapter.system_prompt_args("be consistent").is_empty(),
+            "no verified mechanism means no arguments, not a guessed flag"
+        );
+        assert!(!adapter.capabilities().system_prompt);
     }
 
     #[test]

@@ -35,6 +35,11 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn interactive_cmd(&self, initial_prompt: Option<&str>, extra: &[String]) -> Command;
     fn distiller_cmd(&self, model: &str) -> Command;
 
+    /// Arguments that add `prompt` to this agent's system prompt for one run.
+    /// Empty when the agent has no verified mechanism, which is how an
+    /// unsupported agent ships without injection rather than with a guess.
+    fn system_prompt_args(&self, prompt: &str) -> Vec<String>;
+
     fn transcript_path(&self, session: &SessionRef) -> PathBuf;
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;

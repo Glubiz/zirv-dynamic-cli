@@ -318,6 +318,13 @@ impl AgentAdapter for ClaudeAdapter {
         cmd
     }
 
+    fn system_prompt_args(&self, prompt: &str) -> Vec<String> {
+        if prompt.trim().is_empty() {
+            return Vec::new();
+        }
+        vec!["--append-system-prompt".to_string(), prompt.to_string()]
+    }
+
     /// The distillation prompt is piped to stdin so a long transcript tail
     /// never hits argv length limits.
     fn distiller_cmd(&self, model: &str) -> Command {
@@ -374,6 +381,7 @@ impl AgentAdapter for ClaudeAdapter {
             marker_signal: true,
             token_usage: true,
             turn_signal: true,
+            system_prompt: true,
         }
     }
 
@@ -895,6 +903,66 @@ mod tests {
         let ctx = structural_context(&jsonl, 2);
         assert_eq!(ctx.user_messages, vec!["p4", "p5"]);
         assert_eq!(ctx.files_touched, vec!["/same.rs"]);
+    }
+
+    #[test]
+    fn the_system_prompt_becomes_the_verified_flag_pair() {
+        // Exactly the mechanism recorded in
+        // docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md.
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            adapter.system_prompt_args("be consistent"),
+            vec![
+                "--append-system-prompt".to_string(),
+                "be consistent".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_prompt_injects_nothing() {
+        let adapter = ClaudeAdapter::new(None);
+        assert!(adapter.system_prompt_args("").is_empty());
+        assert!(adapter.system_prompt_args("   \n").is_empty());
+    }
+
+    #[test]
+    fn claude_advertises_the_capability() {
+        assert!(ClaudeAdapter::new(None).capabilities().system_prompt);
+    }
+
+    #[test]
+    fn the_prompt_args_compose_with_the_existing_command_builders() {
+        let adapter = ClaudeAdapter::new(None);
+        let mut extra = adapter.system_prompt_args("be consistent");
+        extra.push("--model".to_string());
+        extra.push("sonnet".to_string());
+
+        let headless = adapter.headless_cmd("go", &SessionId::parse("abc"), &extra);
+        let args: Vec<String> = headless
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-p".to_string(),
+                "go".to_string(),
+                "--session-id".to_string(),
+                "abc".to_string(),
+                "--append-system-prompt".to_string(),
+                "be consistent".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+            ]
+        );
+
+        let interactive = adapter.interactive_cmd(None, &extra);
+        let args: Vec<String> = interactive
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args[0], "--append-system-prompt");
     }
 
     #[test]
