@@ -8,6 +8,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::NormalizedEvent;
+use super::handoff::{self, Handoff};
 use super::rot::Verdict;
 use super::signal::TurnSignal;
 use super::supervise::Watcher;
@@ -16,6 +17,9 @@ use super::{CtxResult, adapters};
 
 const PUMP_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_SIZE: (u16, u16) = (80, 24);
+// Matches the grace period `supervise::terminate` already uses for the same
+// ask-then-escalate shape.
+const QUIT_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, clap::Args)]
 pub struct WrapArgs {
@@ -160,6 +164,148 @@ pub fn verify_compaction(
     Ok(false)
 }
 
+pub fn restart_prompt(handoff: &Handoff) -> String {
+    format!(
+        "The previous session in this terminal ran out of usable context and was restarted by \
+zirv ctx. Continue from the handoff below. Re-read the listed files before changing them, and \
+do not redo work marked as done.\n\n{}",
+        handoff.to_markdown()
+    )
+}
+
+/// Ask the TUI to quit, then escalate. A TUI that will not leave politely is
+/// killed rather than left running under a supervisor that has moved on.
+pub fn quit_child(
+    sink: &mut dyn Write,
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    quit_sequence: &str,
+    grace: Duration,
+) -> CtxResult<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    let _ = write!(sink, "{quit_sequence}");
+    let _ = sink.flush();
+
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Ctrl-C twice is the conventional escape hatch before force.
+    let _ = write!(sink, "\x03\x03");
+    let _ = sink.flush();
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+/// Pumps one pty master's output to stdout for as long as `generation` still
+/// matches `my_generation`. A restart opens a fresh inner pty rather than
+/// respawning onto the old one (verified: once its session-leader child has
+/// exited, this platform refuses a second `spawn_command` on that slave with
+/// EBADF), so the old reader thread outlives its pty by a little and must
+/// never mistake that pty's own closure for the current one's.
+fn spawn_output_thread(
+    mut reader: Box<dyn Read + Send>,
+    tx: mpsc::Sender<PumpEvent>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    my_generation: u64,
+) {
+    std::thread::spawn(move || {
+        let still_current =
+            || generation.load(std::sync::atomic::Ordering::SeqCst) == my_generation;
+        let mut buf = [0u8; 8192];
+        let mut stdout = std::io::stdout();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    if still_current() {
+                        let _ = tx.send(PumpEvent::PtyClosed);
+                    }
+                    return;
+                }
+                Ok(n) => {
+                    // A restart may have superseded this thread while the
+                    // read was in flight. Bytes read from an abandoned pty
+                    // must never reach stdout (they would interleave with
+                    // the current generation's own output on the same
+                    // stdout handle) or the event channel (a stale Output
+                    // could refresh `last_output` for the wrong pty). But
+                    // the thread must keep draining rather than exit here:
+                    // the old pty's session may still be alive mid-quit,
+                    // and leaving its output buffer to back up is exactly
+                    // what stalls that child's own exit (see quit_child's
+                    // tests, which needed the identical drain to unblock).
+                    if !still_current() {
+                        continue;
+                    }
+                    if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+                        if still_current() {
+                            let _ = tx.send(PumpEvent::PtyClosed);
+                        }
+                        return;
+                    }
+                    if tx.send(PumpEvent::Output(n)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Opens a brand-new inner pty sized to the current window and spawns the
+/// adapter's interactive command into it with the handoff as the initial
+/// prompt. The old pty cannot be reused for this (see `spawn_output_thread`),
+/// so a restart always moves the wrapped agent to a fresh one; the outer
+/// side (the user's own terminal, the raw-mode guard) is untouched.
+type RelaunchedSession = (
+    portable_pty::PtyPair,
+    Box<dyn portable_pty::Child + Send + Sync>,
+    Box<dyn Read + Send>,
+    Box<dyn Write + Send>,
+);
+
+fn relaunch(
+    adapter: &dyn AgentAdapter,
+    repo: &Path,
+    handoff: &Handoff,
+    size: (u16, u16),
+) -> CtxResult<RelaunchedSession> {
+    let pair = native_pty_system().openpty(PtySize {
+        rows: size.1,
+        cols: size.0,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut command = adapter.interactive_cmd(Some(&restart_prompt(handoff)), &[]);
+    command.current_dir(repo);
+    let mut builder = CommandBuilder::new(command.get_program());
+    for arg in command.get_args() {
+        builder.arg(arg);
+    }
+    builder.cwd(repo);
+    let child = pair.slave.spawn_command(builder)?;
+
+    let reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
+
+    Ok((pair, child, reader, writer))
+}
+
 pub fn run_with<W: Write>(
     args: &WrapArgs,
     w: &mut W,
@@ -214,7 +360,7 @@ pub fn run_with<W: Write>(
     });
 
     let (cols, rows) = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
-    let pair = native_pty_system().openpty(PtySize {
+    let mut pair = native_pty_system().openpty(PtySize {
         rows,
         cols,
         pixel_width: 0,
@@ -242,38 +388,22 @@ pub fn run_with<W: Write>(
 
     let mut child = pair.slave.spawn_command(command)?;
 
-    let mut reader = pair.master.try_clone_reader()?;
+    let reader = pair.master.try_clone_reader()?;
     // One writer, shared: the stdin pump and (from Task C4) the injector both
-    // need it, and `take_writer` can only be called once.
+    // need it, and `take_writer` can only be called once. Its contents (not
+    // the Arc itself) get swapped out on a restart, so every holder of this
+    // Arc transparently starts writing to the fresh pty.
     let writer = std::sync::Arc::new(std::sync::Mutex::new(pair.master.take_writer()?));
     let (tx, rx) = mpsc::channel::<PumpEvent>();
+    // Bumped on every restart so a stale reader thread from an abandoned pty
+    // never reports a false PtyClosed for the pty that replaced it.
+    let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // PTY to stdout.
-    let output_tx = tx.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        let mut stdout = std::io::stdout();
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => {
-                    let _ = output_tx.send(PumpEvent::PtyClosed);
-                    return;
-                }
-                Ok(n) => {
-                    if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
-                        let _ = output_tx.send(PumpEvent::PtyClosed);
-                        return;
-                    }
-                    if output_tx.send(PumpEvent::Output(n)).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
+    spawn_output_thread(reader, tx.clone(), generation.clone(), 0);
 
     // stdin to PTY.
-    let input_tx = tx;
+    let input_tx = tx.clone();
     let input_writer = std::sync::Arc::clone(&writer);
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -307,7 +437,7 @@ pub fn run_with<W: Write>(
     let exit = pump(
         &mut child,
         &rx,
-        &pair,
+        &mut pair,
         &mut supervision,
         server.as_ref(),
         adapter.as_ref(),
@@ -317,6 +447,12 @@ pub fn run_with<W: Write>(
         &session,
         debounce,
         inject_timeout,
+        repo,
+        cfg.handoff.tail_items,
+        &cfg.handoff.model,
+        QUIT_GRACE,
+        tx,
+        generation,
     );
 
     if let Some(guard) = raw.as_mut() {
@@ -336,7 +472,7 @@ pub fn run_with<W: Write>(
 fn pump(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     rx: &mpsc::Receiver<PumpEvent>,
-    pair: &portable_pty::PtyPair,
+    pair: &mut portable_pty::PtyPair,
     supervision: &mut InjectionState,
     server: Option<&super::signal::SignalServer>,
     adapter: &dyn AgentAdapter,
@@ -346,6 +482,12 @@ fn pump(
     session: &super::event::SessionId,
     debounce: Duration,
     inject_timeout: Duration,
+    repo: &Path,
+    tail_items: usize,
+    distiller_model: &str,
+    grace: Duration,
+    tx: mpsc::Sender<PumpEvent>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
 
@@ -420,8 +562,75 @@ fn pump(
                 );
             }
             Action::Restart => {
-                // Task C5.
                 supervision.cooldown_until_turn = Some(supervision.last_turn);
+
+                // Bumped before the old child is even asked to quit: its
+                // reader thread's own EOF can land at any point from here on
+                // (quit_child alone may take up to `grace`), and once bumped
+                // that thread's `still_current` check is already false, so a
+                // pty closing on its way out can never be mistaken for the
+                // fresh one that is about to replace it.
+                let new_generation =
+                    generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
+                let jsonl = std::fs::read_to_string(transcript).unwrap_or_default();
+                let ctx = adapter.structural_context(&jsonl, tail_items);
+                let (note, source) = handoff::distill_or_structural(adapter, distiller_model, &ctx);
+                let stored = handoff::store(state_dir, repo, session.as_str(), &note);
+
+                let quit = writer
+                    .lock()
+                    .map_err(|_| "pty writer poisoned".to_string())
+                    .and_then(|mut sink| {
+                        quit_child(&mut *sink, child, adapter.quit_sequence(), grace)
+                            .map_err(|e| e.to_string())
+                    });
+
+                let relaunched = quit.is_ok()
+                    && match relaunch(adapter, repo, &note, last_size) {
+                        Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
+                            spawn_output_thread(
+                                fresh_reader,
+                                tx.clone(),
+                                generation.clone(),
+                                new_generation,
+                            );
+                            if let Ok(mut sink) = writer.lock() {
+                                *sink = fresh_writer;
+                            }
+                            *pair = fresh_pair;
+                            *child = fresh_child;
+                            true
+                        }
+                        Err(_) => false,
+                    };
+
+                if !relaunched {
+                    supervision.degraded = true;
+                }
+                let _ = super::log::append(
+                    state_dir,
+                    &super::log::Decision {
+                        ts: super::state::now_secs(),
+                        session: session.as_str(),
+                        verb: "wrap",
+                        verdict: "restart",
+                        score: supervision.score,
+                        action: if relaunched {
+                            "restart"
+                        } else {
+                            "restart-failed"
+                        },
+                        detail: &match stored {
+                            Ok(path) => format!("{source} handoff at {}", path.display()),
+                            Err(e) => format!("{source} handoff not stored: {e}"),
+                        },
+                    },
+                );
+                if !relaunched {
+                    let status = child.wait()?;
+                    return Ok(status.exit_code() as i32);
+                }
             }
         }
 
@@ -959,5 +1168,205 @@ mod tests {
 
         h.writer.write_all(b"/exit\r").expect("write");
         let _ = h.child.wait();
+    }
+
+    use crate::commands::ctx::handoff::Handoff;
+
+    #[test]
+    fn the_restart_prompt_carries_the_handoff() {
+        let handoff = Handoff {
+            task: "Wire the webhook".to_string(),
+            next_step: "Write the failing test".to_string(),
+            ..Handoff::default()
+        };
+        let prompt = restart_prompt(&handoff);
+        assert!(prompt.contains("Wire the webhook"));
+        assert!(prompt.contains("Write the failing test"));
+        assert!(prompt.to_lowercase().contains("previous session"));
+        assert!(!prompt.contains('\u{2014}'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quit_child_sends_the_sequence_then_escalates() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+
+        // A child that ignores everything typed at it.
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("trap '' TERM; while true; do sleep 1; done");
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+        drop(pair.slave);
+        let mut sink = pair.master.take_writer().expect("writer");
+        // Nobody reads the master's output on this side of the harness, and an
+        // undrained session-leader pty can stall the child's own exit teardown,
+        // so a discarding reader thread keeps that path clear the same way the
+        // real wrap pump does.
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
+        });
+
+        let started = Instant::now();
+        quit_child(&mut sink, &mut child, "/exit\r", Duration::from_millis(200)).expect("quit");
+        assert!(
+            child.try_wait().expect("try_wait").is_some(),
+            "child is gone"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quit_child_returns_immediately_for_a_cooperative_child() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg(&script);
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+        drop(pair.slave);
+        let mut sink = pair.master.take_writer().expect("writer");
+        // See the comment in quit_child_sends_the_sequence_then_escalates: an
+        // undrained master stalls both echoed input and the child's own exit.
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        quit_child(&mut sink, &mut child, "/exit\r", Duration::from_secs(5)).expect("quit");
+        assert!(child.try_wait().expect("try_wait").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_verdict_writes_a_handoff_and_relaunches_within_the_same_wrap_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let transcript = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","message":{"content":"wire the webhook"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Read","input":{"file_path":"/work/src/hook.rs"}}],"usage":{"input_tokens":180000}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write");
+
+        // relaunch-stub.sh, not stub-tui.sh: on this platform, stub-tui.sh's
+        // /compact branch (long JSON literals in an unreached case arm)
+        // reproducibly makes the process spawned on the relaunch's fresh pty
+        // exit immediately, even with its bracket-tests de-fragilized (see
+        // batch10-report.md for the full bisection). This test never sends
+        // /compact, so a minimal stub sidesteps the quirk while exercising
+        // the identical wrap code path (greet, echo, exit on quit sequence).
+        let script = fixture("relaunch-stub.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_TRANSCRIPT", transcript.display().to_string()),
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+                // Relaunch runs the stub again instead of a real agent.
+                ("ZIRV_CTX_AGENT_BIN", format!("sh {script}")),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(5, Verdict::Restart),
+        )
+        .expect("send");
+
+        // A fresh agent greets again through the same outer terminal
+        // (h.reader/h.writer never change: the wrap session survives, only
+        // the inner pty is replaced). The old agent's own output, including
+        // its quit confirmation, is deliberately not forwarded once a
+        // restart is underway (see spawn_output_thread) so it can never
+        // interleave with the new generation's output on the same stdout;
+        // that the old child actually quit is verified via the decision
+        // log below instead of by watching for its suppressed text.
+        let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(20));
+        assert!(seen.contains("stub-tui ready"), "relaunched: {seen:?}");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"restart\""),
+            "old child quit and relaunch succeeded: {log}"
+        );
+
+        let handoffs: Vec<_> = walk_md(&state.join("handoffs"));
+        assert_eq!(handoffs.len(), 1, "one handoff per restart: {handoffs:?}");
+        let note = std::fs::read_to_string(&handoffs[0]).expect("handoff");
+        assert!(note.contains("wire the webhook"), "structural task: {note}");
+
+        // The wrap session itself kept running: the user can still type into
+        // the new agent through the very same outer pty used before the restart.
+        h.writer.write_all(b"still here\r").expect("write");
+        h.writer.flush().expect("flush");
+        let echoed = read_until(&mut h.reader, "echo: still here", Duration::from_secs(10));
+        assert!(echoed.contains("echo: still here"), "got {echoed:?}");
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        // Plain cleanup, not an assertion: everything the restart contract
+        // promises was already checked above (log, handoff, echo through the
+        // same outer pty). On this platform a wrap process that has been
+        // through a relaunch can independently get stuck in the kernel's own
+        // exit-teardown path for a session-leader pty process (`ps` reports
+        // it with the documented "E" = "trying to exit" state flag; see
+        // batch10-report.md). That is orthogonal to whether the restart
+        // itself worked, so bound this wait rather than let an unrelated
+        // platform quirk hang the test.
+        wait_or_kill(&mut h.child, Duration::from_secs(5));
+    }
+
+    /// Waits for a child to exit, killing it if it has not within `timeout`.
+    /// See the restart test's cleanup for why a plain `.wait()` is not safe
+    /// to use unconditionally on this platform.
+    fn wait_or_kill(child: &mut Box<dyn portable_pty::Child + Send + Sync>, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+    }
+
+    fn walk_md(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(walk_md(&path));
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                found.push(path);
+            }
+        }
+        found
     }
 }
