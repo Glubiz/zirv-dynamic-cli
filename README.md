@@ -379,6 +379,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx hook <stop\|prompt\|pre-compact\|notify>` | Agent hook entrypoints |
 | `zirv ctx status` | Shows supervised sessions, recent decisions and handoffs |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
+| `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 
 ### Signals and verdicts
 
@@ -632,6 +633,59 @@ the per-window bound entirely and is unset by default.
 A pause is announced once, not once per check, and appears in the decision log as
 a single `pace-wait` entry. Parks and relaunches are logged too. Check the
 current picture, including how fresh each reading is, with `zirv ctx usage`.
+
+### Reviewing your instruction files
+
+`zirv ctx optimize` reads the CLAUDE.md hierarchy and the settings layers that
+steer every session, checks them against recent transcripts and the decision log,
+and prints a report with proposed edits as unified diffs.
+
+```bash
+zirv ctx optimize              # full analysis, one cheap model call
+zirv ctx optimize --no-model   # deterministic checks only, no model call
+```
+
+It reports four kinds of finding: instructions stated in more than one layer,
+instructions naming files or hook programs that no longer exist, contradictions
+between layers, and instruction gaps that correlate with repeated tool failures
+or user corrections.
+
+**It never edits an analysed file.** Every proposal is a diff you apply yourself,
+by hand or with `git apply`. A copy of each report is kept under the state dir,
+and each run appends to the decision log. When a finished session shows a high
+tool-failure rate, the Stop hook queues an "optimize recommended" entry and
+mentions it once in its advisory; it never runs the analysis itself.
+
+### Consistent sessions
+
+When zirv starts an agent through `wrap`, `exec`, `loop` or `resume` it injects a
+small system prompt so sessions behave the same way every time. Three layers
+concatenate, in order:
+
+1. A shipped default baked into the binary: respect repo conventions, use tools
+   deterministically, report failures honestly.
+2. `~/.zirv/system-prompt.md`, your own additions.
+3. `<repo>/.zirv/system-prompt.md`, the repository's additions.
+
+The repo layer is **untrusted input**, treated the same way `ctx.toml`'s repo
+layer is: it is capped in size, labeled in the composed prompt as coming from the
+checkout, and stated not to override anything above it. A repository cannot turn
+its own layer on or raise its own cap: `prompt.enabled`, `prompt.repo_layer` and
+`prompt.max_repo_bytes` are all rejected from a repo config. Set them in
+`~/.zirv/ctx.toml`, or with `ZIRV_CTX_PROMPT`, `ZIRV_CTX_PROMPT_REPO` and
+`ZIRV_CTX_PROMPT_MAX_REPO_BYTES`.
+
+```toml
+[prompt]
+enabled = true
+repo_layer = true
+max_repo_bytes = 4096
+```
+
+Pass `--simple` to any of the four verbs to start the agent with no zirv text at
+all, shipped default included. Supervision, pacing and hooks are unaffected.
+Whether a prompt was injected, and from which layers, is recorded in the decision
+log at every session start.
 
 ## Supported Platforms
 - Windows (see the platform note under [Context Management](#context-management-zirv-ctx): `zirv ctx` supervision is unix only)

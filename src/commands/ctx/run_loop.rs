@@ -45,6 +45,10 @@ pub struct LoopArgs {
     // agent's own flags: `--extra --model --extra opus`.
     #[arg(long, allow_hyphen_values = true)]
     pub extra: Vec<String>,
+    /// Simple run: skip every zirv-injected instruction, including the shipped
+    /// default. Supervision, pacing and hooks still apply.
+    #[arg(long, default_value_t = false)]
+    pub simple: bool,
 }
 
 pub fn resolve_prompt(args: &LoopArgs) -> CtxResult<String> {
@@ -79,6 +83,27 @@ pub fn run_with<W: Write>(
     )?;
     let state = StateDir::resolve(env)?;
 
+    let composed = super::prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        args.simple,
+        &cfg.prompt,
+    );
+    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
+    super::prompt::log_injection(
+        &state,
+        "loop",
+        "loop",
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    );
+    let extra: Vec<String> = args
+        .extra
+        .iter()
+        .cloned()
+        .chain(prompt_args.iter().cloned())
+        .collect();
+
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
     let max_cycle =
         Duration::from_secs(args.max_cycle_secs.unwrap_or(cfg.supervise.max_cycle_secs));
@@ -107,7 +132,7 @@ pub fn run_with<W: Write>(
             cwd: repo.to_path_buf(),
         });
 
-        let mut command = adapter.headless_cmd(&prompt, &session, &args.extra);
+        let mut command = adapter.headless_cmd(&prompt, &session, &extra);
         command.current_dir(repo);
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
@@ -329,6 +354,7 @@ mod tests {
             on_failure: None,
             cycles: Some(cycles),
             extra: Vec::new(),
+            simple: false,
         }
     }
 
@@ -616,6 +642,79 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    #[test]
+    fn a_cycle_launches_with_the_system_prompt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // SAFETY: CI runs tests single-threaded.
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "1");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut out = Vec::new();
+        let mut args = args_for(1);
+        args.simple = false;
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(argv.contains("--append-system-prompt"), "got {argv}");
+        assert!(argv.contains("zirv session conventions"), "got {argv}");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
+    }
+
+    #[test]
+    fn simple_launches_with_no_zirv_text_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "1");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut out = Vec::new();
+        let mut args = args_for(1);
+        args.simple = true;
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "supervision is unaffected by --simple"
+        );
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(!argv.contains("--append-system-prompt"), "got {argv}");
+        assert!(!argv.contains("zirv session conventions"), "got {argv}");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"prompt-skipped\""), "got {log}");
     }
 
     #[test]

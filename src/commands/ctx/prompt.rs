@@ -126,10 +126,133 @@ pub fn compose(
     })
 }
 
+use super::adapters::AgentAdapter;
+use super::log;
+use super::state::{StateDir, now_secs};
+
+/// Turns a composed prompt into launch arguments for this agent. Two things can
+/// make this empty: nothing was composed, or the agent has no verified
+/// mechanism. Both are normal.
+pub fn injection_args(
+    adapter: &dyn AgentAdapter,
+    composed: Option<&ComposedPrompt>,
+) -> Vec<String> {
+    let Some(composed) = composed else {
+        return Vec::new();
+    };
+    adapter.system_prompt_args(&composed.text)
+}
+
+/// Records whether this session start carried zirv text, so a transcript can be
+/// attributed to the prompt that shaped it.
+pub fn log_injection(
+    state: &StateDir,
+    verb: &'static str,
+    session: &str,
+    composed: Option<&ComposedPrompt>,
+    supported: bool,
+) {
+    let (action, detail) = match (composed, supported) {
+        (Some(composed), true) => ("prompt-injected", composed.describe()),
+        (Some(_), false) => (
+            "prompt-skipped",
+            "agent has no verified system-prompt mechanism (unsupported)".to_string(),
+        ),
+        (None, _) => (
+            "prompt-skipped",
+            "no prompt composed (simple run or prompt disabled)".to_string(),
+        ),
+    };
+    let _ = log::append(
+        state,
+        &log::Decision {
+            ts: now_secs(),
+            session,
+            verb,
+            verdict: "n/a",
+            score: 0,
+            action,
+            detail: &detail,
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ctx::adapters::claude::ClaudeAdapter;
+    use crate::commands::ctx::adapters::codex::CodexAdapter;
     use crate::commands::ctx::config::PromptConfig;
+    use crate::commands::ctx::state::StateDir;
+
+    #[test]
+    fn injection_args_come_from_the_adapter() {
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let args = injection_args(&ClaudeAdapter::new(None), composed.as_ref());
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--append-system-prompt");
+        assert!(args[1].contains("zirv session conventions"));
+    }
+
+    #[test]
+    fn nothing_composed_means_no_arguments() {
+        assert!(injection_args(&ClaudeAdapter::new(None), None).is_empty());
+    }
+
+    #[test]
+    fn an_agent_without_the_capability_gets_no_arguments() {
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        assert!(
+            injection_args(&CodexAdapter::new(None), composed.as_ref()).is_empty(),
+            "composition succeeding does not mean the agent can take it"
+        );
+    }
+
+    #[test]
+    fn the_decision_log_records_what_was_injected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+        let (_tmp2, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+
+        log_injection(&state, "wrap", "sess-1", composed.as_ref(), true);
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
+        assert!(log.contains("\"verb\":\"wrap\""), "got {log}");
+        assert!(log.contains("v1"), "the version is attributable: {log}");
+    }
+
+    #[test]
+    fn skipping_is_recorded_too_and_says_why() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+        // `composed` and `supported` are independent: composing a prompt says
+        // nothing about whether this agent can take it, so the "unsupported"
+        // case needs a real composed prompt, not `None`.
+        let (_tmp2, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+
+        log_injection(&state, "exec", "sess-2", None, true);
+        log_injection(&state, "loop", "sess-3", composed.as_ref(), false);
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.contains("\"action\":\"prompt-skipped\""))
+                .count(),
+            2,
+            "got {log}"
+        );
+        assert!(log.contains("simple"), "a --simple run says so: {log}");
+        assert!(
+            log.contains("unsupported"),
+            "an agent that cannot take a prompt says so: {log}"
+        );
+    }
 
     fn tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -20,6 +20,10 @@ pub struct ResumeArgs {
     // agent's own flags: `--extra --continue`.
     #[arg(long, allow_hyphen_values = true)]
     pub extra: Vec<String>,
+    /// Simple run: skip every zirv-injected instruction, including the shipped
+    /// default. Supervision, pacing and hooks still apply.
+    #[arg(long, default_value_t = false)]
+    pub simple: bool,
 }
 
 pub fn resume_prompt(handoff: &Handoff) -> String {
@@ -58,7 +62,29 @@ pub fn run_with<W: Write>(
         &[],
         cfg.agent_bin.as_deref(),
     )?;
-    let mut command = adapter.interactive_cmd(Some(&prompt), &args.extra);
+
+    let composed = super::prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        args.simple,
+        &cfg.prompt,
+    );
+    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
+    super::prompt::log_injection(
+        &state,
+        "resume",
+        "resume",
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    );
+    let extra: Vec<String> = args
+        .extra
+        .iter()
+        .cloned()
+        .chain(prompt_args.iter().cloned())
+        .collect();
+
+    let mut command = adapter.interactive_cmd(Some(&prompt), &extra);
     command.current_dir(repo);
     writeln!(w, "resuming from {}", path.display())?;
     w.flush()?;
@@ -134,6 +160,7 @@ mod tests {
             agent: None,
             print_prompt: true,
             extra: Vec::new(),
+            simple: false,
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -155,6 +182,7 @@ mod tests {
             agent: None,
             print_prompt: true,
             extra: Vec::new(),
+            simple: false,
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())

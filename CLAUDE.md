@@ -32,6 +32,7 @@ cargo clippy --all-targets -- -D warnings
   - `run_loop.rs` / `exec.rs` / `wrap.rs` — The three supervisors (`loop` is a keyword)
   - `signal.rs` / `supervise.rs` / `term.rs` — Turn-signal sockets, process primitives, raw mode
   - `pace.rs` / `usage.rs` / `window.rs` — Usage pacing gate, the `usage` verb (and statusline tee), rolling usage-window state
+  - `optimize.rs` / `prompt.rs` — Configuration analysis and the injected session prompt
 
 ## Conventions
 
@@ -50,3 +51,8 @@ cargo clippy --all-targets -- -D warnings
 - Test fixtures under `tests/fixtures/` are data files only; tests stay inline in
   `#[cfg(test)] mod tests`. Re-record the claude fixture with
   `scripts/record-claude-fixture.py`.
+- `zirv ctx optimize` is report-only. It may read any configuration surface and
+  write only to stdout, its own report copy under the state dir, and an explicit
+  `--out` path. A test asserts the analysed tree is unchanged after a run.
+- Repo-provided prompt text is untrusted input, like the repo `ctx.toml` layer:
+  capped, labeled, and unable to enable itself.

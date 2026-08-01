@@ -14,6 +14,9 @@
 #   FAKE_AGENT_SESSION_ENV_LOG=<path>       append $ZIRV_CTX_SESSION per run,
 #                                           so a test can see what each child
 #                                           was told to report signals as
+#   FAKE_AGENT_ARGV_LOG=<path>              append the full argv of each run,
+#                                           so a test can assert on injected
+#                                           flags such as --append-system-prompt
 #
 #   healthy  distinct tool inputs, marker on every final, 20k tokens
 #   rot      identical tool input, every result an error, marker only on the
@@ -28,6 +31,8 @@
 # own transcript. FAKE_AGENT_SLEEP applies only in rot mode, so a rotted run
 # stays alive long enough to be scored while a healthy one exits promptly.
 set -eu
+
+[ -z "${FAKE_AGENT_ARGV_LOG:-}" ] || printf '%s\n' "$*" >> "$FAKE_AGENT_ARGV_LOG"
 
 session=""
 while [ $# -gt 0 ]; do

@@ -33,6 +33,10 @@ pub struct WrapArgs {
     /// The interactive agent command, after `--`.
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
+    /// Simple run: skip every zirv-injected instruction, including the shipped
+    /// default. Supervision, pacing and hooks still apply.
+    #[arg(long, default_value_t = false)]
+    pub simple: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,6 +416,21 @@ pub fn run_with<W: Write>(
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = super::event::SessionId::new_v4();
 
+    let composed = super::prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        args.simple,
+        &cfg.prompt,
+    );
+    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
+    super::prompt::log_injection(
+        &state_dir,
+        "wrap",
+        session.as_str(),
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    );
+
     let mut supervision = InjectionState::new();
     supervision.degraded = args.no_supervise;
 
@@ -453,6 +472,9 @@ pub fn run_with<W: Write>(
 
     let mut command = CommandBuilder::new(program);
     for arg in rest {
+        command.arg(arg);
+    }
+    for arg in &prompt_args {
         command.arg(arg);
     }
     command.cwd(repo);
@@ -525,6 +547,14 @@ pub fn run_with<W: Write>(
     let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
     let inject_timeout = Duration::from_millis(cfg.wrap.inject_timeout_ms);
 
+    // Carried into `relaunch_command` too, so a restart does not silently drop
+    // the injected prompt the first command already carries.
+    let relaunch_extra: Vec<String> = rest
+        .iter()
+        .cloned()
+        .chain(prompt_args.iter().cloned())
+        .collect();
+
     let exit = pump(
         &mut child,
         &rx,
@@ -545,7 +575,7 @@ pub fn run_with<W: Write>(
         QUIT_GRACE,
         tx,
         generation,
-        rest,
+        &relaunch_extra,
         &turn_env,
     );
 
@@ -894,6 +924,7 @@ mod tests {
             agent: None,
             no_supervise: false,
             command: Vec::new(),
+            simple: false,
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("nothing to wrap");
@@ -1425,7 +1456,11 @@ mod tests {
         let seen = read_until(&mut h.reader, "compacted", Duration::from_secs(15));
         assert!(seen.contains("compacted"), "got {seen:?}");
 
-        let decisions = wait_for_log(&state, "\"verb\":\"wrap\"", Duration::from_secs(15));
+        // Not the generic "verb":"wrap" needle: the prompt-injection log entry
+        // written at session start also carries that verb, and would satisfy
+        // the wait before the compaction outcome this test cares about is
+        // ever appended.
+        let decisions = wait_for_log(&state, "\"action\":\"inject\"", Duration::from_secs(15));
         assert!(
             decisions.contains("\"action\":\"inject\""),
             "the compaction was verified in the reported transcript: {decisions}"

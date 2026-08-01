@@ -41,6 +41,10 @@ pub struct ExecArgs {
     /// The headless agent command, after `--`.
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
+    /// Simple run: skip every zirv-injected instruction, including the shipped
+    /// default. Supervision, pacing and hooks still apply.
+    #[arg(long, default_value_t = false)]
+    pub simple: bool,
 }
 
 /// Finds the prompt in a headless agent command. Returns `None` rather than
@@ -92,11 +96,26 @@ pub fn run_with<W: Write>(
     )?;
     let state = StateDir::resolve(env)?;
 
+    let composed = super::prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        args.simple,
+        &cfg.prompt,
+    );
+    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
+
     let session_raw = args
         .session_id
         .clone()
         .unwrap_or_else(|| SessionId::new_v4().to_string());
     let mut session = SessionId::parse(&session_raw);
+    super::prompt::log_injection(
+        &state,
+        "exec",
+        session.as_str(),
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    );
 
     let derive_transcript = |session: &SessionId| {
         adapter.transcript_path(&SessionRef {
@@ -162,6 +181,9 @@ pub fn run_with<W: Write>(
     };
 
     let mut command = build_command(&args.command, repo)?;
+    for arg in &prompt_args {
+        command.arg(arg);
+    }
     for (key, value) in turn_env_for(&session) {
         command.env(key, value);
     }
@@ -255,7 +277,7 @@ pub fn run_with<W: Write>(
             // A park is not a restart: the budget is for rot, not for waiting.
             session = SessionId::new_v4();
             transcript = derive_transcript(&session);
-            command = adapter.headless_cmd(&prompt_text, &session, &[]);
+            command = adapter.headless_cmd(&prompt_text, &session, &prompt_args);
             command.current_dir(repo);
             for (key, value) in turn_env_for(&session) {
                 command.env(key, value);
@@ -356,7 +378,7 @@ pub fn run_with<W: Write>(
         // must follow it rather than the file the killed child left behind.
         transcript = derive_transcript(&session);
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
-        command = adapter.headless_cmd(&combined, &session, &[]);
+        command = adapter.headless_cmd(&combined, &session, &prompt_args);
         command.current_dir(repo);
         for (key, value) in turn_env_for(&session) {
             command.env(key, value);
@@ -523,6 +545,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(2),
             timeout_secs: Some(60),
+            simple: false,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -552,6 +575,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
             timeout_secs: Some(60),
+            simple: false,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -584,6 +608,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
             timeout_secs: Some(60),
+            simple: false,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -680,6 +705,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
             timeout_secs: Some(60),
+            simple: false,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -731,6 +757,7 @@ mod tests {
             prompt: None,
             max_restarts: Some(2),
             timeout_secs: Some(60),
+            simple: false,
             command,
         };
         let mut out = Vec::new();
@@ -763,6 +790,7 @@ mod tests {
             prompt: None,
             max_restarts: None,
             timeout_secs: None,
+            simple: false,
             command: Vec::new(),
         };
         let mut out = Vec::new();
@@ -843,6 +871,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(1),
             timeout_secs: Some(60),
+            simple: false,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -897,6 +926,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
             timeout_secs: Some(1),
+            simple: false,
             command: fake_agent_command(session),
         };
         let started = std::time::Instant::now();
@@ -943,6 +973,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
             timeout_secs: Some(30),
+            simple: false,
             command,
         };
         let mut out = Vec::new();
@@ -974,6 +1005,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
             timeout_secs: Some(30),
+            simple: false,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -1033,6 +1065,7 @@ mod tests {
             // because a park is not a restart.
             max_restarts: Some(0),
             timeout_secs: Some(60),
+            simple: false,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
@@ -1082,6 +1115,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
             timeout_secs: Some(60),
+            simple: false,
             command: fake_agent_command(session),
         };
         let started = std::time::Instant::now();
@@ -1098,6 +1132,51 @@ mod tests {
         );
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    #[test]
+    fn a_restart_relaunches_with_the_system_prompt_too() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session = "cccccccc-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("--append-system-prompt"),
+            "the restarted child must carry the prompt too: {argv}"
+        );
     }
 
     #[test]
@@ -1120,6 +1199,7 @@ mod tests {
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
             timeout_secs: Some(60),
+            simple: false,
             command: fake_agent_command(session),
         };
         let mut out = Vec::new();
