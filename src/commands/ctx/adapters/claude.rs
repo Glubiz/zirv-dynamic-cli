@@ -330,14 +330,22 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     /// The distillation prompt is piped to stdin so a long transcript tail
-    /// never hits argv length limits.
+    /// never hits argv length limits. This child embeds untrusted repo
+    /// CLAUDE.md text in its prompt (the judgment call) and its only job is
+    /// to answer with text, so it never needs a tool. Verified against the
+    /// real CLI (docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md,
+    /// "I6 fix round"): `Bash` must be denied alongside `Write`/`Edit`, since
+    /// a shell redirect otherwise recreates a Write tool, and the value must
+    /// be one `=`-bound argv token, since the two-token form was verified to
+    /// swallow the next argv entry.
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("-p")
             .arg("--model")
             .arg(model)
             .arg("--output-format")
-            .arg("text");
+            .arg("text")
+            .arg("--disallowedTools=Write,Edit,Bash,NotebookEdit");
         cmd
     }
 
@@ -778,7 +786,40 @@ mod tests {
                 "haiku".to_string(),
                 "--output-format".to_string(),
                 "text".to_string(),
+                "--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string(),
             ]
+        );
+    }
+
+    /// I6: the judgment/distiller child embeds untrusted repo CLAUDE.md text
+    /// in its prompt and otherwise runs with the operator's full tool
+    /// permissions. Verified against the real CLI (see
+    /// docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md):
+    /// this is the one flag, in the one argv shape, that provably blocks
+    /// tool use, including an adversarial attempt to route around it via
+    /// Bash or Task delegation.
+    #[test]
+    fn the_distiller_denies_the_tools_verified_to_matter() {
+        let adapter = ClaudeAdapter::new(None);
+        let cmd = adapter.distiller_cmd("haiku");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        let deny = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("the distiller must restrict its own tools");
+        assert_eq!(
+            deny, "--disallowedTools=Write,Edit,Bash,NotebookEdit",
+            "must be one argv token (a two-token --flag value form was \
+             verified to swallow the next argv entry instead): {args:?}"
+        );
+        assert!(
+            deny.contains("Bash"),
+            "Bash alone bypasses a Write/Edit-only deny list via a shell \
+             redirect, verified against the real CLI: {deny}"
         );
     }
 
@@ -831,6 +872,7 @@ mod tests {
                 "haiku".to_string(),
                 "--output-format".to_string(),
                 "text".to_string(),
+                "--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string(),
             ]
         );
     }

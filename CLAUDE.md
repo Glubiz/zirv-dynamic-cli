@@ -53,6 +53,11 @@ cargo clippy --all-targets -- -D warnings
   `scripts/record-claude-fixture.py`.
 - `zirv ctx optimize` is report-only. It may read any configuration surface and
   write only to stdout, its own report copy under the state dir, and an explicit
-  `--out` path. A test asserts the analysed tree is unchanged after a run.
+  `--out` path. A test asserts the analysed tree is unchanged after a run. The
+  judgment/distiller model child's own tools are restricted too
+  (`ClaudeAdapter::distiller_cmd`), not just zirv's own code path: it embeds
+  untrusted repo CLAUDE.md text in its prompt, so the guarantee would
+  otherwise rest on model judgment alone. Verified against the real CLI; see
+  docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md.
 - Repo-provided prompt text is untrusted input, like the repo `ctx.toml` layer:
   capped, labeled, and unable to enable itself.

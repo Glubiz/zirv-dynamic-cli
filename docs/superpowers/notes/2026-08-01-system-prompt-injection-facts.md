@@ -129,3 +129,77 @@ doing while codex is unauthenticated.
 Task G3 encodes only the claude row. Codex's adapter returns an empty
 argument list and reports `system_prompt: false` in its capabilities, per
 the Global Constraints' "BLOCKED fact" rule.
+
+## I6 fix round (2026-08-01): restricting the judgment/distiller model child's tools
+
+Background: `handoff::run_model` spawns `adapter.distiller_cmd(model)` with no
+tool restriction, and the analysed repo's own (untrusted) CLAUDE.md text is
+embedded in the prompt handed to that child. `optimize`'s judgment call and
+`handoff::distill`/`distill_or_structural` both go through it. Probed against
+the real installed CLI (2.1.220, this user's `~/.claude/settings.json` has
+`defaultMode: auto` and allows `Edit`/`Write`/`Bash`) to find a flag that
+provably blocks tool use, per the fix ruling's verify-first requirement.
+
+All probes ran `claude -p --model haiku "<prompt>"` in a fresh, empty temp
+directory and checked both the exit code and whether a file the prompt asked
+for actually appeared on disk.
+
+**Baseline, no restriction flag**: prompt "Create a file named
+PROBE_MARKER.txt ... containing exactly the text: probed-ok". Exit 0,
+`PROBE_MARKER.txt` created with the exact content. Confirms the risk is real
+under this machine's own default permission settings, not merely a
+theoretical concern.
+
+**`--allowedTools=""` (empty allow-list)**: same prompt, exit 0,
+`PROBE_MARKER.txt` still created. An empty allow-list does **not** deny
+everything by default; it appears to be treated as no filter at all. Ruled
+out: this is the "obvious" fix and it does not work.
+
+**`--permission-mode plan`**: same prompt. Took roughly 90+ seconds (versus
+low single-digit seconds for every other probe) and the file was not
+created, but the model's own answer explained why: `ExitPlanMode` and
+`AskUserQuestion` are not callable in a non-interactive `-p` session, so
+plan mode has no way to hand back control and finish normally in this
+invocation shape. No file was created, but the slow, ambiguous completion
+and the wrong output shape (a written plan artifact, not the plain-text
+answer `run_model` expects and bounds with its own `timeout`) rule this out
+as the encoded fix; a model that reliably takes 90s+ to answer a bounded
+distillation call is itself a regression.
+
+**`--disallowedTools=Write,Edit,Bash,NotebookEdit` (comma-separated, `=`-bound
+to the flag)**: same prompt, exit 0, no file created. The model's own answer
+named the exact cause ("The Write tool is not currently available in this
+context"). Repeated with a prompt that explicitly told the model to fall
+back to Bash if Write was blocked: **excluding `Bash` from the deny list
+let the model create the file anyway via a shell redirect** (`echo ... >
+file`), so `Bash` must be included, not just `Write`/`Edit`. With the full
+four-tool list, repeated once more with a prompt explicitly nudging toward
+Task/subagent delegation or "any other indirect way": the model reported it
+exhausted every method (Write, Bash, Monitor/background delegation,
+TaskCreate) and could not create the file. No file was created in either
+adversarial rerun.
+
+**Argv-shape gotcha, verified the hard way**: passing the flag and its value
+as two separate argv entries (`--disallowedTools "Write Edit Bash
+NotebookEdit"`, i.e. what `cmd.arg("--disallowedTools").arg("Write,Edit,...")`
+would produce in `std::process::Command`) made the CLI's variadic tools
+parser swallow the *next* argv entry too — in the probe that next entry was
+the prompt itself, which came back word-split into a dozen bogus "Permission
+deny rule ... matches no known tool" warnings and then failed outright with
+"Input must be provided either through stdin or as a prompt argument". Binding
+the value to the flag with `=` as a single argv token
+(`--disallowedTools=Write,Edit,Bash,NotebookEdit`) does not have this problem.
+This matters less in production here (the prompt travels over stdin, not
+argv), but the flag is still encoded as one `=`-bound argv token to match
+exactly what was verified rather than the two-token form that was verified
+broken.
+
+**Chosen fix**: `ClaudeAdapter::distiller_cmd` appends
+`--disallowedTools=Write,Edit,Bash,NotebookEdit` as a single argv token. This
+is the only probed option that is both fast (comparable latency to the
+unrestricted baseline) and adversarially verified to block tool use,
+including an explicit attempt to route around it via Bash or Task
+delegation. Codex is out of scope for this fix: it has no verified
+per-run permission-restriction flag any more than it has a verified
+system-prompt flag (see the BLOCKED codex sections above), and its adapter
+is not touched.
