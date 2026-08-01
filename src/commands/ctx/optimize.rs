@@ -1128,6 +1128,15 @@ pub const RECOMMEND_ACTION: &str = "optimize-recommended";
 /// Below this a session is too short to say anything about habits.
 const MIN_TURNS_FOR_RECOMMENDATION: usize = 8;
 
+/// Which signal justified an optimize recommendation. The Stop hook's
+/// user-facing wording needs this: a session that only corrected the assistant
+/// must not be told it "hit tools hard".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecommendReason {
+    ToolFailures,
+    Corrections,
+}
+
 /// Corrections in one transcript. Cheap enough for a hook: one pass over a file
 /// the hook has already caused to be read.
 pub fn count_corrections(jsonl: &str) -> usize {
@@ -1141,13 +1150,28 @@ pub fn count_corrections(jsonl: &str) -> usize {
 }
 
 /// Either signal is enough, both need a mature session. A clean run the user had
-/// to steer five times is exactly as interesting as a failing one.
-pub fn should_recommend(score: &Score, corrections: usize, cfg: &OptimizeConfig) -> bool {
+/// to steer five times is exactly as interesting as a failing one. Tool
+/// failures are checked first: when both signals fired the tools did in fact
+/// fail, so blaming them is still accurate.
+fn recommend_reason(
+    score: &Score,
+    corrections: usize,
+    cfg: &OptimizeConfig,
+) -> Option<RecommendReason> {
     if !cfg.enabled || score.signals.turns < MIN_TURNS_FOR_RECOMMENDATION {
-        return false;
+        return None;
     }
-    score.signals.tool_failure_rate >= cfg.recommend_tool_failure_rate
-        || corrections >= cfg.recommend_corrections
+    if score.signals.tool_failure_rate >= cfg.recommend_tool_failure_rate {
+        return Some(RecommendReason::ToolFailures);
+    }
+    if corrections >= cfg.recommend_corrections {
+        return Some(RecommendReason::Corrections);
+    }
+    None
+}
+
+pub fn should_recommend(score: &Score, corrections: usize, cfg: &OptimizeConfig) -> bool {
+    recommend_reason(score, corrections, cfg).is_some()
 }
 
 /// Reads the tail of the decision log rather than keeping separate state: the
@@ -1171,8 +1195,9 @@ pub fn recently_recommended(state: &StateDir, now: u64, cooldown: u64) -> bool {
     })
 }
 
-/// Queues the recommendation for a human to act on. Returns whether it queued,
-/// so the hook can mention it exactly once.
+/// Queues the recommendation for a human to act on. Returns the signal that
+/// justified it when it queued, so the hook can mention it exactly once and
+/// word it from the real cause.
 pub fn queue_recommendation(
     state: &StateDir,
     session: &str,
@@ -1180,12 +1205,10 @@ pub fn queue_recommendation(
     corrections: usize,
     cfg: &OptimizeConfig,
     now: u64,
-) -> bool {
-    if !should_recommend(score, corrections, cfg) {
-        return false;
-    }
+) -> Option<RecommendReason> {
+    let reason = recommend_reason(score, corrections, cfg)?;
     if recently_recommended(state, now, cfg.recommend_cooldown_secs) {
-        return false;
+        return None;
     }
 
     // Name the signal that fired, so the log does not blame the tools for a
@@ -1206,7 +1229,8 @@ pub fn queue_recommendation(
             detail: &detail,
         },
     )
-    .is_ok()
+    .ok()?;
+    Some(reason)
 }
 
 #[cfg(test)]
@@ -2481,16 +2505,9 @@ mod tests {
         let cfg = OptimizeConfig::default();
         let score = score_with(0.5, 20);
 
-        assert!(queue_recommendation(
-            &state,
-            "sess",
-            &score,
-            0,
-            &cfg,
-            1_800_000_000
-        ));
+        assert!(queue_recommendation(&state, "sess", &score, 0, &cfg, 1_800_000_000).is_some());
         assert!(
-            !queue_recommendation(&state, "sess", &score, 0, &cfg, 1_800_000_060),
+            queue_recommendation(&state, "sess", &score, 0, &cfg, 1_800_000_060).is_none(),
             "a second session minutes later must not queue again"
         );
 
@@ -2509,13 +2526,18 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
         state.ensure().expect("ensure");
 
-        queue_recommendation(
+        let reason = queue_recommendation(
             &state,
             "sess",
             &score_with(0.0, 20),
             5,
             &OptimizeConfig::default(),
             1_800_000_000,
+        );
+        assert_eq!(
+            reason,
+            Some(RecommendReason::Corrections),
+            "the returned reason must match the signal that fired"
         );
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
         assert!(
@@ -2525,17 +2547,36 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_failure_heavy_session_reports_the_tool_failure_reason() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+        let reason = queue_recommendation(
+            &state,
+            "sess",
+            &score_with(0.5, 20),
+            0,
+            &OptimizeConfig::default(),
+            1_800_000_000,
+        );
+        assert_eq!(reason, Some(RecommendReason::ToolFailures));
+    }
+
+    #[test]
     fn a_quiet_session_queues_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         state.ensure().expect("ensure");
-        assert!(!queue_recommendation(
-            &state,
-            "sess",
-            &score_with(0.0, 20),
-            0,
-            &OptimizeConfig::default(),
-            1_800_000_000
-        ));
+        assert!(
+            queue_recommendation(
+                &state,
+                "sess",
+                &score_with(0.0, 20),
+                0,
+                &OptimizeConfig::default(),
+                1_800_000_000
+            )
+            .is_none()
+        );
     }
 }

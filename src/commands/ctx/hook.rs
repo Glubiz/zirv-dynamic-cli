@@ -57,13 +57,29 @@ impl HookPayload {
     }
 }
 
+/// The optimize hint sentence, worded from the signal that actually fired
+/// rather than always blaming the tools.
+fn optimize_hint(reason: super::optimize::RecommendReason) -> &'static str {
+    use super::optimize::RecommendReason;
+    match reason {
+        RecommendReason::ToolFailures => {
+            "This session hit tools hard: `zirv ctx optimize` reviews the instruction files for \
+             gaps behind repeated failures."
+        }
+        RecommendReason::Corrections => {
+            "This session needed repeated corrections: `zirv ctx optimize` reviews the \
+             instruction files for gaps behind that."
+        }
+    }
+}
+
 /// Decides what the Stop hook prints. `None` means print nothing, which is also
 /// what every failure path does.
 pub fn stop_output(
     payload: &HookPayload,
     score: &Score,
     socket: Option<&Path>,
-    optimize_recommended: bool,
+    optimize_recommended: Option<super::optimize::RecommendReason>,
 ) -> Option<String> {
     if payload.stop_hook_active {
         return None;
@@ -71,8 +87,15 @@ pub fn stop_output(
     if socket.is_some() {
         return None;
     }
-    if score.verdict == Verdict::Healthy && !optimize_recommended {
+    if score.verdict == Verdict::Healthy && optimize_recommended.is_none() {
         return None;
+    }
+
+    // A healthy session is never told to /compact or resume: the only thing
+    // worth saying is the optimize hint that got it here in the first place.
+    if score.verdict == Verdict::Healthy {
+        let hint = optimize_recommended.map(optimize_hint).unwrap_or_default();
+        return serde_json::to_string(&serde_json::json!({ "systemMessage": hint })).ok();
     }
 
     let mut advisory = format!(
@@ -81,11 +104,9 @@ pub fn stop_output(
         score.score,
         score.context_tokens
     );
-    if optimize_recommended {
-        advisory.push_str(
-            " This session hit tools hard: `zirv ctx optimize` reviews the instruction files for \
-             gaps behind repeated failures.",
-        );
+    if let Some(reason) = optimize_recommended {
+        advisory.push(' ');
+        advisory.push_str(optimize_hint(reason));
     }
     serde_json::to_string(&serde_json::json!({ "systemMessage": advisory })).ok()
 }
@@ -132,7 +153,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         );
     }
 
-    let mut optimize_recommended = false;
+    let mut optimize_recommended = None;
     if let Ok(state) = StateDir::resolve(env) {
         let _ = log::append(
             &state,
@@ -154,21 +175,24 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // Cheap on purpose: the score is already computed, the correction count
         // is one pass over a file already in page cache, and the cooldown is a
         // log read. The analysis itself is far too heavy for a hook, so this
-        // only queues the recommendation for a human to act on.
+        // only queues the recommendation for a human to act on. The enabled
+        // check comes first so a disabled feature never pays for the reread.
         let optimize_cfg = super::config::CtxConfig::load(&repo, env)
             .map(|cfg| cfg.optimize)
             .unwrap_or_default();
-        let corrections = std::fs::read_to_string(transcript)
-            .map(|jsonl| super::optimize::count_corrections(&jsonl))
-            .unwrap_or(0);
-        optimize_recommended = super::optimize::queue_recommendation(
-            &state,
-            &session,
-            &score,
-            corrections,
-            &optimize_cfg,
-            now_secs(),
-        );
+        if optimize_cfg.enabled {
+            let corrections = std::fs::read_to_string(transcript)
+                .map(|jsonl| super::optimize::count_corrections(&jsonl))
+                .unwrap_or(0);
+            optimize_recommended = super::optimize::queue_recommendation(
+                &state,
+                &session,
+                &score,
+                corrections,
+                &optimize_cfg,
+                now_secs(),
+            );
+        }
     }
 
     if let Some(line) = stop_output(&payload, &score, socket.as_deref(), optimize_recommended) {
@@ -397,14 +421,14 @@ mod tests {
     #[test]
     fn a_healthy_session_prints_nothing() {
         assert_eq!(
-            stop_output(&payload(), &score_of(Verdict::Healthy, 10), None, false),
+            stop_output(&payload(), &score_of(Verdict::Healthy, 10), None, None),
             None
         );
     }
 
     #[test]
     fn an_advisory_verdict_prints_a_non_blocking_system_message() {
-        let out = stop_output(&payload(), &score_of(Verdict::Advise, 45), None, false)
+        let out = stop_output(&payload(), &score_of(Verdict::Advise, 45), None, None)
             .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(parsed["systemMessage"].is_string());
@@ -422,7 +446,7 @@ mod tests {
 
     #[test]
     fn a_restart_verdict_still_only_advises() {
-        let out = stop_output(&payload(), &score_of(Verdict::Restart, 95), None, false)
+        let out = stop_output(&payload(), &score_of(Verdict::Restart, 95), None, None)
             .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(parsed.get("decision").is_none());
@@ -439,7 +463,7 @@ mod tests {
             &payload(),
             &score_of(Verdict::Restart, 95),
             Some(std::path::Path::new("/tmp/s/ab.sock")),
-            false,
+            None,
         );
         assert_eq!(out, None, "the supervisor intervenes, not the hook");
     }
@@ -450,7 +474,7 @@ mod tests {
         let mut p = payload();
         p.stop_hook_active = true;
         assert_eq!(
-            stop_output(&p, &score_of(Verdict::Restart, 95), None, false),
+            stop_output(&p, &score_of(Verdict::Restart, 95), None, None),
             None
         );
     }
@@ -613,10 +637,11 @@ mod tests {
         assert!(parsed.get("decision").is_none(), "still never blocking");
     }
 
-    #[test]
-    fn a_correction_heavy_session_queues_one_even_with_clean_tools() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let transcript = dir.path().join("t.jsonl");
+    /// Five corrections, no tool failures, low context: enough to recommend
+    /// via the corrections signal alone, and healthy enough that the verdict
+    /// stays `Healthy`.
+    fn correction_heavy_transcript(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("t.jsonl");
         let mut text = String::new();
         for i in 0..12 {
             // Tools never fail here; the user keeps correcting.
@@ -631,7 +656,14 @@ mod tests {
             text.push_str("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"r\",\"is_error\":false}]}}\n");
             text.push_str("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[zirv] ok\"}],\"usage\":{\"input_tokens\":1000}}}\n");
         }
-        std::fs::write(&transcript, text).expect("write");
+        std::fs::write(&path, text).expect("write");
+        path
+    }
+
+    #[test]
+    fn a_correction_heavy_session_queues_one_even_with_clean_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = correction_heavy_transcript(dir.path());
 
         let state = dir.path().join("state");
         let env: std::collections::HashMap<String, String> = [(
@@ -656,6 +688,46 @@ mod tests {
         assert!(
             log.contains("5 corrections"),
             "and the entry says which signal: {log}"
+        );
+    }
+
+    /// I1: a healthy, correction-heavy transcript must not be told to
+    /// `/compact`, and must not blame tools it never used.
+    #[test]
+    fn a_healthy_correction_heavy_session_prints_only_the_optimize_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = correction_heavy_transcript(dir.path());
+
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let stdin = format!(
+            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
+            transcript.display(),
+            dir.path().display()
+        );
+
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        let message = parsed["systemMessage"].as_str().unwrap_or_default();
+
+        assert!(
+            !message.contains("/compact"),
+            "a healthy session must not be told to compact: {message}"
+        );
+        assert!(
+            !message.contains("hit tools hard"),
+            "tool failure rate was 0.00, wording must not blame the tools: {message}"
+        );
+        assert!(
+            message.contains("zirv ctx optimize"),
+            "the optimize hint must still appear: {message}"
         );
     }
 
