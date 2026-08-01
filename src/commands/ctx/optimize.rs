@@ -1003,7 +1003,19 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
-    let cfg = CtxConfig::load(repo, env)?;
+    // A findings run must never fail on a bad config: a malformed ctx.toml or
+    // a forbidden key degrades to defaults instead, same spirit as the model
+    // call below.
+    let cfg = match CtxConfig::load(repo, env) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            writeln!(
+                w,
+                "zirv ctx optimize: config load failed, using defaults ({e})"
+            )?;
+            CtxConfig::default()
+        }
+    };
     let home = crate::utils::home_dir().ok();
     let surfaces = collect_surfaces(home.as_deref(), repo, cfg.optimize.max_surface_bytes);
 
@@ -2285,6 +2297,40 @@ mod tests {
             std::fs::read_to_string(&out_path)
                 .expect("out file")
                 .contains("optimize report")
+        );
+    }
+
+    #[test]
+    fn a_malformed_repo_config_falls_back_to_defaults_instead_of_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir zirv");
+        std::fs::write(repo.join(".zirv/ctx.toml"), "this is not [ valid toml").expect("write");
+
+        let state = tmp.path().join("state");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: true,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+
+        assert_eq!(code, 0, "a malformed config must not fail the command");
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("# zirv ctx optimize report"),
+            "the report still renders with defaults: {printed}"
+        );
+        assert!(
+            printed.to_lowercase().contains("config load failed"),
+            "the report admits the config could not be read: {printed}"
         );
     }
 
