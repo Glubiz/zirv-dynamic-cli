@@ -195,6 +195,20 @@ pub fn note_failure(state: &mut InjectionState, log_target: Option<(&StateDir, &
     }
 }
 
+/// Polls until `child` exits or `deadline` passes, returning whether it exited.
+fn wait_for_exit(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    deadline: Instant,
+) -> CtxResult<bool> {
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(false)
+}
+
 /// Ask the TUI to quit, then escalate. A TUI that will not leave politely is
 /// killed rather than left running under a supervisor that has moved on.
 pub fn quit_child(
@@ -208,24 +222,15 @@ pub fn quit_child(
     }
     let _ = write!(sink, "{quit_sequence}");
     let _ = sink.flush();
-
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if wait_for_exit(child, Instant::now() + grace)? {
+        return Ok(());
     }
 
     // Ctrl-C twice is the conventional escape hatch before force.
     let _ = write!(sink, "\x03\x03");
     let _ = sink.flush();
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if wait_for_exit(child, Instant::now() + grace)? {
+        return Ok(());
     }
 
     let _ = child.kill();
@@ -567,7 +572,13 @@ fn pump(
                     )
                     .unwrap_or(false);
 
-                if !verified {
+                if injected.is_err() {
+                    note_failure(
+                        supervision,
+                        Some((state_dir, session.as_str())),
+                        "compact injection failed",
+                    );
+                } else if !verified {
                     note_failure(
                         supervision,
                         Some((state_dir, session.as_str())),
@@ -1386,6 +1397,67 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = child.kill();
+    }
+
+    #[test]
+    fn a_relaunch_that_cannot_spawn_degrades_the_session_cleanly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let transcript = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","message":{"content":"wire the webhook"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Read","input":{"file_path":"/work/src/hook.rs"}}],"usage":{"input_tokens":180000}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write");
+
+        // The initial spawn runs the wrapped argv directly (unaffected by
+        // ZIRV_CTX_AGENT_BIN), so it starts fine on relaunch-stub.sh. relaunch()
+        // instead goes through the adapter's interactive_cmd, which honors
+        // ZIRV_CTX_AGENT_BIN: pointing it at a path that cannot exist makes
+        // relaunch()'s own spawn_command fail, exactly like a real agent
+        // binary going missing between sessions.
+        let script = fixture("relaunch-stub.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_TRANSCRIPT", transcript.display().to_string()),
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+                (
+                    "ZIRV_CTX_AGENT_BIN",
+                    "/nonexistent/zirv-ctx-test-agent-binary".to_string(),
+                ),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(5, Verdict::Restart),
+        )
+        .expect("send");
+
+        // relaunch() cannot spawn, so the session ends: no hang, no crash,
+        // and the process exits through the old (already-quit) child's own
+        // exit path rather than the fresh-generation one.
+        wait_or_kill(&mut h.child, Duration::from_secs(10));
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"degrade\""),
+            "note_failure logged: {log}"
+        );
+        assert!(log.contains("relaunch failed"), "reason recorded: {log}");
+        assert!(
+            log.contains("\"action\":\"restart-failed\""),
+            "restart outcome logged: {log}"
+        );
     }
 
     #[test]
