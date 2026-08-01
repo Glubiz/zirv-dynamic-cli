@@ -264,12 +264,32 @@ pub fn evidence_ref(surface: &Surface, line: usize) -> String {
     format!("{}:{}", surface.path.display(), line)
 }
 
-/// A unified diff that deletes one line, in the form `git apply` accepts.
-fn deletion_diff(surface: &Surface, line: usize) -> Option<String> {
+/// Header paths for a diff against `surface`. A repo-owned surface (its path
+/// lives under `repo`) gets the conventional `a/`+`b/` prefixes over its
+/// repo-relative path, which is what makes `git apply` from the repo root
+/// work. A surface outside the repo (the global CLAUDE.md, user settings) has
+/// no repo root to be relative to, so it gets its plain absolute path with no
+/// prefix instead: a fabricated `a/`+`b/` pair over an absolute path is not a
+/// path `git apply` can ever resolve, and has in practice applied the hunk to
+/// the wrong file when a same-named path happened to exist under `-p3`.
+fn diff_headers(surface: &Surface, repo: &Path) -> (String, String) {
+    if surface.layer.is_repo_owned()
+        && let Ok(relative) = surface.path.strip_prefix(repo)
+    {
+        let relative = relative.display();
+        return (format!("a/{relative}"), format!("b/{relative}"));
+    }
+    let display = surface.path.display().to_string();
+    (display.clone(), display)
+}
+
+/// A unified diff that deletes one line, in the form `git apply` accepts when
+/// the surface is repo-owned (see `diff_headers`).
+fn deletion_diff(surface: &Surface, line: usize, repo: &Path) -> Option<String> {
     let lines: Vec<&str> = surface.text.lines().collect();
     let index = line.checked_sub(1)?;
     let removed = lines.get(index)?;
-    let display = surface.path.display().to_string();
+    let (a_header, b_header) = diff_headers(surface, repo);
     let before = index.checked_sub(1).and_then(|i| lines.get(i));
     let after = lines.get(index + 1);
 
@@ -287,14 +307,14 @@ fn deletion_diff(surface: &Surface, line: usize) -> Option<String> {
     let new_count = old_count - 1;
 
     Some(format!(
-        "--- a{display}\n+++ b{display}\n@@ -{start},{old_count} +{start},{new_count} @@\n{body}"
+        "--- {a_header}\n+++ {b_header}\n@@ -{start},{old_count} +{start},{new_count} @@\n{body}"
     ))
 }
 
 /// Rules stated more than once, whether across layers or inside one file. The
 /// first occurrence is treated as the home of the rule and every later copy is
 /// what the proposed diff removes.
-pub fn lint_redundancy(surfaces: &[Surface]) -> Vec<Finding> {
+pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
     let all: Vec<Instruction> = surfaces
         .iter()
         .enumerate()
@@ -342,7 +362,7 @@ pub fn lint_redundancy(surfaces: &[Surface]) -> Vec<Finding> {
                 "The same instruction appears {} times. Keeping one copy makes the rule easier to change later.",
                 group.len()
             ),
-            proposed_diff: deletion_diff(&surfaces[duplicate.surface], duplicate.line),
+            proposed_diff: deletion_diff(&surfaces[duplicate.surface], duplicate.line, repo),
         });
     }
 
@@ -913,7 +933,10 @@ pub fn render_report(findings: &[Finding], evidence: &Evidence, model_used: bool
              reviewed.\n",
         );
     }
-    report.push_str("\nThis report changes nothing. Apply a diff by hand or with `git apply`.\n\n");
+    report.push_str(
+        "\nThis report changes nothing. Each proposed diff below says whether to apply it \
+         with `git apply` or by hand.\n\n",
+    );
 
     if findings.is_empty() {
         report.push_str("No findings.\n");
@@ -944,7 +967,16 @@ pub fn render_report(findings: &[Finding], evidence: &Evidence, model_used: bool
             report.push('\n');
         }
         if let Some(diff) = &finding.proposed_diff {
-            report.push_str("Proposed change:\n\n```diff\n");
+            // Whether the diff is git-appliable is fully determined by its own
+            // header, written by `diff_headers`: only a repo-relative `a/`+`b/`
+            // pair works with `git apply` from the repo root.
+            let note = if diff.starts_with("--- a/") {
+                "Proposed change (apply with `git apply` from the repository root, or by hand):"
+            } else {
+                "Proposed change (path is outside the repository; apply by hand):"
+            };
+            report.push_str(note);
+            report.push_str("\n\n```diff\n");
             report.push_str(diff);
             if !diff.ends_with('\n') {
                 report.push('\n');
@@ -1034,7 +1066,7 @@ pub fn run_with<W: Write>(
         LOG_LINES_SAMPLED,
     );
 
-    let mut findings = lint_redundancy(&surfaces);
+    let mut findings = lint_redundancy(&surfaces, repo);
     findings.extend(lint_dead_references(&surfaces, repo, &on_path));
     findings.extend(friction_findings(&evidence, &cfg.optimize));
 
@@ -1410,7 +1442,7 @@ mod tests {
                 "- **always** run tests.\n",
             ),
         ];
-        let findings = lint_redundancy(&surfaces);
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
         assert_eq!(findings.len(), 1, "got {findings:?}");
 
         let finding = &findings[0];
@@ -1442,13 +1474,16 @@ mod tests {
                 "- keep me\n- always run tests\n",
             ),
         ];
-        let diff = lint_redundancy(&surfaces)[0]
+        let diff = lint_redundancy(&surfaces, Path::new("/repo"))[0]
             .proposed_diff
             .clone()
             .expect("diff");
 
-        assert!(diff.contains("--- a/repo/CLAUDE.md"), "got {diff}");
-        assert!(diff.contains("+++ b/repo/CLAUDE.md"), "got {diff}");
+        assert!(
+            diff.starts_with("--- a/CLAUDE.md"),
+            "repo-relative, so git apply works from the repo root: {diff}"
+        );
+        assert!(diff.contains("+++ b/CLAUDE.md"), "got {diff}");
         assert!(
             diff.contains("-- always run tests"),
             "the duplicate line is removed: {diff}"
@@ -1463,6 +1498,72 @@ mod tests {
         );
     }
 
+    /// I3: the whole point of a repo-relative header is that `git apply` can
+    /// actually place the hunk. Proving this against a fixture path is not
+    /// enough (the review found the old code only looked correct because its
+    /// fixture paths happened to render that way); this runs the real `git`
+    /// binary against a real repo.
+    #[test]
+    fn a_repo_owned_diff_actually_applies_with_git_apply() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        std::fs::write(repo.join("CLAUDE.md"), "- keep me\n- always run tests\n")
+            .expect("write CLAUDE.md");
+
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+            .expect("run git init");
+        assert!(
+            init.success(),
+            "git init must succeed for this test to mean anything"
+        );
+
+        let surfaces = vec![
+            surface_of(
+                Layer::GlobalClaudeMd,
+                "/home/CLAUDE.md",
+                "- Always run tests\n",
+            ),
+            surface_of(
+                Layer::RepoClaudeMd,
+                &repo.join("CLAUDE.md").display().to_string(),
+                "- keep me\n- always run tests\n",
+            ),
+        ];
+        let diff = lint_redundancy(&surfaces, repo)[0]
+            .proposed_diff
+            .clone()
+            .expect("diff");
+
+        let patch = tmp.path().join("proposed.patch");
+        std::fs::write(&patch, &diff).expect("write patch");
+
+        let check = std::process::Command::new("git")
+            .args(["apply", "--check"])
+            .arg(&patch)
+            .current_dir(repo)
+            .output()
+            .expect("run git apply --check");
+        assert!(
+            check.status.success(),
+            "git apply --check failed: {}\ndiff was:\n{diff}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    /// I3: a surface outside the repo has no repo root to be relative to, so
+    /// its diff must not claim a fake `a/`+`b/` pair that `git apply` would
+    /// either reject or, worse, resolve against the wrong file.
+    #[test]
+    fn a_surface_outside_the_repo_gets_a_plain_absolute_header() {
+        let global = surface_of(Layer::GlobalClaudeMd, "/home/CLAUDE.md", "- keep me\n");
+        let (a, b) = diff_headers(&global, Path::new("/repo"));
+        assert_eq!(a, "/home/CLAUDE.md", "no a/ prefix outside the repo");
+        assert_eq!(b, "/home/CLAUDE.md", "no b/ prefix outside the repo");
+    }
+
     #[test]
     fn a_rule_repeated_within_one_file_is_redundant_too() {
         let surfaces = vec![surface_of(
@@ -1470,7 +1571,7 @@ mod tests {
             "/repo/CLAUDE.md",
             "- run fmt before pushing\n- something else\n- Run fmt before pushing!\n",
         )];
-        let findings = lint_redundancy(&surfaces);
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].evidence,
@@ -1485,7 +1586,7 @@ mod tests {
             "/repo/CLAUDE.md",
             "- run fmt before pushing\n- run clippy before pushing\n",
         )];
-        assert!(lint_redundancy(&surfaces).is_empty());
+        assert!(lint_redundancy(&surfaces, Path::new("/repo")).is_empty());
     }
 
     #[test]
@@ -1495,10 +1596,10 @@ mod tests {
             "/repo/CLAUDE.md",
             "- zebra rule\n- alpha rule\n- zebra rule\n- alpha rule\n",
         )];
-        let first = lint_redundancy(&surfaces);
+        let first = lint_redundancy(&surfaces, Path::new("/repo"));
         for _ in 0..10 {
             assert_eq!(
-                lint_redundancy(&surfaces),
+                lint_redundancy(&surfaces, Path::new("/repo")),
                 first,
                 "hash order must not leak out"
             );
@@ -2079,6 +2180,42 @@ mod tests {
             "diffs are fenced for git apply: {report}"
         );
         assert!(report.contains("/repo/CLAUDE.md:1"), "evidence is shown");
+        assert!(!report.contains('\u{2014}'), "no em dashes in the report");
+    }
+
+    /// I3: the report must say, per finding, whether the diff is
+    /// git-appliable or needs hand-application, not make one blanket claim
+    /// that is only sometimes true.
+    #[test]
+    fn the_report_states_which_diffs_are_git_appliable_and_which_are_not() {
+        let findings = vec![
+            Finding {
+                kind: "redundancy",
+                severity: Severity::Info,
+                title: "Repo-owned duplicate".to_string(),
+                evidence: vec!["/repo/CLAUDE.md:1".to_string()],
+                detail: "detail".to_string(),
+                proposed_diff: Some("--- a/CLAUDE.md\n+++ b/CLAUDE.md\n".to_string()),
+            },
+            Finding {
+                kind: "redundancy",
+                severity: Severity::Info,
+                title: "Global duplicate".to_string(),
+                evidence: vec!["/home/CLAUDE.md:1".to_string()],
+                detail: "detail".to_string(),
+                proposed_diff: Some("--- /home/CLAUDE.md\n+++ /home/CLAUDE.md\n".to_string()),
+            },
+        ];
+        let report = render_report(&findings, &Evidence::default(), true);
+
+        assert!(
+            report.contains("git apply"),
+            "the repo-owned finding names its command: {report}"
+        );
+        assert!(
+            report.contains("apply by hand"),
+            "the outside-the-repo finding says to apply by hand: {report}"
+        );
         assert!(!report.contains('\u{2014}'), "no em dashes in the report");
     }
 

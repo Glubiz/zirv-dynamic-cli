@@ -650,8 +650,13 @@ instructions naming files or hook programs that no longer exist, contradictions
 between layers, and instruction gaps that correlate with repeated tool failures
 or user corrections.
 
-**It never edits an analysed file.** Every proposal is a diff you apply yourself,
-by hand or with `git apply`. A copy of each report is kept under the state dir,
+**It never edits an analysed file.** Every proposal is a diff you apply yourself.
+A finding about a file inside this repository (CLAUDE.md, `.claude/settings.json`)
+gets a repo-relative `a/`/`b/` header, so `git apply` works from the repo root. A
+finding about a file outside the repo (your global CLAUDE.md, `~/.claude/settings.json`)
+gets a plain absolute path with no `a/`/`b/` prefix instead, meant for hand
+application: the report says which is which for every diff it prints. A copy of
+each report is kept under the state dir,
 and each run appends to the decision log. When a finished session shows a high
 tool-failure rate, the Stop hook queues an "optimize recommended" entry and
 mentions it once in its advisory; it never runs the analysis itself.
