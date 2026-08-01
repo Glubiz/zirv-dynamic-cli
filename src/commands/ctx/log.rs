@@ -24,11 +24,8 @@ pub struct Decision<'a> {
 
 pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
     let dir = state.logs();
-    std::fs::create_dir_all(&dir)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(LOG_FILE))?;
+    super::state::create_private_dir_all(&dir)?;
+    let mut file = super::state::open_private_append(&dir.join(LOG_FILE))?;
     writeln!(file, "{}", serde_json::to_string(decision)?)?;
     Ok(())
 }
@@ -86,6 +83,40 @@ mod tests {
 
         let all = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("read");
         assert_eq!(all.lines().count(), 3);
+    }
+
+    /// The log names sessions, repositories and transcript paths, so on a
+    /// shared machine it is nobody else's reading.
+    #[cfg(unix)]
+    #[test]
+    fn the_decision_log_is_not_readable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        append(
+            &state,
+            &Decision {
+                ts: 1,
+                session: "s",
+                verb: "hook",
+                verdict: "healthy",
+                score: 0,
+                action: "observe",
+                detail: "/home/someone/.claude/projects/x/y.jsonl",
+            },
+        )
+        .expect("append");
+
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&state.logs().join(LOG_FILE)), 0o600);
+        assert_eq!(mode(&state.logs()), 0o700);
     }
 
     #[test]

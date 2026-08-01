@@ -245,6 +245,22 @@ pub fn notify_payload_to_hook(raw: &str) -> CtxResult<HookPayload> {
     })
 }
 
+/// What an unmapped payload is allowed to leave behind. Diagnosing a field
+/// mismatch needs the field names, never their values: a notify payload can
+/// carry tokens, prompts and file contents, and the decision log is a plain
+/// file that outlives the session.
+pub fn notify_shape(payload: &str) -> String {
+    const MAX_KEYS: usize = 200;
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(payload)
+    else {
+        return format!("unparseable notify payload, {} bytes", payload.len());
+    };
+
+    let mut keys: String = map.keys().cloned().collect::<Vec<_>>().join(", ");
+    keys.truncate(MAX_KEYS);
+    format!("notify payload fields: {keys}")
+}
+
 pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     // Codex passes its notify payload as an argument on some versions and on
     // stdin on others (see docs/superpowers/notes/2026-07-31-codex-cli-facts.md),
@@ -263,7 +279,7 @@ pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> Ctx
                     verdict: "n/a",
                     score: 0,
                     action: "notify-unmapped",
-                    detail: payload.chars().take(200).collect::<String>().as_str(),
+                    detail: &notify_shape(payload),
                 },
             );
         }
@@ -646,6 +662,64 @@ mod tests {
         let mut out = Vec::new();
         let code = run_notify(&mut out, CODEX_NOTIFY_SAMPLE, &|_| None).expect("runs");
         assert_eq!(code, 0);
+    }
+
+    /// An unmapped payload is the one case where something unrecognised gets
+    /// written down, so it is also the one case that can leak.
+    #[test]
+    fn an_unmapped_notify_payload_is_logged_by_shape_and_never_by_value() {
+        let payload = "{\"kind\":\"turn-done\",\"authorization\":\"Bearer sk-ant-secret-value\",\"prompt\":\"what the user actually typed\"}";
+        let shape = notify_shape(payload);
+
+        assert!(shape.contains("authorization"), "keys diagnose it: {shape}");
+        assert!(shape.contains("kind"));
+        assert!(
+            !shape.contains("sk-ant-secret-value"),
+            "values never reach the log: {shape}"
+        );
+        assert!(
+            !shape.contains("what the user actually typed"),
+            "values never reach the log: {shape}"
+        );
+
+        assert!(
+            notify_shape("not json at all").contains("unparseable"),
+            "an unparseable payload still says something useful"
+        );
+        assert!(
+            !notify_shape("Bearer sk-ant-secret-value").contains("sk-ant"),
+            "not even an unparseable one is quoted back"
+        );
+    }
+
+    #[test]
+    fn an_unmapped_payload_reaches_the_decision_log_by_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        run_notify(
+            &mut out,
+            "{\"kind\":\"turn-done\",\"token\":\"sk-ant-secret-value\"}",
+            &|k| env.get(k).cloned(),
+        )
+        .expect("runs");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("notify-unmapped"), "got {log}");
+        assert!(
+            log.contains("token"),
+            "the field name is the diagnosis: {log}"
+        );
+        assert!(
+            !log.contains("sk-ant-secret-value"),
+            "leaked a value: {log}"
+        );
     }
 
     #[test]

@@ -421,10 +421,10 @@ pub fn run_with<W: Write>(
         match super::signal::SignalServer::bind(&state_dir.socket_for(session.as_str())) {
             Ok(server) => {
                 // Publish the path so `zirv ctx status` and tests can find it.
-                let _ = std::fs::create_dir_all(state_dir.root());
-                let _ = std::fs::write(
-                    state_dir.root().join(SOCKET_PATH_FILE),
-                    server.path().display().to_string(),
+                let _ = super::state::create_private_dir_all(state_dir.root());
+                let _ = super::state::write_private(
+                    &state_dir.root().join(SOCKET_PATH_FILE),
+                    &server.path().display().to_string(),
                 );
                 Some(server)
             }
@@ -541,6 +541,7 @@ pub fn run_with<W: Write>(
         repo,
         cfg.handoff.tail_items,
         &cfg.handoff.model,
+        Duration::from_secs(cfg.handoff.timeout_secs),
         QUIT_GRACE,
         tx,
         generation,
@@ -578,6 +579,7 @@ fn pump(
     repo: &Path,
     tail_items: usize,
     distiller_model: &str,
+    distiller_timeout: Duration,
     grace: Duration,
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -691,7 +693,12 @@ fn pump(
                     .map(|path| std::fs::read_to_string(path).unwrap_or_default())
                     .unwrap_or_default();
                 let ctx = adapter.structural_context(&jsonl, tail_items);
-                let (note, source) = handoff::distill_or_structural(adapter, distiller_model, &ctx);
+                let (note, source) = handoff::distill_or_structural(
+                    adapter,
+                    distiller_model,
+                    &ctx,
+                    distiller_timeout,
+                );
                 let stored = handoff::store(state_dir, repo, session.as_str(), &note);
 
                 let quit = writer

@@ -5,6 +5,8 @@
 #   partial a handoff with no next step, so callers must fall back
 #   garbage prose with no sections
 #   fail    non-zero exit
+#   hang    reads the prompt and then never answers, the way a wedged model
+#           call looks from the outside
 #   echo    dumps the prompt it received to $FAKE_MODEL_PROMPT_LOG and answers good
 set -eu
 prompt=$(cat)
@@ -12,6 +14,7 @@ prompt=$(cat)
 
 case "${FAKE_MODEL_MODE:-good}" in
   fail) exit 4 ;;
+  hang) while true; do sleep 1; done ;;
   garbage) printf 'I had a look and things seem mostly fine.\n' ;;
   partial)
     printf '## Task\nShip the webhook\n\n## Done\n- wrote the route\n'

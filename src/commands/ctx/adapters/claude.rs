@@ -401,16 +401,39 @@ mod tests {
             .join(name)
     }
 
+    /// The needles track `scripts/record-claude-fixture.py`'s SECRET pattern.
+    /// A scrub rule with no guard behind it is a rule that can silently stop
+    /// working, and the cost of that is a credential in a public repository.
     #[test]
     fn recorded_fixture_carries_no_personal_data() {
         let text = std::fs::read_to_string(fixture_path("claude-real-session.jsonl"))
             .expect("fixture must be committed");
-        for needle in ["jonathansolskov", "/Users/", "sk-ant", "ghp_", "Bearer "] {
+        for needle in [
+            "jonathansolskov",
+            "/Users/",
+            "sk-ant",
+            "sk-proj",
+            "ghp_",
+            "gho_",
+            "ghu_",
+            "ghs_",
+            "ghr_",
+            "AKIA",
+            "-----BEGIN",
+            "ApiKey ",
+            "Bearer ",
+            "eyJ",
+        ] {
             assert!(
                 !text.contains(needle),
                 "fixture leaks '{needle}'; re-run scripts/record-claude-fixture.py"
             );
         }
+        assert_eq!(
+            credential_shape(&text),
+            None,
+            "fixture leaks a credential-shaped string; re-run scripts/record-claude-fixture.py"
+        );
         assert!(
             text.contains("compact_boundary"),
             "fixture must include a compaction"
@@ -419,6 +442,56 @@ mod tests {
             text.lines().count() >= 50,
             "fixture is too small to be representative"
         );
+    }
+
+    /// The two scrub rules a literal needle cannot express: the fixture
+    /// legitimately contains `?key=REDACTED` and `checkout@v2`, so only the
+    /// credential-shaped forms of each count as a leak.
+    fn credential_shape(text: &str) -> Option<String> {
+        for (index, _) in text.match_indices("key=") {
+            let hex: String = text[index + 4..]
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect();
+            if hex.len() >= 8 {
+                return Some(format!("key={hex}"));
+            }
+        }
+
+        for (index, _) in text.match_indices('@') {
+            let has_local = text[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric());
+            let domain: String = text[index + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+                .collect();
+            let tld = domain.rsplit('.').next().unwrap_or_default();
+            let is_email = has_local
+                && domain.contains('.')
+                && tld.len() >= 2
+                && tld.chars().all(|c| c.is_ascii_alphabetic());
+            if is_email {
+                return Some(format!("@{domain}"));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_credential_shape_check_separates_secrets_from_ordinary_text() {
+        assert_eq!(
+            credential_shape("http://localhost:1/?key=deadbeefcafe"),
+            Some("key=deadbeefcafe".to_string())
+        );
+        assert_eq!(
+            credential_shape("mail someone@example.com now"),
+            Some("@example.com".to_string())
+        );
+        assert_eq!(credential_shape("?key=REDACTED"), None);
+        assert_eq!(credential_shape("uses: actions/checkout@v2"), None);
+        assert_eq!(credential_shape("#[cfg(test)] @testable import"), None);
     }
 
     #[test]

@@ -325,8 +325,12 @@ pub fn run_with<W: Write>(
 
         let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
         let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
-        let (note, source) =
-            handoff::distill_or_structural(adapter.as_ref(), &cfg.handoff.model, &ctx);
+        let (note, source) = handoff::distill_or_structural(
+            adapter.as_ref(),
+            &cfg.handoff.model,
+            &ctx,
+            Duration::from_secs(cfg.handoff.timeout_secs),
+        );
         let stored = handoff::store(&state, repo, session.as_str(), &note)?;
 
         restarts += 1;

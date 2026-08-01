@@ -4,10 +4,12 @@
 Usage: python3 scripts/record-claude-fixture.py <source.jsonl>
 
 Keeps a window around the first compact_boundary so the fixture exercises
-compaction, sidechain filtering, tool errors and token usage. Rewrites
-identifying paths, redacts credential-shaped strings, truncates long tool
-output, and pins the session uuid. Also writes the expectations file the
-Rust parser test asserts against.
+compaction, tool errors and token usage. Rewrites identifying paths, redacts
+credential-shaped strings, truncates long tool output, and pins the session
+uuid. Also writes the expectations file the Rust parser test asserts against.
+
+Sidechain rows are filtered by the parser but are not guaranteed to appear in
+any given window, so sidechain coverage lives in a synthetic test instead.
 """
 import json
 import pathlib
@@ -16,8 +18,23 @@ import sys
 
 BEFORE, AFTER = 70, 110
 FIXTURE_UUID = "00000000-0000-4000-8000-000000000001"
+# The sk- and gh- alternatives are word-anchored on purpose: without it,
+# "task-notification" matches sk-<8 or more> and is corrupted to "taREDACTED".
+# Keep this list and the guard test in
+# src/commands/ctx/adapters/claude.rs (recorded_fixture_carries_no_personal_data)
+# in step: the guard is what proves the scrub actually held.
 SECRET = re.compile(
-    r"(sk-[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|ApiKey\s+\S+|Bearer\s+\S+|eyJ[A-Za-z0-9_\-]{10,})"
+    r"("
+    r"\bsk-[A-Za-z0-9_\-]{8,}"
+    r"|\bgh[pousr]_[A-Za-z0-9]{8,}"
+    r"|\bAKIA[0-9A-Z]{12,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|ApiKey\s+\S+"
+    r"|Bearer\s+\S+"
+    r"|\beyJ[A-Za-z0-9_\-]{10,}"
+    r"|\b[Kk]ey=[A-Fa-f0-9]{8,}"
+    r"|\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+\.[A-Za-z]{2,}"
+    r")"
 )
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OUT = ROOT / "tests" / "fixtures" / "claude-real-session.jsonl"

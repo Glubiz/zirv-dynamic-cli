@@ -3,9 +3,10 @@
 // module-wide until then, matching config.rs/state.rs/log.rs/event.rs.
 #![allow(dead_code)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use super::CtxResult;
 use super::adapters::AgentAdapter;
@@ -173,12 +174,19 @@ not invent progress that is not evidenced below.\n\n\
     )
 }
 
+const DISTILL_POLL: Duration = Duration::from_millis(25);
+
 /// Runs a fresh, cheap model over the context. The rotted session is never
 /// asked to summarize itself.
+///
+/// Bounded by `timeout`, because `wrap` calls this from its pump: a model call
+/// that never answers would otherwise freeze the user's own terminal with no
+/// way out but killing the wrapper.
 pub fn distill(
     adapter: &dyn AgentAdapter,
     model: &str,
     ctx: &StructuralContext,
+    timeout: Duration,
 ) -> CtxResult<Handoff> {
     let mut command = adapter.distiller_cmd(model);
     command
@@ -191,17 +199,42 @@ pub fn distill(
         let stdin = child.stdin.as_mut().ok_or("distiller stdin unavailable")?;
         stdin.write_all(distill_prompt(ctx).as_bytes())?;
     }
-    let output = child.wait_with_output()?;
+    // The model waits for end of input before it answers.
+    drop(child.stdin.take());
 
-    if !output.status.success() {
+    // Drained on its own thread: a child blocked writing into a full pipe
+    // never exits, which would turn every long answer into a timeout.
+    let mut stdout = child.stdout.take().ok_or("distiller stdout unavailable")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        let _ = tx.send(buffer);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("distiller did not answer within {}s", timeout.as_secs()).into());
+        }
+        std::thread::sleep(DISTILL_POLL);
+    };
+
+    if !status.success() {
         return Err(format!(
             "distiller exited with status {}",
-            output.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         )
         .into());
     }
 
-    let handoff = parse_markdown(&String::from_utf8_lossy(&output.stdout));
+    let answer = rx.recv_timeout(timeout).unwrap_or_default();
+    let handoff = parse_markdown(&String::from_utf8_lossy(&answer));
     if !handoff.is_usable() {
         return Err("distiller produced no usable Task and Next step".into());
     }
@@ -213,8 +246,9 @@ pub fn distill_or_structural(
     adapter: &dyn AgentAdapter,
     model: &str,
     ctx: &StructuralContext,
+    timeout: Duration,
 ) -> (Handoff, &'static str) {
-    match distill(adapter, model, ctx) {
+    match distill(adapter, model, ctx, timeout) {
         Ok(handoff) => (handoff, "distilled"),
         Err(_) => (structural(ctx), "structural"),
     }
@@ -246,7 +280,7 @@ pub fn store(
     handoff: &Handoff,
 ) -> CtxResult<PathBuf> {
     let dir = state.handoffs().join(repo_slug(repo));
-    std::fs::create_dir_all(&dir)?;
+    super::state::create_private_dir_all(&dir)?;
 
     let short: String = session
         .chars()
@@ -254,7 +288,7 @@ pub fn store(
         .take(8)
         .collect();
     let path = dir.join(format!("{}-{}.md", now_secs(), short));
-    std::fs::write(&path, handoff.to_markdown())?;
+    super::state::write_private(&path, &handoff.to_markdown())?;
     Ok(path)
 }
 
@@ -297,7 +331,12 @@ pub fn run_with<W: Write>(
     let (handoff, source) = if args.no_model {
         (structural(&ctx), "structural")
     } else {
-        distill_or_structural(adapter.as_ref(), &cfg.handoff.model, &ctx)
+        distill_or_structural(
+            adapter.as_ref(),
+            &cfg.handoff.model,
+            &ctx,
+            Duration::from_secs(cfg.handoff.timeout_secs),
+        )
     };
 
     if args.stdout {
@@ -352,6 +391,10 @@ mod tests {
         ClaudeAdapter::new(Some(fixture("fake-model.sh").to_str().expect("utf8 path")))
     }
 
+    /// Long enough that a working fake model always finishes inside it, short
+    /// enough that a wedged one does not stall the suite.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+
     fn ctx_sample() -> StructuralContext {
         StructuralContext {
             user_messages: vec!["ship the webhook".to_string()],
@@ -382,7 +425,7 @@ mod tests {
     #[test]
     fn distillation_parses_a_well_formed_answer() {
         let adapter = fake_model_adapter();
-        let handoff = distill(&adapter, "haiku", &ctx_sample()).expect("distills");
+        let handoff = distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT).expect("distills");
         assert_eq!(handoff.task, "Ship the webhook");
         assert_eq!(
             handoff.next_step,
@@ -400,7 +443,7 @@ mod tests {
             std::env::set_var("FAKE_MODEL_PROMPT_LOG", log.path());
         }
         let adapter = fake_model_adapter();
-        distill(&adapter, "haiku", &ctx_sample()).expect("distills");
+        distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT).expect("distills");
         unsafe {
             std::env::remove_var("FAKE_MODEL_PROMPT_LOG");
         }
@@ -415,7 +458,7 @@ mod tests {
             std::env::set_var("FAKE_MODEL_MODE", "fail");
         }
         let adapter = fake_model_adapter();
-        let result = distill(&adapter, "haiku", &ctx_sample());
+        let result = distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
         unsafe {
             std::env::remove_var("FAKE_MODEL_MODE");
         }
@@ -430,7 +473,7 @@ mod tests {
                 std::env::set_var("FAKE_MODEL_MODE", mode);
             }
             let adapter = fake_model_adapter();
-            let result = distill(&adapter, "haiku", &ctx_sample());
+            let result = distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
             unsafe {
                 std::env::remove_var("FAKE_MODEL_MODE");
             }
@@ -444,14 +487,16 @@ mod tests {
     #[test]
     fn distill_or_structural_falls_back_and_reports_which_path_it_took() {
         let adapter = fake_model_adapter();
-        let (handoff, source) = distill_or_structural(&adapter, "haiku", &ctx_sample());
+        let (handoff, source) =
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
         assert_eq!(source, "distilled");
         assert_eq!(handoff.task, "Ship the webhook");
 
         unsafe {
             std::env::set_var("FAKE_MODEL_MODE", "garbage");
         }
-        let (handoff, source) = distill_or_structural(&adapter, "haiku", &ctx_sample());
+        let (handoff, source) =
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
         unsafe {
             std::env::remove_var("FAKE_MODEL_MODE");
         }
@@ -463,10 +508,55 @@ mod tests {
         assert!(handoff.is_usable());
     }
 
+    /// `wrap` calls this from its pump, so an unbounded wait is a frozen
+    /// terminal for the user with no way out but killing the wrapper.
+    #[test]
+    fn a_distiller_that_never_answers_is_given_up_on() {
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "hang");
+        }
+        let adapter = fake_model_adapter();
+        let started = Instant::now();
+        let result = distill(&adapter, "haiku", &ctx_sample(), Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+
+        let err = result.expect_err("a hung distiller must not look like a good handoff");
+        assert!(
+            err.to_string().contains("within"),
+            "say that it timed out: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "it waited {elapsed:?}, so the bound did not hold"
+        );
+    }
+
+    #[test]
+    fn a_hung_distiller_still_produces_a_structural_handoff() {
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "hang");
+        }
+        let adapter = fake_model_adapter();
+        let (handoff, source) =
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), Duration::from_millis(300));
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+        assert_eq!(source, "structural");
+        assert!(
+            handoff.is_usable(),
+            "a restart still has something to stand on"
+        );
+    }
+
     #[test]
     fn a_missing_distiller_binary_falls_back_instead_of_panicking() {
         let adapter = ClaudeAdapter::new(Some("/nonexistent/model-binary"));
-        let (handoff, source) = distill_or_structural(&adapter, "haiku", &ctx_sample());
+        let (handoff, source) =
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
         assert_eq!(source, "structural");
         assert!(handoff.is_usable());
     }
@@ -605,6 +695,34 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("## Task"));
         assert!(text.contains("Wire the payments webhook"));
+    }
+
+    /// A handoff is a verbatim summary of someone's working session, prompts
+    /// and file paths included.
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_handoff_is_not_readable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let path = store(
+            &state,
+            std::path::Path::new("/work/my-repo"),
+            "s",
+            &sample(),
+        )
+        .expect("store");
+
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().expect("parent")), 0o700);
     }
 
     #[test]

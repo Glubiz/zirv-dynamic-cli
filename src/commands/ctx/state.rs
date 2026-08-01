@@ -34,6 +34,61 @@ pub fn repo_slug(path: &Path) -> String {
         .collect()
 }
 
+/// The state dir holds transcript paths, prompts, distilled handoffs and a
+/// decision log: on a shared machine, none of that is anyone else's business.
+/// Directories are created 0700 and files 0600. Both are no-ops on Windows,
+/// which has no equivalent single call, and neither touches a path that
+/// already exists.
+#[cfg(unix)]
+pub fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+pub fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+#[cfg(unix)]
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir(PathBuf);
 
@@ -88,9 +143,9 @@ impl StateDir {
     }
 
     pub fn ensure(&self) -> CtxResult<()> {
-        std::fs::create_dir_all(self.handoffs())?;
-        std::fs::create_dir_all(self.sockets())?;
-        std::fs::create_dir_all(self.logs())?;
+        create_private_dir_all(&self.handoffs())?;
+        create_private_dir_all(&self.sockets())?;
+        create_private_dir_all(&self.logs())?;
         Ok(())
     }
 }
@@ -146,6 +201,59 @@ mod tests {
         assert_eq!(
             repo_slug(std::path::Path::new("/Users/x/Documents/my repo.git")),
             "-Users-x-Documents-my-repo-git"
+        );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_state_directory_is_private_to_its_owner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+
+        for dir in [
+            state.root().to_path_buf(),
+            state.handoffs(),
+            state.sockets(),
+            state.logs(),
+        ] {
+            assert_eq!(
+                mode_of(&dir),
+                0o700,
+                "{} is readable by other users",
+                dir.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_files_are_private_to_their_owner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("state");
+        create_private_dir_all(&root).expect("mkdir");
+
+        let appended = root.join("appended.jsonl");
+        drop(open_private_append(&appended).expect("append"));
+        assert_eq!(mode_of(&appended), 0o600);
+
+        let written = root.join("written.md");
+        write_private(&written, "handoff").expect("write");
+        assert_eq!(mode_of(&written), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&written).expect("read"),
+            "handoff",
+            "a private file is still a normal file"
         );
     }
 

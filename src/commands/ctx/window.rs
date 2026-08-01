@@ -71,10 +71,10 @@ pub fn load(state: &StateDir) -> UsageWindows {
 pub fn store(state: &StateDir, windows: &UsageWindows) -> CtxResult<()> {
     let target = state.usage();
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+        super::state::create_private_dir_all(parent)?;
     }
     let temp = target.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&temp, serde_json::to_string(windows)?)?;
+    super::state::write_private(&temp, &serde_json::to_string(windows)?)?;
     std::fs::rename(&temp, &target)?;
     Ok(())
 }

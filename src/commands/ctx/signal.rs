@@ -61,7 +61,7 @@ impl SignalServer {
 
         check_len(path)?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            super::state::create_private_dir_all(parent)?;
         }
         if path.exists() {
             std::fs::remove_file(path)?;
