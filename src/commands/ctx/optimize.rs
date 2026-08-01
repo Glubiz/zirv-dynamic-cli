@@ -1108,6 +1108,94 @@ pub fn run<W: Write>(args: &OptimizeArgs, w: &mut W) -> CtxResult<i32> {
     run_with(args, w, &repo, &env)
 }
 
+use super::rot::Score;
+
+pub const RECOMMEND_ACTION: &str = "optimize-recommended";
+
+/// Below this a session is too short to say anything about habits.
+const MIN_TURNS_FOR_RECOMMENDATION: usize = 8;
+
+/// Corrections in one transcript. Cheap enough for a hook: one pass over a file
+/// the hook has already caused to be read.
+pub fn count_corrections(jsonl: &str) -> usize {
+    // Only real user turns count: a tool result is not the user speaking, and
+    // an assistant saying "no," is not a correction of itself.
+    claude::structural_context(jsonl, usize::MAX)
+        .user_messages
+        .iter()
+        .filter(|message| correction_phrase(message).is_some())
+        .count()
+}
+
+/// Either signal is enough, both need a mature session. A clean run the user had
+/// to steer five times is exactly as interesting as a failing one.
+pub fn should_recommend(score: &Score, corrections: usize, cfg: &OptimizeConfig) -> bool {
+    if !cfg.enabled || score.signals.turns < MIN_TURNS_FOR_RECOMMENDATION {
+        return false;
+    }
+    score.signals.tool_failure_rate >= cfg.recommend_tool_failure_rate
+        || corrections >= cfg.recommend_corrections
+}
+
+/// Reads the tail of the decision log rather than keeping separate state: the
+/// log is already the record of what zirv decided and when.
+pub fn recently_recommended(state: &StateDir, now: u64, cooldown: u64) -> bool {
+    let Ok(lines) = log::tail(state, 200) else {
+        return false;
+    };
+    lines.iter().rev().any(|line| {
+        if !line.contains(RECOMMEND_ACTION) {
+            return false;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        if entry.get("action").and_then(|a| a.as_str()) != Some(RECOMMEND_ACTION) {
+            return false;
+        }
+        let ts = entry.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+        now.saturating_sub(ts) < cooldown
+    })
+}
+
+/// Queues the recommendation for a human to act on. Returns whether it queued,
+/// so the hook can mention it exactly once.
+pub fn queue_recommendation(
+    state: &StateDir,
+    session: &str,
+    score: &Score,
+    corrections: usize,
+    cfg: &OptimizeConfig,
+    now: u64,
+) -> bool {
+    if !should_recommend(score, corrections, cfg) {
+        return false;
+    }
+    if recently_recommended(state, now, cfg.recommend_cooldown_secs) {
+        return false;
+    }
+
+    // Name the signal that fired, so the log does not blame the tools for a
+    // session where the tools were fine.
+    let detail = format!(
+        "tool failure rate {:.2}, {corrections} corrections over {} turns; run `zirv ctx optimize`",
+        score.signals.tool_failure_rate, score.signals.turns
+    );
+    log::append(
+        state,
+        &log::Decision {
+            ts: now,
+            session,
+            verb: "hook",
+            verdict: score.verdict.as_str(),
+            score: score.score,
+            action: RECOMMEND_ACTION,
+            detail: &detail,
+        },
+    )
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2217,5 +2305,211 @@ mod tests {
             }
             other => panic!("expected Optimize, got {other:?}"),
         }
+    }
+
+    use crate::commands::ctx::rot::{Score, Signals, Verdict as RotVerdict};
+
+    fn score_with(tool_failure_rate: f64, turns: usize) -> Score {
+        Score {
+            score: 50,
+            verdict: RotVerdict::Advise,
+            signals: Signals {
+                turns,
+                tool_failure_rate,
+                repetition_hits: 0,
+                max_repeat: 1,
+                marker_miss_rate: None,
+            },
+            context_tokens: 120_000,
+        }
+    }
+
+    #[test]
+    fn a_failure_heavy_session_earns_a_recommendation() {
+        let cfg = OptimizeConfig::default();
+        assert!(should_recommend(&score_with(0.4, 20), 0, &cfg));
+        assert!(
+            should_recommend(&score_with(0.25, 20), 0, &cfg),
+            "the threshold is inclusive"
+        );
+    }
+
+    #[test]
+    fn a_correction_heavy_session_earns_one_even_with_clean_tools() {
+        // The second trigger the spec names: nothing failed, but the user had
+        // to steer repeatedly, which is an instruction gap by another route.
+        let cfg = OptimizeConfig::default();
+        assert!(should_recommend(&score_with(0.0, 20), 3, &cfg));
+        assert!(
+            !should_recommend(&score_with(0.0, 20), 2, &cfg),
+            "below recommend_corrections, got a recommendation anyway"
+        );
+    }
+
+    #[test]
+    fn a_quiet_or_young_session_earns_nothing() {
+        let cfg = OptimizeConfig::default();
+        assert!(
+            !should_recommend(&score_with(0.05, 20), 0, &cfg),
+            "few failures"
+        );
+        assert!(
+            !should_recommend(&score_with(0.9, 2), 99, &cfg),
+            "two turns is not evidence of a habit, however it went"
+        );
+    }
+
+    #[test]
+    fn recommendations_can_be_switched_off() {
+        let cfg = OptimizeConfig {
+            enabled: false,
+            ..OptimizeConfig::default()
+        };
+        assert!(!should_recommend(&score_with(0.9, 50), 50, &cfg));
+    }
+
+    #[test]
+    fn corrections_are_counted_from_the_transcript() {
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"content":"please add a test"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"no, not like that"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"no, ignore me","is_error":false}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"no, I disagree"}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"actually use rg"}]}}"#,
+            "\n"
+        );
+        assert_eq!(
+            count_corrections(jsonl),
+            2,
+            "user turns only: tool results and assistant text are not corrections"
+        );
+        assert_eq!(count_corrections(""), 0);
+        assert_eq!(count_corrections("not json"), 0);
+    }
+
+    #[test]
+    fn the_cooldown_reads_the_decision_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+
+        assert!(
+            !recently_recommended(&state, 1_800_000_000, 86_400),
+            "an empty log has nothing to cool down from"
+        );
+
+        crate::commands::ctx::log::append(
+            &state,
+            &crate::commands::ctx::log::Decision {
+                ts: 1_800_000_000,
+                session: "s",
+                verb: "hook",
+                verdict: "advise",
+                score: 50,
+                action: RECOMMEND_ACTION,
+                detail: "",
+            },
+        )
+        .expect("append");
+
+        assert!(
+            recently_recommended(&state, 1_800_000_100, 86_400),
+            "still inside the window"
+        );
+        assert!(
+            !recently_recommended(&state, 1_800_000_000 + 86_401, 86_400),
+            "the window expired"
+        );
+    }
+
+    #[test]
+    fn other_log_entries_do_not_trip_the_cooldown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+        crate::commands::ctx::log::append(
+            &state,
+            &crate::commands::ctx::log::Decision {
+                ts: 1_800_000_000,
+                session: "s",
+                verb: "hook",
+                verdict: "advise",
+                score: 50,
+                action: "advise",
+                detail: "",
+            },
+        )
+        .expect("append");
+        assert!(!recently_recommended(&state, 1_800_000_100, 86_400));
+    }
+
+    #[test]
+    fn queueing_writes_one_entry_and_then_respects_its_own_cooldown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+        let cfg = OptimizeConfig::default();
+        let score = score_with(0.5, 20);
+
+        assert!(queue_recommendation(
+            &state,
+            "sess",
+            &score,
+            0,
+            &cfg,
+            1_800_000_000
+        ));
+        assert!(
+            !queue_recommendation(&state, "sess", &score, 0, &cfg, 1_800_000_060),
+            "a second session minutes later must not queue again"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert_eq!(
+            log.lines().filter(|l| l.contains(RECOMMEND_ACTION)).count(),
+            1,
+            "got {log}"
+        );
+        assert!(log.contains("\"verb\":\"hook\""), "got {log}");
+    }
+
+    #[test]
+    fn the_queued_entry_says_which_signal_fired() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+
+        queue_recommendation(
+            &state,
+            "sess",
+            &score_with(0.0, 20),
+            5,
+            &OptimizeConfig::default(),
+            1_800_000_000,
+        );
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("5 corrections"),
+            "a corrections-driven recommendation must say so, not blame the tools: {log}"
+        );
+    }
+
+    #[test]
+    fn a_quiet_session_queues_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+        assert!(!queue_recommendation(
+            &state,
+            "sess",
+            &score_with(0.0, 20),
+            0,
+            &OptimizeConfig::default(),
+            1_800_000_000
+        ));
     }
 }

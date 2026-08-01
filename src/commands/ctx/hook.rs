@@ -59,23 +59,34 @@ impl HookPayload {
 
 /// Decides what the Stop hook prints. `None` means print nothing, which is also
 /// what every failure path does.
-pub fn stop_output(payload: &HookPayload, score: &Score, socket: Option<&Path>) -> Option<String> {
+pub fn stop_output(
+    payload: &HookPayload,
+    score: &Score,
+    socket: Option<&Path>,
+    optimize_recommended: bool,
+) -> Option<String> {
     if payload.stop_hook_active {
         return None;
     }
     if socket.is_some() {
         return None;
     }
-    if score.verdict == Verdict::Healthy {
+    if score.verdict == Verdict::Healthy && !optimize_recommended {
         return None;
     }
 
-    let advisory = format!(
+    let mut advisory = format!(
         "zirv ctx: verdict {} (score {}, context {} tokens). Consider /compact, or run `zirv ctx resume` for a clean session with a handoff.",
         score.verdict.as_str(),
         score.score,
         score.context_tokens
     );
+    if optimize_recommended {
+        advisory.push_str(
+            " This session hit tools hard: `zirv ctx optimize` reviews the instruction files for \
+             gaps behind repeated failures.",
+        );
+    }
     serde_json::to_string(&serde_json::json!({ "systemMessage": advisory })).ok()
 }
 
@@ -121,6 +132,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         );
     }
 
+    let mut optimize_recommended = false;
     if let Ok(state) = StateDir::resolve(env) {
         let _ = log::append(
             &state,
@@ -138,9 +150,28 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 detail: &payload.transcript_path,
             },
         );
+
+        // Cheap on purpose: the score is already computed, the correction count
+        // is one pass over a file already in page cache, and the cooldown is a
+        // log read. The analysis itself is far too heavy for a hook, so this
+        // only queues the recommendation for a human to act on.
+        let optimize_cfg = super::config::CtxConfig::load(&repo, env)
+            .map(|cfg| cfg.optimize)
+            .unwrap_or_default();
+        let corrections = std::fs::read_to_string(transcript)
+            .map(|jsonl| super::optimize::count_corrections(&jsonl))
+            .unwrap_or(0);
+        optimize_recommended = super::optimize::queue_recommendation(
+            &state,
+            &session,
+            &score,
+            corrections,
+            &optimize_cfg,
+            now_secs(),
+        );
     }
 
-    if let Some(line) = stop_output(&payload, &score, socket.as_deref()) {
+    if let Some(line) = stop_output(&payload, &score, socket.as_deref(), optimize_recommended) {
         let _ = writeln!(w, "{line}");
     }
     Ok(0)
@@ -366,14 +397,14 @@ mod tests {
     #[test]
     fn a_healthy_session_prints_nothing() {
         assert_eq!(
-            stop_output(&payload(), &score_of(Verdict::Healthy, 10), None),
+            stop_output(&payload(), &score_of(Verdict::Healthy, 10), None, false),
             None
         );
     }
 
     #[test]
     fn an_advisory_verdict_prints_a_non_blocking_system_message() {
-        let out = stop_output(&payload(), &score_of(Verdict::Advise, 45), None)
+        let out = stop_output(&payload(), &score_of(Verdict::Advise, 45), None, false)
             .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(parsed["systemMessage"].is_string());
@@ -391,7 +422,7 @@ mod tests {
 
     #[test]
     fn a_restart_verdict_still_only_advises() {
-        let out = stop_output(&payload(), &score_of(Verdict::Restart, 95), None)
+        let out = stop_output(&payload(), &score_of(Verdict::Restart, 95), None, false)
             .expect("advisory expected");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert!(parsed.get("decision").is_none());
@@ -408,6 +439,7 @@ mod tests {
             &payload(),
             &score_of(Verdict::Restart, 95),
             Some(std::path::Path::new("/tmp/s/ab.sock")),
+            false,
         );
         assert_eq!(out, None, "the supervisor intervenes, not the hook");
     }
@@ -417,7 +449,10 @@ mod tests {
     fn stop_hook_active_short_circuits_everything() {
         let mut p = payload();
         p.stop_hook_active = true;
-        assert_eq!(stop_output(&p, &score_of(Verdict::Restart, 95), None), None);
+        assert_eq!(
+            stop_output(&p, &score_of(Verdict::Restart, 95), None, false),
+            None
+        );
     }
 
     #[test]
@@ -529,6 +564,137 @@ mod tests {
         }
         std::fs::write(&path, text).expect("write");
         path
+    }
+
+    #[test]
+    fn a_failure_heavy_session_queues_an_optimize_recommendation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        let mut text = String::new();
+        for i in 0..12 {
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n");
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"r\",\"is_error\":true}]}}\n");
+            let block = if i < 2 { "[zirv] ok" } else { "sloppy" };
+            text.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{block}\"}}],\"usage\":{{\"input_tokens\":170000}}}}}}\n"
+            ));
+        }
+        std::fs::write(&transcript, text).expect("write");
+
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let stdin = format!(
+            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
+            transcript.display(),
+            dir.path().display()
+        );
+
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0, "the hook never blocks");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains(crate::commands::ctx::optimize::RECOMMEND_ACTION),
+            "got {log}"
+        );
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        let message = parsed["systemMessage"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("zirv ctx optimize"),
+            "mention it once: {message}"
+        );
+        assert!(parsed.get("decision").is_none(), "still never blocking");
+    }
+
+    #[test]
+    fn a_correction_heavy_session_queues_one_even_with_clean_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        let mut text = String::new();
+        for i in 0..12 {
+            // Tools never fail here; the user keeps correcting.
+            let prompt = if i < 5 {
+                "no, not like that"
+            } else {
+                "carry on"
+            };
+            text.push_str(&format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\"{prompt}\"}}}}\n"
+            ));
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"r\",\"is_error\":false}]}}\n");
+            text.push_str("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[zirv] ok\"}],\"usage\":{\"input_tokens\":1000}}}\n");
+        }
+        std::fs::write(&transcript, text).expect("write");
+
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let stdin = format!(
+            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
+            transcript.display(),
+            dir.path().display()
+        );
+
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains(crate::commands::ctx::optimize::RECOMMEND_ACTION),
+            "corrections alone must be enough to queue: {log}"
+        );
+        assert!(
+            log.contains("5 corrections"),
+            "and the entry says which signal: {log}"
+        );
+    }
+
+    #[test]
+    fn a_clean_session_queues_nothing_and_says_nothing_about_optimize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        let mut text = String::new();
+        for _ in 0..12 {
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n");
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"r\",\"is_error\":false}]}}\n");
+            text.push_str("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[zirv] ok\"}],\"usage\":{\"input_tokens\":1000}}}\n");
+        }
+        std::fs::write(&transcript, text).expect("write");
+
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let stdin = format!(
+            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
+            transcript.display(),
+            dir.path().display()
+        );
+
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
+        assert!(
+            !log.contains(crate::commands::ctx::optimize::RECOMMEND_ACTION),
+            "got {log}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out).contains("optimize"),
+            "a healthy session hears nothing about it"
+        );
     }
 
     #[test]
