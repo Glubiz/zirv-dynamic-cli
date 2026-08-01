@@ -3,8 +3,10 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-use super::config::{EnvLookup, env_from_process};
+use super::config::{CtxConfig, EnvLookup, PaceConfig, env_from_process};
+use super::pace::{self, PaceDecision};
 use super::state::{StateDir, now_secs};
+use super::window::{UsageWindows, Window, age_secs};
 use super::{CtxResult, window};
 
 #[derive(Debug, clap::Args)]
@@ -105,6 +107,131 @@ fn read_stdin() -> String {
     buffer
 }
 
+fn line_for(
+    w: &mut impl Write,
+    name: &str,
+    window: Option<&Window>,
+    now: u64,
+    cfg: &PaceConfig,
+    label: &str,
+) -> CtxResult<()> {
+    match window {
+        Some(found) => {
+            let age = age_secs(found, now);
+            let freshness = if age > cfg.collector_max_age_secs {
+                format!("{age}s ago, stale")
+            } else {
+                format!("{age}s ago")
+            };
+            let reset = if found.resets_at == 0 {
+                "reset time unknown".to_string()
+            } else {
+                format!("resets at unix {}", found.resets_at)
+            };
+            writeln!(
+                w,
+                "  {name}: {:.1}% used ({label}, observed {freshness}, {reset})",
+                found.used_percentage
+            )?;
+        }
+        None => writeln!(w, "  {name}: not reported")?,
+    }
+    Ok(())
+}
+
+pub fn report<W: Write>(
+    w: &mut W,
+    collector: &UsageWindows,
+    estimator: Option<&UsageWindows>,
+    now: u64,
+    cfg: &PaceConfig,
+) -> CtxResult<()> {
+    writeln!(
+        w,
+        "collector (server-authoritative, from the statusline tee):"
+    )?;
+    line_for(
+        w,
+        "five_hour",
+        collector.five_hour.as_ref(),
+        now,
+        cfg,
+        "collector",
+    )?;
+    line_for(
+        w,
+        "seven_day",
+        collector.seven_day.as_ref(),
+        now,
+        cfg,
+        "collector",
+    )?;
+
+    if collector.five_hour.is_none() && collector.seven_day.is_none() {
+        writeln!(
+            w,
+            "  no readings yet. Wire your statusline through `zirv ctx usage tee -- <your statusline command>`; Claude reports these fields only for Pro and Max sessions, after the first response."
+        )?;
+    }
+
+    match estimator {
+        Some(windows) => {
+            writeln!(w, "\nestimator (approximation from local transcripts):")?;
+            line_for(
+                w,
+                "five_hour",
+                windows.five_hour.as_ref(),
+                now,
+                cfg,
+                "approximation",
+            )?;
+            line_for(
+                w,
+                "seven_day",
+                windows.seven_day.as_ref(),
+                now,
+                cfg,
+                "approximation",
+            )?;
+            writeln!(
+                w,
+                "  token class weighting is undocumented, so treat these as an approximation, never ground truth."
+            )?;
+        }
+        None => {
+            writeln!(
+                w,
+                "\nestimator: off (set pace.five_hour_budget_tokens or pace.seven_day_budget_tokens to enable it)"
+            )?;
+        }
+    }
+
+    writeln!(w, "\npacing:")?;
+    if !cfg.enabled {
+        writeln!(w, "  pacing is disabled (pace.enabled = false)")?;
+        return Ok(());
+    }
+    writeln!(w, "  ceiling {:.1}%", cfg.max_percent)?;
+    writeln!(
+        w,
+        "  wait bound: five_hour up to {}s, seven_day up to {}s{}",
+        pace::wait_cap("five_hour", cfg),
+        pace::wait_cap("seven_day", cfg),
+        if cfg.max_wait_secs.is_some() {
+            " (absolute override in effect)"
+        } else {
+            " (each window's own length plus slack)"
+        }
+    )?;
+    let decision = pace::decide(collector, estimator, now, cfg);
+    let verb = match decision {
+        PaceDecision::WaitUntil { .. } => "would wait:",
+        _ => "verdict:",
+    };
+    writeln!(w, "  {verb} {}", pace::describe(&decision))?;
+    Ok(())
+}
+
 pub fn run_with<W: Write>(
     args: &UsageArgs,
     w: &mut W,
@@ -122,10 +249,13 @@ pub fn run_with<W: Write>(
                 now_secs(),
             ))
         }
-        // The human-readable report arrives in Task E5.
         None => {
-            let _ = repo;
-            Err("zirv ctx usage reporting is not implemented yet".into())
+            let cfg = CtxConfig::load(repo, env)?;
+            let state = StateDir::resolve(env)?;
+            let now = now_secs();
+            let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now);
+            report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
+            Ok(0)
         }
     }
 }
@@ -342,5 +472,187 @@ mod tests {
             },
             other => panic!("expected Usage, got {other:?}"),
         }
+    }
+
+    use crate::commands::ctx::config::PaceConfig;
+    use crate::commands::ctx::window::{UsageWindows, Window};
+
+    const NOW: u64 = 1_785_507_315;
+
+    fn collector_at(percent: f64, age: u64) -> UsageWindows {
+        UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: percent,
+                resets_at: NOW + 1800,
+                observed_at: NOW - age,
+            }),
+            seven_day: None,
+        }
+    }
+
+    #[test]
+    fn the_report_names_each_window_and_its_freshness() {
+        let mut out = Vec::new();
+        report(
+            &mut out,
+            &collector_at(63.0, 42),
+            None,
+            NOW,
+            &PaceConfig::default(),
+        )
+        .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("five_hour"), "got {text}");
+        assert!(text.contains("63"), "got {text}");
+        assert!(
+            text.contains("42s ago"),
+            "freshness must be visible: {text}"
+        );
+        assert!(
+            text.contains("seven_day"),
+            "absent windows are still listed: {text}"
+        );
+        assert!(!text.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn an_absent_window_says_so_rather_than_showing_zero() {
+        let mut out = Vec::new();
+        report(
+            &mut out,
+            &UsageWindows::default(),
+            None,
+            NOW,
+            &PaceConfig::default(),
+        )
+        .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("not reported"),
+            "no data must never look like 0%: {text}"
+        );
+        assert!(
+            text.contains("statusline") || text.contains("zirv ctx usage tee"),
+            "tell the user how to start collecting: {text}"
+        );
+    }
+
+    #[test]
+    fn a_stale_collector_reading_is_labeled_stale() {
+        let mut out = Vec::new();
+        report(
+            &mut out,
+            &collector_at(50.0, 100_000),
+            None,
+            NOW,
+            &PaceConfig::default(),
+        )
+        .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("stale"), "got {text}");
+    }
+
+    #[test]
+    fn estimator_output_is_labeled_an_approximation() {
+        let estimated = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 12.5,
+                resets_at: NOW + 600,
+                observed_at: NOW,
+            }),
+            seven_day: None,
+        };
+        let mut out = Vec::new();
+        report(
+            &mut out,
+            &UsageWindows::default(),
+            Some(&estimated),
+            NOW,
+            &PaceConfig::default(),
+        )
+        .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("approximation"), "got {text}");
+        assert!(text.contains("12.5"), "got {text}");
+    }
+
+    #[test]
+    fn the_report_ends_with_the_pacing_verdict() {
+        let mut out = Vec::new();
+        report(
+            &mut out,
+            &collector_at(99.5, 10),
+            None,
+            NOW,
+            &PaceConfig::default(),
+        )
+        .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("waiting") || text.contains("would wait"),
+            "got {text}"
+        );
+        assert!(text.contains("99"), "got {text}");
+    }
+
+    #[test]
+    fn the_report_explains_the_per_window_wait_bound() {
+        let mut out = Vec::new();
+        report(
+            &mut out,
+            &collector_at(50.0, 10),
+            None,
+            NOW,
+            &PaceConfig::default(),
+        )
+        .expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("wait bound"), "got {text}");
+        assert!(text.contains("21600"), "five hours plus slack: {text}");
+        assert!(text.contains("608400"), "seven days plus slack: {text}");
+        assert!(text.contains("own length plus slack"), "got {text}");
+    }
+
+    #[test]
+    fn the_report_flags_an_absolute_wait_override() {
+        let cfg = PaceConfig {
+            max_wait_secs: Some(7200),
+            ..PaceConfig::default()
+        };
+        let mut out = Vec::new();
+        report(&mut out, &collector_at(50.0, 10), None, NOW, &cfg).expect("report");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("7200"), "got {text}");
+        assert!(text.contains("override in effect"), "got {text}");
+    }
+
+    #[test]
+    fn the_report_says_when_pacing_is_switched_off() {
+        let cfg = PaceConfig {
+            enabled: false,
+            ..PaceConfig::default()
+        };
+        let mut out = Vec::new();
+        report(&mut out, &collector_at(99.9, 10), None, NOW, &cfg).expect("report");
+        assert!(String::from_utf8_lossy(&out).contains("pacing is disabled"));
+    }
+
+    #[test]
+    fn the_verb_reports_without_a_subcommand() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_with(&UsageArgs { action: None }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("report runs with no state at all");
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&out).contains("not reported"));
     }
 }

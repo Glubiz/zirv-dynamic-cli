@@ -22,6 +22,7 @@
   - [Directory Structure](#directory-structure)
   - [Schema Examples](#schema-examples)
 - [Shortcuts](#shortcuts)
+- [Context Management (zirv ctx)](#context-management-zirv-ctx)
 - [Supported Platforms](#supported-platforms)
 - [Contribution](#contribution)
 - [License](#license)
@@ -35,7 +36,7 @@
 - **Capture Output**: Use `capture: var_name` on any step to grab its stdout into `${var_name}` for later substitution.  
 - **Failure Hooks**: On a step failure you can declare an `fallback` sub-chain of commands, then retry the original step once.  
 - **Flexible Options**: Interactive mode, OS filters, `proceed_on_failure`, delays, and secret support.  
-- **Multi-Format**: Supports YAML, JSON, and TOML—extendable.  
+- **Multi-Format**: Supports YAML, JSON, and TOML, extendable.  
 - **Cross-Platform**: Compatible with Windows, macOS, and Linux.
 
 ---
@@ -344,6 +345,89 @@ shortcuts:
 ```
 Run zirv b instead of zirv build.yaml.
 This will execute the `build.yaml` script.
+
+## Context Management (zirv ctx)
+
+Autonomous context management for AI coding agents, under `zirv ctx <verb>`.
+
+| Verb | What it does |
+|------|--------------|
+| `zirv ctx usage` | Show usage-window state, or `usage tee` to collect it from the statusline |
+
+### Usage pacing
+
+Long autonomous runs die if a subscription window (5 hour rolling, 7 day) runs
+dry mid-task. `zirv ctx loop` and `zirv ctx exec` consult a pacing gate before
+every spawn and every restart, and wait instead of exiting when a window is at
+or above `pace.max_percent` (default 99).
+
+Three data layers, best available wins:
+
+1. **Collector**, server-authoritative. Claude Code's statusline input carries
+   `rate_limits.five_hour` and `rate_limits.seven_day` for Pro and Max sessions
+   after the first response. Wire your statusline through the tee and every live
+   session keeps machine-wide state fresh:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "zirv ctx usage tee -- bash ~/.claude/statusline-command.sh"
+     }
+   }
+   ```
+
+   The tee records the fields, then runs your original command unchanged. It
+   always exits 0 and always prints a statusline, so a failure here can never
+   leave you looking at a blank one.
+
+2. **Estimator**, an approximation. When no fresh collector reading exists, zirv
+   sums token usage across local transcripts (including subagent files) over the
+   trailing window. It is off until you set a budget, because a plan's real token
+   allowance is undocumented and a made-up default would read as data:
+
+   ```toml
+   [pace]
+   five_hour_budget_tokens = 0   # set to enable the 5h estimate
+   seven_day_budget_tokens = 0   # set to enable the 7d estimate
+   count_cache_reads = false     # cache reads are discounted, so excluded
+   ```
+
+3. **Circuit breaker**, authoritative on trip. If the agent prints a documented
+   limit-hit notice, that is treated as 100% no matter what the other layers say:
+   the run is parked until the window resets and then relaunched, **without
+   consuming the restart budget**.
+
+Full pacing configuration:
+
+```toml
+[pace]
+enabled = true
+max_percent = 99.0
+collector_max_age_secs = 900
+estimator = true
+jitter_secs = 30
+fallback_delay_secs = 900    # used when a window's reset time is unknown
+wait_slack_secs = 3600       # head room added to the window's own length
+# max_wait_secs = 7200       # optional absolute override, see below
+```
+
+#### How long a pause can last
+
+The wait is bounded per window, not by one global clock: at most the window's own
+length plus `wait_slack_secs`, so a five-hour trip is bounded near six hours and
+a seven-day trip is allowed to wait out the week. That distinction matters,
+because resuming a seven-day window every few hours would spend tokens against a
+window that has not reset, which is exactly what pacing exists to prevent.
+
+When a window's reset time is known and lands inside that bound, the pause ends
+at the reset (plus jitter) and not before. Set `max_wait_secs` only if you would
+rather a supervisor give up waiting and proceed after a fixed time; it replaces
+the per-window bound entirely and is unset by default.
+
+A pause is announced once, not once per check, and appears in the decision log as
+a single `pace-wait` entry. Parks and relaunches are logged too. Check the
+current picture, including how fresh each reading is, with `zirv ctx usage`.
 
 ## Supported Platforms
 - Windows

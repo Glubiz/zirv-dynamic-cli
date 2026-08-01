@@ -46,6 +46,19 @@ pub fn run_with<W: Write>(
         }
     }
 
+    let windows = crate::commands::ctx::window::load(&state);
+    let describe = |name: &str, window: Option<&crate::commands::ctx::window::Window>| match window
+    {
+        Some(found) => format!("{name} {:.0}%", found.used_percentage),
+        None => format!("{name} unknown"),
+    };
+    writeln!(
+        w,
+        "\nusage windows: {}, {} (see `zirv ctx usage` for detail)",
+        describe("five_hour", windows.five_hour.as_ref()),
+        describe("seven_day", windows.seven_day.as_ref())
+    )?;
+
     writeln!(w, "\nlatest handoff for {}:", repo.display())?;
     match latest_for_repo(&state, repo)? {
         Some((path, handoff)) => {
@@ -213,5 +226,35 @@ mod tests {
         assert!(text.contains("tick4"));
         assert!(text.contains("tick3"));
         assert!(!text.contains("tick0"));
+    }
+
+    #[test]
+    fn status_mentions_the_usage_windows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        crate::commands::ctx::window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 77.0,
+                    resets_at: 1_785_509_000,
+                    observed_at: crate::commands::ctx::state::now_secs(),
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("usage"), "got {text}");
+        assert!(text.contains("77"), "got {text}");
     }
 }
