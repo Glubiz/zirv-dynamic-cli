@@ -116,6 +116,51 @@ impl Default for HandoffConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaceConfig {
+    pub enabled: bool,
+    /// A supervised window is kept at or below this percentage.
+    pub max_percent: f64,
+    /// Collector readings older than this are treated as stale.
+    pub collector_max_age_secs: u64,
+    pub estimator: bool,
+    /// `0` disables the estimator for that window: a plan's real allowance is
+    /// undocumented, so there is no honest default.
+    pub five_hour_budget_tokens: u64,
+    pub seven_day_budget_tokens: u64,
+    pub count_cache_reads: bool,
+    pub jitter_secs: u64,
+    /// Used when a window's `resets_at` is unknown.
+    pub fallback_delay_secs: u64,
+    /// Head-room added to a window's own length to form the default safety cap,
+    /// so a slightly wrong `resets_at` still resolves.
+    pub wait_slack_secs: u64,
+    /// Absolute override for the safety cap. `None` scales the cap to the window
+    /// that tripped (5h or 7d, plus `wait_slack_secs`), which is what the spec's
+    /// wait-until-reset semantics require: a global cap would resume early and
+    /// spend tokens against a window that is still exhausted.
+    pub max_wait_secs: Option<u64>,
+}
+
+impl Default for PaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_percent: 99.0,
+            collector_max_age_secs: 900,
+            estimator: true,
+            five_hour_budget_tokens: 0,
+            seven_day_budget_tokens: 0,
+            count_cache_reads: false,
+            jitter_secs: 30,
+            fallback_delay_secs: 900,
+            wait_slack_secs: 3600,
+            max_wait_secs: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -125,11 +170,14 @@ pub struct CtxConfig {
     pub wrap: WrapConfig,
     pub supervise: SuperviseConfig,
     pub handoff: HandoffConfig,
+    pub pace: PaceConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum EnvKind {
     Int,
+    Float,
+    Bool,
     Str,
 }
 
@@ -186,6 +234,42 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
+    ("ZIRV_CTX_PACE", &["pace", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_PACE_MAX_PERCENT",
+        &["pace", "max_percent"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_PACE_FALLBACK_SECS",
+        &["pace", "fallback_delay_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_MAX_WAIT_SECS",
+        &["pace", "max_wait_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_SLACK_SECS",
+        &["pace", "wait_slack_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_JITTER_SECS",
+        &["pace", "jitter_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FIVE_HOUR_BUDGET",
+        &["pace", "five_hour_budget_tokens"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SEVEN_DAY_BUDGET",
+        &["pace", "seven_day_budget_tokens"],
+        EnvKind::Int,
+    ),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -227,6 +311,14 @@ fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
             .parse::<i64>()
             .map(toml::Value::Integer)
             .map_err(|_| format!("expected an integer, got '{raw}'").into()),
+        EnvKind::Float => raw
+            .parse::<f64>()
+            .map(toml::Value::Float)
+            .map_err(|_| format!("expected a number, got '{raw}'").into()),
+        EnvKind::Bool => raw
+            .parse::<bool>()
+            .map(toml::Value::Boolean)
+            .map_err(|_| format!("expected true or false, got '{raw}'").into()),
     }
 }
 
@@ -362,5 +454,83 @@ mod tests {
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert_eq!(cfg.score.window, 10);
+    }
+
+    #[test]
+    fn pacing_defaults_match_the_spec() {
+        let pace = PaceConfig::default();
+        assert!(pace.enabled, "pacing is on by default");
+        assert_eq!(pace.max_percent, 99.0);
+        assert_eq!(pace.collector_max_age_secs, 900);
+        assert!(pace.estimator);
+        assert_eq!(
+            (pace.five_hour_budget_tokens, pace.seven_day_budget_tokens),
+            (0, 0),
+            "no invented budget: the estimator stays quiet until an operator sets one"
+        );
+        assert!(!pace.count_cache_reads);
+        assert_eq!(pace.jitter_secs, 30);
+        assert_eq!(pace.fallback_delay_secs, 900);
+        assert_eq!(pace.wait_slack_secs, 3600);
+        assert_eq!(
+            pace.max_wait_secs, None,
+            "no global cap by default: the cap is scaled to the window that tripped"
+        );
+    }
+
+    #[test]
+    fn pacing_reads_from_the_repo_config_file() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[pace]\nenabled = false\nmax_percent = 80.5\nfive_hour_budget_tokens = 500000\ncount_cache_reads = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.pace.enabled);
+        assert_eq!(cfg.pace.max_percent, 80.5);
+        assert_eq!(cfg.pace.five_hour_budget_tokens, 500_000);
+        assert!(cfg.pace.count_cache_reads);
+        assert_eq!(
+            cfg.pace.fallback_delay_secs, 900,
+            "untouched keys keep defaults"
+        );
+    }
+
+    #[test]
+    fn pacing_env_overrides_cover_floats_and_bools() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE", "false"),
+            ("ZIRV_CTX_PACE_MAX_PERCENT", "75"),
+            ("ZIRV_CTX_FIVE_HOUR_BUDGET", "1000"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.pace.enabled);
+        assert_eq!(
+            cfg.pace.max_percent, 75.0,
+            "an integer literal must load as a float"
+        );
+        assert_eq!(cfg.pace.five_hour_budget_tokens, 1000);
+    }
+
+    #[test]
+    fn a_non_numeric_percent_is_rejected_with_the_variable_named() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PACE_MAX_PERCENT", "loads")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad float");
+        let msg = err.to_string();
+        assert!(msg.contains("ZIRV_CTX_PACE_MAX_PERCENT"), "got {msg}");
+    }
+
+    #[test]
+    fn a_non_boolean_flag_is_rejected() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PACE", "yes-please")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad bool");
+        assert!(err.to_string().contains("ZIRV_CTX_PACE"));
     }
 }

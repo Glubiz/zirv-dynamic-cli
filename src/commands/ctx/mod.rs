@@ -7,6 +7,7 @@ pub mod exec;
 pub mod handoff;
 pub mod hook;
 pub mod log;
+pub mod pace;
 pub mod resume;
 pub mod rot;
 pub mod run_loop;
