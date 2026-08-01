@@ -566,10 +566,17 @@ const CORRECTION_OPENERS: &[&str] = &[
 
 /// Decision-log actions that mean zirv had to intervene. Each one is a session
 /// that did not simply run to completion, which is friction the transcripts do
-/// not show on their own. Routine entries (`advise`, `pace-wait`, `report`,
-/// `forward`) are deliberately absent.
+/// not show on their own. `exec` and `loop` name the same event class
+/// differently (`exec`'s `kill`/`stand-down` vs `loop`'s `rot-kill`/
+/// `timeout-kill`/`nonzero-exit`); both supervisors' actions count. Routine
+/// entries (`advise`, `pace-wait`, `report`, `forward`) are deliberately
+/// absent.
 pub const FRICTION_ACTIONS: &[&str] = &[
     "rot-kill",
+    "kill",
+    "stand-down",
+    "timeout-kill",
+    "nonzero-exit",
     "restart",
     "restart-failed",
     "inject",
@@ -2172,6 +2179,60 @@ mod tests {
         assert!(
             friction_findings(&evidence, &cfg).is_empty(),
             "two compactions across five sessions is ordinary"
+        );
+    }
+
+    /// I5: exec's rot/timeout kill writes `kill`, not loop's `rot-kill`. Before
+    /// the fix, ten rotted-and-restarted sessions landed at exactly 1.0
+    /// interventions per session (only `restart` counted) and the strict
+    /// `> 1.0` comparison suppressed the finding for exactly the sessions the
+    /// check exists to catch.
+    #[test]
+    fn ten_sessions_each_killed_and_restarted_trigger_the_supervisor_finding() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+
+        for i in 0..10u64 {
+            for action in ["kill", "restart"] {
+                crate::commands::ctx::log::append(
+                    &state,
+                    &crate::commands::ctx::log::Decision {
+                        ts: 1_800_000_000 + i,
+                        session: &format!("s{i}"),
+                        verb: "exec",
+                        verdict: "rot",
+                        score: 0,
+                        action,
+                        detail: "",
+                    },
+                )
+                .expect("append");
+            }
+        }
+
+        let events = supervisor_events(&state, 200);
+        let kill_count = events
+            .iter()
+            .find(|(name, _)| name == "kill")
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        assert_eq!(
+            kill_count, 10,
+            "exec's kill action must be counted: {events:?}"
+        );
+
+        let evidence = Evidence {
+            sessions_sampled: 10,
+            supervisor_events: events,
+            ..Evidence::default()
+        };
+        let findings = friction_findings(&evidence, &OptimizeConfig::default());
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.to_lowercase().contains("intervened")),
+            "kill + restart at 2.0 interventions/session must fire: {findings:?}"
         );
     }
 
