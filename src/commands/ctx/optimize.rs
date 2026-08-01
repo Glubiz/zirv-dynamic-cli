@@ -1,9 +1,3 @@
-// Consumed by the `optimize` verb wired up in Task F4; nothing calls this yet
-// outside tests, so dead_code is silenced module-wide until then, matching
-// the scaffolding pattern config.rs/state.rs/log.rs/event.rs/handoff.rs used
-// (see 4ff2410, later dropped once its caller landed in the same way).
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// Deep enough for a workspace's crate directories, shallow enough that a
@@ -35,8 +29,11 @@ impl Layer {
         }
     }
 
-    /// Whether cloning the repository is enough to change this layer. Findings
-    /// about repo-owned layers are the ones a reviewer should read first.
+    /// Whether cloning the repository is enough to change this layer. Decides
+    /// whether a proposed diff can use a repo-relative `a/`/`b/` header (see
+    /// `diff_headers`) and whether a backticked path token can be resolved
+    /// against the repo root (see `resolve_token`): a layer this returns
+    /// false for has no fixed repo to be relative to.
     pub fn is_repo_owned(&self) -> bool {
         matches!(
             self,
@@ -1265,10 +1262,6 @@ fn recommend_reason(
     None
 }
 
-pub fn should_recommend(score: &Score, corrections: usize, cfg: &OptimizeConfig) -> bool {
-    recommend_reason(score, corrections, cfg).is_some()
-}
-
 /// Reads the tail of the decision log rather than keeping separate state: the
 /// log is already the record of what zirv decided and when.
 pub fn recently_recommended(state: &StateDir, now: u64, cooldown: u64) -> bool {
@@ -2236,19 +2229,11 @@ mod tests {
         );
     }
 
-    use crate::commands::ctx::adapters::claude::ClaudeAdapter;
-
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join(name)
-    }
-
-    fn fake_optimizer() -> ClaudeAdapter {
-        ClaudeAdapter::new(Some(
-            fixture("fake-optimizer.sh").to_str().expect("utf8 path"),
-        ))
     }
 
     #[test]
@@ -2720,9 +2705,9 @@ mod tests {
     #[test]
     fn a_failure_heavy_session_earns_a_recommendation() {
         let cfg = OptimizeConfig::default();
-        assert!(should_recommend(&score_with(0.4, 20), 0, &cfg));
+        assert!(recommend_reason(&score_with(0.4, 20), 0, &cfg).is_some());
         assert!(
-            should_recommend(&score_with(0.25, 20), 0, &cfg),
+            recommend_reason(&score_with(0.25, 20), 0, &cfg).is_some(),
             "the threshold is inclusive"
         );
     }
@@ -2732,9 +2717,9 @@ mod tests {
         // The second trigger the spec names: nothing failed, but the user had
         // to steer repeatedly, which is an instruction gap by another route.
         let cfg = OptimizeConfig::default();
-        assert!(should_recommend(&score_with(0.0, 20), 3, &cfg));
+        assert!(recommend_reason(&score_with(0.0, 20), 3, &cfg).is_some());
         assert!(
-            !should_recommend(&score_with(0.0, 20), 2, &cfg),
+            recommend_reason(&score_with(0.0, 20), 2, &cfg).is_none(),
             "below recommend_corrections, got a recommendation anyway"
         );
     }
@@ -2743,11 +2728,11 @@ mod tests {
     fn a_quiet_or_young_session_earns_nothing() {
         let cfg = OptimizeConfig::default();
         assert!(
-            !should_recommend(&score_with(0.05, 20), 0, &cfg),
+            recommend_reason(&score_with(0.05, 20), 0, &cfg).is_none(),
             "few failures"
         );
         assert!(
-            !should_recommend(&score_with(0.9, 2), 99, &cfg),
+            recommend_reason(&score_with(0.9, 2), 99, &cfg).is_none(),
             "two turns is not evidence of a habit, however it went"
         );
     }
@@ -2758,7 +2743,7 @@ mod tests {
             enabled: false,
             ..OptimizeConfig::default()
         };
-        assert!(!should_recommend(&score_with(0.9, 50), 50, &cfg));
+        assert!(recommend_reason(&score_with(0.9, 50), 50, &cfg).is_none());
     }
 
     #[test]
