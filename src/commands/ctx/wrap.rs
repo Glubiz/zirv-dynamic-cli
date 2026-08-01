@@ -11,6 +11,7 @@ use super::event::NormalizedEvent;
 use super::handoff::{self, Handoff};
 use super::rot::Verdict;
 use super::signal::TurnSignal;
+use super::state::StateDir;
 use super::supervise::Watcher;
 use super::term::{RawGuard, STDIN_FD, window_size};
 use super::{CtxResult, adapters};
@@ -171,6 +172,27 @@ zirv ctx. Continue from the handoff below. Re-read the listed files before chang
 do not redo work marked as done.\n\n{}",
         handoff.to_markdown()
     )
+}
+
+/// One-way switch to pure passthrough. Once supervision has proven unreliable
+/// in a session it stays off: a wrapped session must never be worse than an
+/// unwrapped one.
+pub fn note_failure(state: &mut InjectionState, log_target: Option<(&StateDir, &str)>, what: &str) {
+    state.degraded = true;
+    if let Some((state_dir, session)) = log_target {
+        let _ = super::log::append(
+            state_dir,
+            &super::log::Decision {
+                ts: super::state::now_secs(),
+                session,
+                verb: "wrap",
+                verdict: "n/a",
+                score: 0,
+                action: "degrade",
+                detail: what,
+            },
+        );
+    }
 }
 
 /// Ask the TUI to quit, then escalate. A TUI that will not leave politely is
@@ -346,7 +368,11 @@ pub fn run_with<W: Write>(
                 Some(server)
             }
             Err(_) => {
-                supervision.degraded = true;
+                note_failure(
+                    &mut supervision,
+                    Some((&state_dir, session.as_str())),
+                    "socket unavailable",
+                );
                 None
             }
         }
@@ -542,7 +568,11 @@ fn pump(
                     .unwrap_or(false);
 
                 if !verified {
-                    supervision.degraded = true;
+                    note_failure(
+                        supervision,
+                        Some((state_dir, session.as_str())),
+                        "compaction not verified",
+                    );
                 }
                 let _ = super::log::append(
                     state_dir,
@@ -606,7 +636,11 @@ fn pump(
                     };
 
                 if !relaunched {
-                    supervision.degraded = true;
+                    note_failure(
+                        supervision,
+                        Some((state_dir, session.as_str())),
+                        "relaunch failed",
+                    );
                 }
                 let _ = super::log::append(
                     state_dir,
@@ -1352,6 +1386,148 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = child.kill();
+    }
+
+    #[test]
+    fn noting_a_failure_degrades_the_supervisor_once_and_for_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        let mut supervision = InjectionState::new();
+
+        note_failure(&mut supervision, Some((&state, "sess")), "socket died");
+        assert!(supervision.degraded);
+
+        // Even a fresh turn signal cannot re-enable injection.
+        supervision.on_turn(&turn_signal(9, Verdict::Restart));
+        supervision.last_output = Instant::now() - Duration::from_secs(30);
+        assert_eq!(
+            action_for(&supervision, Instant::now(), DEBOUNCE),
+            Action::None
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(log.contains("degrade"), "got {log}");
+        assert!(log.contains("socket died"), "record the reason: {log}");
+    }
+
+    #[test]
+    fn note_failure_without_a_state_dir_still_degrades() {
+        let mut supervision = InjectionState::new();
+        note_failure(&mut supervision, None, "no state dir");
+        assert!(supervision.degraded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unbindable_socket_leaves_a_fully_transparent_wrapper() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A state dir path long enough that the socket path exceeds the limit.
+        let long_state = tmp.path().join("s".repeat(120));
+        let script = fixture("stub-tui.sh").display().to_string();
+
+        let mut h = spawn_wrap(
+            &[("ZIRV_CTX_STATE_DIR", long_state.display().to_string())],
+            &["sh", &script],
+        );
+        let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+        assert!(seen.contains("stub-tui ready"), "got {seen:?}");
+
+        h.writer.write_all(b"hello\r").expect("write");
+        h.writer.flush().expect("flush");
+        let echoed = read_until(&mut h.reader, "echo: hello", Duration::from_secs(10));
+        assert!(
+            echoed.contains("echo: hello"),
+            "passthrough intact: {echoed:?}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        let status = h.child.wait().expect("wait");
+        assert_eq!(status.exit_code(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_transcript_path_never_stops_the_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                (
+                    "ZIRV_CTX_TRANSCRIPT",
+                    "/nonexistent/dir/t.jsonl".to_string(),
+                ),
+                ("ZIRV_CTX_DEBOUNCE_MS", "200".to_string()),
+                (
+                    "ZIRV_CTX_STATE_DIR",
+                    tmp.path().join("state").display().to_string(),
+                ),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        let socket = std::fs::read_to_string(tmp.path().join("state/socket-path")).expect("path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(2, Verdict::Compact),
+        )
+        .expect("send");
+
+        // The injection is attempted and cannot be verified, so wrap degrades
+        // while the session continues.
+        h.writer.write_all(b"still here\r").expect("write");
+        h.writer.flush().expect("flush");
+        let echoed = read_until(&mut h.reader, "echo: still here", Duration::from_secs(20));
+        assert!(echoed.contains("echo: still here"), "got {echoed:?}");
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        let status = h.child.wait().expect("wait");
+        assert_eq!(status.exit_code(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_supervise_skips_supervision_entirely() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = fixture("stub-tui.sh").display().to_string();
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new(zirv_bin());
+        cmd.arg("ctx");
+        cmd.arg("wrap");
+        cmd.arg("--agent");
+        cmd.arg("claude");
+        cmd.arg("--no-supervise");
+        cmd.arg("--");
+        cmd.arg("sh");
+        cmd.arg(&script);
+        cmd.env("TERM", "xterm");
+        cmd.env(
+            "ZIRV_CTX_STATE_DIR",
+            tmp.path().join("state").display().to_string(),
+        );
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let mut writer = pair.master.take_writer().expect("writer");
+
+        let seen = read_until(&mut reader, "stub-tui ready", Duration::from_secs(10));
+        assert!(seen.contains("stub-tui ready"));
+        assert!(
+            !tmp.path().join("state/socket-path").exists(),
+            "no socket is bound when supervision is off"
+        );
+
+        writer.write_all(b"/exit\r").expect("write");
+        let status = child.wait().expect("wait");
+        assert_eq!(status.exit_code(), 0);
     }
 
     fn walk_md(dir: &std::path::Path) -> Vec<PathBuf> {
