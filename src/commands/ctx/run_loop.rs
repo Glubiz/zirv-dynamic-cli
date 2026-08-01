@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{SessionId, SessionRef};
+use super::pace;
 use super::rot::Verdict;
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick, Watcher};
@@ -83,6 +84,8 @@ pub fn run_with<W: Write>(
 
     let mut cycle = 0u32;
     let mut failures = 0u32;
+    let now_fn = now_secs;
+    let sleep_fn = |d: Duration| std::thread::sleep(d);
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -90,6 +93,8 @@ pub fn run_with<W: Write>(
             return Ok(0);
         }
         cycle += 1;
+
+        pace::wait_for_window(w, &state, &cfg.pace, "loop", "loop", &now_fn, &sleep_fn);
 
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles.
@@ -103,13 +108,18 @@ pub fn run_with<W: Write>(
         command.current_dir(repo);
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
-        let mut child = supervise::spawn(command)?;
+        let (mut child, tap) = supervise::spawn_tapped(command)?;
         let mut watcher = Watcher::new(transcript.clone());
         let mut rotted = false;
+        let mut limit_hit = false;
 
         let outcome = {
             let agent = args.agent.as_deref().or(cfg.agent.as_deref());
             let mut tick = || {
+                if tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+                    limit_hit = true;
+                    return Tick::Stop("limit");
+                }
                 match watcher.read_if_changed() {
                     Ok(Some(_)) => {}
                     _ => return Tick::Continue,
@@ -125,12 +135,24 @@ pub fn run_with<W: Write>(
             supervise::supervise_child(&mut child, Instant::now() + max_cycle, poll, &mut tick)?
         };
 
+        // See the matching comment in exec.rs: supervise_child checks the
+        // child's exit status before calling the tick, so a fast limit-hit
+        // exit can race past the last tick that would have caught it.
+        if !limit_hit && tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+            limit_hit = true;
+        }
+
         let (action, failed) = match outcome {
+            // A usage limit is the window's fault, not the cycle's: park and
+            // let the next cycle do the work.
+            Outcome::StoppedByTick(_) if limit_hit => ("limit-park", false),
             // Rot is hygiene, not failure: the next cycle is the restart.
             Outcome::StoppedByTick(_) if rotted => ("rot-kill", false),
             Outcome::StoppedByTick(reason) => (reason, true),
             Outcome::TimedOut => ("timeout-kill", true),
-            Outcome::Exited(0) => ("ok", false),
+            Outcome::Exited(0) if !limit_hit => ("ok", false),
+            Outcome::Exited(0) => ("limit-park", false),
+            Outcome::Exited(_) if limit_hit => ("limit-park", false),
             Outcome::Exited(_) => ("nonzero-exit", true),
         };
 
@@ -146,6 +168,18 @@ pub fn run_with<W: Write>(
                 detail: &transcript.display().to_string(),
             },
         );
+
+        if limit_hit {
+            pace::wait_for_window(
+                w,
+                &state,
+                &cfg.pace,
+                "loop",
+                session.as_str(),
+                &now_fn,
+                &sleep_fn,
+            );
+        }
 
         if let Some(code) = handle_cycle_outcome(
             args,
@@ -526,5 +560,97 @@ mod tests {
             Duration::ZERO,
             "tests and one-shot loops must not sleep"
         );
+    }
+
+    use crate::commands::ctx::window::{self, UsageWindows, Window};
+
+    fn store_collector(state_dir: &std::path::Path, percent: f64, resets_in: u64) {
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.to_path_buf());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: percent,
+                    resets_at: now + resets_in,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state");
+    }
+
+    #[test]
+    fn each_cycle_passes_the_pacing_gate_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        store_collector(&state, 100.0, 1);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "2");
+        }
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = run_with(&args_for(1), &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+
+        assert_eq!(code.expect("runs"), 0, "a pause is never an exit");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "it waited"
+        );
+        assert_eq!(transcripts_in(&home).len(), 1, "the cycle still ran");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    #[test]
+    fn a_limit_hit_cycle_is_parked_and_is_not_a_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_FALLBACK_SECS".to_string(), "1".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_TURNS", "2");
+        }
+        let mut args = args_for(2);
+        // One failure would end the loop, so this proves a park is not a failure.
+        args.max_failures = Some(1);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "a usage limit is not a cycle failure: the window just needed time"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"limit-park\""), "got {log}");
+        assert!(!log.contains("\"action\":\"give-up\""), "got {log}");
+        assert_eq!(transcripts_in(&home).len(), 2, "both cycles ran");
     }
 }

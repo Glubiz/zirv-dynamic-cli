@@ -237,11 +237,155 @@ pub fn describe(decision: &PaceDecision) -> String {
     }
 }
 
+use std::io::Write;
+use std::time::Duration;
+
+use super::state::{StateDir, now_secs};
+use super::{log, window as usage_window};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaceOutcome {
+    pub waited_secs: u64,
+    pub source: Source,
+}
+
+/// Longest single sleep, so a supervisor rechecks state (a live session may have
+/// refreshed the collector) rather than sleeping blind for hours.
+const SLEEP_CHUNK_SECS: u64 = 30;
+
+/// Reads the collector file and, only when a budget is configured, the
+/// estimator. Walking every transcript is not free, so it is skipped whenever
+/// its result could not be used.
+pub fn current_windows(
+    state: &StateDir,
+    cfg: &PaceConfig,
+    now: u64,
+) -> (UsageWindows, Option<UsageWindows>) {
+    let collector = usage_window::load(state);
+
+    let budgeted = cfg.five_hour_budget_tokens > 0 || cfg.seven_day_budget_tokens > 0;
+    if !cfg.estimator || !budgeted {
+        return (collector, None);
+    }
+
+    let estimated = usage_window::projects_root()
+        .ok()
+        .map(|root| usage_window::sum_transcripts(&root, now, cfg.count_cache_reads))
+        .map(|sums| {
+            usage_window::estimate_windows(
+                &sums,
+                now,
+                cfg.five_hour_budget_tokens,
+                cfg.seven_day_budget_tokens,
+            )
+        });
+    (collector, estimated)
+}
+
+/// Blocks until the window has room, then returns. Never exits the process and
+/// never returns an error: pacing failing closed would be worse than pacing not
+/// happening, so every unknown proceeds.
+pub fn wait_for_window<W: Write>(
+    w: &mut W,
+    state: &StateDir,
+    cfg: &PaceConfig,
+    verb: &'static str,
+    session: &str,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
+) -> PaceOutcome {
+    if !cfg.enabled {
+        return PaceOutcome {
+            waited_secs: 0,
+            source: Source::None,
+        };
+    }
+
+    let started = now_fn();
+    let mut announced: Option<(String, Option<u64>)> = None;
+
+    loop {
+        let now = now_fn();
+        let (collector, estimated) = current_windows(state, cfg, now);
+        let decision = decide(&collector, estimated.as_ref(), now, cfg);
+
+        let source = match &decision {
+            PaceDecision::Proceed { source, .. } => *source,
+            PaceDecision::WaitUntil { source, .. } => *source,
+            PaceDecision::Unknown => Source::None,
+        };
+
+        let Some(deadline) = wait_deadline(&decision, now, cfg, std::process::id() as u64 ^ now)
+        else {
+            return PaceOutcome {
+                waited_secs: now.saturating_sub(started),
+                source,
+            };
+        };
+
+        // The safety valve, scaled to the window that tripped: a seven-day trip
+        // may legitimately wait days, a five-hour trip may not.
+        let cap = match &decision {
+            PaceDecision::WaitUntil { window, .. } => wait_cap(window, cfg),
+            _ => 0,
+        };
+        if now.saturating_sub(started) >= cap {
+            let _ = writeln!(
+                w,
+                "zirv ctx {verb}: usage still high after waiting {}s (cap {cap}s), proceeding anyway",
+                now.saturating_sub(started)
+            );
+            return PaceOutcome {
+                waited_secs: now.saturating_sub(started),
+                source,
+            };
+        }
+
+        // Announce once per distinct decision, not once per sleep chunk: a
+        // seven-day park would otherwise write thousands of identical audit
+        // lines and scroll the operator's terminal for days.
+        let fingerprint = match &decision {
+            PaceDecision::WaitUntil {
+                window, reset_at, ..
+            } => Some(((*window).to_string(), *reset_at)),
+            _ => None,
+        };
+        if announced != fingerprint {
+            announced = fingerprint;
+            let _ = writeln!(w, "zirv ctx {verb}: {}", describe(&decision));
+            let _ = log::append(
+                state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session,
+                    verb,
+                    verdict: "paced",
+                    score: 0,
+                    action: "pace-wait",
+                    detail: &describe(&decision),
+                },
+            );
+        }
+
+        let remaining = deadline.saturating_sub(now).min(cap);
+        if remaining == 0 {
+            return PaceOutcome {
+                waited_secs: now.saturating_sub(started),
+                source,
+            };
+        }
+        sleep_fn(Duration::from_secs(remaining.min(SLEEP_CHUNK_SECS)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::ctx::config::PaceConfig;
+    use crate::commands::ctx::state::StateDir;
+    use crate::commands::ctx::window;
     use crate::commands::ctx::window::{UsageWindows, Window};
+    use std::cell::RefCell;
 
     const NOW: u64 = 1_785_507_315;
 
@@ -674,5 +818,305 @@ mod tests {
         ] {
             assert!(!is_limit_hit(line), "false positive on {line:?}");
         }
+    }
+
+    /// Fake clock: `now` advances by whatever the code sleeps, so a test can
+    /// observe pacing without waiting for real time.
+    struct FakeClock {
+        now: RefCell<u64>,
+        slept: RefCell<Vec<u64>>,
+    }
+
+    impl FakeClock {
+        fn new(start: u64) -> Self {
+            Self {
+                now: RefCell::new(start),
+                slept: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    fn state_with(collector: UsageWindows) -> (tempfile::TempDir, StateDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        window::store(&state, &collector).expect("store");
+        (tmp, state)
+    }
+
+    #[test]
+    fn a_healthy_window_does_not_wait() {
+        let (_tmp, state) = state_with(collector(10.0));
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig::default(),
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+        );
+
+        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.source, Source::Collector);
+        assert!(clock.slept.borrow().is_empty(), "no sleeping when healthy");
+    }
+
+    #[test]
+    fn an_exhausted_window_waits_past_the_reset_then_proceeds() {
+        // Observed just now, at the ceiling, resetting in 10 minutes.
+        let exhausted = UsageWindows {
+            five_hour: window(99.5, NOW + 600, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+        );
+
+        assert!(outcome.waited_secs >= 600, "waited {}", outcome.waited_secs);
+        assert!(!clock.slept.borrow().is_empty(), "it must actually sleep");
+        assert!(
+            *clock.now.borrow() >= NOW + 600,
+            "the clock advanced past the reset"
+        );
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("five_hour"),
+            "explain the pause: {printed}"
+        );
+        assert!(printed.contains("waiting"), "got {printed}");
+    }
+
+    #[test]
+    fn waiting_is_recorded_in_the_decision_log() {
+        let exhausted = UsageWindows {
+            five_hour: window(100.0, NOW + 120, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig {
+                jitter_secs: 0,
+                ..PaceConfig::default()
+            },
+            "exec",
+            "sess-1",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(log.contains("\"verb\":\"exec\""), "got {log}");
+        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+        assert!(log.contains("sess-1"), "got {log}");
+        assert_eq!(
+            log.lines().filter(|l| l.contains("pace-wait")).count(),
+            1,
+            "one audit line per pause, not one per sleep chunk: {log}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_override_bounds_the_total_wait() {
+        let far = UsageWindows {
+            five_hour: window(100.0, NOW + 10_000_000, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(far);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let cfg = PaceConfig {
+            max_wait_secs: Some(120),
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        assert!(
+            outcome.waited_secs <= 150,
+            "bounded by the override, waited {}",
+            outcome.waited_secs
+        );
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("proceeding"),
+            "after the cap it proceeds rather than exiting: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_bogus_five_hour_reset_is_bounded_by_the_window_not_by_six_hours() {
+        // With no override, the cap comes from the window: 5h plus 1h slack.
+        let bogus = UsageWindows {
+            five_hour: window(100.0, NOW + 10_000_000, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(bogus);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig {
+                jitter_secs: 0,
+                ..PaceConfig::default()
+            },
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        assert!(
+            (18_000..=21_700).contains(&outcome.waited_secs),
+            "expected roughly the five-hour cap, waited {}",
+            outcome.waited_secs
+        );
+    }
+
+    #[test]
+    fn an_exhausted_week_waits_for_the_real_reset_rather_than_resuming_early() {
+        // Five days out. This is the case a fixed six-hour valve got wrong: it
+        // would resume roughly twenty times before the week actually reset.
+        let exhausted_week = UsageWindows {
+            five_hour: None,
+            seven_day: window(100.0, NOW + 432_000, NOW),
+        };
+        let (_tmp, state) = state_with(exhausted_week);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig {
+                jitter_secs: 0,
+                ..PaceConfig::default()
+            },
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        assert!(
+            outcome.waited_secs >= 432_000,
+            "it must wait out the week, waited {}",
+            outcome.waited_secs
+        );
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            !printed.contains("proceeding anyway"),
+            "the real reset arrived inside the cap, so no valve message: {printed}"
+        );
+    }
+
+    #[test]
+    fn unknown_usage_proceeds_without_waiting() {
+        let (_tmp, state) = state_with(UsageWindows::default());
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig::default(),
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+
+        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.source, Source::None);
+    }
+
+    #[test]
+    fn pacing_disabled_skips_the_gate_entirely() {
+        let exhausted = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig {
+                enabled: false,
+                ..PaceConfig::default()
+            },
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+        );
+        assert_eq!(outcome.waited_secs, 0);
+        assert!(
+            String::from_utf8_lossy(&out).is_empty(),
+            "silent when disabled"
+        );
+    }
+
+    #[test]
+    fn the_estimator_is_only_consulted_when_a_budget_is_set() {
+        let (_tmp, state) = state_with(UsageWindows::default());
+        let cfg = PaceConfig::default();
+        let (collector_windows, estimated) = current_windows(&state, &cfg, NOW);
+        assert_eq!(collector_windows, UsageWindows::default());
+        assert!(
+            estimated.is_none(),
+            "with both budgets at zero there is nothing to estimate against"
+        );
+
+        let with_budget = PaceConfig {
+            five_hour_budget_tokens: 1000,
+            ..PaceConfig::default()
+        };
+        let (_, estimated) = current_windows(&state, &with_budget, NOW);
+        assert!(
+            estimated.is_some(),
+            "a configured budget turns the estimator on"
+        );
     }
 }

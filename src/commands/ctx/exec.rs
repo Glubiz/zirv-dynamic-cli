@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{SessionId, SessionRef};
+use super::pace;
 use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
@@ -158,12 +159,25 @@ pub fn run_with<W: Write>(
         command.env(key, value);
     }
     let mut restarts = 0;
+    let now_fn = now_secs;
+    let sleep_fn = |d: Duration| std::thread::sleep(d);
 
     loop {
-        let mut child = supervise::spawn(command)?;
+        pace::wait_for_window(
+            w,
+            &state,
+            &cfg.pace,
+            "exec",
+            session.as_str(),
+            &now_fn,
+            &sleep_fn,
+        );
+
+        let (mut child, tap) = supervise::spawn_tapped(command)?;
         // Fresh watcher per iteration, over the current session's transcript.
         let mut watcher = Watcher::new(transcript.clone());
         let mut rotted = false;
+        let mut limit_hit = false;
 
         let outcome = supervise_run(
             &mut child,
@@ -176,11 +190,69 @@ pub fn run_with<W: Write>(
             env,
             server.as_ref(),
             &mut rotted,
+            &tap,
+            &mut limit_hit,
         )?;
 
+        // `supervise_child` checks the child's exit status before calling the
+        // tick, so a fast limit-hit exit (print the notice, exit immediately,
+        // exactly what a real exhausted-window run looks like) can race past
+        // the last tick that would have caught it. A final drain here closes
+        // that race without touching supervise_child's general contract.
+        if !limit_hit && tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+            limit_hit = true;
+        }
+
         match outcome {
-            Outcome::Exited(code) => return Ok(code),
-            Outcome::TimedOut | Outcome::StoppedByTick(_) => {}
+            Outcome::Exited(code) if !limit_hit => return Ok(code),
+            Outcome::Exited(_) | Outcome::TimedOut | Outcome::StoppedByTick(_) => {}
+        }
+
+        if limit_hit {
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: session.as_str(),
+                    verb: "exec",
+                    verdict: "limit",
+                    score: 100,
+                    action: "limit-park",
+                    detail: "agent reported a usage limit; parking until the window resets",
+                },
+            );
+            writeln!(
+                w,
+                "zirv ctx exec: the agent reported a usage limit, parking until the window resets"
+            )?;
+
+            pace::wait_for_window(
+                w,
+                &state,
+                &cfg.pace,
+                "exec",
+                session.as_str(),
+                &now_fn,
+                &sleep_fn,
+            );
+
+            let Some(prompt_text) = prompt.clone() else {
+                writeln!(
+                    w,
+                    "zirv ctx exec: usage limit hit and the original prompt is unknown, so it cannot relaunch. Pass --prompt to enable parking."
+                )?;
+                return Ok(EXIT_ROT_EXHAUSTED);
+            };
+
+            // A park is not a restart: the budget is for rot, not for waiting.
+            session = SessionId::new_v4();
+            transcript = derive_transcript(&session);
+            command = adapter.headless_cmd(&prompt_text, &session, &[]);
+            command.current_dir(repo);
+            for (key, value) in &turn_env {
+                command.env(key, value);
+            }
+            continue;
         }
 
         let reason = if rotted { "rot" } else { "timeout" };
@@ -292,8 +364,14 @@ fn supervise_run(
     env: EnvLookup<'_>,
     server: Option<&signal::SignalServer>,
     rotted: &mut bool,
+    tap: &supervise::OutputTap,
+    limit_hit: &mut bool,
 ) -> CtxResult<Outcome> {
     let mut tick = || {
+        if tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+            *limit_hit = true;
+            return Tick::Stop("limit");
+        }
         if let Some(server) = server
             && let Some(received) = server.try_recv()
             && should_stop_for_signal(&received)
@@ -806,5 +884,153 @@ mod tests {
             std::env::remove_var("FAKE_AGENT_MODE");
         }
         assert_eq!(code.expect("runs"), 0, "polling still supervises the run");
+    }
+
+    use crate::commands::ctx::window::{self, UsageWindows, Window};
+
+    fn store_collector(state_dir: &std::path::Path, percent: f64, resets_in: u64) {
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.to_path_buf());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: percent,
+                    resets_at: now + resets_in,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state");
+    }
+
+    #[test]
+    fn a_limit_hit_parks_and_relaunches_without_spending_the_restart_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "99999999-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        // A reset one second out plus no jitter keeps the park short; the point
+        // is that it parks and relaunches, not how long it waits.
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_FALLBACK_SECS".to_string(), "1".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+
+        // First child hits the limit, second runs clean.
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            // Zero budget: a limit hit must park even with no restarts allowed,
+            // because a park is not a restart.
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "the relaunched child finished cleanly, so exec exits with its code"
+        );
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"limit-park\""), "got {log}");
+        assert!(
+            !log.contains("\"action\":\"give-up\""),
+            "a park must not consume the restart budget: {log}"
+        );
+        assert_eq!(
+            transcripts_in(&home).len(),
+            2,
+            "the relaunch is a new session with its own transcript"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_window_delays_the_first_spawn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "aaaaaaaa-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".to_string(), "0".to_string());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
+        store_collector(&state, 100.0, 1);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+        };
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), 0, "a pause is never an exit");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "it should have waited before spawning"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    #[test]
+    fn a_healthy_window_adds_no_delay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "bbbbbbbb-2222-4333-8444-555555555555";
+        let env = base_env(&state);
+        store_collector(&state, 5.0, 3600);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
+        assert!(!log.contains("pace-wait"), "nothing to wait for: {log}");
     }
 }

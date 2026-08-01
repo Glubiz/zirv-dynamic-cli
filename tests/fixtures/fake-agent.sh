@@ -17,6 +17,8 @@
 #            first two turns, 170k tokens: score 100, verdict restart
 #   hang     writes a healthy transcript then never exits
 #   fail     writes a healthy transcript then exits 3
+#   limit    writes a healthy transcript, prints the documented limit-hit
+#            notice on stdout, then exits 1 the way an exhausted window would
 #
 # FAKE_AGENT_MODE_FILE lets one test script a sequence across restarts, for
 # example "rot" then "healthy" to prove a restarted child is supervised on its
@@ -73,5 +75,9 @@ fi
 case "$mode" in
   hang) while true; do sleep 1; done ;;
   fail) exit 3 ;;
+  limit)
+    printf "You've hit your session limit · resets 3:45pm\n"
+    exit 1
+    ;;
   *) exit 0 ;;
 esac

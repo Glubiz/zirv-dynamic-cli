@@ -3,6 +3,7 @@
 // matching config.rs/state.rs/log.rs/event.rs/handoff.rs.
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -128,6 +129,70 @@ pub fn run_shell(command: &str, cwd: &Path) -> CtxResult<i32> {
     };
     let status = shell.current_dir(cwd).status()?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Whole lines of a supervised child's output, for matching against known
+/// notices. The bytes are always forwarded onward first: tapping must never
+/// change what the operator sees.
+pub struct OutputTap {
+    rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl OutputTap {
+    pub fn try_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(line) = self.rx.try_recv() {
+            lines.push(line);
+        }
+        lines
+    }
+}
+
+/// Like `spawn`, but the child's stdout and stderr are piped so they can be
+/// matched. Each stream is forwarded to this process's corresponding stream
+/// unchanged, line by line.
+pub fn spawn_tapped(mut command: Command) -> CtxResult<(Child, OutputTap)> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    if let Some(stdout) = child.stdout.take() {
+        forward(stdout, tx.clone(), false);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward(stderr, tx, true);
+    }
+
+    Ok((child, OutputTap { rx }))
+}
+
+fn forward<R: std::io::Read + Send + 'static>(
+    stream: R,
+    tx: std::sync::mpsc::Sender<String>,
+    is_stderr: bool,
+) {
+    use std::io::BufRead;
+
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stream);
+        for line in reader.lines().map_while(Result::ok) {
+            if is_stderr {
+                let mut sink = std::io::stderr();
+                let _ = writeln!(sink, "{line}");
+            } else {
+                let mut sink = std::io::stdout();
+                let _ = writeln!(sink, "{line}");
+                let _ = sink.flush();
+            }
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -288,5 +353,54 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         run_shell("touch marker", dir.path()).expect("run");
         assert!(dir.path().join("marker").exists());
+    }
+
+    #[test]
+    fn a_tapped_child_still_reports_its_exit_code() {
+        let (mut child, _tap) = spawn_tapped(sh("printf hello\\n; exit 4")).expect("spawn");
+        let outcome = supervise_child(
+            &mut child,
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(20),
+            &mut || Tick::Continue,
+        )
+        .expect("supervise");
+        assert_eq!(outcome, Outcome::Exited(4));
+    }
+
+    #[test]
+    fn tapped_lines_reach_the_matcher() {
+        let (mut child, tap) = spawn_tapped(sh("printf 'one\\ntwo\\n'; exit 0")).expect("spawn");
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.len() < 2 && Instant::now() < deadline {
+            seen.extend(tap.try_lines());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
+        assert!(seen.iter().any(|l| l.contains("one")), "got {seen:?}");
+        assert!(seen.iter().any(|l| l.contains("two")), "got {seen:?}");
+    }
+
+    #[test]
+    fn stderr_is_tapped_too_because_notices_can_land_there() {
+        let (mut child, tap) = spawn_tapped(sh("printf 'oops\\n' >&2; exit 0")).expect("spawn");
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.is_empty() && Instant::now() < deadline {
+            seen.extend(tap.try_lines());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
+        assert!(seen.iter().any(|l| l.contains("oops")), "got {seen:?}");
+    }
+
+    #[test]
+    fn try_lines_is_empty_when_nothing_was_written() {
+        let (mut child, tap) = spawn_tapped(sh("exit 0")).expect("spawn");
+        let _ = child.wait();
+        // Drain whatever arrived; a silent child must not block or panic.
+        let _ = tap.try_lines();
+        assert!(tap.try_lines().is_empty());
     }
 }
