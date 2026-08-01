@@ -9,6 +9,7 @@ pub mod hook;
 pub mod log;
 pub mod optimize;
 pub mod pace;
+pub mod prompt;
 pub mod resume;
 pub mod rot;
 pub mod run_loop;

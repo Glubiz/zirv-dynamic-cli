@@ -190,6 +190,26 @@ impl Default for OptimizeConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptConfig {
+    pub enabled: bool,
+    /// Whether `<repo>/.zirv/system-prompt.md` is read at all.
+    pub repo_layer: bool,
+    /// Cap on the repo layer only: untrusted text does not get to be long.
+    pub max_repo_bytes: usize,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repo_layer: true,
+            max_repo_bytes: 4096,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -201,6 +221,7 @@ pub struct CtxConfig {
     pub handoff: HandoffConfig,
     pub pace: PaceConfig,
     pub optimize: OptimizeConfig,
+    pub prompt: PromptConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -316,6 +337,17 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["optimize", "model"],
         EnvKind::Str,
     ),
+    ("ZIRV_CTX_PROMPT", &["prompt", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_PROMPT_REPO",
+        &["prompt", "repo_layer"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PROMPT_MAX_REPO_BYTES",
+        &["prompt", "max_repo_bytes"],
+        EnvKind::Int,
+    ),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -378,6 +410,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),
     (&["handoff", "model"], "ZIRV_CTX_MODEL"),
     (&["optimize", "model"], "ZIRV_CTX_OPTIMIZE_MODEL"),
+    (&["prompt", "enabled"], "ZIRV_CTX_PROMPT"),
+    (&["prompt", "repo_layer"], "ZIRV_CTX_PROMPT_REPO"),
+    // Without this the cap would be decorative: the untrusted layer could
+    // simply raise its own limit.
+    (
+        &["prompt", "max_repo_bytes"],
+        "ZIRV_CTX_PROMPT_MAX_REPO_BYTES",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -719,6 +759,63 @@ mod tests {
         let env = env_map(&[("ZIRV_CTX_OPTIMIZE_SESSIONS", "7")]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.optimize.sessions_sampled, 7);
+    }
+
+    #[test]
+    fn prompt_defaults_inject_with_a_capped_repo_layer() {
+        let prompt = PromptConfig::default();
+        assert!(prompt.enabled);
+        assert!(prompt.repo_layer);
+        assert_eq!(prompt.max_repo_bytes, 4096);
+    }
+
+    #[test]
+    fn a_repo_may_not_enable_its_own_prompt_layer_or_raise_its_cap() {
+        // The same trust boundary as agent_bin: a checkout must not be able to
+        // decide that text from the checkout gets injected, nor how much of it.
+        // A repo that could raise max_repo_bytes would make the cap decorative.
+        for (key, value) in [
+            ("enabled", "true"),
+            ("repo_layer", "true"),
+            ("max_repo_bytes", "1000000"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[prompt]\n{key} = {value}\n"),
+            )
+            .expect("write");
+
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(&format!("prompt.{key}")), "got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_PROMPT"),
+                "the error names where the operator may set it: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operator_may_still_raise_the_repo_cap() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PROMPT_MAX_REPO_BYTES", "9000")]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.prompt.max_repo_bytes, 9000);
+    }
+
+    #[test]
+    fn the_operator_may_still_set_prompt_keys() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PROMPT", "false")]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.prompt.enabled,
+            "the environment is the operator, not the checkout"
+        );
     }
 
     #[test]
