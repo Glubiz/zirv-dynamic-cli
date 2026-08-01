@@ -71,6 +71,12 @@ impl StateDir {
         self.0.join("logs")
     }
 
+    /// Machine-wide usage-window state, shared by every session that runs the
+    /// statusline tee. One file, not per-session: the windows are per account.
+    pub fn usage(&self) -> PathBuf {
+        self.0.join("usage.json")
+    }
+
     /// First 8 hex characters of the session id keep the socket path short.
     pub fn socket_for(&self, session: &str) -> PathBuf {
         let short: String = session
@@ -141,5 +147,12 @@ mod tests {
             repo_slug(std::path::Path::new("/Users/x/Documents/my repo.git")),
             "-Users-x-Documents-my-repo-git"
         );
+    }
+
+    #[test]
+    fn the_usage_file_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.usage(), tmp.path().join("usage.json"));
     }
 }

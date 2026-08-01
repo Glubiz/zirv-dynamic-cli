@@ -16,6 +16,8 @@ pub mod state;
 pub mod status;
 pub mod supervise;
 pub mod term;
+pub mod usage;
+pub mod window;
 pub mod wrap;
 
 /// Every ctx entry point returns this. Matches the error style used by the
@@ -52,6 +54,8 @@ pub enum CtxVerb {
     Exec(exec::ExecArgs),
     /// Supervise an interactive TUI through a PTY.
     Wrap(wrap::WrapArgs),
+    /// Report usage windows, or tee the statusline to record them.
+    Usage(usage::UsageArgs),
 }
 
 /// `args[0]` is the literal "ctx" as it appeared in argv.
@@ -75,6 +79,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Loop(a) => run_loop::run(a, &mut out),
         CtxVerb::Exec(a) => exec::run(a, &mut out),
         CtxVerb::Wrap(a) => wrap::run(a, &mut out),
+        CtxVerb::Usage(a) => usage::run(a, &mut out),
     };
 
     match result {
