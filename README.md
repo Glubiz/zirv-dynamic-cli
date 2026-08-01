@@ -67,7 +67,7 @@ curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/instal
 To install a specific version:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- 2.4.0
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- 2.5.0
 ```
 
 ### Cargo (All Platforms)
@@ -348,11 +348,139 @@ This will execute the `build.yaml` script.
 
 ## Context Management (zirv ctx)
 
-Autonomous context management for AI coding agents, under `zirv ctx <verb>`.
+`zirv ctx` watches AI coding agent sessions (Claude Code, Codex) for context rot
+and intervenes before quality drops: it advises, compacts early, or restarts the
+session with a distilled handoff. Scoring is deterministic, and every decision is
+logged.
 
-| Verb | What it does |
-|------|--------------|
-| `zirv ctx usage` | Show usage-window state, or `usage tee` to collect it from the statusline |
+### Verbs
+
+| Command | What it does |
+|---|---|
+| `zirv ctx score --transcript <path>` | Rot-scores a transcript and prints JSON |
+| `zirv ctx loop --prompt <text>` | Runs a fresh headless session per cycle, so the orchestrator cannot rot |
+| `zirv ctx exec -- <agent command>` | Supervises one headless run: kill, distill, restart |
+| `zirv ctx wrap -- claude` | Supervises an interactive TUI through a PTY |
+| `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
+| `zirv ctx resume` | Starts a clean session with the latest handoff injected |
+| `zirv ctx hook <stop\|prompt\|pre-compact\|notify>` | Agent hook entrypoints |
+| `zirv ctx status` | Shows supervised sessions, recent decisions and handoffs |
+| `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
+
+### Signals and verdicts
+
+Four signals over the trailing window (default 10 turns):
+
+1. **Context size** (a gate, not a vote). Below 100000 tokens the verdict is always
+   `healthy`; at or above 160000 it is at least `compact`.
+2. **Tool-failure rate** (weight 40).
+3. **Repetition loops**, three or more identical tool calls with identical input
+   (weight 30).
+4. **Reply-marker misses** on final answers (weight 30, active only when the
+   marker hook is installed and the session is at least 10 turns old).
+
+Verdicts: score 40 or more is `advise`, 60 or more is `compact`, 80 or more is
+`restart`. At the token ceiling a score of 60 or more escalates to `restart`.
+Without the marker signal (Codex, or Claude without the prompt hook) behavioral
+signals top out at 70, so a restart there comes only from the token ceiling.
+
+### Configuration
+
+Layered, lowest priority first: `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`,
+then `ZIRV_CTX_*` environment variables, then flags.
+
+```toml
+# .zirv/ctx.toml
+agent = "claude"
+
+[score]
+window = 10
+min_turns = 10
+token_floor = 100000
+token_ceiling = 160000
+marker = "[zirv]"
+advise_at = 40
+compact_at = 60
+restart_at = 80
+
+[wrap]
+debounce_ms = 3000
+inject_timeout_ms = 20000
+
+[supervise]
+max_restarts = 2
+interval_secs = 900
+max_cycle_secs = 3600
+max_failures = 5
+
+[handoff]
+model = "haiku"
+tail_items = 5
+```
+
+Handoffs, sockets and logs live in the platform state directory under
+`zirv/ctx/`, never in the repo. Override with `ZIRV_CTX_STATE_DIR`. See
+[Usage pacing](#usage-pacing) below for the `[pace]` table that governs
+subscription-window waiting.
+
+### Hook registration (Claude Code)
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook stop" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook prompt" }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook pre-compact" }] }]
+  }
+}
+```
+
+The Stop hook forwards verdicts to a supervising `wrap` or `exec` when one owns
+the session, and otherwise prints a non-blocking advisory. It never blocks a
+stop. For Codex, point the `notify` program in `~/.codex/config.toml` at
+`zirv ctx hook notify`.
+
+### Interactive use
+
+```bash
+alias claude='zirv ctx wrap -- claude'
+```
+
+The wrapped session is byte-for-byte identical to an unwrapped one until an
+intervention, injection happens only at a turn boundary while you are idle, and
+any supervision failure drops it back to pure passthrough.
+
+### Exit codes for headless supervision
+
+| Code | Meaning |
+|---|---|
+| the child's own code | the run finished on its own |
+| `75` | the restart budget was spent, or the loop hit its failure cap |
+| `76` | a wall-clock timeout with no restarts left |
+
+### Migrating an existing loop
+
+Replace a long-lived orchestrator session with a stateless loop, and wrap worker
+dispatch so individual runs get restarted rather than merely killed:
+
+```yaml
+# .zirv/issue-loop.yaml
+name: Issue Loop
+commands:
+  - command: zirv ctx loop --prompt-file .zirv/issue-loop-prompt.md --interval-secs 900
+```
+
+```bash
+zirv ctx exec --prompt "$WORKER_PROMPT" -- claude -p "$WORKER_PROMPT" --session-id "$SID"
+```
+
+Durable state must live outside the session (GitHub issues and labels, for
+example), because every cycle starts with a clean context. Once `zirv ctx hook
+stop` is registered, remove any older canary Stop hook from
+`~/.claude/settings.json`: two Stop hooks scoring the same session is noise, and
+the older one blocks stops, which this one deliberately never does.
 
 ### Usage pacing
 

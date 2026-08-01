@@ -23,4 +23,15 @@ mod tests {
             "Output should contain the version"
         );
     }
+
+    #[test]
+    fn test_version_is_at_least_2_5_0() {
+        let version = env!("CARGO_PKG_VERSION");
+        let parts: Vec<u32> = version.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+        assert!(parts.len() >= 2, "semantic version expected, got {version}");
+        assert!(
+            (parts[0], parts[1]) >= (2, 5),
+            "zirv ctx ships in 2.5.0, got {version}"
+        );
+    }
 }

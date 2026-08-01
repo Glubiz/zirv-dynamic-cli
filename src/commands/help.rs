@@ -64,6 +64,10 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
             writeln!(writer, "  c -> create")?;
             writeln!(writer, "  v -> version")?;
             writeln!(writer, "  h -> help")?;
+            writeln!(
+                writer,
+                "  ctx -> context management (score, loop, exec, wrap, handoff, resume, hook, status, usage)"
+            )?;
         }
     }
 
@@ -199,6 +203,31 @@ shortcuts:
 
         env::set_current_dir(original_dir)?;
 
+        Ok(())
+    }
+
+    /// `zirv ctx` is a built-in, so it belongs in the shortcut list next to
+    /// init, create, version and help.
+    #[test]
+    fn test_show_help_lists_the_ctx_builtin() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+        write(zirv_dir.join("test.yaml"), "name: \"Test\"\ncommands: []\n")?;
+        write(
+            zirv_dir.join(".shortcuts.yaml"),
+            "shortcuts:\n  t: \"test.yaml\"\n",
+        )?;
+
+        let original_dir = env::current_dir()?;
+        env::set_current_dir(&temp_path)?;
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer);
+        env::set_current_dir(original_dir)?;
+        result?;
+
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(output.contains("ctx -> context management"), "got {output}");
         Ok(())
     }
 
