@@ -228,6 +228,248 @@ pub fn statements(surface_index: usize, surface: &Surface) -> Vec<Instruction> {
         .collect()
 }
 
+use serde::Serialize;
+use serde_json::Value;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Warning,
+    High,
+}
+
+impl Severity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Warning => "warning",
+            Severity::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Finding {
+    pub kind: &'static str,
+    pub severity: Severity,
+    pub title: String,
+    /// `path:line` entries, or transcript references for evidence-backed items.
+    pub evidence: Vec<String>,
+    pub detail: String,
+    pub proposed_diff: Option<String>,
+}
+
+pub fn evidence_ref(surface: &Surface, line: usize) -> String {
+    format!("{}:{}", surface.path.display(), line)
+}
+
+/// A unified diff that deletes one line, in the form `git apply` accepts.
+fn deletion_diff(surface: &Surface, line: usize) -> Option<String> {
+    let lines: Vec<&str> = surface.text.lines().collect();
+    let index = line.checked_sub(1)?;
+    let removed = lines.get(index)?;
+    let display = surface.path.display().to_string();
+    let before = index.checked_sub(1).and_then(|i| lines.get(i));
+    let after = lines.get(index + 1);
+
+    let mut body = String::new();
+    if let Some(context) = before {
+        body.push_str(&format!(" {context}\n"));
+    }
+    body.push_str(&format!("-{removed}\n"));
+    if let Some(context) = after {
+        body.push_str(&format!(" {context}\n"));
+    }
+
+    let start = if before.is_some() { line - 1 } else { line };
+    let old_count = 1 + usize::from(before.is_some()) + usize::from(after.is_some());
+    let new_count = old_count - 1;
+
+    Some(format!(
+        "--- a{display}\n+++ b{display}\n@@ -{start},{old_count} +{start},{new_count} @@\n{body}"
+    ))
+}
+
+/// Rules stated more than once, whether across layers or inside one file. The
+/// first occurrence is treated as the home of the rule and every later copy is
+/// what the proposed diff removes.
+pub fn lint_redundancy(surfaces: &[Surface]) -> Vec<Finding> {
+    let all: Vec<Instruction> = surfaces
+        .iter()
+        .enumerate()
+        .flat_map(|(index, surface)| statements(index, surface))
+        .collect();
+
+    // Grouped by normalized text, keyed in first-seen order so the report does
+    // not depend on hash iteration order.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: hashbrown::HashMap<String, Vec<&Instruction>> = hashbrown::HashMap::new();
+    for instruction in &all {
+        let bucket = groups.entry(instruction.normalized.clone()).or_default();
+        if bucket.is_empty() {
+            order.push(instruction.normalized.clone());
+        }
+        bucket.push(instruction);
+    }
+
+    let mut findings = Vec::new();
+    for key in order {
+        let Some(group) = groups.get(&key) else {
+            continue;
+        };
+        if group.len() < 2 {
+            continue;
+        }
+
+        let evidence: Vec<String> = group
+            .iter()
+            .map(|i| evidence_ref(&surfaces[i.surface], i.line))
+            .collect();
+        let duplicate = group[1];
+        let where_stated = if group.iter().any(|i| i.surface != group[0].surface) {
+            "in more than one layer"
+        } else {
+            "more than once in the same file"
+        };
+
+        findings.push(Finding {
+            kind: "redundancy",
+            severity: Severity::Info,
+            title: format!("Stated {where_stated}: {}", group[0].text),
+            evidence,
+            detail: format!(
+                "The same instruction appears {} times. Keeping one copy makes the rule easier to change later.",
+                group.len()
+            ),
+            proposed_diff: deletion_diff(&surfaces[duplicate.surface], duplicate.line),
+        });
+    }
+
+    findings
+}
+
+fn looks_like_path(token: &str) -> bool {
+    if token.is_empty() || token.len() > 200 {
+        return false;
+    }
+    if token.contains("://") || token.contains('*') || token.contains(' ') {
+        return false;
+    }
+    let has_extension = std::path::Path::new(token)
+        .extension()
+        .is_some_and(|e| !e.is_empty());
+    // `and/or` is prose; `src/main.rs` and `Cargo.toml` are paths.
+    has_extension && (token.contains('/') || token.contains('.'))
+}
+
+fn backticked(line: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else {
+            break;
+        };
+        found.push(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    found
+}
+
+fn hook_commands(text: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    let Some(hooks) = value.get("hooks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    let mut found = Vec::new();
+    for entries in hooks.values() {
+        for entry in entries.as_array().into_iter().flatten() {
+            for inner in entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if inner.get("type").and_then(Value::as_str) != Some("command") {
+                    continue;
+                }
+                if let Some(command) = inner.get("command").and_then(Value::as_str) {
+                    found.push(command.to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Instructions naming files that are gone, and hooks naming programs that are
+/// not installed. `on_path` is injected so the test does not depend on what
+/// happens to be installed on the machine running it.
+pub fn lint_dead_references(
+    surfaces: &[Surface],
+    repo: &Path,
+    on_path: &dyn Fn(&str) -> bool,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    for surface in surfaces {
+        if matches!(
+            surface.layer,
+            Layer::UserSettings | Layer::ProjectSettings | Layer::LocalSettings
+        ) {
+            for command in hook_commands(&surface.text) {
+                let Some(program) = command.split_whitespace().next() else {
+                    continue;
+                };
+                if on_path(program) {
+                    continue;
+                }
+                findings.push(Finding {
+                    kind: "dead-reference",
+                    severity: Severity::High,
+                    title: format!("Hook runs a program that is not installed: {program}"),
+                    evidence: vec![surface.path.display().to_string()],
+                    detail: format!(
+                        "The hook command `{command}` names `{program}`, which is not on PATH. \
+                         A hook that cannot start fails on every turn it is meant to run."
+                    ),
+                    proposed_diff: None,
+                });
+            }
+            continue;
+        }
+
+        for (index, line) in surface.text.lines().enumerate() {
+            for token in backticked(line) {
+                if !looks_like_path(token) {
+                    continue;
+                }
+                if repo.join(token).exists() {
+                    continue;
+                }
+                findings.push(Finding {
+                    kind: "dead-reference",
+                    severity: Severity::Warning,
+                    title: format!("Instruction names a path that does not exist: {token}"),
+                    evidence: vec![evidence_ref(surface, index + 1)],
+                    detail: format!(
+                        "`{token}` was not found under {}. Either the file moved or the \
+                         instruction outlived it.",
+                        repo.display()
+                    ),
+                    proposed_diff: None,
+                });
+            }
+        }
+    }
+
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +622,209 @@ mod tests {
     fn normalization_keeps_genuinely_different_rules_apart() {
         assert_ne!(normalize("always run tests"), normalize("never run tests"));
         assert_ne!(normalize("use rg"), normalize("use grep"));
+    }
+
+    fn surface_of(layer: Layer, path: &str, text: &str) -> Surface {
+        Surface {
+            layer,
+            path: PathBuf::from(path),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_same_rule_in_two_layers_is_redundant() {
+        let surfaces = vec![
+            surface_of(
+                Layer::GlobalClaudeMd,
+                "/home/CLAUDE.md",
+                "- Always run tests\n",
+            ),
+            surface_of(
+                Layer::RepoClaudeMd,
+                "/repo/CLAUDE.md",
+                "- **always** run tests.\n",
+            ),
+        ];
+        let findings = lint_redundancy(&surfaces);
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+
+        let finding = &findings[0];
+        assert_eq!(finding.kind, "redundancy");
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(
+            finding.evidence,
+            vec!["/home/CLAUDE.md:1", "/repo/CLAUDE.md:1"],
+            "evidence is file:line so the reader can jump straight there"
+        );
+        assert!(finding.title.to_lowercase().contains("always run tests"));
+        assert!(
+            finding.proposed_diff.is_some(),
+            "a redundancy has an obvious fix"
+        );
+    }
+
+    #[test]
+    fn the_proposed_diff_removes_the_later_copy_only() {
+        let surfaces = vec![
+            surface_of(
+                Layer::GlobalClaudeMd,
+                "/home/CLAUDE.md",
+                "- Always run tests\n",
+            ),
+            surface_of(
+                Layer::RepoClaudeMd,
+                "/repo/CLAUDE.md",
+                "- keep me\n- always run tests\n",
+            ),
+        ];
+        let diff = lint_redundancy(&surfaces)[0]
+            .proposed_diff
+            .clone()
+            .expect("diff");
+
+        assert!(diff.contains("--- a/repo/CLAUDE.md"), "got {diff}");
+        assert!(diff.contains("+++ b/repo/CLAUDE.md"), "got {diff}");
+        assert!(
+            diff.contains("-- always run tests"),
+            "the duplicate line is removed: {diff}"
+        );
+        assert!(
+            !diff.contains("-- keep me"),
+            "nothing else may be touched: {diff}"
+        );
+        assert!(
+            !diff.contains("/home/CLAUDE.md"),
+            "the first statement of a rule stays where it is: {diff}"
+        );
+    }
+
+    #[test]
+    fn a_rule_repeated_within_one_file_is_redundant_too() {
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "- run fmt before pushing\n- something else\n- Run fmt before pushing!\n",
+        )];
+        let findings = lint_redundancy(&surfaces);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].evidence,
+            vec!["/repo/CLAUDE.md:1", "/repo/CLAUDE.md:3"]
+        );
+    }
+
+    #[test]
+    fn distinct_rules_are_not_redundant() {
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "- run fmt before pushing\n- run clippy before pushing\n",
+        )];
+        assert!(lint_redundancy(&surfaces).is_empty());
+    }
+
+    #[test]
+    fn findings_are_ordered_deterministically() {
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "- zebra rule\n- alpha rule\n- zebra rule\n- alpha rule\n",
+        )];
+        let first = lint_redundancy(&surfaces);
+        for _ in 0..10 {
+            assert_eq!(
+                lint_redundancy(&surfaces),
+                first,
+                "hash order must not leak out"
+            );
+        }
+        assert_eq!(first.len(), 2);
+    }
+
+    #[test]
+    fn a_referenced_file_that_does_not_exist_is_a_dead_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("real.rs"), "").expect("write");
+
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "- see `src/gone.rs` for details\n- and `real.rs` which exists\n",
+        )];
+        let findings = lint_dead_references(&surfaces, tmp.path(), &|_| true);
+
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert_eq!(findings[0].kind, "dead-reference");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(
+            findings[0].detail.contains("src/gone.rs"),
+            "got {:?}",
+            findings[0]
+        );
+        assert_eq!(findings[0].evidence, vec!["/repo/CLAUDE.md:1"]);
+    }
+
+    #[test]
+    fn urls_globs_and_prose_are_not_treated_as_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "- read `https://example.com/docs` first\n\
+             - touch `src/**/*.rs` carefully\n\
+             - the `and/or` question\n\
+             - run `cargo test`\n",
+        )];
+        assert!(
+            lint_dead_references(&surfaces, tmp.path(), &|_| true).is_empty(),
+            "only concrete paths count"
+        );
+    }
+
+    #[test]
+    fn a_hook_command_that_is_not_installed_is_a_dead_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let surfaces = vec![surface_of(
+            Layer::UserSettings,
+            "/home/.claude/settings.json",
+            "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"nosuchbin --flag\"}]}]}}",
+        )];
+        let findings =
+            lint_dead_references(&surfaces, tmp.path(), &|program| program != "nosuchbin");
+
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert!(
+            findings[0].detail.contains("nosuchbin"),
+            "got {:?}",
+            findings[0]
+        );
+        assert_eq!(
+            findings[0].severity,
+            Severity::High,
+            "a dead hook fires on every turn"
+        );
+    }
+
+    #[test]
+    fn an_installed_hook_command_is_fine() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let surfaces = vec![surface_of(
+            Layer::UserSettings,
+            "/home/.claude/settings.json",
+            "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"zirv ctx hook stop\"}]}]}}",
+        )];
+        assert!(lint_dead_references(&surfaces, tmp.path(), &|_| true).is_empty());
+    }
+
+    #[test]
+    fn malformed_settings_json_does_not_panic_the_linter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let surfaces = vec![surface_of(
+            Layer::ProjectSettings,
+            "/repo/.claude/settings.json",
+            "{ not json at all",
+        )];
+        assert!(lint_dead_references(&surfaces, tmp.path(), &|_| true).is_empty());
     }
 }
