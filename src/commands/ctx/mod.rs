@@ -27,7 +27,30 @@ pub mod wrap;
 #[cfg(test)]
 pub(crate) mod testenv {
     use std::ffi::OsString;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    /// A temp directory whose path carries no symlink. Production hands the
+    /// supervisors `std::env::current_dir`, which is always fully resolved, and
+    /// the agent files its transcript under a slug of its own working
+    /// directory. On macOS the temp dir sits behind the `/var` to
+    /// `/private/var` symlink, so an unresolved repo path leaves the supervisor
+    /// watching a slug the agent never writes to.
+    pub(crate) struct TestRepo {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl TestRepo {
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    pub(crate) fn repo() -> TestRepo {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = std::fs::canonicalize(dir.path()).expect("resolve tempdir");
+        TestRepo { _dir: dir, path }
+    }
 
     /// Points `HOME` at a test directory and puts the previous value back on
     /// drop. `HOME` is process-wide, so a test that leaks one naming a deleted

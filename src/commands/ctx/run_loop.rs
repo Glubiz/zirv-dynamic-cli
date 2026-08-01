@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn each_cycle_gets_a_fresh_session() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let env = base_env(&tmp.path().join("state"));
 
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn a_rotted_cycle_is_killed_without_counting_as_a_failure() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let env = base_env(&state);
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn zero_cycles_is_rejected() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let env = base_env(&tmp.path().join("state"));
         let mut args = args_for(0);
         args.cycles = Some(0);
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn repeated_failures_run_on_failure_and_exit_nonzero() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let env = base_env(&state);
@@ -506,7 +506,7 @@ mod tests {
     fn a_successful_cycle_resets_the_failure_count() {
         let mut failures = 3u32;
         let mut out = Vec::new();
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(tmp.path().join("state"));
         let cfg = CtxConfig::default();
         let mut args = args_for(1);
@@ -533,7 +533,7 @@ mod tests {
     fn a_failure_below_the_cap_keeps_looping() {
         let mut failures = 0u32;
         let mut out = Vec::new();
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(tmp.path().join("state"));
         let cfg = CtxConfig::default();
         let mut args = args_for(1);
@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn each_cycle_passes_the_pacing_gate_first() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let mut env = base_env(&state);
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn a_limit_hit_cycle_is_parked_and_is_not_a_failure() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let mut env = base_env(&state);

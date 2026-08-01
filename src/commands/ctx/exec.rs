@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn a_healthy_run_exits_with_the_childs_own_code() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let session = "11111111-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn a_failing_child_propagates_its_exit_code() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let session = "22222222-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
@@ -566,7 +566,7 @@ mod tests {
     /// and the restarted one rot and the budget runs out.
     #[test]
     fn a_rotted_run_is_killed_restarted_and_capped() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let session = "33333333-2222-4333-8444-555555555555";
@@ -658,7 +658,7 @@ mod tests {
     /// the run would exit 75 instead of 0.
     #[test]
     fn a_restart_supervises_the_new_sessions_transcript() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let session = "88888888-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn a_run_with_no_discoverable_prompt_refuses_to_restart() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let session = "44444444-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn an_empty_command_is_rejected() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let env = base_env(&tmp.path().join("state"));
         let args = ExecArgs {
             agent: None,
@@ -820,7 +820,7 @@ mod tests {
     /// the session check above rejects every signal the restart produces.
     #[test]
     fn a_restarted_child_is_told_its_own_session_id() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let session = "cccccccc-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn a_hanging_child_is_killed_at_the_deadline() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let session = "55555555-2222-4333-8444-555555555555";
@@ -918,7 +918,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_child_is_told_where_the_socket_is() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let session = "66666666-2222-4333-8444-555555555555";
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn an_unbindable_socket_does_not_stop_the_run() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let session = "77777777-2222-4333-8444-555555555555";
         // A state dir path long enough that the socket path exceeds the limit.
@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test]
     fn a_limit_hit_parks_and_relaunches_without_spending_the_restart_budget() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let session = "99999999-2222-4333-8444-555555555555";
@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn an_exhausted_window_delays_the_first_spawn() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let session = "aaaaaaaa-2222-4333-8444-555555555555";
@@ -1102,7 +1102,7 @@ mod tests {
 
     #[test]
     fn a_healthy_window_adds_no_delay() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
         let session = "bbbbbbbb-2222-4333-8444-555555555555";
