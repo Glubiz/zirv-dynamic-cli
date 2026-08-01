@@ -426,12 +426,60 @@ fn hook_commands(text: &str) -> Vec<String> {
     found
 }
 
+/// Expands a leading `~` or `$HOME` the way a shell would, using the same
+/// home resolution the rest of the module uses. A hook command written as
+/// `~/.claude/hooks/foo.sh` is a literal path once expanded; left unexpanded
+/// it reads as a bare program name that is never on `PATH`, and every such
+/// hook was reported as missing regardless of whether it existed.
+fn expand_home(program: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return program.to_string();
+    };
+    let home = home.display().to_string();
+    for prefix in ["~/", "$HOME/"] {
+        if let Some(rest) = program.strip_prefix(prefix) {
+            return format!("{home}/{rest}");
+        }
+    }
+    match program {
+        "~" | "$HOME" => home,
+        _ => program.to_string(),
+    }
+}
+
+/// Resolves a backticked token to the path it names, scoped to the surface
+/// that named it. A repo-owned surface's tokens are relative to the repo.
+/// The global CLAUDE.md applies to whatever repo a session happens to run in,
+/// so a plain relative token there (e.g. `change-management.yml` in a
+/// conditional "if the project has X" instruction) names no fixed path in
+/// this repo: only a home-anchored (`~/...`) or absolute token can be
+/// resolved from it. Anything else is left unresolved rather than checked
+/// against a repo root the instruction was never written about.
+fn resolve_token(
+    surface: &Surface,
+    token: &str,
+    repo: &Path,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if surface.layer.is_repo_owned() {
+        return Some(repo.join(token));
+    }
+    if let Some(rest) = token.strip_prefix("~/") {
+        return home.map(|home| home.join(rest));
+    }
+    if Path::new(token).is_absolute() {
+        return Some(PathBuf::from(token));
+    }
+    None
+}
+
 /// Instructions naming files that are gone, and hooks naming programs that are
 /// not installed. `on_path` is injected so the test does not depend on what
 /// happens to be installed on the machine running it.
 pub fn lint_dead_references(
     surfaces: &[Surface],
     repo: &Path,
+    home: Option<&Path>,
     on_path: &dyn Fn(&str) -> bool,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -445,7 +493,7 @@ pub fn lint_dead_references(
                 let Some(program) = command.split_whitespace().next() else {
                     continue;
                 };
-                if on_path(program) {
+                if on_path(&expand_home(program, home)) {
                     continue;
                 }
                 findings.push(Finding {
@@ -468,7 +516,10 @@ pub fn lint_dead_references(
                 if !looks_like_path(token) {
                     continue;
                 }
-                if repo.join(token).exists() {
+                let Some(resolved) = resolve_token(surface, token, repo, home) else {
+                    continue;
+                };
+                if resolved.exists() {
                     continue;
                 }
                 findings.push(Finding {
@@ -477,9 +528,9 @@ pub fn lint_dead_references(
                     title: format!("Instruction names a path that does not exist: {token}"),
                     evidence: vec![evidence_ref(surface, index + 1)],
                     detail: format!(
-                        "`{token}` was not found under {}. Either the file moved or the \
+                        "`{token}` was not found at {}. Either the file moved or the \
                          instruction outlived it.",
-                        repo.display()
+                        resolved.display()
                     ),
                     proposed_diff: None,
                 });
@@ -1067,7 +1118,12 @@ pub fn run_with<W: Write>(
     );
 
     let mut findings = lint_redundancy(&surfaces, repo);
-    findings.extend(lint_dead_references(&surfaces, repo, &on_path));
+    findings.extend(lint_dead_references(
+        &surfaces,
+        repo,
+        home.as_deref(),
+        &on_path,
+    ));
     findings.extend(friction_findings(&evidence, &cfg.optimize));
 
     // One model call, and only if the caller wants one. A dead model degrades
@@ -1617,7 +1673,7 @@ mod tests {
             "/repo/CLAUDE.md",
             "- see `src/gone.rs` for details\n- and `real.rs` which exists\n",
         )];
-        let findings = lint_dead_references(&surfaces, tmp.path(), &|_| true);
+        let findings = lint_dead_references(&surfaces, tmp.path(), None, &|_| true);
 
         assert_eq!(findings.len(), 1, "got {findings:?}");
         assert_eq!(findings[0].kind, "dead-reference");
@@ -1642,7 +1698,7 @@ mod tests {
              - run `cargo test`\n",
         )];
         assert!(
-            lint_dead_references(&surfaces, tmp.path(), &|_| true).is_empty(),
+            lint_dead_references(&surfaces, tmp.path(), None, &|_| true).is_empty(),
             "only concrete paths count"
         );
     }
@@ -1655,8 +1711,9 @@ mod tests {
             "/home/.claude/settings.json",
             "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"nosuchbin --flag\"}]}]}}",
         )];
-        let findings =
-            lint_dead_references(&surfaces, tmp.path(), &|program| program != "nosuchbin");
+        let findings = lint_dead_references(&surfaces, tmp.path(), None, &|program| {
+            program != "nosuchbin"
+        });
 
         assert_eq!(findings.len(), 1, "got {findings:?}");
         assert!(
@@ -1679,7 +1736,95 @@ mod tests {
             "/home/.claude/settings.json",
             "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"zirv ctx hook stop\"}]}]}}",
         )];
-        assert!(lint_dead_references(&surfaces, tmp.path(), &|_| true).is_empty());
+        assert!(lint_dead_references(&surfaces, tmp.path(), None, &|_| true).is_empty());
+    }
+
+    /// I4: `~`-prefixed hook commands (`~/.claude/hooks/foo.sh`) are common.
+    /// This exercises the real, production `on_path` (no fake closure), with
+    /// a real executable inside a fabricated home, so the fix is proven
+    /// against the actual existence check rather than an injected stand-in.
+    #[test]
+    fn a_tilde_prefixed_hook_command_is_resolved_against_its_real_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join("hooks")).expect("mkdir hooks");
+        let hook_path = home.join("hooks/lint.sh");
+        std::fs::write(&hook_path, "#!/bin/sh\nexit 0\n").expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let surfaces = vec![surface_of(
+            Layer::UserSettings,
+            "/home/.claude/settings.json",
+            "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"~/hooks/lint.sh\"}]}]}}",
+        )];
+
+        let findings = lint_dead_references(&surfaces, tmp.path(), Some(&home), &on_path);
+        assert!(
+            findings.is_empty(),
+            "a real, executable ~-prefixed hook must not be reported missing: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_tilde_prefixed_hook_command_that_really_is_missing_is_still_reported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        let surfaces = vec![surface_of(
+            Layer::UserSettings,
+            "/home/.claude/settings.json",
+            "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"~/hooks/gone.sh\"}]}]}}",
+        )];
+
+        let findings = lint_dead_references(&surfaces, tmp.path(), Some(&home), &on_path);
+        assert_eq!(
+            findings.len(),
+            1,
+            "a genuinely missing tilde-prefixed hook is still caught: {findings:?}"
+        );
+    }
+
+    /// I4: a conditional instruction in the global CLAUDE.md ("if the project
+    /// has X") names a file that may or may not exist in whichever repo the
+    /// session happens to run in. Checking it against this repo's root
+    /// produced a false positive in every repo that lacked the file.
+    #[test]
+    fn a_relative_token_in_the_global_claude_md_is_not_checked_against_the_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let surfaces = vec![surface_of(
+            Layer::GlobalClaudeMd,
+            "/home/CLAUDE.md",
+            "- If the project has a `change-management.yml` in the repo root, do X\n",
+        )];
+        let findings = lint_dead_references(&surfaces, tmp.path(), None, &|_| true);
+        assert!(
+            findings.is_empty(),
+            "a conditional global reference must not be checked against every repo: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_home_anchored_token_in_the_global_claude_md_is_still_checked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let surfaces = vec![surface_of(
+            Layer::GlobalClaudeMd,
+            "/home/CLAUDE.md",
+            "- see `~/gone.md` for the full policy\n",
+        )];
+        let findings = lint_dead_references(&surfaces, tmp.path(), Some(&home), &|_| true);
+        assert_eq!(
+            findings.len(),
+            1,
+            "a home-anchored reference is resolvable and genuinely missing: {findings:?}"
+        );
     }
 
     #[test]
@@ -1690,7 +1835,7 @@ mod tests {
             "/repo/.claude/settings.json",
             "{ not json at all",
         )];
-        assert!(lint_dead_references(&surfaces, tmp.path(), &|_| true).is_empty());
+        assert!(lint_dead_references(&surfaces, tmp.path(), None, &|_| true).is_empty());
     }
 
     /// A transcript with a chosen number of turns, tool errors and user lines.
