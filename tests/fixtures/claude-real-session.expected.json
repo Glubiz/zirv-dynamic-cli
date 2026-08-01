@@ -1,0 +1,10 @@
+{
+  "assistant": 48,
+  "compaction": 1,
+  "files_touched_min": 9,
+  "last_context_tokens": 113337,
+  "tool_call": 18,
+  "tool_result_error": 1,
+  "tool_result_ok": 17,
+  "turn_start": 8
+}
