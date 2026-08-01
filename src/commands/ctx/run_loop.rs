@@ -375,9 +375,9 @@ mod tests {
         let home = tmp.path().join("home");
         let env = base_env(&tmp.path().join("state"));
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         // SAFETY: CI runs tests single-threaded.
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
             std::env::set_var("FAKE_AGENT_TURNS", "3");
         }
@@ -400,8 +400,8 @@ mod tests {
         let state = tmp.path().join("state");
         let env = base_env(&state);
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "rot");
             std::env::set_var("FAKE_AGENT_SLEEP", "30");
         }
@@ -475,8 +475,8 @@ mod tests {
         let env = base_env(&state);
         let marker = tmp.path().join("on-failure-ran");
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "fail");
             std::env::set_var("FAKE_AGENT_TURNS", "2");
         }
@@ -594,8 +594,8 @@ mod tests {
         env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
         store_collector(&state, 100.0, 1);
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
             std::env::set_var("FAKE_AGENT_TURNS", "2");
         }
@@ -631,8 +631,8 @@ mod tests {
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
             std::env::set_var("FAKE_AGENT_TURNS", "2");
         }

@@ -22,6 +22,42 @@ pub mod usage;
 pub mod window;
 pub mod wrap;
 
+/// Shared helpers for the supervisor tests, which drive real child processes
+/// and therefore have to steer process-wide state carefully.
+#[cfg(test)]
+pub(crate) mod testenv {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    /// Points `HOME` at a test directory and puts the previous value back on
+    /// drop. `HOME` is process-wide, so a test that leaks one naming a deleted
+    /// temp dir breaks every later pty spawn in the same run: portable-pty
+    /// starts its child in `$HOME` unless the caller sets a working directory,
+    /// and the `chdir` fails before the program is ever reached.
+    pub(crate) struct HomeGuard(Option<OsString>);
+
+    impl HomeGuard {
+        pub(crate) fn set(home: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            // SAFETY: CI runs tests single-threaded.
+            unsafe { std::env::set_var("HOME", home) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("HOME", previous),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+}
+
 /// Every ctx entry point returns this. Matches the error style used by the
 /// rest of the crate (`Box<dyn std::error::Error>`).
 pub type CtxResult<T> = Result<T, Box<dyn std::error::Error>>;

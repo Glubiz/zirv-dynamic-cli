@@ -511,9 +511,9 @@ mod tests {
         let session = "11111111-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         // SAFETY: CI runs tests single-threaded.
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
         }
         let args = ExecArgs {
@@ -541,8 +541,8 @@ mod tests {
         let session = "22222222-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "fail");
         }
         let args = ExecArgs {
@@ -572,8 +572,8 @@ mod tests {
         let session = "33333333-2222-4333-8444-555555555555";
         let env = base_env(&state);
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "rot");
             std::env::set_var("FAKE_AGENT_SLEEP", "30");
         }
@@ -667,8 +667,8 @@ mod tests {
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
             std::env::set_var("FAKE_AGENT_SLEEP", "30");
             std::env::set_var("FAKE_AGENT_TURNS", "12");
@@ -716,8 +716,8 @@ mod tests {
         let session = "44444444-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "rot");
             // Keep the child alive past the first scoring tick so rot is seen.
             std::env::set_var("FAKE_AGENT_SLEEP", "30");
@@ -829,8 +829,8 @@ mod tests {
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
             std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &seen);
             std::env::set_var("FAKE_AGENT_SLEEP", "30");
@@ -886,8 +886,8 @@ mod tests {
         let session = "55555555-2222-4333-8444-555555555555";
         let env = base_env(&state);
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "hang");
         }
         let args = ExecArgs {
@@ -935,9 +935,7 @@ mod tests {
             ),
         ];
 
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let args = ExecArgs {
             agent: Some("claude".to_string()),
             session_id: Some(session.to_string()),
@@ -965,8 +963,8 @@ mod tests {
         let mut env = base_env(&long_state);
         env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
         }
         let args = ExecArgs {
@@ -1022,8 +1020,8 @@ mod tests {
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "limit\nhealthy\n").expect("write modes");
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
         }
         let args = ExecArgs {
@@ -1073,8 +1071,8 @@ mod tests {
         env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".to_string(), "2".to_string());
         store_collector(&state, 100.0, 1);
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
         }
         let args = ExecArgs {
@@ -1111,8 +1109,8 @@ mod tests {
         let env = base_env(&state);
         store_collector(&state, 5.0, 3600);
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
         }
         let args = ExecArgs {
