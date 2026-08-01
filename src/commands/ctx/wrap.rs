@@ -790,11 +790,16 @@ pub fn run<W: Write>(args: &WrapArgs, w: &mut W) -> CtxResult<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Every pty-driven test is unix-only: the supervision it exercises needs a
+    // unix socket for turn signals and raw mode for passthrough.
+    #[cfg(unix)]
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    #[cfg(unix)]
     use std::io::Read;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
     pub(crate) fn zirv_bin() -> PathBuf {
         // cargo test builds the bin target, so it sits next to the test binary's
         // grandparent directory (target/debug/deps/<test> -> target/debug/zirv).
@@ -806,6 +811,7 @@ mod tests {
             .join(if cfg!(windows) { "zirv.exe" } else { "zirv" })
     }
 
+    #[cfg(unix)]
     pub(crate) fn fixture(name: &str) -> PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -815,12 +821,14 @@ mod tests {
 
     /// Drives `zirv ctx wrap` from inside an outer PTY, which is the only way to
     /// exercise raw-mode passthrough end to end.
+    #[cfg(unix)]
     pub(crate) struct Harness {
         pub reader: Box<dyn Read + Send>,
         pub writer: Box<dyn Write + Send>,
         pub child: Box<dyn portable_pty::Child + Send + Sync>,
     }
 
+    #[cfg(unix)]
     pub(crate) fn spawn_wrap(extra_env: &[(&str, String)], wrapped: &[&str]) -> Harness {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -855,6 +863,7 @@ mod tests {
     }
 
     /// Reads until `needle` appears or the timeout expires.
+    #[cfg(unix)]
     pub(crate) fn read_until(
         reader: &mut Box<dyn Read + Send>,
         needle: &str,
@@ -980,6 +989,7 @@ mod tests {
 
     /// The shape a real Stop hook sends: the verdict plus the file the agent
     /// is actually writing.
+    #[cfg(unix)]
     fn turn_signal_for(turn: u64, verdict: Verdict, transcript: &std::path::Path) -> TurnSignal {
         TurnSignal {
             transcript_path: Some(transcript.display().to_string()),
@@ -1711,6 +1721,7 @@ mod tests {
     /// Waits for a child to exit, killing it if it has not within `timeout`.
     /// See the restart test's cleanup for why a plain `.wait()` is not safe
     /// to use unconditionally on this platform.
+    #[cfg(unix)]
     fn wait_or_kill(child: &mut Box<dyn portable_pty::Child + Send + Sync>, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -1722,6 +1733,7 @@ mod tests {
         let _ = child.kill();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_relaunch_that_cannot_spawn_degrades_the_session_cleanly() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1925,6 +1937,7 @@ mod tests {
         assert_eq!(status.exit_code(), 0);
     }
 
+    #[cfg(unix)]
     fn walk_md(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {

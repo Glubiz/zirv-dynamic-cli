@@ -1,8 +1,3 @@
-// Consumed by the exec verb added in a later task of this plan; nothing calls
-// this yet outside tests, so dead_code is silenced module-wide until then,
-// matching config.rs/state.rs/log.rs/event.rs/handoff.rs.
-#![allow(dead_code)]
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -23,6 +18,7 @@ pub enum Outcome {
     StoppedByTick(&'static str),
 }
 
+#[cfg(test)]
 pub fn spawn(mut command: Command) -> CtxResult<Child> {
     Ok(command
         .stdin(Stdio::null())
@@ -98,10 +94,6 @@ pub struct Watcher {
 impl Watcher {
     pub fn new(path: PathBuf) -> Self {
         Self { path, len: 0 }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub fn read_if_changed(&mut self) -> CtxResult<Option<String>> {

@@ -154,9 +154,8 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// For human-readable output in a later verb (`hook`/`status`); the JSON
-    /// path uses `Serialize` instead, so nothing calls this yet.
-    #[allow(dead_code)]
+    /// Human-readable form for the decision log and advisories; the JSON path
+    /// uses `Serialize` instead.
     pub fn as_str(&self) -> &'static str {
         match self {
             Verdict::Healthy => "healthy",

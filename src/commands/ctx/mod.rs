@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 
 pub mod adapters;
 pub mod config;
@@ -130,15 +130,6 @@ pub fn dispatch(args: &[String]) -> i32 {
             1
         }
     }
-}
-
-/// Placeholder arg struct shared by verbs that are implemented in later tasks.
-/// Each later task replaces its own struct and `run` with the real thing.
-#[derive(Debug, Args)]
-pub struct Unimplemented {
-    /// Accepts and ignores any trailing arguments.
-    #[arg(num_args = 0.., allow_hyphen_values = true)]
-    pub rest: Vec<String>,
 }
 
 #[cfg(test)]

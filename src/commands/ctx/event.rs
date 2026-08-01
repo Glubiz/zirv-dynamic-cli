@@ -1,8 +1,3 @@
-// Consumed by verb entry points and adapters added in later tasks of this
-// plan; nothing calls this yet, so dead_code is silenced module-wide until
-// then.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 /// FNV-1a 64. Hand-rolled rather than `DefaultHasher` because the rot engine

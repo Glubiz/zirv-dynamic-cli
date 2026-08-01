@@ -1,8 +1,3 @@
-// Consumed by verb entry points added in later tasks of this plan; nothing
-// calls this yet outside tests, so dead_code is silenced module-wide (this
-// also covers the claude/codex submodules) until then.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

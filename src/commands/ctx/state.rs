@@ -1,7 +1,3 @@
-// Consumed by verb entry points added in a later task of this plan; nothing
-// calls this yet, so dead_code is silenced module-wide until then.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use super::CtxResult;
@@ -93,6 +89,8 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 pub struct StateDir(PathBuf);
 
 impl StateDir {
+    /// Test seam: production always goes through `resolve`.
+    #[cfg(test)]
     pub fn from_root(root: PathBuf) -> Self {
         Self(root)
     }
@@ -142,6 +140,9 @@ impl StateDir {
         self.sockets().join(format!("{short}.sock"))
     }
 
+    /// Test seam: production creates each subdirectory as it first writes
+    /// to it, so nothing needs the whole tree up front.
+    #[cfg(test)]
     pub fn ensure(&self) -> CtxResult<()> {
         create_private_dir_all(&self.handoffs())?;
         create_private_dir_all(&self.sockets())?;

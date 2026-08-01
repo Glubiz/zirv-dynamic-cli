@@ -245,6 +245,7 @@ impl ClaudeAdapter {
     }
 
     /// Test seam: pins the home directory the transcript path is built from.
+    #[cfg(test)]
     pub fn with_home(mut self, home: PathBuf) -> Self {
         self.home = Some(home);
         self

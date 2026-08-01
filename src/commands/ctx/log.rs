@@ -1,7 +1,3 @@
-// Consumed by verb entry points added in a later task of this plan; nothing
-// calls this yet, so dead_code is silenced module-wide until then.
-#![allow(dead_code)]
-
 use std::io::Write;
 
 use serde::Serialize;

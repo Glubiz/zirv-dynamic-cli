@@ -1,7 +1,3 @@
-// Consumed by the hook verb added in a later task of this plan; nothing calls
-// this yet, so dead_code is silenced module-wide until then.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -11,14 +7,17 @@ use super::rot::Verdict;
 
 /// macOS `sockaddr_un.sun_path` is 104 bytes. Fail early with a readable error
 /// instead of an opaque OS error from inside a supervisor.
+#[cfg(unix)]
 pub const MAX_SOCKET_PATH: usize = 100;
 
 /// Per connection, so one noisy client cannot make a supervisor buffer without
 /// bound. A turn signal is a few hundred bytes.
+#[cfg(unix)]
 pub const MAX_SIGNAL_BYTES: u64 = 64 * 1024;
 
 /// Per read, so one silent client cannot hold the accept loop forever and
 /// starve every later signal.
+#[cfg(unix)]
 pub const CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +34,7 @@ pub struct TurnSignal {
     pub transcript_path: Option<String>,
 }
 
+#[cfg(unix)]
 fn check_len(path: &Path) -> CtxResult<()> {
     let len = path.as_os_str().len();
     if len > MAX_SOCKET_PATH {
@@ -132,7 +132,6 @@ pub fn send(path: &Path, signal: &TurnSignal) -> CtxResult<()> {
 /// instead of holding a live `SignalServer`.
 #[cfg(not(unix))]
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct SignalServer {
     path: PathBuf,
     rx: std::sync::mpsc::Receiver<TurnSignal>,

@@ -1,6 +1,3 @@
-// Consumed by the supervisors in Task E4 and the usage verb in Task E5.
-#![allow(dead_code)]
-
 use super::config::PaceConfig;
 use super::window::{FIVE_HOUR_SECS, SEVEN_DAY_SECS, UsageWindows, Window, age_secs};
 

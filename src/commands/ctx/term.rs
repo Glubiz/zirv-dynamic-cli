@@ -1,7 +1,3 @@
-// Consumed by `wrap` in the next task of this plan; nothing calls this yet
-// outside tests, so dead_code is silenced module-wide until then.
-#![allow(dead_code)]
-
 use super::CtxResult;
 
 pub const STDIN_FD: i32 = 0;
@@ -32,10 +28,6 @@ impl RawGuard {
             saved,
             active: true,
         })
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
     }
 
     /// Idempotent. `panic = "abort"` means Drop is not guaranteed, so callers
@@ -69,11 +61,11 @@ pub fn window_size(fd: i32) -> CtxResult<(u16, u16)> {
     Ok((ws.ws_col, ws.ws_row))
 }
 
+/// Never constructed: `enter` always fails off unix. It exists so `wrap`
+/// compiles and degrades there instead of being cfg'd out entirely.
 #[cfg(not(unix))]
 #[derive(Debug)]
-pub struct RawGuard {
-    active: bool,
-}
+pub struct RawGuard;
 
 #[cfg(not(unix))]
 impl RawGuard {
@@ -81,12 +73,7 @@ impl RawGuard {
         Err("raw terminal mode is only implemented on unix".into())
     }
 
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
     pub fn restore(&mut self) -> CtxResult<()> {
-        self.active = false;
         Ok(())
     }
 }
@@ -124,7 +111,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restore_is_idempotent_and_reports_when_it_is_done() {
+    fn restore_is_idempotent() {
         let fd = open_controlling_tty();
         if fd < 0 {
             eprintln!("skipping: no controlling terminal available");
@@ -132,11 +119,8 @@ mod tests {
         }
 
         let mut guard = RawGuard::enter(fd).expect("raw mode on a tty");
-        assert!(guard.is_active());
         guard.restore().expect("restore");
-        assert!(!guard.is_active());
         guard.restore().expect("a second restore is a no-op");
-        assert!(!guard.is_active());
         unsafe { libc::close(fd) };
     }
 

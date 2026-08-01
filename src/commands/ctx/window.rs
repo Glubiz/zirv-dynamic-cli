@@ -1,6 +1,3 @@
-// Consumed by the usage verb and the pacing gate in later tasks of this plan.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};

@@ -1,8 +1,3 @@
-// Handoff/parse_markdown/structural are consumed by the verb wiring added in
-// Task A19; nothing calls them outside tests yet, so dead_code is silenced
-// module-wide until then, matching config.rs/state.rs/log.rs/event.rs.
-#![allow(dead_code)]
-
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
