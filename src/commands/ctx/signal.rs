@@ -13,12 +13,26 @@ use super::rot::Verdict;
 /// instead of an opaque OS error from inside a supervisor.
 pub const MAX_SOCKET_PATH: usize = 100;
 
+/// Per connection, so one noisy client cannot make a supervisor buffer without
+/// bound. A turn signal is a few hundred bytes.
+pub const MAX_SIGNAL_BYTES: u64 = 64 * 1024;
+
+/// Per read, so one silent client cannot hold the accept loop forever and
+/// starve every later signal.
+pub const CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnSignal {
     pub session_id: String,
     pub turn: u64,
     pub score: u32,
     pub verdict: Verdict,
+    /// Where the agent is writing this session's transcript. The agent mints
+    /// its own session id, so a supervisor cannot derive this: the hook that
+    /// runs inside the agent is the only party that knows it. Optional so a
+    /// signal from an older sender still parses.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
 }
 
 fn check_len(path: &Path) -> CtxResult<()> {
@@ -43,7 +57,7 @@ pub struct SignalServer {
 #[cfg(unix)]
 impl SignalServer {
     pub fn bind(path: &Path) -> CtxResult<Self> {
-        use std::io::BufRead;
+        use std::io::{BufRead, Read};
 
         check_len(path)?;
         if let Some(parent) = path.parent() {
@@ -58,10 +72,17 @@ impl SignalServer {
 
         // The accept loop lives for the process. A foreground supervisor owns
         // the socket for its whole run, so there is nothing to join.
+        //
+        // Connections are handled one at a time on purpose (a supervisor sees
+        // one hook at a time), which is exactly why both bounds below matter:
+        // without them a client that connects and then says nothing, or one
+        // that streams without ever sending a newline, would keep every later
+        // turn signal from ever being accepted.
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let reader = std::io::BufReader::new(stream);
+                let _ = stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT));
+                let reader = std::io::BufReader::new(stream.take(MAX_SIGNAL_BYTES));
                 for line in reader.lines().map_while(Result::ok) {
                     let Ok(signal) = serde_json::from_str::<TurnSignal>(&line) else {
                         continue;
@@ -148,7 +169,22 @@ mod tests {
             turn,
             score: 64,
             verdict: Verdict::Compact,
+            transcript_path: Some("/tmp/t.jsonl".to_string()),
         }
+    }
+
+    /// Waits for one signal, so a test never hangs on a supervisor that is
+    /// stuck instead of failing.
+    #[cfg(unix)]
+    fn recv_within(server: &SignalServer, timeout: std::time::Duration) -> Option<TurnSignal> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Some(signal) = server.try_recv() {
+                return Some(signal);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
     }
 
     #[test]
@@ -157,6 +193,20 @@ mod tests {
         assert!(json.contains("\"verdict\":\"compact\""), "got {json}");
         let back: TurnSignal = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, sample(3));
+    }
+
+    /// The supervisor cannot derive the agent's own transcript path, so the
+    /// signal has to carry it.
+    #[test]
+    fn a_signal_carries_the_transcript_the_agent_is_writing() {
+        let json = serde_json::to_string(&sample(3)).expect("serialize");
+        assert!(json.contains("/tmp/t.jsonl"), "got {json}");
+
+        let legacy: TurnSignal = serde_json::from_str(
+            "{\"session_id\":\"s\",\"turn\":1,\"score\":0,\"verdict\":\"healthy\"}",
+        )
+        .expect("a sender that omits the field still parses");
+        assert_eq!(legacy.transcript_path, None);
     }
 
     #[cfg(unix)]
@@ -219,6 +269,63 @@ mod tests {
         assert!(
             err.to_string().contains("too long"),
             "message should say why: {err}"
+        );
+    }
+
+    /// A hook that connects and then wedges (or a stray `nc`) must not be able
+    /// to silence every later turn boundary.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_client_cannot_starve_the_signals_behind_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("silent.sock");
+        let server = SignalServer::bind(&path).expect("bind");
+
+        let silent = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+        // Let the accept loop pick the silent client up before the real one.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        send(&path, &sample(7)).expect("send");
+        let received = recv_within(&server, std::time::Duration::from_secs(15));
+        drop(silent);
+        assert_eq!(
+            received.map(|s| s.turn),
+            Some(7),
+            "the silent connection must time out instead of blocking the loop"
+        );
+    }
+
+    /// The read is bounded, so a client that streams without ever sending a
+    /// newline is abandoned rather than buffered without limit.
+    #[cfg(unix)]
+    #[test]
+    fn a_flooding_client_is_abandoned_at_the_byte_limit() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("flood.sock");
+        let server = SignalServer::bind(&path).expect("bind");
+
+        {
+            let mut stream = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+            let mut junk = vec![b'x'; MAX_SIGNAL_BYTES as usize + 1];
+            junk.push(b'\n');
+            let _ = stream.write_all(&junk);
+            // Past the budget, so this must never be read.
+            let _ = writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&sample(42)).expect("serialize")
+            );
+            let _ = stream.flush();
+        }
+
+        send(&path, &sample(9)).expect("send");
+        let received = recv_within(&server, std::time::Duration::from_secs(15));
+        assert_eq!(
+            received.map(|s| s.turn),
+            Some(9),
+            "the flooded connection's trailing signal must be dropped, not queued ahead of a well-behaved client"
         );
     }
 

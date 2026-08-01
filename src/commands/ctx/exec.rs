@@ -62,9 +62,11 @@ pub fn extract_prompt(command: &[String]) -> Option<String> {
 }
 
 /// Compaction of a headless run is pointless (there is no TUI to type into), so
-/// only a restart verdict acts.
-pub fn should_stop_for_signal(signal: &TurnSignal) -> bool {
-    signal.verdict == Verdict::Restart
+/// only a restart verdict acts, and only for the session this supervisor owns:
+/// the socket is named after eight hex characters of a session id, so a stale
+/// hook can reach it and must not be able to kill a healthy child.
+pub fn should_stop_for_signal(signal: &TurnSignal, session: &str) -> bool {
+    signal.session_id == session && signal.verdict == Verdict::Restart
 }
 
 fn build_command(command: &[String], repo: &Path) -> CtxResult<Command> {
@@ -139,23 +141,28 @@ pub fn run_with<W: Write>(
             None
         }
     };
-    let turn_env = server
-        .as_ref()
-        .map(|server| {
-            adapter
-                .register_turn_signal(
-                    &SessionRef {
-                        id: session.clone(),
-                        cwd: repo.to_path_buf(),
-                    },
-                    server.path(),
-                )
-                .env
-        })
-        .unwrap_or_default();
+    // Rebuilt for every session, because the hook inside a child reports the
+    // session id this exports. Pinning the first one makes every restart's
+    // signals look like they belong to a session that is already dead.
+    let turn_env_for = |session: &SessionId| {
+        server
+            .as_ref()
+            .map(|server| {
+                adapter
+                    .register_turn_signal(
+                        &SessionRef {
+                            id: session.clone(),
+                            cwd: repo.to_path_buf(),
+                        },
+                        server.path(),
+                    )
+                    .env
+            })
+            .unwrap_or_default()
+    };
 
     let mut command = build_command(&args.command, repo)?;
-    for (key, value) in &turn_env {
+    for (key, value) in turn_env_for(&session) {
         command.env(key, value);
     }
     let mut restarts = 0;
@@ -189,6 +196,7 @@ pub fn run_with<W: Write>(
             repo,
             env,
             server.as_ref(),
+            session.as_str(),
             &mut rotted,
             &tap,
             &mut limit_hit,
@@ -249,7 +257,7 @@ pub fn run_with<W: Write>(
             transcript = derive_transcript(&session);
             command = adapter.headless_cmd(&prompt_text, &session, &[]);
             command.current_dir(repo);
-            for (key, value) in &turn_env {
+            for (key, value) in turn_env_for(&session) {
                 command.env(key, value);
             }
             continue;
@@ -346,7 +354,7 @@ pub fn run_with<W: Write>(
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
         command = adapter.headless_cmd(&combined, &session, &[]);
         command.current_dir(repo);
-        for (key, value) in &turn_env {
+        for (key, value) in turn_env_for(&session) {
             command.env(key, value);
         }
     }
@@ -363,6 +371,7 @@ fn supervise_run(
     repo: &Path,
     env: EnvLookup<'_>,
     server: Option<&signal::SignalServer>,
+    session: &str,
     rotted: &mut bool,
     tap: &supervise::OutputTap,
     limit_hit: &mut bool,
@@ -374,7 +383,7 @@ fn supervise_run(
         }
         if let Some(server) = server
             && let Some(received) = server.try_recv()
-            && should_stop_for_signal(&received)
+            && should_stop_for_signal(&received, session)
         {
             *rotted = true;
             return Tick::Stop("rot");
@@ -767,15 +776,102 @@ mod tests {
             turn: 4,
             score,
             verdict,
+            transcript_path: None,
         }
     }
 
     #[test]
     fn only_a_restart_signal_stops_the_run() {
-        assert!(should_stop_for_signal(&signal_with(Verdict::Restart, 95)));
-        assert!(!should_stop_for_signal(&signal_with(Verdict::Compact, 65)));
-        assert!(!should_stop_for_signal(&signal_with(Verdict::Advise, 45)));
-        assert!(!should_stop_for_signal(&signal_with(Verdict::Healthy, 0)));
+        assert!(should_stop_for_signal(
+            &signal_with(Verdict::Restart, 95),
+            "s"
+        ));
+        assert!(!should_stop_for_signal(
+            &signal_with(Verdict::Compact, 65),
+            "s"
+        ));
+        assert!(!should_stop_for_signal(
+            &signal_with(Verdict::Advise, 45),
+            "s"
+        ));
+        assert!(!should_stop_for_signal(
+            &signal_with(Verdict::Healthy, 0),
+            "s"
+        ));
+    }
+
+    /// The socket path is derived from the first eight hex characters of a
+    /// session id, so a stale hook or a neighbouring run can reach it. Killing
+    /// a healthy child on someone else's verdict is the failure to avoid.
+    #[test]
+    fn a_verdict_about_another_session_is_ignored() {
+        assert!(!should_stop_for_signal(
+            &signal_with(Verdict::Restart, 95),
+            "a-different-session"
+        ));
+    }
+
+    /// Every restart is a new session, and the hook inside it reports whatever
+    /// `ZIRV_CTX_SESSION` says. Leave that pinned to the dead session's id and
+    /// the session check above rejects every signal the restart produces.
+    #[test]
+    fn a_restarted_child_is_told_its_own_session_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let session = "cccccccc-2222-4333-8444-555555555555";
+        let env = base_env(&tmp.path().join("state"));
+        let seen = tmp.path().join("sessions.txt");
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &seen);
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_TURNS", "12");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let logged: Vec<String> = std::fs::read_to_string(&seen)
+            .expect("the children recorded their session env")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(logged.len(), 2, "one line per child: {logged:?}");
+        assert_eq!(logged[0], session, "the first child owns the given id");
+
+        let first = transcript_for(&home, tmp.path(), session);
+        let restarted = transcripts_in(&home)
+            .into_iter()
+            .find(|path| *path != first)
+            .expect("the restarted child wrote its own transcript");
+        let restarted_session = restarted
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("session id from the transcript name");
+        assert_eq!(
+            logged[1], restarted_session,
+            "the restart must export the new session id, not the dead one's"
+        );
     }
 
     #[test]

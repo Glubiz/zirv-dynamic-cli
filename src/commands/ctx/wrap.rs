@@ -108,6 +108,46 @@ pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance cr
 pub const TRANSCRIPT_ENV: &str = "ZIRV_CTX_TRANSCRIPT";
 pub const SOCKET_PATH_FILE: &str = "socket-path";
 
+/// Which file wrap watches for compactions and reads handoff context from.
+///
+/// wrap cannot derive it. It spawns the user's own command, and the agent
+/// mints its own session id inside that process, so the only party that knows
+/// the path is the hook running in the agent: it travels on the turn signal.
+/// A relaunch invalidates it, because the fresh session writes somewhere new.
+/// `ZIRV_CTX_TRANSCRIPT` pins it for an agent whose hook cannot report one.
+#[derive(Debug, Default)]
+pub struct TranscriptSource {
+    pinned: Option<PathBuf>,
+    reported: Option<PathBuf>,
+}
+
+impl TranscriptSource {
+    pub fn new(pinned: Option<PathBuf>) -> Self {
+        Self {
+            pinned,
+            reported: None,
+        }
+    }
+
+    /// `None` while no session has reported one, which is the honest answer:
+    /// guessing a path means watching a file nobody writes.
+    pub fn path(&self) -> Option<&Path> {
+        self.pinned.as_deref().or(self.reported.as_deref())
+    }
+
+    pub fn adopt(&mut self, reported: Option<&str>) {
+        if let Some(path) = reported.filter(|p| !p.is_empty()) {
+            self.reported = Some(PathBuf::from(path));
+        }
+    }
+
+    /// The relaunched agent is a new session writing a new file, so the old
+    /// path must not be watched for one more poll.
+    pub fn forget(&mut self) {
+        self.reported = None;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -305,10 +345,22 @@ type RelaunchedSession = (
     Box<dyn Write + Send>,
 );
 
+/// The handoff plus whatever the user themselves wrapped: `wrap -- claude
+/// --model opus` has to come back as an opus session, not a default one.
+fn relaunch_command(
+    adapter: &dyn AgentAdapter,
+    handoff: &Handoff,
+    extra: &[String],
+) -> std::process::Command {
+    adapter.interactive_cmd(Some(&restart_prompt(handoff)), extra)
+}
+
 fn relaunch(
     adapter: &dyn AgentAdapter,
     repo: &Path,
     handoff: &Handoff,
+    extra: &[String],
+    turn_env: &[(String, String)],
     size: (u16, u16),
 ) -> CtxResult<RelaunchedSession> {
     let pair = native_pty_system().openpty(PtySize {
@@ -318,13 +370,17 @@ fn relaunch(
         pixel_height: 0,
     })?;
 
-    let mut command = adapter.interactive_cmd(Some(&restart_prompt(handoff)), &[]);
-    command.current_dir(repo);
+    let command = relaunch_command(adapter, handoff, extra);
     let mut builder = CommandBuilder::new(command.get_program());
     for arg in command.get_args() {
         builder.arg(arg);
     }
     builder.cwd(repo);
+    // Without this the fresh session has no socket to report turn boundaries
+    // on, and supervision would silently end at the first restart.
+    for (key, value) in turn_env {
+        builder.env(key, value);
+    }
     let child = pair.slave.spawn_command(builder)?;
 
     let reader = pair.master.try_clone_reader()?;
@@ -383,12 +439,9 @@ pub fn run_with<W: Write>(
         }
     };
 
-    let transcript = env(TRANSCRIPT_ENV).map(PathBuf::from).unwrap_or_else(|| {
-        adapter.transcript_path(&super::event::SessionRef {
-            id: session.clone(),
-            cwd: repo.to_path_buf(),
-        })
-    });
+    // Deliberately not derived from `session`: that id belongs to wrap, not to
+    // the agent it spawns, so a derived path names a file nobody ever writes.
+    let mut transcript = TranscriptSource::new(env(TRANSCRIPT_ENV).map(PathBuf::from));
 
     let (cols, rows) = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
     let mut pair = native_pty_system().openpty(PtySize {
@@ -404,17 +457,24 @@ pub fn run_with<W: Write>(
     }
     command.cwd(repo);
 
-    if let Some(server) = server.as_ref() {
-        let setup = adapter.register_turn_signal(
-            &super::event::SessionRef {
-                id: session.clone(),
-                cwd: repo.to_path_buf(),
-            },
-            server.path(),
-        );
-        for (key, value) in setup.env {
-            command.env(key, value);
-        }
+    // Kept for the relaunch too: a fresh session with no socket to report on
+    // would leave the rest of the run unsupervised.
+    let turn_env: Vec<(String, String)> = server
+        .as_ref()
+        .map(|server| {
+            adapter
+                .register_turn_signal(
+                    &super::event::SessionRef {
+                        id: session.clone(),
+                        cwd: repo.to_path_buf(),
+                    },
+                    server.path(),
+                )
+                .env
+        })
+        .unwrap_or_default();
+    for (key, value) in &turn_env {
+        command.env(key, value);
     }
 
     let mut child = pair.slave.spawn_command(command)?;
@@ -473,7 +533,7 @@ pub fn run_with<W: Write>(
         server.as_ref(),
         adapter.as_ref(),
         &writer,
-        &transcript,
+        &mut transcript,
         &state_dir,
         &session,
         debounce,
@@ -484,6 +544,8 @@ pub fn run_with<W: Write>(
         QUIT_GRACE,
         tx,
         generation,
+        rest,
+        &turn_env,
     );
 
     if let Some(guard) = raw.as_mut() {
@@ -508,7 +570,7 @@ fn pump(
     server: Option<&super::signal::SignalServer>,
     adapter: &dyn AgentAdapter,
     writer: &std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
-    transcript: &Path,
+    transcript: &mut TranscriptSource,
     state_dir: &super::state::StateDir,
     session: &super::event::SessionId,
     debounce: Duration,
@@ -519,6 +581,8 @@ fn pump(
     grace: Duration,
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    extra: &[String],
+    turn_env: &[(String, String)],
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
 
@@ -540,6 +604,7 @@ fn pump(
         if let Some(server) = server
             && let Some(signal) = server.try_recv()
         {
+            transcript.adopt(signal.transcript_path.as_deref());
             supervision.on_turn(&signal);
         }
 
@@ -564,26 +629,30 @@ fn pump(
                 // cannot turn into a retry loop.
                 supervision.cooldown_until_turn = Some(supervision.last_turn);
 
-                let verified = injected.is_ok()
-                    && verify_compaction(
-                        &mut Watcher::new(transcript.to_path_buf()),
-                        adapter,
-                        Instant::now() + inject_timeout,
-                    )
-                    .unwrap_or(false);
+                // No transcript means no verification is possible, and a
+                // deadline spent polling a file nobody writes would block the
+                // pump for nothing.
+                let failure = match (injected, transcript.path()) {
+                    (Err(_), _) => Some("compact injection failed"),
+                    (Ok(()), None) => Some("no transcript reported, compaction unverifiable"),
+                    (Ok(()), Some(path)) => {
+                        let seen = verify_compaction(
+                            &mut Watcher::new(path.to_path_buf()),
+                            adapter,
+                            Instant::now() + inject_timeout,
+                        )
+                        .unwrap_or(false);
+                        if seen {
+                            None
+                        } else {
+                            Some("compaction not verified")
+                        }
+                    }
+                };
+                let verified = failure.is_none();
 
-                if injected.is_err() {
-                    note_failure(
-                        supervision,
-                        Some((state_dir, session.as_str())),
-                        "compact injection failed",
-                    );
-                } else if !verified {
-                    note_failure(
-                        supervision,
-                        Some((state_dir, session.as_str())),
-                        "compaction not verified",
-                    );
+                if let Some(reason) = failure {
+                    note_failure(supervision, Some((state_dir, session.as_str())), reason);
                 }
                 let _ = super::log::append(
                     state_dir,
@@ -598,7 +667,10 @@ fn pump(
                         } else {
                             "inject-unverified"
                         },
-                        detail: &transcript.display().to_string(),
+                        detail: &transcript
+                            .path()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "no transcript reported".to_string()),
                     },
                 );
             }
@@ -614,7 +686,10 @@ fn pump(
                 let new_generation =
                     generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
-                let jsonl = std::fs::read_to_string(transcript).unwrap_or_default();
+                let jsonl = transcript
+                    .path()
+                    .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+                    .unwrap_or_default();
                 let ctx = adapter.structural_context(&jsonl, tail_items);
                 let (note, source) = handoff::distill_or_structural(adapter, distiller_model, &ctx);
                 let stored = handoff::store(state_dir, repo, session.as_str(), &note);
@@ -627,8 +702,12 @@ fn pump(
                             .map_err(|e| e.to_string())
                     });
 
+                // That session is over. Whatever it was writing is now a dead
+                // file, and the replacement reports its own on its first turn.
+                transcript.forget();
+
                 let relaunched = quit.is_ok()
-                    && match relaunch(adapter, repo, &note, last_size) {
+                    && match relaunch(adapter, repo, &note, extra, turn_env, last_size) {
                         Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
                             spawn_output_thread(
                                 fresh_reader,
@@ -888,6 +967,16 @@ mod tests {
             turn,
             score: 64,
             verdict,
+            transcript_path: None,
+        }
+    }
+
+    /// The shape a real Stop hook sends: the verdict plus the file the agent
+    /// is actually writing.
+    fn turn_signal_for(turn: u64, verdict: Verdict, transcript: &std::path::Path) -> TurnSignal {
+        TurnSignal {
+            transcript_path: Some(transcript.display().to_string()),
+            ..turn_signal(turn, verdict)
         }
     }
 
@@ -984,6 +1073,7 @@ mod tests {
             turn: 9,
             score: 91,
             verdict: Verdict::Restart,
+            transcript_path: None,
         });
         assert_eq!(state.verdict, Verdict::Restart);
         assert_eq!(state.score, 91);
@@ -1215,7 +1305,233 @@ mod tests {
         let _ = h.child.wait();
     }
 
+    #[test]
+    fn wrap_has_no_transcript_until_a_signal_names_one() {
+        let mut source = TranscriptSource::new(None);
+        assert_eq!(
+            source.path(),
+            None,
+            "the agent minted its own session id, so there is nothing to derive"
+        );
+
+        source.adopt(Some("/tmp/a.jsonl"));
+        assert_eq!(source.path(), Some(std::path::Path::new("/tmp/a.jsonl")));
+
+        source.adopt(None);
+        source.adopt(Some(""));
+        assert_eq!(
+            source.path(),
+            Some(std::path::Path::new("/tmp/a.jsonl")),
+            "a signal with nothing to report leaves the known path alone"
+        );
+    }
+
+    #[test]
+    fn an_explicit_transcript_override_outranks_every_signal() {
+        let mut source = TranscriptSource::new(Some(PathBuf::from("/pinned.jsonl")));
+        source.adopt(Some("/tmp/a.jsonl"));
+        assert_eq!(source.path(), Some(std::path::Path::new("/pinned.jsonl")));
+        source.forget();
+        assert_eq!(
+            source.path(),
+            Some(std::path::Path::new("/pinned.jsonl")),
+            "a pinned path outlives the session it was pinned for"
+        );
+    }
+
+    #[test]
+    fn a_relaunch_forgets_the_dead_sessions_transcript() {
+        let mut source = TranscriptSource::new(None);
+        source.adopt(Some("/tmp/old.jsonl"));
+        source.forget();
+        assert_eq!(
+            source.path(),
+            None,
+            "the killed session's file must not be watched a moment longer"
+        );
+
+        source.adopt(Some("/tmp/new.jsonl"));
+        assert_eq!(source.path(), Some(std::path::Path::new("/tmp/new.jsonl")));
+    }
+
+    /// Polls the decision log, which a supervised session writes from another
+    /// process, so a test never races it.
+    #[cfg(unix)]
+    fn wait_for_log(state: &std::path::Path, needle: &str, timeout: Duration) -> String {
+        let path = state.join("logs/decisions.jsonl");
+        let deadline = Instant::now() + timeout;
+        loop {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.contains(needle) || Instant::now() >= deadline {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The end-to-end case every other wrap test masked by pinning
+    /// `ZIRV_CTX_TRANSCRIPT`: with nothing pinned, the only way wrap can know
+    /// which file to verify the compaction in is the turn signal itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_transcript_is_learned_from_the_turn_signal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let log = tmp.path().join("injected.log");
+        let transcript = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n",
+        )
+        .expect("write");
+
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("STUB_TUI_LOG", log.display().to_string()),
+                ("STUB_TUI_TRANSCRIPT", transcript.display().to_string()),
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_INJECT_TIMEOUT_MS", "5000".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal_for(3, Verdict::Compact, &transcript),
+        )
+        .expect("send turn signal");
+
+        let seen = read_until(&mut h.reader, "compacted", Duration::from_secs(15));
+        assert!(seen.contains("compacted"), "got {seen:?}");
+
+        let decisions = wait_for_log(&state, "\"verb\":\"wrap\"", Duration::from_secs(15));
+        assert!(
+            decisions.contains("\"action\":\"inject\""),
+            "the compaction was verified in the reported transcript: {decisions}"
+        );
+        assert!(
+            !decisions.contains("\"action\":\"degrade\""),
+            "a verified injection must not degrade the session: {decisions}"
+        );
+        assert!(
+            decisions.contains(&transcript.display().to_string()),
+            "the log names the file the signal reported: {decisions}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        wait_or_kill(&mut h.child, Duration::from_secs(5));
+    }
+
+    /// Same bug class as the exec one fixed in d3f0ede: after a relaunch the
+    /// old session's transcript is dead, and the new session reports its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_reads_the_reported_transcript_and_then_follows_the_new_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+
+        let first = tmp.path().join("first.jsonl");
+        std::fs::write(
+            &first,
+            concat!(
+                r#"{"type":"user","message":{"content":"wire the webhook"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Read","input":{"file_path":"/work/src/hook.rs"}}],"usage":{"input_tokens":180000}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write");
+
+        // Already compacted: the relaunch stub never compacts on its own, so a
+        // verified compaction can only mean wrap read this file and not the
+        // one the dead session reported.
+        let second = tmp.path().join("second.jsonl");
+        std::fs::write(
+            &second,
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"content\":\"x\"}\n",
+        )
+        .expect("write");
+
+        let script = fixture("relaunch-stub.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_INJECT_TIMEOUT_MS", "5000".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+                ("ZIRV_CTX_AGENT_BIN", format!("sh {script}")),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        let socket_path = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket = std::path::PathBuf::from(socket_path.trim());
+        crate::commands::ctx::signal::send(&socket, &turn_signal_for(5, Verdict::Restart, &first))
+            .expect("send");
+
+        let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(20));
+        assert!(seen.contains("stub-tui ready"), "relaunched: {seen:?}");
+
+        let handoffs = walk_md(&state.join("handoffs"));
+        assert_eq!(handoffs.len(), 1, "one handoff per restart: {handoffs:?}");
+        let note = std::fs::read_to_string(&handoffs[0]).expect("handoff");
+        assert!(
+            note.contains("wire the webhook"),
+            "the handoff was distilled from the reported transcript, not from an empty read: {note}"
+        );
+
+        crate::commands::ctx::signal::send(&socket, &turn_signal_for(6, Verdict::Compact, &second))
+            .expect("send");
+
+        let decisions = wait_for_log(&state, "\"verdict\":\"compact\"", Duration::from_secs(20));
+        let compaction = decisions
+            .lines()
+            .find(|line| line.contains("\"verdict\":\"compact\""))
+            .unwrap_or_else(|| panic!("no compaction decision logged: {decisions}"));
+        assert!(
+            compaction.contains(&second.display().to_string()),
+            "the new session's transcript is the one watched: {compaction}"
+        );
+        assert!(
+            !compaction.contains(&first.display().to_string()),
+            "the dead session's transcript must have been forgotten: {compaction}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        wait_or_kill(&mut h.child, Duration::from_secs(5));
+    }
+
     use crate::commands::ctx::handoff::Handoff;
+
+    #[test]
+    fn the_relaunch_command_keeps_the_flags_the_user_wrapped() {
+        let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let handoff = Handoff {
+            task: "Wire the webhook".to_string(),
+            next_step: "Write the failing test".to_string(),
+            ..Handoff::default()
+        };
+        let command = relaunch_command(
+            &adapter,
+            &handoff,
+            &["--model".to_string(), "opus".to_string()],
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args[0].contains("Wire the webhook"), "got {args:?}");
+        assert_eq!(
+            &args[1..],
+            &["--model".to_string(), "opus".to_string()],
+            "`wrap -- claude --model opus` must not restart a bare claude"
+        );
+    }
 
     #[test]
     fn the_restart_prompt_carries_the_handoff() {

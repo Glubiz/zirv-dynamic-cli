@@ -114,6 +114,9 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 turn,
                 score: score.score,
                 verdict: score.verdict,
+                // The supervisor spawned the agent but does not know which
+                // session file it chose, so the hook has to say.
+                transcript_path: Some(payload.transcript_path.clone()),
             },
         );
     }
@@ -397,17 +400,7 @@ mod tests {
     #[test]
     fn run_scores_a_real_transcript_and_advises() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let transcript = dir.path().join("t.jsonl");
-        let mut text = String::new();
-        for i in 0..12 {
-            text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n");
-            text.push_str("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"r\",\"is_error\":true}]}}\n");
-            let block = if i < 2 { "[zirv] ok" } else { "sloppy" };
-            text.push_str(&format!(
-                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{block}\"}}],\"usage\":{{\"input_tokens\":170000}}}}}}\n"
-            ));
-        }
-        std::fs::write(&transcript, text).expect("write");
+        let transcript = rotting_transcript(dir.path());
 
         let state = dir.path().join("state");
         let env: std::collections::HashMap<String, String> = [(
@@ -436,6 +429,62 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log written");
         assert!(log.contains("\"verb\":\"hook\""), "got {log}");
+    }
+
+    /// A supervisor cannot derive the agent's transcript path: the agent mints
+    /// its own session id. The Stop hook runs inside that session, so it is the
+    /// only party that knows, and the signal is the only channel it has.
+    #[cfg(unix)]
+    #[test]
+    fn the_forwarded_signal_names_the_transcript_the_hook_scored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = rotting_transcript(dir.path());
+        let socket = dir.path().join("t.sock");
+        let server = signal::SignalServer::bind(&socket).expect("bind");
+
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::adapters::SOCKET_ENV.to_string(),
+            socket.display().to_string(),
+        )]
+        .into();
+        let stdin = format!(
+            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
+            transcript.display(),
+            dir.path().display()
+        );
+
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut received = None;
+        while received.is_none() && std::time::Instant::now() < deadline {
+            received = server.try_recv();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let signal = received.expect("the hook forwards a signal");
+        assert_eq!(
+            signal.transcript_path.as_deref(),
+            Some(transcript.display().to_string().as_str()),
+            "the supervisor has no other way to learn this path"
+        );
+    }
+
+    /// Twelve turns of tool errors and missed markers at 170k tokens: enough
+    /// for a non-healthy verdict, which is what makes the hook forward at all.
+    fn rotting_transcript(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("t.jsonl");
+        let mut text = String::new();
+        for i in 0..12 {
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n");
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"r\",\"is_error\":true}]}}\n");
+            let block = if i < 2 { "[zirv] ok" } else { "sloppy" };
+            text.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{block}\"}}],\"usage\":{{\"input_tokens\":170000}}}}}}\n"
+            ));
+        }
+        std::fs::write(&path, text).expect("write");
+        path
     }
 
     #[test]

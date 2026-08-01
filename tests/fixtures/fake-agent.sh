@@ -11,6 +11,9 @@
 #   FAKE_AGENT_MODE_FILE=<path>             one mode per line, popped per run
 #   FAKE_AGENT_TURNS=<n>                    (default 12)
 #   FAKE_AGENT_SLEEP=<secs>                 rot mode only (default 0)
+#   FAKE_AGENT_SESSION_ENV_LOG=<path>       append $ZIRV_CTX_SESSION per run,
+#                                           so a test can see what each child
+#                                           was told to report signals as
 #
 #   healthy  distinct tool inputs, marker on every final, 20k tokens
 #   rot      identical tool input, every result an error, marker only on the
@@ -34,6 +37,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$session" ] || { echo "fake-agent: no --session-id given" >&2; exit 64; }
+
+if [ -n "${FAKE_AGENT_SESSION_ENV_LOG:-}" ]; then
+  printf '%s\n' "${ZIRV_CTX_SESSION:-}" >> "$FAKE_AGENT_SESSION_ENV_LOG"
+fi
 
 mode="${FAKE_AGENT_MODE:-healthy}"
 if [ -n "${FAKE_AGENT_MODE_FILE:-}" ] && [ -s "${FAKE_AGENT_MODE_FILE}" ]; then
