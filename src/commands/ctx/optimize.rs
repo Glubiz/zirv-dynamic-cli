@@ -470,6 +470,296 @@ pub fn lint_dead_references(
     findings
 }
 
+use super::adapters::claude;
+use super::config::{OptimizeConfig, ScoreConfig};
+use super::event::{Capabilities, NormalizedEvent};
+use super::log;
+use super::rot::{self, Verdict};
+use super::state::StateDir;
+
+/// Openings that mark a user turn as a correction rather than a new request.
+/// A heuristic shown to a human, never grounds for an automatic edit.
+const CORRECTION_OPENERS: &[&str] = &[
+    "no,",
+    "no.",
+    "don't",
+    "do not",
+    "stop",
+    "wrong",
+    "that's wrong",
+    "actually",
+    "i said",
+    "not like that",
+    "revert",
+];
+
+/// Decision-log actions that mean zirv had to intervene. Each one is a session
+/// that did not simply run to completion, which is friction the transcripts do
+/// not show on their own. Routine entries (`advise`, `pace-wait`, `report`,
+/// `forward`) are deliberately absent.
+pub const FRICTION_ACTIONS: &[&str] = &[
+    "rot-kill",
+    "restart",
+    "restart-failed",
+    "inject",
+    "inject-unverified",
+    "degrade",
+    "give-up",
+];
+
+/// The threshold above which supervisor interventions are worth a finding,
+/// expressed per sampled session so a long history does not fire on volume.
+const INTERVENTIONS_PER_SESSION: f64 = 1.0;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Evidence {
+    pub sessions_sampled: usize,
+    pub turns: usize,
+    pub tool_failure_rate: f64,
+    /// Error snippet to the number of times it recurred, most frequent first.
+    pub repeated_errors: Vec<(String, usize)>,
+    pub corrections: Vec<(String, usize)>,
+    pub rot_sessions: usize,
+    /// Decision-log action to count, most frequent first: what zirv had to do.
+    pub supervisor_events: Vec<(String, usize)>,
+}
+
+pub fn correction_phrase(text: &str) -> Option<&'static str> {
+    let lowered = text.trim().to_lowercase();
+    CORRECTION_OPENERS
+        .iter()
+        .find(|opener| {
+            // Anchored at the start, and followed by a boundary so "actuality"
+            // does not read as "actually".
+            lowered.strip_prefix(**opener).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with(|c: char| !c.is_alphanumeric())
+            })
+        })
+        .copied()
+}
+
+/// The most recently modified transcripts under the projects root, including
+/// subagent files, newest first.
+pub fn newest_transcripts(projects_root: &Path, sample: usize) -> Vec<PathBuf> {
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut stack = vec![projects_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            found.push((modified, path));
+        }
+    }
+
+    // Newest first, path as the tiebreak so equal timestamps stay deterministic.
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found
+        .into_iter()
+        .take(sample)
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn ranked(counts: hashbrown::HashMap<String, usize>) -> Vec<(String, usize)> {
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    // Count descending, then text, so the report never reorders between runs.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
+pub fn evidence_from_transcripts(paths: &[PathBuf], cfg: &ScoreConfig) -> Evidence {
+    let mut evidence = Evidence::default();
+    let mut errors: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+    let mut corrections: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+    let mut results = 0usize;
+    let mut failures = 0usize;
+
+    for path in paths {
+        let Ok(jsonl) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        evidence.sessions_sampled += 1;
+
+        let events = claude::parse_events(&jsonl);
+        for event in &events {
+            match event {
+                NormalizedEvent::TurnStart => evidence.turns += 1,
+                NormalizedEvent::ToolResult { is_error } => {
+                    results += 1;
+                    if *is_error {
+                        failures += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // The whole session, not the trailing window: optimize is looking for
+        // habits, not for the health of the last ten turns.
+        let context = claude::structural_context(&jsonl, usize::MAX);
+        for message in &context.user_messages {
+            if let Some(phrase) = correction_phrase(message) {
+                *corrections.entry(phrase.to_string()).or_insert(0) += 1;
+            }
+        }
+        for error in &context.tool_errors {
+            let snippet: String = error
+                .lines()
+                .next()
+                .unwrap_or(error)
+                .chars()
+                .take(120)
+                .collect();
+            *errors.entry(snippet).or_insert(0) += 1;
+        }
+
+        let caps = Capabilities {
+            marker_signal: true,
+            token_usage: true,
+            turn_signal: true,
+        };
+        if rot::score_events(&events, caps, cfg).verdict == Verdict::Restart {
+            evidence.rot_sessions += 1;
+        }
+    }
+
+    if results > 0 {
+        evidence.tool_failure_rate = failures as f64 / results as f64;
+    }
+    evidence.repeated_errors = ranked(errors);
+    evidence.corrections = ranked(corrections);
+    evidence
+}
+
+/// What zirv itself had to do, counted from the decision log. The log is the
+/// second evidence source the spec names: it records interventions that never
+/// appear in a transcript as a failure.
+pub fn supervisor_events(state: &StateDir, lines: usize) -> Vec<(String, usize)> {
+    let Ok(entries) = log::tail(state, lines) else {
+        return Vec::new();
+    };
+
+    let mut counts: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+    for line in entries {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(action) = entry.get("action").and_then(|a| a.as_str()) else {
+            continue;
+        };
+        if !FRICTION_ACTIONS.contains(&action) {
+            continue;
+        }
+        *counts.entry(action.to_string()).or_insert(0) += 1;
+    }
+    ranked(counts)
+}
+
+/// Both evidence sources in one place: transcripts for what happened inside
+/// sessions, the decision log for what zirv had to do about it.
+pub fn collect_evidence(
+    paths: &[PathBuf],
+    state: Option<&StateDir>,
+    cfg: &ScoreConfig,
+    log_lines: usize,
+) -> Evidence {
+    let mut evidence = evidence_from_transcripts(paths, cfg);
+    if let Some(state) = state {
+        evidence.supervisor_events = supervisor_events(state, log_lines);
+    }
+    evidence
+}
+
+/// Instruction gaps that the evidence points at. These carry no diff: what to
+/// write is a judgment call, and that is the model's job in Task F4.
+pub fn friction_findings(evidence: &Evidence, cfg: &OptimizeConfig) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let sample = format!("{} sessions sampled", evidence.sessions_sampled);
+
+    if evidence.tool_failure_rate >= cfg.recommend_tool_failure_rate
+        && let Some((error, count)) = evidence.repeated_errors.first()
+    {
+        findings.push(Finding {
+            kind: "friction",
+            severity: Severity::Warning,
+            title: format!(
+                "Tools fail on {:.0}% of results across the sample",
+                evidence.tool_failure_rate * 100.0
+            ),
+            evidence: vec![sample.clone()],
+            detail: format!(
+                "The most repeated failure appeared {count} times: {error}. An instruction that \
+                 prevents this class of failure would pay for itself."
+            ),
+            proposed_diff: None,
+        });
+    }
+
+    let correction_total: usize = evidence.corrections.iter().map(|(_, count)| count).sum();
+    if correction_total >= cfg.recommend_corrections
+        && let Some((phrase, count)) = evidence.corrections.first()
+    {
+        findings.push(Finding {
+            kind: "friction",
+            severity: Severity::Warning,
+            title: format!("{correction_total} user corrections across the sample"),
+            evidence: vec![sample.clone()],
+            detail: format!(
+                "The most common opening was \"{phrase}\" ({count} times). Repeated corrections \
+                 usually mean an unwritten expectation that belongs in an instruction file."
+            ),
+            proposed_diff: None,
+        });
+    }
+
+    let interventions: usize = evidence
+        .supervisor_events
+        .iter()
+        .map(|(_, count)| count)
+        .sum();
+    let per_session = if evidence.sessions_sampled == 0 {
+        0.0
+    } else {
+        interventions as f64 / evidence.sessions_sampled as f64
+    };
+    if per_session > INTERVENTIONS_PER_SESSION {
+        let breakdown = evidence
+            .supervisor_events
+            .iter()
+            .map(|(action, count)| format!("{action} x{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(Finding {
+            kind: "friction",
+            severity: Severity::Warning,
+            title: format!("zirv intervened {interventions} times across the sample"),
+            evidence: vec![format!("{sample}, from the decision log")],
+            detail: format!(
+                "Interventions: {breakdown}. Sessions that have to be compacted, restarted or \
+                 killed usually carry more instruction than they can hold, or repeat work the \
+                 instructions never told them to avoid."
+            ),
+            proposed_diff: None,
+        });
+    }
+
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,5 +1116,342 @@ mod tests {
             "{ not json at all",
         )];
         assert!(lint_dead_references(&surfaces, tmp.path(), &|_| true).is_empty());
+    }
+
+    /// A transcript with a chosen number of turns, tool errors and user lines.
+    fn transcript(turns: usize, errors: bool, user_line: &str, tokens: u64) -> String {
+        let mut text = String::new();
+        for _ in 0..turns {
+            text.push_str(&format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\"{user_line}\"}}}}\n"
+            ));
+            text.push_str(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}],\"usage\":{\"input_tokens\":1}}}\n",
+            );
+            text.push_str(&format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"content\":\"boom: permission denied\",\"is_error\":{errors}}}]}}}}\n"
+            ));
+            text.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"[zirv] ok\"}}],\"usage\":{{\"input_tokens\":{tokens}}}}}}}\n"
+            ));
+        }
+        text
+    }
+
+    fn write_transcripts(root: &Path, files: &[(&str, String)]) -> Vec<PathBuf> {
+        let dir = root.join("-home-testuser-repo");
+        std::fs::create_dir_all(dir.join("subagents")).expect("mkdir");
+        let mut written = Vec::new();
+        for (name, text) in files {
+            let path = dir.join(name);
+            std::fs::write(&path, text).expect("write transcript");
+            written.push(path);
+        }
+        written
+    }
+
+    #[test]
+    fn correction_phrases_are_recognised_at_the_start_of_a_message() {
+        assert_eq!(correction_phrase("no, that is wrong"), Some("no,"));
+        assert_eq!(correction_phrase("  Don't do that"), Some("don't"));
+        assert_eq!(correction_phrase("actually, use rg"), Some("actually"));
+        assert_eq!(correction_phrase("I said use rg"), Some("i said"));
+        assert_eq!(correction_phrase("stop"), Some("stop"));
+    }
+
+    #[test]
+    fn ordinary_requests_are_not_corrections() {
+        for line in [
+            "",
+            "please add a test",
+            "the stop hook needs work",
+            "she said hello in the readme",
+            "actuality is a word",
+        ] {
+            assert_eq!(correction_phrase(line), None, "false positive on {line:?}");
+        }
+    }
+
+    #[test]
+    fn newest_transcripts_are_sampled_including_subagents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let dir = root.join("-home-testuser-repo");
+        std::fs::create_dir_all(dir.join("subagents")).expect("mkdir");
+
+        for name in ["a.jsonl", "b.jsonl", "c.jsonl"] {
+            std::fs::write(dir.join(name), "{}\n").expect("write");
+        }
+        std::fs::write(dir.join("subagents/s.jsonl"), "{}\n").expect("write");
+        std::fs::write(dir.join("notes.txt"), "ignore").expect("write");
+
+        let sampled = newest_transcripts(&root, 10);
+        assert_eq!(
+            sampled.len(),
+            4,
+            "three sessions plus one subagent: {sampled:?}"
+        );
+        assert!(
+            sampled
+                .iter()
+                .all(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl")),
+            "only transcripts: {sampled:?}"
+        );
+
+        assert_eq!(
+            newest_transcripts(&root, 2).len(),
+            2,
+            "the sample is bounded"
+        );
+        assert!(newest_transcripts(Path::new("/nonexistent"), 5).is_empty());
+    }
+
+    #[test]
+    fn evidence_counts_failures_corrections_and_rot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let paths = write_transcripts(
+            &root,
+            &[
+                (
+                    "rotten.jsonl",
+                    transcript(12, true, "no, do it properly", 170_000),
+                ),
+                (
+                    "healthy.jsonl",
+                    transcript(2, false, "please add a test", 1_000),
+                ),
+            ],
+        );
+
+        let evidence = evidence_from_transcripts(&paths, &ScoreConfig::default());
+
+        assert_eq!(evidence.sessions_sampled, 2);
+        assert_eq!(evidence.turns, 14);
+        assert!(
+            evidence.tool_failure_rate > 0.8,
+            "twelve of fourteen turns failed, got {}",
+            evidence.tool_failure_rate
+        );
+        assert_eq!(
+            evidence.rot_sessions, 1,
+            "only the 170k-token rotted session counts"
+        );
+
+        let (phrase, count) = evidence
+            .corrections
+            .first()
+            .cloned()
+            .expect("corrections recorded");
+        assert_eq!(phrase, "no,");
+        assert_eq!(count, 12);
+
+        let (error, count) = evidence
+            .repeated_errors
+            .first()
+            .cloned()
+            .expect("repeated errors recorded");
+        assert!(error.contains("permission denied"), "got {error}");
+        assert_eq!(count, 12);
+    }
+
+    #[test]
+    fn evidence_from_nothing_is_empty_not_an_error() {
+        let evidence = evidence_from_transcripts(&[], &ScoreConfig::default());
+        assert_eq!(evidence, Evidence::default());
+        assert_eq!(evidence.tool_failure_rate, 0.0);
+    }
+
+    #[test]
+    fn the_decision_log_contributes_what_zirv_had_to_do() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+
+        // A synthetic history: rot kills, a forced compaction, a restart, a
+        // degradation, and entries that are not friction at all.
+        for (index, action) in [
+            "rot-kill",
+            "rot-kill",
+            "inject",
+            "restart",
+            "degrade",
+            "advise",
+            "pace-wait",
+            "report",
+        ]
+        .iter()
+        .enumerate()
+        {
+            crate::commands::ctx::log::append(
+                &state,
+                &crate::commands::ctx::log::Decision {
+                    ts: 1_800_000_000 + index as u64,
+                    session: "s",
+                    verb: "loop",
+                    verdict: "n/a",
+                    score: 0,
+                    action,
+                    detail: "",
+                },
+            )
+            .expect("append");
+        }
+
+        let events = supervisor_events(&state, 200);
+
+        assert_eq!(
+            events.first().cloned(),
+            Some(("rot-kill".to_string(), 2)),
+            "most frequent first, got {events:?}"
+        );
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(
+            names.contains(&"inject"),
+            "compactions count as friction: {names:?}"
+        );
+        assert!(names.contains(&"restart"));
+        assert!(names.contains(&"degrade"));
+        assert!(
+            !names.contains(&"advise")
+                && !names.contains(&"pace-wait")
+                && !names.contains(&"report"),
+            "routine entries are not friction: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_empty_decision_log_contributes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("absent"));
+        assert!(supervisor_events(&state, 200).is_empty());
+    }
+
+    #[test]
+    fn collect_evidence_joins_both_sources() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("projects");
+        let paths = write_transcripts(
+            &root,
+            &[(
+                "s.jsonl",
+                transcript(12, true, "no, do it properly", 170_000),
+            )],
+        );
+
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        crate::commands::ctx::log::append(
+            &state,
+            &crate::commands::ctx::log::Decision {
+                ts: 1_800_000_000,
+                session: "s",
+                verb: "loop",
+                verdict: "n/a",
+                score: 0,
+                action: "rot-kill",
+                detail: "",
+            },
+        )
+        .expect("append");
+
+        let evidence = collect_evidence(&paths, Some(&state), &ScoreConfig::default(), 200);
+        assert_eq!(evidence.sessions_sampled, 1, "transcript side");
+        assert_eq!(
+            evidence.supervisor_events,
+            vec![("rot-kill".to_string(), 1)],
+            "decision-log side"
+        );
+
+        let without_log = collect_evidence(&paths, None, &ScoreConfig::default(), 200);
+        assert!(without_log.supervisor_events.is_empty());
+        assert_eq!(
+            without_log.sessions_sampled, 1,
+            "the transcripts still count"
+        );
+    }
+
+    #[test]
+    fn unreadable_transcripts_are_skipped() {
+        let evidence = evidence_from_transcripts(
+            &[PathBuf::from("/nonexistent/x.jsonl")],
+            &ScoreConfig::default(),
+        );
+        assert_eq!(evidence.sessions_sampled, 0);
+    }
+
+    #[test]
+    fn friction_findings_fire_only_above_the_thresholds() {
+        let cfg = OptimizeConfig::default();
+
+        let quiet = Evidence {
+            sessions_sampled: 5,
+            turns: 40,
+            tool_failure_rate: 0.05,
+            repeated_errors: vec![("boom".to_string(), 1)],
+            corrections: vec![("no,".to_string(), 1)],
+            rot_sessions: 0,
+            supervisor_events: vec![("rot-kill".to_string(), 1)],
+        };
+        assert!(friction_findings(&quiet, &cfg).is_empty());
+
+        let noisy = Evidence {
+            sessions_sampled: 5,
+            turns: 40,
+            tool_failure_rate: 0.5,
+            repeated_errors: vec![("boom: permission denied".to_string(), 9)],
+            corrections: vec![("no,".to_string(), 7)],
+            rot_sessions: 2,
+            supervisor_events: vec![("rot-kill".to_string(), 6), ("inject".to_string(), 3)],
+        };
+        let findings = friction_findings(&noisy, &cfg);
+        assert_eq!(
+            findings.len(),
+            3,
+            "one for failures, one for corrections, one for supervisor interventions: {findings:?}"
+        );
+        assert!(findings.iter().all(|f| f.kind == "friction"));
+        assert!(
+            findings.iter().all(|f| f.proposed_diff.is_none()),
+            "friction findings describe evidence; the rewrite comes from the model call"
+        );
+        assert!(
+            findings[0].detail.contains("permission denied"),
+            "quote the actual error: {:?}",
+            findings[0]
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.evidence.iter().any(|e| e.contains("sessions"))),
+            "evidence names the sample it came from: {findings:?}"
+        );
+
+        let supervisor = findings
+            .iter()
+            .find(|f| f.title.to_lowercase().contains("intervened"))
+            .expect("the decision-log finding");
+        assert!(supervisor.detail.contains("rot-kill"), "got {supervisor:?}");
+        assert!(
+            supervisor
+                .evidence
+                .iter()
+                .any(|e| e.contains("decision log")),
+            "say where it came from: {supervisor:?}"
+        );
+    }
+
+    #[test]
+    fn a_quiet_decision_log_produces_no_supervisor_finding() {
+        let cfg = OptimizeConfig::default();
+        let evidence = Evidence {
+            sessions_sampled: 5,
+            supervisor_events: vec![("inject".to_string(), 2)],
+            ..Evidence::default()
+        };
+        assert!(
+            friction_findings(&evidence, &cfg).is_empty(),
+            "two compactions across five sessions is ordinary"
+        );
     }
 }

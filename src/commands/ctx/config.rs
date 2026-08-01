@@ -162,6 +162,34 @@ impl Default for PaceConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OptimizeConfig {
+    /// Whether the Stop hook may queue an "optimize recommended" entry.
+    pub enabled: bool,
+    pub sessions_sampled: usize,
+    pub max_surface_bytes: usize,
+    /// Empty reuses `handoff.model`: one cheap-model choice for the whole tool.
+    pub model: String,
+    pub recommend_tool_failure_rate: f64,
+    pub recommend_corrections: usize,
+    pub recommend_cooldown_secs: u64,
+}
+
+impl Default for OptimizeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sessions_sampled: 10,
+            max_surface_bytes: 200_000,
+            model: String::new(),
+            recommend_tool_failure_rate: 0.25,
+            recommend_corrections: 3,
+            recommend_cooldown_secs: 86_400,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -172,6 +200,7 @@ pub struct CtxConfig {
     pub supervise: SuperviseConfig,
     pub handoff: HandoffConfig,
     pub pace: PaceConfig,
+    pub optimize: OptimizeConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -276,6 +305,17 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["pace", "seven_day_budget_tokens"],
         EnvKind::Int,
     ),
+    ("ZIRV_CTX_OPTIMIZE", &["optimize", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_OPTIMIZE_SESSIONS",
+        &["optimize", "sessions_sampled"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_OPTIMIZE_MODEL",
+        &["optimize", "model"],
+        EnvKind::Str,
+    ),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -337,6 +377,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["agent_bin"], "ZIRV_CTX_AGENT_BIN"),
     (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),
     (&["handoff", "model"], "ZIRV_CTX_MODEL"),
+    (&["optimize", "model"], "ZIRV_CTX_OPTIMIZE_MODEL"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -643,5 +684,63 @@ mod tests {
         let env = env_map(&[("ZIRV_CTX_PACE", "yes-please")]);
         let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad bool");
         assert!(err.to_string().contains("ZIRV_CTX_PACE"));
+    }
+
+    #[test]
+    fn optimize_defaults_are_conservative() {
+        let optimize = OptimizeConfig::default();
+        assert!(optimize.enabled, "the hook recommendation is on by default");
+        assert_eq!(optimize.sessions_sampled, 10);
+        assert_eq!(optimize.max_surface_bytes, 200_000);
+        assert_eq!(
+            optimize.model, "",
+            "empty means reuse the handoff model rather than inventing a second default"
+        );
+        assert_eq!(optimize.recommend_tool_failure_rate, 0.25);
+        assert_eq!(optimize.recommend_corrections, 3);
+        assert_eq!(optimize.recommend_cooldown_secs, 86_400);
+    }
+
+    #[test]
+    fn optimize_reads_config_and_env() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[optimize]\nsessions_sampled = 3\nrecommend_corrections = 9\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.optimize.sessions_sampled, 3);
+        assert_eq!(cfg.optimize.recommend_corrections, 9);
+
+        let env = env_map(&[("ZIRV_CTX_OPTIMIZE_SESSIONS", "7")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.optimize.sessions_sampled, 7);
+    }
+
+    #[test]
+    fn a_repo_may_not_choose_the_optimize_model() {
+        // Same trust boundary as handoff.model: a checkout must not name the
+        // model zirv spends tokens on.
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[optimize]\nmodel = \"opus\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("repo may not set optimize.model");
+        let msg = err.to_string();
+        assert!(msg.contains("optimize.model"), "got {msg}");
+        assert!(
+            msg.contains("ZIRV_CTX_OPTIMIZE_MODEL"),
+            "name the alternative: {msg}"
+        );
     }
 }
