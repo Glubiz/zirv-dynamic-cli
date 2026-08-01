@@ -163,13 +163,44 @@ pub fn prompt_output(marker: &str) -> String {
 }
 
 /// PreCompact cannot add instructions to a compaction (verified against the
-/// hook reference), so this records the event and says so. Focus instructions
-/// ride along with wrap's injected `/compact <focus>` command instead.
+/// hook reference), so all this can do is say so. Focus instructions ride
+/// along with wrap's injected `/compact <focus>` command instead.
 pub fn pre_compact_output() -> String {
     serde_json::json!({
         "systemMessage": "zirv ctx: compaction starting. Preserve the current task, file paths and unresolved errors."
     })
     .to_string()
+}
+
+/// A compaction is the largest single context event a session has, so it is
+/// recorded even though the hook cannot influence it. Without this entry the
+/// decision log shows scores stepping down with no visible cause.
+pub fn run_pre_compact<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    // Same rule as every other hook path: nothing here may keep the advisory
+    // from being printed or turn into a non-zero exit.
+    let payload = HookPayload::parse(stdin).unwrap_or_default();
+    let session = env(SESSION_ENV)
+        .or_else(|| Some(payload.session_id.clone()))
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if let Ok(state) = StateDir::resolve(env) {
+        let _ = log::append(
+            &state,
+            &log::Decision {
+                ts: now_secs(),
+                session: &session,
+                verb: "hook",
+                verdict: "n/a",
+                score: 0,
+                action: "pre-compact",
+                detail: &payload.transcript_path,
+            },
+        );
+    }
+
+    let _ = writeln!(w, "{}", pre_compact_output());
+    Ok(0)
 }
 
 /// Field names codex uses for the rollout path, most specific first. Populate
@@ -261,10 +292,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
             }
             Ok(0)
         }
-        HookEvent::PreCompact => {
-            let _ = writeln!(w, "{}", pre_compact_output());
-            Ok(0)
-        }
+        HookEvent::PreCompact => run_pre_compact(w, &read_stdin(), &env),
         HookEvent::Notify { payload } => {
             let raw = match payload {
                 Some(text) => text.clone(),
@@ -517,6 +545,54 @@ mod tests {
         assert!(
             !out.contains("[zirv]"),
             "nothing user-specific is hardcoded"
+        );
+    }
+
+    /// Observational is not the same as silent: a compaction is the single
+    /// biggest context event in a session, and the decision log is where a
+    /// later "why did quality drop here" gets answered.
+    #[test]
+    fn pre_compact_records_that_a_compaction_started() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_pre_compact(
+            &mut out,
+            "{\"session_id\":\"s\",\"transcript_path\":\"/tmp/t.jsonl\",\"cwd\":\"/work\"}",
+            &|k| env.get(k).cloned(),
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("systemMessage"),
+            "the advisory still goes out: {printed}"
+        );
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log written");
+        assert!(log.contains("\"action\":\"pre-compact\""), "got {log}");
+        assert!(log.contains("\"session\":\"s\""), "name the session: {log}");
+        assert!(
+            log.contains("/tmp/t.jsonl"),
+            "name the transcript it happened in: {log}"
+        );
+    }
+
+    #[test]
+    fn pre_compact_exits_zero_even_with_unusable_stdin() {
+        let mut out = Vec::new();
+        let code = run_pre_compact(&mut out, "not json at all", &|_| None).expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            String::from_utf8_lossy(&out).contains("systemMessage"),
+            "the advisory does not depend on the payload"
         );
     }
 

@@ -15,7 +15,10 @@ pub struct ResumeArgs {
     #[arg(long, default_value_t = false)]
     pub print_prompt: bool,
     /// Extra arguments passed through to the agent.
-    #[arg(long)]
+    //
+    // `allow_hyphen_values`, because what gets passed through here is the
+    // agent's own flags: `--extra --continue`.
+    #[arg(long, allow_hyphen_values = true)]
     pub extra: Vec<String>,
 }
 

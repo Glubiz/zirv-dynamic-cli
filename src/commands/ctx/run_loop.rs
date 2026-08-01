@@ -40,7 +40,10 @@ pub struct LoopArgs {
     #[arg(long)]
     pub cycles: Option<u32>,
     /// Extra arguments passed through to the agent.
-    #[arg(long)]
+    //
+    // `allow_hyphen_values`, because what gets passed through here is the
+    // agent's own flags: `--extra --model --extra opus`.
+    #[arg(long, allow_hyphen_values = true)]
     pub extra: Vec<String>,
 }
 

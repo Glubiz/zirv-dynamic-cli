@@ -59,6 +59,39 @@ pub enum CtxVerb {
     Usage(usage::UsageArgs),
 }
 
+/// What a clap parse failure costs, which is not the same for every verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseFailure {
+    /// The ordinary case: clap printed the error, the caller sees exit 2.
+    Reject,
+    /// Claude Code reads a Stop hook's exit 2 as "block the stop", so a
+    /// mistyped hook invocation would wedge the agent it is meant to watch.
+    Hook,
+    /// Claude Code renders whatever the statusline command prints, so exiting
+    /// without a line looks like a broken terminal to the user.
+    Statusline,
+}
+
+/// Reads the verb straight from argv, because by the time this runs clap has
+/// already refused to tell us what was meant.
+pub fn classify_parse_failure(args: &[String]) -> ParseFailure {
+    match (
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) {
+        (Some("hook"), _) => ParseFailure::Hook,
+        (Some("usage"), Some("tee")) => ParseFailure::Statusline,
+        _ => ParseFailure::Reject,
+    }
+}
+
+fn read_stdin() -> String {
+    use std::io::Read;
+    let mut buffer = String::new();
+    let _ = std::io::stdin().read_to_string(&mut buffer);
+    buffer
+}
+
 /// `args[0]` is the literal "ctx" as it appeared in argv.
 pub fn dispatch(args: &[String]) -> i32 {
     let argv = std::iter::once("zirv ctx".to_string()).chain(args.iter().skip(1).cloned());
@@ -66,7 +99,14 @@ pub fn dispatch(args: &[String]) -> i32 {
         Ok(cli) => cli,
         Err(err) => {
             let _ = err.print();
-            return 2;
+            let mut out = std::io::stdout();
+            return match classify_parse_failure(args) {
+                ParseFailure::Reject => 2,
+                ParseFailure::Hook => 0,
+                // The same fallback the tee itself uses when its chained
+                // command is missing or broken.
+                ParseFailure::Statusline => usage::run_tee(&mut out, &read_stdin(), &[], None, 0),
+            };
         }
     };
 
@@ -254,10 +294,88 @@ mod tests {
         }
     }
 
+    /// `--extra` carries the agent's own flags, which are hyphen-shaped almost
+    /// by definition. Same clap bug class as the `ExecArgs::command` fix.
+    #[test]
+    fn loop_and_resume_accept_hyphen_shaped_extra_values() {
+        let cli = CtxCli::try_parse_from([
+            "zirv ctx", "loop", "--prompt", "go", "--extra", "--model", "--extra", "opus",
+        ])
+        .expect("loop --extra must accept the agent's own flags");
+        match cli.verb {
+            CtxVerb::Loop(args) => {
+                assert_eq!(args.extra, vec!["--model".to_string(), "opus".to_string()])
+            }
+            other => panic!("expected Loop, got {other:?}"),
+        }
+
+        let cli = CtxCli::try_parse_from(["zirv ctx", "resume", "--extra", "--continue"])
+            .expect("resume --extra must accept the agent's own flags");
+        match cli.verb {
+            CtxVerb::Resume(args) => assert_eq!(args.extra, vec!["--continue".to_string()]),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
     #[test]
     fn unknown_verb_exits_two() {
         let code = dispatch(&["ctx".to_string(), "nope".to_string()]);
         assert_eq!(code, 2, "clap parse failure must map to exit code 2");
+    }
+
+    /// The invariant is "a hook always exits 0", and clap's own error path is
+    /// part of the hook: exit 2 from a Stop hook blocks the agent's stop.
+    #[test]
+    fn a_hook_invocation_clap_rejects_still_exits_zero() {
+        for argv in [
+            vec!["ctx", "hook", "Stop"],
+            vec!["ctx", "hook", "stop", "--bogus"],
+            vec!["ctx", "hook", "notify", "-x"],
+            vec!["ctx", "hook"],
+        ] {
+            let args: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+            assert_eq!(
+                dispatch(&args),
+                0,
+                "a hook must never block the agent: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_statusline_tee_still_exits_zero() {
+        let args: Vec<String> = ["ctx", "usage", "tee", "--bogus"]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect();
+        assert_eq!(dispatch(&args), 0, "a statusline must never fail loudly");
+    }
+
+    #[test]
+    fn only_hooks_and_the_statusline_survive_a_parse_failure() {
+        let argv =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(|p| (*p).to_string()).collect() };
+        assert_eq!(
+            classify_parse_failure(&argv(&["ctx", "hook", "Stop"])),
+            ParseFailure::Hook
+        );
+        assert_eq!(
+            classify_parse_failure(&argv(&["ctx", "usage", "tee", "--bogus"])),
+            ParseFailure::Statusline
+        );
+        assert_eq!(
+            classify_parse_failure(&argv(&["ctx", "usage", "--bogus"])),
+            ParseFailure::Reject,
+            "only the tee has a statusline to keep alive"
+        );
+        assert_eq!(
+            classify_parse_failure(&argv(&["ctx", "exec", "--bogus"])),
+            ParseFailure::Reject
+        );
+        assert_eq!(
+            classify_parse_failure(&argv(&["ctx"])),
+            ParseFailure::Reject
+        );
     }
 
     #[test]
