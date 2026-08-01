@@ -2108,10 +2108,7 @@ mod tests {
         let state = tmp.path().join("state");
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
-        // SAFETY: CI runs tests single-threaded.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let args = OptimizeArgs {
             agent: Some("claude".to_string()),
             no_model: false,
@@ -2120,9 +2117,6 @@ mod tests {
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
-        unsafe {
-            std::env::remove_var("HOME");
-        }
 
         assert_eq!(code, 0, "findings are not failures");
         let printed = String::from_utf8(out).expect("utf8");
@@ -2160,9 +2154,7 @@ mod tests {
         let before_repo = tree_snapshot(&repo);
         let before_home = tree_snapshot(&home);
 
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let args = OptimizeArgs {
             agent: Some("claude".to_string()),
             no_model: false,
@@ -2171,9 +2163,6 @@ mod tests {
         };
         let mut out = Vec::new();
         run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
-        unsafe {
-            std::env::remove_var("HOME");
-        }
 
         assert_eq!(before_repo, tree_snapshot(&repo), "optimize is report-only");
         assert_eq!(
@@ -2189,8 +2178,9 @@ mod tests {
         let state = tmp.path().join("state");
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // SAFETY: CI runs tests single-threaded.
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_OPTIMIZER_MODE", "fail");
         }
         let args = OptimizeArgs {
@@ -2202,7 +2192,6 @@ mod tests {
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
         unsafe {
-            std::env::remove_var("HOME");
             std::env::remove_var("FAKE_OPTIMIZER_MODE");
         }
 
@@ -2225,8 +2214,9 @@ mod tests {
         let log = tmp.path().join("prompt.log");
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // SAFETY: CI runs tests single-threaded.
         unsafe {
-            std::env::set_var("HOME", &home);
             std::env::set_var("FAKE_OPTIMIZER_PROMPT_LOG", &log);
         }
         let args = OptimizeArgs {
@@ -2238,7 +2228,6 @@ mod tests {
         let mut out = Vec::new();
         run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
         unsafe {
-            std::env::remove_var("HOME");
             std::env::remove_var("FAKE_OPTIMIZER_PROMPT_LOG");
         }
 
@@ -2251,9 +2240,7 @@ mod tests {
         let state = tmp.path().join("state");
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let args = OptimizeArgs {
             agent: Some("claude".to_string()),
             no_model: true,
@@ -2262,9 +2249,6 @@ mod tests {
         };
         let mut out = Vec::new();
         run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
-        unsafe {
-            std::env::remove_var("HOME");
-        }
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"verb\":\"optimize\""), "got {log}");
@@ -2278,9 +2262,7 @@ mod tests {
         let out_path = tmp.path().join("report.md");
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let args = OptimizeArgs {
             agent: Some("claude".to_string()),
             no_model: true,
@@ -2289,9 +2271,6 @@ mod tests {
         };
         let mut out = Vec::new();
         run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
-        unsafe {
-            std::env::remove_var("HOME");
-        }
 
         assert!(
             std::fs::read_to_string(&out_path)
