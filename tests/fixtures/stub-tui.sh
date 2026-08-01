@@ -5,7 +5,10 @@
 # Records injected slash-commands to $STUB_TUI_LOG and appends a compaction
 # event to $STUB_TUI_TRANSCRIPT when it sees /compact, which is what wrap
 # watches for when it verifies an injection. Exits on /exit, /quit or EOF.
+# Prints its own argv first, so a test can assert on injected flags such as
+# --append-system-prompt.
 set -eu
+printf 'argv: %s\n' "$*"
 printf 'stub-tui ready\n'
 while IFS= read -r line; do
   printf 'echo: %s\n' "$line"

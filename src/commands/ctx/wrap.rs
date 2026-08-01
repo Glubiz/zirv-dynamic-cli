@@ -399,10 +399,9 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
-    let (program, rest) = args
-        .command
-        .split_first()
-        .ok_or("no command to wrap; pass it after --")?;
+    if args.command.is_empty() {
+        return Err("no command to wrap; pass it after --".into());
+    }
 
     let cfg = CtxConfig::load(repo, env)?;
     // Selection happens here so an unknown or unverified agent fails before the
@@ -422,6 +421,11 @@ pub fn run_with<W: Write>(
         args.simple,
         &cfg.prompt,
     );
+    // The wrapped command's own argv may already carry the adapter's
+    // system-prompt flag; merge it in rather than letting `prompt_args` below
+    // silently override it with a second occurrence.
+    let (launch_command, composed) =
+        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed);
     let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
     super::prompt::log_injection(
         &state_dir,
@@ -430,6 +434,9 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         adapter.capabilities().system_prompt,
     );
+    let (program, rest) = launch_command
+        .split_first()
+        .expect("checked non-empty above");
 
     let mut supervision = InjectionState::new();
     supervision.degraded = args.no_supervise;
@@ -939,6 +946,44 @@ mod tests {
 
         let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
         assert!(seen.contains("stub-tui ready"), "got: {seen:?}");
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let status = h.child.wait().expect("wait");
+        assert_eq!(status.exit_code(), 0);
+    }
+
+    /// I2: a user's own --append-system-prompt inside the wrapped command must
+    /// not be silently discarded by zirv's own occurrence of the same flag.
+    #[cfg(unix)]
+    #[test]
+    fn a_users_own_append_system_prompt_is_merged_not_dropped() {
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[],
+            &[
+                "sh",
+                &script,
+                "--append-system-prompt",
+                "always answer in Danish",
+            ],
+        );
+
+        let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+        assert_eq!(
+            seen.matches("--append-system-prompt").count(),
+            1,
+            "exactly one flag must reach the wrapped agent: {seen:?}"
+        );
+        assert!(
+            seen.contains("always answer in Danish"),
+            "the user's own instruction must survive: {seen:?}"
+        );
+        assert!(
+            seen.contains("zirv session conventions"),
+            "zirv's own layer is still present: {seen:?}"
+        );
 
         h.writer.write_all(b"/exit\r").expect("write");
         h.writer.flush().expect("flush");

@@ -325,6 +325,10 @@ impl AgentAdapter for ClaudeAdapter {
         vec!["--append-system-prompt".to_string(), prompt.to_string()]
     }
 
+    fn user_system_prompt_flag(&self) -> Option<&'static str> {
+        Some("--append-system-prompt")
+    }
+
     /// The distillation prompt is piped to stdin so a long transcript tail
     /// never hits argv length limits.
     fn distiller_cmd(&self, model: &str) -> Command {
@@ -924,6 +928,17 @@ mod tests {
         let adapter = ClaudeAdapter::new(None);
         assert!(adapter.system_prompt_args("").is_empty());
         assert!(adapter.system_prompt_args("   \n").is_empty());
+    }
+
+    /// I2: this must name the exact flag `system_prompt_args` emits, so a
+    /// caller can find a user's own use of it and merge rather than override.
+    #[test]
+    fn the_user_facing_flag_name_matches_what_system_prompt_args_emits() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            adapter.user_system_prompt_flag(),
+            Some("--append-system-prompt")
+        );
     }
 
     #[test]

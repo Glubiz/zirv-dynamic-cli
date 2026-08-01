@@ -69,6 +69,8 @@ pub fn run_with<W: Write>(
         args.simple,
         &cfg.prompt,
     );
+    let (user_extra, composed) =
+        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed);
     let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
     super::prompt::log_injection(
         &state,
@@ -77,10 +79,8 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         adapter.capabilities().system_prompt,
     );
-    let extra: Vec<String> = args
-        .extra
-        .iter()
-        .cloned()
+    let extra: Vec<String> = user_extra
+        .into_iter()
         .chain(prompt_args.iter().cloned())
         .collect();
 

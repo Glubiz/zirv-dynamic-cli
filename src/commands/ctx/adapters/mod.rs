@@ -40,6 +40,14 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// unsupported agent ships without injection rather than with a guess.
     fn system_prompt_args(&self, prompt: &str) -> Vec<String>;
 
+    /// The user-facing flag name `system_prompt_args` emits, when the agent has
+    /// one. Lets a caller find and merge a user's own use of the flag instead
+    /// of silently overriding it with a second occurrence. `None` when the
+    /// agent has no such flag, which is also the default: nothing to merge.
+    fn user_system_prompt_flag(&self) -> Option<&'static str> {
+        None
+    }
+
     fn transcript_path(&self, session: &SessionRef) -> PathBuf;
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;

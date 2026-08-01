@@ -89,6 +89,8 @@ pub fn run_with<W: Write>(
         args.simple,
         &cfg.prompt,
     );
+    let (user_extra, composed) =
+        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed);
     let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
     super::prompt::log_injection(
         &state,
@@ -97,10 +99,8 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         adapter.capabilities().system_prompt,
     );
-    let extra: Vec<String> = args
-        .extra
-        .iter()
-        .cloned()
+    let extra: Vec<String> = user_extra
+        .into_iter()
         .chain(prompt_args.iter().cloned())
         .collect();
 
@@ -677,6 +677,54 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
+    }
+
+    /// I2: the caller's own --append-system-prompt (passed via --extra) must
+    /// not be silently discarded by zirv's own occurrence of the same flag.
+    #[test]
+    fn a_users_own_append_system_prompt_survives_alongside_zirvs_own() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "1");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut out = Vec::new();
+        let mut args = args_for(1);
+        args.simple = false;
+        args.extra = vec![
+            "--append-system-prompt".to_string(),
+            "always answer in Danish".to_string(),
+        ];
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert_eq!(
+            argv.matches("--append-system-prompt").count(),
+            1,
+            "exactly one flag must reach the agent: {argv}"
+        );
+        assert!(
+            argv.contains("always answer in Danish"),
+            "the user's own instruction must survive: {argv}"
+        );
+        assert!(
+            argv.contains("zirv session conventions"),
+            "zirv's own layer is still present: {argv}"
+        );
     }
 
     #[test]

@@ -200,6 +200,11 @@ mod tests {
             "no verified mechanism means no arguments, not a guessed flag"
         );
         assert!(!adapter.capabilities().system_prompt);
+        assert_eq!(
+            adapter.user_system_prompt_flag(),
+            None,
+            "nothing to merge when there is no flag at all"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub enum PromptSource {
     Default,
     User,
     Repo,
+    CommandLine,
 }
 
 impl PromptSource {
@@ -33,6 +34,7 @@ impl PromptSource {
             PromptSource::Default => "default",
             PromptSource::User => "user",
             PromptSource::Repo => "repo",
+            PromptSource::CommandLine => "command-line",
         }
     }
 }
@@ -127,6 +129,85 @@ pub fn compose(
 }
 
 use super::adapters::AgentAdapter;
+
+/// Strips the adapter's own user-facing system-prompt flag (and its value) out
+/// of a passthrough argv, returning the cleaned argv and the extracted text.
+/// `None` when the adapter has no such flag, or the flag never appears: both
+/// mean there is nothing to merge. A repeated flag keeps its last value, the
+/// same choice the underlying CLI itself makes.
+pub fn extract_user_prompt_flag(
+    adapter: &dyn AgentAdapter,
+    argv: &[String],
+) -> (Vec<String>, Option<String>) {
+    let Some(flag) = adapter.user_system_prompt_flag() else {
+        return (argv.to_vec(), None);
+    };
+
+    let mut cleaned = Vec::with_capacity(argv.len());
+    let mut extracted = None;
+    let mut iter = argv.iter().cloned();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            if let Some(value) = iter.next() {
+                extracted = Some(value);
+            }
+            continue;
+        }
+        cleaned.push(arg);
+    }
+    (cleaned, extracted)
+}
+
+/// Adds the operator's own command-line text as the final, highest-priority
+/// layer. `None` in means `None` out: a run with nothing composed (`--simple`,
+/// or the prompt disabled) must not gain zirv text just because the user also
+/// passed their own flag.
+fn with_command_line_layer(
+    composed: Option<ComposedPrompt>,
+    cli_text: Option<&str>,
+) -> Option<ComposedPrompt> {
+    let mut composed = composed?;
+    let Some(cli_text) = cli_text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Some(composed);
+    };
+
+    // Last and unlabeled-as-untrusted, unlike the repo layer: this is the
+    // operator's own instruction for this run, so it wins on conflict rather
+    // than being subordinated to what came before it. The label deliberately
+    // never spells out the flag name: that text becomes this flag's own
+    // value, and a literal flag name inside it would be confusable with a
+    // second occurrence of the flag itself.
+    composed.text.push_str(
+        "\n\n---\n\nThe following section is the operator's own instruction, passed directly \
+         on the command line this session was started with. It takes precedence over \
+         everything above it.\n\n",
+    );
+    composed.text.push_str(cli_text);
+    composed.sources.push(PromptSource::CommandLine);
+    Some(composed)
+}
+
+/// Reconciles a user's own use of the adapter's system-prompt flag with what
+/// zirv is about to inject, for the four verbs that launch or relaunch an
+/// agent (`wrap`, `exec`, `loop`, `resume`). When zirv has nothing to inject
+/// (`composed` is `None`), the argv is returned untouched: stripping the
+/// user's flag would drop their instruction with nothing left to carry it.
+/// Otherwise the flag is stripped from the passthrough argv and its text
+/// becomes the final composed layer, so exactly one flag reaches the agent.
+pub fn merge_command_line_prompt(
+    adapter: &dyn AgentAdapter,
+    argv: &[String],
+    composed: Option<ComposedPrompt>,
+) -> (Vec<String>, Option<ComposedPrompt>) {
+    if composed.is_none() {
+        return (argv.to_vec(), None);
+    }
+    let (cleaned, cli_text) = extract_user_prompt_flag(adapter, argv);
+    (
+        cleaned,
+        with_command_line_layer(composed, cli_text.as_deref()),
+    )
+}
 use super::log;
 use super::state::{StateDir, now_secs};
 
@@ -465,5 +546,120 @@ mod tests {
             !described.contains("user"),
             "absent layers are not claimed: {described}"
         );
+    }
+
+    // I2: a user's own --append-system-prompt must be merged, not overridden
+    // by a second occurrence zirv appends afterward.
+
+    #[test]
+    fn extract_user_prompt_flag_strips_claudes_flag_and_keeps_the_rest() {
+        let adapter = ClaudeAdapter::new(None);
+        let argv = vec![
+            "claude".to_string(),
+            "--append-system-prompt".to_string(),
+            "always answer in Danish".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        let (cleaned, extracted) = extract_user_prompt_flag(&adapter, &argv);
+        assert_eq!(
+            cleaned,
+            vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string()
+            ],
+            "the flag and its value are removed, everything else stays"
+        );
+        assert_eq!(extracted, Some("always answer in Danish".to_string()));
+    }
+
+    #[test]
+    fn extract_user_prompt_flag_is_a_noop_without_the_flag() {
+        let adapter = ClaudeAdapter::new(None);
+        let argv = vec![
+            "claude".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        let (cleaned, extracted) = extract_user_prompt_flag(&adapter, &argv);
+        assert_eq!(cleaned, argv);
+        assert_eq!(extracted, None);
+    }
+
+    #[test]
+    fn extract_user_prompt_flag_is_a_noop_for_an_adapter_with_no_such_flag() {
+        let adapter = CodexAdapter::new(None);
+        let argv = vec![
+            "codex".to_string(),
+            "--append-system-prompt".to_string(),
+            "x".to_string(),
+        ];
+        let (cleaned, extracted) = extract_user_prompt_flag(&adapter, &argv);
+        assert_eq!(cleaned, argv, "codex has no such flag: nothing to strip");
+        assert_eq!(extracted, None);
+    }
+
+    #[test]
+    fn merge_command_line_prompt_appends_the_users_text_as_the_final_layer() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let argv = vec![
+            "claude".to_string(),
+            "--append-system-prompt".to_string(),
+            "always answer in Danish".to_string(),
+        ];
+
+        let (cleaned, merged) = merge_command_line_prompt(&adapter, &argv, composed);
+
+        assert_eq!(cleaned, vec!["claude".to_string()], "the flag is stripped");
+        let merged = merged.expect("still composed");
+        assert_eq!(
+            merged.sources,
+            vec![PromptSource::Default, PromptSource::CommandLine]
+        );
+        let default_at = merged
+            .text
+            .find("zirv session conventions")
+            .expect("default");
+        let cli_at = merged
+            .text
+            .find("always answer in Danish")
+            .expect("the user's own text must survive");
+        assert!(
+            default_at < cli_at,
+            "the command-line layer is last:\n{}",
+            merged.text
+        );
+    }
+
+    #[test]
+    fn merge_command_line_prompt_is_a_noop_without_the_flag_in_argv() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let argv = vec!["claude".to_string()];
+
+        let (cleaned, merged) = merge_command_line_prompt(&adapter, &argv, composed.clone());
+        assert_eq!(cleaned, argv);
+        assert_eq!(merged, composed, "nothing to merge, so nothing changes");
+    }
+
+    #[test]
+    fn merge_command_line_prompt_leaves_argv_untouched_when_nothing_is_composed() {
+        // `--simple`, or the prompt disabled: zirv injects nothing, so the
+        // user's own flag must pass through exactly as they wrote it rather
+        // than being stripped with nowhere left to carry its text.
+        let adapter = ClaudeAdapter::new(None);
+        let argv = vec![
+            "claude".to_string(),
+            "--append-system-prompt".to_string(),
+            "always answer in Danish".to_string(),
+        ];
+
+        let (cleaned, merged) = merge_command_line_prompt(&adapter, &argv, None);
+        assert_eq!(cleaned, argv, "nothing composed means nothing stripped");
+        assert_eq!(merged, None);
     }
 }

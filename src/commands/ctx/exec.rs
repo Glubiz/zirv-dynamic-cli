@@ -102,6 +102,11 @@ pub fn run_with<W: Write>(
         args.simple,
         &cfg.prompt,
     );
+    // The first spawn's own argv may already carry the adapter's system-prompt
+    // flag (e.g. `-- claude --append-system-prompt "..."`); merge it in rather
+    // than letting `prompt_args` silently override it below.
+    let (launch_command, composed) =
+        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed);
     let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
 
     let session_raw = args
@@ -180,7 +185,7 @@ pub fn run_with<W: Write>(
             .unwrap_or_default()
     };
 
-    let mut command = build_command(&args.command, repo)?;
+    let mut command = build_command(&launch_command, repo)?;
     for arg in &prompt_args {
         command.arg(arg);
     }
@@ -1176,6 +1181,60 @@ mod tests {
         assert!(
             argv.contains("--append-system-prompt"),
             "the restarted child must carry the prompt too: {argv}"
+        );
+    }
+
+    /// I2: a user's own --append-system-prompt inside the `--` command must
+    /// not be silently discarded by zirv's own occurrence of the same flag.
+    #[test]
+    fn a_users_own_append_system_prompt_is_merged_into_the_first_spawn() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session = "dddddddd-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut command = fake_agent_command(session);
+        command.push("--append-system-prompt".to_string());
+        command.push("always answer in Danish".to_string());
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            timeout_secs: Some(60),
+            simple: false,
+            command,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert_eq!(
+            argv.matches("--append-system-prompt").count(),
+            1,
+            "exactly one flag must reach the agent: {argv}"
+        );
+        assert!(
+            argv.contains("always answer in Danish"),
+            "the user's own instruction must survive: {argv}"
+        );
+        assert!(
+            argv.contains("zirv session conventions"),
+            "zirv's own layer is still present: {argv}"
         );
     }
 
