@@ -59,6 +59,60 @@ pub fn is_limit_hit(line: &str) -> bool {
         .any(|pattern| lowered.contains(pattern))
 }
 
+/// Words that, alongside "limit", suggest a possible usage-limit message even
+/// when the exact phrasing does not match `LIMIT_HIT_PATTERNS`.
+const LOOSE_LIMIT_HINTS: &[&str] = &["hit", "reached", "exceeded"];
+
+/// Loose secondary signal for a possible usage-limit message: the word "limit"
+/// alongside a verb suggesting it was hit, reached, or exceeded. Deliberately
+/// wider than `LIMIT_HIT_PATTERNS` — firing here only leaves a breadcrumb via
+/// `note_limit_wording_drift`, it never feeds into `is_limit_hit` or a pace
+/// decision.
+#[allow(dead_code)] // wired in at the is_limit_hit call sites in exec.rs/run_loop.rs (out of scope here)
+fn is_loose_limit_mention(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    lowered.contains("limit") && LOOSE_LIMIT_HINTS.iter().any(|hint| lowered.contains(hint))
+}
+
+/// Leaves a breadcrumb when `line` loosely resembles a usage-limit message that
+/// the strict patterns did not recognize: a decision-log entry plus a single
+/// stderr advisory, so a wording change upstream leaves a trail instead of
+/// silently falling through to ordinary-failure handling. `strict` is the
+/// result already computed by `is_limit_hit`; when it is true no breadcrumb is
+/// needed, and this function never changes the proceed/wait/park decision by
+/// itself. Fail-open: a broken state dir must not turn this into a hard
+/// failure, so a logging error is swallowed like the rest of this file's
+/// decision logging.
+#[allow(dead_code)] // not yet called from exec.rs/run_loop.rs (out of scope here)
+pub fn note_limit_wording_drift<W: Write>(
+    line: &str,
+    strict: bool,
+    state: &StateDir,
+    session: &str,
+    verb: &'static str,
+    stderr: &mut W,
+) {
+    if strict || !is_loose_limit_mention(line) {
+        return;
+    }
+    let _ = writeln!(
+        stderr,
+        "zirv ctx {verb}: possible usage-limit message not recognized by known patterns"
+    );
+    let _ = log::append(
+        state,
+        &log::Decision {
+            ts: now_secs(),
+            session,
+            verb,
+            verdict: "n/a",
+            score: 0,
+            action: "limit-wording-drift",
+            detail: line,
+        },
+    );
+}
+
 /// Whether a collector window may drive the decision.
 ///
 /// A fresh observation always may. A stale one still may when it reported a full
@@ -815,6 +869,93 @@ mod tests {
         ] {
             assert!(!is_limit_hit(line), "false positive on {line:?}");
         }
+    }
+
+    #[test]
+    fn the_loose_matcher_requires_limit_plus_a_hit_word() {
+        assert!(is_loose_limit_mention("usage limit reached"));
+        assert!(is_loose_limit_mention("You exceeded your limit"));
+        assert!(is_loose_limit_mention("LIMIT HIT"));
+        assert!(!is_loose_limit_mention("limit"), "needs a hit-word too");
+        assert!(
+            !is_loose_limit_mention("hit the ground running"),
+            "needs the word limit too"
+        );
+        assert!(!is_loose_limit_mention(""));
+    }
+
+    #[test]
+    fn a_reworded_limit_message_is_not_mistaken_for_the_documented_shape() {
+        // Guards against silently mis-scoring wording drift as a strict hit:
+        // this phrasing is plausible but not one of the three documented ones.
+        assert!(!is_limit_hit(
+            "You've reached your usage limit for this session"
+        ));
+    }
+
+    #[test]
+    fn loose_wording_drift_leaves_a_breadcrumb_without_changing_behavior() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut stderr = Vec::new();
+
+        let line = "You've reached your usage limit for this session";
+        note_limit_wording_drift(line, false, &state, "sess-1", "exec", &mut stderr);
+
+        let printed = String::from_utf8(stderr).expect("utf8");
+        assert!(
+            printed.contains("possible usage-limit"),
+            "advisory missing: {printed}"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"limit-wording-drift\""),
+            "got {log}"
+        );
+        assert!(log.contains("sess-1"), "got {log}");
+    }
+
+    #[test]
+    fn a_recognized_strict_hit_needs_no_breadcrumb() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut stderr = Vec::new();
+
+        // Strict already matched (would also loosely match), so no breadcrumb.
+        note_limit_wording_drift(
+            "You've hit your session limit · resets 3:45pm",
+            true,
+            &state,
+            "sess-1",
+            "exec",
+            &mut stderr,
+        );
+
+        assert!(String::from_utf8(stderr).expect("utf8").is_empty());
+        assert!(
+            !state.logs().join("decisions.jsonl").exists(),
+            "a recognized hit needs no wording-drift breadcrumb"
+        );
+    }
+
+    #[test]
+    fn ordinary_output_leaves_no_breadcrumb_either() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut stderr = Vec::new();
+
+        note_limit_wording_drift(
+            "all systems normal",
+            false,
+            &state,
+            "sess-1",
+            "exec",
+            &mut stderr,
+        );
+
+        assert!(String::from_utf8(stderr).expect("utf8").is_empty());
+        assert!(!state.logs().join("decisions.jsonl").exists());
     }
 
     /// Fake clock: `now` advances by whatever the code sleeps, so a test can
