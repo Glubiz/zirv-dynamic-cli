@@ -2,9 +2,12 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use crate::utils::{SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir};
+use crate::utils::{
+    SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, candidate_names_in_dir, home_dir,
+    suggest_matches,
+};
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Default)]
 pub struct Input {
     /// A descriptive name for the script.
     pub command: String,
@@ -13,6 +16,16 @@ pub struct Input {
     pub params: Vec<String>,
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+    /// (`create` only) Script name; skips the interactive name prompt.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// (`create` only) Shortcut key; skips the interactive shortcut prompt.
+    #[arg(long)]
+    pub shortcut: Option<String>,
+    /// (`create` only) Create in the global `~/.zirv` folder. Bare `--global`
+    /// means true; pass `--global false` to skip the prompt with "no".
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub global: Option<bool>,
 }
 
 fn find_script_in_dir(
@@ -64,6 +77,139 @@ impl Input {
             return Ok(path);
         }
 
-        Err(format!("No script or shortcut found for '{}'", self.command).into())
+        Err(not_found_error(&self.command))
+    }
+}
+
+/// Builds the "no script or shortcut" error, enriched with up to 3 "did you
+/// mean" suggestions drawn from local (then global) script names and
+/// shortcut keys, plus a pointer to `zirv help`.
+fn not_found_error(command: &str) -> Box<dyn std::error::Error> {
+    let mut candidates = candidate_names_in_dir(&PathBuf::from(SCRIPT_DIR_NAME));
+    if let Ok(home) = home_dir() {
+        candidates.extend(candidate_names_in_dir(&home.join(SCRIPT_DIR_NAME)));
+    }
+
+    let suggestions = suggest_matches(command, candidates.iter().map(String::as_str));
+
+    let mut message = format!("No script or shortcut found for '{command}'.");
+    if !suggestions.is_empty() {
+        message.push_str(&format!(" Did you mean: {}?", suggestions.join(", ")));
+    }
+    message.push_str(" Run `zirv help` to see available scripts and shortcuts.");
+
+    message.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{create_dir_all, write};
+    use tempfile::tempdir;
+
+    /// Helper mirroring `commands::init::tests::with_fake_home`: overrides
+    /// HOME/USERPROFILE and the current directory for the duration of `test`.
+    fn with_fake_env<F, R>(fake_home: &Path, fake_cwd: &Path, test: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let original_home = std::env::var("HOME").ok();
+        let original_userprofile = std::env::var("USERPROFILE").ok();
+        let original_dir = std::env::current_dir().unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home);
+            std::env::set_var("USERPROFILE", fake_home);
+        }
+        std::env::set_current_dir(fake_cwd).unwrap();
+
+        let result = test();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        unsafe {
+            match original_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_userprofile {
+                Some(up) => std::env::set_var("USERPROFILE", up),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn test_get_file_path_missing_script_suggests_closest_match() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "biuld".to_string(),
+                ..Default::default()
+            };
+            let err = input.get_file_path().unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("build"),
+                "expected a suggestion for 'build', got: {message}"
+            );
+            assert!(
+                message.contains("zirv help"),
+                "expected a hint to run `zirv help`, got: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_get_file_path_missing_script_no_suggestion_when_nothing_close() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join("deploy.yaml"), "name: Deploy\ncommands: []\n").unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "zzzzzzzzzz".to_string(),
+                ..Default::default()
+            };
+            let err = input.get_file_path().unwrap_err();
+            let message = err.to_string();
+            assert!(!message.contains("Did you mean"), "got: {message}");
+            assert!(message.contains("zirv help"), "got: {message}");
+        });
+    }
+
+    #[test]
+    fn test_get_file_path_missing_script_suggests_shortcut_key() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join("test.yaml"), "name: Test\ncommands: []\n").unwrap();
+        write(
+            zirv_dir.join(".shortcuts.yaml"),
+            "shortcuts:\n  tst: test.yaml\n",
+        )
+        .unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "tsst".to_string(),
+                ..Default::default()
+            };
+            let err = input.get_file_path().unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("tst"),
+                "expected the shortcut key 'tst' to be suggested, got: {message}"
+            );
+        });
     }
 }
