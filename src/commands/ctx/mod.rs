@@ -162,6 +162,18 @@ pub fn dispatch(args: &[String]) -> i32 {
         Ok(cli) => cli,
         Err(err) => {
             let _ = err.print();
+            // clap represents `--help`/`--version` as an `Err` too, since
+            // printing and exiting is the caller's job here; both are
+            // informational, not a rejected invocation, and must exit 0 like
+            // top-level `zirv --help` already does via `Parser::parse()`'s
+            // own exit path. A genuine parse error keeps falling through to
+            // `classify_parse_failure` below.
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                return 0;
+            }
             let mut out = std::io::stdout();
             return match classify_parse_failure(args) {
                 ParseFailure::Reject => 2,
@@ -376,6 +388,35 @@ mod tests {
     fn unknown_verb_exits_two() {
         let code = dispatch(&["ctx".to_string(), "nope".to_string()]);
         assert_eq!(code, 2, "clap parse failure must map to exit code 2");
+    }
+
+    /// Bug (2026-08-02 validation of 2.5.0): clap represents `--help` as an
+    /// `Err(...)` from `try_parse_from` (printing and exiting is the caller's
+    /// job), and `dispatch` collapsed every parse failure to `classify_parse_
+    /// failure`'s verdict, which only special-cases `hook` and `usage tee`.
+    /// Every other verb's `--help` exited 2 instead of 0, breaking scripts
+    /// that treat `--help` as success. Top-level `zirv --help` was never
+    /// affected: it goes through `Parser::parse()`, which exits correctly on
+    /// its own before any of this code runs.
+    #[test]
+    fn help_exits_zero_on_every_verb_and_bare_ctx() {
+        for argv in [
+            vec!["ctx", "--help"],
+            vec!["ctx", "score", "--help"],
+            vec!["ctx", "optimize", "--help"],
+            vec!["ctx", "usage", "--help"],
+            vec!["ctx", "status", "--help"],
+            vec!["ctx", "wrap", "--help"],
+            vec!["ctx", "exec", "--help"],
+            vec!["ctx", "handoff", "--help"],
+            vec!["ctx", "resume", "--help"],
+            vec!["ctx", "loop", "--help"],
+            vec!["ctx", "wrap", "-h"],
+            vec!["ctx", "hook", "--help"],
+        ] {
+            let args: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+            assert_eq!(dispatch(&args), 0, "--help must exit 0: {argv:?}");
+        }
     }
 
     /// The invariant is "a hook always exits 0", and clap's own error path is

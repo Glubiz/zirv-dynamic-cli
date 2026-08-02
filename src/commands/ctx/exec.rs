@@ -89,17 +89,23 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(
-        args.agent.as_deref().or(cfg.agent.as_deref()),
-        &args.command,
-        cfg.agent_bin.as_deref(),
-    )?;
+    let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
+    let adapter = adapters::select(agent_name, &args.command, cfg.agent_bin.as_deref())?;
     let state = StateDir::resolve(env)?;
 
+    // A wrapped command that matches no adapter (no explicit `--agent`,
+    // detection came up empty) is not actually the agent whose flags we would
+    // be injecting; see the matching gate in wrap.rs.
+    let skip_injection = args.simple
+        || !adapters::command_matches_adapter(
+            adapter.as_ref(),
+            agent_name.is_some(),
+            &args.command,
+        );
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
-        args.simple,
+        skip_injection,
         &cfg.prompt,
     );
     // The first spawn's own argv may already carry the adapter's system-prompt
