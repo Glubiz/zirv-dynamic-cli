@@ -232,6 +232,42 @@ pub fn injection_args(
     adapter.system_prompt_args(&composed.text)
 }
 
+/// Same as `injection_args`, except it prefers delivering the composed
+/// prompt through a private file rather than argv, when the installed
+/// binary supports it (`AgentAdapter::supports_system_prompt_file`): a
+/// composed prompt on argv is visible to any other user on the machine via
+/// `ps`, a file under the state dir is not. Any failure to prepare that file
+/// (probe error, write error) falls back to `system_prompt_args` rather than
+/// losing the prompt: this mechanism is a hardening, never a new single
+/// point of failure for whether the prompt reaches the agent at all.
+pub fn injection_args_for_session(
+    adapter: &dyn AgentAdapter,
+    composed: Option<&ComposedPrompt>,
+    state: &StateDir,
+    session: &str,
+) -> Vec<String> {
+    let Some(composed) = composed else {
+        return Vec::new();
+    };
+    if let Some(flag) = adapter.system_prompt_file_flag()
+        && adapter.supports_system_prompt_file()
+        && let Ok(path) = write_prompt_file(state, session, &composed.text)
+    {
+        return vec![flag.to_string(), path.display().to_string()];
+    }
+    adapter.system_prompt_args(&composed.text)
+}
+
+/// Writes the composed prompt to a private (0600) file under the state dir,
+/// named for the session it belongs to.
+fn write_prompt_file(state: &StateDir, session: &str, text: &str) -> std::io::Result<PathBuf> {
+    let dir = state.root().join("prompts");
+    super::state::create_private_dir_all(&dir)?;
+    let path = dir.join(format!("{session}.md"));
+    super::state::write_private(&path, text)?;
+    Ok(path)
+}
+
 /// Records whether this session start carried zirv text, so a transcript can be
 /// attributed to the prompt that shaped it.
 pub fn log_injection(
@@ -287,6 +323,72 @@ mod tests {
     #[test]
     fn nothing_composed_means_no_arguments() {
         assert!(injection_args(&ClaudeAdapter::new(None), None).is_empty());
+    }
+
+    /// M7: when the installed binary's `--help` does not advertise the
+    /// file-based flag, delivery must fall back to today's argv behavior
+    /// unchanged.
+    #[test]
+    fn injection_args_for_session_falls_back_to_argv_when_unsupported() {
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None).with_file_support_forced(false);
+
+        let args = injection_args_for_session(&adapter, composed.as_ref(), &state, "sess-1");
+        assert_eq!(args[0], "--append-system-prompt");
+        assert!(args[1].contains("zirv session conventions"));
+    }
+
+    /// M7: when the probe reports support, the composed prompt must be
+    /// written to a private file under the state dir rather than argv, and
+    /// `--append-system-prompt-file <path>` must point at it.
+    #[test]
+    fn injection_args_for_session_uses_a_private_file_when_supported() {
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
+
+        let args = injection_args_for_session(&adapter, composed.as_ref(), &state, "sess-2");
+        assert_eq!(args[0], "--append-system-prompt-file");
+        let path = PathBuf::from(&args[1]);
+        let contents = std::fs::read_to_string(&path).expect("prompt file written");
+        assert!(contents.contains("zirv session conventions"));
+    }
+
+    /// The prompt file must be private (0600): it carries the same text an
+    /// argv flag would have, just off `ps`, not off the machine's other users.
+    #[cfg(unix)]
+    #[test]
+    fn injection_args_for_session_writes_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
+
+        let args = injection_args_for_session(&adapter, composed.as_ref(), &state, "sess-3");
+        let path = PathBuf::from(&args[1]);
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the prompt file must be private");
+    }
+
+    /// Nothing composed still means no arguments, file-based delivery or not.
+    #[test]
+    fn injection_args_for_session_is_empty_when_nothing_is_composed() {
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
+        assert!(injection_args_for_session(&adapter, None, &state, "sess-4").is_empty());
     }
 
     #[test]

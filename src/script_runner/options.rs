@@ -40,16 +40,25 @@ impl Options {
 mod tests {
     use super::*;
 
+    /// The struct field (and thus the YAML/JSON/TOML key) is
+    /// `operating_system`. The `#[serde(rename = "os")]` on the
+    /// `OperatingSystem` enum only affects how that type names itself, not
+    /// the key `Options` exposes it under. Guards the README's schema
+    /// examples against drifting back to the wrong key.
     #[test]
-    fn os_alias_deserializes_into_operating_system() {
-        let options: Options = serde_yaml_ng::from_str("os: linux\n").expect("valid yaml");
-        assert_eq!(options.operating_system, Some(OperatingSystem::Linux));
+    fn test_options_operating_system_key_is_the_field_name() {
+        let opts: Options = serde_yaml_ng::from_str("operating_system: linux\n").unwrap();
+        assert_eq!(opts.operating_system, Some(OperatingSystem::Linux));
     }
 
+    /// `os` used to be silently ignored as an unknown key (a script written
+    /// with `os: linux`, as the older docs suggested, parsed "successfully"
+    /// but never applied the filter). It is now an explicit alias, so scripts
+    /// written against the old docs behave as their authors intended instead
+    /// of silently running on every platform.
     #[test]
-    fn operating_system_key_still_works() {
-        let options: Options =
-            serde_yaml_ng::from_str("operating_system: macos\n").expect("valid yaml");
-        assert_eq!(options.operating_system, Some(OperatingSystem::MacOS));
+    fn test_options_os_key_is_an_alias_for_operating_system() {
+        let opts: Options = serde_yaml_ng::from_str("os: linux\n").unwrap();
+        assert_eq!(opts.operating_system, Some(OperatingSystem::Linux));
     }
 }

@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::CtxResult;
 
@@ -84,26 +84,37 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
     Ok(())
 }
 
-/// Polls a growing transcript. Returns the whole file whenever its length
-/// changed, because scoring needs the full turn history, not just the delta.
+/// Polls a growing transcript. Returns the whole file whenever its length or
+/// modification time changed, because scoring needs the full turn history, not
+/// just the delta. Mtime is tracked alongside length so a same-length rewrite
+/// (possible right after a compaction rewrites the transcript in place) is not
+/// mistaken for "unchanged"; a rewrite invalidates any byte offset, so the read
+/// always starts from the beginning of the file.
 pub struct Watcher {
     path: PathBuf,
     len: u64,
+    mtime: Option<SystemTime>,
 }
 
 impl Watcher {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, len: 0 }
+        Self {
+            path,
+            len: 0,
+            mtime: None,
+        }
     }
 
     pub fn read_if_changed(&mut self) -> CtxResult<Option<String>> {
         let Ok(meta) = std::fs::metadata(&self.path) else {
             return Ok(None);
         };
-        if meta.len() == self.len {
+        let mtime = meta.modified().ok();
+        if meta.len() == self.len && mtime == self.mtime {
             return Ok(None);
         }
         self.len = meta.len();
+        self.mtime = mtime;
         Ok(Some(std::fs::read_to_string(&self.path)?))
     }
 }
@@ -330,6 +341,39 @@ mod tests {
             watcher.read_if_changed().expect("read"),
             Some("line one\nline two\n".to_string()),
             "the whole file, since scoring needs the full history"
+        );
+    }
+
+    #[test]
+    fn a_same_length_rewrite_is_detected_via_mtime() {
+        // Right after a compaction the transcript can be rewritten in place at
+        // the same byte length. Length alone would read that as unchanged.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut watcher = Watcher::new(path.clone());
+
+        std::fs::write(&path, "aaaa\n").expect("write");
+        assert_eq!(
+            watcher.read_if_changed().expect("read"),
+            Some("aaaa\n".to_string())
+        );
+
+        std::fs::write(&path, "bbbb\n").expect("rewrite, same length");
+        // Force the mtime forward explicitly rather than relying on real time
+        // to advance: some filesystems have coarse (e.g. one second) mtime
+        // resolution, which would make the test flaky otherwise.
+        let bumped = std::time::SystemTime::now() + Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(bumped)
+            .expect("set_modified");
+
+        assert_eq!(
+            watcher.read_if_changed().expect("read"),
+            Some("bbbb\n".to_string()),
+            "a same-length rewrite must not be mistaken for unchanged"
         );
     }
 

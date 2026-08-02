@@ -48,6 +48,24 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
+    /// The user-facing flag name that delivers the composed prompt via a
+    /// file path instead of argv text, when this agent has a verified one.
+    /// `None` (the default) means: use `system_prompt_args`, which puts the
+    /// prompt on argv instead.
+    fn system_prompt_file_flag(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether the installed binary's own `--help` output currently
+    /// advertises `system_prompt_file_flag`. Probed rather than assumed: an
+    /// adapter can know a flag's name and still find it missing from an
+    /// older install. `false` (the default, and the fallback for any probe
+    /// failure) means argv delivery via `system_prompt_args`, never a
+    /// blocked launch.
+    fn supports_system_prompt_file(&self) -> bool {
+        false
+    }
+
     fn transcript_path(&self, session: &SessionRef) -> PathBuf;
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;
