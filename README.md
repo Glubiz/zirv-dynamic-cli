@@ -13,15 +13,19 @@
 - [Upgrading](#upgrading)
 - [Usage](#usage)
   - [Initialize a Project](#initialize-a-project)
+  - [Creating a New Script](#creating-a-new-script)
   - [Running Scripts](#running-scripts)
-  - [Passing Parameters & Secrets](#passing-parameters--secrets)
+  - [Passing Parameters](#passing-parameters)
+  - [Optional Parameters](#optional-parameters)
   - [Capture Output](#capture-output)
   - [Failure Hooks](#failure-hooks)
+  - [Dry Run](#dry-run)
   - [Chaining Scripts](#chaining-scripts)
 - [Configuration](#configuration)
   - [Directory Structure](#directory-structure)
   - [Schema Examples](#schema-examples)
 - [Shortcuts](#shortcuts)
+- [Reserved Command Names](#reserved-command-names)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
 - [Supported Platforms](#supported-platforms)
 - [Contribution](#contribution)
@@ -34,10 +38,11 @@
 
 - **YAML-Driven Scripts**: Define commands in `.zirv/` files with metadata (name, description, params, secrets).  
 - **Capture Output**: Use `capture: var_name` on any step to grab its stdout into `${var_name}` for later substitution.  
-- **Failure Hooks**: On a step failure you can declare an `fallback` sub-chain of commands, then retry the original step once.  
+- **Failure Hooks**: On a step failure you can declare a `fallback` sub-chain of commands to run as a side action; the original command is never retried.  
 - **Flexible Options**: Interactive mode, OS filters, `proceed_on_failure`, delays, and secret support.  
 - **Multi-Format**: Supports YAML, JSON, and TOML, extendable.  
 - **Cross-Platform**: Compatible with Windows, macOS, and Linux.
+- **Helpful Errors**: A mistyped script or shortcut name gets up to 3 "did you mean" suggestions instead of a bare failure.
 
 ---
 
@@ -111,6 +116,9 @@ cargo build --release
 
 ## Usage
 
+`zirv help` (also `zirv h`, `zirv --help`, `zirv -h`) lists every available
+script and shortcut, local and global.
+
 ### Initialize a Project
 
 Run:
@@ -118,6 +126,32 @@ Run:
 zirv init
 ```
 Creates a `.zirv/` directory with a sample script. This directory is where you will define your scripts. The `.zirv/` directory is created in the current working directory or in the HOME directory depending on the commandline interactions.
+
+### Creating a New Script
+```bash
+zirv create
+```
+Interactively asks for the script name, an optional shortcut key, and whether
+to create it locally or in the global `~/.zirv` folder, then writes a
+template script (and shortcut entry, if given).
+
+To script the creation (e.g. in CI or setup scripts), pass any of the three
+answers as flags to skip the corresponding prompt; passing all three skips
+every prompt:
+
+```bash
+zirv create --name build --shortcut b --global false
+```
+
+- `--name <name>` — the script name (file is written as `<name>.yaml`).
+- `--shortcut <key>` — a shortcut key, or an empty string for "no shortcut".
+- `--global` — create in `~/.zirv` instead of the current directory. Bare
+  `--global` means true; pass `--global false` to answer "no" without a prompt.
+
+If the name or shortcut collides with a [reserved command name](#reserved-command-names),
+zirv warns and asks for confirmation before creating an unreachable script; in
+non-interactive mode (all three flags given) a collision is an error instead,
+since there is no prompt to fall back on.
 
 ### Running Scripts
 Place your script files in `.zirv/` (e.g., `build.yaml`):
@@ -139,6 +173,14 @@ Execute the script with:
 zirv build
 ```
 
+If the name doesn't match any script or shortcut (checked locally in `.zirv/`,
+then globally in `~/.zirv/`), zirv suggests up to 3 close matches by edit
+distance and points you to `zirv help`:
+
+```
+error: No script or shortcut found for 'buld'. Did you mean: build? Run `zirv help` to see available scripts and shortcuts.
+```
+
 ### Passing Parameters
 If a script declares parameters;
 
@@ -156,6 +198,29 @@ Run with:
 ```bash
 zirv commit "Your commit message here"
 ```
+
+### Optional Parameters
+A parameter name ending in `?` is optional and resolves to an empty string
+when omitted. Optional parameters must be declared after all required ones:
+
+```yaml
+name: Greet
+params:
+  - name
+  - greeting?
+commands:
+  - command: echo "${greeting} ${name}"
+```
+
+```bash
+zirv greet Alice            # greeting = "" -> prints " Alice"
+zirv greet Alice "Welcome"  # greeting = "Welcome" -> prints "Welcome Alice"
+```
+
+Declaring an optional parameter before a required one, giving fewer
+arguments than there are required parameters, giving more than the total
+number of declared parameters, or reusing a parameter name (with or without
+the trailing `?`) are all rejected with an error.
 
 ### Capture Output
 To capture the output of a command, use the `capture` option:
@@ -180,12 +245,28 @@ name: OnFailure Demo
 commands:
   - command: "sh -c 'exit 1'"
     options:
-      proceed_on_failure: true     # continue even if retry also fails
+      proceed_on_failure: true     # don't stop the script once fallback succeeds
       fallback:
         - command: "echo 'Fallback action'"
 ```
 
-This will execute the fallback command if the first command fails. The original command will be retried once.
+If the command fails, every `fallback` command runs, in order, once — **the
+original command is never retried**. If any fallback command itself fails,
+the step fails immediately with an error naming both the original and the
+failing fallback command. Otherwise, whether the step's own failure stops the
+script is controlled separately by `proceed_on_failure`: `true` continues to
+the next step, `false` (the default) stops the script with an error, even
+though every fallback succeeded.
+
+### Dry Run
+Pass `--dry-run` to preview a script without running anything:
+
+```bash
+zirv build --dry-run
+```
+
+Each step is printed with its `${...}` parameters substituted, instead of
+being executed, so you can check what a script would do first.
 
 ### Chaining Scripts
 You can chain scripts by calling one script from another. For example, if you have a script `build.yaml` and want to call it from `deploy.yaml`:
@@ -220,6 +301,13 @@ commands:
 ```
 
 Each nested list spawns its own shell window.  Every window executes the commands listed in that group and stays open until they finish.
+
+This needs a desktop/GUI session: macOS uses `osascript` to drive Terminal,
+Windows opens a new `cmd` window, and Linux tries `gnome-terminal`, then
+`x-terminal-emulator`, then `xterm`. Over a headless or SSH-only connection —
+or on Linux specifically, whenever neither `DISPLAY` nor `WAYLAND_DISPLAY` is
+set — zirv returns a clear error naming what it tried, instead of failing
+cryptically or hanging.
 
 The built-in `cd` command updates the working directory for any following
 commands in the same window, allowing scripts like:
@@ -259,7 +347,7 @@ commands:
     description: Prints greeting
     options:
       interactive: true
-      os: linux
+      operating_system: linux
       proceed_on_failure: false
       delay_ms: 2000
       fallback:
@@ -288,7 +376,7 @@ secrets:
       "description": "Prints greeting",
       "options": {
         "interactive": true,
-        "os": "linux",
+        "operating_system": "linux",
         "proceed_on_failure": false,
         "delay_ms": 2000,
         "fallback": [
@@ -322,7 +410,7 @@ options.interactive = false
 [[commands]]
 command = "echo Token is ${token}"
 options.interactive = true
-options.os = "linux"
+options.operating_system = "linux"
 options.proceed_on_failure = false
 options.delay_ms = 2000
 
@@ -341,10 +429,27 @@ Shortcuts are defined in `.shortcuts.yaml` and allow you to create aliases for y
 shortcuts:
   b: build.yaml
   t: test.yaml
-  c: commit.yaml
+  cm: commit.yaml
 ```
 Run zirv b instead of zirv build.yaml.
 This will execute the `build.yaml` script.
+
+A shortcut key that collides with a [reserved command name](#reserved-command-names)
+(for example `c`, already `create`'s alias) can never be reached; `zirv help`
+marks it as shadowed in the listing.
+
+## Reserved Command Names
+
+`help`, `version`, `init`, `create`, `ctx`, and their short aliases `h`, `v`,
+`i`, `c`, are handled as built-in commands before zirv ever looks in `.zirv/`.
+A script file or shortcut key using one of these names can never be invoked:
+
+- `zirv help` lists it but marks it `(shadowed by a built-in command,
+  unreachable)`.
+- `zirv create` warns about the collision and asks for confirmation before
+  creating it anyway; in non-interactive mode (see
+  [Creating a New Script](#creating-a-new-script)) the collision is an error
+  instead.
 
 ## Context Management (zirv ctx)
 
@@ -697,7 +802,7 @@ log at every session start.
 - macOS
 - Linux
 
-Commands can target specific operating systems using the `os` option in the script configuration.
+Commands can target specific operating systems using the `operating_system` option in the script configuration.
 - `windows`: Windows OS
 - `linux`: Linux OS
 - `macos`: macOS
