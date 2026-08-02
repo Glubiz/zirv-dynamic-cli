@@ -84,9 +84,13 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn ready(&self) -> CtxResult<()> {
+        // Item 7: this is the surface a user actually sees (`--agent codex`,
+        // or a config that names it), so it has to be honest in its own
+        // words rather than pointing at an internal plan task number.
         Err(
-            "the codex adapter is not verified yet (see plan task A9/A10); \
-             pass --agent claude or wait for the codex parser"
+            "codex support is not implemented yet; ctx currently supports Claude Code only. \
+             Pass --agent claude, or track progress at \
+             https://github.com/Glubiz/zirv-dynamic-cli/issues/11."
                 .into(),
         )
     }
@@ -212,6 +216,28 @@ mod tests {
         // Replaced by a success assertion in Task A10 once the parser exists.
         let err = select(Some("codex"), &[], None).expect_err("unverified adapter");
         assert!(err.to_string().contains("codex"), "got {err}");
+    }
+
+    /// Item 7: the error a user actually sees from `--agent codex` must be
+    /// plain about codex not working yet, name Claude Code as what does work
+    /// today, and point at the issue tracking it, rather than an internal
+    /// plan task number nobody outside the repo can look up.
+    #[test]
+    fn ready_error_is_honest_about_codex_support_and_points_at_the_tracking_issue() {
+        let err = CodexAdapter::new(None).ready().expect_err("not ready yet");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not implemented yet"),
+            "must plainly say codex is not implemented yet: {msg}"
+        );
+        assert!(
+            msg.contains("Claude Code only"),
+            "must say ctx currently supports Claude Code only: {msg}"
+        );
+        assert!(
+            msg.contains("issues/11"),
+            "must reference the tracking issue: {msg}"
+        );
     }
 
     #[test]
