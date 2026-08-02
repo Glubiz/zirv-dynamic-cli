@@ -67,6 +67,12 @@ pub trait AgentAdapter: std::fmt::Debug {
     }
 
     fn transcript_path(&self, session: &SessionRef) -> PathBuf;
+
+    /// Must be line-local: every line's events depend on that line alone, so
+    /// parsing a transcript in pieces cut at newlines and concatenating the
+    /// results is the same as parsing the whole of it. The incremental scoring
+    /// path in `score.rs` feeds each adapter only the bytes appended since the
+    /// last pass, and that is what makes it equal to a full parse.
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;
 

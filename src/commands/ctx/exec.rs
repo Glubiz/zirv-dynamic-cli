@@ -9,7 +9,7 @@ use super::pace;
 use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
-use super::supervise::{self, Outcome, Tick, Watcher};
+use super::supervise::{self, Outcome, Tick};
 use super::{CtxResult, adapters, handoff, log, score};
 
 /// The restart budget is spent and the session is still rotting. Callers apply
@@ -273,8 +273,8 @@ pub fn run_with<W: Write>(
         );
 
         let (mut child, tap) = supervise::spawn_tapped(command)?;
-        // Fresh watcher per iteration, over the current session's transcript.
-        let mut watcher = Watcher::new(transcript.clone());
+        // Fresh scorer per iteration, over the current session's transcript.
+        let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
         let mut limit_hit = false;
 
@@ -282,11 +282,10 @@ pub fn run_with<W: Write>(
             &mut child,
             Instant::now() + timeout,
             poll,
-            &mut watcher,
-            &transcript,
-            args.agent.as_deref().or(cfg.agent.as_deref()),
-            repo,
-            env,
+            &mut scorer,
+            adapter.as_ref(),
+            &cfg.score,
+            &state,
             server.as_ref(),
             session.as_str(),
             &mut rotted,
@@ -299,8 +298,14 @@ pub fn run_with<W: Write>(
         // exactly what a real exhausted-window run looks like) can race past
         // the last tick that would have caught it. A final drain here closes
         // that race without touching supervise_child's general contract.
-        if !limit_hit && tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
-            limit_hit = true;
+        if !limit_hit {
+            limit_hit = pace::scan_for_limit(
+                &tap.try_lines(),
+                &state,
+                session.as_str(),
+                "exec",
+                &mut std::io::stderr(),
+            );
         }
 
         match outcome {
@@ -495,11 +500,10 @@ fn supervise_run(
     child: &mut std::process::Child,
     deadline: Instant,
     poll: Duration,
-    watcher: &mut Watcher,
-    transcript: &Path,
-    agent: Option<&str>,
-    repo: &Path,
-    env: EnvLookup<'_>,
+    scorer: &mut score::IncrementalScorer,
+    adapter: &dyn adapters::AgentAdapter,
+    score_cfg: &super::config::ScoreConfig,
+    state: &StateDir,
     server: Option<&signal::SignalServer>,
     session: &str,
     rotted: &mut bool,
@@ -507,7 +511,13 @@ fn supervise_run(
     limit_hit: &mut bool,
 ) -> CtxResult<Outcome> {
     let mut tick = || {
-        if tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+        if pace::scan_for_limit(
+            &tap.try_lines(),
+            state,
+            session,
+            "exec",
+            &mut std::io::stderr(),
+        ) {
             *limit_hit = true;
             return Tick::Stop("limit");
         }
@@ -519,12 +529,8 @@ fn supervise_run(
             return Tick::Stop("rot");
         }
         // A scoring failure must never kill a healthy run.
-        match watcher.read_if_changed() {
-            Ok(Some(_)) => {}
-            _ => return Tick::Continue,
-        }
-        match score::score_transcript(transcript, agent, repo, env) {
-            Ok(score) if score.verdict == Verdict::Restart => {
+        match scorer.poll(adapter, score_cfg) {
+            Ok(Some(score)) if score.verdict == Verdict::Restart => {
                 *rotted = true;
                 Tick::Stop("rot")
             }
@@ -1286,6 +1292,49 @@ mod tests {
             transcripts_in(&home).len(),
             2,
             "the relaunch is a new session with its own transcript"
+        );
+    }
+
+    /// Wording that only loosely resembles a usage-limit notice leaves a
+    /// breadcrumb in the decision log and changes nothing else: the run is not
+    /// parked, and its exit code is still the child's own.
+    #[test]
+    fn a_loose_limit_wording_is_noted_without_parking_the_run() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "77777777-2222-4333-8444-555555555555";
+        let env = base_env(&state);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "drift");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), 0, "a breadcrumb is not a park");
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"limit-wording-drift\""),
+            "the drift must be recorded: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"limit-park\""),
+            "and it must never park a healthy run: {log}"
         );
     }
 

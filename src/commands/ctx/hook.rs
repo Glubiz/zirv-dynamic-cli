@@ -145,7 +145,9 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         return Ok(0);
     }
     let repo = payload.repo();
-    let Ok(score) = score::score_transcript(transcript, None, &repo, env) else {
+    // Cached: this hook is a fresh process after every single turn, so scoring
+    // the whole transcript each time is quadratic over a session's length.
+    let Ok(score) = score::score_transcript_cached(transcript, None, &repo, env) else {
         return Ok(0);
     };
 
