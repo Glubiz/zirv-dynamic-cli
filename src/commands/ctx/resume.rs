@@ -73,12 +73,21 @@ pub fn run_with<W: Write>(
     );
     let (user_extra, composed) =
         super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
-    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
     // M2: attribution is logged per session, not once per verb. A resumed run
     // is interactive, so the agent mints its own transcript id and this one is
     // zirv's; exporting it is what makes the two meet, because the hook inside
     // the session reports under it (the same env var the supervisors set).
     let session = SessionId::new_v4();
+    // M7: the composed prompt goes through a private file rather than argv,
+    // where `ps` would show it to every other user on the machine. The adapter
+    // builds this launch itself, so the probe gets an empty argv.
+    let prompt_args = super::prompt::injection_args_for_session(
+        adapter.as_ref(),
+        &[],
+        composed.as_ref(),
+        &state,
+        session.as_str(),
+    );
     super::prompt::log_injection(
         &state,
         "resume",

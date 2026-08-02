@@ -262,8 +262,18 @@ pub fn run_with<W: Write>(
         .unwrap_or_else(|| SessionId::new_v4().to_string());
     let mut session = SessionId::parse(&session_raw);
 
+    // The probe has to hit the binary that will actually be spawned. When the
+    // argv names no program the adapter builds the launch, so there is nothing
+    // in `launch_command` to probe -- it is flags, and `--model --help` is not
+    // a capability check.
+    let probe_target: &[String] = if adapter_builds_launch {
+        &[]
+    } else {
+        &launch_command
+    };
     let prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),
+        probe_target,
         composed.as_ref(),
         &state,
         session.as_str(),

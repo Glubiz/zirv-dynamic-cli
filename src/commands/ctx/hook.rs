@@ -189,13 +189,15 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             },
         );
 
-        // Cheap on purpose: the score is already computed, the correction count
-        // is one pass over a file already in page cache, and the cooldown is a
-        // log read. The analysis itself is far too heavy for a hook, so this
-        // only queues the recommendation for a human to act on. The enabled
-        // check comes first so a disabled feature never pays for the reread.
+        // The analysis itself is far too heavy for a hook, so this only queues
+        // the recommendation for a human to act on. Counting corrections is
+        // the one expensive part -- a full re-read and re-parse of the
+        // transcript -- so it is paid for only once the free gates say it
+        // could matter. Without that ordering every turn re-parses the whole
+        // session, which is precisely what the cached score above removes.
         let cfg = CtxConfig::load(&repo, env).unwrap_or_default();
-        if cfg.optimize.enabled {
+        let now = now_secs();
+        if super::optimize::recommendation_possible(&state, &score, &cfg.optimize, now) {
             let corrections = corrections_in(transcript, &cfg);
             optimize_recommended = super::optimize::queue_recommendation(
                 &state,
@@ -203,7 +205,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 &score,
                 corrections,
                 &cfg.optimize,
-                now_secs(),
+                now,
             );
         }
     }

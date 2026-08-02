@@ -205,6 +205,9 @@ fn save_checkpoint(path: &Path, transcript: &Path, fingerprint: u64, scorer: &In
     if super::state::write_private(&staged, &json).is_ok() {
         let _ = std::fs::rename(&staged, path);
     }
+    // One checkpoint per transcript, and transcripts are never reused, so
+    // without this the directory grows for the life of the machine.
+    super::state::prune_to_newest(dir, super::state::KEEP_NEWEST);
 }
 
 /// The same score `score_transcript` returns, reached by folding only the

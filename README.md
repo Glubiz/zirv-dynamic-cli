@@ -643,6 +643,21 @@ any supervision failure drops it back to pure passthrough. Flags you wrap are
 kept across a restart, so `zirv ctx wrap -- claude --model opus` comes back as
 an opus session.
 
+`wrap` types agent-specific text into the session it supervises (`/compact`,
+`/exit`), so it has to know which agent it is driving. It recognises a command
+whose program is named `claude`; anything else — a wrapper script, `npx
+claude`, a differently named binary — needs `--agent claude` to say so
+explicitly, or it refuses rather than typing claude syntax into a program that
+may not understand it. `--no-supervise` and `--simple` are exempt, since
+neither injects anything:
+
+```bash
+alias claude='zirv ctx wrap --agent claude -- my-claude-wrapper.sh'
+```
+
+Note that a restart relaunches the *adapter's* program, so a wrapped wrapper
+script comes back as a bare `claude`.
+
 `wrap` learns the transcript path from the turn signals the Stop hook sends,
 and forgets it on a restart because the fresh session writes a new file. Set
 `ZIRV_CTX_TRANSCRIPT` to pin a path instead; it outranks every signal and
@@ -661,6 +676,19 @@ verdict ends the run instead of restarting it. `--session-id` names the
 session, and `--transcript` points at the first child's transcript when the
 adapter cannot derive it. Both describe the first child only: every restart is
 a new session whose transcript path is derived again.
+
+Passing the whole command is optional. With `--prompt` and nothing after `--`
+that names a program, `exec` builds the launch from the adapter itself — the
+same way every restart does — so the prompt never has to be encoded into argv
+and read back out:
+
+```bash
+zirv ctx exec --agent claude --prompt "$PROMPT"
+zirv ctx exec --agent claude --prompt "$PROMPT" -- --model opus  # extra flags
+```
+
+This is what a YAML agent step uses, and it is why a prompt that happens to
+begin with `-` or to look like a flag is still just a prompt.
 
 ### Exit codes for headless supervision
 

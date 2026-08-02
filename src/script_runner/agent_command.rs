@@ -45,27 +45,50 @@ impl AgentCommand {
         )
     }
 
-    fn check_unsupported_options(&self) -> Result<(), String> {
+    /// Everything wrong with the step that can be seen without running it.
+    /// Called at load time, so `--dry-run` and the real run reject the same
+    /// scripts: a dry run that reports success for a script that can never
+    /// execute is worse than no dry run.
+    pub fn validate(&self) -> Result<(), String> {
         if self.capture.is_some() {
             return Err("agent steps do not support 'capture'".to_string());
         }
         if self.options.as_ref().is_some_and(|o| o.interactive) {
             return Err("agent steps do not support 'interactive'".to_string());
         }
-        Ok(())
+        if self.prompt.trim().is_empty() {
+            return Err("an agent step needs a non-empty 'prompt'".to_string());
+        }
+        // `flags` reaches the agent's own CLI, and the launch is built from
+        // the adapter, so a leading bare word would be read as the program.
+        if let Some(first) = self.flags.as_ref().and_then(|flags| flags.first())
+            && !first.starts_with('-')
+        {
+            return Err(format!(
+                "'flags' are passed to the agent's own CLI, so they must start with '-'; \
+                 got '{first}'"
+            ));
+        }
+        crate::commands::ctx::adapters::all(None)
+            .iter()
+            .any(|adapter| adapter.name() == self.agent)
+            .then_some(())
+            .ok_or_else(|| format!("unknown agent '{}'", self.agent))
     }
 
     pub async fn execute(
         &self,
         context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
+        // Validation first: a misconfigured step must fail the same way on
+        // every machine, not pass silently wherever the OS filter skips it.
+        self.validate()?;
+
         if let Some(options) = &self.options
             && options.skip_for_os()
         {
             return Ok(Some("Command skipped due to OS filter".to_string()));
         }
-
-        self.check_unsupported_options()?;
 
         let prompt = self.substituted_prompt(context);
         check_unresolved(&self.prompt, &prompt)?;
@@ -119,7 +142,22 @@ impl AgentCommand {
         if code == 0 {
             return Ok(());
         }
-        Err(format!("exited with code {code}"))
+        Err(describe_exit(code))
+    }
+}
+
+/// The supervisor reports its own outcomes through the same `i32` the agent's
+/// exit code arrives on, so "exited with code 75" read as something the agent
+/// did rather than as zirv giving up.
+fn describe_exit(code: i32) -> String {
+    match code {
+        crate::commands::ctx::exec::EXIT_ROT_EXHAUSTED => {
+            "the session kept rotting and the restart budget ran out".to_string()
+        }
+        crate::commands::ctx::exec::EXIT_TIMEOUT => {
+            "the supervised run hit its wall-clock timeout".to_string()
+        }
+        other => format!("exited with code {other}"),
     }
 }
 
@@ -299,6 +337,21 @@ mod tests {
             .await
             .expect_err("codex is not ready yet");
         assert!(err.contains("codex"), "got {err}");
+    }
+
+    /// The supervisor reports its own outcomes on the same `i32` the agent's
+    /// exit code arrives on, so "exited with code 75" read as something the
+    /// agent did rather than as zirv giving up.
+    #[test]
+    fn the_supervisors_own_exit_codes_read_as_outcomes_not_agent_failures() {
+        assert!(
+            describe_exit(crate::commands::ctx::exec::EXIT_ROT_EXHAUSTED)
+                .contains("restart budget")
+        );
+        assert!(
+            describe_exit(crate::commands::ctx::exec::EXIT_TIMEOUT).contains("wall-clock timeout")
+        );
+        assert_eq!(describe_exit(1), "exited with code 1");
     }
 
     #[tokio::test]

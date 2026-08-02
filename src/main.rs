@@ -43,6 +43,20 @@ async fn main() {
 
     let input = Input::parse();
 
+    // These live on the shared `Input` struct, so clap accepts them for every
+    // command and quietly eats the argument after them: `zirv deploy --name
+    // staging` handed `staging` to `--name` and then complained the script got
+    // no parameters. Refuse instead of swallowing.
+    if !matches!(input.command.as_str(), "create" | "c")
+        && let Some(flag) = input.misplaced_create_flag()
+    {
+        output::error(format!(
+            "{flag} belongs to `zirv create`; '{}' does not take it",
+            input.command
+        ));
+        std::process::exit(1);
+    }
+
     match input.command.as_str() {
         "help" | "h" => {
             if let Err(e) = show_help(&mut std::io::stdout()) {

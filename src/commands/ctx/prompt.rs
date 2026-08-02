@@ -67,17 +67,7 @@ fn read_layer(path: &Path, cap: Option<usize>) -> Option<String> {
     if text.trim().is_empty() {
         return None;
     }
-    let Some(cap) = cap else {
-        return Some(text);
-    };
-    if text.len() <= cap {
-        return Some(text);
-    }
-    let mut end = cap;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    Some(text[..end].to_string())
+    Some(crate::utils::truncate_bytes(text, cap))
 }
 
 /// Composes the layered system prompt, or `None` when nothing should be
@@ -265,20 +255,11 @@ pub fn merge_command_line_prompt(
 use super::log;
 use super::state::{StateDir, now_secs};
 
-/// Turns a composed prompt into launch arguments for this agent. Two things can
-/// make this empty: nothing was composed, or the agent has no verified
+/// Turns a composed prompt into launch arguments for this agent. Two things
+/// can make it empty: nothing was composed, or the agent has no verified
 /// mechanism. Both are normal.
-pub fn injection_args(
-    adapter: &dyn AgentAdapter,
-    composed: Option<&ComposedPrompt>,
-) -> Vec<String> {
-    let Some(composed) = composed else {
-        return Vec::new();
-    };
-    adapter.system_prompt_args(&composed.text)
-}
-
-/// Same as `injection_args`, except it prefers delivering the composed
+///
+/// It prefers delivering the composed
 /// prompt through a private file rather than argv, when the installed
 /// binary supports it (`AgentAdapter::supports_system_prompt_file`): a
 /// composed prompt on argv is visible to any other user on the machine via
@@ -286,8 +267,13 @@ pub fn injection_args(
 /// (probe error, write error) falls back to `system_prompt_args` rather than
 /// losing the prompt: this mechanism is a hardening, never a new single
 /// point of failure for whether the prompt reaches the agent at all.
+///
+/// `launch` is the argv about to be spawned, so the capability probe hits the
+/// binary that will actually receive the flag. An empty `launch` means the
+/// caller is letting the adapter build its own invocation.
 pub fn injection_args_for_session(
     adapter: &dyn AgentAdapter,
+    launch: &[String],
     composed: Option<&ComposedPrompt>,
     state: &StateDir,
     session: &str,
@@ -296,7 +282,7 @@ pub fn injection_args_for_session(
         return Vec::new();
     };
     if let Some(flag) = adapter.system_prompt_file_flag()
-        && adapter.supports_system_prompt_file()
+        && adapter.supports_system_prompt_file(launch)
         && let Ok(path) = write_prompt_file(state, session, &composed.text)
     {
         return vec![flag.to_string(), path.display().to_string()];
@@ -311,6 +297,10 @@ fn write_prompt_file(state: &StateDir, session: &str, text: &str) -> std::io::Re
     super::state::create_private_dir_all(&dir)?;
     let path = dir.join(format!("{session}.md"));
     super::state::write_private(&path, text)?;
+    // One file per session start, and nothing else ever deletes them. Pruned
+    // after the write so the file this call returns is always the newest and
+    // can never be the one dropped.
+    super::state::prune_to_newest(&dir, super::state::KEEP_NEWEST);
     Ok(path)
 }
 
@@ -356,19 +346,22 @@ mod tests {
     use crate::commands::ctx::config::PromptConfig;
     use crate::commands::ctx::state::StateDir;
 
-    #[test]
-    fn injection_args_come_from_the_adapter() {
-        let (_tmp, home, repo) = tree();
-        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
-        let args = injection_args(&ClaudeAdapter::new(None), composed.as_ref());
-        assert_eq!(args.len(), 2);
-        assert_eq!(args[0], "--append-system-prompt");
-        assert!(args[1].contains("zirv session conventions"));
+    fn scratch_state() -> (tempfile::TempDir, StateDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        (tmp, state)
     }
 
     #[test]
-    fn nothing_composed_means_no_arguments() {
-        assert!(injection_args(&ClaudeAdapter::new(None), None).is_empty());
+    fn injection_args_come_from_the_adapter() {
+        let (_tmp, home, repo) = tree();
+        let (_state_tmp, state) = scratch_state();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let adapter = ClaudeAdapter::new(None).with_file_support_forced(false);
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-0");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--append-system-prompt");
+        assert!(args[1].contains("zirv session conventions"));
     }
 
     /// M7: when the installed binary's `--help` does not advertise the
@@ -382,7 +375,7 @@ mod tests {
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let adapter = ClaudeAdapter::new(None).with_file_support_forced(false);
 
-        let args = injection_args_for_session(&adapter, composed.as_ref(), &state, "sess-1");
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-1");
         assert_eq!(args[0], "--append-system-prompt");
         assert!(args[1].contains("zirv session conventions"));
     }
@@ -398,7 +391,7 @@ mod tests {
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
 
-        let args = injection_args_for_session(&adapter, composed.as_ref(), &state, "sess-2");
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-2");
         assert_eq!(args[0], "--append-system-prompt-file");
         let path = PathBuf::from(&args[1]);
         let contents = std::fs::read_to_string(&path).expect("prompt file written");
@@ -418,7 +411,7 @@ mod tests {
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
 
-        let args = injection_args_for_session(&adapter, composed.as_ref(), &state, "sess-3");
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-3");
         let path = PathBuf::from(&args[1]);
         let mode = std::fs::metadata(&path)
             .expect("metadata")
@@ -434,15 +427,23 @@ mod tests {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
-        assert!(injection_args_for_session(&adapter, None, &state, "sess-4").is_empty());
+        assert!(injection_args_for_session(&adapter, &[], None, &state, "sess-4").is_empty());
     }
 
     #[test]
     fn an_agent_without_the_capability_gets_no_arguments() {
         let (_tmp, home, repo) = tree();
         let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let (_state_tmp, state) = scratch_state();
         assert!(
-            injection_args(&CodexAdapter::new(None), composed.as_ref()).is_empty(),
+            injection_args_for_session(
+                &CodexAdapter::new(None),
+                &[],
+                composed.as_ref(),
+                &state,
+                "sess-5"
+            )
+            .is_empty(),
             "composition succeeding does not mean the agent can take it"
         );
     }

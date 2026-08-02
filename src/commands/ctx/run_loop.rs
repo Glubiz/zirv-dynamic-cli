@@ -91,11 +91,6 @@ pub fn run_with<W: Write>(
     );
     let (user_extra, composed) =
         super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
-    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
-    let extra: Vec<String> = user_extra
-        .into_iter()
-        .chain(prompt_args.iter().cloned())
-        .collect();
 
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
     let max_cycle =
@@ -120,6 +115,20 @@ pub fn run_with<W: Write>(
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles.
         let session = SessionId::new_v4();
+        // M7: rebuilt per cycle because the private prompt file is named after
+        // the session it belongs to, and every cycle is a new session. The
+        // adapter builds this launch itself, so the probe gets an empty argv.
+        let extra: Vec<String> = user_extra
+            .iter()
+            .cloned()
+            .chain(super::prompt::injection_args_for_session(
+                adapter.as_ref(),
+                &[],
+                composed.as_ref(),
+                &state,
+                session.as_str(),
+            ))
+            .collect();
         // M2: README promises injection attribution "at every session start",
         // and every cycle is a new session, so the entry is written here under
         // that cycle's own id rather than once under a literal "loop".

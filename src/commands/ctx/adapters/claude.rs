@@ -445,12 +445,16 @@ impl AgentAdapter for ClaudeAdapter {
         1 + self.bin_args.len()
     }
 
-    fn supports_system_prompt_file(&self) -> bool {
+    fn supports_system_prompt_file(&self, launch: &[String]) -> bool {
         #[cfg(test)]
         if let Some(forced) = self.forced_file_support {
             return forced;
         }
-        probe_system_prompt_file_support(&self.program, &self.bin_args)
+        // The binary that is about to run, not the one this adapter would
+        // have chosen: wrap spawns the user's own argv.
+        let (program, args) = super::program_invocation(launch)
+            .unwrap_or_else(|| (self.program.clone(), self.bin_args.clone()));
+        probe_system_prompt_file_support(&program, &args)
     }
 
     /// The distillation prompt is piped to stdin so a long transcript tail
@@ -1169,7 +1173,7 @@ mod tests {
             "Options:\n  --append-system-prompt-file <path>",
         );
         let adapter = ClaudeAdapter::new(Some(&bin));
-        assert!(adapter.supports_system_prompt_file());
+        assert!(adapter.supports_system_prompt_file(&[]));
     }
 
     /// Verified against the real CLI (`claude --help`, v2.1.220): the flag is
@@ -1189,7 +1193,7 @@ mod tests {
         );
         let adapter = ClaudeAdapter::new(Some(&bin));
         assert!(
-            adapter.supports_system_prompt_file(),
+            adapter.supports_system_prompt_file(&[]),
             "must recognize the bracket-shorthand form the real CLI actually uses"
         );
     }
@@ -1213,14 +1217,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = help_stub(dir.path(), "probe-no.sh", "nothing relevant here");
         let adapter = ClaudeAdapter::new(Some(&bin));
-        assert!(!adapter.supports_system_prompt_file());
+        assert!(!adapter.supports_system_prompt_file(&[]));
     }
 
     #[test]
     fn supports_system_prompt_file_fails_open_when_the_binary_is_missing() {
         let adapter = ClaudeAdapter::new(Some("/nonexistent/definitely-not-a-binary"));
         assert!(
-            !adapter.supports_system_prompt_file(),
+            !adapter.supports_system_prompt_file(&[]),
             "a probe failure must never block a launch"
         );
     }
@@ -1235,12 +1239,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = help_stub(dir.path(), "probe-cache.sh", "--append-system-prompt-file");
         let adapter = ClaudeAdapter::new(Some(&bin));
-        assert!(adapter.supports_system_prompt_file());
+        assert!(adapter.supports_system_prompt_file(&[]));
 
         let script = dir.path().join("probe-cache.sh");
         std::fs::write(&script, "#!/bin/sh\nprintf 'nothing now\\n'\n").expect("rewrite stub");
         assert!(
-            adapter.supports_system_prompt_file(),
+            adapter.supports_system_prompt_file(&[]),
             "the first probe's answer is cached for the life of the process"
         );
     }

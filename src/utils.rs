@@ -57,6 +57,23 @@ pub fn file_to_script(path: &PathBuf) -> Result<Script, Box<dyn std::error::Erro
     parse_script_content(&content, &ext)
 }
 
+/// Truncates to `cap` bytes on a char boundary, so the result stays valid
+/// UTF-8. `None` means no cap. Shared by the prompt layers and the optimize
+/// surfaces, which both cap what they read from disk the same way.
+pub fn truncate_bytes(text: String, cap: Option<usize>) -> String {
+    let Some(cap) = cap else {
+        return text;
+    };
+    if text.len() <= cap {
+        return text;
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 /// Levenshtein (edit) distance between two strings, counted in chars rather
 /// than bytes so it stays correct for non-ASCII script/shortcut names.
 pub fn levenshtein(a: &str, b: &str) -> usize {
@@ -115,7 +132,20 @@ where
         if !seen.insert(candidate.to_string()) {
             continue;
         }
-        let distance = levenshtein(&target_lower, &candidate.to_lowercase());
+        // Two names whose lengths differ by more than the threshold cannot be
+        // within it -- deleting the difference already costs that much -- and
+        // the full matrix is O(n*m). Without this, a mistyped multi-megabyte
+        // argv is compared character by character against every script.
+        let candidate_lower = candidate.to_lowercase();
+        if target_lower
+            .chars()
+            .count()
+            .abs_diff(candidate_lower.chars().count())
+            > threshold
+        {
+            continue;
+        }
+        let distance = levenshtein(&target_lower, &candidate_lower);
         if distance <= threshold {
             scored.push((distance, candidate.to_string()));
         }
@@ -173,6 +203,35 @@ mod tests {
     use super::*;
     use std::fs::{create_dir_all, write};
     use tempfile::tempdir;
+
+    /// The matrix is O(n*m) and the threshold is at most 3, so a mistyped
+    /// megabyte of argv used to be compared character by character against
+    /// every script name. The short-circuit must not change any answer.
+    #[test]
+    fn a_wildly_long_name_is_dismissed_without_building_the_matrix() {
+        let huge = "x".repeat(400_000);
+        let started = std::time::Instant::now();
+        assert!(suggest_matches(&huge, ["build", "deploy", "test"]).is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "the length check has to come before the matrix"
+        );
+
+        // Same answers as before, for names that are actually close.
+        assert_eq!(suggest_matches("biuld", ["build", "deploy"]), vec!["build"]);
+        assert_eq!(suggest_matches("Build", ["build"]), vec!["build"]);
+    }
+
+    #[test]
+    fn truncate_bytes_cuts_on_a_char_boundary() {
+        assert_eq!(truncate_bytes("hello".to_string(), None), "hello");
+        assert_eq!(truncate_bytes("hello".to_string(), Some(99)), "hello");
+        assert_eq!(truncate_bytes("hello".to_string(), Some(2)), "he");
+        // 'é' is two bytes: a cap landing inside it drops the whole char
+        // rather than producing invalid UTF-8.
+        assert_eq!(truncate_bytes("é".to_string(), Some(1)), "");
+        assert_eq!(truncate_bytes("aé".to_string(), Some(2)), "a");
+    }
 
     #[test]
     fn test_levenshtein_identical() {

@@ -29,6 +29,16 @@ impl Layer {
         }
     }
 
+    /// Whether this layer is a JSON settings file rather than prose. Their
+    /// values are secrets often enough -- an `env` block with an API key is
+    /// ordinary -- that they are never sent to a model verbatim.
+    pub fn is_settings(&self) -> bool {
+        matches!(
+            self,
+            Layer::UserSettings | Layer::ProjectSettings | Layer::LocalSettings
+        )
+    }
+
     /// Whether cloning the repository is enough to change this layer. Decides
     /// whether a proposed diff can use a repo-relative `a/`/`b/` header (see
     /// `diff_headers`) and whether a backticked path token can be resolved
@@ -63,15 +73,7 @@ pub struct Instruction {
 
 fn read_capped(path: &Path, max_bytes: usize) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    if text.len() <= max_bytes {
-        return Some(text);
-    }
-    // Truncating on a char boundary keeps the excerpt valid UTF-8.
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    Some(text[..end].to_string())
+    Some(crate::utils::truncate_bytes(text, Some(max_bytes)))
 }
 
 fn push_surface(into: &mut Vec<Surface>, layer: Layer, path: PathBuf, max_bytes: usize) {
@@ -295,7 +297,20 @@ fn diff_headers(surface: &Surface, repo: &Path) -> (String, String) {
 
 /// A unified diff that deletes one line, in the form `git apply` accepts when
 /// the surface is repo-owned (see `diff_headers`).
+/// Whether a hunk built from `str::lines()` can be byte-exact for this file.
+/// `lines()` drops `\r` and cannot express a missing final newline, so for a
+/// CRLF file the context lines would not match what is on disk, and for an
+/// unterminated last line the hunk would be missing its
+/// `\ No newline at end of file` marker. `git apply` rejects both -- after the
+/// report has already promised they would apply.
+fn diff_can_be_exact(text: &str) -> bool {
+    !text.contains('\r') && (text.is_empty() || text.ends_with('\n'))
+}
+
 fn deletion_diff(surface: &Surface, line: usize, repo: &Path) -> Option<String> {
+    if !diff_can_be_exact(&surface.text) {
+        return None;
+    }
     let lines: Vec<&str> = surface.text.lines().collect();
     let index = line.checked_sub(1)?;
     let removed = lines.get(index)?;
@@ -789,7 +804,19 @@ pub fn evidence_from_transcripts(
 /// What zirv itself had to do, counted from the decision log. The log is the
 /// second evidence source the spec names: it records interventions that never
 /// appear in a transcript as a failure.
-pub fn supervisor_events(state: &StateDir, lines: usize) -> Vec<(String, usize)> {
+///
+/// `sessions` scopes the count to the sessions actually sampled. The state dir
+/// is machine-wide, so counting every entry in it put another repository's
+/// interventions over this run's sample size and reported a rate no session
+/// here produced.
+pub fn supervisor_events(
+    state: &StateDir,
+    lines: usize,
+    sessions: &std::collections::BTreeSet<String>,
+) -> Vec<(String, usize)> {
+    if sessions.is_empty() {
+        return Vec::new();
+    }
     let Ok(entries) = log::tail(state, lines) else {
         return Vec::new();
     };
@@ -805,9 +832,26 @@ pub fn supervisor_events(state: &StateDir, lines: usize) -> Vec<(String, usize)>
         if !FRICTION_ACTIONS.contains(&action) {
             continue;
         }
+        let in_sample = entry
+            .get("session")
+            .and_then(|s| s.as_str())
+            .is_some_and(|session| sessions.contains(session));
+        if !in_sample {
+            continue;
+        }
         *counts.entry(action.to_string()).or_insert(0) += 1;
     }
     ranked(counts)
+}
+
+/// A transcript is named after its session, which is how a decision-log entry
+/// is matched back to a sampled session.
+fn session_ids_of(paths: &[PathBuf]) -> std::collections::BTreeSet<String> {
+    paths
+        .iter()
+        .filter_map(|path| path.file_stem())
+        .map(|stem| stem.to_string_lossy().to_string())
+        .collect()
 }
 
 /// Both evidence sources in one place: transcripts for what happened inside
@@ -821,7 +865,7 @@ pub fn collect_evidence(
 ) -> Evidence {
     let mut evidence = evidence_from_transcripts(paths, cfg, adapter);
     if let Some(state) = state {
-        evidence.supervisor_events = supervisor_events(state, log_lines);
+        evidence.supervisor_events = supervisor_events(state, log_lines, &session_ids_of(paths));
     }
     evidence
 }
@@ -908,6 +952,30 @@ pub const OPTIMIZE_PROMPT_VERSION: &str = "v1";
 /// so one enormous CLAUDE.md cannot crowd out the others.
 const DEFAULT_EXCERPT_LINES: usize = 40;
 
+/// Keys and structure survive; every string value becomes `<redacted>`. The
+/// contradiction check reads the shape of a settings file -- which hooks are
+/// registered, what is permitted -- and never needs the values, which
+/// routinely include an `env` block holding an API key. Unparseable input is
+/// withheld rather than passed through: a settings file truncated by the byte
+/// cap must not fall back to raw bytes.
+fn redact_json_strings(text: &str) -> String {
+    fn walk(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = "<redacted>".to_string(),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            serde_json::Value::Object(map) => map.values_mut().for_each(walk),
+            _ => {}
+        }
+    }
+
+    let withheld = "(not valid JSON on its own; contents withheld)".to_string();
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+        return withheld;
+    };
+    walk(&mut parsed);
+    serde_json::to_string_pretty(&parsed).unwrap_or(withheld)
+}
+
 pub fn judgment_prompt(surfaces: &[Surface], evidence: &Evidence, excerpt_lines: usize) -> String {
     let mut prompt = format!(
         "You are reviewing the instruction files that steer an AI coding agent in one \
@@ -935,7 +1003,16 @@ nothing rather than guessing.\n\n"
             surface.path.display(),
             surface.layer.label()
         ));
-        for line in surface.text.lines().take(excerpt_lines) {
+        if surface.layer.is_settings() {
+            prompt
+                .push_str("(string values redacted; this file's structure is what matters here)\n");
+        }
+        let body = if surface.layer.is_settings() {
+            redact_json_strings(&surface.text)
+        } else {
+            surface.text.clone()
+        };
+        for line in body.lines().take(excerpt_lines) {
             prompt.push_str(line);
             prompt.push('\n');
         }
@@ -1045,12 +1122,14 @@ pub fn parse_judgment(markdown: &str) -> Vec<Finding> {
 fn sampling_disclosure(evidence: &Evidence) -> String {
     if evidence.sampled_project_dirs.is_empty() {
         return "Sessions are sampled machine-wide across every project with a recent \
-                transcript, not just this repository.\n"
+                transcript, not just this repository. Supervisor interventions are counted from \
+                the decision log, restricted to those same sampled sessions.\n"
             .to_string();
     }
     format!(
         "Sessions are sampled machine-wide across every project with a recent transcript, not \
-         just this repository. Projects sampled: {}.\n",
+         just this repository. Projects sampled: {}. Supervisor interventions are counted from \
+         the decision log, restricted to those same sampled sessions.\n",
         evidence.sampled_project_dirs.join(", ")
     )
 }
@@ -1421,6 +1500,23 @@ pub fn recently_recommended(state: &StateDir, now: u64, cooldown: u64) -> bool {
 /// Queues the recommendation for a human to act on. Returns the signal that
 /// justified it when it queued, so the hook can mention it exactly once and
 /// word it from the real cause.
+/// The gates that cost nothing, so the Stop hook can ask before it pays for a
+/// correction count. Counting corrections re-reads and re-parses the whole
+/// transcript, which on every turn is O(session) per turn and O(n²) over a
+/// session -- exactly what the cached incremental score exists to avoid.
+/// Nothing here touches the transcript: the score is already computed and the
+/// cooldown is a short read of the decision log.
+pub fn recommendation_possible(
+    state: &StateDir,
+    score: &Score,
+    cfg: &OptimizeConfig,
+    now: u64,
+) -> bool {
+    cfg.enabled
+        && score.signals.turns >= MIN_TURNS_FOR_RECOMMENDATION
+        && !recently_recommended(state, now, cfg.recommend_cooldown_secs)
+}
+
 pub fn queue_recommendation(
     state: &StateDir,
     session: &str,
@@ -2403,7 +2499,7 @@ mod tests {
             .expect("append");
         }
 
-        let events = supervisor_events(&state, 200);
+        let events = supervisor_events(&state, 200, &["s".to_string()].into());
 
         assert_eq!(
             events.first().cloned(),
@@ -2425,11 +2521,108 @@ mod tests {
         );
     }
 
+    /// The state dir is machine-wide. Counting every intervention in it over
+    /// this run's sample size reported a rate the sampled sessions never
+    /// produced -- five kills from another repository over `--sessions 1`.
+    #[test]
+    fn interventions_are_counted_only_for_the_sampled_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+
+        for session in ["mine", "someone-elses"] {
+            crate::commands::ctx::log::append(
+                &state,
+                &crate::commands::ctx::log::Decision {
+                    ts: 1_800_000_000,
+                    session,
+                    verb: "exec",
+                    verdict: "rot",
+                    score: 0,
+                    action: "rot-kill",
+                    detail: "",
+                },
+            )
+            .expect("append");
+        }
+
+        assert_eq!(
+            supervisor_events(&state, 200, &["mine".to_string()].into()),
+            vec![("rot-kill".to_string(), 1)],
+            "another session's interventions are not this sample's"
+        );
+        assert!(
+            supervisor_events(&state, 200, &Default::default()).is_empty(),
+            "no sample means no rate to report"
+        );
+    }
+
+    /// A settings file's values are routinely credentials -- an `env` block
+    /// with an API key is ordinary -- and the whole file was going verbatim to
+    /// whatever binary `agent_bin` names.
+    #[test]
+    fn settings_values_are_redacted_before_reaching_the_model() {
+        let surfaces = vec![
+            Surface {
+                layer: Layer::UserSettings,
+                path: PathBuf::from("/home/u/.claude/settings.json"),
+                text: "{\"env\":{\"ANTHROPIC_API_KEY\":\"sk-ant-secret\"},\"hooks\":{\"Stop\":[]}}"
+                    .to_string(),
+            },
+            Surface {
+                layer: Layer::RepoClaudeMd,
+                path: PathBuf::from("/repo/CLAUDE.md"),
+                text: "- always run tests".to_string(),
+            },
+        ];
+
+        let prompt = judgment_prompt(&surfaces, &Evidence::default(), 40);
+
+        assert!(
+            !prompt.contains("sk-ant-secret"),
+            "a settings value must never reach the model: {prompt}"
+        );
+        assert!(
+            prompt.contains("ANTHROPIC_API_KEY") && prompt.contains("<redacted>"),
+            "the structure is what the contradiction check needs: {prompt}"
+        );
+        assert!(
+            prompt.contains("- always run tests"),
+            "prose surfaces are still sent verbatim: {prompt}"
+        );
+    }
+
+    /// `str::lines()` drops `\r` and cannot express a missing final newline,
+    /// so the hunk would not match the file -- yet it still earned the "apply
+    /// with `git apply`" label.
+    #[test]
+    fn a_diff_is_only_offered_when_it_can_be_byte_exact() {
+        let surface = |text: &str| Surface {
+            layer: Layer::RepoClaudeMd,
+            path: PathBuf::from("/repo/CLAUDE.md"),
+            text: text.to_string(),
+        };
+        let repo = Path::new("/repo");
+
+        assert!(
+            deletion_diff(&surface("one\ntwo\nthree\n"), 2, repo).is_some(),
+            "an ordinary LF file still gets one"
+        );
+        assert!(
+            deletion_diff(&surface("one\r\ntwo\r\nthree\r\n"), 2, repo).is_none(),
+            "a CRLF file's context lines would not match"
+        );
+        assert!(
+            deletion_diff(&surface("one\ntwo\nthree"), 2, repo).is_none(),
+            "an unterminated last line needs a marker this cannot emit"
+        );
+    }
+
     #[test]
     fn a_missing_or_empty_decision_log_contributes_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("absent"));
-        assert!(supervisor_events(&state, 200).is_empty());
+        assert!(supervisor_events(&state, 200, &["s".to_string()].into()).is_empty());
     }
 
     #[test]
@@ -2600,7 +2793,8 @@ mod tests {
             }
         }
 
-        let events = supervisor_events(&state, 200);
+        let sampled = (0..10u64).map(|i| format!("s{i}")).collect();
+        let events = supervisor_events(&state, 200, &sampled);
         let kill_count = events
             .iter()
             .find(|(name, _)| name == "kill")
@@ -3314,6 +3508,51 @@ mod tests {
             count_corrections(&SentinelAdapter, "not claude jsonl at all"),
             1,
             "the sentinel's structural_context supplies one correction regardless of the input"
+        );
+    }
+
+    /// The Stop hook pays for a correction count only when this says the
+    /// answer could matter, because counting corrections re-reads and
+    /// re-parses the whole transcript. It has to agree with the gates
+    /// `queue_recommendation` applies afterwards, or the hook would either
+    /// skip a real recommendation or pay for one that gets discarded.
+    #[test]
+    fn the_free_gates_agree_with_what_queueing_would_decide() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        state.ensure().expect("ensure");
+        let cfg = OptimizeConfig::default();
+        let now = 1_800_000_000;
+        let mature = score_with(0.9, MIN_TURNS_FOR_RECOMMENDATION);
+
+        assert!(
+            !recommendation_possible(
+                &state,
+                &score_with(0.9, MIN_TURNS_FOR_RECOMMENDATION - 1),
+                &cfg,
+                now
+            ),
+            "a session too short to judge never costs a transcript re-read"
+        );
+        assert!(
+            !recommendation_possible(
+                &state,
+                &mature,
+                &OptimizeConfig {
+                    enabled: false,
+                    ..cfg.clone()
+                },
+                now
+            ),
+            "a disabled feature never costs a transcript re-read"
+        );
+        assert!(recommendation_possible(&state, &mature, &cfg, now));
+
+        // Queueing one arms the cooldown, which closes the gate again.
+        queue_recommendation(&state, "s", &mature, 0, &cfg, now).expect("queues");
+        assert!(
+            !recommendation_possible(&state, &mature, &cfg, now),
+            "a recommendation still in cooldown never costs a transcript re-read"
         );
     }
 

@@ -28,6 +28,21 @@ pub struct Input {
     pub global: Option<bool>,
 }
 
+impl Input {
+    /// The first `create`-only flag present, for a command that is not
+    /// `create`. Clap cannot express "only valid for one command" on a shared
+    /// struct, so the check lives here rather than in the parser.
+    pub fn misplaced_create_flag(&self) -> Option<&'static str> {
+        [
+            ("--name", self.name.is_some()),
+            ("--shortcut", self.shortcut.is_some()),
+            ("--global", self.global.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(flag, present)| present.then_some(flag))
+    }
+}
+
 fn find_script_in_dir(
     dir: &Path,
     name: &str,
@@ -107,37 +122,35 @@ mod tests {
     use std::fs::{create_dir_all, write};
     use tempfile::tempdir;
 
-    /// Helper mirroring `commands::init::tests::with_fake_home`: overrides
-    /// HOME/USERPROFILE and the current directory for the duration of `test`.
+    /// RAII, so a panicking assertion still restores HOME/USERPROFILE and the
+    /// working directory. See `commands::ctx::testenv::EnvGuard`.
     fn with_fake_env<F, R>(fake_home: &Path, fake_cwd: &Path, test: F) -> R
     where
         F: FnOnce() -> R,
     {
-        let original_home = std::env::var("HOME").ok();
-        let original_userprofile = std::env::var("USERPROFILE").ok();
-        let original_dir = std::env::current_dir().unwrap();
+        let _guard = crate::commands::ctx::testenv::EnvGuard::set(fake_home, Some(fake_cwd));
+        test()
+    }
 
-        unsafe {
-            std::env::set_var("HOME", fake_home);
-            std::env::set_var("USERPROFILE", fake_home);
-        }
-        std::env::set_current_dir(fake_cwd).unwrap();
+    /// These live on the shared `Input` struct, so clap accepts them for every
+    /// command and eats the argument after them: `zirv echo --name hello`
+    /// handed `hello` to `--name` and then reported the script got no
+    /// parameters.
+    #[test]
+    fn create_only_flags_are_recognised_as_misplaced_elsewhere() {
+        let with_name = Input {
+            command: "echo".to_string(),
+            name: Some("hello".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(with_name.misplaced_create_flag(), Some("--name"));
 
-        let result = test();
-
-        std::env::set_current_dir(original_dir).unwrap();
-        unsafe {
-            match original_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-            match original_userprofile {
-                Some(up) => std::env::set_var("USERPROFILE", up),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
-
-        result
+        let plain = Input {
+            command: "echo".to_string(),
+            params: vec!["hello".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(plain.misplaced_create_flag(), None);
     }
 
     #[test]

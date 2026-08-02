@@ -43,9 +43,13 @@ impl CommandTypes {
             (true, false) => serde_yaml_ng::from_value(value)
                 .map(CommandTypes::Command)
                 .map_err(describe),
-            (false, true) => serde_yaml_ng::from_value(value)
-                .map(CommandTypes::Agent)
-                .map_err(describe),
+            (false, true) => {
+                let agent: AgentCommand = serde_yaml_ng::from_value(value).map_err(describe)?;
+                // Checked here rather than at execution time so `--dry-run`
+                // and a real run reject exactly the same scripts.
+                agent.validate()?;
+                Ok(CommandTypes::Agent(agent))
+            }
             (false, false) => Err("needs either 'command' (a shell command) or 'agent' \
                                    together with 'prompt' (an agent step)"
                 .to_string()),
@@ -323,6 +327,37 @@ commands:
         let message = parse_error("name: t\ncommands:\n  - command: ok\n  - agent: claude\n");
         assert!(message.contains("step 2"), "names the step: {message}");
         assert!(message.contains("prompt"), "names the field: {message}");
+    }
+
+    /// Validation used to live in `execute`, so `--dry-run` reported success
+    /// for scripts that could never run. Rejecting at load time makes the two
+    /// agree.
+    #[test]
+    fn an_agent_step_that_can_never_run_is_rejected_at_load_time() {
+        for (yaml, expected) in [
+            (
+                "name: t\ncommands:\n  - agent: claude\n    prompt: go\n    capture: out\n",
+                "capture",
+            ),
+            (
+                "name: t\ncommands:\n  - agent: claude\n    prompt: go\n    options:\n      interactive: true\n",
+                "interactive",
+            ),
+            (
+                "name: t\ncommands:\n  - agent: gemini\n    prompt: go\n",
+                "unknown agent",
+            ),
+            (
+                "name: t\ncommands:\n  - agent: claude\n    prompt: go\n    flags: [\"sonnet\"]\n",
+                "must start with",
+            ),
+        ] {
+            let message = parse_error(yaml);
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in: {message}"
+            );
+        }
     }
 
     /// The dispatch reads a self-describing value, so the other supported

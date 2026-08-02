@@ -56,13 +56,21 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
-    /// Whether the installed binary's own `--help` output currently
-    /// advertises `system_prompt_file_flag`. Probed rather than assumed: an
-    /// adapter can know a flag's name and still find it missing from an
-    /// older install. `false` (the default, and the fallback for any probe
-    /// failure) means argv delivery via `system_prompt_args`, never a
-    /// blocked launch.
-    fn supports_system_prompt_file(&self) -> bool {
+    /// Whether the binary about to be spawned advertises
+    /// `system_prompt_file_flag` in its own `--help`. Probed rather than
+    /// assumed: an adapter can know a flag's name and still find it missing
+    /// from an older install.
+    ///
+    /// `launch` is the argv the caller is about to spawn, and the probe must
+    /// hit exactly that program: `wrap` spawns the user's own argv, which can
+    /// be an entirely different install from the one `agent_bin` names, and
+    /// handing the file flag to a binary that does not have it fails the
+    /// launch outright. An empty `launch` means the adapter's own program.
+    ///
+    /// `false` -- the default, and the fallback for any probe failure -- means
+    /// argv delivery via `system_prompt_args`, never a blocked launch.
+    fn supports_system_prompt_file(&self, launch: &[String]) -> bool {
+        let _ = launch;
         false
     }
 
@@ -90,6 +98,20 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup;
+}
+
+/// The program invocation at the head of an argv: the binary plus the leading
+/// arguments before the first flag, which is what `sh wrapper.sh --foo` and
+/// `/usr/bin/env claude -p x` both need. Anything past that is the operator's
+/// own flags and has no business being passed to a `--help` probe.
+pub fn program_invocation(launch: &[String]) -> Option<(String, Vec<String>)> {
+    let (program, rest) = launch.split_first()?;
+    let args = rest
+        .iter()
+        .take_while(|arg| !arg.starts_with('-'))
+        .cloned()
+        .collect();
+    Some((program.clone(), args))
 }
 
 pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
@@ -152,6 +174,31 @@ pub fn command_matches_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M7 probed the adapter's own program while `wrap` spawned the user's
+    /// argv, so the file flag could be handed to a binary that never
+    /// advertised it -- failing the launch outright, which is the one thing
+    /// the probe promises never to do. The probe target now comes from the
+    /// argv about to be spawned, which means finding the invocation in it.
+    #[test]
+    fn the_program_invocation_stops_at_the_first_flag() {
+        let argv =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(|s| s.to_string()).collect() };
+
+        assert_eq!(
+            program_invocation(&argv(&["claude", "-p", "task"])),
+            Some(("claude".to_string(), vec![]))
+        );
+        assert_eq!(
+            program_invocation(&argv(&["/usr/bin/env", "claude", "-p", "task"])),
+            Some(("/usr/bin/env".to_string(), vec!["claude".to_string()]))
+        );
+        assert_eq!(
+            program_invocation(&argv(&["sh", "/opt/wrap.sh", "--model", "opus"])),
+            Some(("sh".to_string(), vec!["/opt/wrap.sh".to_string()]))
+        );
+        assert_eq!(program_invocation(&[]), None, "nothing to probe");
+    }
 
     #[test]
     fn explicit_name_wins() {

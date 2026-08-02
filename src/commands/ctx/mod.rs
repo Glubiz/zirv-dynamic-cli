@@ -53,31 +53,68 @@ pub(crate) mod testenv {
         TestRepo { _dir: dir, path }
     }
 
-    /// Points `HOME` at a test directory and puts the previous value back on
-    /// drop. `HOME` is process-wide, so a test that leaks one naming a deleted
-    /// temp dir breaks every later pty spawn in the same run: portable-pty
-    /// starts its child in `$HOME` unless the caller sets a working directory,
-    /// and the `chdir` fails before the program is ever reached.
-    pub(crate) struct HomeGuard(Option<OsString>);
+    /// Points the home directory (and optionally the working directory) at a
+    /// test directory, putting every one of them back on drop.
+    ///
+    /// All of this is process-wide, so restoring has to survive a panicking
+    /// assertion: a test that leaks `HOME` naming a deleted temp dir breaks
+    /// every later pty spawn in the same run, because portable-pty starts its
+    /// child in `$HOME` unless the caller sets a working directory and the
+    /// `chdir` fails before the program is ever reached. A leaked working
+    /// directory is worse still. Restoring on the happy path only -- which is
+    /// what a `let result = test(); restore; result` helper does -- gets this
+    /// exactly backwards: the failing test is the one that leaks.
+    pub(crate) struct EnvGuard {
+        home: Option<OsString>,
+        userprofile: Option<OsString>,
+        cwd: Option<PathBuf>,
+    }
 
-    impl HomeGuard {
-        pub(crate) fn set(home: &Path) -> Self {
-            let previous = std::env::var_os("HOME");
+    impl EnvGuard {
+        pub(crate) fn set(home: &Path, cwd: Option<&Path>) -> Self {
+            let guard = Self {
+                home: std::env::var_os("HOME"),
+                userprofile: std::env::var_os("USERPROFILE"),
+                cwd: cwd.and(std::env::current_dir().ok()),
+            };
             // SAFETY: CI runs tests single-threaded.
-            unsafe { std::env::set_var("HOME", home) };
-            Self(previous)
+            unsafe {
+                std::env::set_var("HOME", home);
+                std::env::set_var("USERPROFILE", home);
+            }
+            if let Some(cwd) = cwd {
+                std::env::set_current_dir(cwd).expect("enter the test working directory");
+            }
+            guard
         }
     }
 
-    impl Drop for HomeGuard {
+    impl Drop for EnvGuard {
         fn drop(&mut self) {
+            if let Some(previous) = self.cwd.take() {
+                let _ = std::env::set_current_dir(previous);
+            }
             // SAFETY: CI runs tests single-threaded.
             unsafe {
-                match self.0.take() {
-                    Some(previous) => std::env::set_var("HOME", previous),
-                    None => std::env::remove_var("HOME"),
+                for (key, previous) in [
+                    ("HOME", self.home.take()),
+                    ("USERPROFILE", self.userprofile.take()),
+                ] {
+                    match previous {
+                        Some(previous) => std::env::set_var(key, previous),
+                        None => std::env::remove_var(key),
+                    }
                 }
             }
+        }
+    }
+
+    /// `EnvGuard` without the working directory, which is all most tests need.
+    pub(crate) struct HomeGuard(#[allow(dead_code)] EnvGuard);
+
+    impl HomeGuard {
+        pub(crate) fn set(home: &Path) -> Self {
+            Self(EnvGuard::set(home, None))
         }
     }
 }

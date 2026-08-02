@@ -66,8 +66,50 @@ fn write_shortcuts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// Usage, flags and the built-in commands: everything true of zirv regardless
+/// of what is in the current directory. Intercepting `--help` took clap's
+/// generated help away, and what replaced it printed nothing at all in a
+/// directory with no scripts -- so the flags it documents were discoverable
+/// from no help output anywhere.
+fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(writer, "zirv {}\n", env!("CARGO_PKG_VERSION"))?;
+    writeln!(
+        writer,
+        "Usage: zirv <script|command> [params...] [options]\n"
+    )?;
+    writeln!(writer, "Commands:")?;
+    writeln!(writer, "  help, h        Show this help")?;
+    writeln!(writer, "  version, v     Print the version")?;
+    writeln!(writer, "  init, i        Create a .zirv directory here")?;
+    writeln!(writer, "  create, c      Create a new script")?;
+    writeln!(
+        writer,
+        "  ctx            Context management (score, loop, exec, wrap, handoff, resume,"
+    )?;
+    writeln!(writer, "                 hook, status, usage, optimize)")?;
+    writeln!(writer, "\nOptions:")?;
+    writeln!(
+        writer,
+        "  --dry-run      Print each step instead of running it"
+    )?;
+    writeln!(writer, "  -h, --help     Show this help")?;
+    writeln!(writer, "\ncreate only:")?;
+    writeln!(
+        writer,
+        "  --name <NAME>  Script name; skips the interactive prompt"
+    )?;
+    writeln!(writer, "  --shortcut <K> Shortcut key; skips the prompt")?;
+    writeln!(
+        writer,
+        "  --global [b]   Create in ~/.zirv (bare means true)"
+    )?;
+    Ok(())
+}
+
 pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = PathBuf::from(SCRIPT_DIR_NAME);
+
+    write_builtins(writer)?;
 
     if base_dir.exists() {
         writeln!(writer, "\nAvailable Scripts:")?;
@@ -77,14 +119,6 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
         if shortcuts_path.exists() {
             writeln!(writer, "\nAvailable Shortcuts:")?;
             write_shortcuts(writer, &base_dir)?;
-            writeln!(writer, "  i -> init")?;
-            writeln!(writer, "  c -> create")?;
-            writeln!(writer, "  v -> version")?;
-            writeln!(writer, "  h -> help")?;
-            writeln!(
-                writer,
-                "  ctx -> context management (score, loop, exec, wrap, handoff, resume, hook, status, usage)"
-            )?;
         }
     }
 
@@ -128,6 +162,38 @@ mod tests {
         let zirv_dir = temp_dir.join(".zirv");
         create_dir_all(&zirv_dir).unwrap();
         zirv_dir
+    }
+
+    /// Intercepting `--help` replaced clap's generated help, and what replaced
+    /// it printed one line in a directory with no scripts -- so usage, the
+    /// built-in commands and every flag the README documents were discoverable
+    /// from no help output at all.
+    #[test]
+    fn help_always_shows_usage_and_the_builtins() -> Result<(), Box<dyn std::error::Error>> {
+        let empty = tempdir()?;
+        let home = tempdir()?;
+        let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
+
+        let mut out = Cursor::new(Vec::new());
+        show_help(&mut out)?;
+        let text = String::from_utf8(out.into_inner())?;
+
+        for expected in [
+            "Usage:",
+            "create",
+            "version",
+            "init",
+            "ctx",
+            "--dry-run",
+            "--name",
+            "--global",
+        ] {
+            assert!(
+                text.contains(expected),
+                "help must mention {expected}, got:\n{text}"
+            );
+        }
+        Ok(())
     }
 
     /// Test that a local script file is listed correctly.
@@ -214,8 +280,8 @@ shortcuts:
         );
 
         assert!(
-            output.contains("h -> help"),
-            "Output should include a help shortcut"
+            output.contains("help, h"),
+            "Output should include the built-in commands"
         );
 
         env::set_current_dir(original_dir)?;
@@ -223,7 +289,7 @@ shortcuts:
         Ok(())
     }
 
-    /// `zirv ctx` is a built-in, so it belongs in the shortcut list next to
+    /// `zirv ctx` is a built-in, so it belongs in the command list next to
     /// init, create, version and help.
     #[test]
     fn test_show_help_lists_the_ctx_builtin() -> Result<(), Box<dyn std::error::Error>> {
@@ -244,7 +310,10 @@ shortcuts:
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
-        assert!(output.contains("ctx -> context management"), "got {output}");
+        assert!(
+            output.contains("ctx") && output.contains("Context management"),
+            "got {output}"
+        );
         Ok(())
     }
 

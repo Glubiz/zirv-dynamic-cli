@@ -9,6 +9,12 @@ pub fn warn(msg: impl Display) {
     eprintln!("{} {msg}", style("warning:").yellow().bold());
 }
 
+/// Progress a human reads, not output a caller parses. On stderr with the
+/// rest of it, so a setup script can redirect one without losing the other.
+pub fn note(msg: impl Display) {
+    eprintln!("{msg}");
+}
+
 pub fn step(index: usize, total: usize, cmd: &str) {
     eprintln!(
         "{} {}",

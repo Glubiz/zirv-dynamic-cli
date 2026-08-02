@@ -48,12 +48,22 @@ pub enum PumpEvent {
 
 #[derive(Debug, Clone)]
 pub struct InjectionState {
+    /// The turn number the agent last reported, for display only. It counts
+    /// turns within one transcript, so it restarts at 1 after a relaunch and
+    /// shrinks when a compaction rewrites the file -- which is why nothing
+    /// that has to move forwards is keyed on it.
     pub last_turn: u64,
+    /// Turn signals this supervisor has received, ever. Monotonic across
+    /// relaunches and compactions by construction, because it counts what
+    /// arrived here rather than what the transcript says about itself.
+    pub signals_seen: u64,
     pub verdict: Verdict,
     pub score: u32,
     pub user_typed_since_turn: bool,
     pub last_output: Instant,
-    pub cooldown_until_turn: Option<u64>,
+    /// `signals_seen` at the moment an action fired. The next action waits for
+    /// a strictly newer signal than that one.
+    pub cooldown_at_signal: Option<u64>,
     pub degraded: bool,
 }
 
@@ -67,11 +77,12 @@ impl InjectionState {
     pub fn new() -> Self {
         Self {
             last_turn: 0,
+            signals_seen: 0,
             verdict: Verdict::Healthy,
             score: 0,
             user_typed_since_turn: false,
             last_output: Instant::now(),
-            cooldown_until_turn: None,
+            cooldown_at_signal: None,
             degraded: false,
         }
     }
@@ -86,6 +97,7 @@ impl InjectionState {
 
     pub fn on_turn(&mut self, signal: &TurnSignal) {
         self.last_turn = signal.turn;
+        self.signals_seen += 1;
         self.verdict = signal.verdict;
         self.score = signal.score;
         self.user_typed_since_turn = false;
@@ -97,10 +109,16 @@ impl InjectionState {
 /// `may_inject`'s other preconditions (it only prints, never types into the
 /// agent), but it still must not re-fire on every ~100ms poll tick within the
 /// same turn once the pump has armed the cooldown for it.
+///
+/// Keyed on the supervisor's own signal count rather than the turn number the
+/// transcript reports. A relaunch starts a fresh session whose turns count from
+/// one again, and a compaction rewrites the transcript so its turn count
+/// shrinks; a cooldown armed at "turn 30" then never cleared, and supervision
+/// went silent for the rest of the run.
 fn cooldown_cleared(state: &InjectionState) -> bool {
     state
-        .cooldown_until_turn
-        .is_none_or(|turn| state.last_turn > turn)
+        .cooldown_at_signal
+        .is_none_or(|at| state.signals_seen > at)
 }
 
 /// Both spec preconditions, and nothing else: a turn boundary has been reported
@@ -108,7 +126,7 @@ fn cooldown_cleared(state: &InjectionState) -> bool {
 /// lives in the escalation ladder, not here.
 pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> bool {
     !state.degraded
-        && state.last_turn > 0
+        && state.signals_seen > 0
         && !state.user_typed_since_turn
         && now.duration_since(state.last_output) >= debounce
         && cooldown_cleared(state)
@@ -470,6 +488,7 @@ pub fn run_with<W: Write>(
         super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed, None);
     let prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),
+        &launch_command,
         composed.as_ref(),
         &state_dir,
         session.as_str(),
@@ -705,7 +724,7 @@ fn pump(
                 let mut stderr = std::io::stderr();
                 let _ = writeln!(stderr, "\r\n{}\r", advisory_line(supervision.score, 0));
                 // Advise once per turn.
-                supervision.cooldown_until_turn = Some(supervision.last_turn);
+                supervision.cooldown_at_signal = Some(supervision.signals_seen);
             }
             Action::Compact => {
                 let injected = writer
@@ -718,7 +737,7 @@ fn pump(
 
                 // Arm the cooldown before verifying so a failed verification
                 // cannot turn into a retry loop.
-                supervision.cooldown_until_turn = Some(supervision.last_turn);
+                supervision.cooldown_at_signal = Some(supervision.signals_seen);
 
                 // No transcript means no verification is possible, and a
                 // deadline spent polling a file nobody writes would block the
@@ -766,7 +785,7 @@ fn pump(
                 );
             }
             Action::Restart => {
-                supervision.cooldown_until_turn = Some(supervision.last_turn);
+                supervision.cooldown_at_signal = Some(supervision.signals_seen);
 
                 // Bumped before the old child is even asked to quit: its
                 // reader thread's own EOF can land at any point from here on
@@ -1372,7 +1391,7 @@ mod tests {
     fn the_cooldown_blocks_until_a_later_turn_arrives() {
         let now = Instant::now();
         let mut state = ready_state(now);
-        state.cooldown_until_turn = Some(3);
+        state.cooldown_at_signal = Some(state.signals_seen);
         assert!(
             !may_inject(&state, now, DEBOUNCE),
             "same turn as the cooldown"
@@ -1383,6 +1402,26 @@ mod tests {
         assert!(
             may_inject(&state, now, DEBOUNCE),
             "a later turn releases it"
+        );
+    }
+
+    /// The turn number is per-transcript: a relaunched session counts from one
+    /// again, and a compaction rewrites the transcript so the count shrinks.
+    /// A cooldown armed at the dead session's turn 30 then never cleared, and
+    /// advise, compact and restart all went silent for the rest of the run.
+    #[test]
+    fn a_cooldown_outlives_neither_a_relaunch_nor_a_compaction() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.on_turn(&turn_signal(30, Verdict::Restart));
+        state.cooldown_at_signal = Some(state.signals_seen);
+        assert!(!cooldown_cleared(&state), "armed for the signal just seen");
+
+        // The relaunched session's very first turn: number 1, far below 30.
+        state.on_turn(&turn_signal(1, Verdict::Advise));
+        assert!(
+            cooldown_cleared(&state),
+            "a fresh session's first turn is still progress this supervisor saw"
         );
     }
 
@@ -1443,7 +1482,7 @@ mod tests {
         );
     }
 
-    /// Bug (confirmed): the pump loop arms `cooldown_until_turn` after
+    /// Bug (confirmed): the pump loop arms `cooldown_at_signal` after
     /// advising ("advise once per turn"), but `action_for`'s `Advise` arm
     /// never consulted it, so the same advisory reprinted on every ~100ms
     /// poll tick for the rest of the turn. Two consecutive evaluations with
@@ -1461,7 +1500,7 @@ mod tests {
         );
 
         // Mirrors what the pump loop does right after advising.
-        state.cooldown_until_turn = Some(state.last_turn);
+        state.cooldown_at_signal = Some(state.signals_seen);
 
         assert_eq!(
             action_for(&state, now, DEBOUNCE),
