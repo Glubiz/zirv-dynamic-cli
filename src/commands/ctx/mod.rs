@@ -86,10 +86,14 @@ pub(crate) mod testenv {
 /// rest of the crate (`Box<dyn std::error::Error>`).
 pub type CtxResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+// Item 7: named here, in the text `zirv ctx --help` actually prints, so
+// nothing implies codex works today. See adapters::codex::CodexAdapter::ready
+// for the same wording where a user hits it directly (`--agent codex`).
 #[derive(Debug, Parser)]
 #[command(
     name = "zirv ctx",
-    about = "Autonomous context management for AI coding agents",
+    about = "Autonomous context management for AI coding agents (Claude Code only today; codex \
+             is not implemented yet, see issue #11)",
     disable_help_subcommand = true
 )]
 pub struct CtxCli {
@@ -211,6 +215,32 @@ pub fn dispatch(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 7: `zirv ctx --help` is the first thing a curious user reads, so
+    /// it must say plainly that codex is not implemented yet and point at the
+    /// tracking issue, the same honesty `CodexAdapter::ready` gives a user
+    /// who tries `--agent codex` directly.
+    #[test]
+    fn the_top_level_help_is_honest_about_codex_support() {
+        use clap::CommandFactory;
+        let about = CtxCli::command()
+            .get_about()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            about.to_lowercase().contains("not implemented yet"),
+            "must say codex is not implemented yet: {about}"
+        );
+        assert!(
+            about.contains("issue #11"),
+            "must point at the tracking issue: {about}"
+        );
+        assert!(
+            !about.to_lowercase().contains("codex is supported")
+                && !about.to_lowercase().contains("supports codex"),
+            "must not imply codex works today: {about}"
+        );
+    }
 
     #[test]
     fn parses_score_verb() {

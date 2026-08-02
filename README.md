@@ -352,11 +352,12 @@ This will execute the `build.yaml` script.
 quality drops: it advises, compacts early, or restarts the session with a
 distilled handoff. Scoring is deterministic, and every decision is logged.
 
-**Agent support.** Claude Code is the supported agent. A `codex` adapter exists
-in the tree but is gated off: `--agent codex` fails with a message saying so,
-because the event shapes it would have to parse were never verified against an
-authenticated CLI, and the `notify` mechanism the design assumed does not exist
-in current Codex versions. Progress is tracked in
+**Agent support.** Claude Code is the only agent `ctx` supports today. A
+`codex` adapter exists in the tree but is not implemented yet: `--agent codex`
+fails with a message saying so, because the event shapes it would have to
+parse were never verified against an authenticated CLI, and the `notify`
+mechanism the design assumed does not exist in current Codex versions.
+Progress is tracked in
 [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
 
 **Platform support.** Supervision is unix only. `wrap` and `exec` need unix
