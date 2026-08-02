@@ -92,6 +92,17 @@ impl InjectionState {
     }
 }
 
+/// Whether the last-armed cooldown has been cleared by a later turn. Shared
+/// by `may_inject` and `action_for`'s `Advise` arm: an advisory needs none of
+/// `may_inject`'s other preconditions (it only prints, never types into the
+/// agent), but it still must not re-fire on every ~100ms poll tick within the
+/// same turn once the pump has armed the cooldown for it.
+fn cooldown_cleared(state: &InjectionState) -> bool {
+    state
+        .cooldown_until_turn
+        .is_none_or(|turn| state.last_turn > turn)
+}
+
 /// Both spec preconditions, and nothing else: a turn boundary has been reported
 /// and the user is idle. Everything about which verdict deserves which action
 /// lives in the escalation ladder, not here.
@@ -100,9 +111,7 @@ pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> b
         && state.last_turn > 0
         && !state.user_typed_since_turn
         && now.duration_since(state.last_output) >= debounce
-        && state
-            .cooldown_until_turn
-            .is_none_or(|turn| state.last_turn > turn)
+        && cooldown_cleared(state)
 }
 
 /// Sent as arguments to the adapter's compaction command. PreCompact hooks
@@ -168,7 +177,7 @@ pub fn action_for(state: &InjectionState, now: Instant, debounce: Duration) -> A
     }
     match state.verdict {
         Verdict::Healthy => Action::None,
-        Verdict::Advise => Action::Advise,
+        Verdict::Advise if cooldown_cleared(state) => Action::Advise,
         Verdict::Compact if may_inject(state, now, debounce) => Action::Compact,
         Verdict::Restart if may_inject(state, now, debounce) => Action::Restart,
         _ => Action::None,
@@ -409,20 +418,33 @@ pub fn run_with<W: Write>(
     // terminal is touched.
     let adapter = adapters::select(agent_name, &args.command, cfg.agent_bin.as_deref())?;
 
+    // `select` defaults to claude when detection finds nothing to back it,
+    // which is fine for a caller (like `exec`) that already gates every
+    // claude-specific behavior on `command_matches_adapter`. `wrap` must not
+    // spawn a command it can only guess is claude and then start typing
+    // claude-only escape sequences (`/exit\r`, `/compact ...`) into it: an
+    // undetected command with no explicit `--agent` fails loudly here,
+    // before the terminal is ever touched, instead of running silently
+    // unsupervised.
+    if agent_name.is_none()
+        && !adapters::command_matches_adapter(adapter.as_ref(), false, &args.command)
+    {
+        let program = args.command.first().map(String::as_str).unwrap_or("");
+        return Err(format!(
+            "zirv ctx wrap: could not tell which agent '{program}' is; pass --agent claude \
+             (or your agent's name), or run this command unwrapped"
+        )
+        .into());
+    }
+
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = super::event::SessionId::new_v4();
 
-    // Two independent reasons to compose nothing: `--no-supervise` promises
-    // pure passthrough (its own help text says so), and a wrapped command that
-    // matches no adapter (no explicit `--agent`, detection came up empty) is
-    // not actually the agent whose flags we would be injecting.
-    let skip_injection = args.simple
-        || args.no_supervise
-        || !adapters::command_matches_adapter(
-            adapter.as_ref(),
-            agent_name.is_some(),
-            &args.command,
-        );
+    // `--no-supervise` promises pure passthrough (its own help text says so).
+    // The other reason this used to compose nothing -- a wrapped command
+    // that matches no adapter -- can no longer reach this line: the gate
+    // above already sent that case home with an actionable error.
+    let skip_injection = args.simple || args.no_supervise;
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
@@ -434,7 +456,12 @@ pub fn run_with<W: Write>(
     // silently override it with a second occurrence.
     let (launch_command, composed) =
         super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed);
-    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
+    let prompt_args = super::prompt::injection_args_for_session(
+        adapter.as_ref(),
+        composed.as_ref(),
+        &state_dir,
+        session.as_str(),
+    );
     super::prompt::log_injection(
         &state_dir,
         "wrap",
@@ -1085,24 +1112,39 @@ mod tests {
         let _ = h.child.wait();
     }
 
-    /// Bug (same validation pass): with no `--agent` given, `adapters::select`
-    /// falls back to `ClaudeAdapter` when detection finds no match at all, and
-    /// wrap injected that adapter's flags into the wrapped command regardless.
-    /// `echo` is not claude or codex; nothing should be injected into it.
+    /// M5: with no `--agent` given, `adapters::select` falls back to
+    /// `ClaudeAdapter` when detection finds no match at all. Silently running
+    /// the wrapped command anyway (even with injection suppressed) means
+    /// `wrap` guesses an agent it cannot back up and can still start typing
+    /// claude-only escape sequences into a foreign program. `echo` is not
+    /// claude or codex, so wrap must refuse with an actionable error instead
+    /// of running it unsupervised.
     #[cfg(unix)]
     #[test]
-    fn wrapping_a_command_that_matches_no_adapter_injects_nothing() {
+    fn wrapping_an_undetected_command_with_no_explicit_agent_is_a_clear_error() {
         let mut h = spawn_wrap_with_flags(&[], &[], &["echo", "hello"]);
 
-        let seen = read_until(&mut h.reader, "hello", Duration::from_secs(10));
-        assert!(seen.contains("hello"), "got {seen:?}");
+        // Read before waiting: once the child (the pty's only other side) has
+        // exited and every slave-side reference is closed, this platform can
+        // drop whatever was still buffered in the master's queue rather than
+        // let it be read afterwards (the same teardown quirk documented on
+        // `wait_or_kill` above).
+        let seen = read_until(&mut h.reader, "--agent", Duration::from_secs(5));
         assert!(
-            !seen.contains("--append-system-prompt"),
-            "echo was never the selected agent; nothing should be injected: {seen:?}"
+            seen.contains("--agent"),
+            "the error must say how to fix it: {seen:?}"
+        );
+        assert!(
+            !seen.contains("hello"),
+            "the wrapped command must never have run: {seen:?}"
         );
 
         let status = h.child.wait().expect("wait");
-        assert_eq!(status.exit_code(), 0);
+        assert_ne!(
+            status.exit_code(),
+            0,
+            "an unresolvable agent must fail, not run unsupervised"
+        );
     }
 
     #[cfg(unix)]
@@ -1317,6 +1359,33 @@ mod tests {
             action_for(&state, now, DEBOUNCE),
             Action::Advise,
             "advice is written to the terminal, never typed into the agent"
+        );
+    }
+
+    /// Bug (confirmed): the pump loop arms `cooldown_until_turn` after
+    /// advising ("advise once per turn"), but `action_for`'s `Advise` arm
+    /// never consulted it, so the same advisory reprinted on every ~100ms
+    /// poll tick for the rest of the turn. Two consecutive evaluations with
+    /// an unchanged `Advise` verdict, cooldown armed after the first, must
+    /// not both advise.
+    #[test]
+    fn advise_is_not_repeated_every_poll_once_the_cooldown_is_armed() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.verdict = Verdict::Advise;
+        assert_eq!(
+            action_for(&state, now, DEBOUNCE),
+            Action::Advise,
+            "first tick advises"
+        );
+
+        // Mirrors what the pump loop does right after advising.
+        state.cooldown_until_turn = Some(state.last_turn);
+
+        assert_eq!(
+            action_for(&state, now, DEBOUNCE),
+            Action::None,
+            "the same turn must not advise again on every poll tick"
         );
     }
 
