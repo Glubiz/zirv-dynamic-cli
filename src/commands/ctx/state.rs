@@ -134,6 +134,12 @@ impl StateDir {
         self.0.join("usage.json")
     }
 
+    /// Per-transcript scoring checkpoints. The Stop hook is a fresh process on
+    /// every turn, so the only place it can leave its parse position is a file.
+    pub fn scoring(&self) -> PathBuf {
+        self.0.join("scoring")
+    }
+
     /// First 8 hex characters of the session id keep the socket path short.
     pub fn socket_for(&self, session: &str) -> PathBuf {
         let short: String = session

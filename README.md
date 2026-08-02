@@ -568,10 +568,15 @@ timeout_secs = 30   # the distiller is given this long before the structural
                     # fallback is used instead
 ```
 
-Handoffs, sockets and logs live in the platform state directory under
-`zirv/ctx/`, never in the repo. Override with `ZIRV_CTX_STATE_DIR`. On unix the
-state directory is created `0700` and its files `0600`: it holds transcript
-paths, prompts and distilled handoffs. See
+Handoffs, sockets, logs and scoring checkpoints live in the platform state
+directory under `zirv/ctx/`, never in the repo. Override with
+`ZIRV_CTX_STATE_DIR`. On unix the state directory is created `0700` and its
+files `0600`: it holds transcript paths, prompts and distilled handoffs. The
+Stop hook is a fresh process on every turn, so it leaves its parse position and
+the scoring state derived from it in `scoring/`, which is what keeps per-turn
+scoring proportional to the turn rather than to the whole session. Any doubt
+about a checkpoint -- a rewritten or truncated transcript, changed scoring
+config, an unreadable file -- silently rebuilds it from a full parse. See
 [Usage pacing](#usage-pacing) below for the `[pace]` table that governs
 subscription-window waiting.
 

@@ -25,6 +25,9 @@
 #   fail     writes a healthy transcript then exits 3
 #   limit    writes a healthy transcript, prints the documented limit-hit
 #            notice on stdout, then exits 1 the way an exhausted window would
+#   drift    prints a line that only loosely resembles a limit notice (the
+#            wording the strict patterns do NOT recognize) and exits 0, so a
+#            test can prove the breadcrumb is left without a park
 #
 # FAKE_AGENT_MODE_FILE lets one test script a sequence across restarts, for
 # example "rot" then "healthy" to prove a restarted child is supervised on its
@@ -90,6 +93,10 @@ case "$mode" in
   limit)
     printf "You've hit your session limit · resets 3:45pm\n"
     exit 1
+    ;;
+  drift)
+    printf "Notice: you have reached your limit for this model\n"
+    exit 0
     ;;
   *) exit 0 ;;
 esac

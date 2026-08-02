@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +91,42 @@ fn events_in_last_turns(events: &[NormalizedEvent], window: usize) -> &[Normaliz
     &events[starts[starts.len() - window]..]
 }
 
+/// Share of `results` that failed. Zero for an empty window, which is what a
+/// session that ran no tools should score.
+fn failure_rate<I: Iterator<Item = bool>>(results: I) -> f64 {
+    let mut total = 0usize;
+    let mut errors = 0usize;
+    for is_error in results {
+        total += 1;
+        errors += usize::from(is_error);
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    errors as f64 / total as f64
+}
+
+/// `(repetition_hits, max_repeat)` over identical `(tool, input)` pairs.
+fn repetition<'a, I: Iterator<Item = (&'a str, u64)>>(
+    calls: I,
+    threshold: usize,
+) -> (usize, usize) {
+    let mut counts: HashMap<(&str, u64), usize> = HashMap::new();
+    for key in calls {
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let max_repeat = counts.values().copied().max().unwrap_or(0);
+    let hits = counts.values().filter(|count| **count >= threshold).count();
+    (hits, max_repeat)
+}
+
+/// Share of the already-windowed turn finals that are missing the marker.
+/// Only called with a non-empty slice: an empty one means the marker signal is
+/// inactive and no rate is reported at all.
+fn miss_rate(marked: &[bool]) -> f64 {
+    marked.iter().filter(|m| !**m).count() as f64 / marked.len() as f64
+}
+
 pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig) -> Signals {
     let finals = turn_final_texts(events);
     let turns = finals.len();
@@ -97,43 +135,28 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
     let marker_active =
         caps.marker_signal && !cfg.marker.is_empty() && marker_ever && turns >= cfg.min_turns;
 
-    let marker_miss_rate = if marker_active {
-        let recent = last_window(&finals, cfg.window);
-        let misses = recent
+    let marker_miss_rate = marker_active.then(|| {
+        let marked: Vec<bool> = last_window(&finals, cfg.window)
             .iter()
-            .filter(|t| !has_marker(t, &cfg.marker))
-            .count();
-        Some(misses as f64 / recent.len() as f64)
-    } else {
-        None
-    };
+            .map(|t| has_marker(t, &cfg.marker))
+            .collect();
+        miss_rate(&marked)
+    });
 
     let tail = events_in_last_turns(events, cfg.window);
 
-    let results: Vec<bool> = tail
-        .iter()
-        .filter_map(|e| match e {
-            NormalizedEvent::ToolResult { is_error } => Some(*is_error),
-            _ => None,
-        })
-        .collect();
-    let tool_failure_rate = if results.is_empty() {
-        0.0
-    } else {
-        results.iter().filter(|e| **e).count() as f64 / results.len() as f64
-    };
+    let tool_failure_rate = failure_rate(tail.iter().filter_map(|e| match e {
+        NormalizedEvent::ToolResult { is_error } => Some(*is_error),
+        _ => None,
+    }));
 
-    let mut counts: HashMap<(&str, u64), usize> = HashMap::new();
-    for event in tail {
-        if let NormalizedEvent::ToolCall { name, input_hash } = event {
-            *counts.entry((name.as_str(), *input_hash)).or_insert(0) += 1;
-        }
-    }
-    let max_repeat = counts.values().copied().max().unwrap_or(0);
-    let repetition_hits = counts
-        .values()
-        .filter(|count| **count >= cfg.repetition_threshold)
-        .count();
+    let (repetition_hits, max_repeat) = repetition(
+        tail.iter().filter_map(|e| match e {
+            NormalizedEvent::ToolCall { name, input_hash } => Some((name.as_str(), *input_hash)),
+            _ => None,
+        }),
+        cfg.repetition_threshold,
+    );
 
     Signals {
         turns,
@@ -141,6 +164,169 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
         repetition_hits,
         max_repeat,
         marker_miss_rate,
+    }
+}
+
+/// Tool activity of one turn segment: all the windowed signals need from the
+/// events between two `TurnStart`s.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct Segment {
+    calls: Vec<(String, u64)>,
+    results: Vec<bool>,
+}
+
+/// Exactly what `signals` and `context_tokens` read out of a full event
+/// stream, maintained one event at a time so a growing transcript can be
+/// folded in as it arrives instead of parsed from the start on every pass.
+///
+/// Bounded by `window`: only the turn segments and turn-final markers the
+/// windowed signals can still reach are retained. A `window` of zero means "no
+/// window at all", which is unbounded, so `new` refuses it and callers fall
+/// back to a full parse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RotState {
+    marker: String,
+    window: usize,
+    /// Turn finals already closed by a later `TurnStart`.
+    closed_turns: usize,
+    /// `has_marker` of the last `window` closed finals, oldest first.
+    closed_markers: VecDeque<bool>,
+    marker_seen: bool,
+    in_turn: bool,
+    /// `has_marker` of the text the still-open turn would contribute.
+    open_marker: Option<bool>,
+    last_tokens: u64,
+    /// `segments[0]` is the run of events before the first `TurnStart`, kept
+    /// only while the window still reaches back that far.
+    segments: VecDeque<Segment>,
+    turn_starts: usize,
+}
+
+impl RotState {
+    /// `None` when the configured window is unbounded, which this state cannot
+    /// represent in bounded memory.
+    pub fn new(cfg: &ScoreConfig) -> Option<Self> {
+        if cfg.window == 0 {
+            return None;
+        }
+        Some(Self {
+            marker: cfg.marker.clone(),
+            window: cfg.window,
+            closed_turns: 0,
+            closed_markers: VecDeque::new(),
+            marker_seen: false,
+            in_turn: false,
+            open_marker: None,
+            last_tokens: 0,
+            segments: VecDeque::from([Segment::default()]),
+            turn_starts: 0,
+        })
+    }
+
+    /// Whether this state was folded under the same rules `cfg` describes.
+    /// Retention already discarded what a different window or marker would
+    /// need, so a mismatch can only be answered by rebuilding.
+    pub fn built_for(&self, cfg: &ScoreConfig) -> bool {
+        self.window == cfg.window && self.marker == cfg.marker
+    }
+
+    pub fn feed_all(&mut self, events: &[NormalizedEvent]) {
+        for event in events {
+            self.feed(event);
+        }
+    }
+
+    pub fn feed(&mut self, event: &NormalizedEvent) {
+        match event {
+            NormalizedEvent::TurnStart => {
+                if self.in_turn
+                    && let Some(marked) = self.open_marker
+                {
+                    self.close_turn(marked);
+                }
+                self.in_turn = true;
+                self.open_marker = None;
+                self.turn_starts += 1;
+                self.segments.push_back(Segment::default());
+                // Once the window no longer reaches the first turn, neither the
+                // pre-turn prefix nor the older segments can be read again.
+                if self.turn_starts > self.window {
+                    while self.segments.len() > self.window {
+                        self.segments.pop_front();
+                    }
+                }
+            }
+            NormalizedEvent::AssistantFinal { text, input_tokens } => {
+                self.last_tokens = *input_tokens;
+                if !text.trim().is_empty() {
+                    self.open_marker = Some(has_marker(text, &self.marker));
+                }
+            }
+            NormalizedEvent::ToolCall { name, input_hash } => {
+                if let Some(segment) = self.segments.back_mut() {
+                    segment.calls.push((name.clone(), *input_hash));
+                }
+            }
+            NormalizedEvent::ToolResult { is_error } => {
+                if let Some(segment) = self.segments.back_mut() {
+                    segment.results.push(*is_error);
+                }
+            }
+            NormalizedEvent::Compaction => {}
+        }
+    }
+
+    fn close_turn(&mut self, marked: bool) {
+        self.closed_turns += 1;
+        self.marker_seen |= marked;
+        self.closed_markers.push_back(marked);
+        if self.closed_markers.len() > self.window {
+            self.closed_markers.pop_front();
+        }
+    }
+
+    /// `None` when `cfg` no longer matches the rules this state was folded
+    /// under, which is the caller's cue to rebuild from a full parse.
+    pub fn score(&self, caps: Capabilities, cfg: &ScoreConfig) -> Option<Score> {
+        if !self.built_for(cfg) {
+            return None;
+        }
+        Some(score_from(self.signals(caps, cfg), self.last_tokens, cfg))
+    }
+
+    fn signals(&self, caps: Capabilities, cfg: &ScoreConfig) -> Signals {
+        // The open turn's text is a turn final too: a full parse flushes it at
+        // the end of the stream even though no later `TurnStart` closed it.
+        let turns = self.closed_turns + usize::from(self.open_marker.is_some());
+        let marker_ever = self.marker_seen || self.open_marker == Some(true);
+        let marker_active =
+            caps.marker_signal && !cfg.marker.is_empty() && marker_ever && turns >= cfg.min_turns;
+
+        let marker_miss_rate = marker_active.then(|| {
+            let mut marked: Vec<bool> = self.closed_markers.iter().copied().collect();
+            marked.extend(self.open_marker);
+            if marked.len() > self.window {
+                marked.drain(..marked.len() - self.window);
+            }
+            miss_rate(&marked)
+        });
+
+        let tool_failure_rate =
+            failure_rate(self.segments.iter().flat_map(|s| s.results.iter().copied()));
+        let (repetition_hits, max_repeat) = repetition(
+            self.segments
+                .iter()
+                .flat_map(|s| s.calls.iter().map(|(name, hash)| (name.as_str(), *hash))),
+            cfg.repetition_threshold,
+        );
+
+        Signals {
+            turns,
+            tool_failure_rate,
+            repetition_hits,
+            max_repeat,
+            marker_miss_rate,
+        }
     }
 }
 
@@ -211,9 +397,12 @@ pub fn verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig) -> Verdict {
 }
 
 pub fn score_events(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig) -> Score {
-    let signals = signals(events, caps, cfg);
-    let tokens = context_tokens(events);
+    score_from(signals(events, caps, cfg), context_tokens(events), cfg)
+}
 
+/// The weighted sum and the gate, shared by the full-parse and incremental
+/// paths so the two can never drift apart.
+pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig) -> Score {
     let raw = cfg.weight_tool_failure * signals.tool_failure_rate
         + cfg.weight_repetition
             * repetition_component(signals.max_repeat, cfg.repetition_threshold)
@@ -311,6 +500,127 @@ mod tests {
         (0..count)
             .flat_map(|_| turn_with("{\"command\":\"ls\"}", mid, fin, is_error, tokens))
             .collect()
+    }
+
+    /// Every fixture shape the incremental state has to survive: an empty
+    /// stream, events before the first turn, an open final turn, a stream
+    /// longer than the window, and one that compacts mid-way.
+    fn equivalence_fixtures() -> Vec<(&'static str, Vec<NormalizedEvent>)> {
+        let mut past_window = looping_turns(4, "", "[zirv] ok", true, 120_000);
+        past_window.extend(turns(20, "mid", "sloppy", false, 165_000));
+
+        let mut with_compaction = turns(12, "", "[zirv] ok", false, 170_000);
+        with_compaction.push(NormalizedEvent::Compaction);
+        with_compaction.extend(turn_with(
+            "{\"command\":\"p\"}",
+            "",
+            "[zirv] ok",
+            false,
+            12_000,
+        ));
+
+        let mut before_first_turn = vec![
+            assistant("orphan text", 5_000),
+            tool("Bash", "{\"command\":\"ls\"}"),
+            NormalizedEvent::ToolResult { is_error: true },
+        ];
+        before_first_turn.extend(turns(3, "", "[zirv] ok", false, 120_000));
+
+        let mut open_turn = turns(11, "", "[zirv] ok", false, 120_000);
+        open_turn.push(NormalizedEvent::TurnStart);
+        open_turn.push(assistant("still working", 130_000));
+
+        vec![
+            ("empty", Vec::new()),
+            ("short", turns(3, "", "[zirv] ok", false, 120_000)),
+            ("past the window", past_window),
+            ("with a compaction", with_compaction),
+            ("events before the first turn", before_first_turn),
+            ("an open final turn", open_turn),
+            ("no turn starts at all", vec![assistant("[zirv] hi", 9)]),
+        ]
+    }
+
+    /// The whole point of the incremental path: folding the same events in any
+    /// number of chunks has to land on the byte-identical score a single full
+    /// parse produces.
+    #[test]
+    fn folding_events_in_chunks_matches_a_full_parse() {
+        for cfg in [
+            ScoreConfig::default(),
+            ScoreConfig {
+                window: 3,
+                min_turns: 2,
+                ..ScoreConfig::default()
+            },
+        ] {
+            for (name, events) in equivalence_fixtures() {
+                let expected = score_events(&events, full_caps(), &cfg);
+                for chunk in [1, 2, 5, 97] {
+                    let mut state = RotState::new(&cfg).expect("bounded window");
+                    for part in events.chunks(chunk) {
+                        state.feed_all(part);
+                    }
+                    assert_eq!(
+                        state.score(full_caps(), &cfg),
+                        Some(expected.clone()),
+                        "{name} in chunks of {chunk} (window {})",
+                        cfg.window
+                    );
+                }
+            }
+        }
+    }
+
+    /// A prefix is not a special case: the state has to be right after every
+    /// single event, because that is what a per-turn scoring pass reads.
+    #[test]
+    fn every_prefix_of_a_stream_scores_like_a_full_parse_of_that_prefix() {
+        let cfg = ScoreConfig::default();
+        let mut events = looping_turns(3, "", "[zirv] ok", true, 120_000);
+        events.extend(turns(14, "note", "sloppy", false, 170_000));
+
+        let mut state = RotState::new(&cfg).expect("bounded window");
+        for (index, event) in events.iter().enumerate() {
+            state.feed(event);
+            assert_eq!(
+                state.score(full_caps(), &cfg),
+                Some(score_events(&events[..=index], full_caps(), &cfg)),
+                "prefix of {} events",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbounded_window_has_no_incremental_state() {
+        let cfg = ScoreConfig {
+            window: 0,
+            ..ScoreConfig::default()
+        };
+        assert!(
+            RotState::new(&cfg).is_none(),
+            "an unbounded window cannot be folded in bounded memory"
+        );
+    }
+
+    #[test]
+    fn state_folded_under_other_rules_refuses_to_score() {
+        let cfg = ScoreConfig::default();
+        let mut state = RotState::new(&cfg).expect("bounded window");
+        state.feed_all(&turns(12, "", "[zirv] ok", false, 120_000));
+
+        let other_marker = ScoreConfig {
+            marker: "[other]".to_string(),
+            ..cfg.clone()
+        };
+        let other_window = ScoreConfig {
+            window: 4,
+            ..cfg.clone()
+        };
+        assert!(state.score(full_caps(), &other_marker).is_none());
+        assert!(state.score(full_caps(), &other_window).is_none());
+        assert!(state.score(full_caps(), &cfg).is_some());
     }
 
     #[test]

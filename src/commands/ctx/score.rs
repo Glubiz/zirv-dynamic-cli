@@ -1,8 +1,14 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::rot::{self, Score};
+use serde::{Deserialize, Serialize};
+
+use super::adapters::AgentAdapter;
+use super::config::{CtxConfig, EnvLookup, ScoreConfig, env_from_process};
+use super::event::input_hash;
+use super::rot::{self, RotState, Score};
+use super::state::StateDir;
+use super::supervise::Watcher;
 use super::{CtxResult, adapters};
 
 #[derive(Debug, clap::Args)]
@@ -15,8 +21,24 @@ pub struct ScoreArgs {
     pub agent: Option<String>,
 }
 
-/// Shared by `hook`, `exec`, `loop` and `wrap`: read a transcript, parse it with
-/// the selected adapter, score it.
+/// Read a whole transcript, parse it with the selected adapter, score it. The
+/// reference every incremental pass has to agree with.
+fn full_score(
+    adapter: &dyn AgentAdapter,
+    transcript: &Path,
+    cfg: &ScoreConfig,
+) -> CtxResult<Score> {
+    let jsonl = std::fs::read_to_string(transcript)
+        .map_err(|e| format!("{}: {e}", transcript.display()))?;
+    Ok(rot::score_events(
+        &adapter.parse_events(&jsonl),
+        adapter.capabilities(),
+        cfg,
+    ))
+}
+
+/// One-shot scoring, used by the `score` verb itself: no state is kept, so the
+/// whole transcript is parsed every time.
 pub fn score_transcript(
     transcript: &Path,
     agent: Option<&str>,
@@ -29,14 +51,202 @@ pub fn score_transcript(
         &[],
         cfg.agent_bin.as_deref(),
     )?;
-    let jsonl = std::fs::read_to_string(transcript)
-        .map_err(|e| format!("{}: {e}", transcript.display()))?;
-    let events = adapter.parse_events(&jsonl);
-    Ok(rot::score_events(
-        &events,
-        adapter.capabilities(),
-        &cfg.score,
+    full_score(adapter.as_ref(), transcript, &cfg.score)
+}
+
+/// Folds a growing transcript into a `RotState` so each pass costs the bytes
+/// appended since the last one rather than the whole session. Correctness is
+/// never traded for that: whenever the `Watcher` reports the file was
+/// rewritten, or the state was folded under different rules, it is thrown away
+/// and rebuilt from what the file says now.
+pub struct IncrementalScorer {
+    transcript: PathBuf,
+    watcher: Watcher,
+    state: Option<RotState>,
+}
+
+impl IncrementalScorer {
+    pub fn new(transcript: PathBuf) -> Self {
+        Self {
+            watcher: Watcher::new(transcript.clone()),
+            transcript,
+            state: None,
+        }
+    }
+
+    /// Resumes from a checkpoint a previous process wrote.
+    fn resuming(transcript: PathBuf, offset: u64, consumed: u64, state: RotState) -> Self {
+        Self {
+            watcher: Watcher::resuming(transcript.clone(), offset, consumed),
+            transcript,
+            state: Some(state),
+        }
+    }
+
+    pub fn position(&self) -> (u64, u64) {
+        self.watcher.position()
+    }
+
+    fn state(&self) -> Option<&RotState> {
+        self.state.as_ref()
+    }
+
+    /// `None` when the transcript has not changed since the last poll, which
+    /// leaves the caller's previous verdict standing.
+    pub fn poll(
+        &mut self,
+        adapter: &dyn AgentAdapter,
+        cfg: &ScoreConfig,
+    ) -> CtxResult<Option<Score>> {
+        let Some(appended) = self.watcher.read_appended()? else {
+            return Ok(None);
+        };
+        if appended.restarted || self.state.as_ref().is_none_or(|s| !s.built_for(cfg)) {
+            self.state = RotState::new(cfg);
+        }
+        let Some(state) = self.state.as_mut() else {
+            // An unbounded window has no bounded state to fold into.
+            return full_score(adapter, &self.transcript, cfg).map(Some);
+        };
+        state.feed_all(&adapter.parse_events(&appended.lines));
+
+        // The line the agent is still writing counts towards this pass's score
+        // -- a full parse would see it too -- but is never committed to the
+        // state, because the next poll reads it again, complete.
+        if appended.partial.is_empty() {
+            return Ok(state.score(adapter.capabilities(), cfg));
+        }
+        let mut with_partial = state.clone();
+        with_partial.feed_all(&adapter.parse_events(&appended.partial));
+        Ok(with_partial.score(adapter.capabilities(), cfg))
+    }
+}
+
+/// Bumped whenever the checkpoint or `RotState` changes shape, so an older
+/// file is ignored and rebuilt instead of misread.
+const CHECKPOINT_VERSION: u32 = 1;
+
+/// What a fresh process needs to carry on folding where the last one stopped.
+#[derive(Debug, Serialize, Deserialize)]
+struct Checkpoint {
+    version: u32,
+    /// The transcript this state describes: a checkpoint that outlived its
+    /// session must never be applied to a different one.
+    transcript: String,
+    /// Adapter, capabilities and score config the state was folded under.
+    fingerprint: u64,
+    offset: u64,
+    consumed: u64,
+    state: RotState,
+}
+
+/// Everything outside the transcript that decides what the same bytes score
+/// to. Any change to it rebuilds rather than reusing state folded under rules
+/// that no longer apply.
+fn fingerprint(adapter: &dyn AgentAdapter, cfg: &ScoreConfig) -> u64 {
+    input_hash(&format!(
+        "{CHECKPOINT_VERSION}|{}|{:?}|{cfg:?}",
+        adapter.name(),
+        adapter.capabilities()
     ))
+}
+
+/// One file per transcript, named after a hash of its path: the path itself
+/// carries the session id and is far too long to be a filename.
+fn checkpoint_path(state: &StateDir, transcript: &Path) -> PathBuf {
+    state.scoring().join(format!(
+        "{:016x}.json",
+        input_hash(&transcript.display().to_string())
+    ))
+}
+
+/// `None` on any doubt at all -- unreadable, corrupt, a different schema
+/// version, a different transcript, different scoring rules, or an offset that
+/// no longer fits the file -- which sends the caller back to a full parse.
+fn load_checkpoint(
+    path: &Path,
+    transcript: &Path,
+    fingerprint: u64,
+    cfg: &ScoreConfig,
+) -> Option<Checkpoint> {
+    let checkpoint: Checkpoint = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let usable = checkpoint.version == CHECKPOINT_VERSION
+        && checkpoint.transcript == transcript.display().to_string()
+        && checkpoint.fingerprint == fingerprint
+        && checkpoint.state.built_for(cfg)
+        && checkpoint.offset <= std::fs::metadata(transcript).ok()?.len();
+    usable.then_some(checkpoint)
+}
+
+/// Best-effort: a checkpoint that cannot be written costs the next pass a full
+/// parse, which is exactly what happened before there were checkpoints.
+fn save_checkpoint(path: &Path, transcript: &Path, fingerprint: u64, scorer: &IncrementalScorer) {
+    let Some(state) = scorer.state() else {
+        return;
+    };
+    let (offset, consumed) = scorer.position();
+    let Ok(json) = serde_json::to_string(&Checkpoint {
+        version: CHECKPOINT_VERSION,
+        transcript: transcript.display().to_string(),
+        fingerprint,
+        offset,
+        consumed,
+        state: state.clone(),
+    }) else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let _ = super::state::create_private_dir_all(dir);
+    // Renamed into place so a hook killed mid-write leaves the previous
+    // checkpoint intact rather than a truncated one.
+    let staged = dir.join(format!("{}.tmp", std::process::id()));
+    if super::state::write_private(&staged, &json).is_ok() {
+        let _ = std::fs::rename(&staged, path);
+    }
+}
+
+/// The same score `score_transcript` returns, reached by folding only the
+/// bytes appended since the previous call for this transcript. Used by the
+/// Stop hook, which is a fresh process on every turn, so its state lives in a
+/// private file under the state dir. Every failure degrades to a full parse.
+pub fn score_transcript_cached(
+    transcript: &Path,
+    agent: Option<&str>,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<Score> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let adapter = adapters::select(
+        agent.or(cfg.agent.as_deref()),
+        &[],
+        cfg.agent_bin.as_deref(),
+    )?;
+    let Ok(state_dir) = StateDir::resolve(env) else {
+        return full_score(adapter.as_ref(), transcript, &cfg.score);
+    };
+
+    let path = checkpoint_path(&state_dir, transcript);
+    let fingerprint = fingerprint(adapter.as_ref(), &cfg.score);
+    let mut scorer = match load_checkpoint(&path, transcript, fingerprint, &cfg.score) {
+        Some(checkpoint) => IncrementalScorer::resuming(
+            transcript.to_path_buf(),
+            checkpoint.offset,
+            checkpoint.consumed,
+            checkpoint.state,
+        ),
+        None => IncrementalScorer::new(transcript.to_path_buf()),
+    };
+
+    // A poll that reports nothing new cannot be answered from a checkpoint
+    // alone (an unreadable or empty transcript lands here too), so it falls
+    // back rather than guessing.
+    let Ok(Some(score)) = scorer.poll(adapter.as_ref(), &cfg.score) else {
+        return full_score(adapter.as_ref(), transcript, &cfg.score);
+    };
+    save_checkpoint(&path, transcript, fingerprint, &scorer);
+    Ok(score)
 }
 
 pub fn run_with<W: Write>(
@@ -80,6 +290,358 @@ mod tests {
         let path = dir.join("t.jsonl");
         std::fs::write(&path, text).expect("write transcript");
         path
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    /// A state dir of its own per test: the checkpoints are real files.
+    fn state_env(dir: &Path) -> HashMap<String, String> {
+        [(
+            super::super::state::STATE_ENV.to_string(),
+            dir.join("state").display().to_string(),
+        )]
+        .into()
+    }
+
+    /// Grows `transcript` towards `body` in `chunks` appends cut at line
+    /// boundaries, scoring through the cached path after every one, and
+    /// returns the last score. The final write is `body` byte for byte, so a
+    /// transcript with no trailing newline stays one.
+    fn replay(transcript: &Path, body: &str, chunks: usize, env: EnvLookup<'_>) -> Score {
+        let repo = transcript.parent().unwrap_or(Path::new("."));
+        let mut cuts: Vec<usize> = body.match_indices('\n').map(|(i, _)| i + 1).collect();
+        if cuts.last() != Some(&body.len()) {
+            cuts.push(body.len());
+        }
+        let step = cuts.len().div_ceil(chunks.max(1)).max(1);
+
+        let mut score = None;
+        let mut at_end = false;
+        for cut in cuts
+            .iter()
+            .step_by(step)
+            .chain(std::iter::once(&body.len()))
+        {
+            if at_end {
+                break;
+            }
+            at_end = *cut == body.len();
+            std::fs::write(transcript, &body[..*cut]).expect("write transcript");
+            score = Some(
+                score_transcript_cached(transcript, None, repo, env).expect("cached score runs"),
+            );
+        }
+        score.expect("at least one pass")
+    }
+
+    /// The contract in one test: the recorded real session, fed in any number
+    /// of appends, has to end on the byte-identical score one full parse
+    /// produces from the same bytes.
+    #[test]
+    fn replaying_the_real_fixture_in_chunks_matches_a_full_parse() {
+        let jsonl = std::fs::read_to_string(fixture_path("claude-real-session.jsonl"))
+            .expect("fixture must be committed");
+
+        for chunks in [1, 2, 7, 40, jsonl.lines().count()] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let env = state_env(dir.path());
+            let transcript = dir.path().join("session.jsonl");
+
+            let incremental = replay(&transcript, &jsonl, chunks, &|k| env.get(k).cloned());
+            let full = score_transcript(&transcript, None, dir.path(), &|k| env.get(k).cloned())
+                .expect("full score runs");
+            assert_eq!(incremental, full, "the fixture fed in {chunks} chunks");
+        }
+    }
+
+    /// The same equivalence for shapes the fixture happens not to contain: a
+    /// rotting session, an empty file, and a transcript whose last line has no
+    /// trailing newline.
+    #[test]
+    fn replaying_synthetic_transcripts_in_chunks_matches_a_full_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = state_env(dir.path());
+        let rotting = std::fs::read_to_string(write_transcript(dir.path(), 14, false, 170_000))
+            .expect("read");
+
+        for (name, body) in [
+            ("a rotting session", rotting.as_str()),
+            ("an empty transcript", ""),
+            (
+                "no trailing newline",
+                "{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[zirv] ok\"}],\"usage\":{\"input_tokens\":9}}}",
+            ),
+        ] {
+            for chunks in [1, 3, body.lines().count().max(1)] {
+                let case = tempfile::tempdir().expect("tempdir");
+                let env2 = state_env(case.path());
+                let transcript = case.path().join("session.jsonl");
+
+                let incremental = replay(&transcript, body, chunks, &|k| env2.get(k).cloned());
+                let full =
+                    score_transcript(&transcript, None, case.path(), &|k| env2.get(k).cloned())
+                        .expect("full score runs");
+                assert_eq!(incremental, full, "{name} in {chunks} chunks");
+            }
+        }
+        drop(env);
+    }
+
+    /// A line still being written is scored on this pass but never committed,
+    /// so the pass that sees it complete scores it exactly once.
+    #[test]
+    fn a_half_written_line_is_scored_without_being_committed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = state_env(dir.path());
+        let lookup = |k: &str| env.get(k).cloned();
+        let transcript = dir.path().join("session.jsonl");
+
+        let complete = std::fs::read_to_string(write_transcript(dir.path(), 12, false, 170_000))
+            .expect("read");
+        let cut = complete.len() - 40;
+        std::fs::write(&transcript, &complete[..cut]).expect("write a torn tail");
+        let torn = score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("scores");
+        assert_eq!(
+            torn,
+            score_transcript(&transcript, None, dir.path(), &lookup).expect("full"),
+            "a torn tail scores the same either way"
+        );
+
+        std::fs::write(&transcript, &complete).expect("finish the line");
+        let finished =
+            score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("scores");
+        assert_eq!(
+            finished,
+            score_transcript(&transcript, None, dir.path(), &lookup).expect("full"),
+            "and the completed line is counted once, not twice"
+        );
+    }
+
+    /// The performance claim: pass two advances the checkpoint by exactly the
+    /// bytes that were appended, so turn N costs the turn and not the session.
+    #[test]
+    fn the_checkpoint_advances_by_only_the_appended_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = state_env(dir.path());
+        let lookup = |k: &str| env.get(k).cloned();
+        let transcript = dir.path().join("session.jsonl");
+
+        let bulk =
+            std::fs::read_to_string(write_transcript(dir.path(), 30, true, 120_000)).expect("read");
+        std::fs::write(&transcript, &bulk).expect("write");
+        score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("scores");
+
+        let state = StateDir::from_root(dir.path().join("state"));
+        let path = checkpoint_path(&state, &transcript);
+        let read_offset = |label: &str| -> u64 {
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{label}: {e}"));
+            serde_json::from_str::<serde_json::Value>(&text).expect("valid checkpoint")["offset"]
+                .as_u64()
+                .expect("offset")
+        };
+        assert_eq!(read_offset("first pass"), bulk.len() as u64);
+
+        let turn = "{\"type\":\"user\",\"message\":{\"content\":\"more\"}}\n";
+        std::fs::write(&transcript, format!("{bulk}{turn}")).expect("append one turn");
+        score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("scores");
+        assert_eq!(
+            read_offset("second pass") - bulk.len() as u64,
+            turn.len() as u64,
+            "the second pass folded in only the appended turn"
+        );
+    }
+
+    /// Every way a checkpoint can stop describing the file it was written for.
+    /// All of them have to land on the full-parse answer, silently.
+    #[test]
+    fn every_invalidation_path_falls_back_to_a_full_parse() {
+        let corrupt = |path: &Path| std::fs::write(path, "{not json at all").expect("corrupt");
+        let wrong_version = |path: &Path| {
+            let text = std::fs::read_to_string(path).expect("read");
+            let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
+            json["version"] = serde_json::json!(CHECKPOINT_VERSION + 1);
+            std::fs::write(path, json.to_string()).expect("write");
+        };
+        let wrong_transcript = |path: &Path| {
+            let text = std::fs::read_to_string(path).expect("read");
+            let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
+            json["transcript"] = serde_json::json!("/somewhere/else/other-session.jsonl");
+            std::fs::write(path, json.to_string()).expect("write");
+        };
+        let offset_past_the_end = |path: &Path| {
+            let text = std::fs::read_to_string(path).expect("read");
+            let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
+            json["offset"] = serde_json::json!(u64::MAX);
+            std::fs::write(path, json.to_string()).expect("write");
+        };
+        let deleted = |path: &Path| std::fs::remove_file(path).expect("remove");
+
+        for (name, damage) in [
+            ("corrupt", &corrupt as &dyn Fn(&Path)),
+            ("a newer schema", &wrong_version),
+            ("another session's", &wrong_transcript),
+            ("an offset past the end", &offset_past_the_end),
+            ("missing", &deleted),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let env = state_env(dir.path());
+            let lookup = |k: &str| env.get(k).cloned();
+            let transcript = dir.path().join("session.jsonl");
+            let body = std::fs::read_to_string(write_transcript(dir.path(), 12, false, 170_000))
+                .expect("read");
+            std::fs::write(&transcript, &body).expect("write");
+
+            score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("first pass");
+            let state = StateDir::from_root(dir.path().join("state"));
+            damage(&checkpoint_path(&state, &transcript));
+
+            std::fs::write(
+                &transcript,
+                format!("{body}{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n"),
+            )
+            .expect("append");
+            assert_eq!(
+                score_transcript_cached(&transcript, None, dir.path(), &lookup)
+                    .expect("still scores"),
+                score_transcript(&transcript, None, dir.path(), &lookup).expect("full"),
+                "a {name} checkpoint must fall back to a full parse"
+            );
+        }
+    }
+
+    /// A transcript that shrank or was rewritten under a live checkpoint: the
+    /// stored offset points into bytes that no longer mean anything.
+    #[test]
+    fn a_truncated_or_rewritten_transcript_is_rescored_from_scratch() {
+        for rewrite in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let env = state_env(dir.path());
+            let lookup = |k: &str| env.get(k).cloned();
+            let transcript = dir.path().join("session.jsonl");
+            let long = std::fs::read_to_string(write_transcript(dir.path(), 14, false, 170_000))
+                .expect("read");
+            std::fs::write(&transcript, &long).expect("write");
+            score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("first pass");
+
+            // Truncation, or a rewrite that is longer than what came before:
+            // a post-compaction transcript can look like either.
+            let replacement = if rewrite {
+                let mut text =
+                    std::fs::read_to_string(write_transcript(dir.path(), 20, true, 40_000))
+                        .expect("read");
+                text.push_str("{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n");
+                text
+            } else {
+                long.lines().take(6).collect::<Vec<_>>().join("\n") + "\n"
+            };
+            std::fs::write(&transcript, &replacement).expect("replace");
+
+            assert_eq!(
+                score_transcript_cached(&transcript, None, dir.path(), &lookup)
+                    .expect("still scores"),
+                score_transcript(&transcript, None, dir.path(), &lookup).expect("full"),
+                "rewrite={rewrite}"
+            );
+        }
+    }
+
+    /// Changing the scoring rules changes what the retained state should have
+    /// kept, so the checkpoint written under the old ones must not be reused.
+    #[test]
+    fn a_config_change_rebuilds_instead_of_reusing_the_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut env = state_env(dir.path());
+        let transcript = dir.path().join("session.jsonl");
+        let body = std::fs::read_to_string(write_transcript(dir.path(), 14, false, 170_000))
+            .expect("read");
+        std::fs::write(&transcript, &body).expect("write");
+
+        let first =
+            score_transcript_cached(&transcript, None, dir.path(), &|k| env.get(k).cloned())
+                .expect("first pass");
+        assert_eq!(first.signals.marker_miss_rate, Some(1.0));
+
+        env.insert("ZIRV_CTX_WINDOW".to_string(), "4".to_string());
+        std::fs::write(
+            &transcript,
+            format!("{body}{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n"),
+        )
+        .expect("append");
+
+        let lookup = |k: &str| env.get(k).cloned();
+        assert_eq!(
+            score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("scores"),
+            score_transcript(&transcript, None, dir.path(), &lookup).expect("full"),
+            "a narrower window must be honoured, not read off stale state"
+        );
+    }
+
+    /// An unbounded window keeps no state at all; it still has to score.
+    #[test]
+    fn an_unbounded_window_still_scores_correctly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut env = state_env(dir.path());
+        env.insert("ZIRV_CTX_WINDOW".to_string(), "0".to_string());
+        let lookup = |k: &str| env.get(k).cloned();
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            std::fs::read_to_string(write_transcript(dir.path(), 12, false, 170_000))
+                .expect("read"),
+        )
+        .expect("write");
+
+        assert_eq!(
+            score_transcript_cached(&transcript, None, dir.path(), &lookup).expect("scores"),
+            score_transcript(&transcript, None, dir.path(), &lookup).expect("full")
+        );
+    }
+
+    #[test]
+    fn the_checkpoint_file_is_private_to_its_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = state_env(dir.path());
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            std::fs::read_to_string(write_transcript(dir.path(), 4, true, 10_000)).expect("read"),
+        )
+        .expect("write");
+        score_transcript_cached(&transcript, None, dir.path(), &|k| env.get(k).cloned())
+            .expect("scores");
+
+        let state = StateDir::from_root(dir.path().join("state"));
+        let path = checkpoint_path(&state, &transcript);
+        assert!(path.is_file(), "a checkpoint was written");
+        assert!(
+            std::fs::read_dir(state.scoring())
+                .expect("read dir")
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+            "the staged copy is renamed into place, not left behind"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "transcript state is nobody else's");
+        }
+    }
+
+    #[test]
+    fn a_missing_transcript_is_still_an_error_on_the_cached_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = state_env(dir.path());
+        let err = score_transcript_cached(&dir.path().join("nope.jsonl"), None, dir.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect_err("must fail");
+        assert!(err.to_string().contains("nope.jsonl"), "got {err}");
     }
 
     #[test]

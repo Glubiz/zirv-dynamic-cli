@@ -68,7 +68,6 @@ const LOOSE_LIMIT_HINTS: &[&str] = &["hit", "reached", "exceeded"];
 /// wider than `LIMIT_HIT_PATTERNS` — firing here only leaves a breadcrumb via
 /// `note_limit_wording_drift`, it never feeds into `is_limit_hit` or a pace
 /// decision.
-#[allow(dead_code)] // wired in at the is_limit_hit call sites in exec.rs/run_loop.rs (out of scope here)
 fn is_loose_limit_mention(line: &str) -> bool {
     let lowered = line.to_lowercase();
     lowered.contains("limit") && LOOSE_LIMIT_HINTS.iter().any(|hint| lowered.contains(hint))
@@ -83,7 +82,6 @@ fn is_loose_limit_mention(line: &str) -> bool {
 /// itself. Fail-open: a broken state dir must not turn this into a hard
 /// failure, so a logging error is swallowed like the rest of this file's
 /// decision logging.
-#[allow(dead_code)] // not yet called from exec.rs/run_loop.rs (out of scope here)
 pub fn note_limit_wording_drift<W: Write>(
     line: &str,
     strict: bool,
@@ -111,6 +109,26 @@ pub fn note_limit_wording_drift<W: Write>(
             detail: line,
         },
     );
+}
+
+/// The supervisors' single reading of a batch of tapped agent output: whether
+/// it announced a usage limit, plus a breadcrumb for every line that only
+/// loosely resembles one. Only `is_limit_hit` decides the answer, so the
+/// breadcrumb never parks a run on its own.
+pub fn scan_for_limit<W: Write>(
+    lines: &[String],
+    state: &StateDir,
+    session: &str,
+    verb: &'static str,
+    stderr: &mut W,
+) -> bool {
+    let mut hit = false;
+    for line in lines {
+        let strict = is_limit_hit(line);
+        hit |= strict;
+        note_limit_wording_drift(line, strict, state, session, verb, stderr);
+    }
+    hit
 }
 
 /// Whether a collector window may drive the decision.
@@ -956,6 +974,50 @@ mod tests {
 
         assert!(String::from_utf8(stderr).expect("utf8").is_empty());
         assert!(!state.logs().join("decisions.jsonl").exists());
+    }
+
+    /// What the supervisors actually call: one pass over a batch of tapped
+    /// lines answers the park question and leaves the breadcrumbs, and only
+    /// the strict patterns decide the answer.
+    #[test]
+    fn scanning_a_batch_answers_strictly_and_notes_the_rest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut stderr = Vec::new();
+
+        let loose_only = vec![
+            "building the plan".to_string(),
+            "You've reached your usage limit for this session".to_string(),
+        ];
+        assert!(
+            !scan_for_limit(&loose_only, &state, "sess-1", "loop", &mut stderr),
+            "loose wording must never park a run on its own"
+        );
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.contains("limit-wording-drift"))
+                .count(),
+            1,
+            "one breadcrumb, for the one line that drifted: {log}"
+        );
+
+        let with_strict = vec!["You've hit your weekly limit".to_string()];
+        assert!(scan_for_limit(
+            &with_strict,
+            &state,
+            "sess-1",
+            "loop",
+            &mut stderr
+        ));
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.contains("limit-wording-drift"))
+                .count(),
+            1,
+            "a recognized hit adds no breadcrumb: {log}"
+        );
     }
 
     /// Fake clock: `now` advances by whatever the code sleeps, so a test can

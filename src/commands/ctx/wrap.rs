@@ -205,9 +205,9 @@ pub fn verify_compaction(
     deadline: Instant,
 ) -> CtxResult<bool> {
     while Instant::now() < deadline {
-        if let Some(jsonl) = watcher.read_if_changed()?
+        if let Some(appended) = watcher.read_appended()?
             && adapter
-                .parse_events(&jsonl)
+                .parse_events(&appended.lines)
                 .iter()
                 .any(|event| matches!(event, NormalizedEvent::Compaction))
         {
@@ -1507,7 +1507,7 @@ mod tests {
         .expect("write");
 
         let mut watcher = Watcher::new(path.clone());
-        let _ = watcher.read_if_changed();
+        let _ = watcher.read_appended();
 
         let writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));

@@ -737,6 +737,26 @@ mod tests {
         assert_eq!(parse_events(jsonl), vec![NormalizedEvent::TurnStart]);
     }
 
+    /// The invariant the incremental scoring path rests on (see the
+    /// `parse_events` contract on `AgentAdapter`): this parser is line-local,
+    /// so a transcript cut at newlines and parsed piecewise yields exactly the
+    /// events one parse of the whole file yields.
+    #[test]
+    fn parsing_a_transcript_in_pieces_yields_the_same_events() {
+        let jsonl =
+            std::fs::read_to_string(fixture_path("claude-real-session.jsonl")).expect("fixture");
+        let whole = parse_events(&jsonl);
+        let lines: Vec<&str> = jsonl.lines().collect();
+
+        for chunk in [1, 3, 17] {
+            let pieced: Vec<NormalizedEvent> = lines
+                .chunks(chunk)
+                .flat_map(|piece| parse_events(&format!("{}\n", piece.join("\n"))))
+                .collect();
+            assert_eq!(pieced, whole, "in pieces of {chunk} lines");
+        }
+    }
+
     #[test]
     fn real_fixture_matches_recorded_expectations() {
         let jsonl =
