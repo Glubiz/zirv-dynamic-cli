@@ -978,6 +978,32 @@ mod tests {
         seen
     }
 
+    /// Finds `flag`'s value in a space-joined argv rendering (`stub-tui.sh`
+    /// prints `argv: %s` from `"$*"`), on the assumption the value itself
+    /// has no whitespace -- true for a prompt-file path under a state dir
+    /// that is itself a plain tempdir.
+    #[cfg(unix)]
+    pub(crate) fn flag_value<'a>(seen: &'a str, flag: &str) -> Option<&'a str> {
+        let mut tokens = seen.split_whitespace();
+        while let Some(token) = tokens.next() {
+            if token == flag {
+                return tokens.next();
+            }
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn flag_value_finds_the_token_right_after_the_flag() {
+        let seen = "argv: --append-system-prompt-file /tmp/x/prompts/abc.md\r\nstub-tui ready\r\n";
+        assert_eq!(
+            flag_value(seen, "--append-system-prompt-file"),
+            Some("/tmp/x/prompts/abc.md")
+        );
+        assert_eq!(flag_value(seen, "--session-id"), None);
+    }
+
     #[test]
     fn wrap_needs_a_command() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1037,9 +1063,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_users_own_append_system_prompt_is_merged_not_dropped() {
+        // A real state dir (with no override, this test used to run against
+        // one) is not test-isolated, and on macOS its default path contains
+        // a space ("Application Support"), which breaks whitespace-based
+        // parsing of a prompt-file path out of the stub's echoed argv below.
+        // A tempdir sidesteps both.
+        let state = tempfile::tempdir().expect("tempdir");
         let script = fixture("stub-tui.sh").display().to_string();
         let mut h = spawn_wrap(
-            &[],
+            &[("ZIRV_CTX_STATE_DIR", state.path().display().to_string())],
             &[
                 "sh",
                 &script,
@@ -1054,13 +1086,26 @@ mod tests {
             1,
             "exactly one flag must reach the wrapped agent: {seen:?}"
         );
+
+        // M7: the composed prompt travels either on argv
+        // (--append-system-prompt <text>) or, when the configured agent
+        // binary supports it, in a private file referenced by
+        // --append-system-prompt-file <path>. The invariant under test is
+        // that the user's own instruction survives the merge, not which
+        // mechanism carried it, so read whichever one actually fired.
+        let carried_text = match flag_value(&seen, "--append-system-prompt-file") {
+            Some(path) => {
+                std::fs::read_to_string(path).expect("prompt file referenced on argv is readable")
+            }
+            None => seen.clone(),
+        };
         assert!(
-            seen.contains("always answer in Danish"),
-            "the user's own instruction must survive: {seen:?}"
+            carried_text.contains("always answer in Danish"),
+            "the user's own instruction must survive: {carried_text:?}"
         );
         assert!(
-            seen.contains("zirv session conventions"),
-            "zirv's own layer is still present: {seen:?}"
+            carried_text.contains("zirv session conventions"),
+            "zirv's own layer is still present: {carried_text:?}"
         );
 
         h.writer.write_all(b"/exit\r").expect("write");

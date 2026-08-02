@@ -289,9 +289,17 @@ impl ClaudeAdapter {
 const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Process-wide cache of `probe_system_prompt_file_support`'s answer, keyed
-/// by the exact program invocation. A restart inside the same `wrap`/`exec`
-/// run must not re-spawn `--help` on every relaunch.
-static SYSTEM_PROMPT_FILE_SUPPORT: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+/// by the exact program invocation: the binary path plus its leading
+/// arguments, since `ZIRV_CTX_AGENT_BIN` can point at different binaries (or
+/// different versions of the same name resolved from a different PATH) and
+/// each has its own answer. A restart inside the same `wrap`/`exec` run must
+/// not re-spawn `--help` on every relaunch, which is what the cache is for;
+/// it must not, in exchange, let one binary's probe answer for another's.
+/// A tuple key rather than a joined string: joining `program` and `bin_args`
+/// with spaces makes `("sh /tmp/x", ["--help"])` and `("sh", ["/tmp/x",
+/// "--help"])` collide on the same string despite being different commands.
+type ProbeKey = (PathBuf, Vec<String>);
+static SYSTEM_PROMPT_FILE_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
 
 /// Probes the installed binary's own `--help` text for the file-based
 /// system-prompt flag, so injection can move the composed prompt off argv
@@ -300,10 +308,7 @@ static SYSTEM_PROMPT_FILE_SUPPORT: OnceLock<Mutex<HashMap<String, bool>>> = Once
 /// timeout, whatever) is read as unsupported: this is a hardening on top of
 /// argv delivery, never a new way to fail a launch.
 fn probe_system_prompt_file_support(program: &str, bin_args: &[String]) -> bool {
-    let key: String = std::iter::once(program)
-        .chain(bin_args.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let key = (PathBuf::from(program), bin_args.to_vec());
     let cache = SYSTEM_PROMPT_FILE_SUPPORT.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(mut map) = cache.lock() else {
         return false;
@@ -1213,6 +1218,40 @@ mod tests {
         assert!(
             adapter.supports_system_prompt_file(),
             "the first probe's answer is cached for the life of the process"
+        );
+    }
+
+    /// Regression: the cache used to be keyed by joining `program` and
+    /// `bin_args` into one string, which made two distinct commands collide
+    /// on the same key (e.g. `("sh /a", ["--help"])` and `("sh", ["/a",
+    /// "--help"])` both joined to `"sh /a --help"`). Same `program` ("sh"),
+    /// different `bin_args` (two different scripts, one supporting the flag
+    /// and one not) must be cached independently, not share one answer.
+    #[cfg(unix)]
+    #[test]
+    fn the_cache_key_distinguishes_different_bin_args_for_the_same_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supports = dir.path().join("supports.sh");
+        std::fs::write(
+            &supports,
+            "#!/bin/sh\ncat <<'EOF'\n--append-system-prompt-file\nEOF\n",
+        )
+        .expect("write");
+        let unsupported = dir.path().join("unsupported.sh");
+        std::fs::write(&unsupported, "#!/bin/sh\ncat <<'EOF'\nnothing here\nEOF\n").expect("write");
+        for script in [&supports, &unsupported] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        assert!(
+            probe_system_prompt_file_support("sh", &[supports.display().to_string()]),
+            "the supporting script's own answer must not be shadowed by the other's"
+        );
+        assert!(
+            !probe_system_prompt_file_support("sh", &[unsupported.display().to_string()]),
+            "the non-supporting script must get its own answer, not the cached true from above"
         );
     }
 
