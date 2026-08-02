@@ -14,6 +14,7 @@ pub struct Script {
     /// Optional list of secret definitions.
     pub secrets: Option<Vec<Secret>>,
     /// A list of commands to execute.
+    #[serde(deserialize_with = "super::command_types::deserialize_steps")]
     pub commands: Vec<CommandTypes>,
 }
 

@@ -426,13 +426,20 @@ pub fn run_with<W: Write>(
     // undetected command with no explicit `--agent` fails loudly here,
     // before the terminal is ever touched, instead of running silently
     // unsupervised.
-    if agent_name.is_none()
+    //
+    // `--no-supervise` and `--simple` are exempt: both promise pure
+    // passthrough, neither injects anything or types into the child, so there
+    // is nothing left for a wrong guess to get wrong.
+    let passthrough_only = args.no_supervise || args.simple;
+    if !passthrough_only
+        && agent_name.is_none()
         && !adapters::command_matches_adapter(adapter.as_ref(), false, &args.command)
     {
         let program = args.command.first().map(String::as_str).unwrap_or("");
         return Err(format!(
             "zirv ctx wrap: could not tell which agent '{program}' is; pass --agent claude \
-             (or your agent's name), or run this command unwrapped"
+             (or your agent's name), run it with --no-supervise for pure passthrough, \
+             or run this command unwrapped"
         )
         .into());
     }
@@ -440,11 +447,16 @@ pub fn run_with<W: Write>(
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = super::event::SessionId::new_v4();
 
-    // `--no-supervise` promises pure passthrough (its own help text says so).
-    // The other reason this used to compose nothing -- a wrapped command
-    // that matches no adapter -- can no longer reach this line: the gate
-    // above already sent that case home with an actionable error.
-    let skip_injection = args.simple || args.no_supervise;
+    // `--no-supervise` promises pure passthrough (its own help text says so),
+    // and so does a wrapped command that matches no adapter: injecting this
+    // adapter's flags into a program that may not be it would leak them into
+    // its output.
+    let skip_injection = passthrough_only
+        || !adapters::command_matches_adapter(
+            adapter.as_ref(),
+            agent_name.is_some(),
+            &args.command,
+        );
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
@@ -1190,6 +1202,30 @@ mod tests {
             0,
             "an unresolvable agent must fail, not run unsupervised"
         );
+    }
+
+    /// `--no-supervise` promises pure passthrough in its own help text: no
+    /// scoring, no injection, nothing ever typed into the child. The M5 gate
+    /// ran ahead of that decision, so it refused invocations where there was
+    /// nothing left for a wrong guess to get wrong -- including the wrapper
+    /// scripts around claude that the README's alias recipe encourages.
+    #[cfg(unix)]
+    #[test]
+    fn no_supervise_passes_an_undetected_command_through_instead_of_refusing() {
+        let mut h = spawn_wrap_with_flags(&[], &["--no-supervise"], &["echo", "hello"]);
+
+        let seen = read_until(&mut h.reader, "hello", Duration::from_secs(5));
+        assert!(
+            seen.contains("hello"),
+            "pure passthrough must actually run the command: {seen:?}"
+        );
+        assert!(
+            !seen.contains("--agent"),
+            "and must not refuse it: {seen:?}"
+        );
+
+        let status = h.child.wait().expect("wait");
+        assert_eq!(status.exit_code(), 0);
     }
 
     #[cfg(unix)]

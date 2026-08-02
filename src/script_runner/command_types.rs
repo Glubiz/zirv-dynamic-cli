@@ -3,14 +3,76 @@ use std::process::Command as StdCommand;
 use super::agent_command::AgentCommand;
 use super::command::Command;
 use hashbrown::HashMap;
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 pub enum CommandTypes {
     Command(Command),
     Commands(Vec<Command>),
     Agent(AgentCommand),
+}
+
+/// Steps are dispatched on the key that names their kind, not by serde's
+/// untagged fallback. Untagged reports only "data did not match any variant of
+/// untagged enum CommandTypes", which names neither the key that was missing
+/// nor the one that was misspelled, and silently picks the first variant that
+/// happens to fit -- so a step carrying both `command` and `agent` ran as a
+/// shell command and threw the agent half away.
+impl CommandTypes {
+    fn from_value(value: serde_yaml_ng::Value) -> Result<Self, String> {
+        let describe = |e: serde_yaml_ng::Error| e.to_string();
+
+        if value.is_sequence() {
+            return serde_yaml_ng::from_value(value)
+                .map(CommandTypes::Commands)
+                .map_err(describe);
+        }
+        let Some(map) = value.as_mapping() else {
+            return Err("expected a mapping with 'command' or 'agent', \
+                        or a list of shell commands"
+                .to_string());
+        };
+
+        let has = |key: &str| map.contains_key(serde_yaml_ng::Value::String(key.to_string()));
+        match (has("command"), has("agent")) {
+            (true, true) => Err("has both 'command' and 'agent'; a step is either a shell \
+                                 command or an agent step, not both"
+                .to_string()),
+            (true, false) => serde_yaml_ng::from_value(value)
+                .map(CommandTypes::Command)
+                .map_err(describe),
+            (false, true) => serde_yaml_ng::from_value(value)
+                .map(CommandTypes::Agent)
+                .map_err(describe),
+            (false, false) => Err("needs either 'command' (a shell command) or 'agent' \
+                                   together with 'prompt' (an agent step)"
+                .to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandTypes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_yaml_ng::Value::deserialize(deserializer)?;
+        Self::from_value(value).map_err(de::Error::custom)
+    }
+}
+
+/// A step does not know its own position, so the list is what names it. Worth
+/// the wrapper: "step 3" is the difference between a fixable error and a hunt.
+pub fn deserialize_steps<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<CommandTypes>, D::Error> {
+    let raw = Vec::<serde_yaml_ng::Value>::deserialize(deserializer)?;
+    raw.into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            CommandTypes::from_value(value)
+                .map_err(|e| de::Error::custom(format!("step {}: {e}", index + 1)))
+        })
+        .collect()
 }
 
 impl CommandTypes {
@@ -223,6 +285,56 @@ commands:
             }
             other => panic!("expected Agent, got {other:?}"),
         }
+    }
+
+    fn parse_error(yaml: &str) -> String {
+        serde_yaml_ng::from_str::<crate::script_runner::script::Script>(yaml)
+            .expect_err("must not parse")
+            .to_string()
+    }
+
+    /// The untagged enum picked `Command` first and threw the agent half away
+    /// in silence, so converting a step and forgetting to delete `command:`
+    /// ran the old shell command instead.
+    #[test]
+    fn a_step_that_is_both_a_command_and_an_agent_is_rejected_by_name() {
+        let message = parse_error(
+            "name: t\ncommands:\n  - command: echo hello\n    agent: claude\n    prompt: go\n",
+        );
+        assert!(message.contains("step 1"), "names the step: {message}");
+        assert!(message.contains("'command'"), "{message}");
+        assert!(message.contains("'agent'"), "{message}");
+    }
+
+    /// Untagged reported only "data did not match any variant", which named
+    /// neither the key that was misspelled nor the one that was missing.
+    #[test]
+    fn a_step_naming_no_kind_at_all_says_what_it_needed() {
+        let message = parse_error("name: t\ncommands:\n  - agnet: claude\n    prompt: go\n");
+        assert!(message.contains("step 1"), "{message}");
+        assert!(
+            message.contains("'command'") && message.contains("'agent'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_missing_prompt_names_the_field_and_the_step() {
+        let message = parse_error("name: t\ncommands:\n  - command: ok\n  - agent: claude\n");
+        assert!(message.contains("step 2"), "names the step: {message}");
+        assert!(message.contains("prompt"), "names the field: {message}");
+    }
+
+    /// The dispatch reads a self-describing value, so the other supported
+    /// script formats have to keep working.
+    #[test]
+    fn dispatch_still_reads_json_scripts() {
+        let json = r#"{"name":"t","commands":[{"command":"echo hi"},
+                       {"agent":"claude","prompt":"go"}]}"#;
+        let script: crate::script_runner::script::Script =
+            serde_json::from_str(json).expect("valid json script");
+        assert!(matches!(script.commands[0], CommandTypes::Command(_)));
+        assert!(matches!(script.commands[1], CommandTypes::Agent(_)));
     }
 
     #[test]

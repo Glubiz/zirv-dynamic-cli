@@ -96,6 +96,13 @@ fn nested_claude_files(repo: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // `is_dir` follows symlinks, so a link in the checkout would walk
+            // this out of the repository entirely -- and everything found that
+            // way is read into the report and shipped to the model. Whatever a
+            // link points at is not this repository's configuration.
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
             if !path.is_dir() {
                 continue;
             }
@@ -1578,6 +1585,26 @@ mod tests {
         std::fs::write(repo.join(".claude/settings.local.json"), "{}\n").expect("write");
 
         (tmp, home, repo)
+    }
+
+    /// `is_dir` follows symlinks, so a link in the checkout walked the scan
+    /// out of the repository -- and everything it found was printed in the
+    /// report and embedded in the prompt sent to the agent.
+    #[cfg(unix)]
+    #[test]
+    fn the_nested_scan_does_not_follow_a_symlink_out_of_the_repo() {
+        let (tmp, home, repo) = fixture_tree();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::fs::write(outside.join("CLAUDE.md"), "# private notes\n").expect("write");
+        std::os::unix::fs::symlink(&outside, repo.join("linked")).expect("symlink");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+
+        assert!(
+            surfaces.iter().all(|s| !s.text.contains("private notes")),
+            "a symlinked directory is not this repository's configuration"
+        );
     }
 
     #[test]

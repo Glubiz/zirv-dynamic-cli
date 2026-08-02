@@ -70,13 +70,18 @@ pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(unix)]
 pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `mode` applies only when the file is created, so writing over one that
+    // already exists would leave whatever permissions it had -- an operator
+    // who ran `touch report.md` first would get a world-readable report. Fail
+    // rather than write private content somewhere that cannot be made private.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(contents.as_bytes())
 }
 
@@ -182,6 +187,26 @@ mod tests {
         assert!(state.handoffs().is_dir());
         assert!(state.sockets().is_dir());
         assert!(state.logs().is_dir());
+    }
+
+    /// M6 only held for files zirv created. Writing over one that already
+    /// existed kept whatever permissions it had, so `--out` onto a path the
+    /// operator had touched first produced a world-readable report full of
+    /// transcript excerpts.
+    #[cfg(unix)]
+    #[test]
+    fn writing_over_an_existing_file_still_makes_it_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("report.md");
+        std::fs::write(&path, "placeholder").expect("pre-create");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        write_private(&path, "secrets").expect("write");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "an existing file is made private too");
     }
 
     #[test]
