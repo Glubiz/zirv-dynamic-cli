@@ -47,9 +47,11 @@ pub struct ExecArgs {
     pub simple: bool,
 }
 
-/// Finds the prompt in a headless agent command. Returns `None` rather than
-/// guessing: a restart with the wrong prompt is worse than no restart.
-pub fn extract_prompt(command: &[String]) -> Option<String> {
+/// Finds the flag (or subcommand) that carries the prompt in a headless agent
+/// command, along with its own index. Shared by `extract_prompt` (which only
+/// wants the text) and `extra_launch_flags` (which needs the index to strip
+/// exactly that token pair, not guess which one it was).
+fn locate_prompt(command: &[String]) -> Option<(usize, String)> {
     for (index, arg) in command.iter().enumerate().skip(1) {
         let is_prompt_flag = arg == "-p" || arg == "--print";
         let is_subcommand = arg == "exec";
@@ -60,9 +62,41 @@ pub fn extract_prompt(command: &[String]) -> Option<String> {
         if next.starts_with('-') {
             return None;
         }
-        return Some(next.clone());
+        return Some((index, next.clone()));
     }
     None
+}
+
+/// Finds the prompt in a headless agent command. Returns `None` rather than
+/// guessing: a restart with the wrong prompt is worse than no restart.
+pub fn extract_prompt(command: &[String]) -> Option<String> {
+    locate_prompt(command).map(|(_, prompt)| prompt)
+}
+
+/// M8: the user's own flags from the original `--` command, with only what
+/// zirv itself re-supplies on every restart removed: the prompt (it changes
+/// to carry a handoff each time) and `--session-id` (it changes to the new
+/// session's own id). Everything else the operator passed -- `--model`,
+/// `--allowedTools`, anything at all -- must reach a restarted child exactly
+/// as it reached the first one; silently dropping it here was the asymmetry
+/// this fixes (zirv's own added flags, e.g. the system prompt, always
+/// survived a restart; the operator's own did not).
+pub fn extra_launch_flags(command: &[String]) -> Vec<String> {
+    let prompt_at = locate_prompt(command).map(|(index, _)| index);
+    let mut out = Vec::with_capacity(command.len());
+    let mut skip_next = false;
+    for (index, arg) in command.iter().enumerate().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if Some(index) == prompt_at || arg == "--session-id" {
+            skip_next = true;
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
 }
 
 /// Compaction of a headless run is pointless (there is no TUI to type into), so
@@ -113,13 +147,28 @@ pub fn run_with<W: Write>(
     // than letting `prompt_args` silently override it below.
     let (launch_command, composed) =
         super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed);
-    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
 
+    // The user's own flags from the original `--` command (anything beyond
+    // the prompt and `--session-id`, both of which every restart regenerates
+    // fresh): see `extra_launch_flags`. M8: a restart used to rebuild the
+    // command from scratch with only zirv's own added flags, silently
+    // dropping these.
+    let user_extra = extra_launch_flags(&launch_command);
+
+    // Determined before `prompt_args` (M7 needs a session id to name the
+    // private prompt file after) rather than after, as this used to be.
     let session_raw = args
         .session_id
         .clone()
         .unwrap_or_else(|| SessionId::new_v4().to_string());
     let mut session = SessionId::parse(&session_raw);
+
+    let prompt_args = super::prompt::injection_args_for_session(
+        adapter.as_ref(),
+        composed.as_ref(),
+        &state,
+        session.as_str(),
+    );
     super::prompt::log_injection(
         &state,
         "exec",
@@ -147,6 +196,16 @@ pub fn run_with<W: Write>(
         .prompt
         .clone()
         .or_else(|| extract_prompt(&args.command));
+    // Surfaced once, upfront, rather than only when a restart is already
+    // needed: an operator who never rots would otherwise never learn that
+    // rotting is a dead end for this invocation until it actually happens.
+    if prompt.is_none() {
+        writeln!(
+            w,
+            "zirv ctx exec: no prompt could be found in the command; restarts and usage-limit \
+             parking will be unavailable for this run. Pass --prompt to enable them."
+        )?;
+    }
     let max_restarts = args.max_restarts.unwrap_or(cfg.supervise.max_restarts);
     let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(cfg.supervise.max_cycle_secs));
     let poll = Duration::from_millis(cfg.supervise.poll_ms);
@@ -288,7 +347,24 @@ pub fn run_with<W: Write>(
             // A park is not a restart: the budget is for rot, not for waiting.
             session = SessionId::new_v4();
             transcript = derive_transcript(&session);
-            command = adapter.headless_cmd(&prompt_text, &session, &prompt_args);
+            // M2: a park mints a new session id, just like a restart, so the
+            // injection attribution is re-logged under it rather than only
+            // ever naming the first session this run started with.
+            super::prompt::log_injection(
+                &state,
+                "exec",
+                session.as_str(),
+                composed.as_ref(),
+                adapter.capabilities().system_prompt,
+            );
+            // M8: the user's own extra flags survive the relaunch too, not
+            // just zirv's own (the system prompt args).
+            let extra: Vec<String> = user_extra
+                .iter()
+                .cloned()
+                .chain(prompt_args.iter().cloned())
+                .collect();
+            command = adapter.headless_cmd(&prompt_text, &session, &extra);
             command.current_dir(repo);
             for (key, value) in turn_env_for(&session) {
                 command.env(key, value);
@@ -388,8 +464,25 @@ pub fn run_with<W: Write>(
         // The new session writes somewhere new, so the next iteration's watcher
         // must follow it rather than the file the killed child left behind.
         transcript = derive_transcript(&session);
+        // M2: README promises injection attribution "at every session
+        // start"; a restart mints a new session id, so it needs its own
+        // log entry rather than leaving attribution pinned to the first one.
+        super::prompt::log_injection(
+            &state,
+            "exec",
+            session.as_str(),
+            composed.as_ref(),
+            adapter.capabilities().system_prompt,
+        );
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
-        command = adapter.headless_cmd(&combined, &session, &prompt_args);
+        // M8: the user's own extra flags survive the restart too, not just
+        // zirv's own (the system prompt args) -- this used to be asymmetric.
+        let extra: Vec<String> = user_extra
+            .iter()
+            .cloned()
+            .chain(prompt_args.iter().cloned())
+            .collect();
+        command = adapter.headless_cmd(&combined, &session, &extra);
         command.current_dir(repo);
         for (key, value) in turn_env_for(&session) {
             command.env(key, value);
@@ -535,6 +628,51 @@ mod tests {
             None
         );
         assert_eq!(extract_prompt(&[]), None);
+    }
+
+    /// M8: only the prompt and `--session-id` (both regenerated fresh on
+    /// every restart) are stripped; everything else the operator passed
+    /// survives.
+    #[test]
+    fn extra_launch_flags_strips_only_the_prompt_and_session_id() {
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "fix the bug".to_string(),
+            "--session-id".to_string(),
+            "x".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    #[test]
+    fn extra_launch_flags_is_empty_when_the_command_is_only_prompt_and_session_id() {
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "fix the bug".to_string(),
+            "--session-id".to_string(),
+            "x".to_string(),
+        ];
+        assert!(extra_launch_flags(&cmd).is_empty());
+    }
+
+    #[test]
+    fn extra_launch_flags_keeps_everything_when_there_is_no_prompt_or_session_id() {
+        let cmd = vec![
+            "codex".to_string(),
+            "--model".to_string(),
+            "gpt".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd),
+            vec!["--model".to_string(), "gpt".to_string()]
+        );
     }
 
     #[test]
@@ -787,6 +925,53 @@ mod tests {
         assert!(
             text.contains("cannot restart"),
             "say why supervision stood down: {text}"
+        );
+    }
+
+    /// The old warning about a missing prompt only ever surfaced once a
+    /// restart was already needed (see `a_run_with_no_discoverable_prompt_
+    /// refuses_to_restart` above), so a healthy run that never rots gave the
+    /// operator no signal at all that restarts were a dead end for this
+    /// invocation. It must appear upfront, regardless of whether the run
+    /// ever actually needs to restart.
+    #[test]
+    fn an_upfront_warning_appears_even_when_the_run_never_needs_to_restart() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let session = "eeeeeeee-2222-4333-8444-555555555555";
+        let env = base_env(&tmp.path().join("state"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let mut command = fake_agent_command(session);
+        command.retain(|a| a != "-p" && a != "do the work");
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: None,
+            max_restarts: Some(2),
+            timeout_secs: Some(60),
+            simple: false,
+            command,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "a healthy run that never rots must still succeed"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("--prompt") && text.to_lowercase().contains("restart"),
+            "an upfront warning must appear even though this run never needed to restart: {text}"
         );
     }
 
@@ -1187,6 +1372,132 @@ mod tests {
         assert!(
             argv.contains("--append-system-prompt"),
             "the restarted child must carry the prompt too: {argv}"
+        );
+    }
+
+    /// M8: a restart used to rebuild the headless command from scratch with
+    /// only zirv's own added flags (the system prompt), silently dropping any
+    /// extra flag the operator themselves had passed after `--`. Only lines
+    /// carrying `--session-id` are real agent invocations (a `--help` probe,
+    /// if any ran, never gets one), so filtering on it keeps this assertion
+    /// meaningful regardless of what else shares the log.
+    #[test]
+    fn a_restart_preserves_the_users_own_extra_flags_not_just_zirvs() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session = "12121212-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut command = fake_agent_command(session);
+        command.push("--zzz-custom-flag".to_string());
+        command.push("custom-value".to_string());
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            timeout_secs: Some(60),
+            simple: false,
+            command,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        let invocations: Vec<&str> = argv
+            .lines()
+            .filter(|line| line.contains("--session-id"))
+            .collect();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "one real invocation per child: {argv:?}"
+        );
+        for line in &invocations {
+            assert!(
+                line.contains("--zzz-custom-flag") && line.contains("custom-value"),
+                "the user's own extra flag must survive every restart, not just the first spawn: {argv}"
+            );
+        }
+    }
+
+    /// M2: README promises that "whether a prompt was injected, and from
+    /// which layers, is recorded in the decision log at every session
+    /// start". A restart mints a new session id, so its own attribution
+    /// entry must be logged under that id too, not only the first session's.
+    #[test]
+    fn injection_is_logged_again_for_each_restarts_own_session_id() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "ffffffff-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        let injected_sessions: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("\"action\":\"prompt-injected\""))
+            .filter_map(|l| {
+                let key = "\"session\":\"";
+                let start = l.find(key)? + key.len();
+                let end = l[start..].find('"')? + start;
+                Some(&l[start..end])
+            })
+            .collect();
+        assert_eq!(
+            injected_sessions.len(),
+            2,
+            "one attribution entry per actual session id, including the restart: {log}"
+        );
+        assert_ne!(
+            injected_sessions[0], injected_sessions[1],
+            "the restart mints a new session id and must be logged under it: {log}"
         );
     }
 

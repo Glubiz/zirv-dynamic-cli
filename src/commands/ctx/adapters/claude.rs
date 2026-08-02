@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -227,6 +231,8 @@ pub struct ClaudeAdapter {
     program: String,
     bin_args: Vec<String>,
     home: Option<PathBuf>,
+    #[cfg(test)]
+    forced_file_support: Option<bool>,
 }
 
 impl ClaudeAdapter {
@@ -241,6 +247,8 @@ impl ClaudeAdapter {
             program,
             bin_args: parts.collect(),
             home: None,
+            #[cfg(test)]
+            forced_file_support: None,
         }
     }
 
@@ -248,6 +256,15 @@ impl ClaudeAdapter {
     #[cfg(test)]
     pub fn with_home(mut self, home: PathBuf) -> Self {
         self.home = Some(home);
+        self
+    }
+
+    /// Test seam: bypasses the real `--help` probe so a unit test can force
+    /// file-based or argv-based delivery without depending on the machine's
+    /// installed binary.
+    #[cfg(test)]
+    pub fn with_file_support_forced(mut self, supported: bool) -> Self {
+        self.forced_file_support = Some(supported);
         self
     }
 
@@ -265,6 +282,92 @@ impl ClaudeAdapter {
             .or_else(|| crate::utils::home_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
     }
+}
+
+/// Bounds the `--help` probe below: a hang here must never hang the whole
+/// launch, which would be a worse failure mode than falling back to argv.
+const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Process-wide cache of `probe_system_prompt_file_support`'s answer, keyed
+/// by the exact program invocation. A restart inside the same `wrap`/`exec`
+/// run must not re-spawn `--help` on every relaunch.
+static SYSTEM_PROMPT_FILE_SUPPORT: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+
+/// Probes the installed binary's own `--help` text for the file-based
+/// system-prompt flag, so injection can move the composed prompt off argv
+/// (visible to any other user on the machine via `ps`) without hard-coding a
+/// version cutoff. Any failure to run or read the probe (binary missing,
+/// timeout, whatever) is read as unsupported: this is a hardening on top of
+/// argv delivery, never a new way to fail a launch.
+fn probe_system_prompt_file_support(program: &str, bin_args: &[String]) -> bool {
+    let key: String = std::iter::once(program)
+        .chain(bin_args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cache = SYSTEM_PROMPT_FILE_SUPPORT.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = cache.lock() else {
+        return false;
+    };
+    if let Some(cached) = map.get(&key) {
+        return *cached;
+    }
+    let detected = detect_help_flag(program, bin_args);
+    map.insert(key, detected);
+    detected
+}
+
+/// Verified against the real CLI (`claude --help`, v2.1.220): the flag is not
+/// spelled out on its own line. It only appears folded into a shorthand,
+/// `--append-system-prompt[-file]`, inside the `--bare` option's own
+/// description ("Explicitly provide context via: --system-prompt[-file],
+/// --append-system-prompt[-file], --add-dir ..."). Stripping `[` and `]`
+/// before searching turns that shorthand into the plain flag text, and is a
+/// no-op if some future help output ever spells the flag out on its own.
+fn normalizes_to_advertise_the_file_flag(help_text: &str) -> bool {
+    help_text
+        .replace(['[', ']'], "")
+        .contains("--append-system-prompt-file")
+}
+
+/// Runs `program --help` and reports whether its output names
+/// `--append-system-prompt-file`. Stdin is nulled so an interactive TUI that
+/// does not special-case `--help` (and just starts reading a line) gets an
+/// immediate EOF instead of hanging the probe; stdout is drained on a
+/// separate thread so a chatty `--help` cannot deadlock against the wait
+/// loop by filling the pipe buffer.
+fn detect_help_flag(program: &str, bin_args: &[String]) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(bin_args)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let mut stdout_pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let deadline = Instant::now() + HELP_PROBE_TIMEOUT;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+            return normalizes_to_advertise_the_file_flag(&text);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 /// Claude stores transcripts under a slug of the cwd with every character
@@ -327,6 +430,18 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn user_system_prompt_flag(&self) -> Option<&'static str> {
         Some("--append-system-prompt")
+    }
+
+    fn system_prompt_file_flag(&self) -> Option<&'static str> {
+        Some("--append-system-prompt-file")
+    }
+
+    fn supports_system_prompt_file(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_file_support {
+            return forced;
+        }
+        probe_system_prompt_file_support(&self.program, &self.bin_args)
     }
 
     /// The distillation prompt is piped to stdin so a long transcript tail
@@ -986,6 +1101,119 @@ mod tests {
     #[test]
     fn claude_advertises_the_capability() {
         assert!(ClaudeAdapter::new(None).capabilities().system_prompt);
+    }
+
+    #[test]
+    fn the_file_flag_name_is_the_documented_one() {
+        assert_eq!(
+            ClaudeAdapter::new(None).system_prompt_file_flag(),
+            Some("--append-system-prompt-file")
+        );
+    }
+
+    /// Writes a throwaway `--help` stub so the probe can be exercised without
+    /// depending on the machine's actual installed binary. The heredoc keeps
+    /// `help_text` free of shell-escaping concerns.
+    fn help_stub(dir: &std::path::Path, name: &str, help_text: &str) -> String {
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat <<'EOF'\n{help_text}\nEOF\n"),
+        )
+        .expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        format!("sh {}", script.display())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supports_system_prompt_file_detects_the_flag_from_help_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = help_stub(
+            dir.path(),
+            "probe-yes.sh",
+            "Options:\n  --append-system-prompt-file <path>",
+        );
+        let adapter = ClaudeAdapter::new(Some(&bin));
+        assert!(adapter.supports_system_prompt_file());
+    }
+
+    /// Verified against the real CLI (`claude --help`, v2.1.220): the flag is
+    /// never spelled out on its own; it only appears folded into this exact
+    /// shorthand, inside the `--bare` option's own description. A probe that
+    /// only looked for the plain flag text would report "unsupported" on the
+    /// very machine this was verified on.
+    #[cfg(unix)]
+    #[test]
+    fn supports_system_prompt_file_detects_the_real_clis_bracket_shorthand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = help_stub(
+            dir.path(),
+            "probe-bracket.sh",
+            "Explicitly provide context via: --system-prompt[-file],\n  \
+             --append-system-prompt[-file], --add-dir (CLAUDE.md dirs)",
+        );
+        let adapter = ClaudeAdapter::new(Some(&bin));
+        assert!(
+            adapter.supports_system_prompt_file(),
+            "must recognize the bracket-shorthand form the real CLI actually uses"
+        );
+    }
+
+    #[test]
+    fn normalizes_to_advertise_the_file_flag_matches_both_spellings() {
+        assert!(normalizes_to_advertise_the_file_flag(
+            "--append-system-prompt[-file] <path>"
+        ));
+        assert!(normalizes_to_advertise_the_file_flag(
+            "--append-system-prompt-file <path>"
+        ));
+        assert!(!normalizes_to_advertise_the_file_flag(
+            "--append-system-prompt <prompt>"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supports_system_prompt_file_is_false_when_help_omits_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = help_stub(dir.path(), "probe-no.sh", "nothing relevant here");
+        let adapter = ClaudeAdapter::new(Some(&bin));
+        assert!(!adapter.supports_system_prompt_file());
+    }
+
+    #[test]
+    fn supports_system_prompt_file_fails_open_when_the_binary_is_missing() {
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/definitely-not-a-binary"));
+        assert!(
+            !adapter.supports_system_prompt_file(),
+            "a probe failure must never block a launch"
+        );
+    }
+
+    /// M7: "probe... once per launch (cache the result in-process across
+    /// restarts)". Rewriting the stub after the first probe must not change
+    /// the cached answer: a restart inside the same run must never re-spawn
+    /// `--help`.
+    #[cfg(unix)]
+    #[test]
+    fn supports_system_prompt_file_is_cached_after_the_first_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = help_stub(dir.path(), "probe-cache.sh", "--append-system-prompt-file");
+        let adapter = ClaudeAdapter::new(Some(&bin));
+        assert!(adapter.supports_system_prompt_file());
+
+        let script = dir.path().join("probe-cache.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'nothing now\\n'\n").expect("rewrite stub");
+        assert!(
+            adapter.supports_system_prompt_file(),
+            "the first probe's answer is cached for the life of the process"
+        );
     }
 
     #[test]
