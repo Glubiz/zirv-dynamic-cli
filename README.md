@@ -230,6 +230,33 @@ commands:
     - command: "cargo run"
 ```
 
+### Agent Steps
+A command step can run a supervised AI-agent task instead of a shell command,
+using `agent` and `prompt` in place of `command`:
+
+```yaml
+commands:
+  - command: cargo test
+  - agent: claude
+    prompt: "Fix the failing tests in ${dir}"
+    # optional:
+    flags: ["--model", "sonnet"]
+  - command: cargo test
+```
+
+`prompt` gets the same `${var}` substitution as `command`, including the
+unresolved-placeholder error if a variable is missing. `flags` are passed
+straight through to the agent CLI. `operating_system`, `proceed_on_failure`,
+`delay_ms` and `fallback` work the same as they do for a regular command;
+`capture` and `interactive` are not supported and fail the step if set.
+
+The step runs in-process through the same supervision `zirv ctx exec` uses:
+pacing against your usage windows, rot detection, and automatic restart with a
+distilled handoff if the session rots. A non-zero outcome fails the step like
+any other command. Only Claude Code is supported today (see [Context
+Management](#context-management-zirv-ctx) below); naming any other agent fails
+with that adapter's own error.
+
 ## Configuration
 ### Directory Structure
 The `.zirv/` directory contains your scripts and a configuration file. The structure is as follows:

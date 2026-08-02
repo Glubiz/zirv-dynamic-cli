@@ -58,6 +58,7 @@ impl Script {
 
 #[cfg(test)]
 mod tests {
+    use crate::script_runner::agent_command::AgentCommand;
     use crate::script_runner::command::Command;
 
     use super::*;
@@ -161,6 +162,31 @@ mod tests {
 
         let result = script.run(&mut context, false).await;
         assert!(result.is_ok());
+    }
+
+    /// Dry-run must never execute the agent step: `codex` has no ready
+    /// adapter, so a real invocation would error, but a dry run only prints
+    /// the step and must still succeed.
+    #[tokio::test]
+    async fn test_script_dry_run_never_executes_an_agent_step() {
+        let script = Script {
+            name: "Agent Dry Run".to_string(),
+            description: None,
+            params: None,
+            secrets: None,
+            commands: vec![CommandTypes::Agent(AgentCommand {
+                agent: "codex".to_string(),
+                prompt: "do the work".to_string(),
+                flags: None,
+                description: None,
+                options: None,
+                capture: None,
+            })],
+        };
+
+        let mut context = HashMap::new();
+        let result = script.run(&mut context, true).await;
+        assert!(result.is_ok(), "dry run must not execute the agent step");
     }
 
     #[tokio::test]

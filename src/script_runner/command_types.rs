@@ -1,5 +1,6 @@
 use std::process::Command as StdCommand;
 
+use super::agent_command::AgentCommand;
 use super::command::Command;
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub enum CommandTypes {
     Command(Command),
     Commands(Vec<Command>),
+    Agent(AgentCommand),
 }
 
 impl CommandTypes {
@@ -23,6 +25,7 @@ impl CommandTypes {
                     .join(" && ");
                 format!("[multi-shell] {joined}")
             }
+            CommandTypes::Agent(agent) => agent.display(context),
         }
     }
 
@@ -30,6 +33,7 @@ impl CommandTypes {
         match self {
             CommandTypes::Command(cmd) => cmd.description.clone(),
             CommandTypes::Commands(_) => None,
+            CommandTypes::Agent(agent) => agent.description.clone(),
         }
     }
 
@@ -39,6 +43,7 @@ impl CommandTypes {
     ) -> Result<Option<String>, String> {
         match self {
             CommandTypes::Command(cmd) => cmd.execute(context).await,
+            CommandTypes::Agent(agent) => agent.execute(context).await,
             CommandTypes::Commands(cmds) => {
                 if cmds.is_empty() {
                     return Ok(None);
@@ -163,4 +168,68 @@ fn escape_for_applescript(s: &str) -> String {
 
 fn escape_single_quotes(s: &str) -> String {
     s.replace('\'', r#"'\''"#)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_step_parses_from_yaml() {
+        let yaml = r#"
+name: test
+commands:
+  - command: cargo test
+  - agent: claude
+    prompt: "Fix the failing tests in ${dir}"
+    flags: ["--model", "sonnet"]
+  - command: cargo test
+"#;
+        let script: crate::script_runner::script::Script =
+            serde_yaml_ng::from_str(yaml).expect("valid script");
+        assert_eq!(script.commands.len(), 3);
+        assert!(matches!(script.commands[0], CommandTypes::Command(_)));
+        assert!(matches!(script.commands[2], CommandTypes::Command(_)));
+        match &script.commands[1] {
+            CommandTypes::Agent(agent) => {
+                assert_eq!(agent.agent, "claude");
+                assert_eq!(agent.prompt, "Fix the failing tests in ${dir}");
+                assert_eq!(
+                    agent.flags,
+                    Some(vec!["--model".to_string(), "sonnet".to_string()])
+                );
+            }
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_step_display_substitutes_the_prompt() {
+        let step = CommandTypes::Agent(AgentCommand {
+            agent: "claude".to_string(),
+            prompt: "Fix ${dir}".to_string(),
+            flags: None,
+            description: None,
+            options: None,
+            capture: None,
+        });
+        let mut context = HashMap::new();
+        context.insert("dir".to_string(), "/repo".to_string());
+        let text = step.display(&context);
+        assert!(text.contains("claude"), "got {text}");
+        assert!(text.contains("/repo"), "got {text}");
+    }
+
+    #[test]
+    fn agent_step_description_is_read_from_the_step() {
+        let step = CommandTypes::Agent(AgentCommand {
+            agent: "claude".to_string(),
+            prompt: "go".to_string(),
+            flags: None,
+            description: Some("fixes tests".to_string()),
+            options: None,
+            capture: None,
+        });
+        assert_eq!(step.description(), Some("fixes tests".to_string()));
+    }
 }
