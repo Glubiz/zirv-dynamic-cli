@@ -99,6 +99,22 @@ pub fn select(
     Ok(adapter)
 }
 
+/// True when the wrapped command can be trusted to actually be this adapter's
+/// agent: either the operator named it explicitly (`--agent`, or the config's
+/// `agent` key), or detection matched the command's own argv. Neither true
+/// means `select`'s last arm defaulted here with nothing to back it up (an
+/// arbitrary wrapped command that matches no adapter), and injecting this
+/// adapter's own flags (e.g. `--append-system-prompt`) into whatever program
+/// that turns out to be would leak them into its output instead of an agent
+/// that would ever read them.
+pub fn command_matches_adapter(
+    adapter: &dyn AgentAdapter,
+    agent_explicit: bool,
+    command: &[String],
+) -> bool {
+    agent_explicit || adapter.detect(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +156,29 @@ mod tests {
     fn registry_exposes_both_v1_adapters() {
         let names: Vec<&str> = all(None).iter().map(|a| a.name()).collect();
         assert_eq!(names, vec!["claude", "codex"]);
+    }
+
+    /// The gate wrap and exec use before injecting: a command that matches no
+    /// adapter, with no explicit `--agent` to back it, must not be treated as
+    /// a match just because `select` had to default to one.
+    #[test]
+    fn an_undetected_command_with_no_explicit_agent_does_not_match() {
+        let adapter = claude::ClaudeAdapter::new(None);
+        let command = vec!["echo".to_string(), "hello".to_string()];
+        assert!(!command_matches_adapter(&adapter, false, &command));
+    }
+
+    #[test]
+    fn an_explicit_agent_matches_regardless_of_the_command() {
+        let adapter = claude::ClaudeAdapter::new(None);
+        let command = vec!["echo".to_string(), "hello".to_string()];
+        assert!(command_matches_adapter(&adapter, true, &command));
+    }
+
+    #[test]
+    fn a_detected_command_matches_even_without_an_explicit_agent() {
+        let adapter = claude::ClaudeAdapter::new(None);
+        let command = vec!["/opt/homebrew/bin/claude".to_string()];
+        assert!(command_matches_adapter(&adapter, false, &command));
     }
 }

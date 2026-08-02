@@ -404,21 +404,29 @@ pub fn run_with<W: Write>(
     }
 
     let cfg = CtxConfig::load(repo, env)?;
+    let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     // Selection happens here so an unknown or unverified agent fails before the
     // terminal is touched.
-    let adapter = adapters::select(
-        args.agent.as_deref().or(cfg.agent.as_deref()),
-        &args.command,
-        cfg.agent_bin.as_deref(),
-    )?;
+    let adapter = adapters::select(agent_name, &args.command, cfg.agent_bin.as_deref())?;
 
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = super::event::SessionId::new_v4();
 
+    // Two independent reasons to compose nothing: `--no-supervise` promises
+    // pure passthrough (its own help text says so), and a wrapped command that
+    // matches no adapter (no explicit `--agent`, detection came up empty) is
+    // not actually the agent whose flags we would be injecting.
+    let skip_injection = args.simple
+        || args.no_supervise
+        || !adapters::command_matches_adapter(
+            adapter.as_ref(),
+            agent_name.is_some(),
+            &args.command,
+        );
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
-        args.simple,
+        skip_injection,
         &cfg.prompt,
     );
     // The wrapped command's own argv may already carry the adapter's
@@ -870,8 +878,16 @@ mod tests {
         pub child: Box<dyn portable_pty::Child + Send + Sync>,
     }
 
+    /// The general form: `flags` are wrap's own arguments, inserted before the
+    /// `--` separator. `spawn_wrap` below is the common case (`--agent claude`)
+    /// most tests want; this exists for the tests that need to vary wrap's own
+    /// flags (`--no-supervise`, an omitted `--agent`, ...).
     #[cfg(unix)]
-    pub(crate) fn spawn_wrap(extra_env: &[(&str, String)], wrapped: &[&str]) -> Harness {
+    pub(crate) fn spawn_wrap_with_flags(
+        extra_env: &[(&str, String)],
+        flags: &[&str],
+        wrapped: &[&str],
+    ) -> Harness {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -884,8 +900,9 @@ mod tests {
         let mut cmd = CommandBuilder::new(zirv_bin());
         cmd.arg("ctx");
         cmd.arg("wrap");
-        cmd.arg("--agent");
-        cmd.arg("claude");
+        for flag in flags {
+            cmd.arg(flag);
+        }
         cmd.arg("--");
         for arg in wrapped {
             cmd.arg(arg);
@@ -902,6 +919,11 @@ mod tests {
             writer: pair.master.take_writer().expect("writer"),
             child,
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn spawn_wrap(extra_env: &[(&str, String)], wrapped: &[&str]) -> Harness {
+        spawn_wrap_with_flags(extra_env, &["--agent", "claude"], wrapped)
     }
 
     /// Reads until `needle` appears or the timeout expires.
@@ -949,12 +971,15 @@ mod tests {
     /// empty after the merge even though `args.command` itself was not empty
     /// at the top of `run_with`. This must be a returned error, not a panic:
     /// release is `panic = "abort"` and this is a supervisor hot path.
+    /// `--agent claude` is explicit here so the adapter-match gate does not
+    /// also suppress composition: the wrapped "command" is a bare flag pair,
+    /// which detection would never recognize as any adapter's own binary.
     #[test]
     fn a_prompt_flag_that_empties_the_argv_after_merging_is_an_error_not_a_panic() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let args = WrapArgs {
-            agent: None,
-            no_supervise: true,
+            agent: Some("claude".to_string()),
+            no_supervise: false,
             command: vec!["--append-system-prompt".to_string(), "foo".to_string()],
             simple: false,
         };
@@ -1014,6 +1039,68 @@ mod tests {
         h.writer.write_all(b"/exit\r").expect("write");
         h.writer.flush().expect("flush");
         let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let status = h.child.wait().expect("wait");
+        assert_eq!(status.exit_code(), 0);
+    }
+
+    /// Bug (2026-08-02 validation of 2.5.0): `--no-supervise`'s own help text
+    /// promises "no scoring, no injection", but it only turned off scoring;
+    /// the system prompt was still composed and injected. `--no-supervise`
+    /// must skip injection exactly like `--simple` does, including leaving a
+    /// user's own `--append-system-prompt` untouched (nothing left to merge
+    /// it into once nothing is composed).
+    #[cfg(unix)]
+    #[test]
+    fn no_supervise_injects_nothing_and_leaves_the_users_own_flag_untouched() {
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap_with_flags(
+            &[],
+            &["--agent", "claude", "--no-supervise"],
+            &[
+                "sh",
+                &script,
+                "--append-system-prompt",
+                "always answer in Danish",
+            ],
+        );
+
+        let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+        assert_eq!(
+            seen.matches("--append-system-prompt").count(),
+            1,
+            "the user's own flag must pass through untouched: {seen:?}"
+        );
+        assert!(
+            seen.contains("always answer in Danish"),
+            "the user's own instruction is not stripped: {seen:?}"
+        );
+        assert!(
+            !seen.contains("zirv session conventions"),
+            "no-supervise is pure passthrough, no injection: {seen:?}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    /// Bug (same validation pass): with no `--agent` given, `adapters::select`
+    /// falls back to `ClaudeAdapter` when detection finds no match at all, and
+    /// wrap injected that adapter's flags into the wrapped command regardless.
+    /// `echo` is not claude or codex; nothing should be injected into it.
+    #[cfg(unix)]
+    #[test]
+    fn wrapping_a_command_that_matches_no_adapter_injects_nothing() {
+        let mut h = spawn_wrap_with_flags(&[], &[], &["echo", "hello"]);
+
+        let seen = read_until(&mut h.reader, "hello", Duration::from_secs(10));
+        assert!(seen.contains("hello"), "got {seen:?}");
+        assert!(
+            !seen.contains("--append-system-prompt"),
+            "echo was never the selected agent; nothing should be injected: {seen:?}"
+        );
+
         let status = h.child.wait().expect("wait");
         assert_eq!(status.exit_code(), 0);
     }
