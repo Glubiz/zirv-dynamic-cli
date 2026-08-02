@@ -90,7 +90,7 @@ pub fn run_with<W: Write>(
         &cfg.prompt,
     );
     let (user_extra, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed);
+        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
     let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
     let extra: Vec<String> = user_extra
         .into_iter()

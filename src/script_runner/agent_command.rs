@@ -146,13 +146,13 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
     // is what surfaces an adapter's own "not ready" error (e.g. codex) before any
     // supervision starts, and lets the first spawn's argv be built from the exact
     // same `headless_cmd` restarts use.
-    let adapter =
-        adapters::select(Some(agent), &[], cfg.agent_bin.as_deref()).map_err(|e| e.to_string())?;
+    adapters::select(Some(agent), &[], cfg.agent_bin.as_deref()).map_err(|e| e.to_string())?;
 
     let session = SessionId::new_v4();
-    let headless = adapter.headless_cmd(prompt, &session, flags);
-    let command = command_to_argv(&headless);
-
+    // No argv: the prompt travels as data and `run_with` builds the launch
+    // from the adapter, exactly as every relaunch does. Encoding the prompt
+    // into argv here only to have `run_with` parse it back out again is what
+    // let a prompt shaped like a flag be misread as one.
     let args = ExecArgs {
         agent: Some(agent.to_string()),
         session_id: Some(session.as_str().to_string()),
@@ -160,18 +160,12 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
         prompt: Some(prompt.to_string()),
         max_restarts: None,
         timeout_secs: None,
-        command,
+        command: flags.to_vec(),
         simple: false,
     };
 
     let mut out = std::io::stdout();
     exec::run_with(&args, &mut out, repo, &env).map_err(|e| e.to_string())
-}
-
-fn command_to_argv(command: &std::process::Command) -> Vec<String> {
-    let mut argv = vec![command.get_program().to_string_lossy().into_owned()];
-    argv.extend(command.get_args().map(|a| a.to_string_lossy().into_owned()));
-    argv
 }
 
 #[cfg(test)]

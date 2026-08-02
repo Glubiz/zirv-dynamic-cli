@@ -455,7 +455,7 @@ pub fn run_with<W: Write>(
     // system-prompt flag; merge it in rather than letting `prompt_args` below
     // silently override it with a second occurrence.
     let (launch_command, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed);
+        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed, None);
     let prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),
         composed.as_ref(),

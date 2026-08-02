@@ -66,6 +66,16 @@ pub trait AgentAdapter: std::fmt::Debug {
         false
     }
 
+    /// How many leading argv tokens are the program invocation itself rather
+    /// than flags the operator passed. One for a bare binary; more when
+    /// `agent_bin` carries arguments, since `"/usr/bin/env claude"` spends two
+    /// tokens before the first real flag. A relaunch rebuilds the invocation
+    /// from `headless_cmd`, so anything inside this prefix must never be
+    /// carried over as if the operator had asked for it.
+    fn launch_prefix_len(&self) -> usize {
+        1
+    }
+
     fn transcript_path(&self, session: &SessionRef) -> PathBuf;
 
     /// Must be line-local: every line's events depend on that line alone, so

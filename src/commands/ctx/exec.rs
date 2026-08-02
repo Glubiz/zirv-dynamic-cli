@@ -47,22 +47,55 @@ pub struct ExecArgs {
     pub simple: bool,
 }
 
-/// Finds the flag (or subcommand) that carries the prompt in a headless agent
-/// command, along with its own index. Shared by `extract_prompt` (which only
-/// wants the text) and `extra_launch_flags` (which needs the index to strip
-/// exactly that token pair, not guess which one it was).
-fn locate_prompt(command: &[String]) -> Option<(usize, String)> {
-    for (index, arg) in command.iter().enumerate().skip(1) {
+/// Flags that pin a launch to a conversation that already exists. A restart is
+/// a deliberate escape from the session that rotted, so inheriting any of them
+/// would march the fresh child straight back into it and burn the whole
+/// restart budget re-entering rot. The first two carry a value; the rest are
+/// bare.
+const RESUME_FLAGS_WITH_VALUE: [&str; 2] = ["--session-id", "--resume"];
+const RESUME_FLAGS_BARE: [&str; 3] = ["-c", "--continue", "--fork-session"];
+
+/// True for `--resume=abc` when `--resume` is in `flags`: the CLIs accept both
+/// spellings, so stripping only the two-token form leaves the other behind.
+fn is_joined_form(arg: &str, flags: &[&str]) -> bool {
+    arg.split_once('=')
+        .is_some_and(|(name, _)| flags.contains(&name))
+}
+
+/// Locates the token that carries the prompt in a headless agent command, and
+/// the prompt itself when that token is followed by one.
+///
+/// `known` is the prompt zirv already holds for this run (`--prompt`, or an
+/// agent step's own text). Given it, the value is recognised by equality
+/// instead of by shape, which is the only way to tell a prompt that happens to
+/// begin with `-` -- a markdown bullet list, say -- from a genuine second
+/// flag. Without it the shape heuristic still applies, because guessing wrong
+/// about a restart's prompt is worse than not restarting.
+///
+/// The value is `None` for a bare flag: `-p` with another flag after it (or
+/// nothing at all) means the prompt arrives on stdin. The flag itself still
+/// has to be stripped from a restart argv, but the token after it must not be.
+fn locate_prompt(
+    command: &[String],
+    prefix: usize,
+    known: Option<&str>,
+) -> Option<(usize, Option<String>)> {
+    for (index, arg) in command.iter().enumerate().skip(prefix) {
         let is_prompt_flag = arg == "-p" || arg == "--print";
         let is_subcommand = arg == "exec";
         if !is_prompt_flag && !is_subcommand {
             continue;
         }
-        let next = command.get(index + 1)?;
-        if next.starts_with('-') {
-            return None;
+        let Some(next) = command.get(index + 1) else {
+            return Some((index, None));
+        };
+        if Some(next.as_str()) == known {
+            return Some((index, Some(next.clone())));
         }
-        return Some((index, next.clone()));
+        if next.starts_with('-') {
+            return Some((index, None));
+        }
+        return Some((index, Some(next.clone())));
     }
     None
 }
@@ -70,28 +103,64 @@ fn locate_prompt(command: &[String]) -> Option<(usize, String)> {
 /// Finds the prompt in a headless agent command. Returns `None` rather than
 /// guessing: a restart with the wrong prompt is worse than no restart.
 pub fn extract_prompt(command: &[String]) -> Option<String> {
-    locate_prompt(command).map(|(_, prompt)| prompt)
+    locate_prompt(command, 1, None).and_then(|(_, prompt)| prompt)
 }
 
 /// M8: the user's own flags from the original `--` command, with only what
-/// zirv itself re-supplies on every restart removed: the prompt (it changes
-/// to carry a handoff each time) and `--session-id` (it changes to the new
-/// session's own id). Everything else the operator passed -- `--model`,
-/// `--allowedTools`, anything at all -- must reach a restarted child exactly
-/// as it reached the first one; silently dropping it here was the asymmetry
-/// this fixes (zirv's own added flags, e.g. the system prompt, always
-/// survived a restart; the operator's own did not).
-pub fn extra_launch_flags(command: &[String]) -> Vec<String> {
-    let prompt_at = locate_prompt(command).map(|(index, _)| index);
+/// zirv itself re-supplies on every restart removed. Everything else the
+/// operator passed -- `--model`, `--allowedTools`, anything at all -- must
+/// reach a restarted child exactly as it reached the first one; silently
+/// dropping it here was the asymmetry M8 fixed (zirv's own added flags, e.g.
+/// the system prompt, always survived a restart; the operator's own did not).
+///
+/// Three kinds of token are dropped. The prompt, because every relaunch
+/// regenerates it to carry a handoff. Anything pinning the launch to an
+/// existing conversation, because the relaunch is escaping one. And the
+/// leading tokens of the program invocation itself -- `prefix` of them from
+/// the adapter, plus any further positional before the first flag, which is
+/// how `npx claude ...` and a positional prompt both look -- because
+/// `headless_cmd` rebuilds the invocation and re-appending them would leave a
+/// stray argument the agent reads as a second prompt.
+pub fn extra_launch_flags(
+    command: &[String],
+    prefix: usize,
+    known_prompt: Option<&str>,
+) -> Vec<String> {
+    let located = locate_prompt(command, prefix, known_prompt);
+    let prompt_at = located.as_ref().map(|(index, _)| *index);
+    let prompt_takes_value = located.is_some_and(|(_, value)| value.is_some());
+
     let mut out = Vec::with_capacity(command.len());
     let mut skip_next = false;
-    for (index, arg) in command.iter().enumerate().skip(1) {
+    let mut in_prefix = true;
+    for (index, arg) in command.iter().enumerate().skip(prefix) {
         if skip_next {
             skip_next = false;
             continue;
         }
-        if Some(index) == prompt_at || arg == "--session-id" {
-            skip_next = true;
+        if Some(index) == prompt_at {
+            skip_next = prompt_takes_value;
+            in_prefix = false;
+            continue;
+        }
+        if in_prefix && !arg.starts_with('-') {
+            continue;
+        }
+        in_prefix = false;
+
+        if is_joined_form(arg, &RESUME_FLAGS_WITH_VALUE) || is_joined_form(arg, &RESUME_FLAGS_BARE)
+        {
+            continue;
+        }
+        if RESUME_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
+            // A bare `--resume` with a flag after it takes no value, so the
+            // next token belongs to the operator and has to survive.
+            skip_next = command
+                .get(index + 1)
+                .is_some_and(|next| !next.starts_with('-'));
+            continue;
+        }
+        if RESUME_FLAGS_BARE.contains(&arg.as_str()) {
             continue;
         }
         out.push(arg.clone());
@@ -142,18 +211,48 @@ pub fn run_with<W: Write>(
         skip_injection,
         &cfg.prompt,
     );
+    // Known before argv is touched, because it decides how argv is read: the
+    // token holding this exact text is the prompt, whatever it looks like.
+    let prompt = args
+        .prompt
+        .clone()
+        .or_else(|| extract_prompt(&args.command));
+    // An argv that names no program -- empty, or starting with a flag -- is
+    // not a command to pass through: the adapter builds the launch and these
+    // are extra flags for it. That is how an agent step arrives, holding its
+    // prompt as data with no argv to encode it into.
+    let adapter_builds_launch = args
+        .command
+        .first()
+        .is_none_or(|first| first.starts_with('-'));
+    let prefix = if adapter_builds_launch {
+        0
+    } else {
+        adapter.launch_prefix_len()
+    };
+    // The prompt is data, not argv to be interpreted. Protecting its index
+    // keeps a prompt that happens to read like the adapter's own
+    // system-prompt flag from being stripped out of the launch and promoted
+    // into the composed prompt as an operator instruction.
+    let prompt_value_at = locate_prompt(&args.command, prefix, prompt.as_deref())
+        .and_then(|(index, value)| value.map(|_| index + 1));
+
     // The first spawn's own argv may already carry the adapter's system-prompt
     // flag (e.g. `-- claude --append-system-prompt "..."`); merge it in rather
     // than letting `prompt_args` silently override it below.
-    let (launch_command, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed);
+    let (launch_command, composed) = super::prompt::merge_command_line_prompt(
+        adapter.as_ref(),
+        &args.command,
+        composed,
+        prompt_value_at,
+    );
 
     // The user's own flags from the original `--` command (anything beyond
-    // the prompt and `--session-id`, both of which every restart regenerates
-    // fresh): see `extra_launch_flags`. M8: a restart used to rebuild the
-    // command from scratch with only zirv's own added flags, silently
-    // dropping these.
-    let user_extra = extra_launch_flags(&launch_command);
+    // the prompt and the session-pinning flags, all of which every restart
+    // regenerates fresh): see `extra_launch_flags`. M8: a restart used to
+    // rebuild the command from scratch with only zirv's own added flags,
+    // silently dropping these.
+    let user_extra = extra_launch_flags(&launch_command, prefix, prompt.as_deref());
 
     // Determined before `prompt_args` (M7 needs a session id to name the
     // private prompt file after) rather than after, as this used to be.
@@ -192,10 +291,6 @@ pub fn run_with<W: Write>(
         .clone()
         .unwrap_or_else(|| derive_transcript(&session));
 
-    let prompt = args
-        .prompt
-        .clone()
-        .or_else(|| extract_prompt(&args.command));
     // Surfaced once, upfront, rather than only when a restart is already
     // needed: an operator who never rots would otherwise never learn that
     // rotting is a dead end for this invocation until it actually happens.
@@ -250,10 +345,30 @@ pub fn run_with<W: Write>(
             .unwrap_or_default()
     };
 
-    let mut command = build_command(&launch_command, repo)?;
-    for arg in &prompt_args {
-        command.arg(arg);
-    }
+    // With no argv to pass through, the first launch is built exactly the way
+    // every relaunch builds one. That symmetry is the point: a caller holding
+    // the prompt as data never encodes it into argv for this function to
+    // decode again, so it can never be misread as a flag.
+    let mut command = if adapter_builds_launch {
+        let prompt_text = prompt.as_deref().ok_or(
+            "no command to supervise; pass the agent command after --, \
+             or --prompt to have zirv build the launch itself",
+        )?;
+        let extra: Vec<String> = user_extra
+            .iter()
+            .cloned()
+            .chain(prompt_args.iter().cloned())
+            .collect();
+        let mut command = adapter.headless_cmd(prompt_text, &session, &extra);
+        command.current_dir(repo);
+        command
+    } else {
+        let mut command = build_command(&launch_command, repo)?;
+        for arg in &prompt_args {
+            command.arg(arg);
+        }
+        command
+    };
     for (key, value) in turn_env_for(&session) {
         command.env(key, value);
     }
@@ -651,7 +766,7 @@ mod tests {
             "opus".to_string(),
         ];
         assert_eq!(
-            extra_launch_flags(&cmd),
+            extra_launch_flags(&cmd, 1, None),
             vec!["--model".to_string(), "opus".to_string()]
         );
     }
@@ -665,7 +780,112 @@ mod tests {
             "--session-id".to_string(),
             "x".to_string(),
         ];
-        assert!(extra_launch_flags(&cmd).is_empty());
+        assert!(extra_launch_flags(&cmd, 1, None).is_empty());
+    }
+
+    /// A markdown bullet list is an ordinary prompt. Reading it as a flag left
+    /// the `-p` pair in the operator's flags, so every restart passed the
+    /// prompt twice: once with the handoff, once without, and the second one
+    /// won.
+    #[test]
+    fn a_prompt_that_starts_with_a_dash_is_still_stripped_from_the_restart_flags() {
+        let prompt = "- fix the failing tests\n- then run cargo fmt";
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            prompt.to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, Some(prompt)),
+            vec!["--model".to_string(), "opus".to_string()],
+            "the prompt zirv already holds is recognised by value, not by shape"
+        );
+    }
+
+    /// Without the prompt to compare against, a value shaped like a flag still
+    /// reads as one -- but only the flag is dropped, never the token after it,
+    /// which belongs to the operator.
+    #[test]
+    fn a_bare_prompt_flag_drops_itself_and_keeps_what_follows() {
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "--verbose".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, None),
+            vec!["--verbose".to_string()]
+        );
+    }
+
+    /// `headless_cmd` rebuilds the program invocation on every relaunch, so a
+    /// launcher in front of the agent (or a positional prompt) must not come
+    /// back as a stray argument the agent reads as a second prompt.
+    #[test]
+    fn the_program_invocation_is_never_carried_into_the_restart_flags() {
+        let via_npx = vec![
+            "npx".to_string(),
+            "claude".to_string(),
+            "-p".to_string(),
+            "task".to_string(),
+        ];
+        assert!(
+            extra_launch_flags(&via_npx, 1, Some("task")).is_empty(),
+            "the launcher's own argument is part of the invocation, not a flag"
+        );
+
+        // `agent_bin = "/usr/bin/env claude"`: the adapter reports a prefix of
+        // two, because that is how many tokens it spends before the flags.
+        let via_env = vec![
+            "/usr/bin/env".to_string(),
+            "claude".to_string(),
+            "-p".to_string(),
+            "task".to_string(),
+        ];
+        assert!(extra_launch_flags(&via_env, 2, Some("task")).is_empty());
+
+        let positional = vec!["claude".to_string(), "task".to_string()];
+        assert!(extra_launch_flags(&positional, 1, Some("task")).is_empty());
+    }
+
+    /// A restart exists to escape the conversation that rotted. Every spelling
+    /// that would pin it back to that conversation has to go.
+    #[test]
+    fn nothing_that_pins_the_launch_to_the_dead_session_survives_a_restart() {
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "task".to_string(),
+            "--session-id=OLD".to_string(),
+            "--continue".to_string(),
+            "--resume".to_string(),
+            "abc".to_string(),
+            "--fork-session".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, Some("task")),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    /// `--resume` with a flag after it took no value, so swallowing the next
+    /// token would eat one of the operator's own flags.
+    #[test]
+    fn a_valueless_resume_does_not_swallow_the_next_flag() {
+        let cmd = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, None),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
     }
 
     #[test]
@@ -676,7 +896,7 @@ mod tests {
             "gpt".to_string(),
         ];
         assert_eq!(
-            extra_launch_flags(&cmd),
+            extra_launch_flags(&cmd, 1, None),
             vec!["--model".to_string(), "gpt".to_string()]
         );
     }

@@ -441,6 +441,10 @@ impl AgentAdapter for ClaudeAdapter {
         Some("--append-system-prompt-file")
     }
 
+    fn launch_prefix_len(&self) -> usize {
+        1 + self.bin_args.len()
+    }
+
     fn supports_system_prompt_file(&self) -> bool {
         #[cfg(test)]
         if let Some(forced) = self.forced_file_support {

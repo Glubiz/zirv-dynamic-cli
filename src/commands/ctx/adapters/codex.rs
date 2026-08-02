@@ -138,6 +138,10 @@ impl AgentAdapter for CodexAdapter {
         cmd
     }
 
+    fn launch_prefix_len(&self) -> usize {
+        1 + self.bin_args.len()
+    }
+
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
         let sessions_root = self.home_dir().join(".codex").join("sessions");
         let suffix = format!("-{}.jsonl", session.id);
