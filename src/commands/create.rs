@@ -90,9 +90,9 @@ fn validate_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     if name.trim().is_empty() {
         return Err("a script name is required".into());
     }
-    if name.contains(std::path::is_separator) || name.split('.').any(|part| part == "..") {
+    if name.contains(std::path::is_separator) || name == ".." {
         return Err(format!(
-            "'{name}' is not a script name: it must not contain a path separator or '..'"
+            "'{name}' is not a script name: it must not contain a path separator or be '..'"
         )
         .into());
     }
@@ -241,7 +241,7 @@ mod tests {
     /// `--name` reaches this straight from argv, and the name becomes a path.
     #[test]
     fn a_name_that_leaves_the_zirv_directory_is_rejected() {
-        for bad in ["../../escaped", "nested/script", "", "   "] {
+        for bad in ["../../escaped", "nested/script", "", "   ", ".."] {
             assert!(
                 create_script_core(bad, "", false, true, unreachable_confirm).is_err(),
                 "{bad:?} must be refused before anything is written"
@@ -249,6 +249,15 @@ mod tests {
         }
         // A dot in the middle is a perfectly ordinary name.
         assert!(validate_name("deploy.staging").is_ok());
+    }
+
+    /// The separator check alone lets a bare `..` through: splitting a string
+    /// on `.` can never produce a part that itself contains a `.`, so
+    /// `part == ".."` was always false and this name passed validation
+    /// despite the error message's own promise to reject it.
+    #[test]
+    fn a_bare_parent_directory_name_is_rejected_on_its_own() {
+        assert!(validate_name("..").is_err());
     }
 
     /// The whole file is rewritten from what is parsed, so treating a parse

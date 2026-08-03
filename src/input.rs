@@ -56,9 +56,31 @@ fn find_script_in_dir(
 
     let shortcuts_path = dir.join(".shortcuts.yaml");
     if shortcuts_path.exists() {
-        let content = std::fs::read_to_string(&shortcuts_path)?;
-        let shortcuts: Shortcuts = serde_yaml_ng::from_str(&content)?;
-        if let Some(mapped_file) = shortcuts.shortcuts.get(name) {
+        // A malformed `.shortcuts.yaml` must not take down every script
+        // lookup: `create` already treats this file as recoverable rather
+        // than fatal (`read_shortcuts`), and a lookup has somewhere else to
+        // fall through to (the other extensions, then the other directory)
+        // even when this one file cannot be parsed.
+        let shortcuts = match std::fs::read_to_string(&shortcuts_path) {
+            Ok(content) => match serde_yaml_ng::from_str::<Shortcuts>(&content) {
+                Ok(shortcuts) => Some(shortcuts),
+                Err(err) => {
+                    crate::output::warn(format!(
+                        "{} could not be parsed ({err}); ignoring its shortcuts for this lookup",
+                        shortcuts_path.display()
+                    ));
+                    None
+                }
+            },
+            Err(err) => {
+                crate::output::warn(format!(
+                    "{} could not be read ({err}); ignoring its shortcuts for this lookup",
+                    shortcuts_path.display()
+                ));
+                None
+            }
+        };
+        if let Some(mapped_file) = shortcuts.as_ref().and_then(|s| s.shortcuts.get(name)) {
             let path = dir.join(mapped_file);
             if path.exists() {
                 return Ok(Some(path.canonicalize()?));
@@ -222,6 +244,56 @@ mod tests {
             assert!(
                 message.contains("tst"),
                 "expected the shortcut key 'tst' to be suggested, got: {message}"
+            );
+        });
+    }
+
+    /// Before this, a malformed local `.shortcuts.yaml` propagated its parse
+    /// error through `?`, so a lookup that did not even need shortcuts (the
+    /// script exists as a plain file) still failed. `create` already treats
+    /// this file as recoverable rather than fatal; the read path has to
+    /// match, and fall through to a direct extension match in the same
+    /// directory instead of hard-erroring.
+    #[test]
+    fn a_malformed_local_shortcuts_file_does_not_break_a_direct_match() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+        write(zirv_dir.join(".shortcuts.yaml"), "not: [valid, yaml for,").unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "build".to_string(),
+                ..Default::default()
+            };
+            let path = input
+                .get_file_path()
+                .expect("a direct extension match must still resolve");
+            assert!(path.ends_with("build.yaml"), "got: {}", path.display());
+        });
+    }
+
+    /// Same file, but this time the lookup genuinely needs the shortcut: it
+    /// must report "not found" rather than propagating the parse error.
+    #[test]
+    fn a_malformed_local_shortcuts_file_falls_through_to_not_found() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(zirv_dir.join(".shortcuts.yaml"), "not: [valid, yaml for,").unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: "tst".to_string(),
+                ..Default::default()
+            };
+            let err = input.get_file_path().unwrap_err();
+            assert!(
+                err.to_string().contains("zirv help"),
+                "a normal not-found error, not a parse error: {err}"
             );
         });
     }

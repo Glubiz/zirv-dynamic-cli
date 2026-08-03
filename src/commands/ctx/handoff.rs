@@ -172,9 +172,12 @@ not invent progress that is not evidenced below.\n\n\
 const DISTILL_POLL: Duration = Duration::from_millis(25);
 
 /// Runs one fresh model call and returns its stdout. The child is bounded on
-/// every axis that can hang a supervisor: stdin is closed so the model starts
-/// answering, stdout is drained on its own thread so a full pipe cannot wedge
-/// the child, and the wait has a deadline after which the child is killed.
+/// every axis that can hang a supervisor: stdin and stdout are each serviced
+/// on their own thread, started before either side has exchanged a byte, so
+/// a model that starts answering before it has consumed all of stdin cannot
+/// deadlock this call -- it would otherwise block writing a full stdout pipe
+/// while this thread blocks writing an stdin pipe nothing is reading. The
+/// wait below then has a deadline after which the child is killed.
 pub fn run_model(
     adapter: &dyn AgentAdapter,
     model: &str,
@@ -188,12 +191,6 @@ pub fn run_model(
         .stderr(Stdio::null());
 
     let mut child = command.spawn()?;
-    {
-        let stdin = child.stdin.as_mut().ok_or("model stdin unavailable")?;
-        stdin.write_all(prompt.as_bytes())?;
-    }
-    // The model waits for end of input before it answers.
-    drop(child.stdin.take());
 
     let mut stdout = child.stdout.take().ok_or("model stdout unavailable")?;
     let (tx, rx) = std::sync::mpsc::channel();
@@ -201,6 +198,17 @@ pub fn run_model(
         let mut buffer = Vec::new();
         let _ = stdout.read_to_end(&mut buffer);
         let _ = tx.send(buffer);
+    });
+
+    let mut stdin = child.stdin.take().ok_or("model stdin unavailable")?;
+    let prompt = prompt.to_owned();
+    // Dropping `stdin` at the end of this closure is what signals end of
+    // input to the model. A write failure here (broken pipe, because the
+    // child exited early) is not surfaced from this thread: the wait loop
+    // below already turns an early, unsuccessful exit into an error from
+    // the child's own status, which is the more useful of the two reports.
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(prompt.as_bytes());
     });
 
     let deadline = Instant::now() + timeout;
@@ -579,6 +587,35 @@ mod tests {
         }
         let err = result.expect_err("non-zero exit surfaces");
         assert!(err.to_string().contains('4'), "report the exit code: {err}");
+    }
+
+    /// Before this, `run_model` wrote the whole prompt to the child's stdin
+    /// *before* spawning the thread that drains its stdout. A child that
+    /// starts answering before it has consumed all of stdin could deadlock
+    /// the caller: it blocks on a full stdout pipe while this thread blocks
+    /// writing an stdin pipe the child has stopped reading -- and because the
+    /// blocking write happened before the deadline loop even started, no
+    /// `timeout` could rescue it. `flood` reproduces exactly that shape.
+    #[test]
+    fn a_child_that_answers_before_draining_stdin_does_not_deadlock() {
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "flood");
+        }
+        let adapter = fake_model_adapter();
+        // Comfortably past a typical pipe buffer, so writing it cannot
+        // complete without the reader side draining concurrently.
+        let big_prompt = "x".repeat(200_000);
+        let started = Instant::now();
+        let result = run_model(&adapter, "haiku", &big_prompt, Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+        result.expect("a flooding child must not deadlock the caller");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "took {elapsed:?}: the stdin write and the stdout drain must run concurrently"
+        );
     }
 
     #[test]
