@@ -128,6 +128,15 @@ impl AgentAdapter for CodexAdapter {
         Vec::new()
     }
 
+    /// Spelled out rather than left to the trait default, for the same reason
+    /// `system_prompt_args` is empty: the only base layer zirv has is written
+    /// around Claude Code's tools (the Agent tool, `.claude/agents`, the
+    /// `/code-review` skill), none of which codex has. Instructions about
+    /// tools an agent does not have are worse than no instructions.
+    fn base_system_prompt(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Verified via `codex exec --help` (quoted verbatim in the notes file):
     /// `-m, --model <MODEL>` is a real flag, and the prompt is read from
     /// stdin when none is given as an argument, so the distillation prompt

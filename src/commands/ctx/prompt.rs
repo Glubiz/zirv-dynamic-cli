@@ -1,8 +1,14 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
+use super::CtxResult;
 use super::config::PromptConfig;
 
-pub const DEFAULT_PROMPT_VERSION: &str = "v1";
+/// Bumped whenever the composed text changes shape, so a transcript in the
+/// decision log can be attributed to the exact prompt that shaped it. v2
+/// added the adapter's own base layer (`AgentAdapter::base_system_prompt`).
+pub const DEFAULT_PROMPT_VERSION: &str = "v2";
 pub const PROMPT_FILE: &str = "system-prompt.md";
 
 /// The floor every zirv-started session gets. Deliberately three rules: enough
@@ -23,6 +29,10 @@ so plainly and show the output. Never describe unverified work as done or verifi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptSource {
     Default,
+    /// The launched agent's own base layer, from
+    /// `AgentAdapter::base_system_prompt`. Text that names one agent's tools,
+    /// so only that agent ever gets it.
+    Adapter,
     User,
     Repo,
     CommandLine,
@@ -32,6 +42,7 @@ impl PromptSource {
     pub fn label(&self) -> &'static str {
         match self {
             PromptSource::Default => "default",
+            PromptSource::Adapter => "adapter",
             PromptSource::User => "user",
             PromptSource::Repo => "repo",
             PromptSource::CommandLine => "command-line",
@@ -127,25 +138,40 @@ use super::adapters::AgentAdapter;
 /// same choice the underlying CLI itself makes. The real CLI accepts both the
 /// two-token form (`--flag value`) and the single-token `--flag=value` form;
 /// both are stripped here.
+///
+/// `Err` when the file spelling names a path that cannot be read: the flag is
+/// stripped regardless of whether its text could be recovered, so treating an
+/// unreadable file as "nothing to extract" deleted the operator's instruction
+/// without saying so.
 pub fn extract_user_prompt_flag(
     adapter: &dyn AgentAdapter,
     argv: &[String],
     protected: Option<usize>,
-) -> (Vec<String>, Option<String>) {
+) -> CtxResult<(Vec<String>, Option<String>)> {
     let inline = adapter.user_system_prompt_flag();
     let from_file = adapter.system_prompt_file_flag();
     if inline.is_none() && from_file.is_none() {
-        return (argv.to_vec(), None);
+        return Ok((argv.to_vec(), None));
     }
 
     // Both spellings deliver the same layer, so both have to be found: zirv
     // now emits the file form itself and appends it after the user's argv, and
     // a flag it does not recognise here is a flag it silently overrides.
-    let value_of = |name: &str, raw: String| -> Option<String> {
+    //
+    // A file it cannot read is an error, not a shrug. The flag and its value
+    // are stripped from the argv either way, so reading `None` as "nothing to
+    // extract" deleted the operator's own instruction and left no trace of it
+    // anywhere: not in the argv, not in the composed prompt, not on stderr.
+    let value_of = |name: &str, raw: String| -> CtxResult<String> {
         if Some(name) == from_file {
-            return std::fs::read_to_string(&raw).ok();
+            return std::fs::read_to_string(&raw).map_err(|err| {
+                format!(
+                    "cannot read the system-prompt file '{raw}' passed on the command line: {err}"
+                )
+                .into()
+            });
         }
-        Some(raw)
+        Ok(raw)
     };
 
     let mut cleaned = Vec::with_capacity(argv.len());
@@ -171,9 +197,7 @@ pub fn extract_user_prompt_flag(
             .find(|flag| arg == flag);
         if let Some(flag) = matched {
             if let Some(raw) = argv.get(index + 1) {
-                if let Some(value) = value_of(flag, raw.clone()) {
-                    extracted = Some(value);
-                }
+                extracted = Some(value_of(flag, raw.clone())?);
                 skip_next = true;
             }
             continue;
@@ -187,15 +211,46 @@ pub fn extract_user_prompt_flag(
                 .map(|flag| (flag, value.to_string()))
         });
         if let Some((flag, raw)) = joined {
-            if let Some(value) = value_of(flag, raw) {
-                extracted = Some(value);
-            }
+            extracted = Some(value_of(flag, raw)?);
             continue;
         }
 
         cleaned.push(arg.clone());
     }
-    (cleaned, extracted)
+    Ok((cleaned, extracted))
+}
+
+/// Splices the launched agent's own base layer in directly after the shipped
+/// default and before every layer a human wrote, so the user, repo and
+/// command-line layers all still append after it and still take precedence
+/// over it. `None` in means `None` out, exactly like the command-line layer:
+/// `--simple` and a disabled prompt suppress this layer with all the others.
+///
+/// Spliced rather than appended because `compose` cannot see the adapter (it
+/// runs before the launch is known) and this layer is a base, not an
+/// override. `compose` always begins the text with `DEFAULT_PROMPT` verbatim,
+/// so its length is the insertion point exactly: no scanning for a separator
+/// that a layer's own text could contain.
+fn with_adapter_layer(
+    composed: Option<ComposedPrompt>,
+    adapter: &dyn AgentAdapter,
+) -> Option<ComposedPrompt> {
+    let mut composed = composed?;
+    let Some(layer) = adapter
+        .base_system_prompt()
+        .map(str::trim)
+        .filter(|layer| !layer.is_empty())
+    else {
+        return Some(composed);
+    };
+
+    debug_assert!(composed.text.starts_with(DEFAULT_PROMPT));
+    let tail = composed.text.split_off(DEFAULT_PROMPT.len());
+    composed.text.push_str("\n\n---\n\n");
+    composed.text.push_str(layer);
+    composed.text.push_str(&tail);
+    composed.sources.insert(1, PromptSource::Adapter);
+    Some(composed)
 }
 
 /// Adds the operator's own command-line text as the final, highest-priority
@@ -237,6 +292,9 @@ fn with_command_line_layer(
 ///
 /// `protected` is the argv index of this run's own prompt text, when the
 /// caller knows it: that one token is data and is never read as a flag.
+///
+/// This is also where the launched agent's own base layer joins, because this
+/// is the first point that knows which agent is being launched.
 pub fn merge_command_line_prompt(
     adapter: &dyn AgentAdapter,
     argv: &[String],
@@ -246,7 +304,21 @@ pub fn merge_command_line_prompt(
     if composed.is_none() {
         return (argv.to_vec(), None);
     }
-    let (cleaned, cli_text) = extract_user_prompt_flag(adapter, argv, protected);
+    let (cleaned, cli_text) = match extract_user_prompt_flag(adapter, argv, protected) {
+        Ok(extracted) => extracted,
+        Err(err) => {
+            // The operator named a file zirv cannot read. Merging it faithfully
+            // is impossible, and stripping the flag anyway would delete their
+            // instruction silently, so zirv steps aside entirely: the argv goes
+            // through exactly as written and carries the only occurrence of the
+            // flag, which the agent's own CLI then reports on by name.
+            eprintln!(
+                "zirv ctx: {err}; passing your command through unchanged and injecting no zirv prompt this run"
+            );
+            return (argv.to_vec(), None);
+        }
+    };
+    let composed = with_adapter_layer(composed, adapter);
     (
         cleaned,
         with_command_line_layer(composed, cli_text.as_deref()),
@@ -290,6 +362,17 @@ pub fn injection_args_for_session(
     adapter.system_prompt_args(&composed.text)
 }
 
+/// The prompt files this process has handed to an agent. A launch computes
+/// `--append-system-prompt-file <path>` once and reuses that exact path for
+/// every restart of the run, so a file in here is live for as long as the
+/// process is: removing one leaves every later restart pointing at a path
+/// that is no longer there.
+static LIVE_PROMPT_FILES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn live_prompt_files() -> &'static Mutex<HashSet<PathBuf>> {
+    LIVE_PROMPT_FILES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 /// Writes the composed prompt to a private (0600) file under the state dir,
 /// named for the session it belongs to.
 fn write_prompt_file(state: &StateDir, session: &str, text: &str) -> std::io::Result<PathBuf> {
@@ -297,11 +380,63 @@ fn write_prompt_file(state: &StateDir, session: &str, text: &str) -> std::io::Re
     super::state::create_private_dir_all(&dir)?;
     let path = dir.join(format!("{session}.md"));
     super::state::write_private(&path, text)?;
-    // One file per session start, and nothing else ever deletes them. Pruned
-    // after the write so the file this call returns is always the newest and
-    // can never be the one dropped.
-    super::state::prune_to_newest(&dir, super::state::KEEP_NEWEST);
+    // Registered before the prune, so this call can never be the one that
+    // deletes the file it is about to return.
+    if let Ok(mut live) = live_prompt_files().lock() {
+        live.insert(path.clone());
+    }
+    // One file per session start, and nothing else ever deletes them.
+    prune_prompt_files(&dir, super::state::KEEP_NEWEST);
     Ok(path)
+}
+
+/// `state::prune_to_newest` for the prompts directory, with the one exception
+/// that directory needs: a file this process is still using is never a
+/// candidate for removal, however old it is.
+///
+/// The plain newest-`keep` rule was not enough here. Pruning after the write
+/// only protects the file being written; a run that stays up while `keep`
+/// later sessions start (a `loop` cycling, or another zirv process sharing
+/// the state dir) watched its own prompt file age past the cutoff and get
+/// deleted, and every restart after that pointed at a missing path.
+///
+/// Live files also have their mtime refreshed on the way through, which is
+/// what keeps them at the top of the ordering that *other* zirv processes
+/// compute over this same shared directory, where this process's live set is
+/// not visible.
+fn prune_prompt_files(dir: &Path, keep: usize) {
+    let live = live_prompt_files()
+        .lock()
+        .map(|live| live.clone())
+        .unwrap_or_default();
+    let now = std::time::SystemTime::now();
+    for path in &live {
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(now));
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            meta.is_file()
+                .then(|| Some((meta.modified().ok()?, entry.path())))?
+        })
+        .filter(|(_, path)| !live.contains(path))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    // Newest first, so everything past `keep` is the oldest.
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in files.iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Records whether this session start carried zirv text, so a transcript can be
@@ -460,7 +595,10 @@ mod tests {
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
         assert!(log.contains("\"verb\":\"wrap\""), "got {log}");
-        assert!(log.contains("v1"), "the version is attributable: {log}");
+        assert!(
+            log.contains(DEFAULT_PROMPT_VERSION),
+            "the version is attributable: {log}"
+        );
     }
 
     #[test]
@@ -718,7 +856,8 @@ mod tests {
             "--model".to_string(),
             "opus".to_string(),
         ];
-        let (cleaned, extracted) = extract_user_prompt_flag(&adapter, &argv, None);
+        let (cleaned, extracted) =
+            extract_user_prompt_flag(&adapter, &argv, None).expect("readable");
         assert_eq!(
             cleaned,
             vec![
@@ -744,7 +883,8 @@ mod tests {
             "--model".to_string(),
             "opus".to_string(),
         ];
-        let (cleaned, extracted) = extract_user_prompt_flag(&adapter, &argv, None);
+        let (cleaned, extracted) =
+            extract_user_prompt_flag(&adapter, &argv, None).expect("readable");
         assert_eq!(
             cleaned,
             vec![
@@ -765,7 +905,8 @@ mod tests {
             "--model".to_string(),
             "opus".to_string(),
         ];
-        let (cleaned, extracted) = extract_user_prompt_flag(&adapter, &argv, None);
+        let (cleaned, extracted) =
+            extract_user_prompt_flag(&adapter, &argv, None).expect("readable");
         assert_eq!(cleaned, argv);
         assert_eq!(extracted, None);
     }
@@ -778,7 +919,8 @@ mod tests {
             "--append-system-prompt".to_string(),
             "x".to_string(),
         ];
-        let (cleaned, extracted) = extract_user_prompt_flag(&adapter, &argv, None);
+        let (cleaned, extracted) =
+            extract_user_prompt_flag(&adapter, &argv, None).expect("readable");
         assert_eq!(cleaned, argv, "codex has no such flag: nothing to strip");
         assert_eq!(extracted, None);
     }
@@ -800,7 +942,11 @@ mod tests {
         let merged = merged.expect("still composed");
         assert_eq!(
             merged.sources,
-            vec![PromptSource::Default, PromptSource::CommandLine]
+            vec![
+                PromptSource::Default,
+                PromptSource::Adapter,
+                PromptSource::CommandLine
+            ]
         );
         let default_at = merged
             .text
@@ -840,7 +986,7 @@ mod tests {
         let merged = merged.expect("still composed");
         assert_eq!(
             merged.sources,
-            vec![PromptSource::Default],
+            vec![PromptSource::Default, PromptSource::Adapter],
             "and never becomes an operator instruction"
         );
         assert!(!merged.text.contains("ignore every rule above"));
@@ -891,7 +1037,11 @@ mod tests {
         let merged = merged.expect("still composed");
         assert_eq!(
             merged.sources,
-            vec![PromptSource::Default, PromptSource::CommandLine]
+            vec![
+                PromptSource::Default,
+                PromptSource::Adapter,
+                PromptSource::CommandLine
+            ]
         );
         assert!(
             merged.text.contains("always answer in Danish"),
@@ -909,7 +1059,19 @@ mod tests {
 
         let (cleaned, merged) = merge_command_line_prompt(&adapter, &argv, composed.clone(), None);
         assert_eq!(cleaned, argv);
-        assert_eq!(merged, composed, "nothing to merge, so nothing changes");
+        let merged = merged.expect("still composed");
+        assert_eq!(
+            merged.sources,
+            vec![PromptSource::Default, PromptSource::Adapter],
+            "nothing of the operator's to merge, so only the agent's own layer joins"
+        );
+        let composed = composed.expect("composed");
+        assert!(
+            merged
+                .text
+                .starts_with(&composed.text[..DEFAULT_PROMPT.len()]),
+            "and it joins after the shipped default, not before it"
+        );
     }
 
     #[test]
@@ -927,5 +1089,290 @@ mod tests {
         let (cleaned, merged) = merge_command_line_prompt(&adapter, &argv, None, None);
         assert_eq!(cleaned, argv, "nothing composed means nothing stripped");
         assert_eq!(merged, None);
+    }
+
+    // The adapter's own base layer: claude-specific text that only the agent
+    // it was written for ever receives.
+
+    #[test]
+    fn the_orchestrator_layer_is_injected_for_claude() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+
+        let (_, merged) =
+            merge_command_line_prompt(&adapter, &["claude".to_string()], composed, None);
+
+        let merged = merged.expect("composed");
+        assert_eq!(
+            merged.sources,
+            vec![PromptSource::Default, PromptSource::Adapter]
+        );
+        assert!(
+            merged.text.contains("You are an orchestrator"),
+            "every claude session gets the orchestrator layer:\n{}",
+            merged.text
+        );
+    }
+
+    #[test]
+    fn the_orchestrator_layer_is_not_injected_for_codex() {
+        let adapter = CodexAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+
+        let (_, merged) =
+            merge_command_line_prompt(&adapter, &["codex".to_string()], composed, None);
+
+        let merged = merged.expect("composed");
+        assert_eq!(
+            merged.sources,
+            vec![PromptSource::Default],
+            "the layer names claude's own tools, so no other agent gets it"
+        );
+        assert!(!merged.text.contains("You are an orchestrator"));
+    }
+
+    /// The precedence contract: the agent's layer is a base, so everything a
+    /// human wrote still appends after it and still outranks it.
+    #[test]
+    fn the_adapter_layer_sits_after_the_default_and_before_every_human_layer() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        std::fs::write(home.join(".zirv/system-prompt.md"), "user layer text\n").expect("write");
+        std::fs::write(repo.join(".zirv/system-prompt.md"), "repo layer text\n").expect("write");
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let argv = vec![
+            "claude".to_string(),
+            "--append-system-prompt".to_string(),
+            "always answer in Danish".to_string(),
+        ];
+
+        let (_, merged) = merge_command_line_prompt(&adapter, &argv, composed, None);
+
+        let merged = merged.expect("composed");
+        assert_eq!(
+            merged.sources,
+            vec![
+                PromptSource::Default,
+                PromptSource::Adapter,
+                PromptSource::User,
+                PromptSource::Repo,
+                PromptSource::CommandLine
+            ]
+        );
+        let at = |needle: &str| {
+            merged
+                .text
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing from:\n{}", merged.text))
+        };
+        let order = [
+            at("zirv session conventions"),
+            at("You are an orchestrator"),
+            at("user layer text"),
+            at("repo layer text"),
+            at("always answer in Danish"),
+        ];
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "layers must stay in order:\n{}",
+            merged.text
+        );
+    }
+
+    #[test]
+    fn the_description_names_the_adapter_layer_for_the_log() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let (_, merged) =
+            merge_command_line_prompt(&adapter, &["claude".to_string()], composed, None);
+
+        let described = merged.expect("composed").describe();
+        assert_eq!(
+            described,
+            format!("{DEFAULT_PROMPT_VERSION} layers: default+adapter")
+        );
+    }
+
+    /// The escape hatches have to keep meaning "no zirv text at all", which
+    /// now includes the agent's own layer: `--simple` and a disabled prompt
+    /// both stop at `compose`, and `merge_command_line_prompt` refuses to
+    /// revive anything from a `None`.
+    #[test]
+    fn simple_and_a_disabled_prompt_suppress_the_adapter_layer_too() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let disabled = PromptConfig {
+            enabled: false,
+            ..PromptConfig::default()
+        };
+
+        for composed in [
+            compose(Some(&home), &repo, true, &PromptConfig::default()),
+            compose(Some(&home), &repo, false, &disabled),
+        ] {
+            assert_eq!(composed, None);
+            let (_, merged) =
+                merge_command_line_prompt(&adapter, &["claude".to_string()], composed, None);
+            assert_eq!(merged, None, "nothing composed stays nothing composed");
+        }
+    }
+
+    #[test]
+    fn the_orchestrator_layer_is_short_enough_to_ship_on_every_session() {
+        use crate::commands::ctx::adapters::claude::ORCHESTRATOR_PROMPT;
+
+        assert!(
+            ORCHESTRATOR_PROMPT.len() < 3_000,
+            "this ships on every claude session: {} bytes",
+            ORCHESTRATOR_PROMPT.len()
+        );
+        assert!(!ORCHESTRATOR_PROMPT.contains('\u{2014}'), "no em dashes");
+        assert!(
+            !ORCHESTRATOR_PROMPT.contains("--model"),
+            "model choice stays the operator's: {ORCHESTRATOR_PROMPT}"
+        );
+        for aged in ["haiku", "sonnet", "opus", "fable"] {
+            assert!(
+                !ORCHESTRATOR_PROMPT.contains(aged),
+                "a hard-coded model lineup ages out of correctness: '{aged}'"
+            );
+        }
+    }
+
+    // The operator's own `--append-system-prompt-file` naming a path zirv
+    // cannot read.
+
+    #[test]
+    fn an_unreadable_user_prompt_file_is_an_error_not_a_silent_drop() {
+        let adapter = ClaudeAdapter::new(None);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("not-there.md");
+        let argv = vec![
+            "claude".to_string(),
+            "--append-system-prompt-file".to_string(),
+            missing.display().to_string(),
+        ];
+
+        let err = extract_user_prompt_flag(&adapter, &argv, None)
+            .expect_err("an unreadable file must not read as 'nothing to extract'");
+        let message = err.to_string();
+        assert!(
+            message.contains("not-there.md"),
+            "the error names the path: {message}"
+        );
+    }
+
+    /// The equals-bound spelling reaches the same read, so it has to fail the
+    /// same way rather than being the quiet one.
+    #[test]
+    fn an_unreadable_equals_bound_prompt_file_is_an_error_too() {
+        let adapter = ClaudeAdapter::new(None);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("not-there.md");
+        let argv = vec![
+            "claude".to_string(),
+            format!("--append-system-prompt-file={}", missing.display()),
+        ];
+
+        assert!(extract_user_prompt_flag(&adapter, &argv, None).is_err());
+    }
+
+    /// zirv cannot merge what it cannot read, so it steps aside completely:
+    /// the argv goes through as written and carries the only occurrence of
+    /// the flag, which the agent's own CLI then reports on.
+    #[test]
+    fn an_unreadable_user_prompt_file_leaves_the_argv_alone_and_injects_nothing() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let composed = compose(Some(&home), &repo, false, &PromptConfig::default());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let argv = vec![
+            "claude".to_string(),
+            "--append-system-prompt-file".to_string(),
+            tmp.path().join("not-there.md").display().to_string(),
+        ];
+
+        let (cleaned, merged) = merge_command_line_prompt(&adapter, &argv, composed, None);
+        assert_eq!(
+            cleaned, argv,
+            "the operator's instruction is not deleted out from under them"
+        );
+        assert_eq!(
+            merged, None,
+            "and zirv does not add a second occurrence of the same flag"
+        );
+    }
+
+    // The prompt file a live run's launch arguments point at.
+
+    #[test]
+    fn a_sessions_own_prompt_file_survives_pruning() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let live = write_prompt_file(&state, "live-session", "the live run's prompt")
+            .expect("write the live prompt");
+        let dir = live.parent().expect("prompts dir").to_path_buf();
+
+        // Every other file is newer, which is exactly the shape a long run
+        // alongside many short sessions takes.
+        let base = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        for index in 0..5u32 {
+            let path = dir.join(format!("other-{index}.md"));
+            std::fs::write(&path, "x").expect("write");
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open")
+                .set_modified(base + std::time::Duration::from_secs(index as u64))
+                .expect("set_modified");
+        }
+
+        prune_prompt_files(&dir, 2);
+
+        assert!(
+            live.exists(),
+            "the file this run's launch arguments point at must outlive housekeeping"
+        );
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "live-session.md".to_string(),
+                "other-3.md".to_string(),
+                "other-4.md".to_string()
+            ],
+            "the cap still applies to everything that is not live"
+        );
+    }
+
+    /// The live set is what makes the exemption work, so the write has to be
+    /// what registers it: a path nobody registered is prunable as before.
+    #[test]
+    fn an_unregistered_prompt_file_is_still_pruned() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let stale = dir.join("stale.md");
+        std::fs::write(&stale, "x").expect("write");
+        std::fs::write(dir.join("newer.md"), "x").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+            .expect("set_modified");
+
+        prune_prompt_files(&dir, 1);
+
+        assert!(!stale.exists(), "old, and nobody's live file");
+        assert!(dir.join("newer.md").exists());
     }
 }

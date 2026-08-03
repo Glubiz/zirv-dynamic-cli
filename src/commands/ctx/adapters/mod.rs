@@ -40,6 +40,19 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// unsupported agent ships without injection rather than with a guess.
     fn system_prompt_args(&self, prompt: &str) -> Vec<String>;
 
+    /// This agent's own base system prompt: text that only makes sense for
+    /// this agent, because it names that agent's tools and conventions.
+    /// Composed as a base layer, after the shipped default and before every
+    /// layer a human wrote, so the user, repo and command-line layers all
+    /// still append after it and still take precedence.
+    ///
+    /// `None` (the default) means this agent contributes nothing of its own,
+    /// which is what an agent whose tool vocabulary zirv has not verified
+    /// must do rather than be handed another agent's instructions.
+    fn base_system_prompt(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The user-facing flag name `system_prompt_args` emits, when the agent has
     /// one. Lets a caller find and merge a user's own use of the flag instead
     /// of silently overriding it with a second occurrence. `None` when the
@@ -112,6 +125,137 @@ pub fn program_invocation(launch: &[String]) -> Option<(String, Vec<String>)> {
         .cloned()
         .collect();
     Some((program.clone(), args))
+}
+
+/// A program invocation rewritten so the host OS can actually execute it.
+/// `prefix` is the tokens that have to lead the original arguments, empty
+/// whenever the program can be spawned directly (always, off Windows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProgram {
+    pub program: String,
+    pub prefix: Vec<String>,
+}
+
+impl ResolvedProgram {
+    /// The invocation exactly as written: no launcher, nothing prepended.
+    pub fn direct(program: &str) -> Self {
+        Self {
+            program: program.to_string(),
+            prefix: Vec::new(),
+        }
+    }
+}
+
+/// Resolves `program` the way the OS itself would, and rewrites the
+/// invocation when what it resolves to cannot be handed to the process
+/// creation call directly.
+///
+/// Off Windows this is the identity: `execvp` honors the shebang of anything
+/// on `PATH`, so there is nothing to rewrite.
+///
+/// On Windows it matters. An npm-installed `claude` is `claude.cmd`, and the
+/// two resolvers zirv uses disagreed about it: `std::process::Command` only
+/// ever appends `.exe`, while portable-pty's `search_path` honors `PATHEXT`,
+/// finds `claude.cmd`, and then hands it to `CreateProcessW` as
+/// `lpApplicationName`, which rejects it with `ERROR_BAD_EXE_FORMAT` (193).
+/// Resolving `PATH` plus `PATHEXT` here and routing a `.cmd`/`.bat` through
+/// `cmd.exe` (a `.ps1` through PowerShell) is what makes the most common
+/// Windows install layout launch at all.
+///
+/// A program that resolves to nothing is returned untouched, so a missing
+/// binary still fails with the OS's own "not found" rather than a zirv error
+/// about a path that does not exist. `Err` is reserved for the one case zirv
+/// can name before spawning and knows will fail: a bare name that `PATHEXT`
+/// resolved to a file type with no launcher. A program written with a
+/// directory in it is never an error here, whatever it ends in: the caller
+/// named that exact file, and a wrapper this code has never heard of is
+/// theirs to be told about by the OS, exactly as before.
+#[cfg(windows)]
+pub fn resolve_program(program: &str) -> Result<ResolvedProgram, String> {
+    let Some((resolved, from_path)) = resolve_on_path(program) else {
+        return Ok(ResolvedProgram::direct(program));
+    };
+    let extension = resolved
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let found = resolved.display().to_string();
+    match extension.as_str() {
+        "cmd" | "bat" => Ok(ResolvedProgram {
+            program: std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+            prefix: vec!["/c".to_string(), found],
+        }),
+        "ps1" => Ok(ResolvedProgram {
+            program: "powershell".to_string(),
+            prefix: vec!["-NoProfile".to_string(), "-File".to_string(), found],
+        }),
+        other if from_path && !matches!(other, "exe" | "com" | "") => Err(format!(
+            "cannot launch '{program}': it resolves to '{found}', which Windows cannot execute \
+             directly (CreateProcess accepts only .exe and .com). zirv runs .cmd and .bat through \
+             cmd.exe and .ps1 through PowerShell, but it has no launcher for '.{other}'."
+        )),
+        // Directly executable, or named explicitly enough that the caller
+        // owns the outcome. Deliberately keeps the program spelled the way it
+        // was written rather than substituting the resolved path: nothing
+        // about the launch changes, so nothing about it should.
+        _ => Ok(ResolvedProgram::direct(program)),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn resolve_program(program: &str) -> Result<ResolvedProgram, String> {
+    Ok(ResolvedProgram::direct(program))
+}
+
+/// `PATH` plus `PATHEXT`, the search the Windows shell performs and
+/// `std::process::Command` does not. A program that already carries a
+/// directory is looked for where it says, not on `PATH`; the flag reports
+/// which of the two happened, because only a `PATH` hit is a name the shell
+/// itself would have claimed to be executable.
+#[cfg(windows)]
+fn resolve_on_path(program: &str) -> Option<(PathBuf, bool)> {
+    if program.is_empty() {
+        return None;
+    }
+    let extensions: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| ext.to_ascii_lowercase())
+        .collect();
+
+    let named_directory = program.contains('/') || program.contains('\\');
+    let bases: Vec<PathBuf> = if named_directory {
+        vec![PathBuf::from(program)]
+    } else {
+        std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join(program))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let from_path = !named_directory;
+    for base in bases {
+        // An explicit extension that exists wins outright, so
+        // `claude.cmd` is never resolved to `claude.cmd.exe`.
+        if base.extension().is_some() && base.is_file() {
+            return Some((base, from_path));
+        }
+        for extension in &extensions {
+            let candidate = PathBuf::from(format!("{}{extension}", base.display()));
+            if candidate.is_file() {
+                return Some((candidate, from_path));
+            }
+        }
+        if base.is_file() {
+            return Some((base, from_path));
+        }
+    }
+    None
 }
 
 pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
@@ -198,6 +342,115 @@ mod tests {
             Some(("sh".to_string(), vec!["/opt/wrap.sh".to_string()]))
         );
         assert_eq!(program_invocation(&[]), None, "nothing to probe");
+    }
+
+    /// Off Windows there is nothing to rewrite, and on Windows a program that
+    /// is already directly executable is spawned exactly as it was written.
+    #[test]
+    fn a_directly_executable_program_is_left_alone() {
+        let resolved = resolve_program("claude").expect("resolvable");
+        assert_eq!(resolved.program, "claude");
+        assert!(
+            resolved.prefix.is_empty() || cfg!(windows),
+            "only Windows ever inserts a launcher"
+        );
+
+        let missing = resolve_program("definitely-not-a-program-anywhere").expect("no error");
+        assert_eq!(
+            missing,
+            ResolvedProgram::direct("definitely-not-a-program-anywhere"),
+            "a program that resolves to nothing keeps the OS's own not-found"
+        );
+    }
+
+    /// The npm install layout: `claude` on `PATH` is `claude.cmd`, which
+    /// `CreateProcessW` rejects outright. `PATHEXT` finds it, and `cmd.exe`
+    /// is what can actually run it.
+    #[cfg(windows)]
+    #[test]
+    fn a_cmd_shim_is_rewritten_to_run_through_cmd_exe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("shim-agent.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write");
+
+        let resolved = resolve_program(&shim.display().to_string()).expect("resolvable");
+        assert!(
+            resolved.program.to_lowercase().contains("cmd"),
+            "got {}",
+            resolved.program
+        );
+        assert_eq!(
+            resolved.prefix,
+            vec!["/c".to_string(), shim.display().to_string()]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_powershell_script_is_rewritten_to_run_through_powershell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("shim-agent.ps1");
+        std::fs::write(&script, "exit 0\r\n").expect("write");
+
+        let resolved = resolve_program(&script.display().to_string()).expect("resolvable");
+        assert_eq!(resolved.program, "powershell");
+        assert_eq!(
+            resolved.prefix,
+            vec![
+                "-NoProfile".to_string(),
+                "-File".to_string(),
+                script.display().to_string()
+            ]
+        );
+    }
+
+    /// A bare name resolved off `PATH` is one the shell itself claimed to be
+    /// executable, so a file type with no launcher is a failure zirv can name
+    /// before spawning instead of letting it surface as `os error 193`. A
+    /// program written with a directory in it is the caller's own choice and
+    /// is never an error here, whatever it ends in.
+    #[cfg(windows)]
+    #[test]
+    fn an_unlaunchable_program_on_path_is_named_rather_than_left_to_error_193() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("shim-agent.py");
+        std::fs::write(&script, "print('x')\n").expect("write");
+
+        assert_eq!(
+            resolve_program(&script.display().to_string()),
+            Ok(ResolvedProgram::direct(&script.display().to_string())),
+            "an explicit path is the caller's own choice"
+        );
+
+        // Temporarily put the directory on PATH so the bare name resolves the
+        // way the shell would, with `.PY` advertised on PATHEXT.
+        let path = std::env::var("PATH").unwrap_or_default();
+        let pathext = std::env::var("PATHEXT").unwrap_or_default();
+        unsafe {
+            std::env::set_var("PATH", format!("{};{}", dir.path().display(), path));
+            std::env::set_var("PATHEXT", ".EXE;.CMD;.PY");
+        }
+        let err = resolve_program("shim-agent").expect_err("no launcher for .py");
+        unsafe {
+            std::env::set_var("PATH", path);
+            std::env::set_var("PATHEXT", pathext);
+        }
+
+        assert!(err.contains("shim-agent.py"), "the error names it: {err}");
+        assert!(err.contains("shim-agent"), "and what was asked for: {err}");
+    }
+
+    /// The trait default: an agent zirv has verified nothing about receives
+    /// no base layer, rather than another agent's instructions.
+    #[test]
+    fn only_the_agent_a_base_layer_was_written_for_receives_it() {
+        assert!(
+            claude::ClaudeAdapter::new(None)
+                .base_system_prompt()
+                .is_some(),
+            "claude has one of its own"
+        );
+        assert_eq!(codex::CodexAdapter::new(None).base_system_prompt(), None);
     }
 
     #[test]

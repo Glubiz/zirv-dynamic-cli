@@ -12,7 +12,52 @@ use super::super::event::input_hash;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext,
 };
-use super::{AgentAdapter, TurnSignalSetup};
+use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
+
+/// Claude Code's own base layer, injected on every claude session zirv starts
+/// (see `AgentAdapter::base_system_prompt`). Claude-specific by construction:
+/// it names the Agent tool, `.claude/agents` and the `/code-review` skill, so
+/// handing it to another agent would be handing it instructions about tools
+/// that agent does not have.
+///
+/// Deliberately model-agnostic. It says "the model in this seat" and "the
+/// most capable tier" rather than naming a lineup, because a hard-coded
+/// lineup ages out of correctness the moment models are renamed, and because
+/// model choice stays the operator's: this text never asks for `--model`.
+pub const ORCHESTRATOR_PROMPT: &str = "\
+zirv orchestrator conventions (claude)
+
+You are an orchestrator. Coordination and judgment are the job, implementation is not: the \
+orchestrator model is reserved for this seat, so delegate every substantive piece of work \
+(codebase exploration, implementation, testing, review) to subagents via the Agent tool and keep \
+your own context lean for planning, sequencing and integration.
+
+- Bundle before you dispatch. Every spawn has a real startup cost, so never start an agent for one \
+tiny task. Group small related tasks (same file or area, or a natural sequence) into a single \
+checklist brief for one agent, with a per-item output format. Split across agents only when the \
+tasks are independent and each side is substantial, then dispatch them in one message and prefer \
+background dispatch so a slow worker blocks nothing. For a small follow-up in an area a worker \
+just handled, continue that worker instead of spawning a fresh one.
+- Route each dispatch to the cheapest model that can do the job, always cheaper than the model in \
+this seat: the cheapest tier for mechanical and bulk work, a middle tier for ordinary exploration, \
+implementation and test writing, and the most capable tier only for hard debugging and design \
+exploration. Agents defined in .claude/agents pin their own models; do not override those.
+- Write self-contained briefs. Subagents share none of your context, so state the goal, the \
+constraints, the relevant file paths and the exact output format expected, and nothing else. Ask \
+for compact structured findings, never raw file dumps.
+- Decide rather than let a worker loop. Workers execute; choices between valid designs, \
+architecture changes, and anything a worker has failed at twice come back to you. Do not read \
+large files or write code yourself unless the change is trivial.
+- Hold implementers to this repository's standards: follow the patterns already there, look for \
+reusable code before adding new code, write a failing test first, keep diffs minimal, and run the \
+project's format, lint and test commands before reporting back.
+- Verify in batches: one independent reviewer gate per batch of related changes, not one per \
+micro-task. You own the final integration, so resolve conflicts between agent outputs and report \
+outcomes, including failures, plainly.
+- Finish every development task with a full-diff review by a dedicated subagent running the \
+/code-review skill, with model and effort scaled to the blast radius of the diff, scaling up when \
+in doubt. Run it only once the other quality gates pass, then triage its findings, fix what is \
+real, and rerun until it is clean before reporting the work done.";
 
 fn text_of(message: &Value) -> String {
     message
@@ -217,6 +262,12 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     keep_last(&mut out.user_messages, last_n);
     keep_last(&mut out.assistant_texts, last_n);
     keep_last(&mut out.tool_errors, last_n);
+    // Capped with everything else rather than left to accumulate: this is a
+    // deduplicated list of every path the whole session ever named, and it
+    // leaves as a single argv token in a handoff. Windows caps a command line
+    // at 32,767 characters, so an uncapped list is a long session that can no
+    // longer relaunch at all.
+    keep_last(&mut out.files_touched, last_n);
     out
 }
 
@@ -269,9 +320,16 @@ impl ClaudeAdapter {
     }
 
     /// Every command starts here so the program and its leading arguments are
-    /// applied uniformly to headless, interactive and distiller invocations.
+    /// applied uniformly to headless, interactive and distiller invocations,
+    /// and so the Windows launcher rewrite (an npm-installed `claude` is
+    /// `claude.cmd`, which `CreateProcess` refuses) is applied in exactly one
+    /// place. A program zirv cannot resolve is spawned as written, which is
+    /// today's behavior; `ready()` is where an unrunnable one is reported.
     fn base(&self) -> Command {
-        let mut cmd = Command::new(&self.program);
+        let resolved = super::resolve_program(&self.program)
+            .unwrap_or_else(|_| ResolvedProgram::direct(&self.program));
+        let mut cmd = Command::new(&resolved.program);
+        cmd.args(&resolved.prefix);
         cmd.args(&self.bin_args);
         cmd
     }
@@ -341,7 +399,14 @@ fn normalizes_to_advertise_the_file_flag(help_text: &str) -> bool {
 /// separate thread so a chatty `--help` cannot deadlock against the wait
 /// loop by filling the pipe buffer.
 fn detect_help_flag(program: &str, bin_args: &[String]) -> bool {
-    let Ok(mut child) = Command::new(program)
+    // The same resolution the launch itself uses. Without it the probe and
+    // the spawn disagree on Windows: `Command::new` only ever appends `.exe`,
+    // so an npm-installed `claude.cmd` failed the probe here and then failed
+    // the launch there, for two different reasons.
+    let resolved =
+        super::resolve_program(program).unwrap_or_else(|_| ResolvedProgram::direct(program));
+    let Ok(mut child) = Command::new(&resolved.program)
+        .args(&resolved.prefix)
         .args(bin_args)
         .arg("--help")
         .stdin(Stdio::null())
@@ -395,7 +460,14 @@ impl AgentAdapter for ClaudeAdapter {
         "claude"
     }
 
+    /// The one thing that can make this adapter unusable before it is asked
+    /// to do anything: a program that resolves to a file this OS has no way
+    /// to execute. Reported here, by name, rather than left to surface as a
+    /// raw `os error 193` out of the spawn. A program that resolves to
+    /// nothing at all is not an error here: that is the OS's own
+    /// "not found", raised at spawn time where it has always been raised.
     fn ready(&self) -> CtxResult<()> {
+        super::resolve_program(&self.program)?;
         Ok(())
     }
 
@@ -441,6 +513,15 @@ impl AgentAdapter for ClaudeAdapter {
         Some("--append-system-prompt-file")
     }
 
+    fn base_system_prompt(&self) -> Option<&'static str> {
+        Some(ORCHESTRATOR_PROMPT)
+    }
+
+    /// Counted over the argv the operator wrote, not over the argv `base()`
+    /// builds: `exec` uses this to strip the program tokens off the command
+    /// it was handed before carrying the rest into a restart. The Windows
+    /// launcher rewrite lives entirely inside `base()` and never touches that
+    /// argv, so the prefix stays the program plus its own leading arguments.
     fn launch_prefix_len(&self) -> usize {
         1 + self.bin_args.len()
     }
@@ -828,6 +909,20 @@ mod tests {
     use crate::commands::ctx::adapters::{AgentAdapter, SESSION_ENV, SOCKET_ENV};
     use crate::commands::ctx::event::{SessionId, SessionRef};
 
+    /// The flags an adapter-built command carries, with any launcher prefix
+    /// dropped. On a Windows machine where `claude` is an npm `.cmd` shim
+    /// every command this adapter builds starts `cmd.exe /c <shim>`, and
+    /// those tokens are not what a test about agent flags is asserting on.
+    fn built_args(adapter: &ClaudeAdapter, cmd: &Command) -> Vec<String> {
+        let launcher = super::super::resolve_program(&adapter.program)
+            .map(|resolved| resolved.prefix.len())
+            .unwrap_or(0);
+        cmd.get_args()
+            .skip(launcher)
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
     #[test]
     fn project_slug_matches_on_disk_evidence() {
         assert_eq!(
@@ -904,30 +999,21 @@ mod tests {
     fn interactive_cmd_passes_the_initial_prompt_positionally() {
         let adapter = ClaudeAdapter::new(None);
         let with = adapter.interactive_cmd(Some("resume this"), &[]);
-        let args: Vec<String> = with
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(args, vec!["resume this".to_string()]);
+        assert_eq!(built_args(&adapter, &with), vec!["resume this".to_string()]);
 
         let without = adapter.interactive_cmd(None, &["--continue".to_string()]);
-        let args: Vec<String> = without
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(args, vec!["--continue".to_string()]);
+        assert_eq!(
+            built_args(&adapter, &without),
+            vec!["--continue".to_string()]
+        );
     }
 
     #[test]
     fn distiller_cmd_uses_a_cheap_model_and_reads_stdin() {
         let adapter = ClaudeAdapter::new(None);
         let cmd = adapter.distiller_cmd("haiku");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
         assert_eq!(
-            args,
+            built_args(&adapter, &cmd),
             vec![
                 "-p".to_string(),
                 "--model".to_string(),
@@ -950,10 +1036,7 @@ mod tests {
     fn the_distiller_denies_the_tools_verified_to_matter() {
         let adapter = ClaudeAdapter::new(None);
         let cmd = adapter.distiller_cmd("haiku");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
+        let args = built_args(&adapter, &cmd);
 
         let deny = args
             .iter()
@@ -1146,7 +1229,9 @@ mod tests {
 
     /// Writes a throwaway `--help` stub so the probe can be exercised without
     /// depending on the machine's actual installed binary. The heredoc keeps
-    /// `help_text` free of shell-escaping concerns.
+    /// `help_text` free of shell-escaping concerns. Every caller spawns it via
+    /// `sh`, so it is unix-only like they are.
+    #[cfg(unix)]
     fn help_stub(dir: &std::path::Path, name: &str, help_text: &str) -> String {
         let script = dir.join(name);
         std::fs::write(
@@ -1291,12 +1376,8 @@ mod tests {
         extra.push("sonnet".to_string());
 
         let headless = adapter.headless_cmd("go", &SessionId::parse("abc"), &extra);
-        let args: Vec<String> = headless
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
         assert_eq!(
-            args,
+            built_args(&adapter, &headless),
             vec![
                 "-p".to_string(),
                 "go".to_string(),
@@ -1310,11 +1391,10 @@ mod tests {
         );
 
         let interactive = adapter.interactive_cmd(None, &extra);
-        let args: Vec<String> = interactive
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(args[0], "--append-system-prompt");
+        assert_eq!(
+            built_args(&adapter, &interactive)[0],
+            "--append-system-prompt"
+        );
     }
 
     #[test]
@@ -1326,11 +1406,134 @@ mod tests {
                 .expect("expectations"),
         )
         .expect("valid json");
+        let recorded = expected["files_touched_min"].as_u64().unwrap_or(0);
+        assert!(
+            structural_context(&jsonl, 1_000).files_touched.len() as u64 >= recorded,
+            "files_touched should find at least the recorded count"
+        );
+
         let ctx = structural_context(&jsonl, 5);
         assert!(ctx.user_messages.len() <= 5);
         assert!(
-            ctx.files_touched.len() as u64 >= expected["files_touched_min"].as_u64().unwrap_or(0),
-            "files_touched should find at least the recorded count"
+            ctx.files_touched.len() <= 5,
+            "and then keep only the tail, like every other field: {}",
+            ctx.files_touched.len()
         );
+    }
+
+    /// A handoff leaves as a single argv token, and Windows caps a command
+    /// line at 32,767 characters. `files_touched` accumulated every unique
+    /// path of the whole session while its neighbours were capped, so a long
+    /// enough session could no longer relaunch at all.
+    #[test]
+    fn structural_context_caps_files_touched_like_every_other_field() {
+        let mut jsonl = String::new();
+        for index in 0..40 {
+            jsonl.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"Read\",\"input\":{{\"file_path\":\"/src/file-{index}.rs\"}}}}],\"usage\":{{}}}}}}\n"
+            ));
+        }
+
+        let ctx = structural_context(&jsonl, 5);
+        assert_eq!(
+            ctx.files_touched,
+            vec![
+                "/src/file-35.rs",
+                "/src/file-36.rs",
+                "/src/file-37.rs",
+                "/src/file-38.rs",
+                "/src/file-39.rs"
+            ],
+            "the newest paths are the ones a handoff is worth carrying"
+        );
+    }
+
+    #[test]
+    fn claude_contributes_the_orchestrator_layer_and_it_names_claudes_own_tools() {
+        let layer = ClaudeAdapter::new(None)
+            .base_system_prompt()
+            .expect("claude has a base layer of its own");
+        assert_eq!(layer, ORCHESTRATOR_PROMPT);
+        for claude_specific in ["Agent tool", ".claude/agents", "/code-review"] {
+            assert!(
+                layer.contains(claude_specific),
+                "the layer is claude-specific by construction: '{claude_specific}'"
+            );
+        }
+    }
+
+    /// `exec` strips this many leading tokens off the argv the operator
+    /// wrote before carrying the rest into a restart, so a rewrite that
+    /// happens inside `base()` must not be counted here: the argv it applies
+    /// to is the one the adapter builds, not the one it was handed.
+    #[test]
+    fn the_launch_prefix_length_counts_the_operators_argv_not_the_rewritten_one() {
+        assert_eq!(ClaudeAdapter::new(None).launch_prefix_len(), 1);
+        assert_eq!(
+            ClaudeAdapter::new(Some("claude.cmd")).launch_prefix_len(),
+            1,
+            "a .cmd shim is still one program token in the operator's argv"
+        );
+        assert_eq!(
+            ClaudeAdapter::new(Some("sh /tmp/stub.sh")).launch_prefix_len(),
+            2
+        );
+    }
+
+    /// An npm-installed `claude` on Windows is `claude.cmd`, which
+    /// `CreateProcessW` rejects with `ERROR_BAD_EXE_FORMAT` (193). The
+    /// adapter has to hand it to `cmd.exe` instead, and the tokens it adds
+    /// have to lead the ones it was already going to pass.
+    #[cfg(windows)]
+    #[test]
+    fn a_cmd_shim_is_launched_through_cmd_exe_with_its_arguments_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("claude.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let adapter = ClaudeAdapter::new(Some(&shim.display().to_string()));
+        let cmd = adapter.interactive_cmd(Some("resume this"), &["--continue".to_string()]);
+
+        assert!(
+            cmd.get_program()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("cmd"),
+            "got {:?}",
+            cmd.get_program()
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "/c".to_string(),
+                shim.display().to_string(),
+                "resume this".to_string(),
+                "--continue".to_string(),
+            ]
+        );
+        assert_eq!(
+            adapter.launch_prefix_len(),
+            1,
+            "and the rewrite never changes what exec strips off the operator's argv"
+        );
+    }
+
+    /// The rewrite is a Windows concern only: everywhere else the program is
+    /// spawned exactly as written, shebang and all.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_program_is_spawned_exactly_as_written_off_windows() {
+        let adapter = ClaudeAdapter::new(Some("/opt/claude.cmd"));
+        let cmd = adapter.interactive_cmd(Some("resume this"), &[]);
+        assert_eq!(cmd.get_program().to_string_lossy(), "/opt/claude.cmd");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["resume this".to_string()]);
     }
 }

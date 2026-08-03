@@ -22,6 +22,124 @@ const DEFAULT_SIZE: (u16, u16) = (80, 24);
 // ask-then-escalate shape.
 const QUIT_GRACE: Duration = Duration::from_secs(5);
 
+/// A Cursor Position Report for row 1, column 1 -- the reply a terminal sends
+/// when something asks it where the cursor is with `ESC[6n`.
+///
+/// DO NOT DELETE THIS. portable-pty 0.9.0 creates every Windows pseudoconsole
+/// with `PSUEDOCONSOLE_INHERIT_CURSOR` hard-coded (portable-pty
+/// `src/win/psuedocon.rs`, not reachable through `openpty`). That flag makes
+/// conhost emit `ESC[6n` on the pty and then *block* until a Cursor Position
+/// Report comes back on the pty's input pipe -- before it services the child at
+/// all. Nothing in `wrap` ever answered, so every wrapped command hung forever
+/// on Windows; even `wrap --no-supervise -- cmd /c exit 0` never exited.
+/// Writing this one synthetic reply into the master unblocks the console host.
+///
+/// It is written once per pty generation, which includes the relaunch path: a
+/// restart opens a brand-new pseudoconsole that deadlocks exactly the same way.
+///
+/// It stays even now that raw mode works and a real terminal could answer for
+/// itself, because `wrap` also has to run with stdin redirected (CI, a pipe),
+/// where there is no terminal to answer at all. `CprFilter` below keeps the two
+/// replies from colliding.
+#[cfg(windows)]
+const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
+
+/// Answers the `PSUEDOCONSOLE_INHERIT_CURSOR` probe described on
+/// `CURSOR_POSITION_REPORT`. A no-op everywhere else: no other platform's pty
+/// asks anything before it will run a child.
+fn answer_inherit_cursor_probe(writer: &mut (dyn Write + Send)) {
+    #[cfg(windows)]
+    {
+        let _ = writer.write_all(CURSOR_POSITION_REPORT);
+        let _ = writer.flush();
+    }
+    #[cfg(not(windows))]
+    let _ = writer;
+}
+
+/// How long after a pty is opened a Cursor Position Report arriving on stdin is
+/// assumed to be the answer to that pty's own `ESC[6n`. Generous: it covers a
+/// terminal that is slow to answer, and still expires long before a TUI could
+/// plausibly ask for the cursor itself and want the reply.
+#[cfg(windows)]
+const CPR_FILTER_WINDOW: Duration = Duration::from_secs(3);
+
+/// Swallows the *real* terminal's answer to the console-host probe.
+///
+/// `wrap` forwards the inner pty's output verbatim, so the `ESC[6n` from
+/// `CURSOR_POSITION_REPORT`'s story also reaches the user's own terminal, which
+/// -- now that raw mode works -- dutifully answers it on our stdin. The inner
+/// console was already satisfied by the synthetic reply, so forwarding that
+/// answer would type `ESC[24;1R` into the agent's TUI as if the user had. One
+/// report per pty generation is dropped, and only inside a short window after
+/// that pty opened, so a report the agent itself asked for later still arrives.
+#[derive(Debug, Default)]
+pub struct CprFilter {
+    armed_until: Option<Instant>,
+}
+
+impl CprFilter {
+    /// Armed on Windows only: no other platform's pty sends the probe, so on
+    /// unix this filter is permanently inert and stdin is passed through byte
+    /// for byte.
+    pub fn arm(&mut self, now: Instant) {
+        #[cfg(windows)]
+        {
+            self.armed_until = Some(now + CPR_FILTER_WINDOW);
+        }
+        #[cfg(not(windows))]
+        let _ = now;
+    }
+
+    /// Returns the bytes to forward. Borrows unless something was actually
+    /// removed, so the common path copies nothing.
+    pub fn filter<'a>(&mut self, bytes: &'a [u8], now: Instant) -> std::borrow::Cow<'a, [u8]> {
+        let Some(until) = self.armed_until else {
+            return std::borrow::Cow::Borrowed(bytes);
+        };
+        if now >= until {
+            self.armed_until = None;
+            return std::borrow::Cow::Borrowed(bytes);
+        }
+        let Some(range) = find_cursor_position_report(bytes) else {
+            return std::borrow::Cow::Borrowed(bytes);
+        };
+        // One report is all the probe can produce; anything later in this
+        // session is the agent's own business.
+        self.armed_until = None;
+        let mut kept = Vec::with_capacity(bytes.len() - range.len());
+        kept.extend_from_slice(&bytes[..range.start]);
+        kept.extend_from_slice(&bytes[range.end..]);
+        std::borrow::Cow::Owned(kept)
+    }
+}
+
+/// Locates one `ESC [ <rows> ; <cols> R` in `bytes`. Deliberately strict about
+/// the shape: anything else beginning with `ESC[` is a key the user pressed.
+fn find_cursor_position_report(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        if bytes[at] != 0x1b || bytes[at + 1] != b'[' {
+            at += 1;
+            continue;
+        }
+        let mut cursor = at + 2;
+        let mut digits = 0;
+        let mut semicolons = 0;
+        while let Some(byte) = bytes.get(cursor) {
+            match byte {
+                b'0'..=b'9' => digits += 1,
+                b';' => semicolons += 1,
+                b'R' if digits > 0 && semicolons == 1 => return Some(at..cursor + 1),
+                _ => break,
+            }
+            cursor += 1;
+        }
+        at += 1;
+    }
+    None
+}
+
 #[derive(Debug, clap::Args)]
 pub struct WrapArgs {
     /// Adapter name: claude or codex. Detected from the command when omitted.
@@ -386,6 +504,30 @@ fn relaunch_command(
     adapter.interactive_cmd(Some(&restart_prompt(handoff)), extra)
 }
 
+/// The user's own flags, minus everything a restart regenerates for itself.
+///
+/// Delegates to `exec::extra_launch_flags` rather than reimplementing it: both
+/// verbs have to agree on what escaping a rotted session means, and `exec`
+/// already covers `--session-id`, `--resume`, `-c`, `--continue`,
+/// `--fork-session` and their `=`-bound spellings.
+///
+/// `wrap`'s argv always names the program it spawns -- an empty one is rejected
+/// before this is reached -- so the prefix is the adapter's own launch prefix,
+/// with the same fallback `exec` uses for an argv that opens with a flag. No
+/// `known_prompt`: wrap's initial prompt is positional, and the leading
+/// positionals are dropped by `extra_launch_flags` on shape alone.
+fn restart_launch_flags(adapter: &dyn AgentAdapter, launch_command: &[String]) -> Vec<String> {
+    let prefix = if launch_command
+        .first()
+        .is_none_or(|first| first.starts_with('-'))
+    {
+        0
+    } else {
+        adapter.launch_prefix_len()
+    };
+    super::exec::extra_launch_flags(launch_command, prefix, None)
+}
+
 fn relaunch(
     adapter: &dyn AgentAdapter,
     repo: &Path,
@@ -412,10 +554,16 @@ fn relaunch(
     for (key, value) in turn_env {
         builder.env(key, value);
     }
+
+    // Before the spawn, and before anything else touches this pty: on Windows
+    // the console host will not service the child at all until it is answered.
+    // A restart opens a fresh pseudoconsole, so it re-deadlocks without this.
+    let mut writer = pair.master.take_writer()?;
+    answer_inherit_cursor_probe(&mut *writer);
+
     let child = pair.slave.spawn_command(builder)?;
 
     let reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
 
     Ok((pair, child, reader, writer))
 }
@@ -577,14 +725,21 @@ pub fn run_with<W: Write>(
         command.env(key, value);
     }
 
-    let mut child = pair.slave.spawn_command(command)?;
-
-    let reader = pair.master.try_clone_reader()?;
     // One writer, shared: the stdin pump and (from Task C4) the injector both
     // need it, and `take_writer` can only be called once. Its contents (not
     // the Arc itself) get swapped out on a restart, so every holder of this
     // Arc transparently starts writing to the fresh pty.
-    let writer = std::sync::Arc::new(std::sync::Mutex::new(pair.master.take_writer()?));
+    //
+    // Taken before the spawn rather than after it, because on Windows the
+    // console host has to be answered before it will service the child at all
+    // -- see `CURSOR_POSITION_REPORT`.
+    let mut first_writer = pair.master.take_writer()?;
+    answer_inherit_cursor_probe(&mut *first_writer);
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(first_writer));
+
+    let mut child = pair.slave.spawn_command(command)?;
+
+    let reader = pair.master.try_clone_reader()?;
     let (tx, rx) = mpsc::channel::<PumpEvent>();
     // Bumped on every restart so a stale reader thread from an abandoned pty
     // never reports a false PtyClosed for the pty that replaced it.
@@ -593,9 +748,18 @@ pub fn run_with<W: Write>(
     // PTY to stdout.
     spawn_output_thread(reader, tx.clone(), generation.clone(), 0);
 
+    // Armed for the pty just opened, and re-armed by `pump` for every pty a
+    // restart opens after it.
+    let cpr_filter = std::sync::Arc::new(std::sync::Mutex::new(CprFilter::default()));
+    cpr_filter
+        .lock()
+        .map_err(|_| "cpr filter poisoned")?
+        .arm(Instant::now());
+
     // stdin to PTY.
     let input_tx = tx.clone();
     let input_writer = std::sync::Arc::clone(&writer);
+    let input_filter = std::sync::Arc::clone(&cpr_filter);
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut stdin = std::io::stdin();
@@ -603,14 +767,26 @@ pub fn run_with<W: Write>(
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
+                    // The console host's own probe was already answered
+                    // synthetically; the terminal's duplicate answer must not
+                    // reach the agent as keystrokes.
+                    let bytes = {
+                        let Ok(mut filter) = input_filter.lock() else {
+                            return;
+                        };
+                        filter.filter(&buf[..n], Instant::now())
+                    };
+                    if bytes.is_empty() {
+                        continue;
+                    }
                     let Ok(mut sink) = input_writer.lock() else {
                         return;
                     };
-                    if sink.write_all(&buf[..n]).is_err() || sink.flush().is_err() {
+                    if sink.write_all(&bytes).is_err() || sink.flush().is_err() {
                         return;
                     }
                     drop(sink);
-                    if input_tx.send(PumpEvent::Input(n)).is_err() {
+                    if input_tx.send(PumpEvent::Input(bytes.len())).is_err() {
                         return;
                     }
                 }
@@ -627,9 +803,17 @@ pub fn run_with<W: Write>(
 
     // Carried into `relaunch_command` too, so a restart does not silently drop
     // the injected prompt the first command already carries.
-    let relaunch_extra: Vec<String> = rest
-        .iter()
-        .cloned()
+    //
+    // Not the raw argv: a restart is a deliberate escape from the conversation
+    // that rotted, so anything pinning the launch to it (`--continue`,
+    // `--resume <id>`, `--session-id <id>`, `--fork-session`, and their
+    // `=`-bound spellings) has to go, or `wrap -- claude --continue` relaunches
+    // straight back into the session it was leaving and burns the restart
+    // budget doing it. `exec` already worked this out; this is that same
+    // function, and the positional prompt it also strips is one `relaunch`
+    // regenerates from the handoff anyway.
+    let relaunch_extra: Vec<String> = restart_launch_flags(adapter.as_ref(), &launch_command)
+        .into_iter()
         .chain(prompt_args.iter().cloned())
         .collect();
 
@@ -655,6 +839,7 @@ pub fn run_with<W: Write>(
         generation,
         &relaunch_extra,
         &turn_env,
+        &cpr_filter,
     );
 
     if let Some(guard) = raw.as_mut() {
@@ -693,6 +878,7 @@ fn pump(
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     extra: &[String],
     turn_env: &[(String, String)],
+    cpr_filter: &std::sync::Arc<std::sync::Mutex<CprFilter>>,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
 
@@ -787,15 +973,6 @@ fn pump(
             Action::Restart => {
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
 
-                // Bumped before the old child is even asked to quit: its
-                // reader thread's own EOF can land at any point from here on
-                // (quit_child alone may take up to `grace`), and once bumped
-                // that thread's `still_current` check is already false, so a
-                // pty closing on its way out can never be mistaken for the
-                // fresh one that is about to replace it.
-                let new_generation =
-                    generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-
                 let jsonl = transcript
                     .path()
                     .map(|path| std::fs::read_to_string(path).unwrap_or_default())
@@ -809,36 +986,65 @@ fn pump(
                 );
                 let stored = handoff::store(state_dir, repo, session.as_str(), &note);
 
-                let quit = writer
-                    .lock()
-                    .map_err(|_| "pty writer poisoned".to_string())
-                    .and_then(|mut sink| {
-                        quit_child(&mut *sink, child, adapter.quit_sequence(), grace)
-                            .map_err(|e| e.to_string())
-                    });
+                // The writer is taken first, and the generation is bumped only
+                // once this restart is genuinely under way. The two used to be
+                // the other way round, which meant a poisoned writer -- the
+                // one way `quit` can fail -- left the generation bumped over a
+                // child that had never even been asked to quit: `relaunched`
+                // stayed false, the pump fell through to `child.wait()`, and
+                // the old reader thread's `still_current` was already false, so
+                // that very much alive TUI painted to nobody for the rest of
+                // the run.
+                let (new_generation, quit) = match writer.lock() {
+                    Ok(mut sink) => {
+                        // Bumped before the old child is even asked to quit:
+                        // its reader thread's own EOF can land at any point
+                        // from here on (quit_child alone may take up to
+                        // `grace`), and once bumped that thread's
+                        // `still_current` check is already false, so a pty
+                        // closing on its way out can never be mistaken for the
+                        // fresh one that is about to replace it.
+                        let bumped =
+                            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let quit = quit_child(&mut *sink, child, adapter.quit_sequence(), grace)
+                            .map_err(|e| e.to_string());
+                        (Some(bumped), quit)
+                    }
+                    Err(_) => (None, Err("pty writer poisoned".to_string())),
+                };
 
                 // That session is over. Whatever it was writing is now a dead
                 // file, and the replacement reports its own on its first turn.
                 transcript.forget();
 
-                let relaunched = quit.is_ok()
-                    && match relaunch(adapter, repo, &note, extra, turn_env, last_size) {
-                        Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
-                            spawn_output_thread(
-                                fresh_reader,
-                                tx.clone(),
-                                generation.clone(),
-                                new_generation,
-                            );
-                            if let Ok(mut sink) = writer.lock() {
-                                *sink = fresh_writer;
+                let relaunched = match (new_generation, quit.is_ok()) {
+                    (Some(new_generation), true) => {
+                        match relaunch(adapter, repo, &note, extra, turn_env, last_size) {
+                            Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
+                                spawn_output_thread(
+                                    fresh_reader,
+                                    tx.clone(),
+                                    generation.clone(),
+                                    new_generation,
+                                );
+                                if let Ok(mut sink) = writer.lock() {
+                                    *sink = fresh_writer;
+                                }
+                                // The fresh pty ran its own console-host probe,
+                                // so the terminal is about to answer that one
+                                // too; see `CprFilter`.
+                                if let Ok(mut filter) = cpr_filter.lock() {
+                                    filter.arm(Instant::now());
+                                }
+                                *pair = fresh_pair;
+                                *child = fresh_child;
+                                true
                             }
-                            *pair = fresh_pair;
-                            *child = fresh_child;
-                            true
+                            Err(_) => false,
                         }
-                        Err(_) => false,
-                    };
+                    }
+                    _ => false,
+                };
 
                 if !relaunched {
                     note_failure(
@@ -907,7 +1113,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn zirv_bin() -> PathBuf {
         // cargo test builds the bin target, so it sits next to the test binary's
         // grandparent directory (target/debug/deps/<test> -> target/debug/zirv).
@@ -2317,6 +2523,256 @@ mod tests {
         writer.write_all(b"/exit\r").expect("write");
         let status = child.wait().expect("wait");
         assert_eq!(status.exit_code(), 0);
+    }
+
+    /// A restart is an escape from the conversation that rotted, so nothing
+    /// that pins the launch back to it may survive into the relaunched argv.
+    /// Before this, `wrap -- claude --continue` relaunched as `claude
+    /// "<handoff>" --continue` and resumed the very session it was leaving.
+    mod restart_flags {
+        use super::*;
+        use crate::commands::ctx::adapters;
+
+        fn flags_for(argv: &[&str]) -> Vec<String> {
+            let command: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+            let adapter = adapters::select(Some("claude"), &command, None).expect("claude adapter");
+            restart_launch_flags(adapter.as_ref(), &command)
+        }
+
+        #[test]
+        fn a_relaunch_drops_every_flag_that_would_resume_the_rotted_session() {
+            assert!(flags_for(&["claude", "--continue"]).is_empty());
+            assert!(flags_for(&["claude", "-c"]).is_empty());
+            assert!(flags_for(&["claude", "--fork-session"]).is_empty());
+            assert!(flags_for(&["claude", "--resume", "abc123"]).is_empty());
+            assert!(flags_for(&["claude", "--session-id", "abc123"]).is_empty());
+        }
+
+        /// The CLIs accept `--resume=abc` too, so stripping only the two-token
+        /// spelling would leave the other behind.
+        #[test]
+        fn the_joined_spelling_of_a_resume_flag_is_dropped_as_well() {
+            assert!(flags_for(&["claude", "--resume=abc123"]).is_empty());
+            assert!(flags_for(&["claude", "--session-id=abc123"]).is_empty());
+        }
+
+        /// Everything else the operator passed has to reach the restarted
+        /// child exactly as it reached the first one.
+        #[test]
+        fn a_relaunch_keeps_the_operator_flags_that_are_not_about_resuming() {
+            assert_eq!(
+                flags_for(&["claude", "--model", "opus", "--continue"]),
+                vec!["--model".to_string(), "opus".to_string()]
+            );
+            assert_eq!(
+                flags_for(&["claude", "--dangerously-skip-permissions"]),
+                vec!["--dangerously-skip-permissions".to_string()]
+            );
+        }
+
+        /// `relaunch_command` supplies the handoff positionally, so a
+        /// positional prompt from the original argv must not come back too --
+        /// the agent would read it as a second prompt.
+        #[test]
+        fn a_positional_prompt_is_not_replayed_into_the_relaunch() {
+            assert!(flags_for(&["claude", "fix the parser"]).is_empty());
+            assert_eq!(
+                flags_for(&["claude", "fix the parser", "--model", "opus"]),
+                vec!["--model".to_string(), "opus".to_string()]
+            );
+        }
+    }
+
+    /// The `ESC[6n` story: see `CURSOR_POSITION_REPORT`.
+    mod cursor_position_report {
+        use super::*;
+
+        #[test]
+        fn a_cursor_position_report_is_recognised_wherever_it_sits_in_a_chunk() {
+            assert_eq!(find_cursor_position_report(b"\x1b[1;1R"), Some(0..6));
+            assert_eq!(find_cursor_position_report(b"ab\x1b[24;80Rcd"), Some(2..10));
+        }
+
+        /// Every other escape sequence is a key the user pressed and has to
+        /// reach the agent untouched.
+        #[test]
+        fn ordinary_keys_are_never_mistaken_for_a_cursor_report() {
+            assert_eq!(find_cursor_position_report(b"\x1b[A"), None, "up arrow");
+            assert_eq!(find_cursor_position_report(b"\x1b[3~"), None, "delete");
+            assert_eq!(find_cursor_position_report(b"\x1b"), None, "bare escape");
+            assert_eq!(find_cursor_position_report(b"\x1b[R"), None, "no row");
+            assert_eq!(
+                find_cursor_position_report(b"\x1b[12R"),
+                None,
+                "a report has two parameters"
+            );
+            assert_eq!(find_cursor_position_report(b"hello"), None);
+        }
+
+        /// An unarmed filter is a pure passthrough, which is the whole of its
+        /// behavior on unix: no pty there sends the probe.
+        #[test]
+        fn an_unarmed_filter_forwards_everything() {
+            let mut filter = CprFilter::default();
+            let out = filter.filter(b"\x1b[1;1R", Instant::now());
+            assert_eq!(out.as_ref(), b"\x1b[1;1R");
+            assert!(matches!(out, std::borrow::Cow::Borrowed(_)), "no copy");
+        }
+
+        #[cfg(not(windows))]
+        #[test]
+        fn arming_is_inert_off_windows() {
+            let mut filter = CprFilter::default();
+            filter.arm(Instant::now());
+            assert_eq!(
+                filter.filter(b"\x1b[1;1R", Instant::now()).as_ref(),
+                b"\x1b[1;1R"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn an_armed_filter_swallows_exactly_one_report_and_keeps_the_rest() {
+            let mut filter = CprFilter::default();
+            filter.arm(Instant::now());
+
+            // The terminal's answer to the console host's probe, with a real
+            // keystroke riding along in the same read.
+            let out = filter.filter(b"\x1b[24;1Rq", Instant::now());
+            assert_eq!(out.as_ref(), b"q", "only the report is removed");
+
+            // The next one is the agent's own business.
+            assert_eq!(
+                filter.filter(b"\x1b[2;3R", Instant::now()).as_ref(),
+                b"\x1b[2;3R"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn an_armed_filter_stops_filtering_once_its_window_has_passed() {
+            let mut filter = CprFilter::default();
+            filter.arm(Instant::now() - CPR_FILTER_WINDOW - Duration::from_secs(1));
+            assert_eq!(
+                filter.filter(b"\x1b[1;1R", Instant::now()).as_ref(),
+                b"\x1b[1;1R",
+                "a late report belongs to the agent"
+            );
+        }
+    }
+
+    /// Windows coverage for the pty deadlock. Every one of these bounds its own
+    /// wait: a regression here used to hang forever, and a hanging test in CI
+    /// is indistinguishable from a slow one.
+    #[cfg(windows)]
+    mod win {
+        use super::*;
+
+        /// Waits for `child`, killing it and returning `None` past `timeout` so
+        /// a re-deadlocked `wrap` fails the test instead of wedging the suite.
+        fn wait_bounded(
+            child: &mut std::process::Child,
+            timeout: Duration,
+        ) -> Option<std::process::ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(status)) => return Some(status),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(_) => return None,
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+
+        fn spawn_wrap(
+            state: &std::path::Path,
+            flags: &[&str],
+            wrapped: &[&str],
+        ) -> std::process::Child {
+            let mut cmd = std::process::Command::new(zirv_bin());
+            cmd.arg("ctx").arg("wrap");
+            cmd.args(flags);
+            cmd.arg("--");
+            cmd.args(wrapped);
+            cmd.env(crate::commands::ctx::state::STATE_ENV, state);
+            // No terminal: this is also the CI/piped case, which is exactly
+            // why the synthetic cursor report cannot be left to a real
+            // terminal to send.
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            cmd.spawn().expect("spawn zirv ctx wrap")
+        }
+
+        /// The regression that shipped: portable-pty's pseudoconsole asks for a
+        /// cursor position report and blocks until it gets one, so *every*
+        /// wrapped command hung -- this one does nothing but exit.
+        #[test]
+        fn a_wrapped_command_that_exits_immediately_does_not_hang_the_wrapper() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut child =
+                spawn_wrap(tmp.path(), &["--no-supervise"], &["cmd", "/c", "exit", "0"]);
+            let status = wait_bounded(&mut child, Duration::from_secs(30))
+                .expect("wrap must exit, not deadlock on the console host's cursor probe");
+            assert_eq!(status.code(), Some(0), "the child's own exit code");
+        }
+
+        /// The wrapped command's exit code is the wrapper's, so a
+        /// pseudoconsole that never ran the child cannot masquerade as success.
+        #[test]
+        fn a_wrapped_command_reports_its_own_failing_exit_code() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut child =
+                spawn_wrap(tmp.path(), &["--no-supervise"], &["cmd", "/c", "exit", "3"]);
+            let status = wait_bounded(&mut child, Duration::from_secs(30))
+                .expect("wrap must exit rather than deadlock");
+            assert_eq!(status.code(), Some(3));
+        }
+
+        /// Supervision used to be off for the entire run on Windows: the turn
+        /// signal had no transport, so `bind` failed and `wrap` degraded before
+        /// the agent had even started. The named pipe is what fixes that, and a
+        /// bound server leaves the same directory entry unix does.
+        #[test]
+        fn a_supervised_wrap_binds_a_turn_signal_transport() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = tmp.path().join("state");
+            let mut child = spawn_wrap(
+                &state,
+                &["--agent", "claude"],
+                // Long enough to still be running when the assertion below
+                // looks for the socket entry, short enough to reap itself if
+                // the kill somehow misses.
+                &["cmd", "/c", "ping -n 20 127.0.0.1 >NUL"],
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut sockets = Vec::new();
+            while Instant::now() < deadline && sockets.is_empty() {
+                sockets = std::fs::read_dir(state.join("s"))
+                    .map(|entries| entries.flatten().map(|e| e.path()).collect())
+                    .unwrap_or_default();
+                if sockets.is_empty() {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert_eq!(
+                sockets.len(),
+                1,
+                "a supervised wrap publishes exactly one turn-signal endpoint"
+            );
+            let published = std::fs::read_to_string(&sockets[0]).expect("read");
+            assert!(
+                published.starts_with(r"\\.\pipe\zirv-ctx-"),
+                "the endpoint is a named pipe: {published}"
+            );
+        }
     }
 
     #[cfg(unix)]

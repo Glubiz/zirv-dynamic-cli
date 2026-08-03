@@ -33,6 +33,20 @@ tempfile = "3.27.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.183"
 
+# Already in the tree transitively (console, dirs-sys, mio, tempfile all pull
+# it); named here so `ctx wrap` can call the console-mode and named-pipe APIs
+# directly instead of adding a second, redundant win32 binding crate.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [profile.release]
 opt-level       = "z"
 lto             = true

@@ -10,3 +10,4 @@ shortcuts:
   tc: test-capture.yaml
   tof: test-on_failure.yaml
   ts: test-secret.yaml
+  cl: claude.yaml
