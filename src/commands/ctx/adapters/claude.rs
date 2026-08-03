@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -8,7 +12,52 @@ use super::super::event::input_hash;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext,
 };
-use super::{AgentAdapter, TurnSignalSetup};
+use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
+
+/// Claude Code's own base layer, injected on every claude session zirv starts
+/// (see `AgentAdapter::base_system_prompt`). Claude-specific by construction:
+/// it names the Agent tool, `.claude/agents` and the `/code-review` skill, so
+/// handing it to another agent would be handing it instructions about tools
+/// that agent does not have.
+///
+/// Deliberately model-agnostic. It says "the model in this seat" and "the
+/// most capable tier" rather than naming a lineup, because a hard-coded
+/// lineup ages out of correctness the moment models are renamed, and because
+/// model choice stays the operator's: this text never asks for `--model`.
+pub const ORCHESTRATOR_PROMPT: &str = "\
+zirv orchestrator conventions (claude)
+
+You are an orchestrator. Coordination and judgment are the job, implementation is not: the \
+orchestrator model is reserved for this seat, so delegate every substantive piece of work \
+(codebase exploration, implementation, testing, review) to subagents via the Agent tool and keep \
+your own context lean for planning, sequencing and integration.
+
+- Bundle before you dispatch. Every spawn has a real startup cost, so never start an agent for one \
+tiny task. Group small related tasks (same file or area, or a natural sequence) into a single \
+checklist brief for one agent, with a per-item output format. Split across agents only when the \
+tasks are independent and each side is substantial, then dispatch them in one message and prefer \
+background dispatch so a slow worker blocks nothing. For a small follow-up in an area a worker \
+just handled, continue that worker instead of spawning a fresh one.
+- Route each dispatch to the cheapest model that can do the job, always cheaper than the model in \
+this seat: the cheapest tier for mechanical and bulk work, a middle tier for ordinary exploration, \
+implementation and test writing, and the most capable tier only for hard debugging and design \
+exploration. Agents defined in .claude/agents pin their own models; do not override those.
+- Write self-contained briefs. Subagents share none of your context, so state the goal, the \
+constraints, the relevant file paths and the exact output format expected, and nothing else. Ask \
+for compact structured findings, never raw file dumps.
+- Decide rather than let a worker loop. Workers execute; choices between valid designs, \
+architecture changes, and anything a worker has failed at twice come back to you. Do not read \
+large files or write code yourself unless the change is trivial.
+- Hold implementers to this repository's standards: follow the patterns already there, look for \
+reusable code before adding new code, write a failing test first, keep diffs minimal, and run the \
+project's format, lint and test commands before reporting back.
+- Verify in batches: one independent reviewer gate per batch of related changes, not one per \
+micro-task. You own the final integration, so resolve conflicts between agent outputs and report \
+outcomes, including failures, plainly.
+- Finish every development task with a full-diff review by a dedicated subagent running the \
+/code-review skill, with model and effort scaled to the blast radius of the diff, scaling up when \
+in doubt. Run it only once the other quality gates pass, then triage its findings, fix what is \
+real, and rerun until it is clean before reporting the work done.";
 
 fn text_of(message: &Value) -> String {
     message
@@ -213,6 +262,12 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     keep_last(&mut out.user_messages, last_n);
     keep_last(&mut out.assistant_texts, last_n);
     keep_last(&mut out.tool_errors, last_n);
+    // Capped with everything else rather than left to accumulate: this is a
+    // deduplicated list of every path the whole session ever named, and it
+    // leaves as a single argv token in a handoff. Windows caps a command line
+    // at 32,767 characters, so an uncapped list is a long session that can no
+    // longer relaunch at all.
+    keep_last(&mut out.files_touched, last_n);
     out
 }
 
@@ -227,6 +282,8 @@ pub struct ClaudeAdapter {
     program: String,
     bin_args: Vec<String>,
     home: Option<PathBuf>,
+    #[cfg(test)]
+    forced_file_support: Option<bool>,
 }
 
 impl ClaudeAdapter {
@@ -241,6 +298,8 @@ impl ClaudeAdapter {
             program,
             bin_args: parts.collect(),
             home: None,
+            #[cfg(test)]
+            forced_file_support: None,
         }
     }
 
@@ -251,10 +310,26 @@ impl ClaudeAdapter {
         self
     }
 
+    /// Test seam: bypasses the real `--help` probe so a unit test can force
+    /// file-based or argv-based delivery without depending on the machine's
+    /// installed binary.
+    #[cfg(test)]
+    pub fn with_file_support_forced(mut self, supported: bool) -> Self {
+        self.forced_file_support = Some(supported);
+        self
+    }
+
     /// Every command starts here so the program and its leading arguments are
-    /// applied uniformly to headless, interactive and distiller invocations.
+    /// applied uniformly to headless, interactive and distiller invocations,
+    /// and so the Windows launcher rewrite (an npm-installed `claude` is
+    /// `claude.cmd`, which `CreateProcess` refuses) is applied in exactly one
+    /// place. A program zirv cannot resolve is spawned as written, which is
+    /// today's behavior; `ready()` is where an unrunnable one is reported.
     fn base(&self) -> Command {
-        let mut cmd = Command::new(&self.program);
+        let resolved = super::resolve_program(&self.program)
+            .unwrap_or_else(|_| ResolvedProgram::direct(&self.program));
+        let mut cmd = Command::new(&resolved.program);
+        cmd.args(&resolved.prefix);
         cmd.args(&self.bin_args);
         cmd
     }
@@ -265,6 +340,104 @@ impl ClaudeAdapter {
             .or_else(|| crate::utils::home_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
     }
+}
+
+/// Bounds the `--help` probe below: a hang here must never hang the whole
+/// launch, which would be a worse failure mode than falling back to argv.
+const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Process-wide cache of `probe_system_prompt_file_support`'s answer, keyed
+/// by the exact program invocation: the binary path plus its leading
+/// arguments, since `ZIRV_CTX_AGENT_BIN` can point at different binaries (or
+/// different versions of the same name resolved from a different PATH) and
+/// each has its own answer. A restart inside the same `wrap`/`exec` run must
+/// not re-spawn `--help` on every relaunch, which is what the cache is for;
+/// it must not, in exchange, let one binary's probe answer for another's.
+/// A tuple key rather than a joined string: joining `program` and `bin_args`
+/// with spaces makes `("sh /tmp/x", ["--help"])` and `("sh", ["/tmp/x",
+/// "--help"])` collide on the same string despite being different commands.
+type ProbeKey = (PathBuf, Vec<String>);
+static SYSTEM_PROMPT_FILE_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
+
+/// Probes the installed binary's own `--help` text for the file-based
+/// system-prompt flag, so injection can move the composed prompt off argv
+/// (visible to any other user on the machine via `ps`) without hard-coding a
+/// version cutoff. Any failure to run or read the probe (binary missing,
+/// timeout, whatever) is read as unsupported: this is a hardening on top of
+/// argv delivery, never a new way to fail a launch.
+fn probe_system_prompt_file_support(program: &str, bin_args: &[String]) -> bool {
+    let key = (PathBuf::from(program), bin_args.to_vec());
+    let cache = SYSTEM_PROMPT_FILE_SUPPORT.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = cache.lock() else {
+        return false;
+    };
+    if let Some(cached) = map.get(&key) {
+        return *cached;
+    }
+    let detected = detect_help_flag(program, bin_args);
+    map.insert(key, detected);
+    detected
+}
+
+/// Verified against the real CLI (`claude --help`, v2.1.220): the flag is not
+/// spelled out on its own line. It only appears folded into a shorthand,
+/// `--append-system-prompt[-file]`, inside the `--bare` option's own
+/// description ("Explicitly provide context via: --system-prompt[-file],
+/// --append-system-prompt[-file], --add-dir ..."). Stripping `[` and `]`
+/// before searching turns that shorthand into the plain flag text, and is a
+/// no-op if some future help output ever spells the flag out on its own.
+fn normalizes_to_advertise_the_file_flag(help_text: &str) -> bool {
+    help_text
+        .replace(['[', ']'], "")
+        .contains("--append-system-prompt-file")
+}
+
+/// Runs `program --help` and reports whether its output names
+/// `--append-system-prompt-file`. Stdin is nulled so an interactive TUI that
+/// does not special-case `--help` (and just starts reading a line) gets an
+/// immediate EOF instead of hanging the probe; stdout is drained on a
+/// separate thread so a chatty `--help` cannot deadlock against the wait
+/// loop by filling the pipe buffer.
+fn detect_help_flag(program: &str, bin_args: &[String]) -> bool {
+    // The same resolution the launch itself uses. Without it the probe and
+    // the spawn disagree on Windows: `Command::new` only ever appends `.exe`,
+    // so an npm-installed `claude.cmd` failed the probe here and then failed
+    // the launch there, for two different reasons.
+    let resolved =
+        super::resolve_program(program).unwrap_or_else(|_| ResolvedProgram::direct(program));
+    let Ok(mut child) = Command::new(&resolved.program)
+        .args(&resolved.prefix)
+        .args(bin_args)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let mut stdout_pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let deadline = Instant::now() + HELP_PROBE_TIMEOUT;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+            return normalizes_to_advertise_the_file_flag(&text);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 /// Claude stores transcripts under a slug of the cwd with every character
@@ -287,7 +460,14 @@ impl AgentAdapter for ClaudeAdapter {
         "claude"
     }
 
+    /// The one thing that can make this adapter unusable before it is asked
+    /// to do anything: a program that resolves to a file this OS has no way
+    /// to execute. Reported here, by name, rather than left to surface as a
+    /// raw `os error 193` out of the spawn. A program that resolves to
+    /// nothing at all is not an error here: that is the OS's own
+    /// "not found", raised at spawn time where it has always been raised.
     fn ready(&self) -> CtxResult<()> {
+        super::resolve_program(&self.program)?;
         Ok(())
     }
 
@@ -327,6 +507,35 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn user_system_prompt_flag(&self) -> Option<&'static str> {
         Some("--append-system-prompt")
+    }
+
+    fn system_prompt_file_flag(&self) -> Option<&'static str> {
+        Some("--append-system-prompt-file")
+    }
+
+    fn base_system_prompt(&self) -> Option<&'static str> {
+        Some(ORCHESTRATOR_PROMPT)
+    }
+
+    /// Counted over the argv the operator wrote, not over the argv `base()`
+    /// builds: `exec` uses this to strip the program tokens off the command
+    /// it was handed before carrying the rest into a restart. The Windows
+    /// launcher rewrite lives entirely inside `base()` and never touches that
+    /// argv, so the prefix stays the program plus its own leading arguments.
+    fn launch_prefix_len(&self) -> usize {
+        1 + self.bin_args.len()
+    }
+
+    fn supports_system_prompt_file(&self, launch: &[String]) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_file_support {
+            return forced;
+        }
+        // The binary that is about to run, not the one this adapter would
+        // have chosen: wrap spawns the user's own argv.
+        let (program, args) = super::program_invocation(launch)
+            .unwrap_or_else(|| (self.program.clone(), self.bin_args.clone()));
+        probe_system_prompt_file_support(&program, &args)
     }
 
     /// The distillation prompt is piped to stdin so a long transcript tail
@@ -617,6 +826,26 @@ mod tests {
         assert_eq!(parse_events(jsonl), vec![NormalizedEvent::TurnStart]);
     }
 
+    /// The invariant the incremental scoring path rests on (see the
+    /// `parse_events` contract on `AgentAdapter`): this parser is line-local,
+    /// so a transcript cut at newlines and parsed piecewise yields exactly the
+    /// events one parse of the whole file yields.
+    #[test]
+    fn parsing_a_transcript_in_pieces_yields_the_same_events() {
+        let jsonl =
+            std::fs::read_to_string(fixture_path("claude-real-session.jsonl")).expect("fixture");
+        let whole = parse_events(&jsonl);
+        let lines: Vec<&str> = jsonl.lines().collect();
+
+        for chunk in [1, 3, 17] {
+            let pieced: Vec<NormalizedEvent> = lines
+                .chunks(chunk)
+                .flat_map(|piece| parse_events(&format!("{}\n", piece.join("\n"))))
+                .collect();
+            assert_eq!(pieced, whole, "in pieces of {chunk} lines");
+        }
+    }
+
     #[test]
     fn real_fixture_matches_recorded_expectations() {
         let jsonl =
@@ -679,6 +908,20 @@ mod tests {
 
     use crate::commands::ctx::adapters::{AgentAdapter, SESSION_ENV, SOCKET_ENV};
     use crate::commands::ctx::event::{SessionId, SessionRef};
+
+    /// The flags an adapter-built command carries, with any launcher prefix
+    /// dropped. On a Windows machine where `claude` is an npm `.cmd` shim
+    /// every command this adapter builds starts `cmd.exe /c <shim>`, and
+    /// those tokens are not what a test about agent flags is asserting on.
+    fn built_args(adapter: &ClaudeAdapter, cmd: &Command) -> Vec<String> {
+        let launcher = super::super::resolve_program(&adapter.program)
+            .map(|resolved| resolved.prefix.len())
+            .unwrap_or(0);
+        cmd.get_args()
+            .skip(launcher)
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
 
     #[test]
     fn project_slug_matches_on_disk_evidence() {
@@ -756,30 +999,21 @@ mod tests {
     fn interactive_cmd_passes_the_initial_prompt_positionally() {
         let adapter = ClaudeAdapter::new(None);
         let with = adapter.interactive_cmd(Some("resume this"), &[]);
-        let args: Vec<String> = with
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(args, vec!["resume this".to_string()]);
+        assert_eq!(built_args(&adapter, &with), vec!["resume this".to_string()]);
 
         let without = adapter.interactive_cmd(None, &["--continue".to_string()]);
-        let args: Vec<String> = without
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(args, vec!["--continue".to_string()]);
+        assert_eq!(
+            built_args(&adapter, &without),
+            vec!["--continue".to_string()]
+        );
     }
 
     #[test]
     fn distiller_cmd_uses_a_cheap_model_and_reads_stdin() {
         let adapter = ClaudeAdapter::new(None);
         let cmd = adapter.distiller_cmd("haiku");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
         assert_eq!(
-            args,
+            built_args(&adapter, &cmd),
             vec![
                 "-p".to_string(),
                 "--model".to_string(),
@@ -802,10 +1036,7 @@ mod tests {
     fn the_distiller_denies_the_tools_verified_to_matter() {
         let adapter = ClaudeAdapter::new(None);
         let cmd = adapter.distiller_cmd("haiku");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
+        let args = built_args(&adapter, &cmd);
 
         let deny = args
             .iter()
@@ -989,6 +1220,155 @@ mod tests {
     }
 
     #[test]
+    fn the_file_flag_name_is_the_documented_one() {
+        assert_eq!(
+            ClaudeAdapter::new(None).system_prompt_file_flag(),
+            Some("--append-system-prompt-file")
+        );
+    }
+
+    /// Writes a throwaway `--help` stub so the probe can be exercised without
+    /// depending on the machine's actual installed binary. The heredoc keeps
+    /// `help_text` free of shell-escaping concerns. Every caller spawns it via
+    /// `sh`, so it is unix-only like they are.
+    #[cfg(unix)]
+    fn help_stub(dir: &std::path::Path, name: &str, help_text: &str) -> String {
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat <<'EOF'\n{help_text}\nEOF\n"),
+        )
+        .expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        format!("sh {}", script.display())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supports_system_prompt_file_detects_the_flag_from_help_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = help_stub(
+            dir.path(),
+            "probe-yes.sh",
+            "Options:\n  --append-system-prompt-file <path>",
+        );
+        let adapter = ClaudeAdapter::new(Some(&bin));
+        assert!(adapter.supports_system_prompt_file(&[]));
+    }
+
+    /// Verified against the real CLI (`claude --help`, v2.1.220): the flag is
+    /// never spelled out on its own; it only appears folded into this exact
+    /// shorthand, inside the `--bare` option's own description. A probe that
+    /// only looked for the plain flag text would report "unsupported" on the
+    /// very machine this was verified on.
+    #[cfg(unix)]
+    #[test]
+    fn supports_system_prompt_file_detects_the_real_clis_bracket_shorthand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = help_stub(
+            dir.path(),
+            "probe-bracket.sh",
+            "Explicitly provide context via: --system-prompt[-file],\n  \
+             --append-system-prompt[-file], --add-dir (CLAUDE.md dirs)",
+        );
+        let adapter = ClaudeAdapter::new(Some(&bin));
+        assert!(
+            adapter.supports_system_prompt_file(&[]),
+            "must recognize the bracket-shorthand form the real CLI actually uses"
+        );
+    }
+
+    #[test]
+    fn normalizes_to_advertise_the_file_flag_matches_both_spellings() {
+        assert!(normalizes_to_advertise_the_file_flag(
+            "--append-system-prompt[-file] <path>"
+        ));
+        assert!(normalizes_to_advertise_the_file_flag(
+            "--append-system-prompt-file <path>"
+        ));
+        assert!(!normalizes_to_advertise_the_file_flag(
+            "--append-system-prompt <prompt>"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supports_system_prompt_file_is_false_when_help_omits_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = help_stub(dir.path(), "probe-no.sh", "nothing relevant here");
+        let adapter = ClaudeAdapter::new(Some(&bin));
+        assert!(!adapter.supports_system_prompt_file(&[]));
+    }
+
+    #[test]
+    fn supports_system_prompt_file_fails_open_when_the_binary_is_missing() {
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/definitely-not-a-binary"));
+        assert!(
+            !adapter.supports_system_prompt_file(&[]),
+            "a probe failure must never block a launch"
+        );
+    }
+
+    /// M7: "probe... once per launch (cache the result in-process across
+    /// restarts)". Rewriting the stub after the first probe must not change
+    /// the cached answer: a restart inside the same run must never re-spawn
+    /// `--help`.
+    #[cfg(unix)]
+    #[test]
+    fn supports_system_prompt_file_is_cached_after_the_first_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = help_stub(dir.path(), "probe-cache.sh", "--append-system-prompt-file");
+        let adapter = ClaudeAdapter::new(Some(&bin));
+        assert!(adapter.supports_system_prompt_file(&[]));
+
+        let script = dir.path().join("probe-cache.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'nothing now\\n'\n").expect("rewrite stub");
+        assert!(
+            adapter.supports_system_prompt_file(&[]),
+            "the first probe's answer is cached for the life of the process"
+        );
+    }
+
+    /// Regression: the cache used to be keyed by joining `program` and
+    /// `bin_args` into one string, which made two distinct commands collide
+    /// on the same key (e.g. `("sh /a", ["--help"])` and `("sh", ["/a",
+    /// "--help"])` both joined to `"sh /a --help"`). Same `program` ("sh"),
+    /// different `bin_args` (two different scripts, one supporting the flag
+    /// and one not) must be cached independently, not share one answer.
+    #[cfg(unix)]
+    #[test]
+    fn the_cache_key_distinguishes_different_bin_args_for_the_same_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let supports = dir.path().join("supports.sh");
+        std::fs::write(
+            &supports,
+            "#!/bin/sh\ncat <<'EOF'\n--append-system-prompt-file\nEOF\n",
+        )
+        .expect("write");
+        let unsupported = dir.path().join("unsupported.sh");
+        std::fs::write(&unsupported, "#!/bin/sh\ncat <<'EOF'\nnothing here\nEOF\n").expect("write");
+        for script in [&supports, &unsupported] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        assert!(
+            probe_system_prompt_file_support("sh", &[supports.display().to_string()]),
+            "the supporting script's own answer must not be shadowed by the other's"
+        );
+        assert!(
+            !probe_system_prompt_file_support("sh", &[unsupported.display().to_string()]),
+            "the non-supporting script must get its own answer, not the cached true from above"
+        );
+    }
+
+    #[test]
     fn the_prompt_args_compose_with_the_existing_command_builders() {
         let adapter = ClaudeAdapter::new(None);
         let mut extra = adapter.system_prompt_args("be consistent");
@@ -996,12 +1376,8 @@ mod tests {
         extra.push("sonnet".to_string());
 
         let headless = adapter.headless_cmd("go", &SessionId::parse("abc"), &extra);
-        let args: Vec<String> = headless
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
         assert_eq!(
-            args,
+            built_args(&adapter, &headless),
             vec![
                 "-p".to_string(),
                 "go".to_string(),
@@ -1015,11 +1391,10 @@ mod tests {
         );
 
         let interactive = adapter.interactive_cmd(None, &extra);
-        let args: Vec<String> = interactive
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(args[0], "--append-system-prompt");
+        assert_eq!(
+            built_args(&adapter, &interactive)[0],
+            "--append-system-prompt"
+        );
     }
 
     #[test]
@@ -1031,11 +1406,134 @@ mod tests {
                 .expect("expectations"),
         )
         .expect("valid json");
+        let recorded = expected["files_touched_min"].as_u64().unwrap_or(0);
+        assert!(
+            structural_context(&jsonl, 1_000).files_touched.len() as u64 >= recorded,
+            "files_touched should find at least the recorded count"
+        );
+
         let ctx = structural_context(&jsonl, 5);
         assert!(ctx.user_messages.len() <= 5);
         assert!(
-            ctx.files_touched.len() as u64 >= expected["files_touched_min"].as_u64().unwrap_or(0),
-            "files_touched should find at least the recorded count"
+            ctx.files_touched.len() <= 5,
+            "and then keep only the tail, like every other field: {}",
+            ctx.files_touched.len()
         );
+    }
+
+    /// A handoff leaves as a single argv token, and Windows caps a command
+    /// line at 32,767 characters. `files_touched` accumulated every unique
+    /// path of the whole session while its neighbours were capped, so a long
+    /// enough session could no longer relaunch at all.
+    #[test]
+    fn structural_context_caps_files_touched_like_every_other_field() {
+        let mut jsonl = String::new();
+        for index in 0..40 {
+            jsonl.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"Read\",\"input\":{{\"file_path\":\"/src/file-{index}.rs\"}}}}],\"usage\":{{}}}}}}\n"
+            ));
+        }
+
+        let ctx = structural_context(&jsonl, 5);
+        assert_eq!(
+            ctx.files_touched,
+            vec![
+                "/src/file-35.rs",
+                "/src/file-36.rs",
+                "/src/file-37.rs",
+                "/src/file-38.rs",
+                "/src/file-39.rs"
+            ],
+            "the newest paths are the ones a handoff is worth carrying"
+        );
+    }
+
+    #[test]
+    fn claude_contributes_the_orchestrator_layer_and_it_names_claudes_own_tools() {
+        let layer = ClaudeAdapter::new(None)
+            .base_system_prompt()
+            .expect("claude has a base layer of its own");
+        assert_eq!(layer, ORCHESTRATOR_PROMPT);
+        for claude_specific in ["Agent tool", ".claude/agents", "/code-review"] {
+            assert!(
+                layer.contains(claude_specific),
+                "the layer is claude-specific by construction: '{claude_specific}'"
+            );
+        }
+    }
+
+    /// `exec` strips this many leading tokens off the argv the operator
+    /// wrote before carrying the rest into a restart, so a rewrite that
+    /// happens inside `base()` must not be counted here: the argv it applies
+    /// to is the one the adapter builds, not the one it was handed.
+    #[test]
+    fn the_launch_prefix_length_counts_the_operators_argv_not_the_rewritten_one() {
+        assert_eq!(ClaudeAdapter::new(None).launch_prefix_len(), 1);
+        assert_eq!(
+            ClaudeAdapter::new(Some("claude.cmd")).launch_prefix_len(),
+            1,
+            "a .cmd shim is still one program token in the operator's argv"
+        );
+        assert_eq!(
+            ClaudeAdapter::new(Some("sh /tmp/stub.sh")).launch_prefix_len(),
+            2
+        );
+    }
+
+    /// An npm-installed `claude` on Windows is `claude.cmd`, which
+    /// `CreateProcessW` rejects with `ERROR_BAD_EXE_FORMAT` (193). The
+    /// adapter has to hand it to `cmd.exe` instead, and the tokens it adds
+    /// have to lead the ones it was already going to pass.
+    #[cfg(windows)]
+    #[test]
+    fn a_cmd_shim_is_launched_through_cmd_exe_with_its_arguments_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("claude.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let adapter = ClaudeAdapter::new(Some(&shim.display().to_string()));
+        let cmd = adapter.interactive_cmd(Some("resume this"), &["--continue".to_string()]);
+
+        assert!(
+            cmd.get_program()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("cmd"),
+            "got {:?}",
+            cmd.get_program()
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "/c".to_string(),
+                shim.display().to_string(),
+                "resume this".to_string(),
+                "--continue".to_string(),
+            ]
+        );
+        assert_eq!(
+            adapter.launch_prefix_len(),
+            1,
+            "and the rewrite never changes what exec strips off the operator's argv"
+        );
+    }
+
+    /// The rewrite is a Windows concern only: everywhere else the program is
+    /// spawned exactly as written, shebang and all.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_program_is_spawned_exactly_as_written_off_windows() {
+        let adapter = ClaudeAdapter::new(Some("/opt/claude.cmd"));
+        let cmd = adapter.interactive_cmd(Some("resume this"), &[]);
+        assert_eq!(cmd.get_program().to_string_lossy(), "/opt/claude.cmd");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["resume this".to_string()]);
     }
 }

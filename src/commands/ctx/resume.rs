@@ -1,7 +1,9 @@
 use std::io::Write;
 use std::path::Path;
 
+use super::adapters::SESSION_ENV;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::event::SessionId;
 use super::handoff::{Handoff, latest_for_repo};
 use super::state::StateDir;
 use super::{CtxResult, adapters};
@@ -70,12 +72,26 @@ pub fn run_with<W: Write>(
         &cfg.prompt,
     );
     let (user_extra, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed);
-    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
+        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
+    // M2: attribution is logged per session, not once per verb. A resumed run
+    // is interactive, so the agent mints its own transcript id and this one is
+    // zirv's; exporting it is what makes the two meet, because the hook inside
+    // the session reports under it (the same env var the supervisors set).
+    let session = SessionId::new_v4();
+    // M7: the composed prompt goes through a private file rather than argv,
+    // where `ps` would show it to every other user on the machine. The adapter
+    // builds this launch itself, so the probe gets an empty argv.
+    let prompt_args = super::prompt::injection_args_for_session(
+        adapter.as_ref(),
+        &[],
+        composed.as_ref(),
+        &state,
+        session.as_str(),
+    );
     super::prompt::log_injection(
         &state,
         "resume",
-        "resume",
+        session.as_str(),
         composed.as_ref(),
         adapter.capabilities().system_prompt,
     );
@@ -86,6 +102,7 @@ pub fn run_with<W: Write>(
 
     let mut command = adapter.interactive_cmd(Some(&prompt), &extra);
     command.current_dir(repo);
+    command.env(SESSION_ENV, session.as_str());
     writeln!(w, "resuming from {}", path.display())?;
     w.flush()?;
 
@@ -167,6 +184,68 @@ mod tests {
         assert_eq!(code, 0);
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("Wire the payments webhook"), "got {text}");
+    }
+
+    /// M2: README promises injection attribution "at every session start", and
+    /// a resume starts one. It must be attributed to a real session id that the
+    /// agent's own hooks will report under, not to the literal verb name.
+    ///
+    /// Run as a subprocess because `run_with` hands the terminal over with
+    /// `exec`, which would replace the test binary itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_logs_injection_under_the_session_id_it_exports() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        crate::commands::ctx::handoff::store(&state, tmp.path(), "old-session", &handoff())
+            .expect("store");
+
+        // cargo test builds the bin target, so it sits next to the test
+        // binary's grandparent directory (target/debug/deps/<test>).
+        let exe = std::env::current_exe().expect("current_exe");
+        let zirv = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("target dir")
+            .join("zirv");
+        // A stub agent that only records what session it was told it is: the
+        // shared fake agent wants a --session-id, which an interactive launch
+        // (this one) deliberately does not pass.
+        let session_log = tmp.path().join("session-env.log");
+        let stub = tmp.path().join("stub-agent.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{ZIRV_CTX_SESSION:-}}\" > {}\nexit 0\n",
+                session_log.display()
+            ),
+        )
+        .expect("write stub");
+
+        let status = std::process::Command::new(&zirv)
+            .args(["ctx", "resume", "--agent", "claude"])
+            .current_dir(tmp.path())
+            .env("HOME", tmp.path().join("home"))
+            .env(STATE_ENV, state.root())
+            .env("ZIRV_CTX_AGENT_BIN", format!("sh {}", stub.display()))
+            .status()
+            .expect("resume runs");
+        assert!(status.success(), "the launched agent exited cleanly");
+
+        let exported = std::fs::read_to_string(&session_log)
+            .expect("the launched agent recorded ZIRV_CTX_SESSION");
+        let exported = exported.trim();
+        assert!(!exported.is_empty(), "a session id must be exported");
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        let attribution = log
+            .lines()
+            .find(|l| l.contains("\"verb\":\"resume\"") && l.contains("\"action\":\"prompt-"))
+            .unwrap_or_else(|| panic!("no attribution entry: {log}"));
+        assert!(
+            attribution.contains(&format!("\"session\":\"{exported}\"")),
+            "attribution must name the session the agent was told to report as: {attribution}"
+        );
     }
 
     #[test]

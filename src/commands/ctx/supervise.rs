@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::CtxResult;
 
@@ -84,27 +84,133 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
     Ok(())
 }
 
-/// Polls a growing transcript. Returns the whole file whenever its length
-/// changed, because scoring needs the full turn history, not just the delta.
+/// Bytes a transcript grew by since the previous poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Appended {
+    /// Whole lines only: everything up to and including the last newline.
+    pub lines: String,
+    /// The line the agent is still writing, if any. Reported separately and
+    /// read again next poll, so nothing is ever folded in half-written.
+    pub partial: String,
+    /// The transcript was truncated or rewritten rather than appended to, so
+    /// `lines` starts at byte zero again and anything derived from the earlier
+    /// bytes is void.
+    pub restarted: bool,
+}
+
+/// How much of the consumed region is fingerprinted on every poll. Both reads
+/// are O(1), which is the whole point: an append must not cost the file.
+const HEAD_BYTES: u64 = 4096;
+const TAIL_BYTES: u64 = 256;
+
+/// Fingerprint of the region a `Watcher` has already handed out: the first and
+/// last bytes of it, plus its length. Cheap enough to recompute every poll and
+/// enough to catch a transcript that was rewritten rather than appended to.
+fn consumed_fingerprint(file: &mut std::fs::File, offset: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if offset == 0 {
+        return Ok(0);
+    }
+    let mut read_at = |start: u64, len: u64| -> std::io::Result<String> {
+        let mut buffer = vec![0u8; len as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer)?;
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
+    };
+    let head = read_at(0, HEAD_BYTES.min(offset))?;
+    let tail_len = TAIL_BYTES.min(offset);
+    let tail = read_at(offset - tail_len, tail_len)?;
+    Ok(super::event::input_hash(&format!("{offset}|{head}|{tail}")))
+}
+
+/// Polls a growing transcript and reports only what was appended since the
+/// last poll, so a per-turn scoring pass costs the turn rather than the
+/// session. Length and mtime together decide whether anything changed at all
+/// (a same-length rewrite, possible right after a compaction rewrites the
+/// transcript in place, would otherwise read as "unchanged"), and a
+/// fingerprint of the already-consumed region decides whether the byte offset
+/// still means anything. Any doubt reports `restarted` and re-reads from the
+/// beginning: a wrong delta is worse than a slow poll.
 pub struct Watcher {
     path: PathBuf,
     len: u64,
+    mtime: Option<SystemTime>,
+    offset: u64,
+    consumed: u64,
 }
 
 impl Watcher {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, len: 0 }
+        Self {
+            path,
+            len: 0,
+            mtime: None,
+            offset: 0,
+            consumed: 0,
+        }
     }
 
-    pub fn read_if_changed(&mut self) -> CtxResult<Option<String>> {
+    /// Picks up at a position a previous process left off at (see the
+    /// persisted scoring checkpoint). The first poll validates it against the
+    /// file itself, so a bad position costs a re-read, never a wrong answer.
+    pub fn resuming(path: PathBuf, offset: u64, consumed: u64) -> Self {
+        Self {
+            path,
+            len: 0,
+            mtime: None,
+            offset,
+            consumed,
+        }
+    }
+
+    /// The offset and fingerprint another process needs to resume here.
+    pub fn position(&self) -> (u64, u64) {
+        (self.offset, self.consumed)
+    }
+
+    /// `None` when the transcript is missing or has not changed since the last
+    /// poll.
+    pub fn read_appended(&mut self) -> CtxResult<Option<Appended>> {
+        use std::io::{Read, Seek, SeekFrom};
+
         let Ok(meta) = std::fs::metadata(&self.path) else {
             return Ok(None);
         };
-        if meta.len() == self.len {
+        let (len, mtime) = (meta.len(), meta.modified().ok());
+        if len == self.len && mtime == self.mtime {
             return Ok(None);
         }
-        self.len = meta.len();
-        Ok(Some(std::fs::read_to_string(&self.path)?))
+        // Same length but a new mtime is a rewrite, not an append: there is no
+        // delta to read, only different bytes in the same place.
+        let mut restarted = len == self.len || len < self.offset;
+        self.len = len;
+        self.mtime = mtime;
+
+        let mut file = std::fs::File::open(&self.path)?;
+        if !restarted {
+            restarted = consumed_fingerprint(&mut file, self.offset)? != self.consumed;
+        }
+        if restarted {
+            self.offset = 0;
+        }
+
+        let mut buffer = Vec::new();
+        file.seek(SeekFrom::Start(self.offset))?;
+        file.read_to_end(&mut buffer)?;
+        let split = buffer
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |i| i + 1);
+        let appended = Appended {
+            lines: String::from_utf8_lossy(&buffer[..split]).into_owned(),
+            partial: String::from_utf8_lossy(&buffer[split..]).into_owned(),
+            restarted,
+        };
+
+        self.offset += split as u64;
+        self.consumed = consumed_fingerprint(&mut file, self.offset)?;
+        Ok(Some(appended))
     }
 }
 
@@ -305,6 +411,19 @@ mod tests {
         terminate(&mut child, Duration::from_millis(50)).expect("terminate must be idempotent");
     }
 
+    /// Force the mtime forward explicitly rather than relying on real time to
+    /// advance: some filesystems have coarse (e.g. one second) mtime
+    /// resolution, which would make these tests flaky otherwise.
+    fn bump_mtime(path: &Path) {
+        let bumped = std::time::SystemTime::now() + Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(bumped)
+            .expect("set_modified");
+    }
+
     #[test]
     fn the_watcher_reports_content_only_when_it_changed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -313,24 +432,158 @@ mod tests {
 
         assert_eq!(
             watcher
-                .read_if_changed()
+                .read_appended()
                 .expect("missing file is not an error"),
             None
         );
 
         std::fs::write(&path, "line one\n").expect("write");
-        assert_eq!(
-            watcher.read_if_changed().expect("read"),
-            Some("line one\n".to_string())
-        );
-        assert_eq!(watcher.read_if_changed().expect("read"), None, "unchanged");
+        let first = watcher.read_appended().expect("read").expect("changed");
+        assert_eq!(first.lines, "line one\n");
+        assert!(!first.restarted);
+        assert_eq!(watcher.read_appended().expect("read"), None, "unchanged");
 
         std::fs::write(&path, "line one\nline two\n").expect("append");
+        let second = watcher.read_appended().expect("read").expect("changed");
         assert_eq!(
-            watcher.read_if_changed().expect("read"),
-            Some("line one\nline two\n".to_string()),
-            "the whole file, since scoring needs the full history"
+            second.lines, "line two\n",
+            "only the appended bytes, not the whole file again"
         );
+        assert!(!second.restarted);
+    }
+
+    /// The performance claim, asserted: pass two reads the delta, not the file.
+    #[test]
+    fn a_later_poll_reads_only_the_bytes_that_were_appended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let bulk: String = (0..500).map(|i| format!("{{\"n\":{i}}}\n")).collect();
+        std::fs::write(&path, &bulk).expect("write");
+
+        let mut watcher = Watcher::new(path.clone());
+        let first = watcher.read_appended().expect("read").expect("changed");
+        assert_eq!(first.lines.len(), bulk.len());
+        assert_eq!(watcher.position().0, bulk.len() as u64);
+
+        let tail = "{\"n\":500}\n";
+        std::fs::write(&path, format!("{bulk}{tail}")).expect("append");
+        let second = watcher.read_appended().expect("read").expect("changed");
+        assert_eq!(
+            second.lines.len(),
+            tail.len(),
+            "turn N must cost the turn, not the session"
+        );
+    }
+
+    /// A half-written line is scored but never committed: the offset stops at
+    /// the last newline so the next poll sees the whole line.
+    #[test]
+    fn a_partial_line_is_reported_separately_and_read_again_when_complete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut watcher = Watcher::new(path.clone());
+
+        std::fs::write(&path, "done\nhal").expect("write");
+        let first = watcher.read_appended().expect("read").expect("changed");
+        assert_eq!(first.lines, "done\n");
+        assert_eq!(first.partial, "hal");
+        assert_eq!(watcher.position().0, 5);
+
+        std::fs::write(&path, "done\nhalf\n").expect("finish the line");
+        let second = watcher.read_appended().expect("read").expect("changed");
+        assert_eq!(second.lines, "half\n");
+        assert!(second.partial.is_empty());
+    }
+
+    #[test]
+    fn a_same_length_rewrite_is_detected_via_mtime() {
+        // Right after a compaction the transcript can be rewritten in place at
+        // the same byte length. Length alone would read that as unchanged.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut watcher = Watcher::new(path.clone());
+
+        std::fs::write(&path, "aaaa\n").expect("write");
+        assert_eq!(
+            watcher
+                .read_appended()
+                .expect("read")
+                .expect("changed")
+                .lines,
+            "aaaa\n"
+        );
+
+        std::fs::write(&path, "bbbb\n").expect("rewrite, same length");
+        bump_mtime(&path);
+
+        let rewritten = watcher.read_appended().expect("read").expect("changed");
+        assert_eq!(
+            rewritten.lines, "bbbb\n",
+            "a same-length rewrite must not be mistaken for unchanged"
+        );
+        assert!(rewritten.restarted, "and it voids the byte offset");
+    }
+
+    #[test]
+    fn a_truncated_transcript_restarts_from_the_beginning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut watcher = Watcher::new(path.clone());
+
+        std::fs::write(&path, "one\ntwo\nthree\n").expect("write");
+        let _ = watcher.read_appended().expect("read");
+
+        std::fs::write(&path, "one\n").expect("truncate");
+        let after = watcher.read_appended().expect("read").expect("changed");
+        assert!(after.restarted);
+        assert_eq!(after.lines, "one\n");
+        assert_eq!(watcher.position().0, 4);
+    }
+
+    /// A rewrite that happens to be longer keeps the offset in range, so only
+    /// the fingerprint of the consumed region can catch it.
+    #[test]
+    fn a_longer_rewrite_is_caught_by_the_consumed_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut watcher = Watcher::new(path.clone());
+
+        std::fs::write(&path, "one\ntwo\n").expect("write");
+        let _ = watcher.read_appended().expect("read");
+
+        std::fs::write(&path, "different\nhistory\nentirely\n").expect("rewrite, longer");
+        let after = watcher.read_appended().expect("read").expect("changed");
+        assert!(after.restarted, "the earlier bytes are gone");
+        assert_eq!(after.lines, "different\nhistory\nentirely\n");
+    }
+
+    #[test]
+    fn a_resumed_watcher_reads_only_what_arrived_since_that_position() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+
+        std::fs::write(&path, "one\ntwo\n").expect("write");
+        let mut first = Watcher::new(path.clone());
+        let _ = first.read_appended().expect("read");
+        let (offset, consumed) = first.position();
+
+        std::fs::write(&path, "one\ntwo\nthree\n").expect("append");
+        let mut resumed = Watcher::resuming(path.clone(), offset, consumed);
+        let after = resumed.read_appended().expect("read").expect("changed");
+        assert_eq!(after.lines, "three\n");
+        assert!(!after.restarted);
+    }
+
+    #[test]
+    fn a_resumed_position_that_no_longer_fits_the_file_is_discarded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, "fresh\nhistory\n").expect("write");
+
+        let mut resumed = Watcher::resuming(path.clone(), 8, 12345);
+        let after = resumed.read_appended().expect("read").expect("changed");
+        assert!(after.restarted, "a fingerprint that does not match is void");
+        assert_eq!(after.lines, "fresh\nhistory\n");
     }
 
     #[test]

@@ -3,8 +3,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::adapters::{SESSION_ENV, SOCKET_ENV};
-use super::config::{EnvLookup, env_from_process};
+use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
+use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::rot::{Score, Verdict};
 use super::state::{StateDir, now_secs};
 use super::{CtxResult, log, score, signal};
@@ -117,6 +117,21 @@ fn read_stdin() -> String {
     buffer
 }
 
+/// Corrections in `transcript`, read through the same adapter selection
+/// `score_transcript` uses to score it (`cfg.agent`/`cfg.agent_bin`), not a
+/// hardcoded claude parser (item 1). `adapters::select` failing (an unready
+/// adapter, e.g. codex today) degrades to zero corrections rather than
+/// panicking: an optimize recommendation is advisory, and a hook may never
+/// fail loudly.
+fn corrections_in(transcript: &Path, cfg: &CtxConfig) -> usize {
+    let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg.agent_bin.as_deref()) else {
+        return 0;
+    };
+    std::fs::read_to_string(transcript)
+        .map(|jsonl| super::optimize::count_corrections(adapter.as_ref(), &jsonl))
+        .unwrap_or(0)
+}
+
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     // Every early return is deliberate: a hook that errors must still exit 0.
     let Ok(payload) = HookPayload::parse(stdin) else {
@@ -130,7 +145,9 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         return Ok(0);
     }
     let repo = payload.repo();
-    let Ok(score) = score::score_transcript(transcript, None, &repo, env) else {
+    // Cached: this hook is a fresh process after every single turn, so scoring
+    // the whole transcript each time is quadratic over a session's length.
+    let Ok(score) = score::score_transcript_cached(transcript, None, &repo, env) else {
         return Ok(0);
     };
 
@@ -172,25 +189,23 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             },
         );
 
-        // Cheap on purpose: the score is already computed, the correction count
-        // is one pass over a file already in page cache, and the cooldown is a
-        // log read. The analysis itself is far too heavy for a hook, so this
-        // only queues the recommendation for a human to act on. The enabled
-        // check comes first so a disabled feature never pays for the reread.
-        let optimize_cfg = super::config::CtxConfig::load(&repo, env)
-            .map(|cfg| cfg.optimize)
-            .unwrap_or_default();
-        if optimize_cfg.enabled {
-            let corrections = std::fs::read_to_string(transcript)
-                .map(|jsonl| super::optimize::count_corrections(&jsonl))
-                .unwrap_or(0);
+        // The analysis itself is far too heavy for a hook, so this only queues
+        // the recommendation for a human to act on. Counting corrections is
+        // the one expensive part -- a full re-read and re-parse of the
+        // transcript -- so it is paid for only once the free gates say it
+        // could matter. Without that ordering every turn re-parses the whole
+        // session, which is precisely what the cached score above removes.
+        let cfg = CtxConfig::load(&repo, env).unwrap_or_default();
+        let now = now_secs();
+        if super::optimize::recommendation_possible(&state, &score, &cfg.optimize, now) {
+            let corrections = corrections_in(transcript, &cfg);
             optimize_recommended = super::optimize::queue_recommendation(
                 &state,
                 &session,
                 &score,
                 corrections,
-                &optimize_cfg,
-                now_secs(),
+                &cfg.optimize,
+                now,
             );
         }
     }
@@ -658,6 +673,33 @@ mod tests {
         }
         std::fs::write(&path, text).expect("write");
         path
+    }
+
+    /// Item 1: `corrections_in` must use whichever adapter `cfg` selects
+    /// (mirroring `score_transcript`), not a hardcoded claude call.
+    #[test]
+    fn corrections_are_computed_through_the_configured_adapter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = correction_heavy_transcript(dir.path());
+        let cfg = CtxConfig::default();
+        assert_eq!(corrections_in(&transcript, &cfg), 5);
+    }
+
+    /// An unready adapter (codex today) must degrade to zero corrections
+    /// rather than panic: the recommendation is advisory, never load-bearing.
+    #[test]
+    fn corrections_are_zero_when_the_configured_adapter_is_not_ready() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = correction_heavy_transcript(dir.path());
+        let cfg = CtxConfig {
+            agent: Some("codex".to_string()),
+            ..CtxConfig::default()
+        };
+        assert_eq!(
+            corrections_in(&transcript, &cfg),
+            0,
+            "an unready adapter degrades to zero corrections, not a panic"
+        );
     }
 
     #[test]

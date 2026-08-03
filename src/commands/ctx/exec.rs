@@ -9,7 +9,7 @@ use super::pace;
 use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
-use super::supervise::{self, Outcome, Tick, Watcher};
+use super::supervise::{self, Outcome, Tick};
 use super::{CtxResult, adapters, handoff, log, score};
 
 /// The restart budget is spent and the session is still rotting. Callers apply
@@ -47,22 +47,125 @@ pub struct ExecArgs {
     pub simple: bool,
 }
 
-/// Finds the prompt in a headless agent command. Returns `None` rather than
-/// guessing: a restart with the wrong prompt is worse than no restart.
-pub fn extract_prompt(command: &[String]) -> Option<String> {
-    for (index, arg) in command.iter().enumerate().skip(1) {
+/// Flags that pin a launch to a conversation that already exists. A restart is
+/// a deliberate escape from the session that rotted, so inheriting any of them
+/// would march the fresh child straight back into it and burn the whole
+/// restart budget re-entering rot. The first two carry a value; the rest are
+/// bare.
+const RESUME_FLAGS_WITH_VALUE: [&str; 2] = ["--session-id", "--resume"];
+const RESUME_FLAGS_BARE: [&str; 3] = ["-c", "--continue", "--fork-session"];
+
+/// True for `--resume=abc` when `--resume` is in `flags`: the CLIs accept both
+/// spellings, so stripping only the two-token form leaves the other behind.
+fn is_joined_form(arg: &str, flags: &[&str]) -> bool {
+    arg.split_once('=')
+        .is_some_and(|(name, _)| flags.contains(&name))
+}
+
+/// Locates the token that carries the prompt in a headless agent command, and
+/// the prompt itself when that token is followed by one.
+///
+/// `known` is the prompt zirv already holds for this run (`--prompt`, or an
+/// agent step's own text). Given it, the value is recognised by equality
+/// instead of by shape, which is the only way to tell a prompt that happens to
+/// begin with `-` -- a markdown bullet list, say -- from a genuine second
+/// flag. Without it the shape heuristic still applies, because guessing wrong
+/// about a restart's prompt is worse than not restarting.
+///
+/// The value is `None` for a bare flag: `-p` with another flag after it (or
+/// nothing at all) means the prompt arrives on stdin. The flag itself still
+/// has to be stripped from a restart argv, but the token after it must not be.
+fn locate_prompt(
+    command: &[String],
+    prefix: usize,
+    known: Option<&str>,
+) -> Option<(usize, Option<String>)> {
+    for (index, arg) in command.iter().enumerate().skip(prefix) {
         let is_prompt_flag = arg == "-p" || arg == "--print";
         let is_subcommand = arg == "exec";
         if !is_prompt_flag && !is_subcommand {
             continue;
         }
-        let next = command.get(index + 1)?;
-        if next.starts_with('-') {
-            return None;
+        let Some(next) = command.get(index + 1) else {
+            return Some((index, None));
+        };
+        if Some(next.as_str()) == known {
+            return Some((index, Some(next.clone())));
         }
-        return Some(next.clone());
+        if next.starts_with('-') {
+            return Some((index, None));
+        }
+        return Some((index, Some(next.clone())));
     }
     None
+}
+
+/// Finds the prompt in a headless agent command. Returns `None` rather than
+/// guessing: a restart with the wrong prompt is worse than no restart.
+pub fn extract_prompt(command: &[String]) -> Option<String> {
+    locate_prompt(command, 1, None).and_then(|(_, prompt)| prompt)
+}
+
+/// M8: the user's own flags from the original `--` command, with only what
+/// zirv itself re-supplies on every restart removed. Everything else the
+/// operator passed -- `--model`, `--allowedTools`, anything at all -- must
+/// reach a restarted child exactly as it reached the first one; silently
+/// dropping it here was the asymmetry M8 fixed (zirv's own added flags, e.g.
+/// the system prompt, always survived a restart; the operator's own did not).
+///
+/// Three kinds of token are dropped. The prompt, because every relaunch
+/// regenerates it to carry a handoff. Anything pinning the launch to an
+/// existing conversation, because the relaunch is escaping one. And the
+/// leading tokens of the program invocation itself -- `prefix` of them from
+/// the adapter, plus any further positional before the first flag, which is
+/// how `npx claude ...` and a positional prompt both look -- because
+/// `headless_cmd` rebuilds the invocation and re-appending them would leave a
+/// stray argument the agent reads as a second prompt.
+pub fn extra_launch_flags(
+    command: &[String],
+    prefix: usize,
+    known_prompt: Option<&str>,
+) -> Vec<String> {
+    let located = locate_prompt(command, prefix, known_prompt);
+    let prompt_at = located.as_ref().map(|(index, _)| *index);
+    let prompt_takes_value = located.is_some_and(|(_, value)| value.is_some());
+
+    let mut out = Vec::with_capacity(command.len());
+    let mut skip_next = false;
+    let mut in_prefix = true;
+    for (index, arg) in command.iter().enumerate().skip(prefix) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if Some(index) == prompt_at {
+            skip_next = prompt_takes_value;
+            in_prefix = false;
+            continue;
+        }
+        if in_prefix && !arg.starts_with('-') {
+            continue;
+        }
+        in_prefix = false;
+
+        if is_joined_form(arg, &RESUME_FLAGS_WITH_VALUE) || is_joined_form(arg, &RESUME_FLAGS_BARE)
+        {
+            continue;
+        }
+        if RESUME_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
+            // A bare `--resume` with a flag after it takes no value, so the
+            // next token belongs to the operator and has to survive.
+            skip_next = command
+                .get(index + 1)
+                .is_some_and(|next| !next.starts_with('-'));
+            continue;
+        }
+        if RESUME_FLAGS_BARE.contains(&arg.as_str()) {
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
 }
 
 /// Compaction of a headless run is pointless (there is no TUI to type into), so
@@ -108,18 +211,73 @@ pub fn run_with<W: Write>(
         skip_injection,
         &cfg.prompt,
     );
+    // Known before argv is touched, because it decides how argv is read: the
+    // token holding this exact text is the prompt, whatever it looks like.
+    let prompt = args
+        .prompt
+        .clone()
+        .or_else(|| extract_prompt(&args.command));
+    // An argv that names no program -- empty, or starting with a flag -- is
+    // not a command to pass through: the adapter builds the launch and these
+    // are extra flags for it. That is how an agent step arrives, holding its
+    // prompt as data with no argv to encode it into.
+    let adapter_builds_launch = args
+        .command
+        .first()
+        .is_none_or(|first| first.starts_with('-'));
+    let prefix = if adapter_builds_launch {
+        0
+    } else {
+        adapter.launch_prefix_len()
+    };
+    // The prompt is data, not argv to be interpreted. Protecting its index
+    // keeps a prompt that happens to read like the adapter's own
+    // system-prompt flag from being stripped out of the launch and promoted
+    // into the composed prompt as an operator instruction.
+    let prompt_value_at = locate_prompt(&args.command, prefix, prompt.as_deref())
+        .and_then(|(index, value)| value.map(|_| index + 1));
+
     // The first spawn's own argv may already carry the adapter's system-prompt
     // flag (e.g. `-- claude --append-system-prompt "..."`); merge it in rather
     // than letting `prompt_args` silently override it below.
-    let (launch_command, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed);
-    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
+    let (launch_command, composed) = super::prompt::merge_command_line_prompt(
+        adapter.as_ref(),
+        &args.command,
+        composed,
+        prompt_value_at,
+    );
 
+    // The user's own flags from the original `--` command (anything beyond
+    // the prompt and the session-pinning flags, all of which every restart
+    // regenerates fresh): see `extra_launch_flags`. M8: a restart used to
+    // rebuild the command from scratch with only zirv's own added flags,
+    // silently dropping these.
+    let user_extra = extra_launch_flags(&launch_command, prefix, prompt.as_deref());
+
+    // Determined before `prompt_args` (M7 needs a session id to name the
+    // private prompt file after) rather than after, as this used to be.
     let session_raw = args
         .session_id
         .clone()
         .unwrap_or_else(|| SessionId::new_v4().to_string());
     let mut session = SessionId::parse(&session_raw);
+
+    // The probe has to hit the binary that will actually be spawned. When the
+    // argv names no program the adapter builds the launch, so there is nothing
+    // in `launch_command` to probe -- it is flags, and `--model --help` is not
+    // a capability check.
+    let probe_target: &[String] = if adapter_builds_launch {
+        &[]
+    } else {
+        &launch_command
+    };
+    let prompt_args = super::prompt::injection_args_for_session(
+        adapter.as_ref(),
+        probe_target,
+        composed.as_ref(),
+        &state,
+        session.as_str(),
+    );
     super::prompt::log_injection(
         &state,
         "exec",
@@ -143,10 +301,16 @@ pub fn run_with<W: Write>(
         .clone()
         .unwrap_or_else(|| derive_transcript(&session));
 
-    let prompt = args
-        .prompt
-        .clone()
-        .or_else(|| extract_prompt(&args.command));
+    // Surfaced once, upfront, rather than only when a restart is already
+    // needed: an operator who never rots would otherwise never learn that
+    // rotting is a dead end for this invocation until it actually happens.
+    if prompt.is_none() {
+        writeln!(
+            w,
+            "zirv ctx exec: no prompt could be found in the command; restarts and usage-limit \
+             parking will be unavailable for this run. Pass --prompt to enable them."
+        )?;
+    }
     let max_restarts = args.max_restarts.unwrap_or(cfg.supervise.max_restarts);
     let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(cfg.supervise.max_cycle_secs));
     let poll = Duration::from_millis(cfg.supervise.poll_ms);
@@ -191,10 +355,30 @@ pub fn run_with<W: Write>(
             .unwrap_or_default()
     };
 
-    let mut command = build_command(&launch_command, repo)?;
-    for arg in &prompt_args {
-        command.arg(arg);
-    }
+    // With no argv to pass through, the first launch is built exactly the way
+    // every relaunch builds one. That symmetry is the point: a caller holding
+    // the prompt as data never encodes it into argv for this function to
+    // decode again, so it can never be misread as a flag.
+    let mut command = if adapter_builds_launch {
+        let prompt_text = prompt.as_deref().ok_or(
+            "no command to supervise; pass the agent command after --, \
+             or --prompt to have zirv build the launch itself",
+        )?;
+        let extra: Vec<String> = user_extra
+            .iter()
+            .cloned()
+            .chain(prompt_args.iter().cloned())
+            .collect();
+        let mut command = adapter.headless_cmd(prompt_text, &session, &extra);
+        command.current_dir(repo);
+        command
+    } else {
+        let mut command = build_command(&launch_command, repo)?;
+        for arg in &prompt_args {
+            command.arg(arg);
+        }
+        command
+    };
     for (key, value) in turn_env_for(&session) {
         command.env(key, value);
     }
@@ -214,8 +398,8 @@ pub fn run_with<W: Write>(
         );
 
         let (mut child, tap) = supervise::spawn_tapped(command)?;
-        // Fresh watcher per iteration, over the current session's transcript.
-        let mut watcher = Watcher::new(transcript.clone());
+        // Fresh scorer per iteration, over the current session's transcript.
+        let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
         let mut limit_hit = false;
 
@@ -223,11 +407,10 @@ pub fn run_with<W: Write>(
             &mut child,
             Instant::now() + timeout,
             poll,
-            &mut watcher,
-            &transcript,
-            args.agent.as_deref().or(cfg.agent.as_deref()),
-            repo,
-            env,
+            &mut scorer,
+            adapter.as_ref(),
+            &cfg.score,
+            &state,
             server.as_ref(),
             session.as_str(),
             &mut rotted,
@@ -240,8 +423,14 @@ pub fn run_with<W: Write>(
         // exactly what a real exhausted-window run looks like) can race past
         // the last tick that would have caught it. A final drain here closes
         // that race without touching supervise_child's general contract.
-        if !limit_hit && tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
-            limit_hit = true;
+        if !limit_hit {
+            limit_hit = pace::scan_for_limit(
+                &tap.try_lines(),
+                &state,
+                session.as_str(),
+                "exec",
+                &mut std::io::stderr(),
+            );
         }
 
         match outcome {
@@ -288,7 +477,24 @@ pub fn run_with<W: Write>(
             // A park is not a restart: the budget is for rot, not for waiting.
             session = SessionId::new_v4();
             transcript = derive_transcript(&session);
-            command = adapter.headless_cmd(&prompt_text, &session, &prompt_args);
+            // M2: a park mints a new session id, just like a restart, so the
+            // injection attribution is re-logged under it rather than only
+            // ever naming the first session this run started with.
+            super::prompt::log_injection(
+                &state,
+                "exec",
+                session.as_str(),
+                composed.as_ref(),
+                adapter.capabilities().system_prompt,
+            );
+            // M8: the user's own extra flags survive the relaunch too, not
+            // just zirv's own (the system prompt args).
+            let extra: Vec<String> = user_extra
+                .iter()
+                .cloned()
+                .chain(prompt_args.iter().cloned())
+                .collect();
+            command = adapter.headless_cmd(&prompt_text, &session, &extra);
             command.current_dir(repo);
             for (key, value) in turn_env_for(&session) {
                 command.env(key, value);
@@ -388,8 +594,25 @@ pub fn run_with<W: Write>(
         // The new session writes somewhere new, so the next iteration's watcher
         // must follow it rather than the file the killed child left behind.
         transcript = derive_transcript(&session);
+        // M2: README promises injection attribution "at every session
+        // start"; a restart mints a new session id, so it needs its own
+        // log entry rather than leaving attribution pinned to the first one.
+        super::prompt::log_injection(
+            &state,
+            "exec",
+            session.as_str(),
+            composed.as_ref(),
+            adapter.capabilities().system_prompt,
+        );
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
-        command = adapter.headless_cmd(&combined, &session, &prompt_args);
+        // M8: the user's own extra flags survive the restart too, not just
+        // zirv's own (the system prompt args) -- this used to be asymmetric.
+        let extra: Vec<String> = user_extra
+            .iter()
+            .cloned()
+            .chain(prompt_args.iter().cloned())
+            .collect();
+        command = adapter.headless_cmd(&combined, &session, &extra);
         command.current_dir(repo);
         for (key, value) in turn_env_for(&session) {
             command.env(key, value);
@@ -402,11 +625,10 @@ fn supervise_run(
     child: &mut std::process::Child,
     deadline: Instant,
     poll: Duration,
-    watcher: &mut Watcher,
-    transcript: &Path,
-    agent: Option<&str>,
-    repo: &Path,
-    env: EnvLookup<'_>,
+    scorer: &mut score::IncrementalScorer,
+    adapter: &dyn adapters::AgentAdapter,
+    score_cfg: &super::config::ScoreConfig,
+    state: &StateDir,
     server: Option<&signal::SignalServer>,
     session: &str,
     rotted: &mut bool,
@@ -414,7 +636,13 @@ fn supervise_run(
     limit_hit: &mut bool,
 ) -> CtxResult<Outcome> {
     let mut tick = || {
-        if tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+        if pace::scan_for_limit(
+            &tap.try_lines(),
+            state,
+            session,
+            "exec",
+            &mut std::io::stderr(),
+        ) {
             *limit_hit = true;
             return Tick::Stop("limit");
         }
@@ -426,12 +654,8 @@ fn supervise_run(
             return Tick::Stop("rot");
         }
         // A scoring failure must never kill a healthy run.
-        match watcher.read_if_changed() {
-            Ok(Some(_)) => {}
-            _ => return Tick::Continue,
-        }
-        match score::score_transcript(transcript, agent, repo, env) {
-            Ok(score) if score.verdict == Verdict::Restart => {
+        match scorer.poll(adapter, score_cfg) {
+            Ok(Some(score)) if score.verdict == Verdict::Restart => {
                 *rotted = true;
                 Tick::Stop("rot")
             }
@@ -535,6 +759,156 @@ mod tests {
             None
         );
         assert_eq!(extract_prompt(&[]), None);
+    }
+
+    /// M8: only the prompt and `--session-id` (both regenerated fresh on
+    /// every restart) are stripped; everything else the operator passed
+    /// survives.
+    #[test]
+    fn extra_launch_flags_strips_only_the_prompt_and_session_id() {
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "fix the bug".to_string(),
+            "--session-id".to_string(),
+            "x".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, None),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    #[test]
+    fn extra_launch_flags_is_empty_when_the_command_is_only_prompt_and_session_id() {
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "fix the bug".to_string(),
+            "--session-id".to_string(),
+            "x".to_string(),
+        ];
+        assert!(extra_launch_flags(&cmd, 1, None).is_empty());
+    }
+
+    /// A markdown bullet list is an ordinary prompt. Reading it as a flag left
+    /// the `-p` pair in the operator's flags, so every restart passed the
+    /// prompt twice: once with the handoff, once without, and the second one
+    /// won.
+    #[test]
+    fn a_prompt_that_starts_with_a_dash_is_still_stripped_from_the_restart_flags() {
+        let prompt = "- fix the failing tests\n- then run cargo fmt";
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            prompt.to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, Some(prompt)),
+            vec!["--model".to_string(), "opus".to_string()],
+            "the prompt zirv already holds is recognised by value, not by shape"
+        );
+    }
+
+    /// Without the prompt to compare against, a value shaped like a flag still
+    /// reads as one -- but only the flag is dropped, never the token after it,
+    /// which belongs to the operator.
+    #[test]
+    fn a_bare_prompt_flag_drops_itself_and_keeps_what_follows() {
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "--verbose".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, None),
+            vec!["--verbose".to_string()]
+        );
+    }
+
+    /// `headless_cmd` rebuilds the program invocation on every relaunch, so a
+    /// launcher in front of the agent (or a positional prompt) must not come
+    /// back as a stray argument the agent reads as a second prompt.
+    #[test]
+    fn the_program_invocation_is_never_carried_into_the_restart_flags() {
+        let via_npx = vec![
+            "npx".to_string(),
+            "claude".to_string(),
+            "-p".to_string(),
+            "task".to_string(),
+        ];
+        assert!(
+            extra_launch_flags(&via_npx, 1, Some("task")).is_empty(),
+            "the launcher's own argument is part of the invocation, not a flag"
+        );
+
+        // `agent_bin = "/usr/bin/env claude"`: the adapter reports a prefix of
+        // two, because that is how many tokens it spends before the flags.
+        let via_env = vec![
+            "/usr/bin/env".to_string(),
+            "claude".to_string(),
+            "-p".to_string(),
+            "task".to_string(),
+        ];
+        assert!(extra_launch_flags(&via_env, 2, Some("task")).is_empty());
+
+        let positional = vec!["claude".to_string(), "task".to_string()];
+        assert!(extra_launch_flags(&positional, 1, Some("task")).is_empty());
+    }
+
+    /// A restart exists to escape the conversation that rotted. Every spelling
+    /// that would pin it back to that conversation has to go.
+    #[test]
+    fn nothing_that_pins_the_launch_to_the_dead_session_survives_a_restart() {
+        let cmd = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "task".to_string(),
+            "--session-id=OLD".to_string(),
+            "--continue".to_string(),
+            "--resume".to_string(),
+            "abc".to_string(),
+            "--fork-session".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, Some("task")),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    /// `--resume` with a flag after it took no value, so swallowing the next
+    /// token would eat one of the operator's own flags.
+    #[test]
+    fn a_valueless_resume_does_not_swallow_the_next_flag() {
+        let cmd = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, None),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    #[test]
+    fn extra_launch_flags_keeps_everything_when_there_is_no_prompt_or_session_id() {
+        let cmd = vec![
+            "codex".to_string(),
+            "--model".to_string(),
+            "gpt".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 1, None),
+            vec!["--model".to_string(), "gpt".to_string()]
+        );
     }
 
     #[test]
@@ -787,6 +1161,53 @@ mod tests {
         assert!(
             text.contains("cannot restart"),
             "say why supervision stood down: {text}"
+        );
+    }
+
+    /// The old warning about a missing prompt only ever surfaced once a
+    /// restart was already needed (see `a_run_with_no_discoverable_prompt_
+    /// refuses_to_restart` above), so a healthy run that never rots gave the
+    /// operator no signal at all that restarts were a dead end for this
+    /// invocation. It must appear upfront, regardless of whether the run
+    /// ever actually needs to restart.
+    #[test]
+    fn an_upfront_warning_appears_even_when_the_run_never_needs_to_restart() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let session = "eeeeeeee-2222-4333-8444-555555555555";
+        let env = base_env(&tmp.path().join("state"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let mut command = fake_agent_command(session);
+        command.retain(|a| a != "-p" && a != "do the work");
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: None,
+            max_restarts: Some(2),
+            timeout_secs: Some(60),
+            simple: false,
+            command,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "a healthy run that never rots must still succeed"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("--prompt") && text.to_lowercase().contains("restart"),
+            "an upfront warning must appear even though this run never needed to restart: {text}"
         );
     }
 
@@ -1104,6 +1525,49 @@ mod tests {
         );
     }
 
+    /// Wording that only loosely resembles a usage-limit notice leaves a
+    /// breadcrumb in the decision log and changes nothing else: the run is not
+    /// parked, and its exit code is still the child's own.
+    #[test]
+    fn a_loose_limit_wording_is_noted_without_parking_the_run() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "77777777-2222-4333-8444-555555555555";
+        let env = base_env(&state);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "drift");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), 0, "a breadcrumb is not a park");
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"limit-wording-drift\""),
+            "the drift must be recorded: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"limit-park\""),
+            "and it must never park a healthy run: {log}"
+        );
+    }
+
     #[test]
     fn an_exhausted_window_delays_the_first_spawn() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -1187,6 +1651,132 @@ mod tests {
         assert!(
             argv.contains("--append-system-prompt"),
             "the restarted child must carry the prompt too: {argv}"
+        );
+    }
+
+    /// M8: a restart used to rebuild the headless command from scratch with
+    /// only zirv's own added flags (the system prompt), silently dropping any
+    /// extra flag the operator themselves had passed after `--`. Only lines
+    /// carrying `--session-id` are real agent invocations (a `--help` probe,
+    /// if any ran, never gets one), so filtering on it keeps this assertion
+    /// meaningful regardless of what else shares the log.
+    #[test]
+    fn a_restart_preserves_the_users_own_extra_flags_not_just_zirvs() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session = "12121212-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut command = fake_agent_command(session);
+        command.push("--zzz-custom-flag".to_string());
+        command.push("custom-value".to_string());
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            timeout_secs: Some(60),
+            simple: false,
+            command,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        let invocations: Vec<&str> = argv
+            .lines()
+            .filter(|line| line.contains("--session-id"))
+            .collect();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "one real invocation per child: {argv:?}"
+        );
+        for line in &invocations {
+            assert!(
+                line.contains("--zzz-custom-flag") && line.contains("custom-value"),
+                "the user's own extra flag must survive every restart, not just the first spawn: {argv}"
+            );
+        }
+    }
+
+    /// M2: README promises that "whether a prompt was injected, and from
+    /// which layers, is recorded in the decision log at every session
+    /// start". A restart mints a new session id, so its own attribution
+    /// entry must be logged under that id too, not only the first session's.
+    #[test]
+    fn injection_is_logged_again_for_each_restarts_own_session_id() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "ffffffff-2222-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(1),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        let injected_sessions: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("\"action\":\"prompt-injected\""))
+            .filter_map(|l| {
+                let key = "\"session\":\"";
+                let start = l.find(key)? + key.len();
+                let end = l[start..].find('"')? + start;
+                Some(&l[start..end])
+            })
+            .collect();
+        assert_eq!(
+            injected_sessions.len(),
+            2,
+            "one attribution entry per actual session id, including the restart: {log}"
+        );
+        assert_ne!(
+            injected_sessions[0], injected_sessions[1],
+            "the restart mints a new session id and must be logged under it: {log}"
         );
     }
 

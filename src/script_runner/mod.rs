@@ -1,6 +1,7 @@
 use hashbrown::HashMap;
 use script::Script;
 
+mod agent_command;
 mod command;
 mod command_types;
 mod fallback_command;

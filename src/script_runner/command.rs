@@ -145,12 +145,7 @@ impl Command {
     }
 
     pub fn substituted_command(&self, params: &HashMap<String, String>) -> String {
-        let mut command = self.command.clone();
-        for (key, value) in params {
-            let placeholder = format!("${{{key}}}");
-            command = command.replace(&placeholder, value);
-        }
-        command
+        substitute(&self.command, params)
     }
 
     pub fn check_unresolved_placeholders(
@@ -158,20 +153,38 @@ impl Command {
         context: &HashMap<String, String>,
     ) -> Result<(), String> {
         let substituted = self.substituted_command(context);
-        let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
-        let unresolved: Vec<&str> = re
-            .captures_iter(&substituted)
-            .map(|c| c.get(1).unwrap().as_str())
-            .collect();
-        if unresolved.is_empty() {
-            return Ok(());
-        }
-        Err(format!(
-            "Unresolved placeholders in '{}': {}",
-            self.command,
-            unresolved.join(", ")
-        ))
+        check_unresolved(&self.command, &substituted)
     }
+}
+
+/// Replaces every `${key}` placeholder in `template` with its value from
+/// `context`. Shared by `Command` and agent steps so both honor the same
+/// substitution syntax.
+pub(crate) fn substitute(template: &str, context: &HashMap<String, String>) -> String {
+    let mut result = template.to_string();
+    for (key, value) in context {
+        let placeholder = format!("${{{key}}}");
+        result = result.replace(&placeholder, value);
+    }
+    result
+}
+
+/// Hard error naming any `${...}` placeholder left in `substituted` after
+/// substitution ran. `original` is the pre-substitution text, quoted in the
+/// error so the message points at the offending line in the script.
+pub(crate) fn check_unresolved(original: &str, substituted: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
+    let unresolved: Vec<&str> = re
+        .captures_iter(substituted)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Unresolved placeholders in '{original}': {}",
+        unresolved.join(", ")
+    ))
 }
 
 #[cfg(test)]

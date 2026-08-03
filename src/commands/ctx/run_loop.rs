@@ -7,7 +7,7 @@ use super::event::{SessionId, SessionRef};
 use super::pace;
 use super::rot::Verdict;
 use super::state::{StateDir, now_secs};
-use super::supervise::{self, Outcome, Tick, Watcher};
+use super::supervise::{self, Outcome, Tick};
 use super::{CtxResult, adapters, log, score};
 
 /// Repeated cycle failures, escalated to the caller.
@@ -90,19 +90,7 @@ pub fn run_with<W: Write>(
         &cfg.prompt,
     );
     let (user_extra, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed);
-    let prompt_args = super::prompt::injection_args(adapter.as_ref(), composed.as_ref());
-    super::prompt::log_injection(
-        &state,
-        "loop",
-        "loop",
-        composed.as_ref(),
-        adapter.capabilities().system_prompt,
-    );
-    let extra: Vec<String> = user_extra
-        .into_iter()
-        .chain(prompt_args.iter().cloned())
-        .collect();
+        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
 
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
     let max_cycle =
@@ -127,6 +115,30 @@ pub fn run_with<W: Write>(
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles.
         let session = SessionId::new_v4();
+        // M7: rebuilt per cycle because the private prompt file is named after
+        // the session it belongs to, and every cycle is a new session. The
+        // adapter builds this launch itself, so the probe gets an empty argv.
+        let extra: Vec<String> = user_extra
+            .iter()
+            .cloned()
+            .chain(super::prompt::injection_args_for_session(
+                adapter.as_ref(),
+                &[],
+                composed.as_ref(),
+                &state,
+                session.as_str(),
+            ))
+            .collect();
+        // M2: README promises injection attribution "at every session start",
+        // and every cycle is a new session, so the entry is written here under
+        // that cycle's own id rather than once under a literal "loop".
+        super::prompt::log_injection(
+            &state,
+            "loop",
+            session.as_str(),
+            composed.as_ref(),
+            adapter.capabilities().system_prompt,
+        );
         let transcript = adapter.transcript_path(&SessionRef {
             id: session.clone(),
             cwd: repo.to_path_buf(),
@@ -137,23 +149,24 @@ pub fn run_with<W: Write>(
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
         let (mut child, tap) = supervise::spawn_tapped(command)?;
-        let mut watcher = Watcher::new(transcript.clone());
+        let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
         let mut limit_hit = false;
 
         let outcome = {
-            let agent = args.agent.as_deref().or(cfg.agent.as_deref());
             let mut tick = || {
-                if tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
+                if pace::scan_for_limit(
+                    &tap.try_lines(),
+                    &state,
+                    session.as_str(),
+                    "loop",
+                    &mut std::io::stderr(),
+                ) {
                     limit_hit = true;
                     return Tick::Stop("limit");
                 }
-                match watcher.read_if_changed() {
-                    Ok(Some(_)) => {}
-                    _ => return Tick::Continue,
-                }
-                match score::score_transcript(&transcript, agent, repo, env) {
-                    Ok(score) if score.verdict == Verdict::Restart => {
+                match scorer.poll(adapter.as_ref(), &cfg.score) {
+                    Ok(Some(score)) if score.verdict == Verdict::Restart => {
                         rotted = true;
                         Tick::Stop("rot")
                     }
@@ -166,8 +179,14 @@ pub fn run_with<W: Write>(
         // See the matching comment in exec.rs: supervise_child checks the
         // child's exit status before calling the tick, so a fast limit-hit
         // exit can race past the last tick that would have caught it.
-        if !limit_hit && tap.try_lines().iter().any(|line| pace::is_limit_hit(line)) {
-            limit_hit = true;
+        if !limit_hit {
+            limit_hit = pace::scan_for_limit(
+                &tap.try_lines(),
+                &state,
+                session.as_str(),
+                "loop",
+                &mut std::io::stderr(),
+            );
         }
 
         let (action, failed) = match outcome {
@@ -677,6 +696,52 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
+    }
+
+    /// M2: README promises injection attribution "at every session start", and
+    /// every cycle is its own session. One entry per cycle, each under that
+    /// cycle's own id, not one entry under a literal "loop".
+    #[test]
+    fn injection_is_logged_once_per_cycle_under_that_cycles_session_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // SAFETY: CI runs tests single-threaded.
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "1");
+        }
+        let mut out = Vec::new();
+        let code = run_with(&args_for(2), &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        let attributed: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("\"action\":\"prompt-injected\""))
+            .filter_map(|l| {
+                let key = "\"session\":\"";
+                let start = l.find(key)? + key.len();
+                Some(&l[start..start + l[start..].find('"')?])
+            })
+            .collect();
+        assert_eq!(attributed.len(), 2, "one entry per cycle: {log}");
+        assert_ne!(
+            attributed[0], attributed[1],
+            "each cycle is a new session and must be logged under its own id: {log}"
+        );
+        assert!(
+            !attributed.contains(&"loop"),
+            "the verb is not a session id: {log}"
+        );
     }
 
     /// I2: the caller's own --append-system-prompt (passed via --extra) must

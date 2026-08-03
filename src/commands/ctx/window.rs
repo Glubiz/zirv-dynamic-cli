@@ -101,6 +101,13 @@ pub fn age_secs(window: &Window, now: u64) -> u64 {
 pub const FIVE_HOUR_SECS: u64 = 5 * 3600;
 pub const SEVEN_DAY_SECS: u64 = 7 * 24 * 3600;
 
+/// How far into the future an event timestamp may sit before it is treated as
+/// bogus rather than merely clock-skewed. Within this tolerance a future
+/// timestamp still clamps to age-zero via `saturating_sub`, same as before;
+/// beyond it, the event is skipped rather than inflating the freshest usage
+/// bucket until wall-clock time catches up.
+const FUTURE_SKEW_TOLERANCE_SECS: u64 = 5 * 60;
+
 /// Days from the unix epoch for a civil date, valid for any year in range.
 /// Howard Hinnant's `days_from_civil`, which is why no date crate is needed.
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -197,6 +204,9 @@ pub fn sum_file(jsonl: &str, now: u64, count_cache_reads: bool, into: &mut Token
         else {
             continue;
         };
+        if at > now.saturating_add(FUTURE_SKEW_TOLERANCE_SECS) {
+            continue;
+        }
         let age = now.saturating_sub(at);
         if age > SEVEN_DAY_SECS {
             continue;
@@ -576,6 +586,50 @@ mod tests {
                 "round trip {unix}"
             );
         }
+    }
+
+    #[test]
+    fn a_future_dated_timestamp_is_excluded_from_every_bucket() {
+        // Clock skew or corrupt data can date an event a day in the future.
+        // `now.saturating_sub` would otherwise read that as age-zero and
+        // inflate the freshest usage bucket until wall-clock time catches up.
+        let now = 1_785_507_315;
+        let far_future_at = now + 86_400;
+        let jsonl = format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"usage\":{{\"input_tokens\":100}}}}}}\n",
+            iso_of(far_future_at)
+        );
+
+        let mut sums = TokenSums::default();
+        sum_file(&jsonl, now, false, &mut sums);
+
+        assert_eq!(sums.five_hour, 0);
+        assert_eq!(sums.seven_day, 0);
+        assert_eq!(
+            sums.events_counted, 0,
+            "a far-future-dated event must not be counted at all"
+        );
+    }
+
+    #[test]
+    fn a_timestamp_within_the_skew_tolerance_still_clamps_to_age_zero() {
+        // A few seconds of clock skew, well inside the tolerance, keeps today's
+        // behavior: it counts, clamped to age zero.
+        let now = 1_785_507_315;
+        let slightly_future_at = now + 30;
+        let jsonl = format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"usage\":{{\"input_tokens\":100}}}}}}\n",
+            iso_of(slightly_future_at)
+        );
+
+        let mut sums = TokenSums::default();
+        sum_file(&jsonl, now, false, &mut sums);
+
+        assert_eq!(
+            sums.five_hour, 100,
+            "small skew still clamps to age zero, as before"
+        );
+        assert_eq!(sums.events_counted, 1);
     }
 
     #[test]

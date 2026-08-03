@@ -13,15 +13,19 @@
 - [Upgrading](#upgrading)
 - [Usage](#usage)
   - [Initialize a Project](#initialize-a-project)
+  - [Creating a New Script](#creating-a-new-script)
   - [Running Scripts](#running-scripts)
-  - [Passing Parameters & Secrets](#passing-parameters--secrets)
+  - [Passing Parameters](#passing-parameters)
+  - [Optional Parameters](#optional-parameters)
   - [Capture Output](#capture-output)
   - [Failure Hooks](#failure-hooks)
+  - [Dry Run](#dry-run)
   - [Chaining Scripts](#chaining-scripts)
 - [Configuration](#configuration)
   - [Directory Structure](#directory-structure)
   - [Schema Examples](#schema-examples)
 - [Shortcuts](#shortcuts)
+- [Reserved Command Names](#reserved-command-names)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
 - [Supported Platforms](#supported-platforms)
 - [Contribution](#contribution)
@@ -34,10 +38,11 @@
 
 - **YAML-Driven Scripts**: Define commands in `.zirv/` files with metadata (name, description, params, secrets).  
 - **Capture Output**: Use `capture: var_name` on any step to grab its stdout into `${var_name}` for later substitution.  
-- **Failure Hooks**: On a step failure you can declare an `fallback` sub-chain of commands, then retry the original step once.  
+- **Failure Hooks**: On a step failure you can declare a `fallback` sub-chain of commands to run as a side action; the original command is never retried.  
 - **Flexible Options**: Interactive mode, OS filters, `proceed_on_failure`, delays, and secret support.  
 - **Multi-Format**: Supports YAML, JSON, and TOML, extendable.  
 - **Cross-Platform**: Compatible with Windows, macOS, and Linux.
+- **Helpful Errors**: A mistyped script or shortcut name gets up to 3 "did you mean" suggestions instead of a bare failure.
 
 ---
 
@@ -111,6 +116,9 @@ cargo build --release
 
 ## Usage
 
+`zirv help` (also `zirv h`, `zirv --help`, `zirv -h`) lists every available
+script and shortcut, local and global.
+
 ### Initialize a Project
 
 Run:
@@ -118,6 +126,32 @@ Run:
 zirv init
 ```
 Creates a `.zirv/` directory with a sample script. This directory is where you will define your scripts. The `.zirv/` directory is created in the current working directory or in the HOME directory depending on the commandline interactions.
+
+### Creating a New Script
+```bash
+zirv create
+```
+Interactively asks for the script name, an optional shortcut key, and whether
+to create it locally or in the global `~/.zirv` folder, then writes a
+template script (and shortcut entry, if given).
+
+To script the creation (e.g. in CI or setup scripts), pass any of the three
+answers as flags to skip the corresponding prompt; passing all three skips
+every prompt:
+
+```bash
+zirv create --name build --shortcut b --global false
+```
+
+- `--name <name>` — the script name (file is written as `<name>.yaml`).
+- `--shortcut <key>` — a shortcut key, or an empty string for "no shortcut".
+- `--global` — create in `~/.zirv` instead of the current directory. Bare
+  `--global` means true; pass `--global false` to answer "no" without a prompt.
+
+If the name or shortcut collides with a [reserved command name](#reserved-command-names),
+zirv warns and asks for confirmation before creating an unreachable script; in
+non-interactive mode (all three flags given) a collision is an error instead,
+since there is no prompt to fall back on.
 
 ### Running Scripts
 Place your script files in `.zirv/` (e.g., `build.yaml`):
@@ -139,6 +173,14 @@ Execute the script with:
 zirv build
 ```
 
+If the name doesn't match any script or shortcut (checked locally in `.zirv/`,
+then globally in `~/.zirv/`), zirv suggests up to 3 close matches by edit
+distance and points you to `zirv help`:
+
+```
+error: No script or shortcut found for 'buld'. Did you mean: build? Run `zirv help` to see available scripts and shortcuts.
+```
+
 ### Passing Parameters
 If a script declares parameters;
 
@@ -156,6 +198,29 @@ Run with:
 ```bash
 zirv commit "Your commit message here"
 ```
+
+### Optional Parameters
+A parameter name ending in `?` is optional and resolves to an empty string
+when omitted. Optional parameters must be declared after all required ones:
+
+```yaml
+name: Greet
+params:
+  - name
+  - greeting?
+commands:
+  - command: echo "${greeting} ${name}"
+```
+
+```bash
+zirv greet Alice            # greeting = "" -> prints " Alice"
+zirv greet Alice "Welcome"  # greeting = "Welcome" -> prints "Welcome Alice"
+```
+
+Declaring an optional parameter before a required one, giving fewer
+arguments than there are required parameters, giving more than the total
+number of declared parameters, or reusing a parameter name (with or without
+the trailing `?`) are all rejected with an error.
 
 ### Capture Output
 To capture the output of a command, use the `capture` option:
@@ -180,12 +245,28 @@ name: OnFailure Demo
 commands:
   - command: "sh -c 'exit 1'"
     options:
-      proceed_on_failure: true     # continue even if retry also fails
+      proceed_on_failure: true     # don't stop the script once fallback succeeds
       fallback:
         - command: "echo 'Fallback action'"
 ```
 
-This will execute the fallback command if the first command fails. The original command will be retried once.
+If the command fails, every `fallback` command runs, in order, once — **the
+original command is never retried**. If any fallback command itself fails,
+the step fails immediately with an error naming both the original and the
+failing fallback command. Otherwise, whether the step's own failure stops the
+script is controlled separately by `proceed_on_failure`: `true` continues to
+the next step, `false` (the default) stops the script with an error, even
+though every fallback succeeded.
+
+### Dry Run
+Pass `--dry-run` to preview a script without running anything:
+
+```bash
+zirv build --dry-run
+```
+
+Each step is printed with its `${...}` parameters substituted, instead of
+being executed, so you can check what a script would do first.
 
 ### Chaining Scripts
 You can chain scripts by calling one script from another. For example, if you have a script `build.yaml` and want to call it from `deploy.yaml`:
@@ -221,6 +302,13 @@ commands:
 
 Each nested list spawns its own shell window.  Every window executes the commands listed in that group and stays open until they finish.
 
+This needs a desktop/GUI session: macOS uses `osascript` to drive Terminal,
+Windows opens a new `cmd` window, and Linux tries `gnome-terminal`, then
+`x-terminal-emulator`, then `xterm`. Over a headless or SSH-only connection —
+or on Linux specifically, whenever neither `DISPLAY` nor `WAYLAND_DISPLAY` is
+set — zirv returns a clear error naming what it tried, instead of failing
+cryptically or hanging.
+
 The built-in `cd` command updates the working directory for any following
 commands in the same window, allowing scripts like:
 
@@ -229,6 +317,33 @@ commands:
   - - command: "cd backend"
     - command: "cargo run"
 ```
+
+### Agent Steps
+A command step can run a supervised AI-agent task instead of a shell command,
+using `agent` and `prompt` in place of `command`:
+
+```yaml
+commands:
+  - command: cargo test
+  - agent: claude
+    prompt: "Fix the failing tests in ${dir}"
+    # optional:
+    flags: ["--model", "sonnet"]
+  - command: cargo test
+```
+
+`prompt` gets the same `${var}` substitution as `command`, including the
+unresolved-placeholder error if a variable is missing. `flags` are passed
+straight through to the agent CLI. `operating_system`, `proceed_on_failure`,
+`delay_ms` and `fallback` work the same as they do for a regular command;
+`capture` and `interactive` are not supported and fail the step if set.
+
+The step runs in-process through the same supervision `zirv ctx exec` uses:
+pacing against your usage windows, rot detection, and automatic restart with a
+distilled handoff if the session rots. A non-zero outcome fails the step like
+any other command. Only Claude Code is supported today (see [Context
+Management](#context-management-zirv-ctx) below); naming any other agent fails
+with that adapter's own error.
 
 ## Configuration
 ### Directory Structure
@@ -259,7 +374,7 @@ commands:
     description: Prints greeting
     options:
       interactive: true
-      os: linux
+      operating_system: linux
       proceed_on_failure: false
       delay_ms: 2000
       fallback:
@@ -288,7 +403,7 @@ secrets:
       "description": "Prints greeting",
       "options": {
         "interactive": true,
-        "os": "linux",
+        "operating_system": "linux",
         "proceed_on_failure": false,
         "delay_ms": 2000,
         "fallback": [
@@ -322,7 +437,7 @@ options.interactive = false
 [[commands]]
 command = "echo Token is ${token}"
 options.interactive = true
-options.os = "linux"
+options.operating_system = "linux"
 options.proceed_on_failure = false
 options.delay_ms = 2000
 
@@ -341,10 +456,27 @@ Shortcuts are defined in `.shortcuts.yaml` and allow you to create aliases for y
 shortcuts:
   b: build.yaml
   t: test.yaml
-  c: commit.yaml
+  cm: commit.yaml
 ```
 Run zirv b instead of zirv build.yaml.
 This will execute the `build.yaml` script.
+
+A shortcut key that collides with a [reserved command name](#reserved-command-names)
+(for example `c`, already `create`'s alias) can never be reached; `zirv help`
+marks it as shadowed in the listing.
+
+## Reserved Command Names
+
+`help`, `version`, `init`, `create`, `ctx`, and their short aliases `h`, `v`,
+`i`, `c`, are handled as built-in commands before zirv ever looks in `.zirv/`.
+A script file or shortcut key using one of these names can never be invoked:
+
+- `zirv help` lists it but marks it `(shadowed by a built-in command,
+  unreachable)`.
+- `zirv create` warns about the collision and asks for confirmation before
+  creating it anyway; in non-interactive mode (see
+  [Creating a New Script](#creating-a-new-script)) the collision is an error
+  instead.
 
 ## Context Management (zirv ctx)
 
@@ -352,11 +484,12 @@ This will execute the `build.yaml` script.
 quality drops: it advises, compacts early, or restarts the session with a
 distilled handoff. Scoring is deterministic, and every decision is logged.
 
-**Agent support.** Claude Code is the supported agent. A `codex` adapter exists
-in the tree but is gated off: `--agent codex` fails with a message saying so,
-because the event shapes it would have to parse were never verified against an
-authenticated CLI, and the `notify` mechanism the design assumed does not exist
-in current Codex versions. Progress is tracked in
+**Agent support.** Claude Code is the only agent `ctx` supports today. A
+`codex` adapter exists in the tree but is not implemented yet: `--agent codex`
+fails with a message saying so, because the event shapes it would have to
+parse were never verified against an authenticated CLI, and the `notify`
+mechanism the design assumed does not exist in current Codex versions.
+Progress is tracked in
 [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
 
 **Platform support.** Supervision is unix only. `wrap` and `exec` need unix
@@ -435,10 +568,15 @@ timeout_secs = 30   # the distiller is given this long before the structural
                     # fallback is used instead
 ```
 
-Handoffs, sockets and logs live in the platform state directory under
-`zirv/ctx/`, never in the repo. Override with `ZIRV_CTX_STATE_DIR`. On unix the
-state directory is created `0700` and its files `0600`: it holds transcript
-paths, prompts and distilled handoffs. See
+Handoffs, sockets, logs and scoring checkpoints live in the platform state
+directory under `zirv/ctx/`, never in the repo. Override with
+`ZIRV_CTX_STATE_DIR`. On unix the state directory is created `0700` and its
+files `0600`: it holds transcript paths, prompts and distilled handoffs. The
+Stop hook is a fresh process on every turn, so it leaves its parse position and
+the scoring state derived from it in `scoring/`, which is what keeps per-turn
+scoring proportional to the turn rather than to the whole session. Any doubt
+about a checkpoint -- a rewritten or truncated transcript, changed scoring
+config, an unreadable file -- silently rebuilds it from a full parse. See
 [Usage pacing](#usage-pacing) below for the `[pace]` table that governs
 subscription-window waiting.
 
@@ -505,6 +643,21 @@ any supervision failure drops it back to pure passthrough. Flags you wrap are
 kept across a restart, so `zirv ctx wrap -- claude --model opus` comes back as
 an opus session.
 
+`wrap` types agent-specific text into the session it supervises (`/compact`,
+`/exit`), so it has to know which agent it is driving. It recognises a command
+whose program is named `claude`; anything else — a wrapper script, `npx
+claude`, a differently named binary — needs `--agent claude` to say so
+explicitly, or it refuses rather than typing claude syntax into a program that
+may not understand it. `--no-supervise` and `--simple` are exempt, since
+neither injects anything:
+
+```bash
+alias claude='zirv ctx wrap --agent claude -- my-claude-wrapper.sh'
+```
+
+Note that a restart relaunches the *adapter's* program, so a wrapped wrapper
+script comes back as a bare `claude`.
+
 `wrap` learns the transcript path from the turn signals the Stop hook sends,
 and forgets it on a restart because the fresh session writes a new file. Set
 `ZIRV_CTX_TRANSCRIPT` to pin a path instead; it outranks every signal and
@@ -523,6 +676,19 @@ verdict ends the run instead of restarting it. `--session-id` names the
 session, and `--transcript` points at the first child's transcript when the
 adapter cannot derive it. Both describe the first child only: every restart is
 a new session whose transcript path is derived again.
+
+Passing the whole command is optional. With `--prompt` and nothing after `--`
+that names a program, `exec` builds the launch from the adapter itself — the
+same way every restart does — so the prompt never has to be encoded into argv
+and read back out:
+
+```bash
+zirv ctx exec --agent claude --prompt "$PROMPT"
+zirv ctx exec --agent claude --prompt "$PROMPT" -- --model opus  # extra flags
+```
+
+This is what a YAML agent step uses, and it is why a prompt that happens to
+begin with `-` or to look like a flag is still just a prompt.
 
 ### Exit codes for headless supervision
 
@@ -697,7 +863,7 @@ log at every session start.
 - macOS
 - Linux
 
-Commands can target specific operating systems using the `os` option in the script configuration.
+Commands can target specific operating systems using the `operating_system` option in the script configuration.
 - `windows`: Windows OS
 - `linux`: Linux OS
 - `macos`: macOS

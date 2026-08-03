@@ -75,45 +75,12 @@ pub fn init_zirv() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs::{read_to_string, remove_dir_all};
-    use std::path::PathBuf;
     use tempfile::tempdir;
 
     const DEFAULT_SHORTCUTS_CONTENT: &str = r#"shortcuts:
   e: "example.yaml"
 "#;
-
-    /// Helper function to temporarily override HOME and USERPROFILE.
-    fn with_fake_home<F, R>(fake_home: &PathBuf, test: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let original_home = env::var("HOME").ok();
-        let original_userprofile = env::var("USERPROFILE").ok();
-
-        unsafe {
-            env::set_var("HOME", fake_home);
-            env::set_var("USERPROFILE", fake_home);
-        }
-
-        let result = test();
-
-        unsafe {
-            if let Some(home) = original_home {
-                env::set_var("HOME", home);
-            } else {
-                env::remove_var("HOME");
-            }
-            if let Some(up) = original_userprofile {
-                env::set_var("USERPROFILE", up);
-            } else {
-                env::remove_var("USERPROFILE");
-            }
-        }
-
-        result
-    }
 
     /// Test that only the home directory .zirv folder (with default .shortcuts.yaml) is created,
     /// if the user declines to initialize in the current directory.
@@ -125,46 +92,44 @@ mod tests {
         let fake_current_dir = tempdir()?;
         let fake_current_path = fake_current_dir.path().to_path_buf();
 
-        // Override HOME and USERPROFILE.
-        with_fake_home(&fake_home_path, || {
-            // Change current directory to fake_current.
-            let original_dir = env::current_dir().unwrap();
-            env::set_current_dir(&fake_current_path).unwrap();
+        // Overrides HOME, USERPROFILE, and the working directory, and puts
+        // all three back on drop -- including when an assertion below
+        // panics, which is exactly when a leaked HOME or working directory
+        // would otherwise break every later test in this process.
+        let _guard =
+            crate::commands::ctx::testenv::EnvGuard::set(&fake_home_path, Some(&fake_current_path));
 
-            // Ensure no .zirv exists in current directory.
-            let current_zirv = fake_current_path.join(".zirv");
-            if current_zirv.exists() {
-                remove_dir_all(&current_zirv).unwrap();
-            }
+        // Ensure no .zirv exists in current directory.
+        let current_zirv = fake_current_path.join(".zirv");
+        if current_zirv.exists() {
+            remove_dir_all(&current_zirv).unwrap();
+        }
 
-            // Call init_zirv_with with a confirmation function that returns false.
-            init_zirv_with(|| Ok(false)).unwrap();
+        // Call init_zirv_with with a confirmation function that returns false.
+        init_zirv_with(|| Ok(false)).unwrap();
 
-            // Verify that .zirv exists in the fake home directory.
-            let home_zirv = fake_home_path.join(".zirv");
+        // Verify that .zirv exists in the fake home directory.
+        let home_zirv = fake_home_path.join(".zirv");
 
-            assert!(
-                home_zirv.exists(),
-                ".zirv should be created in the home directory"
-            );
+        assert!(
+            home_zirv.exists(),
+            ".zirv should be created in the home directory"
+        );
 
-            let home_shortcuts = home_zirv.join(".shortcuts.yaml");
-            assert!(
-                home_shortcuts.exists(),
-                ".shortcuts.yaml should be created in the home directory"
-            );
+        let home_shortcuts = home_zirv.join(".shortcuts.yaml");
+        assert!(
+            home_shortcuts.exists(),
+            ".shortcuts.yaml should be created in the home directory"
+        );
 
-            let content = read_to_string(&home_shortcuts).unwrap();
-            assert_eq!(content, DEFAULT_SHORTCUTS_CONTENT);
+        let content = read_to_string(&home_shortcuts).unwrap();
+        assert_eq!(content, DEFAULT_SHORTCUTS_CONTENT);
 
-            // Verify that .zirv was NOT created in the current directory.
-            assert!(
-                !current_zirv.exists(),
-                ".zirv should not be created in the current directory"
-            );
-
-            env::set_current_dir(&original_dir).unwrap();
-        });
+        // Verify that .zirv was NOT created in the current directory.
+        assert!(
+            !current_zirv.exists(),
+            ".zirv should not be created in the current directory"
+        );
 
         Ok(())
     }
@@ -178,55 +143,51 @@ mod tests {
         let fake_current_dir = tempdir()?;
         let fake_current_path = fake_current_dir.path().to_path_buf();
 
-        with_fake_home(&fake_home_path, || {
-            let original_dir = env::current_dir().unwrap();
-            env::set_current_dir(&fake_current_path).unwrap();
+        let _guard =
+            crate::commands::ctx::testenv::EnvGuard::set(&fake_home_path, Some(&fake_current_path));
 
-            // Ensure no .zirv exists in the current directory.
-            let current_zirv = fake_current_path.join(".zirv");
-            if current_zirv.exists() {
-                remove_dir_all(&current_zirv).unwrap();
-            }
+        // Ensure no .zirv exists in the current directory.
+        let current_zirv = fake_current_path.join(".zirv");
+        if current_zirv.exists() {
+            remove_dir_all(&current_zirv).unwrap();
+        }
 
-            // Call init_zirv_with with a confirmation function that returns true.
-            init_zirv_with(|| Ok(true)).unwrap();
+        // Call init_zirv_with with a confirmation function that returns true.
+        init_zirv_with(|| Ok(true)).unwrap();
 
-            // Verify that .zirv exists in the home directory.
-            let home_zirv = fake_home_path.join(".zirv");
+        // Verify that .zirv exists in the home directory.
+        let home_zirv = fake_home_path.join(".zirv");
 
-            assert!(
-                home_zirv.exists(),
-                ".zirv should be created in the home directory"
-            );
+        assert!(
+            home_zirv.exists(),
+            ".zirv should be created in the home directory"
+        );
 
-            let home_shortcuts = home_zirv.join(".shortcuts.yaml");
+        let home_shortcuts = home_zirv.join(".shortcuts.yaml");
 
-            assert!(
-                home_shortcuts.exists(),
-                "Global .shortcuts.yaml should be created"
-            );
+        assert!(
+            home_shortcuts.exists(),
+            "Global .shortcuts.yaml should be created"
+        );
 
-            let home_content = read_to_string(home_shortcuts).unwrap();
-            assert_eq!(home_content, DEFAULT_SHORTCUTS_CONTENT);
+        let home_content = read_to_string(home_shortcuts).unwrap();
+        assert_eq!(home_content, DEFAULT_SHORTCUTS_CONTENT);
 
-            // Verify that .zirv exists in the current directory.
-            assert!(
-                current_zirv.exists(),
-                ".zirv should be created in the current directory"
-            );
+        // Verify that .zirv exists in the current directory.
+        assert!(
+            current_zirv.exists(),
+            ".zirv should be created in the current directory"
+        );
 
-            let current_shortcuts = current_zirv.join(".shortcuts.yaml");
+        let current_shortcuts = current_zirv.join(".shortcuts.yaml");
 
-            assert!(
-                current_shortcuts.exists(),
-                "Local .shortcuts.yaml should be created"
-            );
+        assert!(
+            current_shortcuts.exists(),
+            "Local .shortcuts.yaml should be created"
+        );
 
-            let current_content = read_to_string(current_shortcuts).unwrap();
-            assert_eq!(current_content, DEFAULT_SHORTCUTS_CONTENT);
-
-            env::set_current_dir(&original_dir).unwrap();
-        });
+        let current_content = read_to_string(current_shortcuts).unwrap();
+        assert_eq!(current_content, DEFAULT_SHORTCUTS_CONTENT);
 
         Ok(())
     }
