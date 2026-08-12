@@ -36,6 +36,11 @@ cargo clippy --all-targets -- -D warnings
   - `signal.rs` / `supervise.rs` / `term.rs` — Turn-signal sockets, process primitives, raw mode
   - `pace.rs` / `usage.rs` / `window.rs` — Usage pacing gate, the `usage` verb (and statusline tee), rolling usage-window state
   - `optimize.rs` / `prompt.rs` — Configuration analysis and the injected session prompt
+  - `chat.rs` — `zirv ctx chat`: an interactive orchestrator session built from the resolved adapter and driven through `wrap`
+  - `agent.rs` — `zirv ctx agent <name> <prompt>`: one-shot delegation to a supervised headless worker, driven through `exec`
+  - `mail.rs` — `zirv ctx send`/`zirv ctx inbox`: repo-scoped inter-session notes, read once then moved to `read/`
+  - `chrome.rs` — Terminal chrome (launch banner, reserved status bar, colour) eligibility and pure renderers
+  - `announce.rs` — The `zirv ▸` announcement channel on stderr
 
 ## Conventions
 
@@ -67,6 +72,17 @@ cargo clippy --all-targets -- -D warnings
 - Repo `.settings.toml` may only disable agents, never enable one: the same
   trust asymmetry as `ctx.toml`'s repo-forbidden keys, folded per agent rather
   than deep-merged (see `src/settings.rs`).
+- Bare `zirv` (no arguments) is an alias: it starts `zirv ctx chat` in a repo
+  with a local or global `.zirv` directory and a real terminal on stdin,
+  otherwise it shows `zirv help` — a deliberate behavior change from clap's
+  own bare-invocation handling, which was a usage error (exit 2). `zirv chat`
+  and `zirv agent` are further top-level aliases for `zirv ctx chat`/`zirv ctx
+  agent`, checked against raw argv in `main.rs` before clap runs (same
+  interception style as `ctx` itself) and reserved in `utils::RESERVED_
+  COMMANDS` so a script can never shadow them. An explicit `zirv chat` is not
+  subject to the bare-invocation TTY rule. Any agent workflow that pipes
+  `zirv`'s stdout/stdin should not rely on the bare form: pipe into `zirv
+  ctx chat` (or a specific verb) explicitly instead.
 
 ## Using the Obsidian Vault
 

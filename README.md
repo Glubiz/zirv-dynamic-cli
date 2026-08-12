@@ -8,6 +8,7 @@
 
 ## Table of Contents
 
+- [Just Run `zirv`](#just-run-zirv)
 - [Features](#features)
 - [Installation](#installation)
 - [Upgrading](#upgrading)
@@ -33,6 +34,82 @@
 - [Contact](#contact)
 
 ---
+
+## Just Run `zirv`
+
+The fastest way to start a session: run `zirv` with no arguments, in a
+zirv-managed repo (one with a local `.zirv/` or a global `~/.zirv/`), from a
+real terminal.
+
+```bash
+cd my-project
+zirv
+```
+
+| Situation | Result |
+|---|---|
+| `.zirv` exists (locally or in `~/.zirv`) and stdin is a real terminal | starts `zirv ctx chat` — an interactive orchestrator session |
+| No `.zirv` anywhere, or stdin is piped/redirected | shows this same `zirv help` listing, exit 0 |
+| `zirv --help` / `zirv -h` | always shows help, even with nothing else on the command line |
+
+This is a deliberate behavior change: before, a bare `zirv` was a clap usage
+error (missing the required `command` argument, exit 2). Piped stdin (`echo
+hi | zirv`, a CI job, anything non-interactive) always falls back to help —
+a bare invocation never blocks waiting on a chat session nothing is there to
+drive.
+
+### `zirv chat` and `zirv agent`
+
+`zirv chat` and `zirv agent` are shorter top-level aliases for `zirv ctx
+chat` and `zirv ctx agent`. Both are reserved command names (see
+[Reserved Command Names](#reserved-command-names)), so a script or shortcut
+can never shadow them, and — unlike the bare-invocation alias above — an
+explicit `zirv chat` always starts a session regardless of whether stdin is
+a terminal.
+
+- **`zirv chat`** — the same interactive orchestrator session the bare
+  invocation starts.
+- **`zirv agent <name> <prompt> [-- flags]`** — delegates one task to a
+  supervised headless worker on another enabled harness: the same pacing,
+  rot detection and restart-with-handoff behavior `zirv ctx exec` gives a
+  hand-written invocation, as one command. Pass `-` as the prompt to read it
+  from stdin instead.
+
+### Sending mail between sessions
+
+Agent sessions running on the same machine can leave each other short notes,
+scoped to the current repository, with `zirv ctx send` and `zirv ctx inbox`:
+
+```bash
+zirv ctx send --message "the webhook route moved to /v2/webhook"
+zirv ctx inbox
+```
+
+`zirv ctx status` reports how many are waiting (`mail: N unread`). A mail
+message is free-form text written by whichever agent session sent it, not an
+operator instruction — see the vault's Untrusted Configuration page for how
+it's capped and labeled the same way the other untrusted surfaces are.
+
+### Banner, status bar and events
+
+A `zirv ctx chat` session (bare `zirv` included) with a real, large-enough
+terminal attached also gets a bit of chrome:
+
+- a one-time **launch banner** naming the resolved harness, the rule that
+  chose it, and the session id;
+- a reserved **one-row status bar** pinned to the bottom of the terminal;
+- an **event channel** on stderr, one line per notable event, in the shape
+  `[HH:MM:SS] zirv ▸ <message>`.
+
+All three degrade together and only in one direction: `--simple`,
+`--no-supervise`, a terminal narrower than 40 columns or shorter than 8
+rows, or a non-terminal stdout turns every piece off, and nothing here ever
+upgrades a session mid-run. Turn just the event channel off with `--quiet`,
+the `ZIRV_CTX_QUIET` environment variable, or `[chrome] events = false` in
+`ctx.toml`; `[chrome] banner` and `[chrome] bar` switch the other two off
+the same way. See [.settings.toml](#settingstoml) below for enabling or
+disabling the harnesses themselves (claude, codex) — a separate file from
+`[chrome]`.
 
 ## Features
 
@@ -467,9 +544,10 @@ marks it as shadowed in the listing.
 
 ## Reserved Command Names
 
-`help`, `version`, `init`, `create`, `ctx`, and their short aliases `h`, `v`,
-`i`, `c`, are handled as built-in commands before zirv ever looks in `.zirv/`.
-A script file or shortcut key using one of these names can never be invoked:
+`help`, `version`, `init`, `create`, `ctx`, `chat`, `agent`, and their short
+aliases `h`, `v`, `i`, `c`, are handled as built-in commands before zirv ever
+looks in `.zirv/`. A script file or shortcut key using one of these names can
+never be invoked:
 
 - `zirv help` lists it but marks it `(shadowed by a built-in command,
   unreachable)`.
@@ -510,9 +588,12 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|notify>` | Agent hook entrypoints |
-| `zirv ctx status` | Shows supervised sessions, recent decisions and handoffs |
+| `zirv ctx status` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions and handoffs |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
+| `zirv ctx chat` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)) |
+| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised headless worker on another enabled harness (also `zirv agent`) |
+| `zirv ctx send` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo |
 
 ### Signals and verdicts
 

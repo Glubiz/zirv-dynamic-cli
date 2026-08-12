@@ -92,7 +92,9 @@ pairs="$(printf '%s\t%s\n' \
   '^src/commands/ctx/(mod|config|state|log|handoff|resume|hook|status)\.rs' 'docs/obsidian/Modules/Ctx Subsystem.md' \
   '^src/commands/(mod|create|init|help|version)\.rs' 'docs/obsidian/Modules/Built-in Commands.md' \
   '^src/utils\.rs' 'docs/obsidian/Modules/Utilities.md' \
-  '^src/commands/ctx/(optimize|prompt)\.rs' 'docs/obsidian/Modules/Utilities.md')"
+  '^src/commands/ctx/(optimize|prompt)\.rs' 'docs/obsidian/Modules/Utilities.md' \
+  '^src/commands/ctx/(chat|agent|mail)\.rs' 'docs/obsidian/Modules/Ctx Subsystem.md' \
+  '^src/commands/ctx/(chrome|announce)\.rs' 'docs/obsidian/Modules/Ctx Supervisors.md')"
 
 missing=""
 

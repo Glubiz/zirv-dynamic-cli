@@ -10,10 +10,13 @@
 use std::io::Write;
 use std::path::Path;
 
-use super::adapters::{self, AgentAdapter};
+use super::adapters::{self, AgentAdapter, DefaultOrigin};
+use super::chrome::{self, BannerFacts, ChromeCaps, HarnessRule};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::event::SessionId;
 use super::prompt::PromptRole;
 use super::state::StateDir;
+use super::term;
 use super::wrap::{self, WrapArgs};
 use super::{CtxResult, handoff, resume};
 
@@ -30,6 +33,11 @@ pub struct ChatArgs {
     /// default. Supervision, pacing and hooks still apply.
     #[arg(long, default_value_t = false)]
     pub simple: bool,
+    /// Suppress the `zirv ▸` announcement channel. Errors and warnings are
+    /// never suppressed; the launch banner and status bar have their own
+    /// `[chrome]` toggles.
+    #[arg(long, default_value_t = false)]
+    pub quiet: bool,
     /// Extra arguments passed through to the agent, after `--`.
     //
     // `allow_hyphen_values`, because what gets passed through here is the
@@ -81,11 +89,40 @@ pub fn build_launch(
 /// all: `wrap::run_with` performs the identical `adapters::select` check of
 /// its own before opening a pty, so the same refusal holds even if this
 /// function's own check were ever bypassed.
-fn resolve_adapter(cfg: &CtxConfig, requested: Option<&str>) -> CtxResult<Box<dyn AgentAdapter>> {
-    match requested.or(cfg.agent.as_deref()) {
-        Some(name) => adapters::select(Some(name), &[], cfg),
-        None => adapters::resolve_default(cfg).map(|(adapter, _origin)| adapter),
+///
+/// Also returns the `HarnessRule` that picked the adapter, for the launch
+/// banner: an explicit `--agent` never reaches `resolve_default`, so that
+/// rule cannot come from `DefaultOrigin` alone.
+fn resolve_adapter(
+    cfg: &CtxConfig,
+    requested: Option<&str>,
+) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
+    if requested.is_some() {
+        let adapter = adapters::select(requested, &[], cfg)?;
+        return Ok((adapter, HarnessRule::Explicit));
     }
+    match cfg.agent.as_deref() {
+        Some(name) => Ok((
+            adapters::select(Some(name), &[], cfg)?,
+            HarnessRule::Configured,
+        )),
+        None => adapters::resolve_default(cfg).map(|(adapter, origin)| {
+            let rule = match origin {
+                DefaultOrigin::Configured => HarnessRule::Configured,
+                DefaultOrigin::FirstEnabledReady => HarnessRule::FirstEnabledReady,
+            };
+            (adapter, rule)
+        }),
+    }
+}
+
+/// Every known harness in registry order, alongside whether the gate
+/// currently enables it -- the banner's own harness list.
+fn harness_list(cfg: &CtxConfig) -> Vec<(String, bool)> {
+    adapters::ADAPTERS
+        .iter()
+        .map(|(name, _)| ((*name).to_string(), cfg.agents.is_enabled(name)))
+        .collect()
 }
 
 /// `--resume`'s initial prompt: the latest stored handoff, folded in the same
@@ -115,6 +152,20 @@ pub fn resolve_initial_prompt<W: Write>(
     }
 }
 
+/// Probes stdout for the launch banner: whether it is a terminal at all
+/// (`term::window_size` fails identically for a pipe or a redirected file),
+/// its current size, and whether VT output could be enabled. The returned
+/// guard must outlive the whole session -- it is what keeps VT processing on
+/// for `wrap`'s own raw-mode session that follows -- so callers hold it
+/// rather than letting it drop immediately.
+fn probe_terminal() -> (bool, bool, (u16, u16), Option<term::VtGuard>) {
+    let size = term::window_size(term::STDIN_FD);
+    let stdout_is_tty = size.is_ok();
+    let vt_guard = term::enable_vt_output().ok();
+    let vt_ok = vt_guard.is_some();
+    (stdout_is_tty, vt_ok, size.unwrap_or((0, 0)), vt_guard)
+}
+
 pub fn run_with<W: Write>(
     args: &ChatArgs,
     w: &mut W,
@@ -122,18 +173,72 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = resolve_adapter(&cfg, args.agent.as_deref())?;
+    // Held for the rest of this function: dropping it early would restore
+    // the console's original VT mode before `wrap`'s own raw-mode session
+    // (which relies on VT already being on) even opens.
+    let (stdout_is_tty, vt_ok, size, _vt_guard) = probe_terminal();
+    let chrome = ChromeCaps::probe(stdout_is_tty, vt_ok, size, &cfg.chrome, args.simple, false);
+
+    let (adapter, rule) = match resolve_adapter(&cfg, args.agent.as_deref()) {
+        Ok(found) => found,
+        Err(err) => {
+            if chrome.banner {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}",
+                    chrome::style_no_adapter_error(&err.to_string(), chrome.colour)
+                );
+            }
+            return Err(err);
+        }
+    };
     let state = StateDir::resolve(env)?;
     let initial_prompt = resolve_initial_prompt(args.resume, &state, repo, w)?;
+    let resuming = args.resume && initial_prompt.is_some();
+    let session = SessionId::new_v4();
+
+    if chrome.banner {
+        let facts = BannerFacts {
+            harness: adapter.name().to_string(),
+            rule,
+            session: session.as_str().to_string(),
+            harnesses: harness_list(&cfg),
+            resuming: resuming.then(|| "the last stored handoff for this repo".to_string()),
+        };
+        writeln!(w, "{}", chrome::banner(&facts, chrome.colour, vt_ok))?;
+    }
+
     let launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &args.extra);
 
+    let env = quiet_env(env, args.quiet);
     let wrap_args = WrapArgs {
         agent: Some(launch.agent_name),
         no_supervise: false,
         command: launch.argv,
         simple: args.simple,
     };
-    wrap::run_with(&wrap_args, w, repo, env, launch.role)
+    wrap::run_with(&wrap_args, w, repo, &env, launch.role, Some(session))
+}
+
+/// `--quiet` on the `chat` and `agent` verbs is a CLI flag, not an
+/// environment variable, but `CtxConfig::load` (inside `wrap::run_with`)
+/// only ever reads `chrome.events` from config layers and `ZIRV_CTX_QUIET`.
+/// Folding the flag into the same env lookup both already share is simpler
+/// than adding a second, parallel "quiet" parameter to every downstream
+/// signature: it reuses the one config key that already means "silence the
+/// announcement channel", and honors the same operator-overrides-repo
+/// precedence `ZIRV_CTX_QUIET` always has.
+pub(crate) fn quiet_env<'a>(
+    env: EnvLookup<'a>,
+    quiet: bool,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |key: &str| {
+        if quiet && key == "ZIRV_CTX_QUIET" {
+            Some("true".to_string())
+        } else {
+            env(key)
+        }
+    }
 }
 
 pub fn run<W: Write>(args: &ChatArgs, w: &mut W) -> CtxResult<i32> {
@@ -281,6 +386,7 @@ mod tests {
             agent: None,
             resume: false,
             simple: false,
+            quiet: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -313,6 +419,7 @@ mod tests {
             agent: Some("claude".to_string()),
             resume: false,
             simple: false,
+            quiet: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -331,5 +438,74 @@ mod tests {
         let launch = build_launch(&adapter, None, &[]);
         assert_eq!(launch.agent_name, "codex");
         assert_eq!(launch.role, PromptRole::Orchestrator);
+    }
+
+    /// A non-terminal `cargo test` run must never crash on the chrome probe:
+    /// it degrades to no banner and passes through to `wrap`, which then
+    /// fails for the ordinary reason (no `claude` binary on the test
+    /// machine) rather than for anything chrome-related.
+    #[test]
+    fn a_non_terminal_test_run_gets_no_banner_and_still_reaches_wrap() {
+        // The agent is disabled explicitly (the same setup `chat_with_no_
+        // enabled_and_ready_adapter_names_each_candidate_and_its_reason`
+        // uses) so this test never depends on whatever agent binaries
+        // happen to be on this machine's PATH: `resolve_adapter` fails
+        // deterministically before `wrap::run_with` -- and therefore before
+        // any pty or subprocess -- is ever reached.
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let args = ChatArgs {
+            agent: Some("claude".to_string()),
+            resume: false,
+            simple: false,
+            quiet: false,
+            extra: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("claude is disabled, so this never reaches wrap");
+        assert!(err.to_string().contains("disabled"), "got {err}");
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            !printed.contains("zirv chat"),
+            "no terminal means no banner: {printed}"
+        );
+    }
+
+    #[test]
+    fn quiet_folds_into_the_env_lookup_as_zirv_ctx_quiet() {
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let base = |k: &str| empty.get(k).cloned();
+        let looked_up = quiet_env(&base, true);
+        assert_eq!(looked_up("ZIRV_CTX_QUIET"), Some("true".to_string()));
+        assert_eq!(looked_up("ZIRV_CTX_AGENT"), None, "other keys pass through");
+
+        let not_quiet = quiet_env(&base, false);
+        assert_eq!(
+            not_quiet("ZIRV_CTX_QUIET"),
+            None,
+            "without --quiet the underlying lookup is untouched"
+        );
+    }
+
+    #[test]
+    fn quiet_never_overrides_an_operators_own_zirv_ctx_quiet_false() {
+        // An operator who explicitly set ZIRV_CTX_QUIET=false is still
+        // overridden by an interactive --quiet flag: the flag is this
+        // invocation's own request, layered on top like any other override.
+        let set: std::collections::HashMap<String, String> =
+            [("ZIRV_CTX_QUIET".to_string(), "false".to_string())].into();
+        let base = |k: &str| set.get(k).cloned();
+        let looked_up = quiet_env(&base, true);
+        assert_eq!(looked_up("ZIRV_CTX_QUIET"), Some("true".to_string()));
     }
 }

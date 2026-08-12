@@ -354,6 +354,13 @@ pub fn current_windows(
 /// Blocks until the window has room, then returns. Never exits the process and
 /// never returns an error: pacing failing closed would be worse than pacing not
 /// happening, so every unknown proceeds.
+///
+/// `announcer` is `Some` where a session with a live chrome context is
+/// running (`exec`, and by extension `agent`, which delegates to it) and
+/// `None` where there is none to hand in (`loop`, which keeps today's plain
+/// writer as its only channel): either way, `w` keeps receiving the same
+/// text it always has, so nothing that already asserts on it breaks.
+#[allow(clippy::too_many_arguments)]
 pub fn wait_for_window<W: Write>(
     w: &mut W,
     state: &StateDir,
@@ -362,6 +369,7 @@ pub fn wait_for_window<W: Write>(
     session: &str,
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
+    announcer: Option<&super::announce::Announcer>,
 ) -> PaceOutcome {
     if !cfg.enabled {
         return PaceOutcome {
@@ -422,6 +430,18 @@ pub fn wait_for_window<W: Write>(
         if announced != fingerprint {
             announced = fingerprint;
             let _ = writeln!(w, "zirv ctx {verb}: {}", describe(&decision));
+            if let (
+                Some(announcer),
+                PaceDecision::WaitUntil {
+                    window, reset_at, ..
+                },
+            ) = (announcer, &decision)
+            {
+                announcer.emit(&super::announce::Event::PacingWait {
+                    window: (*window).to_string(),
+                    reset_at: *reset_at,
+                });
+            }
             let _ = log::append(
                 state,
                 &log::Decision {
@@ -1060,6 +1080,7 @@ mod tests {
                 clock.slept.borrow_mut().push(d.as_secs());
                 *clock.now.borrow_mut() += d.as_secs();
             },
+            None,
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1093,6 +1114,7 @@ mod tests {
                 clock.slept.borrow_mut().push(d.as_secs());
                 *clock.now.borrow_mut() += d.as_secs();
             },
+            None,
         );
 
         assert!(outcome.waited_secs >= 600, "waited {}", outcome.waited_secs);
@@ -1131,6 +1153,7 @@ mod tests {
             "sess-1",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
         );
 
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
@@ -1167,6 +1190,7 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
         );
 
         assert!(
@@ -1203,6 +1227,7 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
         );
 
         assert!(
@@ -1235,6 +1260,7 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
         );
 
         assert!(
@@ -1263,6 +1289,7 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1290,6 +1317,7 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
         );
         assert_eq!(outcome.waited_secs, 0);
         assert!(

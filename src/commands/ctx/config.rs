@@ -238,6 +238,28 @@ impl Default for MailConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChromeConfig {
+    /// The launch banner naming the resolved harness, the rule that chose it,
+    /// and the session id.
+    pub banner: bool,
+    /// The reserved bottom status bar (T12b).
+    pub bar: bool,
+    /// The `zirv ▸` announcement channel on stderr.
+    pub events: bool,
+}
+
+impl Default for ChromeConfig {
+    fn default() -> Self {
+        Self {
+            banner: true,
+            bar: true,
+            events: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -251,6 +273,7 @@ pub struct CtxConfig {
     pub optimize: OptimizeConfig,
     pub prompt: PromptConfig,
     pub mail: MailConfig,
+    pub chrome: ChromeConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -265,6 +288,11 @@ enum EnvKind {
     Int,
     Float,
     Bool,
+    /// Same parsing as `Bool`, but the parsed value is inverted before being
+    /// inserted. `ZIRV_CTX_QUIET=true` needs to become `chrome.events =
+    /// false`, and this is the one variable in `ENV_MAP` whose meaning is the
+    /// negation of the config key it feeds.
+    NegatedBool,
     Str,
 }
 
@@ -396,6 +424,19 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     ("ZIRV_CTX_MAIL_KEEP", &["mail", "keep"], EnvKind::Int),
+    (
+        "ZIRV_CTX_CHROME_BANNER",
+        &["chrome", "banner"],
+        EnvKind::Bool,
+    ),
+    ("ZIRV_CTX_CHROME_BAR", &["chrome", "bar"], EnvKind::Bool),
+    // Not `["chrome", "events"], EnvKind::Bool`: quiet is the inverse of
+    // events, so this is the one entry that needs `NegatedBool`.
+    (
+        "ZIRV_CTX_QUIET",
+        &["chrome", "events"],
+        EnvKind::NegatedBool,
+    ),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -444,6 +485,10 @@ fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
         EnvKind::Bool => raw
             .parse::<bool>()
             .map(toml::Value::Boolean)
+            .map_err(|_| format!("expected true or false, got '{raw}'").into()),
+        EnvKind::NegatedBool => raw
+            .parse::<bool>()
+            .map(|b| toml::Value::Boolean(!b))
             .map_err(|_| format!("expected true or false, got '{raw}'").into()),
     }
 }
@@ -949,6 +994,85 @@ mod tests {
         let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
             .expect_err("[agents] belongs in .settings.toml, not ctx.toml");
         assert!(err.to_string().contains("agents"), "got {err}");
+    }
+
+    #[test]
+    fn chrome_defaults_are_all_on() {
+        let chrome = ChromeConfig::default();
+        assert!(chrome.banner, "the launch banner is on by default");
+        assert!(chrome.bar, "the status bar is on by default");
+        assert!(chrome.events, "the announcement channel is on by default");
+    }
+
+    #[test]
+    fn chrome_reads_config_and_env() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chrome]\nbanner = false\nbar = false\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.chrome.banner);
+        assert!(!cfg.chrome.bar);
+        assert!(cfg.chrome.events, "untouched keys keep defaults");
+
+        let env = env_map(&[
+            ("ZIRV_CTX_CHROME_BANNER", "false"),
+            ("ZIRV_CTX_CHROME_BAR", "false"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.chrome.banner);
+        assert!(!cfg.chrome.bar);
+    }
+
+    /// `ZIRV_CTX_QUIET=true` must turn the announcement channel off, not on:
+    /// it is the negation of `chrome.events`, the one entry in `ENV_MAP`
+    /// whose meaning is inverted from the key it feeds.
+    #[test]
+    fn zirv_ctx_quiet_inverts_into_chrome_events() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_QUIET", "true")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.chrome.events,
+            "quiet=true must silence the announcement channel"
+        );
+
+        let env = env_map(&[("ZIRV_CTX_QUIET", "false")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            cfg.chrome.events,
+            "quiet=false must leave the announcement channel on"
+        );
+    }
+
+    #[test]
+    fn a_non_boolean_quiet_value_is_rejected() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_QUIET", "loud")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad bool");
+        assert!(err.to_string().contains("ZIRV_CTX_QUIET"), "got {err}");
+    }
+
+    /// `[chrome]` is not in `REPO_FORBIDDEN`: unlike `agent_bin` or
+    /// `handoff.model`, nothing here names what zirv runs or spends tokens
+    /// on, so a repository may configure its own chrome defaults.
+    #[test]
+    fn a_repository_may_configure_chrome() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chrome]\nbar = false\n",
+        )
+        .expect("write");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.chrome.bar);
     }
 
     #[test]

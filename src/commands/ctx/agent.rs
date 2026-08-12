@@ -16,7 +16,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use super::CtxResult;
-use super::config::{EnvLookup, env_from_process};
+use super::announce::{Announcer, Event};
+use super::chat::quiet_env;
+use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::SessionId;
 use super::exec::{self, ExecArgs};
 
@@ -38,6 +40,10 @@ pub struct AgentArgs {
     /// Wall-clock limit for the whole supervised run.
     #[arg(long)]
     pub timeout_secs: Option<u64>,
+    /// Suppress the `zirv ▸` announcement channel for this delegated run.
+    /// Errors and warnings are never suppressed.
+    #[arg(long, default_value_t = false)]
+    pub quiet: bool,
 }
 
 /// Everything wrong with `flags` that can be seen without running anything.
@@ -84,6 +90,17 @@ pub fn run_with<W: Write>(
     validate_flags(&args.flags)?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
 
+    // A second, independent config load just for the announcer: `exec::
+    // run_with` below loads its own copy internally (the same pattern
+    // `chat.rs` already uses ahead of `wrap::run_with`), so this costs one
+    // extra read of the same layered config rather than a new code path.
+    let cfg = CtxConfig::load(repo, env)?;
+    let announcer = Announcer::new(
+        cfg.chrome.events && !args.quiet,
+        console::colors_enabled_stderr(),
+    );
+    let env = quiet_env(env, args.quiet);
+
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
         session_id: Some(SessionId::new_v4().to_string()),
@@ -100,7 +117,14 @@ pub fn run_with<W: Write>(
         simple: false,
     };
 
-    let code = exec::run_with(&exec_args, w, repo, env)?;
+    announcer.emit(&Event::DelegatedStart {
+        agent: args.name.clone(),
+    });
+    let code = exec::run_with(&exec_args, w, repo, &env)?;
+    announcer.emit(&Event::DelegatedFinish {
+        agent: args.name.clone(),
+        meaning: exec::describe_exit(code),
+    });
     if let Some(note) = exit_note(code) {
         eprintln!("zirv ctx agent: {note}");
     }
@@ -147,6 +171,7 @@ mod tests {
             flags: Vec::new(),
             max_restarts: Some(0),
             timeout_secs: Some(30),
+            quiet: false,
         }
     }
 
@@ -329,6 +354,35 @@ mod tests {
         assert!(
             !argv.contains("zirv meta-harness"),
             "a worker session must never get the harness delegation layer: {argv}"
+        );
+    }
+
+    /// `--quiet` folds into `ZIRV_CTX_QUIET` for the delegated `exec::
+    /// run_with` call the same way it does for `chat`; this pins that the
+    /// flag does not otherwise disturb a delegated run (it still launches,
+    /// still succeeds, still exits 0).
+    #[test]
+    fn quiet_still_lets_the_delegated_run_complete_normally() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let mut args = args_for("claude", "do the work");
+        args.quiet = true;
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "--quiet must not change the outcome"
         );
     }
 }

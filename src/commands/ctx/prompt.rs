@@ -588,6 +588,32 @@ pub fn log_injection(
     );
 }
 
+/// The `zirv ▸` announcement for this same session-start decision, mirroring
+/// `log_injection`'s own branches exactly (composed-and-supported,
+/// composed-but-unsupported, nothing composed at all) so the stderr
+/// narration and the decision log never disagree about what happened. Kept
+/// as its own pure function -- rather than folded into `log_injection`
+/// itself -- so a caller with no `Announcer` (nothing here forces one on
+/// `resume.rs`, which never got a chrome context) is unaffected: only the
+/// call sites that already gained one (`wrap`, `exec`, `loop`) call this too.
+pub fn injection_event(
+    composed: Option<&ComposedPrompt>,
+    supported: bool,
+) -> super::announce::Event {
+    use super::announce::Event;
+    match (composed, supported) {
+        (Some(composed), true) => Event::InjectionComposed {
+            layers: composed.describe(),
+        },
+        (Some(_), false) => Event::InjectionSkipped {
+            reason: "agent has no verified system-prompt mechanism (unsupported)".to_string(),
+        },
+        (None, _) => Event::InjectionSkipped {
+            reason: "no prompt composed (simple run or prompt disabled)".to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,6 +776,39 @@ mod tests {
             log.contains(DEFAULT_PROMPT_VERSION),
             "the version is attributable: {log}"
         );
+    }
+
+    #[test]
+    fn the_injection_event_mirrors_log_injections_own_branches() {
+        use crate::commands::ctx::announce::Event;
+
+        let (_tmp, home, repo) = tree();
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+        );
+
+        match injection_event(composed.as_ref(), true) {
+            Event::InjectionComposed { layers } => {
+                assert!(layers.contains("default"), "got {layers}")
+            }
+            other => panic!("expected InjectionComposed, got {other:?}"),
+        }
+        match injection_event(composed.as_ref(), false) {
+            Event::InjectionSkipped { reason } => {
+                assert!(reason.contains("unsupported"), "got {reason}")
+            }
+            other => panic!("expected InjectionSkipped, got {other:?}"),
+        }
+        match injection_event(None, true) {
+            Event::InjectionSkipped { reason } => {
+                assert!(reason.contains("simple"), "got {reason}")
+            }
+            other => panic!("expected InjectionSkipped, got {other:?}"),
+        }
     }
 
     #[test]

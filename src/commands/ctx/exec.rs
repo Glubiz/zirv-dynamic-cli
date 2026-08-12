@@ -217,6 +217,12 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
+    // Gated only by `cfg.chrome.events` (which already folds in `--quiet` on
+    // `zirv ctx agent`, `ZIRV_CTX_QUIET` and `[chrome] events`), independent
+    // of whatever terminal (if any) is attached: a headless supervised run
+    // still wants these lines on its stderr.
+    let announcer =
+        super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     let adapter = adapters::select(agent_name, &args.command, &cfg)?;
     let state = StateDir::resolve(env)?;
@@ -275,6 +281,11 @@ pub fn run_with<W: Write>(
     } else {
         Vec::new()
     };
+    if !mail_messages.is_empty() {
+        announcer.emit(&super::announce::Event::MailDelivered {
+            count: mail_messages.len(),
+        });
+    }
     let composed =
         super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
 
@@ -326,6 +337,10 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         adapter.capabilities().system_prompt,
     );
+    announcer.emit(&super::prompt::injection_event(
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    ));
 
     let derive_transcript = |session: &SessionId| {
         adapter.transcript_path(&SessionRef {
@@ -445,6 +460,7 @@ pub fn run_with<W: Write>(
             session.as_str(),
             &now_fn,
             &sleep_fn,
+            Some(&announcer),
         );
 
         let (mut child, tap) = supervise::spawn_tapped(command)?;
@@ -514,6 +530,7 @@ pub fn run_with<W: Write>(
                 session.as_str(),
                 &now_fn,
                 &sleep_fn,
+                Some(&announcer),
             );
 
             let Some(prompt_text) = prompt.clone() else {
@@ -537,6 +554,10 @@ pub fn run_with<W: Write>(
                 composed.as_ref(),
                 adapter.capabilities().system_prompt,
             );
+            announcer.emit(&super::prompt::injection_event(
+                composed.as_ref(),
+                adapter.capabilities().system_prompt,
+            ));
             // M8: the user's own extra flags survive the relaunch too, not
             // just zirv's own (the system prompt args).
             let extra: Vec<String> = user_extra
@@ -621,6 +642,10 @@ pub fn run_with<W: Write>(
             Duration::from_secs(cfg.handoff.timeout_secs),
         );
         let stored = handoff::store(&state, repo, session.as_str(), &note)?;
+        announcer.emit(&super::announce::Event::Restart {
+            style: source.to_string(),
+            stored: stored.display().to_string(),
+        });
 
         restarts += 1;
         let _ = log::append(
@@ -654,6 +679,10 @@ pub fn run_with<W: Write>(
             composed.as_ref(),
             adapter.capabilities().system_prompt,
         );
+        announcer.emit(&super::prompt::injection_event(
+            composed.as_ref(),
+            adapter.capabilities().system_prompt,
+        ));
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
         // M8: the user's own extra flags survive the restart too, not just
         // zirv's own (the system prompt args) -- this used to be asymmetric.

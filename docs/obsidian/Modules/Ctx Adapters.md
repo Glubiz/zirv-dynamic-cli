@@ -40,6 +40,25 @@ Several methods have trait-default implementations that only `claude.rs` current
 
 `command_matches_adapter(adapter, agent_explicit, command)` is the trust gate used before injecting adapter-specific flags (like `--append-system-prompt`) into a wrapped command: it's true only when the operator named the agent explicitly or `detect()` matched, never merely because `select()`'s last resort had to default to claude with nothing backing it.
 
+### The registry table and `resolve_default`
+
+`ADAPTERS: &[(&str, AdapterCtor)]` (`mod.rs`) is the single source of truth for which adapters exist — a name paired with a constructor function:
+
+| Name | Constructor |
+|---|---|
+| `"claude"` | `make_claude` → `ClaudeAdapter::new(bin)` |
+| `"codex"` | `make_codex` → `CodexAdapter::new(bin)` |
+
+`all(bin)`, `select`'s fallback, `describe_known_adapters`, `resolve_default`, and `readiness_note` all walk this table rather than naming adapters by hand, so none of them can drift from it or from each other — adding a third adapter is one entry here plus its own module.
+
+`resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, DefaultOrigin)>` is the fallback `select` calls when neither an explicit `--agent` nor argv detection named an adapter, but it also stands on its own — callers that want to *explain* the default rather than just use it (`zirv ctx status`'s `chat:` line, `zirv ctx chat`'s own resolution) call it directly:
+
+1. If `cfg.agent` names an adapter, that one is used (after the gate check and its own `ready()`), tagged `DefaultOrigin::Configured`.
+2. Otherwise, the first registry entry that is both gate-enabled and `ready()` wins, tagged `DefaultOrigin::FirstEnabledReady`.
+3. If nothing qualifies, the error aggregates one line per adapter naming why it was skipped (the gate's refusal text, or the adapter's own `ready()` text) rather than reporting only the first failure — this is the same aggregated message `zirv ctx status` reuses (see [[Ctx Subsystem]]) instead of inventing its own wording.
+
+`DefaultOrigin` is coarser than `chrome.rs`'s own `HarnessRule` (see [[Ctx Supervisors]]): `HarnessRule` adds a third case, `Explicit`, for an operator-named `--agent`, which never reaches `resolve_default` at all since `select`'s explicit-name arm short-circuits before the fallback.
+
 ### The `.settings.toml` enable/disable gate
 
 `src/settings.rs` owns `AgentGate`, loaded once per `CtxConfig::load` into `cfg.agents` and consulted by `select` before every `ready()` call. Its module doc lays out the full layering (`~/.zirv/.settings.toml`, then `<repo>/.zirv/.settings.toml`, then `ZIRV_AGENT_<NAME>_ENABLED`) and the per-agent AND-fold trust rule (a repo may only narrow, the environment is the operator in both directions). What matters here: the gate is operator *policy* ("may zirv use this adapter"), separate from `ready()`'s implementation *state* ("does this adapter work yet"), and policy is checked first — a disabled codex reports the disable, not "not implemented yet". `select`'s three arms all honor it identically: an explicit `--agent codex` with codex disabled refuses outright (no fallback), and so does an argv `detect()` match — mirroring the existing invariant that detecting codex on the wrapped command never silently falls back to claude. The unknown-agent error's adapter list also marks disabled names, e.g. `known adapters: claude, codex (disabled)`. `zirv ctx status` prints one line per adapter from `AgentGate::states()`, enabled or disabled plus the file/variable responsible.

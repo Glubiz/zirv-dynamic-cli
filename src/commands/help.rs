@@ -79,6 +79,14 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
         writer,
         "Usage: zirv <script|command> [params...] [options]\n"
     )?;
+    writeln!(
+        writer,
+        "Bare `zirv` (no arguments) starts `zirv ctx chat` when a `.zirv` directory exists"
+    )?;
+    writeln!(
+        writer,
+        "(locally or in ~/.zirv) and stdin is a real terminal; otherwise it shows this help.\n"
+    )?;
     writeln!(writer, "Commands:")?;
     writeln!(writer, "  help, h        Show this help")?;
     writeln!(writer, "  version, v     Print the version")?;
@@ -88,7 +96,18 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
         writer,
         "  ctx            Context management (score, loop, exec, wrap, handoff, resume,"
     )?;
-    writeln!(writer, "                 hook, status, usage, optimize)")?;
+    writeln!(
+        writer,
+        "                 hook, status, usage, optimize, chat, agent, send, inbox)"
+    )?;
+    writeln!(
+        writer,
+        "  chat           Alias for `zirv ctx chat`: start an interactive orchestrator session"
+    )?;
+    writeln!(
+        writer,
+        "  agent <name> <prompt>  Alias for `zirv ctx agent`: delegate one task to another harness"
+    )?;
     writeln!(writer, "\nOptions:")?;
     writeln!(
         writer,
@@ -316,6 +335,25 @@ shortcuts:
             output.contains("ctx") && output.contains("Context management"),
             "got {output}"
         );
+        Ok(())
+    }
+
+    /// `zirv chat`/`zirv agent` are top-level aliases for `zirv ctx chat`/
+    /// `zirv ctx agent` (see `main.rs`'s `top_level_ctx_alias`); they belong
+    /// in the help listing next to the other built-ins so they're
+    /// discoverable, not just documented.
+    #[test]
+    fn help_lists_chat_and_agent_as_built_ins() -> Result<(), Box<dyn std::error::Error>> {
+        let empty = tempdir()?;
+        let home = tempdir()?;
+        let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
+
+        let mut out = Cursor::new(Vec::new());
+        show_help(&mut out)?;
+        let text = String::from_utf8(out.into_inner())?;
+
+        assert!(text.contains("chat"), "got {text}");
+        assert!(text.contains("agent"), "got {text}");
         Ok(())
     }
 

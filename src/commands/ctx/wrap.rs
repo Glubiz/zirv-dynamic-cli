@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use super::adapters::AgentAdapter;
+use super::announce::{Announcer, Event};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::NormalizedEvent;
 use super::handoff::{self, Handoff};
@@ -321,22 +322,6 @@ pub fn action_for(state: &InjectionState, now: Instant, debounce: Duration) -> A
     }
 }
 
-pub fn advisory_line(score: u32, tokens: u64) -> String {
-    format!(
-        "zirv ctx: context health is slipping (score {score}, {tokens} tokens in context). A /compact soon will keep instruction-following sharp."
-    )
-}
-
-/// One line telling the user/agent unread mail is waiting, without saying
-/// what it is: wrap only advises, it never reads or injects mail itself (see
-/// `unread_mail_count`).
-pub fn mail_advisory_line(count: usize) -> String {
-    let plural = if count == 1 { "" } else { "s" };
-    format!(
-        "zirv ctx: {count} new mail message{plural} waiting; run `zirv ctx inbox` to read them."
-    )
-}
-
 /// Whether the mailbox has grown since the last check: the only thing that
 /// should ever trigger a fresh advisory. Equal or shrinking (a message was
 /// consumed elsewhere, or the read failed and fell back to the last known
@@ -398,8 +383,16 @@ do not redo work marked as done.\n\n{}",
 /// One-way switch to pure passthrough. Once supervision has proven unreliable
 /// in a session it stays off: a wrapped session must never be worse than an
 /// unwrapped one.
-pub fn note_failure(state: &mut InjectionState, log_target: Option<(&StateDir, &str)>, what: &str) {
+pub fn note_failure(
+    state: &mut InjectionState,
+    log_target: Option<(&StateDir, &str)>,
+    what: &str,
+    announcer: &Announcer,
+) {
     state.degraded = true;
+    announcer.emit(&Event::Degraded {
+        cause: what.to_string(),
+    });
     if let Some((state_dir, session)) = log_target {
         let _ = super::log::append(
             state_dir,
@@ -470,6 +463,7 @@ fn spawn_output_thread(
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     my_generation: u64,
+    stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
 ) {
     std::thread::spawn(move || {
         let still_current =
@@ -499,7 +493,18 @@ fn spawn_output_thread(
                     if !still_current() {
                         continue;
                     }
-                    if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+                    // Held only around the write itself (T12b): the same
+                    // lock the bar's own redraw takes, so one assembled bar
+                    // buffer can never land in the middle of a child-byte
+                    // write and vice versa. A poisoned lock (a panic
+                    // elsewhere while holding it) still yields its guard --
+                    // the child's own output must never be dropped because
+                    // some unrelated code panicked while holding this lock.
+                    let write_result = {
+                        let _guard = stdout_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        stdout.write_all(&buf[..n]).and_then(|()| stdout.flush())
+                    };
+                    if write_result.is_err() {
                         if still_current() {
                             let _ = tx.send(PumpEvent::PtyClosed);
                         }
@@ -606,18 +611,35 @@ fn relaunch(
 /// existing `wrap` caller (the `wrap` verb itself, and every relaunch inside
 /// `pump`) passes `PromptRole::Worker`; `chat` is the one caller that passes
 /// `PromptRole::Orchestrator`.
+/// `session` lets a caller that already generated a session id for its own
+/// purposes (`chat.rs`'s launch banner, printed before this function is ever
+/// called) hand it in rather than have two different ids exist for the same
+/// launch. `None` (every caller but `chat`) keeps today's behavior: a fresh
+/// id minted here.
 pub fn run_with<W: Write>(
     args: &WrapArgs,
     w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
     role: PromptRole,
+    session: Option<super::event::SessionId>,
 ) -> CtxResult<i32> {
     if args.command.is_empty() {
         return Err("no command to wrap; pass it after --".into());
     }
 
     let cfg = CtxConfig::load(repo, env)?;
+    // Announcements are gated by `cfg.chrome.events` (which already folds in
+    // `--quiet`, `ZIRV_CTX_QUIET` and `[chrome] events`), never by whether
+    // the terminal is big enough or colour-capable for the banner and bar: a
+    // piped stderr in CI still wants these lines. `--no-supervise` is the one
+    // exception: it promises pure passthrough ("no scoring, no injection"),
+    // so nothing about supervision has anything to narrate either.
+    let announcer = if args.no_supervise {
+        Announcer::silent()
+    } else {
+        Announcer::new(cfg.chrome.events, console::colors_enabled_stderr())
+    };
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     // Selection happens here so an unknown or unverified agent fails before the
     // terminal is touched.
@@ -659,7 +681,7 @@ pub fn run_with<W: Write>(
     }
 
     let state_dir = super::state::StateDir::resolve(env)?;
-    let session = super::event::SessionId::new_v4();
+    let session = session.unwrap_or_else(super::event::SessionId::new_v4);
 
     // `--no-supervise` promises pure passthrough (its own help text says so),
     // and so does a wrapped command that matches no adapter: injecting this
@@ -697,6 +719,10 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         adapter.capabilities().system_prompt,
     );
+    announcer.emit(&super::prompt::injection_event(
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    ));
     // Stripping the user's own --append-system-prompt (see
     // merge_command_line_prompt) can empty the argv even though args.command
     // itself was not empty at the top of this function, e.g. `wrap -- --
@@ -727,6 +753,7 @@ pub fn run_with<W: Write>(
                     &mut supervision,
                     Some((&state_dir, session.as_str())),
                     "socket unavailable",
+                    &announcer,
                 );
                 None
             }
@@ -738,9 +765,27 @@ pub fn run_with<W: Write>(
     let mut transcript = TranscriptSource::new(env(TRANSCRIPT_ENV).map(PathBuf::from));
 
     let (cols, rows) = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
+    // Probed (and, on success, held) ahead of `RawGuard::enter` below: the
+    // chrome eligibility decision (in particular whether the bar may draw at
+    // all) needs to know this before the pty is even sized, and the bar's
+    // own escape sequences need VT on regardless of whether the wrapped
+    // command is itself claude or codex. Restored explicitly alongside
+    // `raw`, at the one place this function ever leaves the pump.
+    let mut vt_guard = super::term::enable_vt_output().ok();
+    let vt_ok = vt_guard.is_some();
+    let stdout_is_tty = window_size(STDIN_FD).is_ok();
+    let chrome = super::chrome::ChromeCaps::probe(
+        stdout_is_tty,
+        vt_ok,
+        (cols, rows),
+        &cfg.chrome,
+        args.simple,
+        args.no_supervise,
+    );
+    let (pty_cols, pty_rows) = super::chrome::reserved_pty_size((cols, rows), chrome.bar);
     let mut pair = native_pty_system().openpty(PtySize {
-        rows,
-        cols,
+        rows: pty_rows,
+        cols: pty_cols,
         pixel_width: 0,
         pixel_height: 0,
     })?;
@@ -801,8 +846,21 @@ pub fn run_with<W: Write>(
     // never reports a false PtyClosed for the pty that replaced it.
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    // Guards every write to the real stdout: the output thread's own
+    // child-byte writes, and (T12b) the bar's assembled redraw buffer. One
+    // `Mutex<()>` rather than wrapping `Stdout` itself, since both writers
+    // already hold their own handle and only need to serialize *when* they
+    // write, not share the handle.
+    let stdout_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+
     // PTY to stdout.
-    spawn_output_thread(reader, tx.clone(), generation.clone(), 0);
+    spawn_output_thread(
+        reader,
+        tx.clone(),
+        generation.clone(),
+        0,
+        stdout_lock.clone(),
+    );
 
     // Armed for the pty just opened, and re-armed by `pump` for every pty a
     // restart opens after it.
@@ -854,6 +912,21 @@ pub fn run_with<W: Write>(
     // still passes bytes through.
     let mut raw = RawGuard::enter(STDIN_FD).ok();
 
+    let mut bar = BarRuntime::new(
+        chrome,
+        adapter.name().to_string(),
+        stdout_lock.clone(),
+        (cols, rows),
+    );
+    if bar.chrome.bar {
+        let region = super::chrome::scroll_region_sequence(bar.rows);
+        if let Ok(_guard) = stdout_lock.lock() {
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(region.as_bytes());
+            let _ = stdout.flush();
+        }
+    }
+
     let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
     let inject_timeout = Duration::from_millis(cfg.wrap.inject_timeout_ms);
 
@@ -896,9 +969,15 @@ pub fn run_with<W: Write>(
         &relaunch_extra,
         &turn_env,
         &cpr_filter,
+        &announcer,
+        &mut bar,
     );
 
+    reset_bar(&bar);
     if let Some(guard) = raw.as_mut() {
+        let _ = guard.restore();
+    }
+    if let Some(guard) = vt_guard.as_mut() {
         let _ = guard.restore();
     }
 
@@ -908,6 +987,127 @@ pub fn run_with<W: Write>(
             writeln!(w, "zirv ctx wrap: {e}")?;
             Ok(1)
         }
+    }
+}
+
+/// Mutable T12b bookkeeping for the reserved status bar, bundled into one
+/// struct rather than further widening `pump`'s already-long parameter list.
+/// `disabled` is a one-way switch exactly like `InjectionState::degraded`:
+/// once a probe, lock or write failure sets it, nothing here ever clears it
+/// again, and the child is never touched by that decision (see
+/// `chrome::after_redraw_attempt`).
+struct BarRuntime {
+    chrome: super::chrome::Chrome,
+    disabled: bool,
+    last_text: Option<String>,
+    last_draw: Instant,
+    harness: String,
+    stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    rows: u16,
+    cols: u16,
+}
+
+impl BarRuntime {
+    fn new(
+        chrome: super::chrome::Chrome,
+        harness: String,
+        stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
+        size: (u16, u16),
+    ) -> Self {
+        Self {
+            disabled: !chrome.bar,
+            chrome,
+            // Never drawn yet, so the first due check always draws.
+            last_text: None,
+            last_draw: Instant::now() - BAR_THROTTLE,
+            harness,
+            stdout_lock,
+            cols: size.0,
+            rows: size.1,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.chrome.bar && !self.disabled
+    }
+}
+
+/// The 1s redraw throttle: usage and mail are read from disk only when this
+/// has elapsed, never on the byte-pump path.
+const BAR_THROTTLE: Duration = Duration::from_secs(1);
+
+/// Writes the reset sequence once, at the one place `wrap` ever leaves the
+/// pump (alongside `RawGuard::restore`). A no-op when the bar was never
+/// eligible in the first place, but attempted even if it later degraded:
+/// a degraded bar may have left a stale row on the real terminal that still
+/// needs clearing.
+fn reset_bar(bar: &BarRuntime) {
+    if !bar.chrome.bar {
+        return;
+    }
+    let sequence = super::chrome::bar_reset_sequence(bar.rows);
+    if let Ok(_guard) = bar.stdout_lock.lock() {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(sequence.as_bytes());
+        let _ = stdout.flush();
+    }
+}
+
+/// Redraws the bar when it is active, its rendered text actually changed,
+/// and the 1s throttle has elapsed. Usage and mail are read from disk only
+/// here, gated by that same throttle, never from the byte-pump path. Any
+/// lock or write failure disables the bar permanently and leaves the child
+/// untouched; `now` is threaded in rather than read internally so the
+/// throttle itself stays testable without a real clock.
+fn redraw_bar_if_due(
+    bar: &mut BarRuntime,
+    supervision: &InjectionState,
+    state_dir: &super::state::StateDir,
+    repo: &Path,
+    now: Instant,
+) {
+    if !bar.active() || now.duration_since(bar.last_draw) < BAR_THROTTLE {
+        return;
+    }
+    bar.last_draw = now;
+
+    let windows = super::window::load(state_dir);
+    let usage_percent = windows
+        .five_hour
+        .iter()
+        .chain(windows.seven_day.iter())
+        .map(|w| w.used_percentage)
+        .fold(None, |acc: Option<f64>, p| {
+            Some(acc.map_or(p, |a| a.max(p)))
+        });
+    let unread_mail = unread_mail_count(state_dir, repo);
+
+    let state = super::chrome::BarState {
+        harness: bar.harness.clone(),
+        score: (supervision.signals_seen > 0).then_some(supervision.score),
+        verdict: (supervision.signals_seen > 0).then_some(supervision.verdict),
+        usage_percent,
+        unread_mail,
+        degraded: supervision.degraded,
+    };
+    let text = super::chrome::status_bar(&state, bar.cols, bar.chrome.colour);
+    if !super::chrome::bar_text_changed(bar.last_text.as_deref(), &text) {
+        return;
+    }
+
+    let sequence = super::chrome::bar_redraw_sequence(bar.rows, &text);
+    let wrote = match bar.stdout_lock.lock() {
+        Ok(_guard) => {
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(sequence.as_bytes())
+                .and_then(|()| stdout.flush())
+        }
+        Err(_) => Err(std::io::Error::other("stdout lock poisoned")),
+    };
+    bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, wrote.is_ok());
+    if wrote.is_ok() {
+        bar.last_text = Some(text);
     }
 }
 
@@ -935,6 +1135,8 @@ fn pump(
     extra: &[String],
     turn_env: &[(String, String)],
     cpr_filter: &std::sync::Arc<std::sync::Mutex<CprFilter>>,
+    announcer: &Announcer,
+    bar: &mut BarRuntime,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
     // Read only from the turn-signal arm below, never from a byte-pump or
@@ -960,7 +1162,13 @@ fn pump(
             && let Some(signal) = server.try_recv()
         {
             transcript.adopt(signal.transcript_path.as_deref());
+            let previous_verdict = supervision.verdict;
             supervision.on_turn(&signal);
+            if let Some(event) =
+                super::announce::verdict_change(previous_verdict, supervision.verdict, signal.score)
+            {
+                announcer.emit(&event);
+            }
 
             // Advisory only: wrap never consumes mail (it stays unread for
             // `zirv ctx inbox`) and never writes to the pty, only to stderr.
@@ -969,17 +1177,25 @@ fn pump(
             if let Some(count) = unread_mail_count(state_dir, repo)
                 && mail_grew(mail_seen, count)
             {
-                let mut stderr = std::io::stderr();
-                let _ = writeln!(stderr, "\r\n{}\r", mail_advisory_line(count));
+                announcer.emit(&Event::MailWaiting { count });
                 mail_seen = count;
             }
         }
 
+        // T12b: ticks on the ordinary ~100ms poll, so the bar still
+        // refreshes (usage, mail, a still-degrading session) both right
+        // after a turn signal and during a long turn with none at all.
+        // `redraw_bar_if_due` is what actually enforces the 1s throttle and
+        // the no-op-when-unchanged check; this call is cheap otherwise.
+        redraw_bar_if_due(bar, supervision, state_dir, repo, Instant::now());
+
         match action_for(supervision, Instant::now(), debounce) {
             Action::None => {}
             Action::Advise => {
-                let mut stderr = std::io::stderr();
-                let _ = writeln!(stderr, "\r\n{}\r", advisory_line(supervision.score, 0));
+                announcer.emit(&Event::RotAdvisory {
+                    score: supervision.score,
+                    tokens: 0,
+                });
                 // Advise once per turn.
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
             }
@@ -1017,9 +1233,15 @@ fn pump(
                     }
                 };
                 let verified = failure.is_none();
+                announcer.emit(&Event::Compact { verified });
 
                 if let Some(reason) = failure {
-                    note_failure(supervision, Some((state_dir, session.as_str())), reason);
+                    note_failure(
+                        supervision,
+                        Some((state_dir, session.as_str())),
+                        reason,
+                        announcer,
+                    );
                 }
                 let _ = super::log::append(
                     state_dir,
@@ -1097,6 +1319,7 @@ fn pump(
                                     tx.clone(),
                                     generation.clone(),
                                     new_generation,
+                                    bar.stdout_lock.clone(),
                                 );
                                 if let Ok(mut sink) = writer.lock() {
                                     *sink = fresh_writer;
@@ -1117,11 +1340,20 @@ fn pump(
                     _ => false,
                 };
 
-                if !relaunched {
+                if relaunched {
+                    announcer.emit(&Event::Restart {
+                        style: source.to_string(),
+                        stored: match &stored {
+                            Ok(path) => path.display().to_string(),
+                            Err(e) => format!("not stored: {e}"),
+                        },
+                    });
+                } else {
                     note_failure(
                         supervision,
                         Some((state_dir, session.as_str())),
                         "relaunch failed",
+                        announcer,
                     );
                 }
                 let _ = super::log::append(
@@ -1153,13 +1385,49 @@ fn pump(
         if let Ok(size) = window_size(STDIN_FD)
             && size != last_size
         {
-            last_size = size;
-            let _ = pair.master.resize(PtySize {
-                rows: size.1,
-                cols: size.0,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
+            // Once a bar-eligible session has degraded, the pty is kept at
+            // its last size for the rest of the session: resizing further
+            // (up or down) would either fight a bar that has stopped
+            // drawing or resume drawing over a scroll region nobody is
+            // maintaining anymore.
+            let frozen = bar.chrome.bar && bar.disabled;
+            if !frozen {
+                last_size = size;
+                if bar.active() {
+                    if super::chrome::bar_should_disable_after_resize(size.0) {
+                        bar.disabled = true;
+                    } else {
+                        bar.cols = size.0;
+                        bar.rows = size.1;
+                        let region = super::chrome::scroll_region_sequence(bar.rows);
+                        let region_ok = match bar.stdout_lock.lock() {
+                            Ok(_guard) => {
+                                let mut stdout = std::io::stdout();
+                                stdout
+                                    .write_all(region.as_bytes())
+                                    .and_then(|()| stdout.flush())
+                                    .is_ok()
+                            }
+                            Err(_) => false,
+                        };
+                        bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
+                        if !bar.disabled {
+                            // The bar's own row moved; the next throttle tick
+                            // must redraw it even if the text is unchanged.
+                            bar.last_text = None;
+                        }
+                    }
+                }
+                if !(bar.chrome.bar && bar.disabled) {
+                    let (pty_cols, pty_rows) = super::chrome::reserved_pty_size(size, bar.active());
+                    let _ = pair.master.resize(PtySize {
+                        rows: pty_rows,
+                        cols: pty_cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+            }
         }
 
         std::thread::sleep(PUMP_POLL);
@@ -1169,7 +1437,7 @@ fn pump(
 pub fn run<W: Write>(args: &WrapArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env, PromptRole::Worker)
+    run_with(args, w, &repo, &env, PromptRole::Worker, None)
 }
 
 #[cfg(test)]
@@ -1322,8 +1590,15 @@ mod tests {
             simple: false,
         };
         let mut out = Vec::new();
-        let err = run_with(&args, &mut out, tmp.path(), &|_| None, PromptRole::Worker)
-            .expect_err("nothing to wrap");
+        let err = run_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+        )
+        .expect_err("nothing to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
@@ -1343,8 +1618,15 @@ mod tests {
             simple: false,
         };
         let mut out = Vec::new();
-        let err = run_with(&args, &mut out, tmp.path(), &|_| None, PromptRole::Worker)
-            .expect_err("echo matches no adapter");
+        let err = run_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+        )
+        .expect_err("echo matches no adapter");
         let msg = err.to_string();
         assert!(
             msg.contains("--agent"),
@@ -1377,8 +1659,15 @@ mod tests {
             simple: false,
         };
         let mut out = Vec::new();
-        let err = run_with(&args, &mut out, tmp.path(), &|_| None, PromptRole::Worker)
-            .expect_err("nothing left to wrap");
+        let err = run_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+        )
+        .expect_err("nothing left to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
@@ -1842,9 +2131,17 @@ mod tests {
         assert_eq!(action_for(&state, now, DEBOUNCE), Action::None);
     }
 
+    /// The rot advisory now lives on the `announce::Event` channel
+    /// (`Event::RotAdvisory`) rather than as a wrap-local `advisory_line`
+    /// free function; this pins the same content guarantees the old
+    /// function's own test did.
     #[test]
     fn the_advisory_line_is_one_line_and_plain() {
-        let line = advisory_line(47, 138_000);
+        let line = Event::RotAdvisory {
+            score: 47,
+            tokens: 138_000,
+        }
+        .line();
         assert_eq!(line.lines().count(), 1);
         assert!(line.contains("47"));
         assert!(line.contains("138000") || line.contains("138"));
@@ -1854,11 +2151,11 @@ mod tests {
         );
     }
 
-    // T8: mail advisory in wrap's pump.
+    // T8: mail advisory in wrap's pump, now `announce::Event::MailWaiting`.
 
     #[test]
     fn the_mail_advisory_line_names_the_count_and_points_at_inbox() {
-        let line = mail_advisory_line(3);
+        let line = Event::MailWaiting { count: 3 }.line();
         assert_eq!(line.lines().count(), 1);
         assert!(line.contains('3'));
         assert!(line.contains("zirv ctx inbox"));
@@ -1867,7 +2164,7 @@ mod tests {
             "no em dashes in user-facing copy"
         );
 
-        let singular = mail_advisory_line(1);
+        let singular = Event::MailWaiting { count: 1 }.line();
         assert!(!singular.contains("messages"), "got {singular}");
     }
 
@@ -2803,7 +3100,12 @@ mod tests {
         let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
         let mut supervision = InjectionState::new();
 
-        note_failure(&mut supervision, Some((&state, "sess")), "socket died");
+        note_failure(
+            &mut supervision,
+            Some((&state, "sess")),
+            "socket died",
+            &Announcer::silent(),
+        );
         assert!(supervision.degraded);
 
         // Even a fresh turn signal cannot re-enable injection.
@@ -2822,7 +3124,7 @@ mod tests {
     #[test]
     fn note_failure_without_a_state_dir_still_degrades() {
         let mut supervision = InjectionState::new();
-        note_failure(&mut supervision, None, "no state dir");
+        note_failure(&mut supervision, None, "no state dir", &Announcer::silent());
         assert!(supervision.degraded);
     }
 

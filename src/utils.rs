@@ -15,7 +15,7 @@ pub const SCRIPT_DIR_NAME: &str = ".zirv";
 /// built-ins in `main.rs` before any script lookup happens. A script or
 /// shortcut sharing one of these names can never be reached.
 pub const RESERVED_COMMANDS: &[&str] = &[
-    "help", "h", "version", "v", "init", "i", "create", "c", "ctx",
+    "help", "h", "version", "v", "init", "i", "create", "c", "ctx", "chat", "agent",
 ];
 
 pub fn is_reserved_command(name: &str) -> bool {

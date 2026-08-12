@@ -76,6 +76,8 @@ pub fn run_with<W: Write>(
 
     let prompt = resolve_prompt(args)?;
     let cfg = CtxConfig::load(repo, env)?;
+    let announcer =
+        super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let state = StateDir::resolve(env)?;
 
@@ -97,7 +99,9 @@ pub fn run_with<W: Write>(
         }
         cycle += 1;
 
-        pace::wait_for_window(w, &state, &cfg.pace, "loop", "loop", &now_fn, &sleep_fn);
+        pace::wait_for_window(
+            w, &state, &cfg.pace, "loop", "loop", &now_fn, &sleep_fn, None,
+        );
 
         // Recomposed every cycle -- the same seam as `injection_args_for_
         // session` a few lines down -- because each cycle is a fresh,
@@ -118,6 +122,11 @@ pub fn run_with<W: Write>(
         } else {
             Vec::new()
         };
+        if !mail_messages.is_empty() {
+            announcer.emit(&super::announce::Event::MailDelivered {
+                count: mail_messages.len(),
+            });
+        }
         let composed =
             super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
         let (user_extra, composed) =
@@ -150,6 +159,10 @@ pub fn run_with<W: Write>(
             composed.as_ref(),
             adapter.capabilities().system_prompt,
         );
+        announcer.emit(&super::prompt::injection_event(
+            composed.as_ref(),
+            adapter.capabilities().system_prompt,
+        ));
         let transcript = adapter.transcript_path(&SessionRef {
             id: session.clone(),
             cwd: repo.to_path_buf(),
@@ -241,6 +254,7 @@ pub fn run_with<W: Write>(
                 session.as_str(),
                 &now_fn,
                 &sleep_fn,
+                None,
             );
         }
 

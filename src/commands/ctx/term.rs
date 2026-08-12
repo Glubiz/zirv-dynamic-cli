@@ -260,9 +260,127 @@ pub fn window_size(_fd: i32) -> CtxResult<(u16, u16)> {
     Err("window size probing is only implemented on unix and Windows".into())
 }
 
+/// Restoring guard for `enable_vt_output`. Deliberately independent from
+/// `RawGuard`: the launch banner (and, once drawn, the reserved status bar)
+/// need VT processing enabled before `wrap` ever puts the terminal into raw
+/// mode, and it needs to stay enabled for the life of the session, not just
+/// the pump loop.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct VtGuard {
+    output: windows_sys::Win32::Foundation::HANDLE,
+    saved: windows_sys::Win32::System::Console::CONSOLE_MODE,
+    active: bool,
+}
+
+// Same reasoning as `RawGuard`: a process-wide console handle, not an owned
+// resource.
+#[cfg(windows)]
+unsafe impl Send for VtGuard {}
+
+#[cfg(windows)]
+impl VtGuard {
+    /// Idempotent, like `RawGuard::restore`.
+    pub fn restore(&mut self) -> CtxResult<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        windows::set_console_mode(self.output, self.saved)
+            .map_err(|_| "SetConsoleMode failed: could not restore VT output".into())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VtGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+/// ORs `ENABLE_VIRTUAL_TERMINAL_PROCESSING` onto the current output console
+/// mode, saving the original for `restore`. Failure (no console, e.g. stdout
+/// redirected to a file or pipe) is exactly how a caller learns `vt_ok` is
+/// false; it never falls back to guessing.
+#[cfg(windows)]
+pub fn enable_vt_output() -> CtxResult<VtGuard> {
+    let (_, output) = windows::std_handles(STDIN_FD)?;
+    let saved = windows::console_mode(output)?;
+    let enabled = saved | windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    windows::set_console_mode(output, enabled)
+        .map_err(|_| "SetConsoleMode failed: could not enable VT output")?;
+    Ok(VtGuard {
+        output,
+        saved,
+        active: true,
+    })
+}
+
+/// Unix terminals already interpret VT escapes with no mode to flip; the only
+/// question is whether stdout is a terminal at all.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct VtGuard;
+
+#[cfg(unix)]
+impl VtGuard {
+    pub fn restore(&mut self) -> CtxResult<()> {
+        Ok(())
+    }
+}
+
+/// Unix's stdout file descriptor, for the same `isatty` check
+/// `window_size`/`RawGuard` already key off of `STDIN_FD` for stdin.
+#[cfg(unix)]
+const STDOUT_FD: i32 = 1;
+
+#[cfg(unix)]
+pub fn enable_vt_output() -> CtxResult<VtGuard> {
+    // SAFETY: isatty takes a plain fd and only ever returns 0 or 1.
+    if unsafe { libc::isatty(STDOUT_FD) } == 1 {
+        Ok(VtGuard)
+    } else {
+        Err("stdout is not a terminal".into())
+    }
+}
+
+/// Never constructed, matching `RawGuard`'s fallback on a platform that is
+/// neither unix nor Windows.
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug)]
+pub struct VtGuard;
+
+#[cfg(not(any(unix, windows)))]
+impl VtGuard {
+    pub fn restore(&mut self) -> CtxResult<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn enable_vt_output() -> CtxResult<VtGuard> {
+    Err("VT output is only implemented on unix and Windows".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn enable_vt_output_on_a_non_terminal_is_an_error() {
+        // CI's stdout is piped, not a controlling terminal.
+        let err = enable_vt_output().expect_err("stdout is not a terminal under CI");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_a_vt_guard_twice_is_a_noop() {
+        let mut guard = VtGuard;
+        guard.restore().expect("restore");
+        guard.restore().expect("a second restore is a no-op");
+    }
 
     #[test]
     fn entering_raw_mode_on_a_non_terminal_is_an_error() {
@@ -465,6 +583,30 @@ mod tests {
             // redirected stdout would.
             assert!(set_console_mode(std::ptr::null_mut(), 0).is_err());
             assert_eq!(console_mode(input).expect("input mode"), before);
+        }
+
+        /// `enable_vt_output` must OR the flag on without clearing anything
+        /// else the console already had, and `restore` must put the mode back
+        /// exactly.
+        #[test]
+        fn enable_vt_output_round_trips_the_console_mode() {
+            if !has_console() {
+                eprintln!("skipping: this test process owns no console");
+                return;
+            }
+            let (_, output) = std_handles(STDIN_FD).expect("handles");
+            let before = console_mode(output).expect("output mode");
+
+            let mut guard = super::super::enable_vt_output().expect("vt on a console");
+            assert_ne!(
+                console_mode(output).expect("output mode") & ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                0,
+                "VT processing must be enabled"
+            );
+
+            guard.restore().expect("restore");
+            assert_eq!(console_mode(output).expect("output mode"), before);
+            guard.restore().expect("a second restore is a no-op");
         }
     }
 }

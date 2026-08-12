@@ -31,15 +31,15 @@ graph TB
 
 - [[Architecture Overview]] — module map and the top-level dispatch flow from `main.rs` through to script execution.
 - [[Technology Stack]] — crate dependencies, release profile, and why `panic = "abort"` matters.
-- [[Script Resolution]] — the full order a command name resolves through: built-ins, literal path, local/global `.zirv/`, shortcuts.
+- [[Script Resolution]] — the full order a command name resolves through: built-ins (now including a bare-`zirv`/`chat`/`agent` alias), literal path, local/global `.zirv/`, shortcuts.
 
 ### Modules
 
 - [[Script Runner]] — parses and executes a `Script`: context building, step dispatch, shell/concurrent/agent steps.
-- [[Built-in Commands]] — `main.rs` dispatch table and the `help`/`version`/`init`/`create` built-ins.
-- [[Ctx Subsystem]] — the `zirv ctx` hub: verb tree, dispatch, layered config, state directory, decision log.
-- [[Ctx Supervisors]] — `loop`/`exec`/`wrap`, the three process supervisors, plus turn-signal sockets and raw-mode terminal handling.
-- [[Ctx Adapters]] — the `AgentAdapter` trait and the claude/codex implementations that build agent launch commands.
+- [[Built-in Commands]] — `main.rs` dispatch table: `help`/`version`/`init`/`create`/`ctx`, the `chat`/`agent` top-level aliases, and the bare-`zirv` alias.
+- [[Ctx Subsystem]] — the `zirv ctx` hub: verb tree (including `chat`/`agent`/`send`/`inbox`), dispatch, layered config, state directory, decision log.
+- [[Ctx Supervisors]] — `loop`/`exec`/`wrap`, the three process supervisors, turn-signal sockets, raw-mode terminal handling, and the chat session's role/mail advisory/terminal chrome.
+- [[Ctx Adapters]] — the `AgentAdapter` trait, the claude/codex implementations, and the registry/`resolve_default` selection logic.
 - [[Rot Engine]] — the pure, deterministic transcript-scoring core that produces a `Verdict`.
 - [[Usage and Pacing]] — rolling rate-limit windows, the pacing gate, and the statusline tee.
 - [[Utilities]] — shared file-parsing/name-matching helpers, plus `zirv ctx optimize` and the injected session prompt.
@@ -48,8 +48,8 @@ graph TB
 
 - [[Script Files]] — the YAML/JSON/TOML script format: params, secrets, command steps, chaining.
 - [[Shortcuts]] — `.shortcuts.yaml` short-key-to-script mapping and when it's consulted.
-- [[Context Management]] — why `zirv ctx` exists: the rot problem, the scoring approach, and how the supervisors act on it.
-- [[Untrusted Configuration]] — the trust boundary around repo-provided config and prompt text.
+- [[Context Management]] — why `zirv ctx` exists: the rot problem, the scoring approach, how the supervisors act on it, and zirv as a meta-harness (chat, delegation, mailbox).
+- [[Untrusted Configuration]] — the trust boundary around repo-provided config and prompt text, and around agent-authored mail.
 
 ### Development
 
