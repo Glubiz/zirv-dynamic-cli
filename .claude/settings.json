@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash scripts/check-doc-coverage.sh",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/check-doc-coverage.sh\"",
             "timeout": 10,
             "statusMessage": "Checking documentation coverage..."
           }
