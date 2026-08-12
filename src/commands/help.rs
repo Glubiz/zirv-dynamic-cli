@@ -1,8 +1,8 @@
 use std::{fs, io::Write, path::Path, path::PathBuf};
 
 use crate::utils::{
-    SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir, is_reserved_command,
-    parse_script_content,
+    RESERVED_ZIRV_FILES, SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir,
+    is_reserved_command, parse_script_content,
 };
 
 /// Note appended when a script or shortcut name collides with a built-in
@@ -18,8 +18,10 @@ fn write_scripts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std
         if path.is_file()
             && let Some(ext) = path.extension().and_then(|s| s.to_str())
             && SUPPORTED_EXTENSIONS.contains(&ext)
-            && path.file_name().unwrap() != ".shortcuts.yaml"
-            && path.file_name().unwrap() != crate::commands::ctx::config::CTX_CONFIG_FILE
+            && !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| RESERVED_ZIRV_FILES.contains(&n))
         {
             let content = fs::read_to_string(&path)?;
             let script = parse_script_content(&content, ext)?;
@@ -343,6 +345,39 @@ shortcuts:
         let output = String::from_utf8(buffer.into_inner())?;
         assert!(output.contains("Test Script"));
         assert!(!output.contains("ctx.toml"));
+
+        Ok(())
+    }
+
+    /// `.zirv/.settings.toml` is zirv's own agent switchboard, not a script.
+    /// Mirrors `test_show_help_ignores_ctx_config` above.
+    #[test]
+    fn the_settings_file_is_not_listed_as_a_script() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        write(
+            zirv_dir.join("test.yaml"),
+            "name: \"Test Script\"\ncommands: []\n",
+        )?;
+        write(
+            zirv_dir.join(".settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )?;
+
+        let original_dir = env::current_dir()?;
+        env::set_current_dir(&temp_path)?;
+
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer);
+
+        env::set_current_dir(original_dir)?;
+
+        result?;
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(output.contains("Test Script"));
+        assert!(!output.contains(".settings.toml"));
 
         Ok(())
     }

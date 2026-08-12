@@ -25,6 +25,7 @@ cargo clippy --all-targets -- -D warnings
   - `mod.rs` — Context building from params/secrets, entry point for execution
 - `src/input.rs` — Clap CLI argument definitions
 - `src/utils.rs` — File parsing (YAML/JSON/TOML), shortcuts, path helpers
+- `src/settings.rs` — `.zirv/.settings.toml` (per-agent enable/disable), distinct from `ctx.toml`
 - `src/commands/ctx/` — Context management for AI agent sessions (`zirv ctx <verb>`)
   - `mod.rs` — Verb tree and dispatch, intercepted in `main.rs` before script lookup
   - `config.rs` / `state.rs` / `log.rs` — Layered config, platform state dir, decision log
@@ -63,6 +64,9 @@ cargo clippy --all-targets -- -D warnings
   docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md.
 - Repo-provided prompt text is untrusted input, like the repo `ctx.toml` layer:
   capped, labeled, and unable to enable itself.
+- Repo `.settings.toml` may only disable agents, never enable one: the same
+  trust asymmetry as `ctx.toml`'s repo-forbidden keys, folded per agent rather
+  than deep-merged (see `src/settings.rs`).
 
 ## Using the Obsidian Vault
 

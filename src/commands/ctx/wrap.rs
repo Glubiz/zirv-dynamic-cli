@@ -582,7 +582,7 @@ pub fn run_with<W: Write>(
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     // Selection happens here so an unknown or unverified agent fails before the
     // terminal is touched.
-    let adapter = adapters::select(agent_name, &args.command, cfg.agent_bin.as_deref())?;
+    let adapter = adapters::select(agent_name, &args.command, &cfg)?;
 
     // `select` defaults to claude when detection finds nothing to back it,
     // which is fine for a caller (like `exec`) that already gates every
@@ -2535,7 +2535,8 @@ mod tests {
 
         fn flags_for(argv: &[&str]) -> Vec<String> {
             let command: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
-            let adapter = adapters::select(Some("claude"), &command, None).expect("claude adapter");
+            let adapter = adapters::select(Some("claude"), &command, &CtxConfig::default())
+                .expect("claude adapter");
             restart_launch_flags(adapter.as_ref(), &command)
         }
 

@@ -11,6 +11,7 @@ mod commands;
 mod input;
 mod output;
 mod script_runner;
+mod settings;
 mod utils;
 
 use input::Input;

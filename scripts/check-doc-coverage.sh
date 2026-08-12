@@ -83,6 +83,7 @@ fi
 pairs="$(printf '%s\t%s\n' \
   '^src/script_runner/' 'docs/obsidian/Modules/Script Runner.md' \
   '^src/commands/ctx/adapters/' 'docs/obsidian/Modules/Ctx Adapters.md' \
+  '^src/settings\.rs' 'docs/obsidian/Modules/Ctx Adapters.md' \
   '^src/commands/ctx/(rot|event|score)\.rs' 'docs/obsidian/Modules/Rot Engine.md' \
   '^src/commands/ctx/(run_loop|exec|wrap|signal|supervise|term)\.rs' 'docs/obsidian/Modules/Ctx Supervisors.md' \
   '^src/commands/ctx/(pace|usage|window)\.rs' 'docs/obsidian/Modules/Usage and Pacing.md' \

@@ -124,7 +124,7 @@ fn read_stdin() -> String {
 /// panicking: an optimize recommendation is advisory, and a hook may never
 /// fail loudly.
 fn corrections_in(transcript: &Path, cfg: &CtxConfig) -> usize {
-    let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg.agent_bin.as_deref()) else {
+    let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) else {
         return 0;
     };
     std::fs::read_to_string(transcript)
@@ -770,6 +770,31 @@ mod tests {
         assert!(
             message.contains("zirv ctx optimize"),
             "the optimize hint must still appear: {message}"
+        );
+    }
+
+    /// Task A6: `select`'s new gate check degrades the same way an unready
+    /// adapter already does -- `corrections_in`'s `Ok(adapter)` else-branch
+    /// already covers both causes, so a disabled agent must leave the Stop
+    /// hook a silent no-op exactly like the unready-codex case above.
+    #[test]
+    fn a_disabled_agent_leaves_the_stop_hook_a_silent_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = correction_heavy_transcript(dir.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+
+        assert_eq!(
+            corrections_in(&transcript, &cfg),
+            0,
+            "a disabled adapter degrades to zero corrections, not a panic"
         );
     }
 

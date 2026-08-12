@@ -193,7 +193,7 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
-    let adapter = adapters::select(agent_name, &args.command, cfg.agent_bin.as_deref())?;
+    let adapter = adapters::select(agent_name, &args.command, &cfg)?;
     let state = StateDir::resolve(env)?;
 
     // A wrapped command that matches no adapter (no explicit `--agent`,

@@ -5,6 +5,7 @@ pub mod claude;
 pub mod codex;
 
 use super::CtxResult;
+use super::config::CtxConfig;
 use super::event::{Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext};
 
 /// How an adapter arranges for turn-boundary events to reach a supervisor's
@@ -265,12 +266,34 @@ pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
     ]
 }
 
+/// The registry's names, each suffixed `(disabled)` when `gate` refuses it --
+/// used by the unknown-name error so a mistyped `--agent` also shows which
+/// known names are actually usable right now.
+fn describe_known_adapters(gate: &crate::settings::AgentGate) -> String {
+    all(None)
+        .iter()
+        .map(|a| {
+            if gate.is_enabled(a.name()) {
+                a.name().to_string()
+            } else {
+                format!("{} (disabled)", a.name())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Explicit `--agent` name, else detection from the wrapped argv, else claude.
+/// The `.settings.toml` gate (`cfg.agents`) is checked before `ready()` in
+/// every arm: `ready()` reports implementation state, the gate reports
+/// operator policy, and a disabled agent must report the disable rather than
+/// (for codex) "not implemented yet".
 pub fn select(
     name: Option<&str>,
     command: &[String],
-    bin: Option<&str>,
+    cfg: &CtxConfig,
 ) -> CtxResult<Box<dyn AgentAdapter>> {
+    let bin = cfg.agent_bin.as_deref();
     let adapters = all(bin);
 
     if let Some(name) = name {
@@ -278,23 +301,28 @@ pub fn select(
         let adapter = found.ok_or_else(|| {
             format!(
                 "unknown agent '{name}'; known adapters: {}",
-                all(None)
-                    .iter()
-                    .map(|a| a.name())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                describe_known_adapters(&cfg.agents)
             )
         })?;
+        if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
+            return Err(refusal.into());
+        }
         adapter.ready()?;
         return Ok(adapter);
     }
 
     if let Some(adapter) = adapters.into_iter().find(|a| a.detect(command)) {
+        if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
+            return Err(refusal.into());
+        }
         adapter.ready()?;
         return Ok(adapter);
     }
 
     let adapter: Box<dyn AgentAdapter> = Box::new(claude::ClaudeAdapter::new(bin));
+    if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
+        return Err(refusal.into());
+    }
     adapter.ready()?;
     Ok(adapter)
 }
@@ -318,6 +346,33 @@ pub fn command_matches_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A permissive `CtxConfig` (every agent enabled, no `agent_bin`
+    /// override) for tests that only care about selection, not gating.
+    fn permissive_cfg() -> CtxConfig {
+        CtxConfig::default()
+    }
+
+    /// A `CtxConfig` whose gate disables exactly one named agent, as if an
+    /// operator or repo `.settings.toml` had set `[agents.<name>] enabled =
+    /// false`, but without touching any file: `AgentGate`'s fields are
+    /// crate-private, so the state is built by loading a real settings file
+    /// from an isolated repo dir instead.
+    fn cfg_disabling(name: &str) -> CtxConfig {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            format!("[agents.{name}]\nenabled = false\n"),
+        )
+        .expect("write");
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        }
+    }
 
     /// M7 probed the adapter's own program while `wrap` spawned the user's
     /// argv, so the file flag could be handed to a binary that never
@@ -455,7 +510,7 @@ mod tests {
 
     #[test]
     fn explicit_name_wins() {
-        let adapter = select(Some("claude"), &[], None).expect("claude selects");
+        let adapter = select(Some("claude"), &[], &permissive_cfg()).expect("claude selects");
         assert_eq!(adapter.name(), "claude");
     }
 
@@ -465,25 +520,76 @@ mod tests {
             "/opt/homebrew/bin/claude".to_string(),
             "--resume".to_string(),
         ];
-        let adapter = select(None, &cmd, None).expect("detect claude");
+        let adapter = select(None, &cmd, &permissive_cfg()).expect("detect claude");
         assert_eq!(adapter.name(), "claude");
     }
 
     #[test]
     fn empty_command_defaults_to_claude() {
-        let adapter = select(None, &[], None).expect("default");
+        let adapter = select(None, &[], &permissive_cfg()).expect("default");
         assert_eq!(adapter.name(), "claude");
     }
 
     #[test]
     fn unknown_name_is_an_error_that_lists_the_options() {
-        let err = select(Some("gemini"), &[], None).expect_err("unknown agent");
+        let err = select(Some("gemini"), &[], &permissive_cfg()).expect_err("unknown agent");
         let msg = err.to_string();
         assert!(msg.contains("gemini"), "got {msg}");
         assert!(
             msg.contains("claude"),
             "error should list known adapters: {msg}"
         );
+    }
+
+    /// Task A3: an agent named explicitly is refused, and the message names
+    /// the layer that disabled it (mirrors the settings-layer wording tests
+    /// in `settings.rs`; here the point is that `select` actually surfaces
+    /// it, not the exact wording).
+    #[test]
+    fn a_disabled_agent_named_explicitly_is_refused_with_the_layer_that_disabled_it() {
+        let cfg = cfg_disabling("codex");
+        let err = select(Some("codex"), &[], &cfg).expect_err("codex is disabled");
+        let msg = err.to_string();
+        assert!(msg.contains("codex"), "got {msg}");
+        assert!(msg.contains("disabled"), "got {msg}");
+        assert!(
+            msg.contains(".settings.toml"),
+            "names the file that disabled it: {msg}"
+        );
+    }
+
+    /// The detection arm must refuse, not silently fall back to claude, the
+    /// same invariant `detecting_codex_argv_does_not_silently_fall_back_to_claude`
+    /// pins for the unready case.
+    #[test]
+    fn a_disabled_agent_detected_on_the_argv_does_not_fall_back_to_the_default() {
+        let cfg = cfg_disabling("codex");
+        let cmd = vec!["codex".to_string(), "exec".to_string(), "go".to_string()];
+        let err = select(None, &cmd, &cfg).expect_err("must not misroute to claude");
+        assert!(err.to_string().contains("codex"), "got {err}");
+    }
+
+    /// `select`'s empty-command default is claude; disabling claude itself
+    /// must refuse rather than launch it anyway.
+    #[test]
+    fn the_default_fallback_is_refused_when_the_default_agent_is_disabled() {
+        let cfg = cfg_disabling("claude");
+        let err = select(None, &[], &cfg).expect_err("the default agent is disabled");
+        assert!(err.to_string().contains("claude"), "got {err}");
+    }
+
+    /// The gate is checked before `ready()`: a disabled-and-unready agent
+    /// (codex, always) must report the disable, not "not implemented yet".
+    #[test]
+    fn the_disable_is_reported_before_an_adapters_own_readiness() {
+        let cfg = cfg_disabling("codex");
+        let err = select(Some("codex"), &[], &cfg).expect_err("codex is disabled");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("not implemented yet"),
+            "the gate must win over ready(): {msg}"
+        );
+        assert!(msg.contains("disabled"), "got {msg}");
     }
 
     #[test]

@@ -184,7 +184,7 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
     // is what surfaces an adapter's own "not ready" error (e.g. codex) before any
     // supervision starts, and lets the first spawn's argv be built from the exact
     // same `headless_cmd` restarts use.
-    adapters::select(Some(agent), &[], cfg.agent_bin.as_deref()).map_err(|e| e.to_string())?;
+    adapters::select(Some(agent), &[], &cfg).map_err(|e| e.to_string())?;
 
     let session = SessionId::new_v4();
     // No argv: the prompt travels as data and `run_with` builds the launch
@@ -337,6 +337,40 @@ mod tests {
             .await
             .expect_err("codex is not ready yet");
         assert!(err.contains("codex"), "got {err}");
+    }
+
+    /// Task A6: `validate()` stays registry-only (it only checks the agent
+    /// name against `adapters::all`, never loads `.settings.toml`), so a step
+    /// naming a disabled agent must still pass validation and only fail once
+    /// `execute()` actually tries to run it, through the same `select` gate
+    /// `run_supervised` calls.
+    #[tokio::test]
+    async fn a_step_naming_a_disabled_agent_fails_at_execution_not_at_load() {
+        let mut cmd = agent_step("go");
+        cmd.agent = "claude".to_string();
+        assert!(
+            cmd.validate().is_ok(),
+            "validate is registry-only and must not need .settings.toml"
+        );
+
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let mut context = HashMap::new();
+        context.insert("cwd".to_string(), tmp.path().display().to_string());
+        let err = cmd
+            .execute(&mut context)
+            .await
+            .expect_err("a disabled agent must fail at execution");
+        assert!(err.contains("claude"), "got {err}");
+        assert!(err.contains("disabled"), "got {err}");
     }
 
     /// The supervisor reports its own outcomes on the same `i32` the agent's

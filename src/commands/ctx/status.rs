@@ -22,6 +22,26 @@ pub fn run_with<W: Write>(
     let state = StateDir::resolve(env)?;
     writeln!(w, "state dir: {}", state.root().display())?;
 
+    match crate::settings::AgentGate::load(repo, env) {
+        Ok(gate) => {
+            writeln!(w, "\nagents:")?;
+            for adapter in crate::commands::ctx::adapters::all(None) {
+                let name = adapter.name();
+                let (enabled, location) = gate
+                    .states()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, s)| (s.enabled, s.location()))
+                    .unwrap_or((true, "default".to_string()));
+                writeln!(
+                    w,
+                    "  {name:<8} {:<8} ({location})",
+                    if enabled { "enabled" } else { "disabled" }
+                )?;
+            }
+        }
+        Err(e) => writeln!(w, "\nagents: (settings unreadable: {e})")?,
+    }
+
     let mut sessions: Vec<String> = std::fs::read_dir(state.sockets())
         .map(|entries| {
             entries
@@ -226,6 +246,40 @@ mod tests {
         assert!(text.contains("tick4"));
         assert!(text.contains("tick3"));
         assert!(!text.contains("tick0"));
+    }
+
+    /// `zirv ctx status` surfaces the `.settings.toml` gate: every known
+    /// adapter, whether it is enabled, and (when disabled) why.
+    #[test]
+    fn status_lists_each_adapter_with_whether_it_is_enabled_and_why() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/.settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("agents:"), "got {text}");
+        let claude_line = text.lines().find(|l| l.contains("claude")).unwrap_or("");
+        assert!(claude_line.contains("enabled"), "got {claude_line}");
+        let codex_line = text.lines().find(|l| l.contains("codex")).unwrap_or("");
+        assert!(codex_line.contains("disabled"), "got {codex_line}");
+        assert!(
+            codex_line.contains(".settings.toml"),
+            "names the file that disabled it: {codex_line}"
+        );
     }
 
     #[test]

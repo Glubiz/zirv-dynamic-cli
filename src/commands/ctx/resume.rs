@@ -59,11 +59,7 @@ pub fn run_with<W: Write>(
         return Ok(0);
     }
 
-    let adapter = adapters::select(
-        args.agent.as_deref().or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    )?;
+    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
 
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),

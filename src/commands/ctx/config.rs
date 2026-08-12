@@ -222,6 +222,13 @@ pub struct CtxConfig {
     pub pace: PaceConfig,
     pub optimize: OptimizeConfig,
     pub prompt: PromptConfig,
+    /// Per-agent enable/disable state from `.settings.toml`, a file this type
+    /// deliberately never deserializes (see `crate::settings`): loaded
+    /// separately at the end of `load`, and rejected outright if it appears
+    /// as an `[agents]` table inside `ctx.toml` itself, so the two files stay
+    /// distinct.
+    #[serde(skip)]
+    pub agents: crate::settings::AgentGate,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -492,9 +499,11 @@ impl CtxConfig {
             }
         }
 
-        toml::Value::Table(merged)
+        let mut cfg: Self = toml::Value::Table(merged)
             .try_into()
-            .map_err(|e| format!("invalid ctx config: {e}").into())
+            .map_err(|e| format!("invalid ctx config: {e}"))?;
+        cfg.agents = crate::settings::AgentGate::load(repo, env)?;
+        Ok(cfg)
     }
 }
 
@@ -839,5 +848,40 @@ mod tests {
             msg.contains("ZIRV_CTX_OPTIMIZE_MODEL"),
             "name the alternative: {msg}"
         );
+    }
+
+    /// `.settings.toml` and `ctx.toml` are deliberately distinct files:
+    /// `agents` is `#[serde(skip)]` on `CtxConfig`, so an `[agents]` table
+    /// inside `ctx.toml` is unrecognized rather than silently accepted.
+    #[test]
+    fn agents_in_ctx_toml_is_rejected_so_the_two_files_stay_distinct() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("[agents] belongs in .settings.toml, not ctx.toml");
+        assert!(err.to_string().contains("agents"), "got {err}");
+    }
+
+    #[test]
+    fn the_agent_gate_is_loaded_alongside_the_ctx_config() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.agents.is_enabled("codex"));
+        assert!(cfg.agents.is_enabled("claude"));
     }
 }

@@ -1284,11 +1284,7 @@ pub fn run_with<W: Write>(
     // call below, the same adapter `score`/`exec`/`wrap` would use to parse
     // this agent's transcripts: a future codex parser needs no separate
     // wiring in this verb.
-    let adapter = adapters::select(
-        args.agent.as_deref().or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    );
+    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg);
 
     let sample = args.sessions.unwrap_or(cfg.optimize.sessions_sampled);
     let transcripts = window::projects_root()

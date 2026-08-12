@@ -76,11 +76,7 @@ pub fn run_with<W: Write>(
 
     let prompt = resolve_prompt(args)?;
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(
-        args.agent.as_deref().or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    )?;
+    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let state = StateDir::resolve(env)?;
 
     let composed = super::prompt::compose(

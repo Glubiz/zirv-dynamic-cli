@@ -591,6 +591,39 @@ from the operator rather than the checkout. Everything else, including `agent`
 (which chooses between built-in adapters rather than naming an executable) and
 every threshold, is still repo-configurable.
 
+### .settings.toml
+
+`ctx.toml` tunes how the ctx supervisor *behaves*; `.zirv/.settings.toml` is a
+separate, zirv-wide file that only answers yes/no questions about what zirv
+may *use*. The rule of thumb: if the question is "yes/no, may zirv use this
+thing", it goes in `.settings.toml`; anything else goes in `ctx.toml`. Today
+that means one section, per-adapter enable/disable:
+
+```toml
+# .zirv/.settings.toml
+[agents.codex]
+enabled = false
+```
+
+Layered the same way as `ctx.toml` -- `~/.zirv/.settings.toml`, then
+`<repo>/.zirv/.settings.toml`, then `ZIRV_AGENT_<NAME>_ENABLED` (a boolean) --
+but folded per agent rather than deep-merged:
+
+```
+final(name) = env(name) if set
+            else home(name).unwrap_or(true) && repo(name).unwrap_or(true)
+```
+
+Every known adapter defaults to enabled. The environment is the operator, in
+both directions: `ZIRV_AGENT_CODEX_ENABLED=true` re-enables an agent a repo
+disabled, and `=false` disables one nothing else touched. A repository can
+only narrow what it inherited -- `enabled = true` in a repo's own
+`.settings.toml` is a silent no-op, since there is nothing there for a repo to
+refuse. Disabling an agent is checked before that adapter's own readiness, so
+`--agent codex` with codex disabled reports the disable, not "not implemented
+yet". `zirv ctx status` lists every known adapter, whether it is enabled, and
+(when not) which file or variable disabled it.
+
 #### Environment variables worth knowing
 
 | Variable | Effect |

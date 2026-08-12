@@ -22,6 +22,14 @@ pub fn is_reserved_command(name: &str) -> bool {
     RESERVED_COMMANDS.contains(&name)
 }
 
+/// File names inside a `.zirv` directory that are zirv's own configuration
+/// rather than an invocable script: the shortcuts map and the two config
+/// files (`ctx.toml`, `.settings.toml`). Shared by script listing
+/// (`candidate_names_in_dir`, `help.rs`) and script lookup (`input.rs`'s
+/// `find_script_in_dir`), so a name like `.settings` can never resolve to
+/// `.settings.toml` by way of the usual `{name}.{ext}` search.
+pub const RESERVED_ZIRV_FILES: &[&str] = &[".shortcuts.yaml", "ctx.toml", ".settings.toml"];
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Shortcuts {
     pub shortcuts: HashMap<String, String>,
@@ -174,11 +182,10 @@ pub fn candidate_names_in_dir(dir: &Path) -> Vec<String> {
             if !SUPPORTED_EXTENSIONS.contains(&ext) {
                 continue;
             }
-            if path.file_name().and_then(|n| n.to_str()) == Some(".shortcuts.yaml") {
-                continue;
-            }
-            if path.file_name().and_then(|n| n.to_str())
-                == Some(crate::commands::ctx::config::CTX_CONFIG_FILE)
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| RESERVED_ZIRV_FILES.contains(&n))
             {
                 continue;
             }
@@ -334,5 +341,26 @@ mod tests {
         assert!(is_reserved_command("help"));
         assert!(is_reserved_command("c"));
         assert!(!is_reserved_command("build"));
+    }
+
+    /// `.settings.toml` is zirv's own configuration file, not a script: it
+    /// must not show up as a candidate name (and, via `RESERVED_ZIRV_FILES`,
+    /// must not be resolvable as one either -- see the matching guard in
+    /// `input.rs`).
+    #[test]
+    fn the_settings_file_is_not_an_invocable_script_name() {
+        let temp_dir = tempdir().unwrap();
+        let zirv_dir = temp_dir.path().join(".zirv");
+        create_dir_all(&zirv_dir).unwrap();
+        write(
+            zirv_dir.join(".settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .unwrap();
+        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+
+        let names = candidate_names_in_dir(&zirv_dir);
+        assert!(!names.contains(&".settings".to_string()));
+        assert!(names.contains(&"build".to_string()));
     }
 }

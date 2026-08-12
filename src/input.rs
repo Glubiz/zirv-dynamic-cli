@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use crate::utils::{
-    SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, candidate_names_in_dir, home_dir,
-    suggest_matches,
+    RESERVED_ZIRV_FILES, SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, candidate_names_in_dir,
+    home_dir, suggest_matches,
 };
 
 #[derive(Debug, Parser, Default)]
@@ -48,7 +48,14 @@ fn find_script_in_dir(
     name: &str,
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     for ext in SUPPORTED_EXTENSIONS {
-        let path = dir.join(format!("{name}.{ext}"));
+        let file_name = format!("{name}.{ext}");
+        // A name like ".settings" would otherwise resolve to
+        // ".settings.toml" -- zirv's own configuration, not a script -- by
+        // the exact same `{name}.{ext}` search a real script uses.
+        if RESERVED_ZIRV_FILES.contains(&file_name.as_str()) {
+            continue;
+        }
+        let path = dir.join(&file_name);
         if path.exists() {
             return Ok(Some(path.canonicalize()?));
         }
@@ -272,6 +279,36 @@ mod tests {
                 .get_file_path()
                 .expect("a direct extension match must still resolve");
             assert!(path.ends_with("build.yaml"), "got: {}", path.display());
+        });
+    }
+
+    /// `zirv .settings` must not resolve to `.zirv/.settings.toml`: that file
+    /// is zirv's own agent switchboard, reached the same way a script
+    /// extension search would ("{name}.{ext}") if the guard did not exist.
+    #[test]
+    fn the_settings_file_cannot_be_invoked_as_a_script_name() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(
+            zirv_dir.join(".settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: ".settings".to_string(),
+                ..Default::default()
+            };
+            let err = input
+                .get_file_path()
+                .expect_err("the settings file must not be an invocable script");
+            assert!(
+                err.to_string().contains("zirv help"),
+                "a normal not-found error, not a resolved config file: {err}"
+            );
         });
     }
 

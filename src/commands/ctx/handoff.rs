@@ -330,11 +330,7 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(
-        args.agent.as_deref().or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    )?;
+    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let jsonl = std::fs::read_to_string(&args.transcript)
         .map_err(|e| format!("{}: {e}", args.transcript.display()))?;
     let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);

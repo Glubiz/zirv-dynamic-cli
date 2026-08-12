@@ -195,6 +195,7 @@ impl AgentAdapter for CodexAdapter {
 mod tests {
     use super::*;
     use crate::commands::ctx::adapters::{AgentAdapter, select};
+    use crate::commands::ctx::config::CtxConfig;
 
     #[test]
     fn codex_detects_its_own_binary() {
@@ -227,7 +228,8 @@ mod tests {
     #[test]
     fn selecting_codex_before_it_is_verified_fails_loudly() {
         // Replaced by a success assertion in Task A10 once the parser exists.
-        let err = select(Some("codex"), &[], None).expect_err("unverified adapter");
+        let err =
+            select(Some("codex"), &[], &CtxConfig::default()).expect_err("unverified adapter");
         assert!(err.to_string().contains("codex"), "got {err}");
     }
 
@@ -256,7 +258,8 @@ mod tests {
     #[test]
     fn detecting_codex_argv_does_not_silently_fall_back_to_claude() {
         let cmd = vec!["codex".to_string(), "exec".to_string(), "do it".to_string()];
-        let err = select(None, &cmd, None).expect_err("must not misroute to claude");
+        let err =
+            select(None, &cmd, &CtxConfig::default()).expect_err("must not misroute to claude");
         assert!(err.to_string().contains("codex"), "got {err}");
     }
 

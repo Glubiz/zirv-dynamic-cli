@@ -46,11 +46,7 @@ pub fn score_transcript(
     env: EnvLookup<'_>,
 ) -> CtxResult<Score> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(
-        agent.or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    )?;
+    let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     full_score(adapter.as_ref(), transcript, &cfg.score)
 }
 
@@ -221,11 +217,7 @@ pub fn score_transcript_cached(
     env: EnvLookup<'_>,
 ) -> CtxResult<Score> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(
-        agent.or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    )?;
+    let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     let Ok(state_dir) = StateDir::resolve(env) else {
         return full_score(adapter.as_ref(), transcript, &cfg.score);
     };
