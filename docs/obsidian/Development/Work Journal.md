@@ -20,6 +20,11 @@ last-verified: 2026-08-12
 
 ## Entries
 
+### 2026-08-12: Agent enable/disable gate (.zirv/.settings.toml)
+**What:** New zirv-wide settings file toggling the claude/codex harnesses, enforced in `adapters::select` before `ready()`. Repo layer can only narrow; env is operator authority. Malformed repo file falls back to an operator-only/deny-all gate.
+**Key changes:** src/settings.rs (new), adapters/mod.rs + 10 call sites, utils/help/input reserved-name guards, ctx status, README, vault pages. PR #18.
+**Follow-up:** harness roadmap (session registry, mailbox, codex completion) awaits prioritization — see [[Decision Log]] and PR #18 description.
+
 ### 2026-08-12: Obsidian vault created
 **What:** Set up the docs/obsidian vault (23 notes: Architecture, Modules, Concepts, Development) mirroring the zirv-fitness setup, plus Claude Code wiring: CLAUDE.md vault contract with doc-update trigger table, vault-keeper agent, doc-coverage push hook, staleness checker.
 **Key changes:** docs/obsidian/**, CLAUDE.md, .claude/settings.json, .claude/agents/vault-keeper.md, scripts/check-doc-*.sh, .gitignore.

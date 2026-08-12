@@ -16,10 +16,14 @@ Entries use the format:
 
 ## In Progress
 
-### Obsidian vault setup — in progress (`feat/obsidian-vault`, 2026-08-12)
-**Status (2026-08-12):** Creating the `docs/obsidian` vault — tracked `.obsidian/` config, the `Development/` notes, and the Claude Code wiring that keeps this vault in sync with sessions. Content pages (Architecture/, Modules/, Concepts/, `_system-context.md`, `Home.md`) are being written in parallel by other agents.
-**Next:** merge the parallel content once all pages land, then verify wikilinks resolve and the graph view groups render.
+### Agent enable/disable settings — in review (`feat/agent-settings`, 2026-08-12)
+**Status (2026-08-12):** `.zirv/.settings.toml` gate implemented, two review rounds passed; PR #18, stacked on PR #17. A prioritized roadmap for broader harness/inter-agent improvements (session registry, status telemetry, registry hygiene, mailbox, codex completion, cross-harness handoff, model routing) was designed and awaits prioritization.
+**Next:** merge PR #17, then PR #18; pick the first roadmap item.
 
 ## Recently Completed
 
 <!-- Cap at ~10 entries; drop the oldest when adding a new one. -->
+
+### Obsidian vault setup — in review (`feat/obsidian-vault`, 2026-08-12)
+**Status (2026-08-12):** Vault complete (23 notes, all wikilinks resolving) with Claude Code wiring: CLAUDE.md contract, vault-keeper agent, doc-coverage push hook (warn-once deny), staleness checker. PR #17.
+**Next:** merge, then confirm the hook behaves in a real session.
