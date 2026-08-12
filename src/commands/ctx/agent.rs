@@ -258,8 +258,7 @@ mod tests {
         let home = tmp.path().join("home");
         let argv_log = tmp.path().join("argv.log");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let mut env = base_env(&tmp.path().join("state"));
-        env.insert("ZIRV_CTX_ARGV_LOG_PLACEHOLDER".to_string(), String::new());
+        let env = base_env(&tmp.path().join("state"));
         unsafe {
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
             std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);

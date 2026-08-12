@@ -504,6 +504,43 @@ shortcuts:
         Ok(())
     }
 
+    /// S4: NTFS (and APFS by default) resolve a file case-insensitively, so
+    /// `Chat.yaml` is exactly as unreachable as `chat.yaml` would be, even
+    /// though `zirv Chat` is not literally intercepted as the `chat` alias
+    /// (only the lowercase spelling is). The shadow marker has to catch a
+    /// differently-cased collision, or a user creating one gets no warning
+    /// anywhere it's listed.
+    #[test]
+    fn a_differently_cased_reserved_command_is_flagged_as_shadowed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        write(
+            zirv_dir.join("Chat.yaml"),
+            "name: \"My Chat Script\"\ncommands: []\n",
+        )?;
+
+        let original_dir = env::current_dir()?;
+        env::set_current_dir(&temp_path)?;
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer);
+        env::set_current_dir(original_dir)?;
+        result?;
+
+        let output = String::from_utf8(buffer.into_inner())?;
+        let chat_line = output
+            .lines()
+            .find(|l| l.starts_with("File: Chat.yaml"))
+            .unwrap_or("");
+        assert!(
+            chat_line.contains("shadowed") || chat_line.contains("unreachable"),
+            "expected 'Chat.yaml' to be marked unreachable, got: {chat_line}"
+        );
+        Ok(())
+    }
+
     /// Same idea for shortcuts: a `.shortcuts.yaml` entry keyed on a reserved
     /// letter (e.g. `c`, already `create`'s alias) can never be reached.
     #[test]

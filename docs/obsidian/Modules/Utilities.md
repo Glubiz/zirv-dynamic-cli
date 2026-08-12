@@ -21,7 +21,7 @@ last-verified: 2026-08-12
 
 **Parsing.** `SUPPORTED_EXTENSIONS` is `["yaml", "yml", "json", "toml"]`. `file_to_script` reads a path, lowercases its extension, and hands off to `parse_script_content`, which dispatches to `serde_yaml_ng`, `serde_json`, or `toml` to deserialize into a `Script` (see [[Script Runner]] for that type's shape). An unrecognized extension is a plain `Err`, not a panic.
 
-**Reserved names.** `SCRIPT_DIR_NAME` is `.zirv`. `RESERVED_COMMANDS` lists the built-in top-level names and short aliases handled in `main.rs` before any script lookup: `help`/`h`, `version`/`v`, `init`/`i`, `create`/`c`, `ctx`. `is_reserved_command` just checks membership. Because these are intercepted first, a `.zirv/ctx.yaml` or a shortcut named `help` can never be reached — see [[Built-in Commands]].
+**Reserved names.** `SCRIPT_DIR_NAME` is `.zirv`. `RESERVED_COMMANDS` lists the built-in top-level names and short aliases handled in `main.rs` before any script lookup: `help`/`h`, `version`/`v`, `init`/`i`, `create`/`c`, `ctx`, `chat`, `agent`. `is_reserved_command` compares case-insensitively (`eq_ignore_ascii_case`, mirroring `is_reserved_zirv_file` below) rather than exact membership: NTFS/APFS resolve a script file case-insensitively, so `Chat.yaml` is exactly as unreachable as `chat.yaml` would be, even though only the lowercase spelling is literally intercepted as the `chat` alias in `main.rs`. Because these are intercepted first, a `.zirv/ctx.yaml` or a shortcut named `help` can never be reached — see [[Built-in Commands]].
 
 **Shortcuts.** `Shortcuts` is `{ shortcuts: HashMap<String, String> }`, deserialized from a directory's `.shortcuts.yaml` (short alias → script filename). See [[Shortcuts]].
 
@@ -31,7 +31,7 @@ last-verified: 2026-08-12
 
 **`RESERVED_ZIRV_FILES`.** `[".shortcuts.yaml", "ctx.toml", ".settings.toml"]` — zirv's own configuration files inside a `.zirv/` directory, never invocable scripts. `is_reserved_zirv_file(name)` compares against this list with `eq_ignore_ascii_case`, not exact equality: NTFS (and APFS by default) resolve a file case-insensitively, so `Path::exists` finds `.Settings.toml` when asked for `.settings.toml`, and the guard has to agree or a differently-cased reserved file would be honored by `AgentGate`/`CtxConfig` while still being listed as an invocable script and resolvable as one. This is deliberately stricter than every filesystem requires — on ext4, `CTX.toml` is a distinct, ordinary file from `ctx.toml`, and the guard excludes it anyway — because the goal is one rule that behaves the same everywhere zirv runs, not the minimum each platform demands. Used by `candidate_names_in_dir` here, by `help.rs`'s script listing, and by `input.rs`'s `find_script_in_dir` (so a literal `zirv .settings` cannot resolve `.settings.toml` as a script).
 
-**Shared helper.** `truncate_bytes(text, cap)` truncates a `String` to at most `cap` bytes, backing off to the nearest earlier char boundary so the result is always valid UTF-8 (an `Option<usize>` cap of `None` means unlimited). It's the one place both `optimize.rs` and `prompt.rs` cap untrusted disk content, so the two modules cap the same way.
+**Shared helper.** `truncate_bytes(text, cap)` truncates a `String` to at most `cap` bytes, backing off to the nearest earlier char boundary so the result is always valid UTF-8 (an `Option<usize>` cap of `None` means unlimited). It's the one place `optimize.rs`, `prompt.rs`, and `mail.rs` (both the per-message cap in `store` and the whole-delivered-batch cap in `with_mail_layer`) cap untrusted or semi-trusted text, so all three cap the same way.
 
 ## How It Works — `zirv ctx optimize` (`optimize.rs`)
 
@@ -49,19 +49,21 @@ Args (`OptimizeArgs`): `--agent` (adapter override), `--no-model` (skip the judg
 
 ## How It Works — the injected session prompt (`prompt.rs`)
 
-`prompt::compose(home, repo, simple, cfg: &PromptConfig)` builds the text zirv injects as the agent's system prompt for a launched session, or returns `None` when nothing should be injected (`simple` — e.g. `--simple` — or `cfg.enabled == false` both suppress it entirely, including the shipped default).
+`prompt::compose(home, repo, simple, cfg: &PromptConfig, role: PromptRole)` builds the text zirv injects as the agent's system prompt for a launched session, or returns `None` when nothing should be injected (`simple` — e.g. `--simple` — or `cfg.enabled == false` both suppress it entirely, including the shipped default). `role` is `PromptRole::Orchestrator` for `zirv ctx chat`'s own `wrap` launch and `PromptRole::Worker` for every other caller — it gates the Harness layer below, the mechanism that keeps a delegated worker from being taught to delegate further (see [[Ctx Supervisors]], [[Context Management]]).
 
-**Layers, in fixed order**, each separated by a `---` divider:
+**Layers, in fixed order** (`v3`; `v2` added the Adapter layer, `v3` added Harness), each separated by a `---` divider — Mail is not part of `compose` itself, added afterward by a separate call (see below):
 
 1. **Default** — `DEFAULT_PROMPT`, a zirv-authored, deliberately short, three-rule floor (follow the repo's own conventions and let a repository instruction file win over these defaults; prefer deterministic tool use; report failures honestly rather than describing unverified work as done).
 2. **Adapter** (spliced in right after Default, by `with_adapter_layer`, called from the supervisor after the adapter is known — `compose` itself doesn't see the adapter) — `AgentAdapter::base_system_prompt()`, agent-specific text naming that agent's own tools, so only that agent ever gets it. `None` by default; only the claude adapter currently overrides it.
-3. **User** — `~/.zirv/system-prompt.md`, read uncapped (the operator's own file).
-4. **Repo** — `<repo>/.zirv/system-prompt.md`, read only when `cfg.repo_layer` is true and truncated to `cfg.max_repo_bytes` (default 4096) via `truncate_bytes`. It is explicitly labeled in the composed text as coming from the repository checkout and told it does not override anything above it and grants no permissions — the same "capped, labeled, can't enable itself" treatment `CLAUDE.md` gets in `optimize.rs`'s judgment prompt.
-5. **Command-line** — the operator's own `--system-prompt`/equivalent flag value, added last as the highest-priority layer.
+3. **Harness** (`HARNESS_PROMPT`, orchestrator only — `compose` inserts this itself, immediately after Default, when `role == PromptRole::Orchestrator`) — deterministic, agent-agnostic teaching about zirv as a meta-harness: how to delegate via `zirv ctx agent`, exchange notes via `zirv ctx send`/`inbox`, and read `zirv ctx status`. A `PromptRole::Worker` session never gets this layer, which is what keeps a delegated run from being taught to delegate further.
+4. **User** — `~/.zirv/system-prompt.md`, read uncapped (the operator's own file).
+5. **Repo** — `<repo>/.zirv/system-prompt.md`, read only when `cfg.repo_layer` is true and truncated to `cfg.max_repo_bytes` (default 4096) via `truncate_bytes`. It is explicitly labeled in the composed text as coming from the repository checkout and told it does not override anything above it and grants no permissions — the same "capped, labeled, can't enable itself" treatment `CLAUDE.md` gets in `optimize.rs`'s judgment prompt.
+6. **Mail** (`with_mail_layer`, a separate function called after `compose` returns, only by `exec.rs`/`run_loop.rs` — never by `wrap.rs`/`resume.rs`) — unread mail for the repo (`mail::list`), capped as a whole batch to `cfg.mail.max_delivered_bytes` and labeled the same way the repo layer is, gated by `cfg.mail.enabled`. See [[Untrusted Configuration]]'s "Mail" section and [[Ctx Supervisors]].
+7. **Command-line** — the operator's own `--system-prompt`/equivalent flag value, added last as the highest-priority layer, by `merge_command_line_prompt`.
 
-`PromptConfig` (`src/commands/ctx/config.rs`) has three fields: `enabled` (default `true`), `repo_layer` (default `true`), `max_repo_bytes` (default `4096`). All three are on the `REPO_FORBIDDEN` list in `config.rs`: if a repository's own `.zirv/ctx.toml` sets any of `prompt.enabled`, `prompt.repo_layer`, or `prompt.max_repo_bytes`, `CtxConfig::load` returns a hard error naming the key and where it belongs instead (`~/.zirv/ctx.toml` or the corresponding `ZIRV_CTX_PROMPT*` / `ZIRV_CTX_PROMPT_REPO` / `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` env var) — a repo checkout cannot raise its own cap or turn its own layer on, and the failure mode is loud rather than a silently-clamped value.
+`PromptConfig` (`src/commands/ctx/config.rs`) has three fields: `enabled` (default `true`), `repo_layer` (default `true`), `max_repo_bytes` (default `4096`). All three are on the `REPO_FORBIDDEN` list in `config.rs`, alongside `mail.enabled`/`mail.max_delivered_bytes` and `chrome.events` (same rationale, extended to the Mail layer and to the announcement channel): if a repository's own `.zirv/ctx.toml` sets any of them, `CtxConfig::load` returns a hard error naming the key and where it belongs instead (`~/.zirv/ctx.toml` or the corresponding `ZIRV_CTX_*` env var) — a repo checkout cannot raise its own cap, turn its own layer on, or re-enable/silence something the operator decided, and the failure mode is loud rather than a silently-clamped value.
 
-**Injection point**: `compose` is called from the four session-launching verbs — `exec.rs`, `wrap.rs`, `run_loop.rs`, and `resume.rs` (all under `src/commands/ctx/`) — each of which resolves `cfg.prompt`, calls `compose`, splices in the adapter layer once the adapter is chosen, and delivers the composed text to the child process via the adapter's system-prompt mechanism (a file-flag or inline-flag argv, per `AgentAdapter::system_prompt_file_flag`/`user_system_prompt_flag`). `ComposedPrompt::describe()` produces a one-line `"<version> layers: default+adapter+repo+..."` summary that gets attributed in the decision log, so a transcript can be traced back to exactly which layers shaped it.
+**Injection point**: `compose` is called from the four session-launching verbs — `exec.rs`, `wrap.rs`, `run_loop.rs`, and `resume.rs` (all under `src/commands/ctx/`) — each of which resolves `cfg.prompt`, calls `compose` with its own `PromptRole`, splices in the adapter layer once the adapter is chosen, and delivers the composed text to the child process via the adapter's system-prompt mechanism (a file-flag or inline-flag argv, per `AgentAdapter::system_prompt_file_flag`/`user_system_prompt_flag`). `exec.rs`/`run_loop.rs` additionally call `with_mail_layer` before delivery. `ComposedPrompt::describe()` produces a one-line `"<version> layers: default+adapter+harness+...+mail+..."` summary that gets attributed in the decision log, so a transcript can be traced back to exactly which layers shaped it.
 
 ## Data Flow
 
@@ -73,10 +75,14 @@ flowchart TD
     F[CLAUDE.md, settings.json, nested CLAUDE.md] -->|collect_surfaces, capped| G[optimize findings]
     G -->|judgment_prompt| H[distiller_cmd child, restricted tools]
     H --> I[report: stdout + state copy 0600 + --out]
-    J[DEFAULT_PROMPT] --> K[compose]
+    J[DEFAULT_PROMPT] --> K[compose role]
     L[adapter.base_system_prompt] --> K
+    HH["HARNESS_PROMPT, orchestrator role only"] --> K
     M["~/.zirv/system-prompt.md"] --> K
     N["repo/.zirv/system-prompt.md, capped+labeled"] --> K
-    K --> O[exec.rs / wrap.rs / run_loop.rs / resume.rs]
-    O --> P[agent child process]
+    K --> O[exec.rs / run_loop.rs only]
+    MM["mail::list, capped+labeled, mail.enabled gated"] -->|with_mail_layer| O
+    K --> P2[wrap.rs / resume.rs]
+    O --> P[agent child process, Worker role]
+    P2 --> P3[agent child process, Orchestrator role]
 ```

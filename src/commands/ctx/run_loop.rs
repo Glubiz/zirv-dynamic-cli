@@ -115,13 +115,15 @@ pub fn run_with<W: Write>(
             &cfg.prompt,
             super::prompt::PromptRole::Worker,
         );
-        let mail_messages: Vec<super::mail::Message> = if composed.is_some() {
-            super::mail::list(&state, &super::state::repo_slug(repo), Some(adapter.name()))
-                .map(|found| found.into_iter().map(|(_, msg)| msg).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let mail_slug = super::state::repo_slug(repo);
+        let mail_entries: Vec<(PathBuf, super::mail::Message)> =
+            if composed.is_some() && cfg.mail.enabled {
+                super::mail::list(&state, &mail_slug, Some(adapter.name())).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        let mail_messages: Vec<super::mail::Message> =
+            mail_entries.iter().map(|(_, msg)| msg.clone()).collect();
         if !mail_messages.is_empty() {
             announcer.emit(&super::announce::Event::MailDelivered {
                 count: mail_messages.len(),
@@ -129,6 +131,14 @@ pub fn run_with<W: Write>(
         }
         let composed =
             super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
+        // Consumed right after being folded into this cycle's prompt, so the
+        // next cycle's own fresh `mail::list` does not pick the same message
+        // up again. A failed consume must not stop the cycle: the mail has
+        // already reached the prompt either way, and housekeeping failures
+        // are best-effort throughout the state dir.
+        for (path, _) in &mail_entries {
+            let _ = super::mail::consume(&state, &mail_slug, path);
+        }
         let (user_extra, composed) =
             super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
 
@@ -899,6 +909,63 @@ mod tests {
         assert_eq!(transcripts_in(&home).len(), 2, "both cycles ran");
     }
 
+    /// B3: `mail.enabled = false` must gate delivery at the `loop` seam too,
+    /// not just `exec`'s (and not just `send`/`inbox`).
+    #[test]
+    fn disabled_mail_is_not_delivered_into_a_loop_cycle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                sent: 1,
+                body: "a disabled notice".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_MAIL".to_string(), "false".to_string());
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+
+        let args = args_for(1);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            !argv.contains("a disabled notice"),
+            "mail.enabled = false must gate delivery at the loop seam too: {argv}"
+        );
+
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None).expect("list");
+        assert_eq!(
+            unread.len(),
+            1,
+            "a delivery that never happened must not consume the message either"
+        );
+    }
+
     /// T7: `run_with` recomposes the system prompt (and re-lists mail) inside
     /// the per-cycle loop, not once before it starts, so a message sent
     /// *during* one cycle reaches the next one within the very same `run_
@@ -975,7 +1042,11 @@ mod tests {
             );
         });
 
-        let mut args = args_for(2);
+        // Three cycles, not two: the third is what proves S3 -- mail
+        // delivered into cycle 2's prompt is consumed right after, so cycle
+        // 3's own fresh `mail::list` must not pick the same message up
+        // again.
+        let mut args = args_for(3);
         args.interval_secs = Some(0);
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -984,7 +1055,7 @@ mod tests {
             std::env::remove_var("FAKE_AGENT_ARGV_LOG");
             std::env::remove_var("CYCLE_MARKER");
         }
-        assert_eq!(code.expect("both cycles run"), 0);
+        assert_eq!(code.expect("all three cycles run"), 0);
 
         // Each cycle's own session id, from `zirv ctx loop`'s own "cycle N
         // session <id>" announcement on `out` -- the anchor used below,
@@ -995,7 +1066,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.rsplit(' ').next())
             .collect();
-        assert_eq!(sessions.len(), 2, "two cycles ran: {printed:?}");
+        assert_eq!(sessions.len(), 3, "three cycles ran: {printed:?}");
 
         let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
         let cycle1_at = argv.find(sessions[0]).expect("cycle 1's own invocation");
@@ -1008,6 +1079,11 @@ mod tests {
         assert!(
             mail_at > cycle2_at,
             "mail sent during cycle 1 must land in cycle 2's own launch, not cycle 1's: {argv}"
+        );
+        assert_eq!(
+            argv.matches("a fresh notice").count(),
+            1,
+            "delivered once in cycle 2, consumed, and must not reappear in cycle 3: {argv}"
         );
     }
 }

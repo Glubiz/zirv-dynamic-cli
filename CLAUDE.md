@@ -73,16 +73,40 @@ cargo clippy --all-targets -- -D warnings
   trust asymmetry as `ctx.toml`'s repo-forbidden keys, folded per agent rather
   than deep-merged (see `src/settings.rs`).
 - Bare `zirv` (no arguments) is an alias: it starts `zirv ctx chat` in a repo
-  with a local or global `.zirv` directory and a real terminal on stdin,
-  otherwise it shows `zirv help` — a deliberate behavior change from clap's
-  own bare-invocation handling, which was a usage error (exit 2). `zirv chat`
-  and `zirv agent` are further top-level aliases for `zirv ctx chat`/`zirv ctx
-  agent`, checked against raw argv in `main.rs` before clap runs (same
-  interception style as `ctx` itself) and reserved in `utils::RESERVED_
-  COMMANDS` so a script can never shadow them. An explicit `zirv chat` is not
-  subject to the bare-invocation TTY rule. Any agent workflow that pipes
-  `zirv`'s stdout/stdin should not rely on the bare form: pipe into `zirv
-  ctx chat` (or a specific verb) explicitly instead.
+  with a **local** `.zirv` directory and both stdin and stdout attached to a
+  real terminal, otherwise it shows `zirv help` — a deliberate behavior
+  change from clap's own bare-invocation handling, which was a usage error
+  (exit 2). A global `~/.zirv` alone does not count (only a local `.zirv`
+  says "this repo is zirv-managed"), and both stdin *and* stdout have to be
+  a terminal (`zirv | less` must not open a chat session into the pipe).
+  `zirv chat` and `zirv agent` are further top-level aliases for `zirv ctx
+  chat`/`zirv ctx agent`, checked against raw argv in `main.rs` before clap
+  runs (same interception style as `ctx` itself) and reserved in
+  `utils::RESERVED_COMMANDS` (compared case-insensitively, like
+  `RESERVED_ZIRV_FILES`) so a script can never shadow them, in any case. An
+  explicit `zirv chat` is not subject to the bare-invocation TTY rule. Any
+  agent workflow that pipes `zirv`'s stdout/stdin should not rely on the bare
+  form: pipe into `zirv ctx chat` (or a specific verb) explicitly instead.
+- `REPO_FORBIDDEN` in `config.rs` also covers `mail.enabled`,
+  `mail.max_delivered_bytes`, and `chrome.events`, on top of the `agent_bin`/
+  `handoff.model`/`optimize.model`/`prompt.*` keys: a repo checkout must not
+  be able to raise its own delivered-mail cap, re-enable mail delivery an
+  operator disabled, or silence the `zirv ▸` announcement channel (including
+  its own degradation notices).
+- `zirv ctx send`/`zirv ctx inbox` deliver full message bodies only into a
+  headless **Worker** session's composed prompt (`exec`/`loop`, gated by
+  `cfg.mail.enabled`, consumed via `mail::consume` right after so a later
+  launch/cycle does not see the same message again); an interactive
+  **Orchestrator** session (`chat`/`wrap`) gets a one-line unread-count
+  advisory instead, never the message bodies. Mail filenames
+  (`mail::store`) get a collision-free `_NNN` suffix on a same-second
+  collision, since `now_secs()` has one-second granularity and two real
+  sends that close together is common, not a rare edge case.
+- `ctx/mod.rs`'s `CtxCli` `about` text calls `adapters::readiness_note()`,
+  which calls `ready()` on every registered adapter; this is cached in a
+  process-wide `OnceLock` (`ctx_about()`) since it otherwise re-runs on every
+  `dispatch()` call, including hook/statusline invocations that never
+  display it.
 
 ## Using the Obsidian Vault
 

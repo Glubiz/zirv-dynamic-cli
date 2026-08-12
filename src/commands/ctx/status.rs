@@ -33,7 +33,7 @@ fn describe_chat(cfg: &CtxConfig) -> String {
             } else {
                 reasons.join("; ")
             };
-            format!("chat: unavailable — {detail}")
+            format!("chat: unavailable ({detail})")
         }
     }
 }
@@ -76,7 +76,7 @@ pub fn run_with<W: Write>(
 
     match CtxConfig::load(repo, env) {
         Ok(cfg) => writeln!(w, "\n{}", describe_chat(&cfg))?,
-        Err(e) => writeln!(w, "\nchat: unavailable — configuration error: {e}")?,
+        Err(e) => writeln!(w, "\nchat: unavailable (configuration error: {e})")?,
     }
 
     let mail_slug = repo_slug(repo);
@@ -382,6 +382,10 @@ mod tests {
         assert!(chat_line.contains("disabled"), "got {chat_line}");
         assert!(chat_line.contains("codex"), "got {chat_line}");
         assert!(chat_line.contains("not implemented yet"), "got {chat_line}");
+        assert!(
+            !chat_line.contains('\u{2014}'),
+            "no em dashes in user-facing copy: {chat_line}"
+        );
     }
 
     /// `mail: N unread` counts messages stored for this repo's slug via

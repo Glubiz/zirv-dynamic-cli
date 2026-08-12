@@ -109,13 +109,21 @@ pub struct BannerFacts {
     pub resuming: Option<String>,
 }
 
+/// `colour` here is already the final decision (`Chrome::colour`, or an
+/// explicit test value): forcing styling on rather than letting
+/// `StyledObject`'s own `Display` impl re-check the process-global
+/// `console::colors_enabled()` flag is what keeps this deterministic. Without
+/// `force_styling`, a caller that computed `colour = true` still rendered
+/// plain text whenever the global flag happened to be off (a no-color CI
+/// environment, or -- in tests -- a leftover from whichever test last
+/// touched `console::set_colors_enabled` and ran first).
 fn styled(
     text: &str,
     colour: bool,
     apply: impl FnOnce(console::StyledObject<&str>) -> console::StyledObject<&str>,
 ) -> String {
     if colour {
-        apply(console::style(text)).to_string()
+        apply(console::style(text).force_styling(true)).to_string()
     } else {
         text.to_string()
     }
@@ -228,7 +236,13 @@ pub fn status_bar(state: &BarState, cols: u16, colour: bool) -> String {
     );
     let truncated = right_truncate(&text, cols as usize);
     if colour {
-        console::style(truncated).dim().to_string()
+        // `force_styling`: same reasoning as `styled` above -- `colour` is
+        // already the final decision, so this must not be re-gated by the
+        // process-global `console::colors_enabled()` flag a second time.
+        console::style(truncated)
+            .dim()
+            .force_styling(true)
+            .to_string()
     } else {
         truncated
     }
@@ -259,8 +273,17 @@ pub fn reserved_pty_size(size: (u16, u16), bar_on: bool) -> (u16, u16) {
 /// `announce`-channel line printed above the bar) to every row except the
 /// reserved one. `rows` is the terminal's own row count, matching
 /// `reserved_pty_size`'s reservation of exactly one row.
+///
+/// Wrapped in a cursor save/restore (`ESC7` ... `ESC8`): `CSI r` (DECSTBM) is
+/// specified to home the cursor to the scroll region's own top-left the
+/// moment it takes effect, in every VT100-descended terminal including every
+/// real one this ships on. Writing it bare would yank the cursor back to row
+/// 1 out from under whatever the session had already printed there (the
+/// launch banner, in particular) -- B2. The save has to come *before* the
+/// region write, and the restore after, so what gets saved is the real
+/// pre-existing position rather than the row the region write just homed to.
 pub fn scroll_region_sequence(rows: u16) -> String {
-    format!("\x1b[1;{}r", rows.saturating_sub(1).max(1))
+    format!("\x1b7\x1b[1;{}r\x1b8", rows.saturating_sub(1).max(1))
 }
 
 /// One assembled redraw buffer: save cursor, jump to the reserved row, clear
@@ -271,18 +294,23 @@ pub fn bar_redraw_sequence(rows: u16, text: &str) -> String {
     format!("\x1b7\x1b[{rows};1H\x1b[2K{text}\x1b8")
 }
 
-/// Undoes `scroll_region_sequence` and clears the reserved row, for the one
-/// place `wrap` restores the terminal (the same arm that calls
-/// `RawGuard::restore`).
+/// Undoes `scroll_region_sequence` and clears the reserved row, for every
+/// place `wrap` gives up the reserved row: the final cleanup alongside
+/// `RawGuard::restore`, and (B1) the moment the bar degrades mid-session.
+///
+/// Same save-first ordering as `scroll_region_sequence` and for the same
+/// reason: `CSI r` homes the cursor the instant it runs, so the position has
+/// to be captured *before* that happens, or what gets restored is the homed
+/// position rather than wherever the session's own output actually was.
 pub fn bar_reset_sequence(rows: u16) -> String {
-    format!("\x1b[r\x1b7\x1b[{rows};1H\x1b[2K\x1b8")
+    format!("\x1b7\x1b[r\x1b[{rows};1H\x1b[2K\x1b8")
 }
 
 /// Whether a terminal has shrunk below the floor the bar needs to still be
-/// legible, the post-resize half of the degrade rule (`ChromeCaps::probe`
-/// covers the pre-launch half).
-pub fn bar_should_disable_after_resize(cols: u16) -> bool {
-    cols < MIN_COLS
+/// legible in either dimension -- the post-resize half of the degrade rule
+/// (`ChromeCaps::probe` covers the pre-launch half, and already checks both).
+pub fn bar_should_disable(size: (u16, u16)) -> bool {
+    size.0 < MIN_COLS || size.1 < MIN_ROWS
 }
 
 /// One redraw attempt's effect on the permanent degrade flag: a one-way
@@ -301,6 +329,60 @@ pub fn after_redraw_attempt(chrome_disabled: bool, write_succeeded: bool) -> boo
 /// regardless of how the throttle is timed.
 pub fn bar_text_changed(last: Option<&str>, next: &str) -> bool {
     last != Some(next)
+}
+
+/// B1: what one resize tick does to the bar and the child pty, decided
+/// without touching a pty handle so `wrap`'s pump can apply it verbatim and
+/// the decision itself stays unit-testable. `bar_was_active` is the bar's
+/// state going *into* this resize (`chrome.bar && !disabled`): once it is
+/// `false` -- never eligible, or already degraded -- every later resize is
+/// ordinary full-size forwarding forever, exactly like a bar-less session;
+/// nothing here ever re-enables a bar that degraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeDecision {
+    /// The pty size to apply this tick.
+    pub pty_size: (u16, u16),
+    /// Whether the bar's own scroll region needs to be (re)written this tick
+    /// (only true while the bar is still active and stays that way).
+    pub set_scroll_region: bool,
+    /// Whether this tick is the one that disables the bar (the terminal
+    /// shrank below the floor in either dimension).
+    pub disables_bar: bool,
+}
+
+pub fn resize_decision(bar_was_active: bool, new_size: (u16, u16)) -> ResizeDecision {
+    if !bar_was_active {
+        return ResizeDecision {
+            pty_size: new_size,
+            set_scroll_region: false,
+            disables_bar: false,
+        };
+    }
+    if bar_should_disable(new_size) {
+        // B1: the whole point is that this is *not* `reserved_pty_size` --
+        // a session that just lost its bar must reach full size immediately,
+        // not stay pinned at the last reserved height.
+        ResizeDecision {
+            pty_size: new_size,
+            set_scroll_region: false,
+            disables_bar: true,
+        }
+    } else {
+        ResizeDecision {
+            pty_size: reserved_pty_size(new_size, true),
+            set_scroll_region: true,
+            disables_bar: false,
+        }
+    }
+}
+
+/// B1: whether the bar's one-time degrade cleanup (clear the reserved row,
+/// stop pinning the pty size) still needs to run. `true` exactly once, on
+/// the first check after the bar shows disabled; every later check (with
+/// `recovered` now `true`) is a no-op, and a bar that was never eligible
+/// (`chrome_bar` false) never needed any cleanup in the first place.
+pub fn bar_needs_recovery(chrome_bar: bool, disabled: bool, recovered: bool) -> bool {
+    chrome_bar && disabled && !recovered
 }
 
 #[cfg(test)]
@@ -346,15 +428,21 @@ mod tests {
         // console's colour detection is a process-wide, once-computed flag;
         // `set_colors_enabled` is the crate's own supported way to simulate
         // what a NO_COLOR-influenced first read would have produced, without
-        // depending on cargo test's own I/O environment.
+        // depending on cargo test's own I/O environment. Restored to
+        // whatever it actually was, not hardcoded back to `true`: this test
+        // otherwise leaks a forced-on flag process-wide, which is exactly
+        // what made `the_banner_is_plain_text_when_the_terminal_cannot_do_vt`
+        // pass only when it happened to run after this one (S6).
+        let original = console::colors_enabled();
         console::set_colors_enabled(false);
         let chrome = ChromeCaps::probe(true, true, SIZE, &cfg(), false, false);
+        console::set_colors_enabled(original);
+
         assert!(!chrome.colour, "NO_COLOR must suppress colour");
         assert!(
             chrome.banner && chrome.bar,
             "colour is independent of whether chrome itself is eligible"
         );
-        console::set_colors_enabled(true);
     }
 
     #[test]
@@ -540,13 +628,68 @@ mod tests {
         assert_eq!(reserved_pty_size((100, 0), true), (100, 1));
     }
 
+    /// The pure sizing math a resize recomputes: the reserved row and the
+    /// scroll region's own bottom line move together, one row short of the
+    /// terminal, whatever the terminal's actual size is.
     #[test]
-    fn a_resize_recomputes_the_reserved_row_and_the_scroll_region() {
+    fn the_reserved_row_and_the_scroll_region_bottom_move_together_on_any_size() {
         assert_eq!(reserved_pty_size((80, 24), true), (80, 23));
         assert_eq!(reserved_pty_size((120, 40), true), (120, 39));
 
-        assert_eq!(scroll_region_sequence(24), "\x1b[1;23r");
-        assert_eq!(scroll_region_sequence(40), "\x1b[1;39r");
+        assert!(scroll_region_sequence(24).contains("\x1b[1;23r"));
+        assert!(scroll_region_sequence(40).contains("\x1b[1;39r"));
+    }
+
+    /// B1: this is the actual resize decision `wrap`'s pump applies verbatim
+    /// -- while the bar is still active and the new size still clears both
+    /// floors, it keeps the reserved row and rewrites the scroll region.
+    #[test]
+    fn a_resize_while_the_bar_is_active_recomputes_the_reserved_row_and_the_scroll_region() {
+        let decision = resize_decision(true, (80, 24));
+        assert_eq!(decision.pty_size, (80, 23), "still reserving one row");
+        assert!(decision.set_scroll_region, "the region moves with it");
+        assert!(!decision.disables_bar);
+    }
+
+    /// B1 (blocking): shrinking below either floor must disable the bar
+    /// *and* hand the child the full new size immediately -- not the last
+    /// reserved size, which is the bug the review's `frozen` guard produced
+    /// (the pty stayed pinned forever, even once the terminal widened back
+    /// out).
+    #[test]
+    fn a_resize_below_minimum_disables_the_bar_and_restores_full_size_forwarding() {
+        let too_narrow = resize_decision(true, (MIN_COLS - 1, 30));
+        assert!(too_narrow.disables_bar, "cols below the floor disables it");
+        assert_eq!(
+            too_narrow.pty_size,
+            (MIN_COLS - 1, 30),
+            "the child gets the full size right away, not a stale reserved one"
+        );
+        assert!(!too_narrow.set_scroll_region);
+
+        let too_short = resize_decision(true, (80, MIN_ROWS - 1));
+        assert!(
+            too_short.disables_bar,
+            "rows below the floor disables it too"
+        );
+        assert_eq!(too_short.pty_size, (80, MIN_ROWS - 1));
+    }
+
+    /// B1: once the bar is no longer active (already degraded, or never
+    /// eligible in the first place), every later resize -- including
+    /// widening back out past the floor -- is ordinary full-size forwarding.
+    /// Nothing re-enables a degraded bar; the child simply keeps tracking
+    /// the terminal from here on, exactly like a bar-less session.
+    #[test]
+    fn a_later_widen_after_degrade_reaches_the_child() {
+        let widened = resize_decision(false, (200, 60));
+        assert_eq!(widened.pty_size, (200, 60));
+        assert!(!widened.set_scroll_region);
+        assert!(!widened.disables_bar, "a degraded bar never re-enables");
+
+        // And a bar-less session (never eligible) behaves identically.
+        let never_eligible = resize_decision(false, (30, 5));
+        assert_eq!(never_eligible.pty_size, (30, 5));
     }
 
     #[test]
@@ -566,36 +709,67 @@ mod tests {
         );
     }
 
-    /// The degrade decision is a bare `bool -> bool` function: it has no
-    /// parameter that could name a child process, no return value that could
-    /// signal one, and nothing it touches reaches outside this module. A
-    /// sequence of attempts -- including failures -- therefore has no way to
-    /// affect any "child alive" state a caller tracks separately, which this
-    /// pins by running such a sequence against a simulated child flag that
-    /// only this test's own loop, never `after_redraw_attempt`, could set.
+    /// B1: the one-time recovery (clear the row, hand back full size) fires
+    /// exactly once per degrade, regardless of which caller noticed the
+    /// disable first (a resize below the floor, or a redraw/lock failure
+    /// with no resize event at all).
     #[test]
-    fn a_failed_bar_write_never_ends_the_child() {
-        let mut chrome_disabled = false;
-        let mut child_alive = true;
-        for write_succeeded in [true, false, false, true] {
-            chrome_disabled = after_redraw_attempt(chrome_disabled, write_succeeded);
-            // Nothing above this line touches `child_alive`; it stays true
-            // through every outcome, including repeated failures.
-        }
-        assert!(chrome_disabled, "the run included a failure");
+    fn bar_recovery_fires_exactly_once_after_a_degrade() {
         assert!(
-            child_alive,
-            "the child is never referenced by the degrade decision"
+            !bar_needs_recovery(false, true, false),
+            "never eligible: there is nothing to recover"
         );
-        let _ = &mut child_alive;
+        assert!(
+            bar_needs_recovery(true, true, false),
+            "eligible, just disabled, not yet cleaned up"
+        );
+        assert!(
+            !bar_needs_recovery(true, true, true),
+            "already recovered once: never again"
+        );
+        assert!(
+            !bar_needs_recovery(true, false, false),
+            "still active: nothing to recover"
+        );
     }
 
+    /// B2 (blocking): `CSI r` (DECSTBM) homes the cursor the instant it
+    /// takes effect in every VT100-descended terminal. Every place this
+    /// module writes a region set or clear has to save the cursor *before*
+    /// that happens and restore it *after*, or the write yanks the cursor
+    /// back to row 1 over whatever the session had already printed there
+    /// (the launch banner, in particular).
     #[test]
-    fn the_scroll_region_and_cursor_are_reset_in_every_arm_that_leaves_the_pump() {
+    fn every_scroll_region_write_saves_and_restores_the_cursor() {
+        for sequence in [scroll_region_sequence(24), bar_reset_sequence(24)] {
+            assert!(
+                sequence.starts_with("\x1b7"),
+                "the cursor is saved before the region op: {sequence:?}"
+            );
+            assert!(
+                sequence.ends_with("\x1b8"),
+                "and restored after it: {sequence:?}"
+            );
+            let save_at = sequence.find("\x1b7").expect("save present");
+            let region_at = sequence
+                .find("\x1b[r")
+                .or_else(|| sequence.find("\x1b[1;"))
+                .expect("a region op (either the plain reset or the explicit set) is present");
+            assert!(
+                save_at < region_at,
+                "save must precede the homing region op: {sequence:?}"
+            );
+        }
+    }
+
+    /// The reset sequence itself: region cleared, reserved row addressed and
+    /// blanked, all inside the save/restore pair B2 requires.
+    #[test]
+    fn bar_reset_sequence_clears_the_region_and_the_reserved_row() {
         let reset = bar_reset_sequence(24);
         assert!(
-            reset.starts_with("\x1b[r"),
-            "the scroll region is cleared first: {reset:?}"
+            reset.contains("\x1b[r"),
+            "the scroll region is cleared: {reset:?}"
         );
         assert!(
             reset.contains("\x1b[24;1H"),
@@ -621,9 +795,13 @@ mod tests {
         assert!(bar_text_changed(Some("a"), "b"));
     }
 
+    /// B1: both floors, not just columns -- `chrome::MIN_ROWS` is enforced
+    /// after a resize exactly like `MIN_COLS` is, matching what
+    /// `ChromeCaps::probe` already enforces before launch.
     #[test]
-    fn a_terminal_shrunk_below_the_floor_disables_the_bar() {
-        assert!(bar_should_disable_after_resize(MIN_COLS - 1));
-        assert!(!bar_should_disable_after_resize(MIN_COLS));
+    fn a_terminal_shrunk_below_either_floor_disables_the_bar() {
+        assert!(bar_should_disable((MIN_COLS - 1, 30)));
+        assert!(bar_should_disable((80, MIN_ROWS - 1)));
+        assert!(!bar_should_disable((MIN_COLS, MIN_ROWS)));
     }
 }

@@ -7,7 +7,7 @@
 //! allowed to hear about delegating to other harnesses (`zirv ctx send`,
 //! `zirv ctx inbox`, `zirv ctx agent`).
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use super::adapters::{self, AgentAdapter, DefaultOrigin};
@@ -152,18 +152,24 @@ pub fn resolve_initial_prompt<W: Write>(
     }
 }
 
-/// Probes stdout for the launch banner: whether it is a terminal at all
-/// (`term::window_size` fails identically for a pipe or a redirected file),
-/// its current size, and whether VT output could be enabled. The returned
-/// guard must outlive the whole session -- it is what keeps VT processing on
-/// for `wrap`'s own raw-mode session that follows -- so callers hold it
-/// rather than letting it drop immediately.
+/// Probes stdout for the launch banner: whether it is a terminal at all, its
+/// current size, and whether VT output could be enabled. The returned guard
+/// must outlive the whole session -- it is what keeps VT processing on for
+/// `wrap`'s own raw-mode session that follows -- so callers hold it rather
+/// than letting it drop immediately.
+///
+/// `stdout_is_tty` comes from `IsTerminal` on stdout specifically, not from
+/// whether `window_size` succeeded: on unix that call reads `STDIN_FD`'s own
+/// terminal-ness, so `zirv chat > log` -- stdout redirected, stdin still a
+/// real terminal -- used to still print the banner straight into the log
+/// file. The size itself still has to come from `window_size`: it is the
+/// only source for it either way.
 fn probe_terminal() -> (bool, bool, (u16, u16), Option<term::VtGuard>) {
-    let size = term::window_size(term::STDIN_FD);
-    let stdout_is_tty = size.is_ok();
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let size = term::window_size(term::STDIN_FD).unwrap_or((0, 0));
     let vt_guard = term::enable_vt_output().ok();
     let vt_ok = vt_guard.is_some();
-    (stdout_is_tty, vt_ok, size.unwrap_or((0, 0)), vt_guard)
+    (stdout_is_tty, vt_ok, size, vt_guard)
 }
 
 pub fn run_with<W: Write>(
@@ -182,14 +188,26 @@ pub fn run_with<W: Write>(
     let (adapter, rule) = match resolve_adapter(&cfg, args.agent.as_deref()) {
         Ok(found) => found,
         Err(err) => {
-            if chrome.banner {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "{}",
-                    chrome::style_no_adapter_error(&err.to_string(), chrome.colour)
-                );
-            }
-            return Err(err);
+            // Printed once, here, rather than propagated as `Err`: `zirv
+            // ctx`'s own top-level dispatch prints any returned `Err` a
+            // second time, unstyled, through `output::error`. Styling only
+            // when `chrome.colour` (not gating whether this prints at all
+            // on `chrome.banner`, the old bug -- a piped or redirected run
+            // still needs to see why it refused to start) and returning
+            // `Ok(1)` instead is what keeps this to one printed copy;
+            // main.rs's own early-exit branches use the same shape,
+            // printing their own message and choosing the exit code
+            // directly rather than bubbling an error up to be printed
+            // again. Goes through `w` -- this verb's own narration channel,
+            // the same one `resolve_initial_prompt`'s "starting fresh" note
+            // already uses -- rather than stderr directly, so it stays
+            // testable the same way every other message here is.
+            writeln!(
+                w,
+                "{}",
+                chrome::style_no_adapter_error(&err.to_string(), chrome.colour)
+            )?;
+            return Ok(1);
         }
     };
     let state = StateDir::resolve(env)?;
@@ -268,16 +286,37 @@ mod tests {
 
     #[test]
     fn chat_builds_the_launch_from_the_adapter_rather_than_a_user_argv() {
+        // Deliberately does not recompute `expected_argv` by calling
+        // `adapter.interactive_cmd` a second time and extracting it the same
+        // way `build_launch` does: that would just be `build_launch`'s own
+        // extraction logic compared against itself, so a bug in it would
+        // never show up here. Asserting on fixed, independently-known
+        // content (the adapter binary is the given constant; the prompt is
+        // the given constant; extra flags land after both) is what actually
+        // pins the behavior.
         let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
-        let expected = adapter.interactive_cmd(Some("hello"), &[]);
-        let mut expected_argv = vec![expected.get_program().to_string_lossy().to_string()];
-        expected_argv.extend(expected.get_args().map(|a| a.to_string_lossy().to_string()));
-
-        let launch = build_launch(&adapter, Some("hello"), &[]);
+        let launch = build_launch(
+            &adapter,
+            Some("hello"),
+            &["--model".to_string(), "opus".to_string()],
+        );
 
         assert_eq!(
-            launch.argv, expected_argv,
-            "the launch argv must come straight from the adapter's own interactive_cmd"
+            launch.argv.first().map(String::as_str),
+            Some("/tmp/fake-claude"),
+            "the argv's own program is the adapter's own binary: {:?}",
+            launch.argv
+        );
+        assert!(
+            launch.argv.contains(&"hello".to_string()),
+            "the initial prompt reaches argv: {:?}",
+            launch.argv
+        );
+        assert_eq!(
+            &launch.argv[launch.argv.len() - 2..],
+            &["--model".to_string(), "opus".to_string()],
+            "extra flags land last: {:?}",
+            launch.argv
         );
     }
 
@@ -369,6 +408,9 @@ mod tests {
     /// The registry's own aggregated error (naming every candidate and why it
     /// was skipped) is the message shown when nothing is both enabled and
     /// ready -- the same one `adapters::resolve_default` produces on its own.
+    /// Printed through `w` and reported via exit code 1 rather than a
+    /// returned `Err`: propagating it would have `zirv ctx`'s own dispatch
+    /// print the same text a second time, unstyled, through `output::error`.
     #[test]
     fn chat_with_no_enabled_and_ready_adapter_names_each_candidate_and_its_reason() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -390,18 +432,22 @@ mod tests {
             extra: Vec::new(),
         };
         let mut out = Vec::new();
-        let err = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
-            .expect_err("nothing is both enabled and ready");
-        let msg = err.to_string();
+        let code = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
+            .expect("prints and exits 1 rather than propagating an Err");
+        assert_eq!(code, 1, "nothing is both enabled and ready");
+        let msg = String::from_utf8(out).expect("utf8");
         assert!(msg.contains("claude"), "must name claude: {msg}");
         assert!(msg.contains("codex"), "must name codex: {msg}");
         assert!(msg.contains("disabled"), "must say why: {msg}");
     }
 
-    /// The gate is checked, and refuses, before any terminal or pty work: this
-    /// runs synchronously to a returned `Err` with no pty ever opened. `wrap`
-    /// performs the identical check on its own before touching a terminal, so
-    /// the refusal holds even by that second, independent path.
+    /// The gate is checked, and refuses, before any terminal or pty work:
+    /// this runs synchronously, with no pty ever opened, to a printed
+    /// message and exit code 1 (not a returned `Err` -- see the comment on
+    /// `chat_with_no_enabled_and_ready_adapter_names_each_candidate_and_its_
+    /// reason` for why). `wrap` performs the identical gate check on its
+    /// own before touching a terminal, so the refusal holds even by that
+    /// second, independent path.
     #[test]
     fn an_explicitly_named_disabled_agent_is_refused_before_the_terminal_is_touched() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -423,9 +469,10 @@ mod tests {
             extra: Vec::new(),
         };
         let mut out = Vec::new();
-        let err = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
-            .expect_err("claude is disabled");
-        let msg = err.to_string();
+        let code = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
+            .expect("prints and exits 1");
+        assert_eq!(code, 1, "claude is disabled");
+        let msg = String::from_utf8(out).expect("utf8");
         assert!(msg.contains("claude"), "got {msg}");
         assert!(msg.contains("disabled"), "got {msg}");
     }
@@ -440,12 +487,14 @@ mod tests {
         assert_eq!(launch.role, PromptRole::Orchestrator);
     }
 
-    /// A non-terminal `cargo test` run must never crash on the chrome probe:
-    /// it degrades to no banner and passes through to `wrap`, which then
-    /// fails for the ordinary reason (no `claude` binary on the test
-    /// machine) rather than for anything chrome-related.
+    /// The chrome probe (`std::io::stdout().is_terminal()`, `term::window_
+    /// size`, `term::enable_vt_output`) runs unconditionally at the top of
+    /// `run_with`, before adapter resolution -- under cargo test's own piped
+    /// stdio (never a terminal) it must degrade cleanly rather than panic,
+    /// and a disabled agent must still be refused, with no banner printed
+    /// (there is nothing to show a banner for once resolution has failed).
     #[test]
-    fn a_non_terminal_test_run_gets_no_banner_and_still_reaches_wrap() {
+    fn resolving_a_disabled_agent_under_non_terminal_stdio_does_not_panic_and_prints_no_banner() {
         // The agent is disabled explicitly (the same setup `chat_with_no_
         // enabled_and_ready_adapter_names_each_candidate_and_its_reason`
         // uses) so this test never depends on whatever agent binaries
@@ -471,13 +520,16 @@ mod tests {
             extra: Vec::new(),
         };
         let mut out = Vec::new();
-        let err = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
-            .expect_err("claude is disabled, so this never reaches wrap");
-        assert!(err.to_string().contains("disabled"), "got {err}");
+        // Reaching this line at all -- rather than a panic from the probe --
+        // is the main thing this test pins.
+        let code = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
+            .expect("prints and exits 1, no panic");
+        assert_eq!(code, 1);
         let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains("disabled"), "got {printed}");
         assert!(
             !printed.contains("zirv chat"),
-            "no terminal means no banner: {printed}"
+            "no terminal means no banner, and resolution failed before the banner code anyway: {printed}"
         );
     }
 
@@ -498,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_never_overrides_an_operators_own_zirv_ctx_quiet_false() {
+    fn an_interactive_quiet_flag_overrides_the_operators_stored_zirv_ctx_quiet_false() {
         // An operator who explicitly set ZIRV_CTX_QUIET=false is still
         // overridden by an interactive --quiet flag: the flag is this
         // invocation's own request, layered on top like any other override.

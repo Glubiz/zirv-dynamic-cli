@@ -274,13 +274,15 @@ pub fn run_with<W: Write>(
     // that arrives mid-run is not retroactively injected into an
     // already-running session. `run_loop`, by contrast, starts a fresh
     // session every cycle and re-lists mail on each one.
-    let mail_messages: Vec<super::mail::Message> = if composed.is_some() {
-        super::mail::list(&state, &super::state::repo_slug(repo), Some(adapter.name()))
-            .map(|found| found.into_iter().map(|(_, msg)| msg).collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let mail_slug = super::state::repo_slug(repo);
+    let mail_entries: Vec<(PathBuf, super::mail::Message)> =
+        if composed.is_some() && cfg.mail.enabled {
+            super::mail::list(&state, &mail_slug, Some(adapter.name())).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    let mail_messages: Vec<super::mail::Message> =
+        mail_entries.iter().map(|(_, msg)| msg.clone()).collect();
     if !mail_messages.is_empty() {
         announcer.emit(&super::announce::Event::MailDelivered {
             count: mail_messages.len(),
@@ -288,6 +290,15 @@ pub fn run_with<W: Write>(
     }
     let composed =
         super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
+    // The messages just folded into the launch prompt are consumed now, so a
+    // later launch does not redeliver them (see the module doc: this is the
+    // one place `exec` composes mail at all). A failed consume must not fail
+    // the launch itself -- best effort, like the rest of state-dir
+    // housekeeping -- since the mail has already reached the prompt either
+    // way.
+    for (path, _) in &mail_entries {
+        let _ = super::mail::consume(&state, &mail_slug, path);
+    }
 
     // The first spawn's own argv may already carry the adapter's system-prompt
     // flag (e.g. `-- claude --append-system-prompt "..."`); merge it in rather
@@ -1918,6 +1929,219 @@ mod tests {
         assert!(
             argv.contains("another agent session"),
             "labeled as mail, not as an operator instruction: {argv}"
+        );
+    }
+
+    /// B3: `mail.enabled = false` must gate delivery at every seam that folds
+    /// mail into a composed prompt, not just `send`/`inbox`.
+    #[test]
+    fn disabled_mail_is_not_delivered_into_a_headless_prompt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session = "eeeeeeee-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_MAIL".to_string(), "false".to_string());
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            !argv.contains("heads up: the webhook route moved"),
+            "mail.enabled = false must gate delivery, not just send/inbox: {argv}"
+        );
+
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None).expect("list");
+        assert_eq!(
+            unread.len(),
+            1,
+            "a delivery that never happened must not consume the message either"
+        );
+    }
+
+    /// S3: mail delivered into a launch prompt is consumed right after, so a
+    /// later launch does not redeliver it.
+    #[test]
+    fn delivered_mail_is_not_delivered_a_second_time() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let session1 = "abababab-2222-4333-8444-555555555555";
+        let argv_log1 = tmp.path().join("argv1.log");
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log1);
+        }
+        let args1 = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session1.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session1)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session1),
+        };
+        let mut out1 = Vec::new();
+        let code1 = run_with(&args1, &mut out1, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(code1.expect("first launch runs"), 0);
+        let argv1 = std::fs::read_to_string(&argv_log1).expect("argv recorded");
+        assert!(
+            argv1.contains("heads up: the webhook route moved"),
+            "the first launch must see the mail: {argv1}"
+        );
+
+        let session2 = "cdcdcdcd-2222-4333-8444-555555555555";
+        let argv_log2 = tmp.path().join("argv2.log");
+        unsafe {
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log2);
+        }
+        let args2 = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session2.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session2)),
+            prompt: Some("do more work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session2),
+        };
+        let mut out2 = Vec::new();
+        let code2 = run_with(&args2, &mut out2, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code2.expect("second launch runs"), 0);
+        let argv2 = std::fs::read_to_string(&argv_log2).expect("argv recorded");
+        assert!(
+            !argv2.contains("heads up: the webhook route moved"),
+            "the mail was already delivered once and must not be redelivered: {argv2}"
+        );
+    }
+
+    /// S3: a consume failure (e.g. `read/` cannot be created) must not sink
+    /// the launch -- the mail already reached the prompt either way.
+    #[test]
+    fn a_failed_consume_does_not_stop_the_launch() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session = "ffffffff-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        // Block `mail::consume`'s own `read/` directory creation by putting
+        // an ordinary file where it needs a directory: a deterministic way
+        // to force the consume step to fail without racing a real
+        // filesystem deletion mid-flight.
+        std::fs::write(state.mail().join(&slug).join("read"), b"not a directory")
+            .expect("write blocker");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("a failed consume must not fail the launch"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("heads up: the webhook route moved"),
+            "the mail still had to reach the prompt even though consuming it afterward failed: {argv}"
         );
     }
 

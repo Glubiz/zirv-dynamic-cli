@@ -133,15 +133,31 @@ pub type CtxResult<T> = Result<T, Box<dyn std::error::Error>>;
 // the not-ready clause from the registry's own `ready()` calls rather than a
 // literal, so it never drifts from adapters::codex::CodexAdapter::ready --
 // the same wording a user hits directly via `--agent codex`.
+//
+// Perf: `clap`'s derive bakes `about` into `CtxCli::command()`, which runs on
+// *every* `try_parse_from` -- i.e. every `dispatch()` call, whether or not
+// help text is ever displayed. `readiness_note()` calls `ready()` on every
+// registered adapter, and on Windows that walks `PATH`/`PATHEXT` per
+// adapter, so an ordinary `ctx hook Stop` (once per turn) or `ctx usage tee`
+// (once per statusline render) used to pay that cost for text nobody was
+// about to read. `ctx_about()` computes it once per process and caches it,
+// which is free within one process (tests, in particular, call `dispatch`
+// hundreds of times) even though a fresh `zirv ctx ...` invocation is still
+// its own process either way.
+fn ctx_about() -> String {
+    static ABOUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ABOUT
+        .get_or_init(|| {
+            format!(
+                "Autonomous context management for AI coding agents. {}",
+                adapters::readiness_note()
+            )
+        })
+        .clone()
+}
+
 #[derive(Debug, Parser)]
-#[command(
-    name = "zirv ctx",
-    about = format!(
-        "Autonomous context management for AI coding agents. {}",
-        adapters::readiness_note()
-    ),
-    disable_help_subcommand = true
-)]
+#[command(name = "zirv ctx", about = ctx_about(), disable_help_subcommand = true)]
 pub struct CtxCli {
     #[command(subcommand)]
     pub verb: CtxVerb,

@@ -38,8 +38,8 @@
 ## Just Run `zirv`
 
 The fastest way to start a session: run `zirv` with no arguments, in a
-zirv-managed repo (one with a local `.zirv/` or a global `~/.zirv/`), from a
-real terminal.
+zirv-managed repo (one with a **local** `.zirv/` directory), from a real
+terminal.
 
 ```bash
 cd my-project
@@ -48,24 +48,31 @@ zirv
 
 | Situation | Result |
 |---|---|
-| `.zirv` exists (locally or in `~/.zirv`) and stdin is a real terminal | starts `zirv ctx chat` — an interactive orchestrator session |
-| No `.zirv` anywhere, or stdin is piped/redirected | shows this same `zirv help` listing, exit 0 |
+| a local `./.zirv` exists and both stdin and stdout are a real terminal | starts `zirv ctx chat` — an interactive orchestrator session |
+| No local `.zirv`, or stdin/stdout is piped or redirected | shows this same `zirv help` listing, exit 0 |
 | `zirv --help` / `zirv -h` | always shows help, even with nothing else on the command line |
 
 This is a deliberate behavior change: before, a bare `zirv` was a clap usage
-error (missing the required `command` argument, exit 2). Piped stdin (`echo
-hi | zirv`, a CI job, anything non-interactive) always falls back to help —
-a bare invocation never blocks waiting on a chat session nothing is there to
-drive.
+error (missing the required `command` argument, exit 2). A **global**
+`~/.zirv` alone does not count — only a local `./.zirv` says "this directory
+is zirv-managed" — and **both** stdin and stdout have to be a real terminal:
+piped stdin (`echo hi | zirv`, a CI job) or a redirected stdout (`zirv |
+less`) always falls back to help instead, so a bare invocation never blocks
+waiting on a chat session, or opens one into a pipe, when nothing interactive
+is on the other end.
 
 ### `zirv chat` and `zirv agent`
 
 `zirv chat` and `zirv agent` are shorter top-level aliases for `zirv ctx
-chat` and `zirv ctx agent`. Both are reserved command names (see
-[Reserved Command Names](#reserved-command-names)), so a script or shortcut
-can never shadow them, and — unlike the bare-invocation alias above — an
-explicit `zirv chat` always starts a session regardless of whether stdin is
-a terminal.
+chat` and `zirv ctx agent`. Both are reserved command names, compared
+case-insensitively (see [Reserved Command Names](#reserved-command-names)),
+so a script or shortcut can never shadow them, and — unlike the
+bare-invocation alias above — an explicit `zirv chat` always starts a
+session regardless of the local-`.zirv`/terminal checks bare `zirv` applies.
+`zirv ctx chat --help` (and `zirv chat --help`) prints `Usage: zirv ctx
+chat...` even when reached through the `zirv chat` alias — a cosmetic
+side effect of the alias reusing `zirv ctx`'s own clap tree rather than
+having a separate one, not a bug in the alias routing itself.
 
 - **`zirv chat`** — the same interactive orchestrator session the bare
   invocation starts.
@@ -546,8 +553,12 @@ marks it as shadowed in the listing.
 
 `help`, `version`, `init`, `create`, `ctx`, `chat`, `agent`, and their short
 aliases `h`, `v`, `i`, `c`, are handled as built-in commands before zirv ever
-looks in `.zirv/`. A script file or shortcut key using one of these names can
-never be invoked:
+looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
+just as much as `chat`, matching how NTFS/APFS resolve script filenames), so
+a differently-cased script or shortcut is caught too, even though only the
+exact lowercase spelling is literally intercepted as a routing alias. A
+script file or shortcut key using one of these names (in any case) can never
+be invoked:
 
 - `zirv help` lists it but marks it `(shadowed by a built-in command,
   unreachable)`.
@@ -647,6 +658,17 @@ model = "haiku"
 tail_items = 5
 timeout_secs = 30   # the distiller is given this long before the structural
                     # fallback is used instead
+
+[mail]
+enabled = true
+max_message_bytes = 4096      # per-message cap, applied by `zirv ctx send`
+max_delivered_bytes = 4096    # cap on a whole batch folded into one launch prompt
+keep = 50                     # unread messages kept per repo before the oldest are pruned
+
+[chrome]
+banner = true   # the one-time launch banner
+bar = true      # the reserved one-row status bar
+events = true   # the `zirv ▸` announcement channel on stderr
 ```
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
@@ -665,12 +687,34 @@ subscription-window waiting.
 
 A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
-`agent_bin`, `supervise.on_failure` or `handoff.model`; doing so is an error
-that names the key. Set those in `~/.zirv/ctx.toml`, or with
-`ZIRV_CTX_AGENT_BIN`, `ZIRV_CTX_ON_FAILURE` and `ZIRV_CTX_MODEL`, which come
-from the operator rather than the checkout. Everything else, including `agent`
-(which chooses between built-in adapters rather than naming an executable) and
-every threshold, is still repo-configurable.
+`agent_bin`, `supervise.on_failure`, `handoff.model`, `optimize.model`,
+`prompt.enabled`, `prompt.repo_layer`, `prompt.max_repo_bytes`,
+`mail.enabled`, `mail.max_delivered_bytes`, or `chrome.events`; doing so is an
+error that names the key. Set those in `~/.zirv/ctx.toml`, or with the
+matching `ZIRV_CTX_*` variable below, which comes from the operator rather
+than the checkout:
+
+| Forbidden repo key | Set instead via |
+|---|---|
+| `agent_bin` | `ZIRV_CTX_AGENT_BIN` |
+| `supervise.on_failure` | `ZIRV_CTX_ON_FAILURE` |
+| `handoff.model` | `ZIRV_CTX_MODEL` |
+| `optimize.model` | `ZIRV_CTX_OPTIMIZE_MODEL` |
+| `prompt.enabled` | `ZIRV_CTX_PROMPT` |
+| `prompt.repo_layer` | `ZIRV_CTX_PROMPT_REPO` |
+| `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
+| `mail.enabled` | `ZIRV_CTX_MAIL` |
+| `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
+| `chrome.events` | `ZIRV_CTX_QUIET` (see the note below on why this one's name looks different) |
+
+The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
+does: mail is folded into a launched worker's prompt as its own layer, so a
+repo raising its own delivered-mail cap (or turning delivery back on after an
+operator disabled it) would make the operator's choice decorative; a repo
+silencing the announcement channel would hide its own degradation notices
+from anyone running zirv there. Everything else, including `agent` (which
+chooses between built-in adapters rather than naming an executable),
+`chrome.banner`/`chrome.bar`, and every threshold, is still repo-configurable.
 
 #### Environment variables worth knowing
 
@@ -681,8 +725,15 @@ every threshold, is still repo-configurable.
 | `ZIRV_CTX_SOCKET`, `ZIRV_CTX_SESSION` | Exported into the supervised agent so its hook can find the supervisor. Set by zirv, not by you |
 | `ZIRV_AGENT_<NAME>_ENABLED` | Enables or disables one adapter (`ZIRV_AGENT_CODEX_ENABLED`); see [.settings.toml](#settingstoml) below. Must be exactly `true` or `false` -- any other value is a hard error naming the variable, matching the strictness of every `ZIRV_CTX_*` boolean |
 
-Every `[section] key` in the table above also has a `ZIRV_CTX_*` variable; the
-names follow the key, for example `ZIRV_CTX_DEBOUNCE_MS` for `wrap.debounce_ms`.
+Every `[section] key` in the tables above also has a `ZIRV_CTX_*` variable;
+the names follow the key, for example `ZIRV_CTX_DEBOUNCE_MS` for
+`wrap.debounce_ms`, with two deliberate exceptions: a section's own top-level
+`enabled` flag drops the `_ENABLED` suffix (`ZIRV_CTX_MAIL` for
+`mail.enabled`, `ZIRV_CTX_PROMPT` for `prompt.enabled`, and so on), and
+`ZIRV_CTX_QUIET` is a named alias for `chrome.events` set to its *opposite*
+(`ZIRV_CTX_QUIET=true` turns events off) rather than `ZIRV_CTX_CHROME_EVENTS`,
+because "quiet" is the more natural spelling for the flag most people will
+actually reach for.
 
 ### .settings.toml
 

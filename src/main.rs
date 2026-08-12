@@ -56,11 +56,16 @@ fn rewrite_ctx_alias_args(verb: &str, argv: &[String]) -> Vec<String> {
 }
 
 /// What a bare `zirv` invocation (no arguments at all) does: open an
-/// interactive chat when this looks like a zirv-managed repo and stdin is a
-/// real terminal, or fall back to the ordinary help listing otherwise. A
-/// pure function of those two facts so the policy is testable without a pty
-/// or a real filesystem/stdin check -- `zirv_dir_present` and
-/// `std::io::IsTerminal` supply them at the call site.
+/// interactive chat when this looks like a zirv-managed repo and *both*
+/// stdin and stdout are a real terminal, or fall back to the ordinary help
+/// listing otherwise. A pure function of those three facts so the policy is
+/// testable without a pty or a real filesystem/stdin/stdout check --
+/// `zirv_dir_present` and `std::io::IsTerminal` supply them at the call site.
+///
+/// Both stdin *and* stdout have to be a terminal, not just stdin: `zirv |
+/// less` (or any other redirect of stdout alone) has an interactive stdin
+/// but would otherwise launch a chat session into a pipe nothing is reading
+/// interactively.
 ///
 /// This is a deliberate behavior change from clap's own bare-invocation
 /// handling: `Input::command` is a required positional, so before this a
@@ -72,22 +77,30 @@ enum BareTarget {
     Help,
 }
 
-fn bare_invocation_target(zirv_dir_exists: bool, stdin_is_tty: bool) -> BareTarget {
-    if zirv_dir_exists && stdin_is_tty {
+fn bare_invocation_target(
+    zirv_dir_exists: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> BareTarget {
+    if zirv_dir_exists && stdin_is_tty && stdout_is_tty {
         BareTarget::Chat
     } else {
         BareTarget::Help
     }
 }
 
-/// True when either `./.zirv` (relative to `cwd`) or `~/.zirv` (relative to
-/// `home`, when known) exists as a directory. The signal a bare `zirv`
-/// invocation uses to decide there is something worth chatting about here,
-/// separated from `bare_invocation_target` so each half (the filesystem
-/// check, the policy) is testable on its own.
-fn zirv_dir_present(cwd: &Path, home: Option<&Path>) -> bool {
+/// True when `./.zirv` (relative to `cwd`) exists as a directory. **Local
+/// only**, deliberately: a global `~/.zirv` says something about the
+/// operator's machine, not about the directory zirv happens to be run from,
+/// and treating it as "this is a zirv-managed repo" would open a chat
+/// session for a bare `zirv` in literally any directory for anyone who has
+/// ever run `zirv create --global` once. Matches the approved design's own
+/// wording -- "in a repo with a `.zirv` directory" -- and mirrors
+/// `SCRIPT_DIR_NAME` resolution order elsewhere: local is checked, global is
+/// not consulted for this decision. `zirv chat`/`zirv ctx chat` remain
+/// unaffected and still work anywhere, with or without a local `.zirv`.
+fn zirv_dir_present(cwd: &Path) -> bool {
     cwd.join(utils::SCRIPT_DIR_NAME).is_dir()
-        || home.is_some_and(|h| h.join(utils::SCRIPT_DIR_NAME).is_dir())
 }
 
 #[tokio::main]
@@ -103,10 +116,10 @@ async fn main() {
 
     if argv.len() == 1 {
         let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-        let home = utils::home_dir().ok();
-        let zirv_exists = zirv_dir_present(&cwd, home.as_deref());
+        let zirv_exists = zirv_dir_present(&cwd);
         let stdin_is_tty = std::io::stdin().is_terminal();
-        match bare_invocation_target(zirv_exists, stdin_is_tty) {
+        let stdout_is_tty = std::io::stdout().is_terminal();
+        match bare_invocation_target(zirv_exists, stdin_is_tty, stdout_is_tty) {
             BareTarget::Chat => {
                 std::process::exit(ctx::dispatch(&["ctx".to_string(), "chat".to_string()]));
             }
@@ -240,27 +253,31 @@ mod tests {
         let cwd = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(cwd.path().join(".zirv")).expect("mkdir");
 
-        assert!(zirv_dir_present(cwd.path(), None));
-        assert_eq!(bare_invocation_target(true, true), BareTarget::Chat);
+        assert!(zirv_dir_present(cwd.path()));
+        assert_eq!(bare_invocation_target(true, true, true), BareTarget::Chat);
     }
 
+    /// S5: a *global* `~/.zirv` alone must not turn a bare `zirv` into a chat
+    /// launch in an arbitrary directory -- only a local `./.zirv` counts.
     #[test]
-    fn a_bare_invocation_with_a_global_zirv_directory_starts_chat() {
+    fn a_bare_invocation_with_only_a_global_zirv_directory_shows_help() {
         let cwd = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
 
-        assert!(zirv_dir_present(cwd.path(), Some(home.path())));
-        assert_eq!(bare_invocation_target(true, true), BareTarget::Chat);
+        assert!(
+            !zirv_dir_present(cwd.path()),
+            "a global .zirv is not a local one"
+        );
+        assert_eq!(bare_invocation_target(false, true, true), BareTarget::Help);
     }
 
     #[test]
     fn a_bare_invocation_with_no_zirv_directory_anywhere_shows_help() {
         let cwd = tempfile::tempdir().expect("tempdir");
-        let home = tempfile::tempdir().expect("tempdir");
 
-        assert!(!zirv_dir_present(cwd.path(), Some(home.path())));
-        assert_eq!(bare_invocation_target(false, true), BareTarget::Help);
+        assert!(!zirv_dir_present(cwd.path()));
+        assert_eq!(bare_invocation_target(false, true, true), BareTarget::Help);
     }
 
     #[test]
@@ -268,7 +285,15 @@ mod tests {
         // A `.zirv` directory exists, but stdin is not a real terminal (e.g.
         // `echo hi | zirv`): help wins, so a bare invocation piped into a
         // script never blocks on an interactive chat session.
-        assert_eq!(bare_invocation_target(true, false), BareTarget::Help);
+        assert_eq!(bare_invocation_target(true, false, true), BareTarget::Help);
+    }
+
+    /// S5: stdin alone being a terminal is not enough -- `zirv | less` has an
+    /// interactive stdin but a redirected stdout, and must not launch a chat
+    /// session into the pipe on the other end.
+    #[test]
+    fn a_bare_invocation_with_piped_stdout_shows_help_instead_of_opening_a_chat_into_the_pipe() {
+        assert_eq!(bare_invocation_target(true, true, false), BareTarget::Help);
     }
 
     #[test]

@@ -414,7 +414,7 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
     ("ZIRV_CTX_MAIL", &["mail", "enabled"], EnvKind::Bool),
     (
-        "ZIRV_CTX_MAIL_MAX_BYTES",
+        "ZIRV_CTX_MAIL_MAX_MESSAGE_BYTES",
         &["mail", "max_message_bytes"],
         EnvKind::Int,
     ),
@@ -511,6 +511,24 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["prompt", "max_repo_bytes"],
         "ZIRV_CTX_PROMPT_MAX_REPO_BYTES",
     ),
+    // Same rationale as prompt.max_repo_bytes above: mail is folded into the
+    // composed prompt as its own layer (`with_mail_layer`), and without this
+    // a repo could simply raise its own delivered-mail cap, making it
+    // decorative.
+    (
+        &["mail", "max_delivered_bytes"],
+        "ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES",
+    ),
+    // A repo could otherwise turn mail delivery back on after an operator
+    // disabled it -- the same "the checkout is not the operator" boundary
+    // every other entry here enforces, applied to a boolean instead of a
+    // number.
+    (&["mail", "enabled"], "ZIRV_CTX_MAIL"),
+    // Without this a repo could silence the `zirv \u{25b8}` announcement
+    // channel -- including the degradation notices it exists to surface --
+    // for anyone running zirv there, with no operator-visible sign that it
+    // happened.
+    (&["chrome", "events"], "ZIRV_CTX_QUIET"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -948,6 +966,8 @@ mod tests {
     #[test]
     fn mail_reads_config_and_env() {
         let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
@@ -966,7 +986,7 @@ mod tests {
 
         let env = env_map(&[
             ("ZIRV_CTX_MAIL", "false"),
-            ("ZIRV_CTX_MAIL_MAX_BYTES", "512"),
+            ("ZIRV_CTX_MAIL_MAX_MESSAGE_BYTES", "512"),
             ("ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES", "256"),
             ("ZIRV_CTX_MAIL_KEEP", "5"),
         ]);
@@ -1007,6 +1027,8 @@ mod tests {
     #[test]
     fn chrome_reads_config_and_env() {
         let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
@@ -1058,9 +1080,11 @@ mod tests {
         assert!(err.to_string().contains("ZIRV_CTX_QUIET"), "got {err}");
     }
 
-    /// `[chrome]` is not in `REPO_FORBIDDEN`: unlike `agent_bin` or
-    /// `handoff.model`, nothing here names what zirv runs or spends tokens
-    /// on, so a repository may configure its own chrome defaults.
+    /// `chrome.bar`/`chrome.banner` are not in `REPO_FORBIDDEN`: unlike
+    /// `agent_bin` or `handoff.model`, neither names what zirv runs or
+    /// spends tokens on, so a repository may configure its own defaults for
+    /// them. `chrome.events` is different -- see
+    /// `a_repo_may_not_silence_the_announcement_channel` below.
     #[test]
     fn a_repository_may_configure_chrome() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1073,6 +1097,77 @@ mod tests {
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert!(!cfg.chrome.bar);
+    }
+
+    /// S1: mail is folded into the composed prompt as its own layer
+    /// (`with_mail_layer`), the same reasoning that puts `prompt.max_repo_
+    /// bytes` in `REPO_FORBIDDEN` -- a repo raising its own delivered-mail
+    /// cap would make the cap decorative, and a repo re-enabling delivery
+    /// after an operator disabled it would defeat the point of disabling it.
+    #[test]
+    fn a_repo_may_not_raise_the_mail_delivered_cap_or_toggle_delivery() {
+        for (key, value) in [("max_delivered_bytes", "1000000"), ("enabled", "true")] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[mail]\n{key} = {value}\n"),
+            )
+            .expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(&format!("mail.{key}")), "got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_MAIL"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+    }
+
+    /// S1: a repo could otherwise silence the `zirv \u{25b8}` announcement
+    /// channel -- including its own degradation notices -- for anyone
+    /// running zirv there, with no operator-visible sign that it happened.
+    #[test]
+    fn a_repo_may_not_silence_the_announcement_channel() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chrome]\nevents = false\n",
+        )
+        .expect("write");
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not silence the announcement channel")
+            .to_string();
+        assert!(err.contains("chrome.events"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_QUIET"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    #[test]
+    fn the_operator_may_still_toggle_mail_delivery_and_the_announcement_channel() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_only.path());
+        let env = env_map(&[
+            ("ZIRV_CTX_MAIL", "false"),
+            ("ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES", "9000"),
+            ("ZIRV_CTX_QUIET", "true"),
+        ]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.mail.enabled, "the environment is the operator");
+        assert_eq!(cfg.mail.max_delivered_bytes, 9000);
+        assert!(!cfg.chrome.events);
     }
 
     #[test]

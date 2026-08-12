@@ -18,8 +18,16 @@ pub const RESERVED_COMMANDS: &[&str] = &[
     "help", "h", "version", "v", "init", "i", "create", "c", "ctx", "chat", "agent",
 ];
 
+/// Compared case-insensitively, the same way `is_reserved_zirv_file` compares
+/// against `RESERVED_ZIRV_FILES`: NTFS (and APFS by default) resolve a file
+/// name case-insensitively, and `main.rs`'s dispatch matches `input.command`
+/// as typed, so `zirv Chat`/a script named `Chat.yaml` would otherwise slip
+/// past this guard while `zirv chat` (lowercase) is still intercepted as the
+/// built-in -- one name, two different answers about whether it is reachable.
 pub fn is_reserved_command(name: &str) -> bool {
-    RESERVED_COMMANDS.contains(&name)
+    RESERVED_COMMANDS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
 
 /// File names inside a `.zirv` directory that are zirv's own configuration
@@ -360,6 +368,19 @@ mod tests {
         assert!(is_reserved_command("help"));
         assert!(is_reserved_command("c"));
         assert!(!is_reserved_command("build"));
+    }
+
+    /// S4: NTFS (and APFS by default) resolve a file name case-insensitively,
+    /// so a script `Chat.yaml` is exactly as unreachable as `chat.yaml`
+    /// would be. The guard has to agree, the same way `is_reserved_zirv_file`
+    /// already does for `RESERVED_ZIRV_FILES`.
+    #[test]
+    fn is_reserved_command_is_case_insensitive() {
+        assert!(is_reserved_command("Help"));
+        assert!(is_reserved_command("CHAT"));
+        assert!(is_reserved_command("Agent"));
+        assert!(is_reserved_command("CtX"));
+        assert!(!is_reserved_command("Build"));
     }
 
     /// `.settings.toml` is zirv's own configuration file, not a script: it

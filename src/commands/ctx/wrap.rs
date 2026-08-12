@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -330,15 +330,29 @@ pub fn mail_grew(previous: usize, current: usize) -> bool {
     current > previous
 }
 
-/// Unread mail for `repo`, or `None` on any read error. Never called from a
-/// byte-pump or per-tick path -- only from the turn-signal arm, which is
-/// bounded by how often the agent actually reports a turn boundary -- so an
+/// Unread mail for `repo`, filtered to what this session's own harness would
+/// see (`mail::list`'s `for_agent`, the same filter delivery and `zirv ctx
+/// inbox` already use -- a message addressed to a different agent by name
+/// must not count here either). `None` when mail is disabled outright
+/// (`cfg.mail.enabled = false`, honored exactly like delivery does: an
+/// operator who turned mail off must never be told mail is waiting) or on any
+/// read error. Called from two throttled call sites -- the turn-signal arm,
+/// bounded by how often the agent reports a turn boundary, and (T12b) the
+/// bar's own 1s redraw throttle, never the raw byte-pump path -- so an
 /// unreadable mail directory (permissions, a stray non-directory file at that
 /// path) is silently ignored rather than degrading or interrupting the
 /// session: mail is advisory, and a wrapped session must never be made worse
 /// by it.
-fn unread_mail_count(state: &super::state::StateDir, repo: &Path) -> Option<usize> {
-    super::mail::list(state, &super::state::repo_slug(repo), None)
+fn unread_mail_count(
+    state: &super::state::StateDir,
+    repo: &Path,
+    agent: &str,
+    mail_enabled: bool,
+) -> Option<usize> {
+    if !mail_enabled {
+        return None;
+    }
+    super::mail::list(state, &super::state::repo_slug(repo), Some(agent))
         .ok()
         .map(|found| found.len())
 }
@@ -773,7 +787,12 @@ pub fn run_with<W: Write>(
     // `raw`, at the one place this function ever leaves the pump.
     let mut vt_guard = super::term::enable_vt_output().ok();
     let vt_ok = vt_guard.is_some();
-    let stdout_is_tty = window_size(STDIN_FD).is_ok();
+    // `IsTerminal` on stdout specifically, not `window_size(STDIN_FD)`'s own
+    // success: on unix that probes stdin's own fd, so `zirv chat > log` (or
+    // `wrap`) left stdin attached to a real terminal still banered straight
+    // into the redirected file. The size itself still comes from
+    // `window_size`, which is the only source `wrap` has for it.
+    let stdout_is_tty = std::io::stdout().is_terminal();
     let chrome = super::chrome::ChromeCaps::probe(
         stdout_is_tty,
         vt_ok,
@@ -915,16 +934,26 @@ pub fn run_with<W: Write>(
     let mut bar = BarRuntime::new(
         chrome,
         adapter.name().to_string(),
+        cfg.mail.enabled,
         stdout_lock.clone(),
         (cols, rows),
     );
     if bar.chrome.bar {
         let region = super::chrome::scroll_region_sequence(bar.rows);
-        if let Ok(_guard) = stdout_lock.lock() {
-            let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(region.as_bytes());
-            let _ = stdout.flush();
-        }
+        let region_ok = match stdout_lock.lock() {
+            Ok(_guard) => {
+                let mut stdout = std::io::stdout();
+                stdout
+                    .write_all(region.as_bytes())
+                    .and_then(|()| stdout.flush())
+                    .is_ok()
+            }
+            Err(_) => false,
+        };
+        // Same degrade-on-failure as every other bar write: a scroll region
+        // that never actually got set must not leave the bar thinking it is
+        // still safely confining the child.
+        bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
     }
 
     let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
@@ -995,13 +1024,18 @@ pub fn run_with<W: Write>(
 /// `disabled` is a one-way switch exactly like `InjectionState::degraded`:
 /// once a probe, lock or write failure sets it, nothing here ever clears it
 /// again, and the child is never touched by that decision (see
-/// `chrome::after_redraw_attempt`).
+/// `chrome::after_redraw_attempt`). `recovered` (B1) is a second, later
+/// one-way switch: it tracks whether the *disable* has already been reacted
+/// to (row cleared, pty widened back to full size), so that reaction runs
+/// exactly once no matter which caller noticed the disable first.
 struct BarRuntime {
     chrome: super::chrome::Chrome,
     disabled: bool,
+    recovered: bool,
     last_text: Option<String>,
     last_draw: Instant,
     harness: String,
+    mail_enabled: bool,
     stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
     rows: u16,
     cols: u16,
@@ -1011,16 +1045,26 @@ impl BarRuntime {
     fn new(
         chrome: super::chrome::Chrome,
         harness: String,
+        mail_enabled: bool,
         stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
         size: (u16, u16),
     ) -> Self {
         Self {
             disabled: !chrome.bar,
             chrome,
-            // Never drawn yet, so the first due check always draws.
+            recovered: false,
+            // Never drawn yet, so the first due check always draws. Process
+            // uptime under a second (a fast test run, a fresh container)
+            // would make a bare subtraction panic (an abort, on the release
+            // profile this ships with); `checked_sub` degrades to "draw
+            // immediately" instead, which is the same outcome a real elapsed
+            // second would have produced anyway.
             last_text: None,
-            last_draw: Instant::now() - BAR_THROTTLE,
+            last_draw: Instant::now()
+                .checked_sub(BAR_THROTTLE)
+                .unwrap_or_else(Instant::now),
             harness,
+            mail_enabled,
             stdout_lock,
             cols: size.0,
             rows: size.1,
@@ -1036,11 +1080,11 @@ impl BarRuntime {
 /// has elapsed, never on the byte-pump path.
 const BAR_THROTTLE: Duration = Duration::from_secs(1);
 
-/// Writes the reset sequence once, at the one place `wrap` ever leaves the
-/// pump (alongside `RawGuard::restore`). A no-op when the bar was never
-/// eligible in the first place, but attempted even if it later degraded:
-/// a degraded bar may have left a stale row on the real terminal that still
-/// needs clearing.
+/// Writes the reset sequence: region cleared, reserved row blanked. Called
+/// from two places -- the final cleanup alongside `RawGuard::restore`, and
+/// (B1) `recover_bar_to_full_size` the moment the bar degrades mid-session --
+/// so callers decide when it is due; this just performs it. A no-op when the
+/// bar was never eligible in the first place.
 fn reset_bar(bar: &BarRuntime) {
     if !bar.chrome.bar {
         return;
@@ -1051,6 +1095,33 @@ fn reset_bar(bar: &BarRuntime) {
         let _ = stdout.write_all(sequence.as_bytes());
         let _ = stdout.flush();
     }
+}
+
+/// B1 (blocking fix): the moment the bar shows disabled -- whichever caller
+/// noticed first, a too-small resize or a redraw/lock failure with no resize
+/// event of its own -- this clears the reserved row exactly once and widens
+/// the child pty to the full current size. Without it the pty stayed pinned
+/// at its last reserved height forever, and a later widen never reached the
+/// child: a degraded session must behave exactly like a bar-less one from
+/// here on, including tracking every resize after this at full size.
+/// Idempotent (`bar.recovered` guards it), so calling this every tick is
+/// cheap and safe.
+fn recover_bar_to_full_size(
+    bar: &mut BarRuntime,
+    pair: &mut portable_pty::PtyPair,
+    size: (u16, u16),
+) {
+    if !super::chrome::bar_needs_recovery(bar.chrome.bar, bar.disabled, bar.recovered) {
+        return;
+    }
+    bar.recovered = true;
+    reset_bar(bar);
+    let _ = pair.master.resize(PtySize {
+        rows: size.1,
+        cols: size.0,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
 }
 
 /// Redraws the bar when it is active, its rendered text actually changed,
@@ -1080,7 +1151,7 @@ fn redraw_bar_if_due(
         .fold(None, |acc: Option<f64>, p| {
             Some(acc.map_or(p, |a| a.max(p)))
         });
-    let unread_mail = unread_mail_count(state_dir, repo);
+    let unread_mail = unread_mail_count(state_dir, repo, &bar.harness, bar.mail_enabled);
 
     let state = super::chrome::BarState {
         harness: bar.harness.clone(),
@@ -1174,7 +1245,8 @@ fn pump(
             // `zirv ctx inbox`) and never writes to the pty, only to stderr.
             // A read error (including no mailbox at all) leaves `mail_seen`
             // where it was, so it neither advises nor errors.
-            if let Some(count) = unread_mail_count(state_dir, repo)
+            if let Some(count) =
+                unread_mail_count(state_dir, repo, adapter.name(), bar.mail_enabled)
                 && mail_grew(mail_seen, count)
             {
                 announcer.emit(&Event::MailWaiting { count });
@@ -1385,50 +1457,51 @@ fn pump(
         if let Ok(size) = window_size(STDIN_FD)
             && size != last_size
         {
-            // Once a bar-eligible session has degraded, the pty is kept at
-            // its last size for the rest of the session: resizing further
-            // (up or down) would either fight a bar that has stopped
-            // drawing or resume drawing over a scroll region nobody is
-            // maintaining anymore.
-            let frozen = bar.chrome.bar && bar.disabled;
-            if !frozen {
-                last_size = size;
-                if bar.active() {
-                    if super::chrome::bar_should_disable_after_resize(size.0) {
-                        bar.disabled = true;
-                    } else {
-                        bar.cols = size.0;
-                        bar.rows = size.1;
-                        let region = super::chrome::scroll_region_sequence(bar.rows);
-                        let region_ok = match bar.stdout_lock.lock() {
-                            Ok(_guard) => {
-                                let mut stdout = std::io::stdout();
-                                stdout
-                                    .write_all(region.as_bytes())
-                                    .and_then(|()| stdout.flush())
-                                    .is_ok()
-                            }
-                            Err(_) => false,
-                        };
-                        bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
-                        if !bar.disabled {
-                            // The bar's own row moved; the next throttle tick
-                            // must redraw it even if the text is unchanged.
-                            bar.last_text = None;
-                        }
+            last_size = size;
+            // B1: `chrome::resize_decision` is the single source of truth for
+            // what a resize does to the bar and the pty -- see its own tests
+            // for the shrink-below-floor and widen-after-degrade cases this
+            // used to get wrong (the child pinned at a stale reserved size
+            // forever, even once the terminal widened back out).
+            let decision = super::chrome::resize_decision(bar.active(), size);
+            if decision.disables_bar {
+                bar.disabled = true;
+            } else if decision.set_scroll_region {
+                bar.cols = size.0;
+                bar.rows = size.1;
+                let region = super::chrome::scroll_region_sequence(bar.rows);
+                let region_ok = match bar.stdout_lock.lock() {
+                    Ok(_guard) => {
+                        let mut stdout = std::io::stdout();
+                        stdout
+                            .write_all(region.as_bytes())
+                            .and_then(|()| stdout.flush())
+                            .is_ok()
                     }
-                }
-                if !(bar.chrome.bar && bar.disabled) {
-                    let (pty_cols, pty_rows) = super::chrome::reserved_pty_size(size, bar.active());
-                    let _ = pair.master.resize(PtySize {
-                        rows: pty_rows,
-                        cols: pty_cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+                    Err(_) => false,
+                };
+                bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
+                if !bar.disabled {
+                    // The bar's own row moved; the next throttle tick must
+                    // redraw it even if the text is unchanged.
+                    bar.last_text = None;
                 }
             }
+            let _ = pair.master.resize(PtySize {
+                rows: decision.pty_size.1,
+                cols: decision.pty_size.0,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
         }
+
+        // B1: catches a disable that just happened above (this tick's
+        // resize shrank below the floor) *and* one that happened earlier
+        // with no resize event at all (a redraw or lock failure) -- either
+        // way, `bar_needs_recovery` makes this a one-time, idempotent
+        // reaction, so calling it unconditionally every tick is cheap and
+        // correct in both cases.
+        recover_bar_to_full_size(bar, pair, last_size);
 
         std::thread::sleep(PUMP_POLL);
     }
@@ -2184,7 +2257,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
-        assert_eq!(unread_mail_count(&state, &repo), Some(0));
+        assert_eq!(unread_mail_count(&state, &repo, "claude", true), Some(0));
     }
 
     #[test]
@@ -2202,7 +2275,60 @@ mod tests {
         };
         crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
             .expect("store");
-        assert_eq!(unread_mail_count(&state, &repo), Some(1));
+        assert_eq!(unread_mail_count(&state, &repo, "claude", true), Some(1));
+    }
+
+    /// B3: `cfg.mail.enabled = false` must gate this the same way it gates
+    /// delivery -- an operator who turned mail off must never see the wrap
+    /// advisory (or the bar's mail count) either.
+    #[test]
+    fn mail_disabled_in_config_reports_no_unread_mail_even_when_some_is_stored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let msg = crate::commands::ctx::mail::Message {
+            from_session: "other".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            sent: 1,
+            body: "note".to_string(),
+        };
+        crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
+            .expect("store");
+
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", false),
+            None,
+            "mail.enabled = false must silence the advisory entirely"
+        );
+    }
+
+    /// B3 alignment: a message addressed to a different agent by name must
+    /// not count for this session, the same filter `mail::list`'s own
+    /// `for_agent` already applies to delivery and `zirv ctx inbox`.
+    #[test]
+    fn unread_mail_count_filters_by_the_sessions_own_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let msg = crate::commands::ctx::mail::Message {
+            from_session: "other".to_string(),
+            from_agent: "claude".to_string(),
+            to: "codex".to_string(),
+            sent: 1,
+            body: "note".to_string(),
+        };
+        crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
+            .expect("store");
+
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", true),
+            Some(0),
+            "addressed to codex, not this claude session"
+        );
+        assert_eq!(unread_mail_count(&state, &repo, "codex", true), Some(1));
     }
 
     /// `mail::list` itself treats "nothing there, or not a directory" as an
@@ -2218,7 +2344,7 @@ mod tests {
         // A plain file where `mail::list` expects a directory.
         std::fs::write(state.mail().join(&slug), "not a directory").expect("write");
 
-        assert_eq!(unread_mail_count(&state, &repo), Some(0));
+        assert_eq!(unread_mail_count(&state, &repo, "claude", true), Some(0));
     }
 
     /// A genuine read error -- unlike "missing" or "not a directory", which
@@ -2239,7 +2365,7 @@ mod tests {
         std::fs::create_dir_all(&mailbox).expect("mkdir");
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let result = unread_mail_count(&state, &repo);
+        let result = unread_mail_count(&state, &repo, "claude", true);
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o700))
@@ -3463,7 +3589,7 @@ mod tests {
                 // Long enough to still be running when the assertion below
                 // looks for the socket entry, short enough to reap itself if
                 // the kill somehow misses.
-                &["cmd", "/c", "ping -n 20 127.0.0.1 >NUL"],
+                &["cmd", "/c", "ping -n 20 127.0.0.1"],
             );
 
             let deadline = Instant::now() + Duration::from_secs(30);

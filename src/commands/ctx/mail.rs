@@ -109,14 +109,29 @@ pub fn parse_markdown(md: &str) -> Message {
     msg
 }
 
-/// Truncates `s` to at most `max_bytes` bytes without splitting a UTF-8
-/// character.
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
-    let mut end = max_bytes.min(s.len());
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+/// The first collision-free path for `<dir>/<base>.md`: `<base>.md` itself
+/// if nothing is there yet, else `<base>_001.md`, `<base>_002.md`, ... . Two
+/// messages from the same sender landing in the same wall-clock second
+/// (`now_secs()` has one-second granularity) used to produce the identical
+/// base and silently overwrite one another via `write_private`; this keeps
+/// every one of them. `_NNN` (not `-N`) is deliberate: `-` (0x2D) sorts
+/// *before* `.` (0x2E), which would put a collision's suffixed file ahead of
+/// the unsuffixed one it collided with; `_` (0x5F) sorts after, so the
+/// zero-padded seconds prefix this shares with every other mail filename
+/// keeps sorting messages oldest-first even across a same-second collision.
+fn next_available_mail_path(dir: &Path, base: &str) -> PathBuf {
+    let unsuffixed = dir.join(format!("{base}.md"));
+    if !unsuffixed.exists() {
+        return unsuffixed;
     }
-    &s[..end]
+    let mut n = 1u32;
+    loop {
+        let candidate = dir.join(format!("{base}_{n:03}.md"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Writes `msg` under `<state>/mail/<repo_slug>/`, truncating an oversized
@@ -136,7 +151,7 @@ pub fn store(
     if msg.body.len() > cap {
         const MARKER: &str = "\n[truncated]";
         let keep = cap.saturating_sub(MARKER.len());
-        let mut truncated = truncate_at_char_boundary(&msg.body, keep).to_string();
+        let mut truncated = crate::utils::truncate_bytes(msg.body.clone(), Some(keep));
         truncated.push_str(MARKER);
         msg.body = truncated;
     }
@@ -147,7 +162,8 @@ pub fn store(
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect();
-    let path = dir.join(format!("{:010}-{}.md", now_secs(), short));
+    let base = format!("{:010}-{}", now_secs(), short);
+    let path = next_available_mail_path(&dir, &base);
     super::state::write_private(&path, &msg.to_markdown())?;
 
     super::state::prune_to_newest(&dir, cfg.mail.keep);
@@ -384,6 +400,42 @@ mod tests {
         assert!(text.contains("## Message"));
     }
 
+    /// The filename is `{secs:010}-{short}.md`: two messages from the same
+    /// sender landing in the same wall-clock second (`now_secs()` has
+    /// one-second granularity, and two real sends this close together is
+    /// common, not a rare edge case) used to collide on that exact path, and
+    /// the second `write_private` silently overwrote the first. Both must
+    /// survive.
+    #[test]
+    fn two_messages_sent_in_the_same_second_are_both_stored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut first = sample("s1", 1_700_000_000);
+        first.body = "first message".to_string();
+        let mut second = sample("s1", 1_700_000_000);
+        second.body = "second message".to_string();
+
+        let first_path = store(&state, "-work-repo", &first, &cfg).expect("store first");
+        let second_path = store(&state, "-work-repo", &second, &cfg).expect("store second");
+
+        assert_ne!(
+            first_path, second_path,
+            "a same-second, same-sender collision must not reuse the first path"
+        );
+
+        let listed = list(&state, "-work-repo", None).expect("list");
+        assert_eq!(
+            listed.len(),
+            2,
+            "both messages must be stored even when the filename base collides"
+        );
+        let bodies: Vec<&str> = listed.iter().map(|(_, m)| m.body.as_str()).collect();
+        assert!(bodies.contains(&"first message"), "got {bodies:?}");
+        assert!(bodies.contains(&"second message"), "got {bodies:?}");
+    }
+
     #[test]
     fn messages_are_listed_oldest_first_and_never_leak_across_repos() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -580,6 +632,8 @@ This should not appear in the body.\n";
     #[test]
     fn send_records_the_sending_session_and_agent_from_the_environment() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let state_dir = tmp.path().join("state");
         let env = env_map(&[
             (
@@ -614,6 +668,8 @@ This should not appear in the body.\n";
     #[test]
     fn send_falls_back_to_an_unknown_sender_rather_than_refusing() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let state_dir = tmp.path().join("state");
         let env = env_map(&[(
             super::super::state::STATE_ENV,
@@ -641,6 +697,8 @@ This should not appear in the body.\n";
     #[test]
     fn send_reads_the_message_from_stdin_when_no_flag_gives_one() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let state_dir = tmp.path().join("state");
         let env = env_map(&[(
             super::super::state::STATE_ENV,
@@ -690,6 +748,8 @@ This should not appear in the body.\n";
     #[test]
     fn inbox_with_consume_leaves_the_second_read_empty() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let state_dir = tmp.path().join("state");
         let state = StateDir::from_root(state_dir.clone());
         let cfg = CtxConfig::default();
@@ -723,6 +783,8 @@ This should not appear in the body.\n";
     #[test]
     fn inbox_without_consume_is_idempotent() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let state_dir = tmp.path().join("state");
         let state = StateDir::from_root(state_dir.clone());
         let cfg = CtxConfig::default();
