@@ -2,6 +2,8 @@
 
 Cross-platform CLI for executing developer-defined YAML/JSON/TOML scripts.
 
+> For comprehensive documentation, see `docs/obsidian/_system-context.md` (agent entry point) and `docs/obsidian/Home.md` (vault navigation).
+
 ## Build & Test
 
 ```bash
@@ -18,7 +20,7 @@ cargo clippy --all-targets -- -D warnings
 - `src/script_runner/` — Script execution engine
   - `script.rs` — Script data model and execution loop
   - `command.rs` — Single command execution with parameter substitution (`${var}`)
-  - `command_types.rs` — Command type enum (Command, Script chaining)
+  - `command_types.rs` — Command step kinds (Command, Commands, Agent)
   - `options.rs` — Per-command options (interactive, OS filter, delay, fallback)
   - `mod.rs` — Context building from params/secrets, entry point for execution
 - `src/input.rs` — Clap CLI argument definitions
@@ -61,3 +63,52 @@ cargo clippy --all-targets -- -D warnings
   docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md.
 - Repo-provided prompt text is untrusted input, like the repo `ctx.toml` layer:
   capped, labeled, and unable to enable itself.
+
+## Using the Obsidian Vault
+
+The `docs/obsidian/` vault is the project's knowledge base. Start with `docs/obsidian/_system-context.md` for agent-optimized context, or `docs/obsidian/Home.md` for full navigation.
+
+### Before Starting Work
+
+1. **Read `docs/obsidian/_system-context.md`** — mandatory first read for every session. Contains the module map, key flows, gotchas, and cross-reference index.
+2. **Check Active Work** (`docs/obsidian/Development/Active Work.md`) — in-progress work and handoff context from the previous session.
+3. **Check the Work Journal** (`docs/obsidian/Development/Work Journal.md`) — read the last 2–3 entries for recent context.
+4. **Check Known Issues** (`docs/obsidian/Development/Known Issues.md`) — if working in an area with known gotchas.
+5. **Check the Decision Log** (`docs/obsidian/Development/Decision Log.md`) — before proposing alternative approaches.
+
+### After Completing Work
+
+1. **Update Active Work** — move current work to "Recently Completed", add context for the next session.
+2. **Log significant work** in the Work Journal. Cap each entry at ~10 lines; link out instead of inlining. When the active journal grows past ~10 entries, move the oldest to a quarterly file under `docs/obsidian/Development/journal-archive/`.
+3. **Log non-obvious decisions** in the Decision Log — cap ~15 lines; if it needs more, write a spec under `docs/superpowers/specs/` and link it. Undocumented decisions get re-debated next session.
+4. **Log new gotchas** in Known Issues; remove entries for resolved issues.
+5. **Update affected documentation pages** per the table below — check the "If changed" line on each page you touched. Prefer deletion over layering.
+
+### Obsidian Documentation Updates
+
+Update vault pages when a **change in behavior, contract, or architecture** lands — not on every diff that touches a file. Each page has a `last-verified` date in its YAML frontmatter; update it when you verify or modify a page.
+
+**Triggers that require a doc update:**
+
+| Change type | Update |
+|-------------|--------|
+| CLI argument or built-in command added/changed | `Modules/Built-in Commands.md` |
+| Script file format, option, or parameter semantics change | `Concepts/Script Files.md`, `Modules/Script Runner.md` |
+| Shortcut resolution change | `Concepts/Shortcuts.md` |
+| ctx verb added/removed/changed | `Modules/Ctx Subsystem.md` plus the specific module page |
+| Adapter behavior change (claude/codex) | `Modules/Ctx Adapters.md` |
+| Rot engine event or verdict change | `Modules/Rot Engine.md`, `Concepts/Context Management.md` |
+| Supervisor behavior change (loop/exec/wrap, signals, raw mode) | `Modules/Ctx Supervisors.md` |
+| Pacing/usage/window change | `Modules/Usage and Pacing.md` |
+| Dependency added/removed or release profile change | `Architecture/Technology Stack.md` |
+| Non-obvious architectural decision | `Development/Decision Log.md` (length cap above) |
+| Significant sprint/session work | `Development/Work Journal.md` (length cap and archive rule above) |
+| New gotcha discovered / old gotcha resolved | `Development/Known Issues.md` |
+
+**Do NOT trigger doc updates for:**
+- Refactors that don't change external behavior (internal helper extraction, formatting).
+- Content that belongs in a commit message, PR body, or spec file.
+- Bug fixes, unless the root cause is a gotcha worth preserving in Known Issues.
+- New test files, dependency patch bumps, or CI-only changes.
+
+When adding content, look first for an existing page that already covers the topic and extend it. When a topic fits two pages, pick one canonical owner and link from the other — no parallel copies.

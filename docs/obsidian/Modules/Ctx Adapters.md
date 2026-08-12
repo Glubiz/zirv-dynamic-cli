@@ -1,0 +1,102 @@
+---
+last-verified: 2026-08-12
+---
+
+# Ctx Adapters
+
+## Quick Reference
+
+- **Files:** `src/commands/ctx/adapters/mod.rs`, `src/commands/ctx/adapters/claude.rs`, `src/commands/ctx/adapters/codex.rs`
+- **Used by:** [[Ctx Supervisors]] (`exec.rs`, `wrap.rs` build agent argv and relaunch through an adapter), [[Script Runner]] (`src/script_runner/agent_command.rs` calls `adapters::select`/`adapters::all` to run a wrapped agent command from a script), [[Ctx Subsystem]] (`handoff.rs` calls `distiller_cmd` to build the summarization child; `score.rs` calls `parse_events`/`structural_context`)
+- **Depends on:** [[Ctx Subsystem]] for `CtxResult` and the `event` types (`SessionId`, `SessionRef`, `NormalizedEvent`, `StructuralContext`, `Capabilities`), [[Utilities]] for `home_dir()`
+- **Tests:** inline `#[cfg(test)] mod tests` in all three files — `mod.rs` (adapter selection, Windows launcher rewriting, `program_invocation`), `claude.rs` (transcript parsing against a recorded fixture, command building, the distiller tool-restriction tests, the `--help` probe cache), `codex.rs` (command shapes verified against `codex --help`, the honest not-ready error)
+- **If changed:** [[Ctx Supervisors]], [[Ctx Subsystem]], [[Untrusted Configuration]], [[Known Issues]] (issue #11 tracks codex), [[Decision Log]] (the I6 distiller-restriction fix round)
+- **Gotchas:** `distiller_cmd`'s tool restriction is a security control, not cosmetic — see below; it must stay a single `=`-bound `--disallowedTools=...` argv token, and `Bash` must stay in the deny list, or the restriction silently stops working. The `codex` adapter is **not implemented**: `ready()` always returns `Err` with a message pointing at issue #11, so `--agent codex` fails loudly rather than pretending to work.
+
+## Purpose
+
+This module is the seam between zirv's ctx subsystem and whatever coding-agent CLI is actually being wrapped. Everything that needs to spawn an agent process, parse its transcript, or know what it's capable of goes through the `AgentAdapter` trait rather than hard-coding "claude" or "codex" logic elsewhere.
+
+## The `AgentAdapter` trait
+
+Defined in `mod.rs`, with `Debug` as a supertrait (so `Box<dyn AgentAdapter>` can appear in test assertions). Required methods:
+
+- `name()` — the adapter's short identifier (`"claude"`, `"codex"`), used for `--agent` selection and error messages.
+- `ready()` — returns `Err` when the adapter exists but isn't safe to use yet, so callers fail loudly instead of scoring garbage. This is where codex reports its own non-readiness (see below).
+- `detect(command)` — whether a wrapped argv looks like this adapter's binary, by filename.
+- `headless_cmd(prompt, session, extra)` — builds the one-shot, non-interactive command (`exec`'s launch shape).
+- `interactive_cmd(initial_prompt, extra)` — builds the TUI command (`wrap`'s launch shape).
+- `distiller_cmd(model)` — builds the command for the small judgment/summarization model child used by handoff distillation and `optimize`.
+- `system_prompt_args(prompt)` — argv that appends `prompt` to the agent's system prompt for one run; empty when the adapter has no verified mechanism.
+- `transcript_path(session)` — where this agent's own transcript file lives on disk.
+- `parse_events(jsonl)` / `structural_context(jsonl, last_n)` — turn a raw transcript into the ctx subsystem's normalized event stream and rolling structural summary. Must be line-local (each line's events depend only on that line), because `score.rs` feeds adapters only the bytes appended since the last incremental pass.
+- `compact_command()`, `quit_sequence()`, `capabilities()`, `register_turn_signal(session, socket)` — the remaining agent-specific knobs the supervisors need (whether the agent supports `/compact`, how to send it a clean quit, its `Capabilities` flags, and how to wire up the turn-signal socket via `TurnSignalSetup { env, instructions }`).
+
+Several methods have trait-default implementations that only `claude.rs` currently overrides: `base_system_prompt()` (`None` by default — an unverified agent gets no base layer, not another agent's instructions), `user_system_prompt_flag()`, `system_prompt_file_flag()`, `supports_system_prompt_file(launch)` (defaults to `false`, i.e. "fail open to argv delivery"), and `launch_prefix_len()` (defaults to `1`, the count of leading argv tokens that are the program invocation itself rather than operator flags — used when a relaunch has to strip the program off an argv it didn't build).
+
+### Selection
+
+`adapters::all(bin)` returns `vec![ClaudeAdapter, CodexAdapter]` — the full registry. `adapters::select(name, command, bin)` picks one adapter, in priority order: an explicit `--agent` name, else `detect()` against the wrapped command's argv, else default to claude. Every path calls the chosen adapter's `ready()` before returning it, so an unready adapter (currently: codex, always) is rejected at selection time rather than after a launch has started.
+
+`command_matches_adapter(adapter, agent_explicit, command)` is the trust gate used before injecting adapter-specific flags (like `--append-system-prompt`) into a wrapped command: it's true only when the operator named the agent explicitly or `detect()` matched, never merely because `select()`'s last resort had to default to claude with nothing backing it.
+
+Three call sites use this registry: `src/script_runner/agent_command.rs` (a script's `agent_command` option runs a wrapped agent via `adapters::select`), and the two supervisors in `src/commands/ctx/exec.rs` and `src/commands/ctx/wrap.rs` (headless and interactive sessions respectively — see [[Ctx Supervisors]]).
+
+### Windows launcher rewriting
+
+`mod.rs` also owns `resolve_program`/`ResolvedProgram`, used by both adapters' `base()` helpers. Off Windows it's the identity. On Windows, `std::process::Command` only ever appends `.exe`, so an npm-installed `claude` (actually `claude.cmd`) fails to spawn directly (`CreateProcessW` error 193); `resolve_program` walks `PATH`/`PATHEXT` the way the shell would and routes `.cmd`/`.bat` through `cmd.exe` and `.ps1` through PowerShell. A name that resolves to an unlaunchable extension is reported as a named `ready()`-style error before spawning; a name that resolves to nothing at all is left alone so the OS's own "not found" still surfaces.
+
+## The `claude` adapter
+
+`ClaudeAdapter` (in `claude.rs`) wraps a `program` plus `bin_args` (so `ZIRV_CTX_AGENT_BIN="sh /tmp/stub.sh"` or `/usr/bin/env claude` both work) and an optional `home` override for tests. Every command starts from a shared `base()` that applies the program, its leading args, and the Windows resolution above uniformly.
+
+- **`headless_cmd`** builds `claude -p <prompt> --session-id <id> <extra...>` — this is what pins a specific `SessionId` onto the launched process for `exec`.
+- **`interactive_cmd`** builds `claude [<initial_prompt>] <extra...>`, the positional form `wrap` uses to start or resume a TUI session.
+- **`ready()`** just calls `resolve_program` — claude is always considered implemented; the only failure mode is an unlaunchable binary.
+- **System prompt injection**: `system_prompt_args` emits `--append-system-prompt <text>` (empty when the composed prompt is blank). `base_system_prompt()` returns `ORCHESTRATOR_PROMPT`, a claude-specific constant describing zirv's orchestrator conventions (delegate to the Agent tool, route work to cheaper models, finish with a `/code-review` skill pass) — deliberately model-agnostic in its wording, but tool-specific enough that no other adapter reuses it. `supports_system_prompt_file` probes the installed binary's own `--help` output (cached process-wide, keyed by resolved program + bin_args, bounded by a 3-second timeout) for `--append-system-prompt-file`, so injection can move off argv (visible to other users via `ps`) once the installed version supports it, without hard-coding a version cutoff. Any probe failure reads as "unsupported," which only ever falls back to argv delivery — it never blocks a launch.
+- **Transcript location**: `transcript_path` computes `~/.claude/projects/<slug of cwd>/<session-id>.jsonl`, where `project_slug` replaces every character outside `[A-Za-z0-9-]` with `-`. If the computed path doesn't exist (the slug rule is verified only for `/` and `.`, not every character), it falls back to scanning every project directory for a file matching `<session-id>.jsonl`.
+- **Transcript parsing**: module-level `parse_events`/`structural_context`/`context_tokens_of` functions (which the trait methods just delegate to) read Claude Code's own JSONL transcript format — assistant/tool-call/token-usage shapes, compact boundaries, sidechain/meta line skipping — and are validated in tests both against hand-built JSON and against a recorded, credential-scrubbed real session fixture (`tests/fixtures/claude-real-session.jsonl`, re-recorded via `scripts/record-claude-fixture.py`).
+- **Session ids**: claude accepts an explicit `--session-id` on the headless path, so zirv controls the id up front; there's no equivalent for `interactive_cmd`, which relies on claude's own session management plus the transcript-scanning fallback above.
+
+## The `codex` adapter
+
+`CodexAdapter`, in `codex.rs`, is a working command-builder skeleton, but **codex support is not implemented**. Confirmed directly in the source: `ready()` unconditionally returns
+
+```
+Err("codex support is not implemented yet; ctx currently supports Claude Code only. \
+     Pass --agent claude, or track progress at \
+     https://github.com/Glubiz/zirv-dynamic-cli/issues/11.")
+```
+
+so `adapters::select(Some("codex"), ...)` — and thus `--agent codex` — always fails loudly at selection time, before any process is spawned. A test (`ready_error_is_honest_about_codex_support_and_points_at_the_tracking_issue`) pins the exact wording: it must say "not implemented yet," name Claude Code as what does work today, and reference `issues/11`. `parse_events` and `structural_context` are both stubbed to return empty/default values. `base_system_prompt()` returns `None` deliberately (not just via the trait default) because zirv's only base layer is written around Claude Code's own tools (the Agent tool, `.claude/agents`, the `/code-review` skill), none of which codex has, and `system_prompt_args` returns nothing because no per-run injection mechanism has been verified for codex.
+
+What *is* implemented, per command comments citing `docs/superpowers/notes/2026-07-31-codex-cli-facts.md` and `docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md` (verified against `codex --help`/`codex exec --help`): `headless_cmd` builds `codex exec <prompt> <extra...>` (codex has no `--session-id` flag — it always mints its own id), `interactive_cmd` builds `codex [<prompt>] <extra...>`, `distiller_cmd` builds `codex exec --model <model>` (codex reads its prompt from stdin, so it's built the same way as claude's), and `transcript_path` scans `~/.codex/sessions/<YYYY>/<MM>/<DD>/...` recursively by filename suffix, since codex nests transcripts under a date directory that a bare session id can't predict. This matches the repo's CLAUDE.md and the ctx CLI's own `about` text: codex is tracked but not ready.
+
+## `distiller_cmd` and the untrusted-CLAUDE.md trust boundary
+
+`distiller_cmd` builds the command for a separate, usually cheaper model child process — spawned by `handoff::run_model` — whose only job is to read a distillation prompt from stdin and answer with plain text: either summarizing a session transcript into a handoff (`handoff::distill`/`distill_or_structural`) or making the judgment calls in `zirv ctx optimize`. That prompt embeds text that ultimately traces back to a repository's own `CLAUDE.md` (or similar repo-provided configuration) — content the ctx subsystem must treat as **untrusted input**, exactly like the general trust boundary described in [[Untrusted Configuration]].
+
+The concrete risk, and why it isn't just theoretical: this distiller child is otherwise launched with the operator's normal permission settings. If a hostile or careless `CLAUDE.md` can steer the distiller model's output (prompt injection) and that child still has tool access, the injection stops being "the model says something misleading" and becomes "the model actually writes a file, runs a shell command, or spawns further work" — a real code-execution path, not just a bad summary.
+
+`ClaudeAdapter::distiller_cmd` closes that path for the claude adapter with one restriction, added and adversarially verified in what the code and notes call the "I6 fix round":
+
+```
+claude -p --model <model> --output-format text --disallowedTools=Write,Edit,Bash,NotebookEdit
+```
+
+Concretely, per `docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md`:
+
+- **`--disallowedTools`** must name `Write`, `Edit`, `Bash`, and `NotebookEdit` together. Probing found that `Bash` alone, if left off the deny list, lets the model recreate a Write tool via a shell redirect (`echo ... > file`) even with `Write`/`Edit` blocked — so all four have to be denied, not just the two obvious ones.
+- The value must be a **single `=`-bound argv token** (`--disallowedTools=Write,Edit,Bash,NotebookEdit`), never passed as two separate `Command::arg()` calls. The two-token form was verified against the real CLI to make claude's variadic tools parser swallow the *next* argv entry as part of the tool list, corrupting whatever followed it.
+- Other candidate fixes were probed and rejected: an empty `--allowedTools=""` allow-list does **not** deny everything by default (a file was still created in the probe); `--permission-mode plan` doesn't complete cleanly in non-interactive `-p` mode at all (no `ExitPlanMode`/`AskUserQuestion`) and took 90+ seconds.
+- The chosen restriction was re-verified adversarially: a prompt explicitly instructing the model to fall back to Bash, or to route around the restriction via Task/subagent delegation, still failed to create a marker file, with the model itself reporting it had exhausted every method.
+
+The comment on `distiller_cmd` and the dedicated test `the_distiller_denies_the_tools_verified_to_matter` both exist specifically to keep this from regressing: the exact flag spelling, the exact four-tool set, and the single-token argv shape are all load-bearing, not stylistic. Codex's `distiller_cmd` has no equivalent restriction — the notes file records that no per-run permission-restriction flag has been verified for codex, so this fix is claude-only by scope, consistent with codex not being a supported adapter yet.
+
+This is verified against the real installed CLI (not just documentation), as recorded in `docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md`: the notes log the exact probe commands, exit codes, and file-creation outcomes for each candidate fix, including the baseline (no restriction) actually succeeding at writing a file, which confirms the risk is real under a normal user's own default permission settings before demonstrating the fix closes it.
+
+## See also
+
+- [[Ctx Subsystem]] — the hub page for the whole `zirv ctx` feature area.
+- [[Ctx Supervisors]] — `exec.rs`/`wrap.rs`, which select an adapter and drive the headless/interactive processes this module builds commands for.
+- [[Untrusted Configuration]] — the general principle (repo-provided config and prompt text is untrusted input, capped and unable to enable itself) that `distiller_cmd`'s restriction is a concrete instance of.

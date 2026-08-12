@@ -1,0 +1,101 @@
+---
+last-verified: 2026-08-12
+---
+
+# Rot Engine
+
+## Quick Reference
+
+- **Files:** `src/commands/ctx/event.rs`, `src/commands/ctx/rot.rs` (also `src/commands/ctx/score.rs`, the `score` verb's driver — see [[Ctx Subsystem]] for its CLI surface)
+- **Used by:** [[Ctx Subsystem]] (`score` verb), [[Ctx Supervisors]] (`exec`/`wrap`/`run_loop` poll a score every turn and act on the `Verdict`)
+- **Depends on:** [[Ctx Adapters]] (`AgentAdapter::parse_events` turns a raw transcript into `NormalizedEvent`s and reports `Capabilities`), [[Ctx Subsystem]]'s `ScoreConfig` (config.rs) for weights/thresholds
+- **Tests:** `event::tests` (FNV-1a hash stability, `SessionId` uniqueness, `Capabilities` defaults, event equality); `rot::tests` — the largest suite in the module, covering marker detection, windowed signals, the incremental/full-parse equivalence (`folding_events_in_chunks_matches_a_full_parse`, `every_prefix_of_a_stream_scores_like_a_full_parse_of_that_prefix`), verdict thresholds, and eight cases ported from `~/.claude/hooks/canary-check.test.sh`; `score::tests` covers the transcript-driving and checkpoint-caching layer around the engine
+- **If changed:** [[Ctx Subsystem]], [[Ctx Supervisors]], [[Ctx Adapters]], [[Usage and Pacing]], [[Decision Log]]
+- **Gotchas:** **Purity invariant** — `rot.rs` contains no `std::fs`, `std::time`, `std::env`, or `std::net` calls anywhere (verified by grep across the whole file); every scoring function takes only data and returns data, so identical events always produce an identical verdict. All I/O (reading the transcript file, checkpoint files, clock/env lookups) lives in `score.rs`, one layer up. Also: the marker signal is capability-gated and only activates once `min_turns` is reached *and* the marker has appeared at least once — a session where the hook was never installed reports `marker_miss_rate: None`, not a score of zero. The token floor/ceiling is a hard gate, not a fourth weighted term: below `token_floor` the verdict is always `Healthy` regardless of how badly the other signals fire.
+
+## Purpose
+
+`rot.rs` is zirv's deterministic answer to "has this agent session gone stale and should it be nudged, compacted, or restarted?" It replaces the ad hoc shell "canary" script (an older per-session heuristic referenced directly in the ported test names) with a small, pure, unit-tested scoring function. It never touches a transcript file, a clock, or the environment itself — `score.rs` does that job and hands the engine only normalized events.
+
+## How It Works
+
+### Normalized events (`event.rs`)
+
+`NormalizedEvent` is the only vocabulary the rot engine and the supervisors understand — the sole input to everything in `rot.rs`. Five variants:
+
+- `TurnStart` — marks a new agent turn.
+- `AssistantFinal { text, input_tokens }` — emitted for every assistant message; `text` is the concatenated text blocks (empty for tool-only/thinking-only messages). The marker signal groups these by turn and reads only the *last* non-empty text per turn; the token gate instead reads the most recent event's `input_tokens` regardless of whether it carried text, so mid-turn token growth is still visible.
+- `ToolCall { name, input_hash }` — `input_hash` is a hand-rolled FNV-1a 64 hash (`event::input_hash`), chosen over `DefaultHasher` specifically so the rot engine's output is stable across compiler versions, not just across runs.
+- `ToolResult { is_error }`.
+- `Compaction` — a marker for a context-compaction boundary in the transcript; carries no signal itself, but resets what "recent" tokens mean.
+
+Two other types travel alongside events but aren't scoring inputs: `Capabilities` (`marker_signal`, `token_usage`, `turn_signal`, `system_prompt`) tells the engine which signals a given adapter can actually feed — a capability that's off is treated the same as a signal that never fired, not as a zero — and `StructuralContext` carries raw material (user messages, assistant texts, files touched, tool errors) that handoffs need but the normalized stream deliberately drops.
+
+### Signals and scoring (`rot.rs`)
+
+`signals(events, caps, cfg) -> Signals` computes four independent measurements over the trailing `cfg.window` turns (0 means unbounded — the whole transcript):
+
+- **`tool_failure_rate`** — share of `ToolResult`s in the window that were errors; 0.0 for a window with no tool calls at all.
+- **`repetition_hits` / `max_repeat`** — groups `ToolCall`s in the window by `(name, input_hash)`; `max_repeat` is the largest count, `repetition_hits` counts how many distinct `(tool, input)` pairs reached `cfg.repetition_threshold` or more repeats.
+- **`marker_miss_rate: Option<f64>`** — share of turn-final texts in the window missing `cfg.marker` (e.g. `[zirv]`), tolerating leading markdown/whitespace/quote characters (`has_marker` strips a small lead-character set before comparing). `None` — not `Some(0.0)` — whenever the signal is inactive: `caps.marker_signal` is off, `cfg.marker` is empty, the marker has never appeared even once, or the session hasn't reached `cfg.min_turns` yet. This distinguishes "the hook isn't installed" from "the hook is installed and behaving."
+- **`turns`** — count of turns that produced any assistant text.
+
+`score_from(signals, tokens, cfg) -> Score` combines three of those four into a weighted sum:
+
+```
+raw = weight_tool_failure * tool_failure_rate
+    + weight_repetition   * repetition_component(max_repeat, repetition_threshold)
+    + weight_marker       * marker_miss_rate.unwrap_or(0.0)
+score = round(raw).clamp(0, 100)
+```
+
+`repetition_component` is zero below `repetition_threshold`, then ramps linearly to 1.0 at `2 * threshold - 1` identical calls (clamped above that). The defaults from `ScoreConfig` (config.rs) are `window: 10`, `min_turns: 10`, `token_floor: 100_000`, `token_ceiling: 160_000`, `weight_tool_failure: 40.0`, `weight_repetition: 30.0`, `weight_marker: 30.0`, `repetition_threshold: 3`, `advise_at: 40`, `compact_at: 60`, `restart_at: 80`, `marker: "[zirv]"` — so each signal alone can push the score into `Advise` territory, and any two together reach `Compact`.
+
+### Verdicts and the token gate
+
+```rust
+pub enum Verdict { Healthy, Advise, Compact, Restart }
+```
+
+`Verdict` derives `Ord` (`Healthy < Advise < Compact < Restart`) so a supervisor can compare/escalate verdicts directly, and serializes lowercase via serde for the JSON the `score` verb prints.
+
+`verdict_for(score, tokens, cfg) -> Verdict` layers a hard token gate on top of the plain threshold mapping (`score >= advise_at` → `Advise`, `>= compact_at` → `Compact`, `>= restart_at` → `Restart`, else `Healthy`):
+
+- Below `token_floor`, the verdict is **always** `Healthy` — no amount of tool-failure or repetition alone escalates a short, low-context session. (One ported canary case makes this explicit: every signal maxed out at 100 but `Healthy` because context is only 40k tokens.)
+- At or above `token_ceiling`, the verdict is **at least** `Compact` even if the weighted score alone wouldn't reach it — and a score that had already reached `compact_at` is escalated all the way to `Restart`.
+
+Net effect: token growth is a gate, not a fifth weighted vote. Behavioral signals decide *how bad* a session looks; token count decides *whether that badness is allowed to matter yet* and can force an outcome behavior alone wouldn't reach.
+
+```mermaid
+flowchart LR
+    T[raw transcript] -->|AgentAdapter::parse_events| E["NormalizedEvent stream<br/>(TurnStart, AssistantFinal,<br/>ToolCall, ToolResult, Compaction)"]
+    E --> S[rot::signals]
+    C[ScoreConfig: window, min_turns,<br/>weights, thresholds] --> S
+    S --> SIG["Signals: tool_failure_rate,<br/>repetition_hits/max_repeat,<br/>marker_miss_rate, turns"]
+    SIG --> W[score_from: weighted sum, clamp 0..100]
+    TOK[context_tokens: most recent<br/>input_tokens] --> G[verdict_for: threshold map + token gate]
+    W --> G
+    G --> V["Verdict: Healthy / Advise / Compact / Restart"]
+    V --> SUP["Ctx Supervisors: advise message,<br/>trigger compact, restart+handoff"]
+```
+
+### Incremental scoring (`RotState`)
+
+Re-parsing a whole transcript on every turn is wasteful, so `RotState` folds events one at a time (`feed`/`feed_all`) into a bounded structure — a ring of turn-final marker flags and a deque of per-turn tool-call/result segments, both capped at `cfg.window`. `RotState::score(caps, cfg)` reproduces exactly what a full `score_events` call over the same events would return, provided the state was `built_for` the same `cfg` (same `window` and `marker`; otherwise it returns `None` and the caller rebuilds from scratch). A `window` of 0 (unbounded) has no representable bounded state, so `RotState::new` returns `None` in that case and callers fall back to a full parse.
+
+This equivalence is the module's heaviest-tested property: `folding_events_in_chunks_matches_a_full_parse` feeds identical event streams through the incremental path in chunk sizes of 1, 2, 5, and 97 events and asserts byte-identical `Score`s against a full parse, across multiple `ScoreConfig`s and seven transcript shapes (empty, past-window, with a `Compaction`, events before the first `TurnStart`, an open/unclosed final turn, etc.). `every_prefix_of_a_stream_scores_like_a_full_parse_of_that_prefix` goes further and checks every single prefix length, not just chunk boundaries.
+
+### The `score` verb driver (`score.rs`)
+
+`score.rs` is the one layer that actually touches the outside world, and it's intentionally thin around the pure core: `score_transcript` reads the JSONL transcript from disk, resolves the adapter and `ScoreConfig` from `CtxConfig::load`, calls `adapter.parse_events` to normalize it, and calls `rot::score_events` — the reference every incremental pass has to agree with. `score_transcript_cached` (used by the Stop hook, a fresh process every turn) adds `IncrementalScorer` + a checkpoint file per transcript (keyed by a hash of its path, written atomically via rename, invalidated on any doubt at all — corrupt JSON, wrong schema version, wrong transcript, wrong `ScoreConfig` fingerprint, or an offset past the current file length) so a long session is scored in the bytes appended since the last poll rather than from scratch. All of that machinery — file reads, `Watcher` diffing, checkpoint persistence — lives outside `rot.rs`; the engine itself only ever sees the `&[NormalizedEvent]` slice it's handed. The CLI plumbing for `zirv ctx score` (args, output format) is documented on [[Ctx Subsystem]].
+
+## Purity invariant
+
+Per the repo's CLAUDE.md: *"The rot engine is pure: no clock, no filesystem, no environment reads inside `rot.rs`, so the same events always produce the same verdict."* This was checked directly against the source rather than taken on faith:
+
+- A grep for `std::fs`, `std::time`, `std::env`, and `std::net` across `src/commands/ctx/rot.rs` returns **no matches**.
+- The core functions' signatures confirm the same thing structurally: `signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig) -> Signals`, `score_events(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig) -> Score`, `score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig) -> Score`, and `verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig) -> Verdict` — every one takes only data (event slices, a config reference, plain numbers) and returns data. None take a file handle, a clock, or an environment-lookup closure.
+- `RotState` (the incremental path) is likewise data-in/data-out: `feed`/`feed_all` consume `&NormalizedEvent`, and `score` reads only its own fields plus `cfg`.
+- `scoring_is_deterministic` in `rot::tests` asserts this directly: the same event slice scored 20 times in a loop produces byte-identical `Score` values every time.
+
+No exceptions were found — the invariant as stated in CLAUDE.md holds exactly as written. All I/O (`std::fs::read_to_string`, checkpoint files, `std::process::id()`, `EnvLookup` closures) is confined to `score.rs`, one layer above the engine.

@@ -1,1 +1,6 @@
 /target
+
+# Root-level Obsidian workspace state (user-local; the tracked vault config lives at docs/obsidian/.obsidian)
+/.obsidian/
+# User-local Obsidian pane state inside the vault
+docs/obsidian/.obsidian/workspace*.json
