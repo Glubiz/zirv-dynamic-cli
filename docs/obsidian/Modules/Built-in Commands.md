@@ -44,7 +44,7 @@ last-verified: 2026-08-12
 
 ### `help` (`commands/help.rs`)
 
-`show_help` writes: a builtins/usage block (hardcoded, not generated from clap — intercepting `--help` took away clap's auto-generated help, so this exists specifically to keep every flag discoverable), then local `.zirv/` scripts and shortcuts, then global `~/.zirv` scripts and shortcuts. Script listing skips `.shortcuts.yaml` and `ctx.toml` (`commands::ctx::config::CTX_CONFIG_FILE`) — parsing the latter as a `Script` used to fail the whole listing. Any script file or shortcut whose name collides with a reserved built-in is annotated `(shadowed by a built-in command, unreachable)`, since `main.rs`'s built-in match runs before `.zirv/` is ever consulted.
+`show_help` writes: a builtins/usage block (hardcoded, not generated from clap — intercepting `--help` took away clap's auto-generated help, so this exists specifically to keep every flag discoverable), then local `.zirv/` scripts and shortcuts, then global `~/.zirv` scripts and shortcuts. Script listing skips every name in `utils::RESERVED_ZIRV_FILES` (`.shortcuts.yaml`, `ctx.toml`, `.settings.toml`), compared case-insensitively (`utils::is_reserved_zirv_file`, since NTFS/APFS resolve file names case-insensitively too) — parsing one of these as a `Script` used to fail the whole listing. Any script file or shortcut whose name collides with a reserved built-in is annotated `(shadowed by a built-in command, unreachable)`, since `main.rs`'s built-in match runs before `.zirv/` is ever consulted.
 
 ### `version` (`commands/version.rs`)
 

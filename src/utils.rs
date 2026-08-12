@@ -30,6 +30,25 @@ pub fn is_reserved_command(name: &str) -> bool {
 /// `.settings.toml` by way of the usual `{name}.{ext}` search.
 pub const RESERVED_ZIRV_FILES: &[&str] = &[".shortcuts.yaml", "ctx.toml", ".settings.toml"];
 
+/// Whether `name` is one of `RESERVED_ZIRV_FILES`, compared the way the
+/// filesystem that put it there will resolve it: case-insensitively on
+/// platforms (NTFS, APFS by default) where `Path::exists` already is, so a
+/// repo file like `.Settings.toml` is caught by the same guard a lowercase
+/// `.settings.toml` is. A case-sensitive comparison here would let a
+/// differently-cased reserved file be honored by `AgentGate`/`CtxConfig`
+/// (which resolve it via `exists()`) while still being listed as an
+/// invocable script and resolvable as one -- the filesystem and zirv's own
+/// guards disagreeing about what the file even is. This is deliberately
+/// stricter than every filesystem requires -- on ext4, a file literally
+/// named `CTX.toml` is a different, ordinary file from `ctx.toml`, and this
+/// check excludes it anyway -- because the point is one rule that behaves
+/// the same on every platform zirv runs on, not the minimum each one demands.
+pub fn is_reserved_zirv_file(name: &str) -> bool {
+    RESERVED_ZIRV_FILES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Shortcuts {
     pub shortcuts: HashMap<String, String>,
@@ -185,7 +204,7 @@ pub fn candidate_names_in_dir(dir: &Path) -> Vec<String> {
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| RESERVED_ZIRV_FILES.contains(&n))
+                .is_some_and(is_reserved_zirv_file)
             {
                 continue;
             }
@@ -362,5 +381,40 @@ mod tests {
         let names = candidate_names_in_dir(&zirv_dir);
         assert!(!names.contains(&".settings".to_string()));
         assert!(names.contains(&"build".to_string()));
+    }
+
+    /// Review finding 2: NTFS (and APFS by default) resolve a file by name
+    /// case-insensitively, so `Path::exists` finds `.Settings.toml` when
+    /// asked for `.settings.toml`. The reserved-file guard has to agree, or
+    /// a differently-cased settings/ctx-config file is honored by
+    /// `AgentGate`/`CtxConfig` while still being listed as an invocable
+    /// script name.
+    #[test]
+    fn a_differently_cased_reserved_file_is_still_skipped() {
+        let temp_dir = tempdir().unwrap();
+        let zirv_dir = temp_dir.path().join(".zirv");
+        create_dir_all(&zirv_dir).unwrap();
+        write(
+            zirv_dir.join(".Settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .unwrap();
+        write(zirv_dir.join("CTX.toml"), "[score]\nwindow = 4\n").unwrap();
+        write(zirv_dir.join("build.yaml"), "name: Build\ncommands: []\n").unwrap();
+
+        let names = candidate_names_in_dir(&zirv_dir);
+        assert!(!names.contains(&".Settings".to_string()));
+        assert!(!names.contains(&"CTX".to_string()));
+        assert!(names.contains(&"build".to_string()));
+    }
+
+    #[test]
+    fn is_reserved_zirv_file_is_case_insensitive() {
+        assert!(is_reserved_zirv_file(".settings.toml"));
+        assert!(is_reserved_zirv_file(".Settings.toml"));
+        assert!(is_reserved_zirv_file(".SETTINGS.TOML"));
+        assert!(is_reserved_zirv_file("CTX.toml"));
+        assert!(is_reserved_zirv_file(".Shortcuts.YAML"));
+        assert!(!is_reserved_zirv_file("build.yaml"));
     }
 }

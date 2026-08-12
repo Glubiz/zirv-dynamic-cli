@@ -5,10 +5,11 @@ last-verified: 2026-08-12
 # Untrusted Configuration
 
 > [!tip] Quick Reference
-> - A repo checkout is not a trusted operator: `.zirv/ctx.toml`'s repo layer and `<repo>/.zirv/system-prompt.md`'s repo layer are both untrusted input, and `zirv ctx optimize` reads (never writes) the repo's own CLAUDE.md text.
+> - A repo checkout is not a trusted operator: `.zirv/ctx.toml`'s repo layer, `.zirv/.settings.toml`'s repo layer, and `<repo>/.zirv/system-prompt.md`'s repo layer are all untrusted input, and `zirv ctx optimize` reads (never writes) the repo's own CLAUDE.md text.
 > - The repo prompt layer is capped, labeled inside the composed prompt as non-authoritative, and structurally unable to enable or uncap itself (those keys are repo-forbidden in `ctx.toml`).
+> - `.settings.toml`'s repo layer may only *narrow* what the operator already allowed (disable an agent), never widen it — folded per agent, not deep-merged, and a load failure fails closed to the operator's own layers rather than a permissive default (`AgentGate::load_operator_only`).
 > - `zirv ctx optimize` is report-only — asserted by a test that snapshots the analyzed tree before and after a run — and its judgment/distiller model child, which embeds that untrusted CLAUDE.md text in its own prompt, has its tools structurally denied (`ClaudeAdapter::distiller_cmd`), not just discouraged by instruction.
-> - Cross-links: [[Ctx Adapters]] (`distiller_cmd` lives here), [[Utilities]] (`truncate_bytes`, the shared capping helper), [[Context Management]] (why the injected prompt exists at all).
+> - Cross-links: [[Ctx Adapters]] (`distiller_cmd` lives here, and the `.settings.toml` gate `select` enforces), [[Utilities]] (`truncate_bytes`, the shared capping helper), [[Context Management]] (why the injected prompt exists at all).
 
 > [!warning] If changed
 > If `REPO_FORBIDDEN` (`src/commands/ctx/config.rs`) or `ClaudeAdapter::distiller_cmd` (`src/commands/ctx/adapters/claude.rs`) change, re-verify against the real CLI before updating this page — see the verification note below. Also update [[Ctx Adapters]].
@@ -37,6 +38,19 @@ Plus a third, read-only case: `zirv ctx optimize` reads the repo's own CLAUDE.md
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 
 The rationale is explicit in the source: cloning a repository must not be enough to choose the binary zirv launches, the shell command it runs on failure, or the model it spends tokens on — those come from the operator (global config, environment, flags), never from the checkout. The last three entries close a specific self-reference loop: without them, the repo prompt layer described below could simply turn its own injection on or raise its own size cap, making the cap decorative. The error is loud, not silent — it names the offending key, the file, and exactly where to put it instead.
+
+## `.settings.toml`: a repo may only narrow, never widen
+
+`.zirv/.settings.toml` (`src/settings.rs`) is a separate file from `ctx.toml` — it answers "may zirv use this agent at all", not "how should the supervisor behave". The same repo-is-not-the-operator boundary applies, but the mechanism is different from `REPO_FORBIDDEN`'s outright rejection: each layer (`~/.zirv/.settings.toml`, then `<repo>/.zirv/.settings.toml`, then `ZIRV_AGENT_<NAME>_ENABLED`) is parsed **on its own**, never deep-merged, and folded per agent as
+
+```text
+final(name) = env(name) if set
+            else home(name).unwrap_or(true) && repo(name).unwrap_or(true)
+```
+
+The `&&` is the trust boundary: a repo's `enabled = true` is a silent no-op (there is nothing for it to refuse), and a repo's `enabled = false` narrows regardless of what the operator's home file said, but a repo can never turn `false` back into `true` — only the environment sits above the fold entirely and can re-enable an agent a repo disabled.
+
+**The load-failure case matters as much as the fold.** `optimize.rs` and `hook.rs` both must never fail outright on a bad config, and used to degrade a failed `CtxConfig::load` to `CtxConfig::default()` — whose `AgentGate` is fully permissive. That meant one malformed byte in the untrusted *repo* `.settings.toml` could silently void an *operator* disable: the whole config load fails, the fallback forgets the operator ever said anything, and the agent the operator turned off launches anyway. The fix is `AgentGate::load_operator_only(env)`, used in both fallback arms instead of `CtxConfig::default()`'s gate: it reads the home file and the environment only, skipping the repo layer entirely (not merely "ignoring it if broken" — never consulting it), so a broken repo file can only narrow what survives, never revive what the operator disabled. If even the operator-only path cannot be read (a malformed home file, a bad env value), the result denies every known adapter rather than falling open — a settings surface zirv cannot read at all fails closed.
 
 ## `system-prompt.md`: capped, labeled, and outranked
 

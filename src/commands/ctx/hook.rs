@@ -132,6 +132,25 @@ fn corrections_in(transcript: &Path, cfg: &CtxConfig) -> usize {
         .unwrap_or(0)
 }
 
+/// `CtxConfig::load`'s degrade-on-error fallback used by the Stop hook's
+/// optimize-recommendation path: a hook must never fail outright on a bad
+/// config, but degrading all the way to `CtxConfig::default()` would hand
+/// `corrections_in` a fully permissive `AgentGate`, which is exactly the
+/// same trust hole `optimize.rs`'s config-load fallback had (review finding
+/// 1): a malformed *repo* `.settings.toml` would silently revive an agent
+/// the *operator* disabled. Falling back to `AgentGate::load_operator_only`
+/// keeps the operator's policy in force even when the rest of the config
+/// (or the repo settings layer specifically) cannot be read.
+fn cfg_or_operator_only_gate(repo: &Path, env: EnvLookup<'_>) -> CtxConfig {
+    match CtxConfig::load(repo, env) {
+        Ok(cfg) => cfg,
+        Err(_) => CtxConfig {
+            agents: crate::settings::AgentGate::load_operator_only(env),
+            ..CtxConfig::default()
+        },
+    }
+}
+
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     // Every early return is deliberate: a hook that errors must still exit 0.
     let Ok(payload) = HookPayload::parse(stdin) else {
@@ -195,7 +214,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // transcript -- so it is paid for only once the free gates say it
         // could matter. Without that ordering every turn re-parses the whole
         // session, which is precisely what the cached score above removes.
-        let cfg = CtxConfig::load(&repo, env).unwrap_or_default();
+        let cfg = cfg_or_operator_only_gate(&repo, env);
         let now = now_secs();
         if super::optimize::recommendation_possible(&state, &score, &cfg.optimize, now) {
             let corrections = corrections_in(transcript, &cfg);
@@ -788,6 +807,8 @@ mod tests {
             "[agents.claude]\nenabled = false\n",
         )
         .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
 
@@ -795,6 +816,94 @@ mod tests {
             corrections_in(&transcript, &cfg),
             0,
             "a disabled adapter degrades to zero corrections, not a panic"
+        );
+    }
+
+    /// Review finding 1: `run_stop`'s config-load degradation
+    /// (`CtxConfig::load(&repo, env).unwrap_or_default()`) used to fall back
+    /// to a fully permissive gate, so a malformed *repo* `.settings.toml`
+    /// could silently void an *operator* disable and let the hook compute
+    /// corrections through the very adapter the operator turned off. The
+    /// fallback must use `AgentGate::load_operator_only` so the operator's
+    /// disable survives a broken repo layer.
+    ///
+    /// This is an end-to-end regression guard, not the primary evidence for
+    /// the fix: `run_stop` already bails out earlier, at
+    /// `score::score_transcript_cached`'s own `CtxConfig::load(repo, env)?`,
+    /// for the exact same `(repo, env)` this test's malformed repo file
+    /// breaks -- so the hook was already a silent no-op here before this fix,
+    /// for an unrelated reason. `cfg_or_operator_only_gate_denies_what_the_
+    /// operator_denied_even_with_a_broken_repo_layer` below is the test that
+    /// actually exercises the changed line.
+    #[test]
+    fn a_malformed_repo_settings_file_does_not_revive_an_operator_disabled_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = correction_heavy_transcript(dir.path());
+
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(
+            home.join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        std::fs::create_dir_all(dir.path().join(".zirv")).expect("mkdir repo");
+        std::fs::write(dir.path().join(".zirv/.settings.toml"), "not [ valid toml").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let stdin = format!(
+            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
+            transcript.display(),
+            dir.path().display()
+        );
+
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
+        assert!(
+            !log.contains("5 corrections"),
+            "the disabled adapter must never be used to count corrections: {log}"
+        );
+    }
+
+    /// Direct test of the changed line (review finding 1, hook.rs half): a
+    /// malformed repo `.settings.toml` must not make `cfg_or_operator_only_
+    /// gate` fall back to a fully permissive gate. Unlike the end-to-end
+    /// test above, this reaches the fallback arm directly, independent of
+    /// whatever else in `run_stop` might also happen to fail closed first.
+    #[test]
+    fn cfg_or_operator_only_gate_denies_what_the_operator_denied_even_with_a_broken_repo_layer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(
+            home.join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir repo");
+        std::fs::write(repo.join(".zirv/.settings.toml"), "not [ valid toml").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        assert!(
+            CtxConfig::load(&repo, &|k| empty.get(k).cloned()).is_err(),
+            "the malformed repo file must actually make CtxConfig::load fail, or this test \
+             proves nothing"
+        );
+
+        let cfg = cfg_or_operator_only_gate(&repo, &|k| empty.get(k).cloned());
+        assert!(
+            !cfg.agents.is_enabled("claude"),
+            "the operator's disable must survive a repo layer that could not be read"
         );
     }
 

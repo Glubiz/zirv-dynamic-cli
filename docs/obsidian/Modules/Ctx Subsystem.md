@@ -8,11 +8,11 @@ last-verified: 2026-08-12
 
 - **Files:** `src/commands/ctx/mod.rs`, `src/commands/ctx/config.rs`, `src/commands/ctx/state.rs`, `src/commands/ctx/log.rs`, `src/commands/ctx/score.rs`, `src/commands/ctx/handoff.rs`, `src/commands/ctx/resume.rs`, `src/commands/ctx/hook.rs`, `src/commands/ctx/status.rs`
 - **Used by:** the `zirv ctx <verb>` CLI surface; intercepted directly in `src/main.rs` (`argv[1] == "ctx"` calls `ctx::dispatch` and exits) before any `.zirv/` script lookup runs
-- **Depends on:** [[Ctx Supervisors]] (`loop`/`exec`/`wrap` verbs live there), [[Ctx Adapters]] (`AgentAdapter` used by score/handoff/resume/hook), [[Rot Engine]] (`rot`/`event` scoring that `score` and `hook Stop` call into), [[Usage and Pacing]] (`usage` verb and the `pace` config block)
+- **Depends on:** [[Ctx Supervisors]] (`loop`/`exec`/`wrap` verbs live there), [[Ctx Adapters]] (`AgentAdapter` used by score/handoff/resume/hook), [[Rot Engine]] (`rot`/`event` scoring that `score` and `hook Stop` call into), [[Usage and Pacing]] (`usage` verb and the `pace` config block), `src/settings.rs` (`AgentGate`, loaded into `CtxConfig.agents` and surfaced by `status`)
 - **Tests:** inline `#[cfg(test)] mod tests` in every file listed above — `mod.rs` covers dispatch/argv parsing/exit-code classification, `config.rs` covers layering and the `REPO_FORBIDDEN` boundary, `state.rs` covers path resolution and unix permissions, `log.rs` covers JSONL append/tail, and each verb module tests its own `run_with`
 - **If changed:** [[Ctx Supervisors]], [[Ctx Adapters]], [[Rot Engine]], [[Usage and Pacing]], [[Untrusted Configuration]], [[Context Management]], [[Decision Log]]
 - **Gotchas:**
-  - A `.zirv/ctx.yaml` script literally named `ctx` is unreachable — `main.rs` intercepts the `ctx` verb before script resolution ever runs (see `ctx_is_intercepted_before_script_lookup` in `mod.rs`). `.zirv/ctx.toml` is the config file, not a script, and `help.rs` excludes it from script listing.
+  - A `.zirv/ctx.yaml` script literally named `ctx` is unreachable — `main.rs` intercepts the `ctx` verb before script resolution ever runs (see `ctx_is_intercepted_before_script_lookup` in `mod.rs`). `.zirv/ctx.toml` and `.zirv/.settings.toml` are config files, not scripts: both are in `utils::RESERVED_ZIRV_FILES` (compared case-insensitively, since NTFS/APFS would otherwise honor a differently-cased file the guard missed) and excluded from script listing (`help.rs`) and invocation (`input.rs`'s `find_script_in_dir`) alike.
   - A Stop hook must **never** exit non-zero: Claude Code reads hook exit 2 as "block the stop," so a mistyped `zirv ctx hook Stop --bogus` still exits 0.
   - The statusline tee (`ctx usage tee`) must never fail loudly either — a broken invocation still prints a fallback line via `usage::run_tee` instead of exiting with nothing.
   - `REPO_FORBIDDEN` is a real security boundary, not a style preference — see below.
@@ -72,6 +72,8 @@ A verb's own successful run maps `Ok(code)` straight through and `Err(e)` to `cr
 Flags passed on the command line are applied by each verb after `load()` returns, so they win over all three. Merging is a recursive TOML-table merge (`merge()`); env vars are inserted by dotted path (`insert_path()`) and type-coerced per `EnvKind` (`Str`/`Int`/`Float`/`Bool`). Unknown keys anywhere are rejected loudly (`deny_unknown_fields` on every config struct), and a missing file is not an error.
 
 The config covers `agent`/`agent_bin`, and per-verb blocks: `score` (rot thresholds), `wrap` (debounce/inject timeouts), `supervise` (restart/backoff/`on_failure`), `handoff` (model, tail items, timeout), `pace` (usage pacing — see [[Usage and Pacing]]), `optimize` (report cadence and its own model), and `prompt` (the injected session-prompt layer, enable flag, repo-layer toggle, byte cap).
+
+`CtxConfig` also carries `agents: AgentGate` (`#[serde(skip)]`, populated at the end of `load()` from a separate file — `.zirv/.settings.toml`, not `ctx.toml`; see `src/settings.rs` and [[Ctx Adapters]]'s selection section). This is the per-adapter enable/disable gate `adapters::select` consults before every `ready()` call. `zirv ctx status` prints an `agents:` block, one line per known adapter, showing whether it's enabled and — when not — which file or environment variable disabled it; if the gate itself cannot be loaded, `status` prints `agents: (settings unreadable: <err>)` instead of failing the whole command.
 
 ### The `REPO_FORBIDDEN` security boundary
 

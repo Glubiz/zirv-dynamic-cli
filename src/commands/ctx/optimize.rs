@@ -1266,7 +1266,12 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     // A findings run must never fail on a bad config: a malformed ctx.toml or
     // a forbidden key degrades to defaults instead, same spirit as the model
-    // call below.
+    // call below. The gate is the one exception: it does not fall back to
+    // `CtxConfig::default()`'s permissive `AgentGate`, because that would let
+    // a malformed *repo* `.settings.toml` silently void an *operator*
+    // disable and launch the agent the operator turned off. Falling back to
+    // `AgentGate::load_operator_only` keeps the operator's policy in force
+    // even when the rest of the config could not be read.
     let cfg = match CtxConfig::load(repo, env) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -1274,7 +1279,10 @@ pub fn run_with<W: Write>(
                 w,
                 "zirv ctx optimize: config load failed, using defaults ({e})"
             )?;
-            CtxConfig::default()
+            CtxConfig {
+                agents: crate::settings::AgentGate::load_operator_only(env),
+                ..CtxConfig::default()
+            }
         }
     };
     let home = crate::utils::home_dir().ok();
@@ -3387,6 +3395,56 @@ mod tests {
         assert!(
             printed.to_lowercase().contains("config load failed"),
             "the report admits the config could not be read: {printed}"
+        );
+    }
+
+    /// Review finding 1: a malformed *repo* `.settings.toml` makes
+    /// `CtxConfig::load` fail, and the fallback used to be
+    /// `CtxConfig::default()` -- whose gate is permissive. That let one bad
+    /// byte in the repo's own settings file silently void an *operator*
+    /// disable and launch (or, here, parse transcripts through) the agent
+    /// the operator turned off. The fallback gate must come from
+    /// `AgentGate::load_operator_only` instead, so the operator's disable
+    /// still holds even though the repo layer could not be read.
+    #[test]
+    fn a_malformed_repo_settings_file_does_not_void_an_operator_disable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(
+            home.join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir zirv");
+        std::fs::write(repo.join(".zirv/.settings.toml"), "not [ valid toml").expect("write");
+
+        let state = tmp.path().join("state");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: true,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+
+        assert_eq!(
+            code, 0,
+            "a malformed settings file must not fail the command"
+        );
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("no adapter available"),
+            "claude must not have been selected: {printed}"
+        );
+        assert!(
+            printed.contains("claude") && printed.to_lowercase().contains("disabled"),
+            "the operator's disable must still be reported: {printed}"
         );
     }
 

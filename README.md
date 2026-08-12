@@ -591,6 +591,18 @@ from the operator rather than the checkout. Everything else, including `agent`
 (which chooses between built-in adapters rather than naming an executable) and
 every threshold, is still repo-configurable.
 
+#### Environment variables worth knowing
+
+| Variable | Effect |
+|---|---|
+| `ZIRV_CTX_STATE_DIR` | Where handoffs, sockets, logs and usage state live |
+| `ZIRV_CTX_TRANSCRIPT` | Pins the transcript `wrap` watches, overriding what the turn signal reports (see below) |
+| `ZIRV_CTX_SOCKET`, `ZIRV_CTX_SESSION` | Exported into the supervised agent so its hook can find the supervisor. Set by zirv, not by you |
+| `ZIRV_AGENT_<NAME>_ENABLED` | Enables or disables one adapter (`ZIRV_AGENT_CODEX_ENABLED`); see [.settings.toml](#settingstoml) below. Must be exactly `true` or `false` -- any other value is a hard error naming the variable, matching the strictness of every `ZIRV_CTX_*` boolean |
+
+Every `[section] key` in the table above also has a `ZIRV_CTX_*` variable; the
+names follow the key, for example `ZIRV_CTX_DEBOUNCE_MS` for `wrap.debounce_ms`.
+
 ### .settings.toml
 
 `ctx.toml` tunes how the ctx supervisor *behaves*; `.zirv/.settings.toml` is a
@@ -622,18 +634,11 @@ only narrow what it inherited -- `enabled = true` in a repo's own
 refuse. Disabling an agent is checked before that adapter's own readiness, so
 `--agent codex` with codex disabled reports the disable, not "not implemented
 yet". `zirv ctx status` lists every known adapter, whether it is enabled, and
-(when not) which file or variable disabled it.
-
-#### Environment variables worth knowing
-
-| Variable | Effect |
-|---|---|
-| `ZIRV_CTX_STATE_DIR` | Where handoffs, sockets, logs and usage state live |
-| `ZIRV_CTX_TRANSCRIPT` | Pins the transcript `wrap` watches, overriding what the turn signal reports (see below) |
-| `ZIRV_CTX_SOCKET`, `ZIRV_CTX_SESSION` | Exported into the supervised agent so its hook can find the supervisor. Set by zirv, not by you |
-
-Every `[section] key` in the table above also has a `ZIRV_CTX_*` variable; the
-names follow the key, for example `ZIRV_CTX_DEBOUNCE_MS` for `wrap.debounce_ms`.
+(when not) which file or variable disabled it. A malformed *repo*
+`.settings.toml` never falls back to a fully permissive gate: `zirv ctx
+optimize` and the Stop hook both fall back to the operator's own layers only
+(home file, then environment) if the full config cannot be loaded, so a broken
+repo file can narrow what an operator already disabled but can never revive it.
 
 ### Hook registration (Claude Code)
 

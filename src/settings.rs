@@ -16,8 +16,14 @@
 //! ```
 //!
 //! so a repository can only narrow (`enabled = true` in a repo file is a
-//! silent no-op: there is nothing to refuse), while the operator -- the home
-//! file or the environment -- may disable *or* re-enable in either direction.
+//! silent no-op: there is nothing to refuse). The home file can disable an
+//! agent too -- that half is symmetric with the repo file -- but the
+//! `&&` means a repo's `false` cannot be undone by the home file alone
+//! (`true && false` is still `false`); only the environment sits above the
+//! fold entirely and can re-enable an agent a repo disabled, or disable one
+//! nothing else touched. The environment is the operator, in both
+//! directions; the home file is the operator only in the narrowing
+//! direction the fold actually gives it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -58,6 +64,13 @@ pub enum Source {
     OperatorFile(PathBuf),
     RepoFile(PathBuf),
     Env(String),
+    /// The gate itself could not be determined at all -- `AgentGate::
+    /// load_operator_only`'s own fallback, used when even the reduced
+    /// operator-only path errors (a malformed home file, a non-boolean env
+    /// override). Every known adapter is denied rather than left permissive,
+    /// so a broken settings surface fails closed. Carries a short reason for
+    /// the refusal message and `zirv ctx status`.
+    Unavailable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +91,7 @@ impl AgentState {
                 path.display().to_string()
             }
             Some(Source::Env(var)) => format!("environment: {var}"),
+            Some(Source::Unavailable(reason)) => format!("settings unreadable: {reason}"),
         }
     }
 }
@@ -130,19 +144,46 @@ fn env_var_for(name: &str) -> String {
     format!("ZIRV_AGENT_{}_ENABLED", name.to_uppercase())
 }
 
+fn known_adapter_names() -> Vec<&'static str> {
+    crate::commands::ctx::adapters::all(None)
+        .iter()
+        .map(|a| a.name())
+        .collect()
+}
+
+fn operator_settings_path() -> Option<PathBuf> {
+    crate::utils::home_dir()
+        .ok()
+        .map(|home| home.join(crate::utils::SCRIPT_DIR_NAME).join(SETTINGS_FILE))
+}
+
+/// `Ok(None)` when the environment is silent on this agent; `Err` names the
+/// variable when it is set but not a boolean.
+fn env_override(name: &str, env: EnvLookup<'_>) -> CtxResult<Option<bool>> {
+    let env_var = env_var_for(name);
+    match env(&env_var) {
+        Some(raw) => raw
+            .parse::<bool>()
+            .map(Some)
+            .map_err(|_| format!("{env_var}: expected true or false, got '{raw}'").into()),
+        None => Ok(None),
+    }
+}
+
+fn file_enabled(layer: Option<&SettingsFile>, name: &str) -> Option<bool> {
+    layer
+        .and_then(|s| s.agents.get(name))
+        .and_then(|a| a.enabled)
+}
+
 impl AgentGate {
     /// Layers `~/.zirv/.settings.toml`, then `<repo>/.zirv/.settings.toml`,
     /// then `ZIRV_AGENT_<NAME>_ENABLED`, per agent name known to
     /// `adapters::all`. See the module doc for the exact fold.
     pub fn load(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
-        let known: Vec<&'static str> = crate::commands::ctx::adapters::all(None)
-            .iter()
-            .map(|a| a.name())
-            .collect();
+        let known = known_adapter_names();
 
-        let operator_path = crate::utils::home_dir()
-            .ok()
-            .map(|home| home.join(crate::utils::SCRIPT_DIR_NAME).join(SETTINGS_FILE));
+        let operator_path = operator_settings_path();
         let operator = match &operator_path {
             Some(path) => read_layer(path, &known)?,
             None => None,
@@ -153,44 +194,26 @@ impl AgentGate {
 
         let mut states = HashMap::new();
         for name in known {
-            let operator_enabled = operator
-                .as_ref()
-                .and_then(|s| s.agents.get(name))
-                .and_then(|a| a.enabled);
-            let repo_enabled = repo_layer
-                .as_ref()
-                .and_then(|s| s.agents.get(name))
-                .and_then(|a| a.enabled);
-
-            let env_var = env_var_for(name);
-            let env_value = match env(&env_var) {
-                Some(raw) => Some(
-                    raw.parse::<bool>()
-                        .map_err(|_| format!("{env_var}: expected true or false, got '{raw}'"))?,
-                ),
-                None => None,
-            };
-
-            let state = if let Some(enabled) = env_value {
-                let disabled_by = (!enabled).then(|| Source::Env(env_var.clone()));
-                AgentState {
+            let state = match env_override(name, env)? {
+                Some(enabled) => AgentState {
                     enabled,
-                    disabled_by,
-                }
-            } else {
-                let operator_component = operator_enabled.unwrap_or(true);
-                let repo_component = repo_enabled.unwrap_or(true);
-                let enabled = operator_component && repo_component;
-                let disabled_by = if enabled {
-                    None
-                } else if !operator_component {
-                    operator_path.clone().map(Source::OperatorFile)
-                } else {
-                    Some(Source::RepoFile(repo_path.clone()))
-                };
-                AgentState {
-                    enabled,
-                    disabled_by,
+                    disabled_by: (!enabled).then(|| Source::Env(env_var_for(name))),
+                },
+                None => {
+                    let operator_component = file_enabled(operator.as_ref(), name).unwrap_or(true);
+                    let repo_component = file_enabled(repo_layer.as_ref(), name).unwrap_or(true);
+                    let enabled = operator_component && repo_component;
+                    let disabled_by = if enabled {
+                        None
+                    } else if !operator_component {
+                        operator_path.clone().map(Source::OperatorFile)
+                    } else {
+                        Some(Source::RepoFile(repo_path.clone()))
+                    };
+                    AgentState {
+                        enabled,
+                        disabled_by,
+                    }
                 }
             };
 
@@ -198,6 +221,86 @@ impl AgentGate {
         }
 
         Ok(Self { states })
+    }
+
+    /// Fallback for callers that must never fail outright (`optimize`'s and
+    /// `hook`'s config-load degradation arms): the operator layers only --
+    /// home file, then environment -- with the repo layer skipped entirely.
+    /// A malformed *repo* `.settings.toml` must never be able to void an
+    /// *operator* disable by taking the whole `CtxConfig::load` down with it
+    /// and landing a caller on a permissive default.
+    ///
+    /// If even this reduced path errors, the result denies every known
+    /// adapter rather than falling open: a settings surface zirv cannot read
+    /// at all fails closed, never permissive. What "even this reduced path
+    /// errors" means is scoped narrowly, though (see `load_operator_layers`):
+    /// only a home *file* that cannot be read is genuinely global, because
+    /// nothing else was even attempted. A single agent's malformed env
+    /// override is not global -- it is that one agent's problem, handled per
+    /// name inside `load_operator_layers` -- so it never reaches here.
+    pub fn load_operator_only(env: EnvLookup<'_>) -> Self {
+        let known = known_adapter_names();
+        match Self::load_operator_layers(&known, env) {
+            Ok(gate) => gate,
+            Err(e) => Self::deny_all(&known, &e.to_string()),
+        }
+    }
+
+    /// The only failure this propagates (`?`, hence `CtxResult`) is the home
+    /// file itself being unreadable/malformed -- genuinely global, since it
+    /// means nothing about *any* agent could be determined from it. A single
+    /// agent's `env_override` error is deliberately NOT propagated with `?`:
+    /// `ZIRV_AGENT_CODEX_ENABLED=1` (invalid) must deny only codex, not also
+    /// claude, which has no reason to be unresolvable just because a
+    /// different agent's variable is malformed.
+    fn load_operator_layers(known: &[&'static str], env: EnvLookup<'_>) -> CtxResult<Self> {
+        let operator_path = operator_settings_path();
+        let operator = match &operator_path {
+            Some(path) => read_layer(path, known)?,
+            None => None,
+        };
+
+        let mut states = HashMap::new();
+        for name in known {
+            let state = match env_override(name, env) {
+                Ok(Some(enabled)) => AgentState {
+                    enabled,
+                    disabled_by: (!enabled).then(|| Source::Env(env_var_for(name))),
+                },
+                Ok(None) => {
+                    let enabled = file_enabled(operator.as_ref(), name).unwrap_or(true);
+                    let disabled_by = (!enabled)
+                        .then(|| operator_path.clone().map(Source::OperatorFile))
+                        .flatten();
+                    AgentState {
+                        enabled,
+                        disabled_by,
+                    }
+                }
+                Err(e) => AgentState {
+                    enabled: false,
+                    disabled_by: Some(Source::Unavailable(e.to_string())),
+                },
+            };
+            states.insert((*name).to_string(), state);
+        }
+        Ok(Self { states })
+    }
+
+    fn deny_all(known: &[&'static str], reason: &str) -> Self {
+        let states = known
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    AgentState {
+                        enabled: false,
+                        disabled_by: Some(Source::Unavailable(reason.to_string())),
+                    },
+                )
+            })
+            .collect();
+        Self { states }
     }
 
     /// Unknown names are enabled: this gate only ever narrows what its known
@@ -214,8 +317,20 @@ impl AgentGate {
         if state.enabled {
             return None;
         }
-        let location = state.location();
         let env_var = env_var_for(name);
+        if let Some(Source::Unavailable(reason)) = &state.disabled_by {
+            // No "set VAR=true" suggestion here, deliberately: `reason` may
+            // name a file (unreadable/malformed home file, where the
+            // environment is never even consulted -- see
+            // `load_operator_layers`), not this agent's own env var, and a
+            // remedy naming the wrong thing to fix is worse than none.
+            return Some(format!(
+                "agent '{name}' cannot be verified enabled: its settings could not be read \
+                 ({reason}); zirv will not launch or parse it until that is fixed. Pass a \
+                 different --agent in the meantime."
+            ));
+        }
+        let location = state.location();
         let repo_note = matches!(state.disabled_by, Some(Source::RepoFile(_)))
             .then_some(" (a repository may only disable an agent, never enable one)")
             .unwrap_or_default();
@@ -248,9 +363,16 @@ mod tests {
         std::fs::write(dir.join(".zirv").join(SETTINGS_FILE), contents).expect("write");
     }
 
+    /// Review finding 3: without an isolated `HOME`, this read the
+    /// developer's real `~/.zirv/.settings.toml` -- harmless on a clean
+    /// machine, but a false pass (or a false failure on a machine that has
+    /// one) either way.
     #[test]
     fn defaults_enable_every_known_adapter() {
         let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
         let empty = env_map(&[]);
         let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert!(gate.is_enabled("claude"));
@@ -442,6 +564,117 @@ mod tests {
         assert!(
             err.to_string().contains("ZIRV_AGENT_CODEX_ENABLED"),
             "got {err}"
+        );
+    }
+
+    /// Review finding 1's core primitive: the operator-only fallback must
+    /// see the home file and ignore the repo file entirely -- not merely
+    /// "ignore a broken repo file", but never read it at all, since the
+    /// whole point is to be usable when the repo layer already blew up
+    /// `AgentGate::load`.
+    #[test]
+    fn load_operator_only_ignores_the_repo_layer_even_when_it_is_well_formed() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[agents.codex]\nenabled = false\n");
+        let repo = tempfile::tempdir().expect("tempdir");
+        write_settings(repo.path(), "[agents.claude]\nenabled = false\n");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load_operator_only(&|k| empty.get(k).cloned());
+        assert!(
+            !gate.is_enabled("codex"),
+            "the operator disable still holds"
+        );
+        assert!(
+            gate.is_enabled("claude"),
+            "the repo layer must never be consulted, not even read"
+        );
+    }
+
+    #[test]
+    fn load_operator_only_still_honors_the_environment() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[agents.codex]\nenabled = false\n");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let env = env_map(&[("ZIRV_AGENT_CODEX_ENABLED", "true")]);
+        let gate = AgentGate::load_operator_only(&|k| env.get(k).cloned());
+        assert!(
+            gate.is_enabled("codex"),
+            "the environment is still the operator"
+        );
+    }
+
+    /// The deny-all degradation: if even the operator-only path cannot be
+    /// read, every known adapter is refused rather than left permissive.
+    #[test]
+    fn load_operator_only_denies_every_known_adapter_when_it_cannot_be_read_either() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "not [ valid toml");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load_operator_only(&|k| empty.get(k).cloned());
+        assert!(!gate.is_enabled("claude"), "fail closed, not open");
+        assert!(!gate.is_enabled("codex"), "fail closed, not open");
+        let msg = gate.refusal("claude").expect("must be refused");
+        assert!(
+            msg.to_lowercase().contains("could not be read")
+                || msg.to_lowercase().contains("unreadable"),
+            "got {msg}"
+        );
+    }
+
+    /// Review finding NEW-1: `env_override` erroring for one agent must not
+    /// deny every agent -- `ZIRV_AGENT_CODEX_ENABLED=1` (invalid) is codex's
+    /// problem alone, and claude's fold (no file, no env override) must
+    /// still resolve to its ordinary permissive default.
+    #[test]
+    fn an_invalid_env_override_denies_only_the_agent_it_names() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let env = env_map(&[("ZIRV_AGENT_CODEX_ENABLED", "1")]);
+        let gate = AgentGate::load_operator_only(&|k| env.get(k).cloned());
+
+        assert!(
+            gate.is_enabled("claude"),
+            "an unrelated agent's bad env var must not deny claude"
+        );
+        assert!(!gate.is_enabled("codex"));
+        let msg = gate.refusal("codex").expect("codex must be refused");
+        assert!(
+            msg.contains("ZIRV_AGENT_CODEX_ENABLED"),
+            "the reason must name the actual bad variable: {msg}"
+        );
+        assert!(
+            !msg.contains("ZIRV_AGENT_CLAUDE_ENABLED"),
+            "the remedy must not suggest fixing an unrelated agent's variable: {msg}"
+        );
+    }
+
+    /// The same scoping applies to `AgentGate::load` (not just the
+    /// operator-only fallback): a bad env var still fails the whole
+    /// `CtxConfig::load` (existing, deliberate -- `a_non_boolean_env_
+    /// override_is_rejected_with_the_variable_named` above pins that), but
+    /// `refusal`'s wording for the *resulting* `Unavailable` state (reached
+    /// only through `load_operator_only`) must never suggest a remedy for
+    /// the wrong agent. This is a direct regression guard on the message
+    /// itself, independent of which path produced the `Unavailable` state.
+    #[test]
+    fn the_unavailable_refusal_never_suggests_setting_an_unrelated_variable() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "not [ valid toml");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load_operator_only(&|k| empty.get(k).cloned());
+        let msg = gate.refusal("claude").expect("must be refused");
+        assert!(
+            !msg.contains("Set ZIRV_AGENT_CLAUDE_ENABLED=true"),
+            "the whole-file-unreadable case never even consults env, so this remedy is a dead \
+             end: {msg}"
         );
     }
 }

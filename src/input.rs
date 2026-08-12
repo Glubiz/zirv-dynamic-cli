@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use crate::utils::{
-    RESERVED_ZIRV_FILES, SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, candidate_names_in_dir,
-    home_dir, suggest_matches,
+    SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, candidate_names_in_dir, home_dir,
+    is_reserved_zirv_file, suggest_matches,
 };
 
 #[derive(Debug, Parser, Default)]
@@ -51,8 +51,10 @@ fn find_script_in_dir(
         let file_name = format!("{name}.{ext}");
         // A name like ".settings" would otherwise resolve to
         // ".settings.toml" -- zirv's own configuration, not a script -- by
-        // the exact same `{name}.{ext}` search a real script uses.
-        if RESERVED_ZIRV_FILES.contains(&file_name.as_str()) {
+        // the exact same `{name}.{ext}` search a real script uses. Compared
+        // case-insensitively: NTFS resolves `.Settings.toml` to the same
+        // file `Path::exists` would find below, so the guard has to agree.
+        if is_reserved_zirv_file(&file_name) {
             continue;
         }
         let path = dir.join(&file_name);
@@ -305,6 +307,38 @@ mod tests {
             let err = input
                 .get_file_path()
                 .expect_err("the settings file must not be an invocable script");
+            assert!(
+                err.to_string().contains("zirv help"),
+                "a normal not-found error, not a resolved config file: {err}"
+            );
+        });
+    }
+
+    /// Review finding 2: `zirv .Settings` builds the candidate name
+    /// `.Settings.toml`, which NTFS (and APFS by default) would resolve to
+    /// the very same on-disk `.settings.toml` file `Path::exists` finds --
+    /// so the reserved-name guard has to match case-insensitively too, not
+    /// just the lowercase spelling.
+    #[test]
+    fn a_differently_cased_settings_invocation_is_still_blocked() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+        let zirv_dir = fake_cwd.path().join(SCRIPT_DIR_NAME);
+        create_dir_all(&zirv_dir).unwrap();
+        write(
+            zirv_dir.join(".settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            let input = Input {
+                command: ".Settings".to_string(),
+                ..Default::default()
+            };
+            let err = input
+                .get_file_path()
+                .expect_err("a differently-cased invocation must not resolve the settings file");
             assert!(
                 err.to_string().contains("zirv help"),
                 "a normal not-found error, not a resolved config file: {err}"

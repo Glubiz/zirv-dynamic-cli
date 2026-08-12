@@ -256,6 +256,8 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
         let env = env_for(state.root());
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
 
         std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
         std::fs::write(

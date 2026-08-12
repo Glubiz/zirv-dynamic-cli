@@ -1,8 +1,8 @@
 use std::{fs, io::Write, path::Path, path::PathBuf};
 
 use crate::utils::{
-    RESERVED_ZIRV_FILES, SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir,
-    is_reserved_command, parse_script_content,
+    SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir, is_reserved_command,
+    is_reserved_zirv_file, parse_script_content,
 };
 
 /// Note appended when a script or shortcut name collides with a built-in
@@ -21,7 +21,7 @@ fn write_scripts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std
             && !path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| RESERVED_ZIRV_FILES.contains(&n))
+                .is_some_and(is_reserved_zirv_file)
         {
             let content = fs::read_to_string(&path)?;
             let script = parse_script_content(&content, ext)?;
@@ -378,6 +378,41 @@ shortcuts:
         let output = String::from_utf8(buffer.into_inner())?;
         assert!(output.contains("Test Script"));
         assert!(!output.contains(".settings.toml"));
+
+        Ok(())
+    }
+
+    /// Review finding 2: a differently-cased settings/ctx-config file
+    /// (`.Settings.toml`, honored the same as `.settings.toml` by NTFS) must
+    /// still be skipped, not parsed as a script and hard-error `zirv help`.
+    #[test]
+    fn a_differently_cased_settings_file_is_not_listed_as_a_script()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        write(
+            zirv_dir.join("test.yaml"),
+            "name: \"Test Script\"\ncommands: []\n",
+        )?;
+        write(
+            zirv_dir.join(".Settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )?;
+
+        let original_dir = env::current_dir()?;
+        env::set_current_dir(&temp_path)?;
+
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer);
+
+        env::set_current_dir(original_dir)?;
+
+        result?;
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(output.contains("Test Script"));
+        assert!(!output.contains(".Settings.toml"));
 
         Ok(())
     }

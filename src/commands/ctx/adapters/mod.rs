@@ -349,6 +349,9 @@ mod tests {
 
     /// A permissive `CtxConfig` (every agent enabled, no `agent_bin`
     /// override) for tests that only care about selection, not gating.
+    /// `CtxConfig::default()` never touches the filesystem or `HOME` (its
+    /// `AgentGate` is `AgentGate::default()`, not a `load`), so this one
+    /// needs no `HomeGuard`, unlike `cfg_disabling` below.
     fn permissive_cfg() -> CtxConfig {
         CtxConfig::default()
     }
@@ -357,7 +360,10 @@ mod tests {
     /// operator or repo `.settings.toml` had set `[agents.<name>] enabled =
     /// false`, but without touching any file: `AgentGate`'s fields are
     /// crate-private, so the state is built by loading a real settings file
-    /// from an isolated repo dir instead.
+    /// from an isolated repo dir instead. `AgentGate::load` also reads the
+    /// operator (home) layer, so this isolates `HOME`/`USERPROFILE` too --
+    /// otherwise a developer machine's real `~/.zirv/.settings.toml` (if any)
+    /// would leak into the loaded gate.
     fn cfg_disabling(name: &str) -> CtxConfig {
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -366,6 +372,8 @@ mod tests {
             format!("[agents.{name}]\nenabled = false\n"),
         )
         .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         CtxConfig {
             agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
