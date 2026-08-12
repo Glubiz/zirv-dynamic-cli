@@ -79,16 +79,6 @@ pub fn run_with<W: Write>(
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let state = StateDir::resolve(env)?;
 
-    let composed = super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        args.simple,
-        &cfg.prompt,
-        super::prompt::PromptRole::Worker,
-    );
-    let (user_extra, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
-
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
     let max_cycle =
         Duration::from_secs(args.max_cycle_secs.unwrap_or(cfg.supervise.max_cycle_secs));
@@ -108,6 +98,30 @@ pub fn run_with<W: Write>(
         cycle += 1;
 
         pace::wait_for_window(w, &state, &cfg.pace, "loop", "loop", &now_fn, &sleep_fn);
+
+        // Recomposed every cycle -- the same seam as `injection_args_for_
+        // session` a few lines down -- because each cycle is a fresh,
+        // stateless session: it must pick up whatever mail has arrived since
+        // the previous cycle, not a snapshot taken once before the loop
+        // started.
+        let composed = super::prompt::compose(
+            crate::utils::home_dir().ok().as_deref(),
+            repo,
+            args.simple,
+            &cfg.prompt,
+            super::prompt::PromptRole::Worker,
+        );
+        let mail_messages: Vec<super::mail::Message> = if composed.is_some() {
+            super::mail::list(&state, &super::state::repo_slug(repo), Some(adapter.name()))
+                .map(|found| found.into_iter().map(|(_, msg)| msg).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let composed =
+            super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
+        let (user_extra, composed) =
+            super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
 
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles.
@@ -143,6 +157,11 @@ pub fn run_with<W: Write>(
 
         let mut command = adapter.headless_cmd(&prompt, &session, &extra);
         command.current_dir(repo);
+        // Names the same fact `ctx.toml`'s own `agent` key would, so a nested
+        // `zirv ctx ...` call inside this cycle's own child processes
+        // defaults to this cycle's harness rather than re-resolving from
+        // scratch.
+        command.env(super::adapters::AGENT_ENV, adapter.name());
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
         let (mut child, tap) = supervise::spawn_tapped(command)?;
@@ -864,5 +883,117 @@ mod tests {
         assert!(log.contains("\"action\":\"limit-park\""), "got {log}");
         assert!(!log.contains("\"action\":\"give-up\""), "got {log}");
         assert_eq!(transcripts_in(&home).len(), 2, "both cycles ran");
+    }
+
+    /// T7: `run_with` recomposes the system prompt (and re-lists mail) inside
+    /// the per-cycle loop, not once before it starts, so a message sent
+    /// *during* one cycle reaches the next one within the very same `run_
+    /// with` call. A custom one-shot agent script touches a marker file the
+    /// instant its first invocation starts, then pauses briefly; a
+    /// background thread races to write the mail as soon as it sees that
+    /// marker, landing it before cycle 2's own compose-and-list runs.
+    #[test]
+    fn each_loop_cycle_picks_up_mail_that_arrived_since_the_previous_one() {
+        // A plain tempdir, not `testenv::repo()`: this test never matches a
+        // transcript path against `HOME` (the only reason that helper
+        // canonicalizes), and on Windows a canonicalized `\\?\`-prefixed path
+        // embedded in an argv string sh(1) parses loses its backslashes.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let marker = tmp.path().join("cycle-marker");
+        let script = tmp.path().join("mid-loop-agent.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             set -eu\n\
+             [ -z \"${FAKE_AGENT_ARGV_LOG:-}\" ] || printf '%s\\n' \"$*\" >> \"$FAKE_AGENT_ARGV_LOG\"\n\
+             if [ ! -f \"$CYCLE_MARKER\" ]; then\n\
+             \ttouch \"$CYCLE_MARKER\"\n\
+             \tsleep 0.3\n\
+             fi\n\
+             exit 0\n",
+        )
+        .expect("write script");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        // `adapter.headless_cmd` spawns `ZIRV_CTX_AGENT_BIN` directly, unlike
+        // the raw `sh <script>` commands `fake_agent_command`-style helpers
+        // use elsewhere; routing it through `sh` explicitly keeps this
+        // test's spawn portable, the same way the wrap.rs relaunch tests
+        // already do (`("ZIRV_CTX_AGENT_BIN", format!("sh {script}"))`).
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", script.display()),
+        );
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // The spawned script inherits the real process environment (not the
+        // `env` closure above, which only feeds `CtxConfig::load`), so these
+        // two have to be real process env vars.
+        unsafe {
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+            std::env::set_var("CYCLE_MARKER", &marker);
+        }
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let marker_for_writer = marker.clone();
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !marker_for_writer.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer);
+            let slug = crate::commands::ctx::state::repo_slug(&repo_for_writer);
+            let _ = crate::commands::ctx::mail::store(
+                &state,
+                &slug,
+                &crate::commands::ctx::mail::Message {
+                    from_session: "other-session".to_string(),
+                    from_agent: "claude".to_string(),
+                    to: "any".to_string(),
+                    sent: 1,
+                    body: "a fresh notice".to_string(),
+                },
+                &CtxConfig::default(),
+            );
+        });
+
+        let mut args = args_for(2);
+        args.interval_secs = Some(0);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        writer.join().expect("writer thread");
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+            std::env::remove_var("CYCLE_MARKER");
+        }
+        assert_eq!(code.expect("both cycles run"), 0);
+
+        // Each cycle's own session id, from `zirv ctx loop`'s own "cycle N
+        // session <id>" announcement on `out` -- the anchor used below,
+        // since the composed prompt text itself contains embedded newlines
+        // and would make a naive `argv.lines()` count meaningless.
+        let printed = String::from_utf8(out).expect("utf8");
+        let sessions: Vec<&str> = printed
+            .lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .collect();
+        assert_eq!(sessions.len(), 2, "two cycles ran: {printed:?}");
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        let cycle1_at = argv.find(sessions[0]).expect("cycle 1's own invocation");
+        let cycle2_at = argv.find(sessions[1]).expect("cycle 2's own invocation");
+        assert!(cycle1_at < cycle2_at, "cycle 1 launches before cycle 2");
+
+        let mail_at = argv
+            .find("a fresh notice")
+            .expect("the mail must reach a launch's composed prompt");
+        assert!(
+            mail_at > cycle2_at,
+            "mail sent during cycle 1 must land in cycle 2's own launch, not cycle 1's: {argv}"
+        );
     }
 }

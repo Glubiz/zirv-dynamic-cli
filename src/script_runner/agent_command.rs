@@ -142,22 +142,7 @@ impl AgentCommand {
         if code == 0 {
             return Ok(());
         }
-        Err(describe_exit(code))
-    }
-}
-
-/// The supervisor reports its own outcomes through the same `i32` the agent's
-/// exit code arrives on, so "exited with code 75" read as something the agent
-/// did rather than as zirv giving up.
-fn describe_exit(code: i32) -> String {
-    match code {
-        crate::commands::ctx::exec::EXIT_ROT_EXHAUSTED => {
-            "the session kept rotting and the restart budget ran out".to_string()
-        }
-        crate::commands::ctx::exec::EXIT_TIMEOUT => {
-            "the supervised run hit its wall-clock timeout".to_string()
-        }
-        other => format!("exited with code {other}"),
+        Err(crate::commands::ctx::exec::describe_exit(code))
     }
 }
 
@@ -371,21 +356,6 @@ mod tests {
             .expect_err("a disabled agent must fail at execution");
         assert!(err.contains("claude"), "got {err}");
         assert!(err.contains("disabled"), "got {err}");
-    }
-
-    /// The supervisor reports its own outcomes on the same `i32` the agent's
-    /// exit code arrives on, so "exited with code 75" read as something the
-    /// agent did rather than as zirv giving up.
-    #[test]
-    fn the_supervisors_own_exit_codes_read_as_outcomes_not_agent_failures() {
-        assert!(
-            describe_exit(crate::commands::ctx::exec::EXIT_ROT_EXHAUSTED)
-                .contains("restart budget")
-        );
-        assert!(
-            describe_exit(crate::commands::ctx::exec::EXIT_TIMEOUT).contains("wall-clock timeout")
-        );
-        assert_eq!(describe_exit(1), "exited with code 1");
     }
 
     #[tokio::test]

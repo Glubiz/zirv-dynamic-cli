@@ -5,15 +5,19 @@
 //! pruned or deleted, since a mail message is meant to be read exactly once
 //! by whichever session gets to it first.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use super::CtxResult;
-use super::config::CtxConfig;
-use super::state::{StateDir, now_secs};
+use super::adapters::{AGENT_ENV, SESSION_ENV};
+use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::state::{StateDir, now_secs, repo_slug};
 
 /// One mail message: a free-form markdown note plus who sent it, who it is
 /// addressed to, and when.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Message {
     pub from_session: String,
     pub from_agent: String,
@@ -82,18 +86,18 @@ pub fn parse_markdown(md: &str) -> Message {
             if trimmed.is_empty() {
                 continue;
             }
-            if let Some(bullet) = strip_bullet(line) {
-                if let Some((key, value)) = bullet.split_once(':') {
-                    match key.trim().to_ascii_lowercase().as_str() {
-                        "from-session" => msg.from_session = value.trim().to_string(),
-                        "from-agent" => msg.from_agent = value.trim().to_string(),
-                        "to" => msg.to = value.trim().to_string(),
-                        "sent" => msg.sent = value.trim().parse().unwrap_or(0),
-                        // Unknown header inside the block: skipped, not an error.
-                        _ => {}
-                    }
-                    continue;
+            if let Some(bullet) = strip_bullet(line)
+                && let Some((key, value)) = bullet.split_once(':')
+            {
+                match key.trim().to_ascii_lowercase().as_str() {
+                    "from-session" => msg.from_session = value.trim().to_string(),
+                    "from-agent" => msg.from_agent = value.trim().to_string(),
+                    "to" => msg.to = value.trim().to_string(),
+                    "sent" => msg.sent = value.trim().parse().unwrap_or(0),
+                    // Unknown header inside the block: skipped, not an error.
+                    _ => {}
                 }
+                continue;
             }
             // First non-bullet, non-blank line ends the header block.
             in_header = false;
@@ -202,6 +206,137 @@ pub fn consume(state: &StateDir, repo_slug: &str, path: &Path) -> CtxResult<()> 
         .ok_or("mail message path has no file name")?;
     std::fs::rename(path, read_dir.join(file_name))?;
     Ok(())
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SendArgs {
+    /// Recipient agent name, or "any" (the default) for every agent.
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Message text. When omitted, read from `--message-file`, else from
+    /// stdin.
+    #[arg(long)]
+    pub message: Option<String>,
+    /// Path to a file holding the message text.
+    #[arg(long)]
+    pub message_file: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InboxArgs {
+    /// Move each printed message to `read/` once it has been shown.
+    #[arg(long, default_value_t = false)]
+    pub consume: bool,
+    /// Emit one JSON object per line instead of markdown.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// `env(key)`, treating a missing or blank value as `"unknown"` rather than
+/// refusing: a message worth sending is still worth sending even from a
+/// session zirv cannot fully identify (a shell run directly, a hook context
+/// missing a variable), and it is the recipient's call whether an unknown
+/// sender is trustworthy, not `send`'s.
+fn identity_or_unknown(env: EnvLookup<'_>, key: &str) -> String {
+    env(key)
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// `--message`, else `--message-file`, else stdin -- trimmed either way, the
+/// same convention `run_loop::resolve_prompt` uses for `--prompt-file`.
+fn resolve_message(args: &SendArgs, stdin: &mut dyn Read) -> CtxResult<String> {
+    if let Some(text) = &args.message {
+        return Ok(text.trim().to_string());
+    }
+    if let Some(path) = &args.message_file {
+        return Ok(std::fs::read_to_string(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .trim()
+            .to_string());
+    }
+    let mut buffer = String::new();
+    stdin.read_to_string(&mut buffer)?;
+    Ok(buffer.trim().to_string())
+}
+
+pub fn run_send_with<W: Write>(
+    args: &SendArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    stdin: &mut dyn Read,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    if !cfg.mail.enabled {
+        return Err(
+            "zirv ctx send: mail is disabled (mail.enabled = false); nothing was sent".into(),
+        );
+    }
+
+    let body = resolve_message(args, stdin)?;
+    if body.is_empty() {
+        return Err(
+            "zirv ctx send: no message given; pass --message, --message-file, or pipe one on stdin"
+                .into(),
+        );
+    }
+
+    let state = StateDir::resolve(env)?;
+    let msg = Message {
+        from_session: identity_or_unknown(env, SESSION_ENV),
+        from_agent: identity_or_unknown(env, AGENT_ENV),
+        to: args.to.clone().unwrap_or_else(|| "any".to_string()),
+        sent: now_secs(),
+        body,
+    };
+    let slug = repo_slug(repo);
+    store(&state, &slug, &msg, &cfg)?;
+    writeln!(w, "zirv ctx send: message queued for {}", msg.to)?;
+    Ok(0)
+}
+
+pub fn run_send<W: Write>(args: &SendArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_send_with(args, w, &repo, &env, &mut std::io::stdin())
+}
+
+pub fn run_inbox_with<W: Write>(
+    args: &InboxArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    if !cfg.mail.enabled {
+        // Disabled means the mailbox reports empty, exactly like a repo with
+        // no mail at all: nothing is printed, exit 0.
+        return Ok(0);
+    }
+
+    let state = StateDir::resolve(env)?;
+    let slug = repo_slug(repo);
+    let for_agent = env(AGENT_ENV);
+    let messages = list(&state, &slug, for_agent.as_deref())?;
+
+    for (path, msg) in &messages {
+        if args.json {
+            writeln!(w, "{}", serde_json::to_string(msg)?)?;
+        } else {
+            write!(w, "{}", msg.to_markdown())?;
+        }
+        if args.consume {
+            consume(&state, &slug, path)?;
+        }
+    }
+    Ok(0)
+}
+
+pub fn run_inbox<W: Write>(args: &InboxArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_inbox_with(args, w, &repo, &env)
 }
 
 #[cfg(test)]
@@ -424,6 +559,246 @@ This should not appear in the body.\n";
             remaining.len(),
             cfg.mail.keep,
             "pruned down to the newest keep entries"
+        );
+    }
+
+    fn env_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn send_args(message: &str) -> SendArgs {
+        SendArgs {
+            to: None,
+            message: Some(message.to_string()),
+            message_file: None,
+        }
+    }
+
+    #[test]
+    fn send_records_the_sending_session_and_agent_from_the_environment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "sess-123"),
+            (AGENT_ENV, "claude"),
+        ]);
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_send_with(
+            &send_args("heads up: the webhook route moved"),
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send");
+        assert_eq!(code, 0);
+
+        let state = StateDir::from_root(state_dir);
+        let slug = repo_slug(tmp.path());
+        let listed = list(&state, &slug, None).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.from_session, "sess-123");
+        assert_eq!(listed[0].1.from_agent, "claude");
+        assert_eq!(listed[0].1.to, "any");
+        assert_eq!(listed[0].1.body, "heads up: the webhook route moved");
+    }
+
+    #[test]
+    fn send_falls_back_to_an_unknown_sender_rather_than_refusing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_send_with(
+            &send_args("no identity in the environment"),
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send must not refuse just because identity is unknown");
+        assert_eq!(code, 0);
+
+        let state = StateDir::from_root(state_dir);
+        let slug = repo_slug(tmp.path());
+        let listed = list(&state, &slug, None).expect("list");
+        assert_eq!(listed[0].1.from_session, "unknown");
+        assert_eq!(listed[0].1.from_agent, "unknown");
+    }
+
+    #[test]
+    fn send_reads_the_message_from_stdin_when_no_flag_gives_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to: None,
+            message: None,
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(b"note from stdin\n".to_vec());
+        run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send from stdin");
+
+        let state = StateDir::from_root(state_dir);
+        let slug = repo_slug(tmp.path());
+        let listed = list(&state, &slug, None).expect("list");
+        assert_eq!(listed[0].1.body, "note from stdin");
+    }
+
+    #[test]
+    fn inbox_prints_nothing_and_exits_zero_when_there_is_no_mail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = InboxArgs {
+            consume: false,
+            json: false,
+        };
+        let mut out = Vec::new();
+        let code =
+            run_inbox_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("inbox");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "nothing to print: {out:?}");
+    }
+
+    #[test]
+    fn inbox_with_consume_leaves_the_second_read_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(tmp.path());
+        store(&state, &slug, &sample("s1", 1_700_000_000), &cfg).expect("store");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = InboxArgs {
+            consume: true,
+            json: false,
+        };
+
+        let mut first = Vec::new();
+        run_inbox_with(&args, &mut first, tmp.path(), &|k| env.get(k).cloned()).expect("inbox");
+        assert!(
+            !first.is_empty(),
+            "the stored message must be printed the first time"
+        );
+
+        let mut second = Vec::new();
+        run_inbox_with(&args, &mut second, tmp.path(), &|k| env.get(k).cloned()).expect("inbox");
+        assert!(
+            second.is_empty(),
+            "consumed on the first read, so the second finds nothing: {second:?}"
+        );
+    }
+
+    #[test]
+    fn inbox_without_consume_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(tmp.path());
+        store(&state, &slug, &sample("s1", 1_700_000_000), &cfg).expect("store");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = InboxArgs {
+            consume: false,
+            json: false,
+        };
+
+        let mut first = Vec::new();
+        run_inbox_with(&args, &mut first, tmp.path(), &|k| env.get(k).cloned()).expect("inbox");
+        let mut second = Vec::new();
+        run_inbox_with(&args, &mut second, tmp.path(), &|k| env.get(k).cloned()).expect("inbox");
+
+        assert!(!first.is_empty());
+        assert_eq!(
+            first, second,
+            "reading without --consume must not change anything"
+        );
+    }
+
+    #[test]
+    fn mail_disabled_in_config_refuses_send_and_reports_an_empty_inbox() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let slug = repo_slug(tmp.path());
+        // A message already sitting in storage from before mail was disabled
+        // must not leak through the disabled inbox either.
+        store(
+            &state,
+            &slug,
+            &sample("s1", 1_700_000_000),
+            &CtxConfig::default(),
+        )
+        .expect("store");
+
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            ("ZIRV_CTX_MAIL", "false"),
+        ]);
+
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = run_send_with(
+            &send_args("should not be queued"),
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("mail is disabled");
+        assert!(err.to_string().contains("disabled"), "got {err}");
+
+        let inbox_args = InboxArgs {
+            consume: false,
+            json: false,
+        };
+        let mut inbox_out = Vec::new();
+        let code = run_inbox_with(&inbox_args, &mut inbox_out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("inbox still succeeds, just empty");
+        assert_eq!(code, 0);
+        assert!(
+            inbox_out.is_empty(),
+            "a disabled mailbox reports empty even with mail sitting in storage: {inbox_out:?}"
         );
     }
 }

@@ -19,6 +19,14 @@ pub struct TurnSignalSetup {
 
 pub const SOCKET_ENV: &str = "ZIRV_CTX_SOCKET";
 pub const SESSION_ENV: &str = "ZIRV_CTX_SESSION";
+/// Tells a spawned session which agent it is running as. Deliberately the
+/// same name as `ctx.toml`'s own `agent` config key (`ZIRV_CTX_AGENT` in
+/// `config::ENV_MAP`): it states the same fact from the other direction, so a
+/// nested `zirv ctx ...` invocation inside a worker's own child processes
+/// defaults to that worker's own harness rather than re-resolving from
+/// scratch. Read by `mail::run_send`/`mail::run_inbox` to identify the
+/// calling session without requiring an explicit `--to`/`--agent` flag.
+pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 
 /// `Debug` is a supertrait so `Box<dyn AgentAdapter>` can appear in
 /// `Result::expect_err` (the registry tests assert on the unknown-adapter

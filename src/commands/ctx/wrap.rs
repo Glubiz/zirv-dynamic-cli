@@ -9,6 +9,7 @@ use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::NormalizedEvent;
 use super::handoff::{self, Handoff};
+use super::prompt::PromptRole;
 use super::rot::Verdict;
 use super::signal::TurnSignal;
 use super::state::StateDir;
@@ -326,6 +327,37 @@ pub fn advisory_line(score: u32, tokens: u64) -> String {
     )
 }
 
+/// One line telling the user/agent unread mail is waiting, without saying
+/// what it is: wrap only advises, it never reads or injects mail itself (see
+/// `unread_mail_count`).
+pub fn mail_advisory_line(count: usize) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!(
+        "zirv ctx: {count} new mail message{plural} waiting; run `zirv ctx inbox` to read them."
+    )
+}
+
+/// Whether the mailbox has grown since the last check: the only thing that
+/// should ever trigger a fresh advisory. Equal or shrinking (a message was
+/// consumed elsewhere, or the read failed and fell back to the last known
+/// count) never re-fires one.
+pub fn mail_grew(previous: usize, current: usize) -> bool {
+    current > previous
+}
+
+/// Unread mail for `repo`, or `None` on any read error. Never called from a
+/// byte-pump or per-tick path -- only from the turn-signal arm, which is
+/// bounded by how often the agent actually reports a turn boundary -- so an
+/// unreadable mail directory (permissions, a stray non-directory file at that
+/// path) is silently ignored rather than degrading or interrupting the
+/// session: mail is advisory, and a wrapped session must never be made worse
+/// by it.
+fn unread_mail_count(state: &super::state::StateDir, repo: &Path) -> Option<usize> {
+    super::mail::list(state, &super::state::repo_slug(repo), None)
+        .ok()
+        .map(|found| found.len())
+}
+
 pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
     // A TUI submits on carriage return, not newline.
     write!(sink, "{compact_command} {COMPACT_FOCUS}\r")?;
@@ -568,11 +600,18 @@ fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
+/// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
+/// not something a user ever types on the `wrap` command line, only something
+/// another verb (`zirv ctx chat`) decides on the caller's behalf. Every
+/// existing `wrap` caller (the `wrap` verb itself, and every relaunch inside
+/// `pump`) passes `PromptRole::Worker`; `chat` is the one caller that passes
+/// `PromptRole::Orchestrator`.
 pub fn run_with<W: Write>(
     args: &WrapArgs,
     w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
+    role: PromptRole,
 ) -> CtxResult<i32> {
     if args.command.is_empty() {
         return Err("no command to wrap; pass it after --".into());
@@ -637,7 +676,7 @@ pub fn run_with<W: Write>(
         repo,
         skip_injection,
         &cfg.prompt,
-        super::prompt::PromptRole::Worker,
+        role,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -717,7 +756,13 @@ pub fn run_with<W: Write>(
 
     // Kept for the relaunch too: a fresh session with no socket to report on
     // would leave the rest of the run unsupervised.
-    let turn_env: Vec<(String, String)> = server
+    // `AGENT_ENV` is exported unconditionally, unlike the turn-signal env
+    // (which needs a bound socket): it names the same fact `ctx.toml`'s own
+    // `agent` config key would, so a nested `zirv ctx ...` call inside this
+    // session's own children defaults to this session's own harness. Kept in
+    // `turn_env` (despite the name) because a relaunch reuses this exact
+    // vector, and the freshly relaunched session needs it too.
+    let mut turn_env: Vec<(String, String)> = server
         .as_ref()
         .map(|server| {
             adapter
@@ -731,6 +776,7 @@ pub fn run_with<W: Write>(
                 .env
         })
         .unwrap_or_default();
+    turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
     for (key, value) in &turn_env {
         command.env(key, value);
     }
@@ -891,6 +937,9 @@ fn pump(
     cpr_filter: &std::sync::Arc<std::sync::Mutex<CprFilter>>,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
+    // Read only from the turn-signal arm below, never from a byte-pump or
+    // per-tick path: see `unread_mail_count`.
+    let mut mail_seen = 0usize;
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -912,6 +961,18 @@ fn pump(
         {
             transcript.adopt(signal.transcript_path.as_deref());
             supervision.on_turn(&signal);
+
+            // Advisory only: wrap never consumes mail (it stays unread for
+            // `zirv ctx inbox`) and never writes to the pty, only to stderr.
+            // A read error (including no mailbox at all) leaves `mail_seen`
+            // where it was, so it neither advises nor errors.
+            if let Some(count) = unread_mail_count(state_dir, repo)
+                && mail_grew(mail_seen, count)
+            {
+                let mut stderr = std::io::stderr();
+                let _ = writeln!(stderr, "\r\n{}\r", mail_advisory_line(count));
+                mail_seen = count;
+            }
         }
 
         match action_for(supervision, Instant::now(), debounce) {
@@ -1108,7 +1169,7 @@ fn pump(
 pub fn run<W: Write>(args: &WrapArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env)
+    run_with(args, w, &repo, &env, PromptRole::Worker)
 }
 
 #[cfg(test)]
@@ -1261,7 +1322,8 @@ mod tests {
             simple: false,
         };
         let mut out = Vec::new();
-        let err = run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("nothing to wrap");
+        let err = run_with(&args, &mut out, tmp.path(), &|_| None, PromptRole::Worker)
+            .expect_err("nothing to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
@@ -1281,8 +1343,8 @@ mod tests {
             simple: false,
         };
         let mut out = Vec::new();
-        let err =
-            run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("echo matches no adapter");
+        let err = run_with(&args, &mut out, tmp.path(), &|_| None, PromptRole::Worker)
+            .expect_err("echo matches no adapter");
         let msg = err.to_string();
         assert!(
             msg.contains("--agent"),
@@ -1315,8 +1377,8 @@ mod tests {
             simple: false,
         };
         let mut out = Vec::new();
-        let err =
-            run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("nothing left to wrap");
+        let err = run_with(&args, &mut out, tmp.path(), &|_| None, PromptRole::Worker)
+            .expect_err("nothing left to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
@@ -1792,6 +1854,106 @@ mod tests {
         );
     }
 
+    // T8: mail advisory in wrap's pump.
+
+    #[test]
+    fn the_mail_advisory_line_names_the_count_and_points_at_inbox() {
+        let line = mail_advisory_line(3);
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains('3'));
+        assert!(line.contains("zirv ctx inbox"));
+        assert!(
+            !line.contains('\u{2014}'),
+            "no em dashes in user-facing copy"
+        );
+
+        let singular = mail_advisory_line(1);
+        assert!(!singular.contains("messages"), "got {singular}");
+    }
+
+    #[test]
+    fn mail_grew_only_fires_on_a_genuine_increase() {
+        assert!(mail_grew(0, 1));
+        assert!(mail_grew(2, 5));
+        assert!(!mail_grew(3, 3), "unchanged is not growth");
+        assert!(
+            !mail_grew(3, 1),
+            "a shrink (consumed elsewhere) is not growth"
+        );
+    }
+
+    #[test]
+    fn unread_mail_count_is_zero_for_a_repo_with_no_mailbox_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        assert_eq!(unread_mail_count(&state, &repo), Some(0));
+    }
+
+    #[test]
+    fn unread_mail_count_counts_what_store_wrote() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let msg = crate::commands::ctx::mail::Message {
+            from_session: "other".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            sent: 1,
+            body: "note".to_string(),
+        };
+        crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
+            .expect("store");
+        assert_eq!(unread_mail_count(&state, &repo), Some(1));
+    }
+
+    /// `mail::list` itself treats "nothing there, or not a directory" as an
+    /// empty mailbox rather than an error (see its own doc), so this is the
+    /// ordinary case, indistinguishable from a repo that has never had mail.
+    #[test]
+    fn a_missing_or_non_directory_mailbox_reads_as_empty_not_as_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        std::fs::create_dir_all(state.mail()).expect("mkdir");
+        // A plain file where `mail::list` expects a directory.
+        std::fs::write(state.mail().join(&slug), "not a directory").expect("write");
+
+        assert_eq!(unread_mail_count(&state, &repo), Some(0));
+    }
+
+    /// A genuine read error -- unlike "missing" or "not a directory", which
+    /// `mail::list` already treats as empty -- is what `unread_mail_count`
+    /// must swallow into `None` rather than propagate: the pump's own
+    /// `if let Some(count) = unread_mail_count(...) { .. }` then does nothing
+    /// at all for this turn, leaving the session untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_mail_directory_the_process_cannot_read_is_reported_as_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let mailbox = state.mail().join(&slug);
+        std::fs::create_dir_all(&mailbox).expect("mkdir");
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let result = unread_mail_count(&state, &repo);
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+
+        assert_eq!(
+            result, None,
+            "a genuine read error must never masquerade as an empty mailbox"
+        );
+    }
+
     #[test]
     fn the_injected_command_carries_focus_instructions_and_ends_with_a_carriage_return() {
         let mut sink: Vec<u8> = Vec::new();
@@ -1944,6 +2106,217 @@ mod tests {
         );
 
         h.writer.write_all(b"/exit\r").expect("write");
+        let _ = h.child.wait();
+    }
+
+    // T8: mail advisory driven end to end through a real wrapped session.
+
+    #[cfg(unix)]
+    fn store_mail_for_cwd(state_root: &std::path::Path, body: &str) {
+        let repo = std::env::current_dir().expect("cwd");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_root.to_path_buf());
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                sent: 1,
+                body: body.to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapped_session_is_told_about_new_mail_on_stderr_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        store_mail_for_cwd(&state, "note");
+
+        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send turn signal");
+
+        // `wrap`'s own stderr shares the outer pty in this harness (there is
+        // no separate stderr stream to redirect it to), so it arrives on
+        // `h.reader` exactly like the compact/restart tests' own log output
+        // does; the point under test is the wording, not the transport.
+        let seen = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
+        assert!(seen.contains("zirv ctx inbox"), "got {seen:?}");
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrap_never_consumes_or_injects_mail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        store_mail_for_cwd(&state, "do-not-type-this-body");
+
+        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send turn signal");
+
+        let seen = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
+        assert!(seen.contains("zirv ctx inbox"), "advisory fired: {seen:?}");
+        assert!(
+            !seen.contains("do-not-type-this-body"),
+            "the mail body must never be typed into the agent: {seen:?}"
+        );
+
+        // Still unread: wrap only advises. `zirv ctx inbox --consume` is
+        // what moves a message into read/, and wrap never calls it.
+        let repo = std::env::current_dir().expect("cwd");
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state.clone());
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let unread = crate::commands::ctx::mail::list(&state_dir, &slug, None).expect("list");
+        assert_eq!(unread.len(), 1, "wrap must never consume mail on its own");
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_advisory_fires_at_most_once_per_turn_boundary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        store_mail_for_cwd(&state, "note");
+
+        let socket_path = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket = std::path::PathBuf::from(socket_path.trim());
+
+        crate::commands::ctx::signal::send(&socket, &turn_signal(3, Verdict::Healthy))
+            .expect("send 1");
+        let first = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
+        assert!(
+            first.contains("zirv ctx inbox"),
+            "the first turn advises: {first:?}"
+        );
+
+        // A second turn boundary, no new mail in between.
+        crate::commands::ctx::signal::send(&socket, &turn_signal(4, Verdict::Healthy))
+            .expect("send 2");
+        h.writer.write_all(b"still here\r").expect("write");
+        h.writer.flush().expect("flush");
+        let after = read_until(&mut h.reader, "echo: still here", Duration::from_secs(10));
+
+        assert!(
+            !after.contains("zirv ctx inbox"),
+            "a second turn boundary with no new mail must not advise again: {after:?}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mail_directory_that_cannot_be_read_leaves_the_session_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        let repo = std::env::current_dir().expect("cwd");
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state.clone());
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let mailbox = state_dir.mail().join(&slug);
+        std::fs::create_dir_all(&mailbox).expect("mkdir");
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send");
+
+        // The session keeps going, unaffected: no advisory (nothing readable
+        // to report), no crash, no degrade.
+        h.writer.write_all(b"still here\r").expect("write");
+        h.writer.flush().expect("flush");
+        let seen = read_until(&mut h.reader, "echo: still here", Duration::from_secs(10));
+
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+
+        assert!(
+            seen.contains("echo: still here"),
+            "the session must keep working: {seen:?}"
+        );
+        assert!(
+            !seen.contains("zirv ctx inbox"),
+            "nothing readable, so no advisory: {seen:?}"
+        );
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
+        assert!(
+            !log.contains("\"action\":\"degrade\""),
+            "an unreadable mailbox must not degrade the session: {log}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
         let _ = h.child.wait();
     }
 

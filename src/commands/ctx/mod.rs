@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 
 pub mod adapters;
+pub mod agent;
+pub mod chat;
 pub mod config;
 pub mod event;
 pub mod exec;
@@ -166,6 +168,14 @@ pub enum CtxVerb {
     Usage(usage::UsageArgs),
     /// Analyse the configuration surfaces that steer every session.
     Optimize(optimize::OptimizeArgs),
+    /// Start an interactive orchestrator session on the resolved adapter.
+    Chat(chat::ChatArgs),
+    /// Run a supervised headless worker on another enabled harness.
+    Agent(agent::AgentArgs),
+    /// Leave a note for other agent sessions on this machine.
+    Send(mail::SendArgs),
+    /// Read notes other agent sessions left for this one.
+    Inbox(mail::InboxArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -243,6 +253,10 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Wrap(a) => wrap::run(a, &mut out),
         CtxVerb::Usage(a) => usage::run(a, &mut out),
         CtxVerb::Optimize(a) => optimize::run(a, &mut out),
+        CtxVerb::Chat(a) => chat::run(a, &mut out),
+        CtxVerb::Agent(a) => agent::run(a, &mut out),
+        CtxVerb::Send(a) => mail::run_send(a, &mut out),
+        CtxVerb::Inbox(a) => mail::run_inbox(a, &mut out),
     };
 
     match result {

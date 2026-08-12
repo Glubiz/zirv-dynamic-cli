@@ -1,3 +1,14 @@
+//! Supervises one headless run, restarting it on rot with a distilled
+//! handoff. Mail (`super::mail`) is delivered into the composed system
+//! prompt exactly once, at the very first launch computed in `run_with`: a
+//! restart or a usage-limit park reuses that same launch's `prompt_args`
+//! (the argv already carrying the composed text, whichever mechanism
+//! delivered it), it does not recompute the composed prompt or re-list mail.
+//! A message that arrives after the run has started is therefore not
+//! retroactively injected into it -- the next `zirv ctx exec` invocation (or
+//! a `zirv ctx loop` cycle, which re-lists mail every cycle by design) picks
+//! it up instead.
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,6 +28,20 @@ use super::{CtxResult, adapters, handoff, log, score};
 pub const EXIT_ROT_EXHAUSTED: i32 = 75;
 /// Wall-clock timeout with no restarts left.
 pub const EXIT_TIMEOUT: i32 = 76;
+
+/// The supervisor reports its own outcomes through the same `i32` an agent's
+/// exit code arrives on, so "exited with code 75" reads as something the
+/// agent did rather than as zirv giving up. Shared by `zirv ctx agent`
+/// (agent.rs) and script `agent:` steps (agent_command.rs), which both
+/// delegate to this supervisor and want the same wording for the same two
+/// outcomes.
+pub fn describe_exit(code: i32) -> String {
+    match code {
+        EXIT_ROT_EXHAUSTED => "the session kept rotting and the restart budget ran out".to_string(),
+        EXIT_TIMEOUT => "the supervised run hit its wall-clock timeout".to_string(),
+        other => format!("exited with code {other}"),
+    }
+}
 
 #[derive(Debug, clap::Args)]
 pub struct ExecArgs {
@@ -238,6 +263,21 @@ pub fn run_with<W: Write>(
     let prompt_value_at = locate_prompt(&args.command, prefix, prompt.as_deref())
         .and_then(|(index, value)| value.map(|_| index + 1));
 
+    // Mail is delivered once, here, at the first launch: every restart below
+    // reuses this same `composed` value (see the module doc), so a message
+    // that arrives mid-run is not retroactively injected into an
+    // already-running session. `run_loop`, by contrast, starts a fresh
+    // session every cycle and re-lists mail on each one.
+    let mail_messages: Vec<super::mail::Message> = if composed.is_some() {
+        super::mail::list(&state, &super::state::repo_slug(repo), Some(adapter.name()))
+            .map(|found| found.into_iter().map(|(_, msg)| msg).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let composed =
+        super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
+
     // The first spawn's own argv may already carry the adapter's system-prompt
     // flag (e.g. `-- claude --append-system-prompt "..."`); merge it in rather
     // than letting `prompt_args` silently override it below.
@@ -339,8 +379,15 @@ pub fn run_with<W: Write>(
     // Rebuilt for every session, because the hook inside a child reports the
     // session id this exports. Pinning the first one makes every restart's
     // signals look like they belong to a session that is already dead.
+    //
+    // `AGENT_ENV` is exported unconditionally, unlike the turn-signal env
+    // above (which needs a bound socket): it names the same fact
+    // `ctx.toml`'s own `agent` config key would, so a nested `zirv ctx ...`
+    // call inside this session's own children defaults to this session's own
+    // harness rather than re-resolving from scratch, whether or not turn
+    // signals are available.
     let turn_env_for = |session: &SessionId| {
-        server
+        let mut env: Vec<(String, String)> = server
             .as_ref()
             .map(|server| {
                 adapter
@@ -353,7 +400,9 @@ pub fn run_with<W: Write>(
                     )
                     .env
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+        env
     };
 
     // With no argv to pass through, the first launch is built exactly the way
@@ -1781,6 +1830,68 @@ mod tests {
         );
     }
 
+    /// T7: unread mail addressed to this session's agent is folded into the
+    /// composed system prompt at launch, the same way the repo layer is.
+    #[test]
+    fn unread_mail_is_delivered_into_the_launch_system_prompt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session = "abababab-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("heads up: the webhook route moved"),
+            "the mail must reach the launch's composed prompt: {argv}"
+        );
+        assert!(
+            argv.contains("another agent session"),
+            "labeled as mail, not as an operator instruction: {argv}"
+        );
+    }
+
     /// I2: a user's own --append-system-prompt inside the `--` command must
     /// not be silently discarded by zirv's own occurrence of the same flag.
     #[test]
@@ -1833,6 +1944,17 @@ mod tests {
             argv.contains("zirv session conventions"),
             "zirv's own layer is still present: {argv}"
         );
+    }
+
+    /// Shared with `zirv ctx agent` (agent.rs) and script `agent:` steps
+    /// (agent_command.rs), which both delegate to this supervisor and want
+    /// the same wording for the same two outcomes: the supervisor's own exit
+    /// codes read as outcomes, not agent failures.
+    #[test]
+    fn describe_exit_names_the_supervisors_own_outcomes() {
+        assert!(describe_exit(EXIT_ROT_EXHAUSTED).contains("restart budget"));
+        assert!(describe_exit(EXIT_TIMEOUT).contains("wall-clock timeout"));
+        assert_eq!(describe_exit(1), "exited with code 1");
     }
 
     #[test]

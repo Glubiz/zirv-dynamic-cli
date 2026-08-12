@@ -100,6 +100,10 @@ pub fn run_with<W: Write>(
     let mut command = adapter.interactive_cmd(Some(&prompt), &extra);
     command.current_dir(repo);
     command.env(SESSION_ENV, session.as_str());
+    // Names the same fact `ctx.toml`'s own `agent` config key would, so a
+    // nested `zirv ctx ...` call inside this session's own children defaults
+    // to this session's own harness rather than re-resolving from scratch.
+    command.env(super::adapters::AGENT_ENV, adapter.name());
     writeln!(w, "resuming from {}", path.display())?;
     w.flush()?;
 
