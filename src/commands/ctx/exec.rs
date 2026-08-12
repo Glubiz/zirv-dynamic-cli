@@ -210,6 +210,7 @@ pub fn run_with<W: Write>(
         repo,
         skip_injection,
         &cfg.prompt,
+        super::prompt::PromptRole::Worker,
     );
     // Known before argv is touched, because it decides how argv is read: the
     // token holding this exact text is the prompt, whatever it looks like.

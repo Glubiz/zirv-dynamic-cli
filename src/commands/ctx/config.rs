@@ -210,6 +210,34 @@ impl Default for PromptConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MailConfig {
+    pub enabled: bool,
+    /// Cap on a stored message's body. Enforced by `mail::store`, which
+    /// truncates rather than fails an oversize message.
+    pub max_message_bytes: usize,
+    /// Cap on how much mail is surfaced to a session at once (delivery is a
+    /// later piece; the cap lives here so it is configured alongside the
+    /// rest of the mailbox from the start).
+    pub max_delivered_bytes: usize,
+    /// How many unread messages a repo's mailbox keeps before the oldest are
+    /// pruned. Read messages, already moved into `read/`, are never touched
+    /// by this limit.
+    pub keep: usize,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_message_bytes: 4096,
+            max_delivered_bytes: 4096,
+            keep: 50,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -222,6 +250,7 @@ pub struct CtxConfig {
     pub pace: PaceConfig,
     pub optimize: OptimizeConfig,
     pub prompt: PromptConfig,
+    pub mail: MailConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -355,6 +384,18 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["prompt", "max_repo_bytes"],
         EnvKind::Int,
     ),
+    ("ZIRV_CTX_MAIL", &["mail", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_MAIL_MAX_BYTES",
+        &["mail", "max_message_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES",
+        &["mail", "max_delivered_bytes"],
+        EnvKind::Int,
+    ),
+    ("ZIRV_CTX_MAIL_KEEP", &["mail", "keep"], EnvKind::Int),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -848,6 +889,47 @@ mod tests {
             msg.contains("ZIRV_CTX_OPTIMIZE_MODEL"),
             "name the alternative: {msg}"
         );
+    }
+
+    #[test]
+    fn mail_defaults_are_enabled_with_sane_caps() {
+        let mail = MailConfig::default();
+        assert!(mail.enabled, "the mailbox is on by default");
+        assert_eq!(mail.max_message_bytes, 4096);
+        assert_eq!(mail.max_delivered_bytes, 4096);
+        assert_eq!(mail.keep, 50);
+    }
+
+    #[test]
+    fn mail_reads_config_and_env() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[mail]\nkeep = 10\nmax_message_bytes = 2048\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.mail.keep, 10);
+        assert_eq!(cfg.mail.max_message_bytes, 2048);
+        assert_eq!(
+            cfg.mail.max_delivered_bytes, 4096,
+            "untouched keys keep defaults"
+        );
+
+        let env = env_map(&[
+            ("ZIRV_CTX_MAIL", "false"),
+            ("ZIRV_CTX_MAIL_MAX_BYTES", "512"),
+            ("ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES", "256"),
+            ("ZIRV_CTX_MAIL_KEEP", "5"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.mail.enabled);
+        assert_eq!(cfg.mail.max_message_bytes, 512);
+        assert_eq!(cfg.mail.max_delivered_bytes, 256);
+        assert_eq!(cfg.mail.keep, 5);
     }
 
     /// `.settings.toml` and `ctx.toml` are deliberately distinct files:

@@ -7,6 +7,7 @@ pub mod exec;
 pub mod handoff;
 pub mod hook;
 pub mod log;
+pub mod mail;
 pub mod optimize;
 pub mod pace;
 pub mod prompt;
@@ -124,13 +125,17 @@ pub(crate) mod testenv {
 pub type CtxResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 // Item 7: named here, in the text `zirv ctx --help` actually prints, so
-// nothing implies codex works today. See adapters::codex::CodexAdapter::ready
-// for the same wording where a user hits it directly (`--agent codex`).
+// nothing implies an unready adapter works today. `readiness_note` generates
+// the not-ready clause from the registry's own `ready()` calls rather than a
+// literal, so it never drifts from adapters::codex::CodexAdapter::ready --
+// the same wording a user hits directly via `--agent codex`.
 #[derive(Debug, Parser)]
 #[command(
     name = "zirv ctx",
-    about = "Autonomous context management for AI coding agents (Claude Code only today; codex \
-             is not implemented yet, see issue #11)",
+    about = format!(
+        "Autonomous context management for AI coding agents. {}",
+        adapters::readiness_note()
+    ),
     disable_help_subcommand = true
 )]
 pub struct CtxCli {
@@ -254,28 +259,40 @@ mod tests {
     use super::*;
 
     /// Item 7: `zirv ctx --help` is the first thing a curious user reads, so
-    /// it must say plainly that codex is not implemented yet and point at the
-    /// tracking issue, the same honesty `CodexAdapter::ready` gives a user
-    /// who tries `--agent codex` directly.
+    /// it must say plainly which adapters are not ready yet, the same
+    /// honesty `CodexAdapter::ready` gives a user who tries `--agent codex`
+    /// directly. Pinned as a property over the registry (every adapter whose
+    /// own `ready()` fails must be named, with a not-ready indication)
+    /// rather than a literal sentence, so wiring up a real adapter -- or
+    /// adding a third one that also is not ready -- keeps this test honest
+    /// without an edit.
     #[test]
-    fn the_top_level_help_is_honest_about_codex_support() {
+    fn the_top_level_help_names_every_adapter_that_is_not_ready() {
         use clap::CommandFactory;
         let about = CtxCli::command()
             .get_about()
             .map(|s| s.to_string())
             .unwrap_or_default();
+
+        let not_ready: Vec<_> = adapters::all(None)
+            .into_iter()
+            .filter(|a| a.ready().is_err())
+            .collect();
         assert!(
-            about.to_lowercase().contains("not implemented yet"),
-            "must say codex is not implemented yet: {about}"
+            !not_ready.is_empty(),
+            "this test expects at least one not-ready adapter today (codex)"
         );
+        for adapter in &not_ready {
+            assert!(
+                about.contains(adapter.name()),
+                "about must name not-ready adapter '{}': {about}",
+                adapter.name()
+            );
+        }
         assert!(
-            about.contains("issue #11"),
-            "must point at the tracking issue: {about}"
-        );
-        assert!(
-            !about.to_lowercase().contains("codex is supported")
-                && !about.to_lowercase().contains("supports codex"),
-            "must not imply codex works today: {about}"
+            about.to_lowercase().contains("not implemented yet")
+                || about.to_lowercase().contains("not ready"),
+            "about must indicate not-ready status: {about}"
         );
     }
 

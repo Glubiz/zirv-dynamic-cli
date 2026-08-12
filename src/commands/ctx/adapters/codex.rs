@@ -86,11 +86,14 @@ impl AgentAdapter for CodexAdapter {
     fn ready(&self) -> CtxResult<()> {
         // Item 7: this is the surface a user actually sees (`--agent codex`,
         // or a config that names it), so it has to be honest in its own
-        // words rather than pointing at an internal plan task number.
+        // words rather than pointing at an internal plan task number. It
+        // deliberately does not prescribe one other adapter by name -- that
+        // wording ages out the moment a third adapter is wired in, and
+        // `select`'s unknown-name error and `resolve_default`'s aggregate
+        // already say what is actually usable right now.
         Err(
             "codex support is not implemented yet; ctx currently supports Claude Code only. \
-             Pass --agent claude, or track progress at \
-             https://github.com/Glubiz/zirv-dynamic-cli/issues/11."
+             Track progress at https://github.com/Glubiz/zirv-dynamic-cli/issues/11."
                 .into(),
         )
     }
@@ -252,6 +255,23 @@ mod tests {
         assert!(
             msg.contains("issues/11"),
             "must reference the tracking issue: {msg}"
+        );
+    }
+
+    /// The refusal has to be honest that codex is not ready (and may still
+    /// say Claude Code is what works today), but it must not hand-pick one
+    /// other adapter as *the* fix by telling the caller to pass a specific
+    /// `--agent` value: that wording ages out the moment a third adapter is
+    /// wired in, and the registry (via `select`'s unknown-name error and
+    /// `resolve_default`'s aggregate) already tells a caller what is
+    /// actually usable right now.
+    #[test]
+    fn the_codex_refusal_does_not_prescribe_one_other_adapter_by_name() {
+        let err = CodexAdapter::new(None).ready().expect_err("not ready yet");
+        let msg = err.to_string();
+        assert!(
+            !msg.to_lowercase().contains("--agent"),
+            "must not tell the caller to pass a specific --agent value as the fix: {msg}"
         );
     }
 

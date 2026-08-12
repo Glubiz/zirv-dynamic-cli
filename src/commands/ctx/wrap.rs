@@ -602,8 +602,17 @@ pub fn run_with<W: Write>(
         && !adapters::command_matches_adapter(adapter.as_ref(), false, &args.command)
     {
         let program = args.command.first().map(String::as_str).unwrap_or("");
+        // Named generically rather than hardcoding one adapter: the actual
+        // options come from the registry (gate-enabled and `ready()` right
+        // now), so a second working adapter shows up here without an edit.
+        let available = adapters::available_adapter_names(&cfg);
+        let agent_hint = if available.is_empty() {
+            "pass --agent <name>".to_string()
+        } else {
+            format!("pass --agent {}", available.join("/"))
+        };
         return Err(format!(
-            "zirv ctx wrap: could not tell which agent '{program}' is; pass --agent claude \
+            "zirv ctx wrap: could not tell which agent '{program}' is; {agent_hint} \
              (or your agent's name), run it with --no-supervise for pure passthrough, \
              or run this command unwrapped"
         )
@@ -628,6 +637,7 @@ pub fn run_with<W: Write>(
         repo,
         skip_injection,
         &cfg.prompt,
+        super::prompt::PromptRole::Worker,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -1253,6 +1263,37 @@ mod tests {
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("nothing to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
+    }
+
+    /// M5's undetected-command refusal used to hardcode "pass --agent
+    /// claude", which only ever named one adapter no matter how many the
+    /// registry actually holds. The error must instead name whatever the
+    /// registry currently reports as available (gate-enabled and `ready()`),
+    /// so a second working adapter shows up here without an edit to this
+    /// string.
+    #[test]
+    fn the_undetected_command_error_names_the_registry_rather_than_claude() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let args = WrapArgs {
+            agent: None,
+            no_supervise: false,
+            command: vec!["echo".to_string(), "hello".to_string()],
+            simple: false,
+        };
+        let mut out = Vec::new();
+        let err =
+            run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("echo matches no adapter");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--agent"),
+            "still tells the user how to fix it: {msg}"
+        );
+        for name in adapters::available_adapter_names(&CtxConfig::default()) {
+            assert!(
+                msg.contains(name),
+                "must name available adapter '{name}': {msg}"
+            );
+        }
     }
 
     /// N1: `merge_command_line_prompt` strips the user's own

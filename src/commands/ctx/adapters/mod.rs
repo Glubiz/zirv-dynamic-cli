@@ -259,35 +259,147 @@ fn resolve_on_path(program: &str) -> Option<(PathBuf, bool)> {
     None
 }
 
+/// An adapter constructor: the same shape `ClaudeAdapter::new` and
+/// `CodexAdapter::new` already share, named so `ADAPTERS` reads as a table
+/// rather than a wall of type punctuation.
+pub type AdapterCtor = fn(Option<&str>) -> Box<dyn AgentAdapter>;
+
+fn make_claude(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(claude::ClaudeAdapter::new(bin))
+}
+
+fn make_codex(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(codex::CodexAdapter::new(bin))
+}
+
+/// The single source of truth for which adapters exist: a name paired with a
+/// constructor. Adding an adapter is one entry here (plus its own module) --
+/// `all`, `select`'s fallback, `describe_known_adapters`, `resolve_default`
+/// and `readiness_note` all walk this table rather than naming adapters by
+/// hand, so none of them can drift from it.
+pub const ADAPTERS: &[(&str, AdapterCtor)] = &[("claude", make_claude), ("codex", make_codex)];
+
 pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
-    vec![
-        Box::new(claude::ClaudeAdapter::new(bin)),
-        Box::new(codex::CodexAdapter::new(bin)),
-    ]
+    ADAPTERS.iter().map(|(_, ctor)| ctor(bin)).collect()
 }
 
 /// The registry's names, each suffixed `(disabled)` when `gate` refuses it --
 /// used by the unknown-name error so a mistyped `--agent` also shows which
 /// known names are actually usable right now.
 fn describe_known_adapters(gate: &crate::settings::AgentGate) -> String {
-    all(None)
+    ADAPTERS
         .iter()
-        .map(|a| {
-            if gate.is_enabled(a.name()) {
-                a.name().to_string()
+        .map(|(name, _)| {
+            if gate.is_enabled(name) {
+                name.to_string()
             } else {
-                format!("{} (disabled)", a.name())
+                format!("{name} (disabled)")
             }
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// Explicit `--agent` name, else detection from the wrapped argv, else claude.
-/// The `.settings.toml` gate (`cfg.agents`) is checked before `ready()` in
-/// every arm: `ready()` reports implementation state, the gate reports
-/// operator policy, and a disabled agent must report the disable rather than
-/// (for codex) "not implemented yet".
+/// The adapters that are both gate-enabled and `ready()` right now, in
+/// registry order. Used to spell out actual options in an error instead of a
+/// single hardcoded name -- `wrap`'s undetected-command refusal in
+/// particular, which used to say "pass --agent claude" no matter how many
+/// adapters the registry actually held.
+pub fn available_adapter_names(cfg: &CtxConfig) -> Vec<&'static str> {
+    let bin = cfg.agent_bin.as_deref();
+    ADAPTERS
+        .iter()
+        .filter(|(name, ctor)| cfg.agents.is_enabled(name) && ctor(bin).ready().is_ok())
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// A short clause naming every adapter that is not ready yet, for `zirv ctx
+/// --help`'s `about` text. Generated from each adapter's own `ready()`
+/// rather than hardcoded, so a newly wired-up adapter falls out of the
+/// sentence on its own once it starts returning `Ok`, and a third adapter
+/// that is also not ready is named without an edit here. Empty once every
+/// adapter is ready.
+pub fn readiness_note() -> String {
+    let not_ready: Vec<&str> = ADAPTERS
+        .iter()
+        .filter(|(_, ctor)| ctor(None).ready().is_err())
+        .map(|(name, _)| *name)
+        .collect();
+    if not_ready.is_empty() {
+        return String::new();
+    }
+    format!("Not ready yet: {} (see issue #11).", not_ready.join(", "))
+}
+
+/// Which rule picked the default adapter, for callers (`zirv ctx status`,
+/// diagnostics) that want to explain the choice rather than just use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultOrigin {
+    /// `cfg.agent` named it explicitly.
+    Configured,
+    /// No configured agent; this was the first adapter in registry order
+    /// that was both gate-enabled and `ready()`.
+    FirstEnabledReady,
+}
+
+/// Resolves the adapter `select` falls back to when neither an explicit
+/// `--agent` nor detection named one: `cfg.agent` if set, else the first
+/// registry entry that is both gate-enabled and `ready()`. Every call site
+/// of `select` already folds `cfg.agent` into the `name` it passes in, so by
+/// the time `select`'s fallback arm calls this, `cfg.agent` is always `None`
+/// there -- but this function stands on its own (and is tested that way),
+/// since a `None` name is not the only way to reach "use the configured or
+/// default agent".
+///
+/// When nothing qualifies, the error aggregates one line per adapter naming
+/// why it was skipped, reusing the gate's own refusal text and each
+/// adapter's own `ready()` text rather than inventing new wording.
+pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, DefaultOrigin)> {
+    let bin = cfg.agent_bin.as_deref();
+
+    if let Some(name) = cfg.agent.as_deref() {
+        let adapter = ADAPTERS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ctor)| ctor(bin))
+            .ok_or_else(|| {
+                format!(
+                    "unknown agent '{name}'; known adapters: {}",
+                    describe_known_adapters(&cfg.agents)
+                )
+            })?;
+        if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
+            return Err(refusal.into());
+        }
+        adapter.ready()?;
+        return Ok((adapter, DefaultOrigin::Configured));
+    }
+
+    let mut reasons = Vec::new();
+    for (name, ctor) in ADAPTERS {
+        let adapter = ctor(bin);
+        if let Some(refusal) = cfg.agents.refusal(name) {
+            reasons.push(format!("{name}: {refusal}"));
+            continue;
+        }
+        match adapter.ready() {
+            Ok(()) => return Ok((adapter, DefaultOrigin::FirstEnabledReady)),
+            Err(e) => reasons.push(format!("{name}: {e}")),
+        }
+    }
+    Err(format!(
+        "no agent is both enabled and ready:\n{}",
+        reasons.join("\n")
+    )
+    .into())
+}
+
+/// Explicit `--agent` name, else detection from the wrapped argv, else
+/// `resolve_default`. The `.settings.toml` gate (`cfg.agents`) is checked
+/// before `ready()` in every arm: `ready()` reports implementation state,
+/// the gate reports operator policy, and a disabled agent must report the
+/// disable rather than (for codex) "not implemented yet".
 pub fn select(
     name: Option<&str>,
     command: &[String],
@@ -319,12 +431,7 @@ pub fn select(
         return Ok(adapter);
     }
 
-    let adapter: Box<dyn AgentAdapter> = Box::new(claude::ClaudeAdapter::new(bin));
-    if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
-        return Err(refusal.into());
-    }
-    adapter.ready()?;
-    Ok(adapter)
+    resolve_default(cfg).map(|(adapter, _origin)| adapter)
 }
 
 /// True when the wrapped command can be trusted to actually be this adapter's
@@ -532,9 +639,20 @@ mod tests {
         assert_eq!(adapter.name(), "claude");
     }
 
+    /// The property the fallback actually promises: whatever it picks is
+    /// enabled and ready. Today that adapter happens to be claude (registry
+    /// order plus claude being the only one that ever passes `ready()`), so
+    /// both are asserted -- the property for its own sake, the concrete name
+    /// because losing it silently would be a regression worth catching too.
     #[test]
     fn empty_command_defaults_to_claude() {
-        let adapter = select(None, &[], &permissive_cfg()).expect("default");
+        let cfg = permissive_cfg();
+        let adapter = select(None, &[], &cfg).expect("default");
+        assert!(
+            cfg.agents.is_enabled(adapter.name()),
+            "must be gate-enabled"
+        );
+        assert!(adapter.ready().is_ok(), "must be ready");
         assert_eq!(adapter.name(), "claude");
     }
 
@@ -577,13 +695,19 @@ mod tests {
         assert!(err.to_string().contains("codex"), "got {err}");
     }
 
-    /// `select`'s empty-command default is claude; disabling claude itself
-    /// must refuse rather than launch it anyway.
+    /// `select`'s empty-command default is the first enabled-and-ready
+    /// adapter; disabling claude leaves no adapter that qualifies (codex is
+    /// never ready), so the aggregated error must name both, each with its
+    /// own reason.
     #[test]
     fn the_default_fallback_is_refused_when_the_default_agent_is_disabled() {
         let cfg = cfg_disabling("claude");
-        let err = select(None, &[], &cfg).expect_err("the default agent is disabled");
-        assert!(err.to_string().contains("claude"), "got {err}");
+        let err = select(None, &[], &cfg).expect_err("no adapter qualifies");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "got {msg}");
+        assert!(msg.contains("disabled"), "got {msg}");
+        assert!(msg.contains("codex"), "got {msg}");
+        assert!(msg.contains("not implemented yet"), "got {msg}");
     }
 
     /// The gate is checked before `ready()`: a disabled-and-unready agent
@@ -602,8 +726,137 @@ mod tests {
 
     #[test]
     fn registry_exposes_both_v1_adapters() {
-        let names: Vec<&str> = all(None).iter().map(|a| a.name()).collect();
+        let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, vec!["claude", "codex"]);
+    }
+
+    /// The registry table is the one place a new adapter is wired in: `all`
+    /// must produce exactly one instance per table entry, in table order,
+    /// with matching names -- otherwise `all` and `ADAPTERS` could drift.
+    #[test]
+    fn adding_an_adapter_is_one_entry_in_the_constructor_table() {
+        let instances = all(None);
+        assert_eq!(instances.len(), ADAPTERS.len());
+        for (instance, (name, _)) in instances.iter().zip(ADAPTERS.iter()) {
+            assert_eq!(instance.name(), *name);
+        }
+    }
+
+    #[test]
+    fn the_registry_names_are_unique_and_non_empty() {
+        let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
+        for name in &names {
+            assert!(!name.is_empty(), "no adapter may have an empty name");
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "duplicate adapter name in {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_command_falls_back_to_the_first_enabled_and_ready_adapter() {
+        let (adapter, origin) = resolve_default(&permissive_cfg()).expect("a default exists");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// Disabling claude (enabled but the only one that is actually `ready()`)
+    /// must not fall through to codex just because it is next in the table:
+    /// codex is enabled by the gate but never ready, so no adapter qualifies
+    /// and `resolve_default` must refuse rather than silently pick codex.
+    #[test]
+    fn the_fallback_skips_an_adapter_that_is_enabled_but_not_ready() {
+        let cfg = cfg_disabling("claude");
+        let err = resolve_default(&cfg).expect_err("codex is enabled but never ready");
+        let msg = err.to_string();
+        assert!(msg.contains("codex"), "got {msg}");
+        assert!(msg.contains("not implemented yet"), "got {msg}");
+    }
+
+    /// Symmetric case: an adapter that would otherwise be ready (claude) is
+    /// disabled by the gate, so it must be skipped even though `ready()`
+    /// alone would have accepted it.
+    #[test]
+    fn the_fallback_skips_an_adapter_that_is_ready_but_disabled() {
+        let cfg = cfg_disabling("claude");
+        let err = resolve_default(&cfg).expect_err("claude is disabled");
+        assert!(err.to_string().contains("claude"), "got {err}");
+    }
+
+    /// Disabling both known adapters leaves nothing to fall back to; the
+    /// error must aggregate one line per adapter naming its own reason,
+    /// reusing the gate's refusal text and each adapter's own `ready()` text
+    /// rather than inventing new wording.
+    #[test]
+    fn when_no_adapter_is_both_enabled_and_ready_the_error_names_each_one_and_why() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let cfg = CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        };
+
+        let err = resolve_default(&cfg).expect_err("both disabled");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "must name claude: {msg}");
+        assert!(msg.contains("codex"), "must name codex: {msg}");
+        assert!(
+            msg.contains("disabled"),
+            "must say why claude lost out: {msg}"
+        );
+        assert!(
+            msg.contains("not implemented yet") || msg.contains("disabled"),
+            "must say why codex lost out: {msg}"
+        );
+    }
+
+    /// The fallback is only reached when neither an explicit `--agent` nor
+    /// detection named an adapter; either one must bypass it entirely, even
+    /// when the fallback itself would have refused.
+    #[test]
+    fn an_explicit_or_detected_agent_still_bypasses_the_fallback_entirely() {
+        let cfg = cfg_disabling("claude");
+
+        // Explicit name: codex is still enabled by this gate, so it is
+        // selected directly (and fails on its own `ready()`, not the gate).
+        let err = select(Some("codex"), &[], &cfg).expect_err("codex is never ready");
+        assert!(
+            err.to_string().contains("not implemented yet"),
+            "must reach codex's own ready() error, not the fallback aggregate: {err}"
+        );
+
+        // Detection: an argv that names claude explicitly is refused for
+        // being disabled, not silently redirected into the fallback.
+        let cmd = vec!["/usr/bin/claude".to_string()];
+        let err = select(None, &cmd, &cfg).expect_err("claude is disabled");
+        assert!(err.to_string().contains("disabled"), "got {err}");
+    }
+
+    #[test]
+    fn resolve_default_reports_which_rule_chose_the_adapter() {
+        let mut cfg = permissive_cfg();
+        cfg.agent = Some("claude".to_string());
+        let (adapter, origin) = resolve_default(&cfg).expect("claude is configured");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::Configured);
+
+        let (adapter, origin) = resolve_default(&permissive_cfg()).expect("fallback picks one");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
     }
 
     /// The gate wrap and exec use before injecting: a command that matches no

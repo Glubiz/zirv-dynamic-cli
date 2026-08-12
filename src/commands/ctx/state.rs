@@ -158,6 +158,12 @@ impl StateDir {
         self.0.join("optimize")
     }
 
+    /// Inter-agent mailbox: `<state>/mail/<repo_slug>/...`. See
+    /// `super::mail` for the storage layout and message format.
+    pub fn mail(&self) -> PathBuf {
+        self.0.join("mail")
+    }
+
     /// Short on purpose: unix socket paths are capped near 104 bytes on macOS.
     pub fn sockets(&self) -> PathBuf {
         self.0.join("s")

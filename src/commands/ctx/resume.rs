@@ -66,6 +66,7 @@ pub fn run_with<W: Write>(
         repo,
         args.simple,
         &cfg.prompt,
+        super::prompt::PromptRole::Worker,
     );
     let (user_extra, composed) =
         super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
