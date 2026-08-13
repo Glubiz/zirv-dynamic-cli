@@ -43,6 +43,7 @@ cargo clippy --all-targets -- -D warnings
   - `memory.rs` — The cross-session memory bank (`zirv ctx remember`/`recall`/`forget`) and handoff-harvest opt-in
   - `chrome.rs` — Terminal chrome (launch banner, reserved status bar, colour) eligibility and pure renderers
   - `announce.rs` — The `zirv ▸` announcement channel on stderr
+  - `dash/` — The `zirv chat` dashboard multiplexer: `mod.rs` (event loop, `Ctrl+A` prefix keys, overlays), `pane.rs` (supervised ConPTY child behind a vt100 screen), `ui.rs` (pure ratatui renderers), `spawnreq.rs` (spawn-request IPC for `zirv ctx agent` panes), `roster.rs` (quit capture / restore-on-relaunch)
 
 ## Conventions
 
