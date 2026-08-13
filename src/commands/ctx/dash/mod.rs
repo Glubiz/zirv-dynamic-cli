@@ -2,14 +2,14 @@
 //! interactive ConPTY harness sessions, each rendered through its own
 //! embedded `vt100` screen model.
 //!
-//! This module now carries the event loop itself (`run_dashboard`) plus the
-//! pure input filter (`filter_key`/`encode_key`) that decides, for every
+//! This module carries the event loop itself (`run_dashboard`) plus the pure
+//! input filter (`filter_key`/`encode_key`) that decides, for every
 //! keystroke, whether it goes straight to the active pane's child or gets
-//! swallowed as a dashboard command behind the `Ctrl+A` prefix. Nothing in
-//! `main.rs`/`chat.rs` calls `run_dashboard` yet -- that wiring is Task 6 --
-//! so the function (and anything only it reaches) carries an explicit
-//! `#[allow(dead_code)]`, the same precedent `pane.rs`'s own module-level
-//! attribute already set for this plan.
+//! swallowed as a dashboard command behind the `Ctrl+A` prefix.
+//! `chat.rs::run_with` calls `run_dashboard` once `chrome::dash_eligible`
+//! says the terminal can carry it (Task 6); every ineligible terminal
+//! (`--simple`, non-terminal stdio, too small, or the dashboard turned off
+//! in config) still reaches today's `wrap::run_with` passthrough instead.
 
 pub mod pane;
 pub mod ui;
@@ -311,11 +311,11 @@ fn build_turn_env(
 /// Runs the dashboard until the operator quits, owning `first` (the
 /// orchestrator pane the caller already built via `build_launch`) plus
 /// whatever additional panes get spawned along the way. Nesting is the
-/// caller's job (Task 6 checks `sessions::nesting_refusal` before calling
-/// this at all) -- `env` is accepted for interface completeness with the
-/// rest of the launch pipeline and for the roster/spawn-request env lookups
-/// Tasks 10-12 add, but this task's own body does not read it.
-#[allow(dead_code)]
+/// caller's job (`chat.rs::run_with` checks `sessions::nesting_refusal`
+/// before calling this at all) -- `env` is accepted for interface
+/// completeness with the rest of the launch pipeline and for the
+/// roster/spawn-request env lookups Tasks 10-12 add, but this task's own
+/// body does not read it.
 pub fn run_dashboard(
     cfg: &CtxConfig,
     repo: &Path,

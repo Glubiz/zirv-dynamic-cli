@@ -13,7 +13,7 @@
 //! touches the wrapped child: nobody but `wrap`'s own pump reads or writes
 //! the child's pty.
 
-use super::config::ChromeConfig;
+use super::config::{ChromeConfig, DashConfig};
 
 /// Below this width the banner and the status bar both risk wrapping their
 /// own text across lines, which corrupts the bar's single-line redraw.
@@ -21,6 +21,41 @@ pub const MIN_COLS: u16 = 40;
 /// Below this height a reserved bottom row would eat a meaningful fraction of
 /// the visible terminal.
 pub const MIN_ROWS: u16 = 8;
+
+/// The dashboard's own, taller floor: a sidebar plus a usable pane grid needs
+/// more room than the banner/status-bar chrome above. Measured by the vt100
+/// spike (`docs/superpowers/notes/2026-08-13-vt100-spike.md`): no rendering
+/// problems were observed at these sizes, so the defaults stand as the
+/// minimums.
+pub const MIN_DASH_COLS: u16 = 80;
+pub const MIN_DASH_ROWS: u16 = 20;
+
+/// Whether `zirv chat` should open the dashboard rather than falling through
+/// to the plain `wrap` passthrough session. Pure: every input is caller-
+/// supplied, so this is unit-testable without a real terminal.
+///
+/// `simple` and `!cfg.enabled` both turn eligibility off outright, matching
+/// `ChromeCaps::probe`'s own one-way degrade rule -- `--simple` promises a
+/// plain session, and an operator who disabled the dashboard gets exactly
+/// that, unconditionally. Both `stdout_tty` and `stdin_tty` have to be real
+/// terminals (not just stdout, the way `ChromeCaps::probe` only checks
+/// stdout): the dashboard reads keystrokes from stdin to drive pane
+/// selection and overlays, so a piped stdin can never make a usable session
+/// even if stdout happens to be a terminal.
+pub fn dash_eligible(
+    stdout_tty: bool,
+    stdin_tty: bool,
+    vt_ok: bool,
+    size: (u16, u16),
+    cfg: &DashConfig,
+    simple: bool,
+) -> bool {
+    if simple || !cfg.enabled || !stdout_tty || !stdin_tty || !vt_ok {
+        return false;
+    }
+    let (cols, rows) = size;
+    cols >= MIN_DASH_COLS && rows >= MIN_DASH_ROWS
+}
 
 /// What this session gets, decided once at launch. `colour` is ANDed with
 /// `vt_ok`: on Windows, ANSI colour codes are only interpreted once VT
@@ -107,6 +142,12 @@ pub struct BannerFacts {
     /// `Some` names where the resumed handoff came from (a short human
     /// description, not a path) when `--resume` folded one into this launch.
     pub resuming: Option<String>,
+    /// `cfg.chat.model`/`ZIRV_CTX_CHAT_MODEL` when set: the model the
+    /// orchestrator session was launched with, shown so an operator who
+    /// configured it can see at a glance that it actually took effect.
+    /// `None` renders no line at all, matching the resuming field's own
+    /// "absent means nothing to say" convention.
+    pub model: Option<String>,
 }
 
 /// `colour` here is already the final decision (`Chrome::colour`, or an
@@ -160,6 +201,10 @@ pub fn banner(facts: &BannerFacts, colour: bool, vt: bool) -> String {
 
     if let Some(resuming) = &facts.resuming {
         lines.push(format!("resuming: {resuming}"));
+    }
+
+    if let Some(model) = &facts.model {
+        lines.push(format!("model: {model}"));
     }
 
     lines.join("\n")
@@ -468,7 +513,22 @@ mod tests {
             session: "abc12345".to_string(),
             harnesses: vec![("claude".to_string(), true), ("codex".to_string(), false)],
             resuming: None,
+            model: None,
         }
+    }
+
+    #[test]
+    fn the_banner_shows_the_model_when_configured() {
+        let without = banner(&facts(), false, false);
+        assert!(
+            !without.to_lowercase().contains("model"),
+            "no line at all when unset: {without}"
+        );
+
+        let mut with_model = facts();
+        with_model.model = Some("fable".to_string());
+        let text = banner(&with_model, false, false);
+        assert!(text.contains("model: fable"), "got {text}");
     }
 
     #[test]
@@ -834,5 +894,107 @@ mod tests {
         assert!(bar_should_disable((MIN_COLS - 1, 30)));
         assert!(bar_should_disable((80, MIN_ROWS - 1)));
         assert!(!bar_should_disable((MIN_COLS, MIN_ROWS)));
+    }
+
+    // Task 6: dashboard eligibility.
+
+    fn dash_cfg() -> DashConfig {
+        DashConfig::default()
+    }
+
+    const DASH_SIZE: (u16, u16) = (100, 30);
+
+    #[test]
+    fn dash_is_eligible_with_every_axis_satisfied() {
+        assert!(dash_eligible(
+            true,
+            true,
+            true,
+            DASH_SIZE,
+            &dash_cfg(),
+            false
+        ));
+    }
+
+    #[test]
+    fn dash_is_ineligible_when_either_stream_is_not_a_terminal() {
+        assert!(!dash_eligible(
+            false,
+            true,
+            true,
+            DASH_SIZE,
+            &dash_cfg(),
+            false
+        ));
+        assert!(!dash_eligible(
+            true,
+            false,
+            true,
+            DASH_SIZE,
+            &dash_cfg(),
+            false
+        ));
+    }
+
+    #[test]
+    fn dash_is_ineligible_without_vt() {
+        assert!(!dash_eligible(
+            true,
+            true,
+            false,
+            DASH_SIZE,
+            &dash_cfg(),
+            false
+        ));
+    }
+
+    #[test]
+    fn dash_is_ineligible_when_disabled_or_simple() {
+        let mut disabled = dash_cfg();
+        disabled.enabled = false;
+        assert!(!dash_eligible(
+            true, true, true, DASH_SIZE, &disabled, false
+        ));
+
+        assert!(!dash_eligible(
+            true,
+            true,
+            true,
+            DASH_SIZE,
+            &dash_cfg(),
+            true
+        ));
+    }
+
+    #[test]
+    fn dash_is_eligible_exactly_at_the_minimum_size() {
+        assert!(dash_eligible(
+            true,
+            true,
+            true,
+            (MIN_DASH_COLS, MIN_DASH_ROWS),
+            &dash_cfg(),
+            false
+        ));
+    }
+
+    #[test]
+    fn dash_is_ineligible_one_below_the_minimum_size_in_either_dimension() {
+        assert!(!dash_eligible(
+            true,
+            true,
+            true,
+            (MIN_DASH_COLS - 1, MIN_DASH_ROWS),
+            &dash_cfg(),
+            false
+        ));
+        assert!(!dash_eligible(
+            true,
+            true,
+            true,
+            (MIN_DASH_COLS, MIN_DASH_ROWS - 1),
+            &dash_cfg(),
+            false
+        ));
     }
 }

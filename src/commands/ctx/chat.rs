@@ -13,6 +13,8 @@ use std::path::Path;
 use super::adapters::{self, AgentAdapter, DefaultOrigin};
 use super::chrome::{self, BannerFacts, ChromeCaps, HarnessRule};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::dash;
+use super::dash::pane::PaneSpec;
 use super::event::SessionId;
 use super::prompt::PromptRole;
 use super::state::StateDir;
@@ -175,12 +177,20 @@ pub fn resolve_initial_prompt<W: Write>(
 /// real terminal -- used to still print the banner straight into the log
 /// file. The size itself still has to come from `window_size`: it is the
 /// only source for it either way.
-fn probe_terminal() -> (bool, bool, (u16, u16), Option<term::VtGuard>) {
+///
+/// `stdin_is_tty` is a second, independent probe (not derived from
+/// `window_size` succeeding): `ChromeCaps::probe` never needed it -- the
+/// banner and status bar only ever write to stdout -- but `dash_eligible`
+/// does, since the dashboard reads keystrokes from stdin to drive pane
+/// selection and overlays, and a piped stdin can never make a usable session
+/// even when stdout happens to be a terminal.
+fn probe_terminal() -> (bool, bool, bool, (u16, u16), Option<term::VtGuard>) {
     let stdout_is_tty = std::io::stdout().is_terminal();
+    let stdin_is_tty = std::io::stdin().is_terminal();
     let size = term::window_size(term::STDIN_FD).unwrap_or((0, 0));
     let vt_guard = term::enable_vt_output().ok();
     let vt_ok = vt_guard.is_some();
-    (stdout_is_tty, vt_ok, size, vt_guard)
+    (stdout_is_tty, stdin_is_tty, vt_ok, size, vt_guard)
 }
 
 /// `stderr` is a second, explicit writer -- not `std::io::stderr()` reached
@@ -217,7 +227,7 @@ pub fn run_with<W: Write, E: Write>(
     // Held for the rest of this function: dropping it early would restore
     // the console's original VT mode before `wrap`'s own raw-mode session
     // (which relies on VT already being on) even opens.
-    let (stdout_is_tty, vt_ok, size, _vt_guard) = probe_terminal();
+    let (stdout_is_tty, stdin_is_tty, vt_ok, size, _vt_guard) = probe_terminal();
     let chrome = ChromeCaps::probe(stdout_is_tty, vt_ok, size, &cfg.chrome, args.simple, false);
 
     let (adapter, rule) = match resolve_adapter(&cfg, args.agent.as_deref()) {
@@ -254,6 +264,19 @@ pub fn run_with<W: Write, E: Write>(
     let resuming = args.resume && initial_prompt.is_some();
     let session = SessionId::new_v4();
 
+    let mut launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &args.extra);
+    // Applies to both branches below (the dashboard's orchestrator pane and
+    // the wrap fallback): `chat.model` shapes `zirv chat` generally, not
+    // only the dashboard, so the splice happens once, here, before either
+    // path reads `launch.argv`.
+    if let Some(model) = cfg.chat.model.as_deref() {
+        splice_model_args(
+            &mut launch.argv,
+            adapter.launch_prefix_len(),
+            adapter.model_args(model),
+        );
+    }
+
     if chrome.banner {
         let facts = BannerFacts {
             harness: adapter.name().to_string(),
@@ -261,13 +284,58 @@ pub fn run_with<W: Write, E: Write>(
             session: session.as_str().to_string(),
             harnesses: harness_list(&cfg),
             resuming: resuming.then(|| "the last stored handoff for this repo".to_string()),
+            model: cfg.chat.model.clone(),
         };
         writeln!(w, "{}", chrome::banner(&facts, chrome.colour, vt_ok))?;
     }
 
-    let launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &args.extra);
-
     let env = quiet_env(env, args.quiet);
+
+    if chrome::dash_eligible(
+        stdout_is_tty,
+        stdin_is_tty,
+        vt_ok,
+        size,
+        &cfg.dash,
+        args.simple,
+    ) {
+        let pane = PaneSpec {
+            agent_name: launch.agent_name,
+            argv: launch.argv,
+            role: launch.role,
+            verb: launch.verb,
+            session_id: session.as_str().to_string(),
+            title: "orch".to_string(),
+        };
+        return dash::run_dashboard(&cfg, repo, &env, &state, pane);
+    }
+
+    // Ineligible because the dashboard is on but the terminal is too small
+    // (every other axis -- both streams a terminal, VT available, not
+    // `--simple` -- already passed): the operator gets one line naming the
+    // floor and how to silence the notice, then the same wrap passthrough
+    // every other ineligible terminal already reaches. `--simple` itself
+    // never reaches here (it is excluded from `dash_eligible`'s failure by
+    // construction: it is checked first there, and it is checked here too so
+    // an explicit `--simple` never prints a notice about a size it was never
+    // going to use anyway).
+    if cfg.dash.enabled
+        && !args.simple
+        && stdout_is_tty
+        && stdin_is_tty
+        && vt_ok
+        && (size.0 < chrome::MIN_DASH_COLS || size.1 < chrome::MIN_DASH_ROWS)
+    {
+        crate::output::error(format!(
+            "the terminal is too small for the dashboard (need at least {}x{}, got {}x{}); \
+             falling back to a plain session. Pass --simple to silence this.",
+            chrome::MIN_DASH_COLS,
+            chrome::MIN_DASH_ROWS,
+            size.0,
+            size.1
+        ));
+    }
+
     let wrap_args = wrap_args_for(args, launch.clone());
     wrap::run_with(
         &wrap_args,
@@ -277,6 +345,22 @@ pub fn run_with<W: Write, E: Write>(
         Some(session),
         launch.verb,
     )
+}
+
+/// Splices `model_args` into `argv` immediately after the launch prefix --
+/// the program invocation plus any leading `bin_args`
+/// (`AgentAdapter::launch_prefix_len`) -- so the model selection precedes
+/// the initial prompt and any operator-supplied extra flags. Applies
+/// uniformly wherever a chat launch's argv is used (the dashboard's
+/// orchestrator pane and the wrap fallback): `chat.model` shapes `zirv chat`
+/// generally, not only the dashboard. A no-op when `model_args` is empty --
+/// no configured model, or an adapter with no verified model flag.
+fn splice_model_args(argv: &mut Vec<String>, prefix_len: usize, model_args: Vec<String>) {
+    if model_args.is_empty() {
+        return;
+    }
+    let at = prefix_len.min(argv.len());
+    argv.splice(at..at, model_args);
 }
 
 /// The `wrap` invocation a resolved chat launch becomes. Pure, so what does
@@ -780,5 +864,135 @@ mod tests {
         let base = |k: &str| set.get(k).cloned();
         let looked_up = quiet_env(&base, true);
         assert_eq!(looked_up("ZIRV_CTX_QUIET"), Some("true".to_string()));
+    }
+
+    // Task 6: dashboard wiring -- model splice and the wrap fallback.
+
+    /// `Some` lands right after the launch prefix, ahead of the initial
+    /// prompt and any extra flags; `None` (an empty `model_args`) leaves the
+    /// argv byte-for-byte unchanged.
+    #[test]
+    fn orchestrator_argv_carries_the_configured_model() {
+        let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let prefix_len = adapter.launch_prefix_len();
+
+        let mut with_model = build_launch(&adapter, Some("hello"), &["--continue".to_string()]);
+        splice_model_args(&mut with_model.argv, prefix_len, adapter.model_args("opus"));
+        assert_eq!(
+            &with_model.argv[prefix_len..prefix_len + 2],
+            &["--model".to_string(), "opus".to_string()],
+            "model args land right after the launch prefix: {:?}",
+            with_model.argv
+        );
+        assert_eq!(with_model.argv[0], "/tmp/fake-claude");
+        assert!(with_model.argv.contains(&"hello".to_string()));
+        assert_eq!(
+            with_model.argv.last().map(String::as_str),
+            Some("--continue"),
+            "the operator's own extra flags still land last: {:?}",
+            with_model.argv
+        );
+
+        let mut without_model = build_launch(&adapter, Some("hello"), &["--continue".to_string()]);
+        let before = without_model.argv.clone();
+        splice_model_args(&mut without_model.argv, prefix_len, Vec::new());
+        assert_eq!(
+            without_model.argv, before,
+            "no configured model means the argv is untouched"
+        );
+    }
+
+    /// The dashboard eligibility gate is real terminal I/O
+    /// (`std::io::stdout()`/`stdin().is_terminal()`), and `cargo test`'s own
+    /// stdio is never a real terminal either way -- so under test, `zirv
+    /// chat` always falls through to the `wrap` path regardless of
+    /// `--simple`. This pins that the fallback is actually reached (not
+    /// short-circuited by some other refusal) by letting adapter resolution
+    /// succeed and following it all the way into `wrap::run_with`'s own
+    /// spawn attempt, which fails fast because the binary does not exist --
+    /// the fake-agent-bin pattern, never a real agent.
+    #[test]
+    fn simple_flag_still_reaches_the_wrap_fallback_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                "Z:/nonexistent/agent-bin".to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_tmp.path().display().to_string(),
+            ),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let result = run_with(
+            &chat_args(false),
+            &mut out,
+            &mut err_out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        );
+        // The dashboard is never reachable under `cargo test`'s own piped
+        // stdio (`dash_eligible` requires a real terminal on both streams),
+        // so this pins the wrap path specifically: it got far enough to
+        // actually attempt the configured, nonexistent binary -- proof the
+        // model splice and the dashboard branch above it did not divert or
+        // corrupt the launch -- and failed there rather than anywhere
+        // earlier (a disabled agent, the nesting guard, or a config error).
+        let failure =
+            result.expect_err("the configured binary does not exist, so the spawn must fail");
+        let msg = failure.to_string();
+        assert!(
+            msg.contains("agent-bin") || msg.contains("Z:"),
+            "expected the failure to name the configured (nonexistent) binary: {msg}"
+        );
+    }
+
+    /// `chat_args(false).simple` is `false` above deliberately: the point is
+    /// that even the default (non-`--simple`) path reaches `wrap` under
+    /// non-terminal stdio. This companion pins that `--simple` explicitly
+    /// set behaves the same way -- neither flag value changes which path a
+    /// non-terminal `cargo test` run reaches.
+    #[test]
+    fn explicit_simple_also_reaches_the_wrap_fallback_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let mut simple_args = chat_args(false);
+        simple_args.simple = true;
+
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                "Z:/nonexistent/agent-bin".to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_tmp.path().display().to_string(),
+            ),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let result = run_with(&simple_args, &mut out, &mut err_out, repo.path(), &|k| {
+            env.get(k).cloned()
+        });
+        let failure =
+            result.expect_err("the configured binary does not exist, so the spawn must fail");
+        let msg = failure.to_string();
+        assert!(
+            msg.contains("agent-bin") || msg.contains("Z:"),
+            "expected the failure to name the configured (nonexistent) binary: {msg}"
+        );
     }
 }
