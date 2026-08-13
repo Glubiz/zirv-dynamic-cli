@@ -340,7 +340,7 @@ pub fn run_with<W: Write>(
                 &state,
                 &mail_slug,
                 Some(adapter.name()),
-                Some(&registry_short),
+                super::sessions::delivery_filter(None, &registry_short),
             )
             .unwrap_or_default()
         } else {
@@ -705,18 +705,22 @@ pub fn run_with<W: Write>(
             // fold mail into, so listing it here only led to it being
             // consumed (moved to `read/`) by the post-spawn drain below --
             // silently marking a message read that no session ever saw.
-            let nudge_mail: Vec<(PathBuf, super::mail::Message)> =
-                if fresh.is_some() && cfg.mail.enabled {
-                    super::mail::list(
-                        &state,
-                        &mail_slug,
-                        Some(adapter.name()),
-                        Some(&registry_short),
-                    )
-                    .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+            let nudge_mail: Vec<(PathBuf, super::mail::Message)> = if fresh.is_some()
+                && cfg.mail.enabled
+            {
+                // Read back off the guard, which is the one thing that
+                // demonstrably did not rotate when `refresh_session` ran
+                // a few lines above.
+                super::mail::list(
+                    &state,
+                    &mail_slug,
+                    Some(adapter.name()),
+                    super::sessions::delivery_filter(Some(session_guard.short()), &registry_short),
+                )
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let nudge_mail_msgs: Vec<super::mail::Message> =
                 nudge_mail.iter().map(|(_, msg)| msg.clone()).collect();
             if !nudge_mail_msgs.is_empty() {
@@ -2463,10 +2467,13 @@ mod tests {
 
         let session1 = "abababab-2222-4333-8444-555555555555";
         let argv_log1 = tmp.path().join("argv1.log");
-        unsafe {
-            std::env::set_var("FAKE_AGENT_MODE", "healthy");
-            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log1);
-        }
+        // NEW-1: a guard. Three panicking statements sit between the old
+        // set and its restore, so any of them leaked `FAKE_AGENT_*` into
+        // every later test in this process.
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("FAKE_AGENT_ARGV_LOG", argv_log1.to_str()),
+        ]);
         let args1 = ExecArgs {
             agent: Some("claude".to_string()),
             session_id: Some(session1.to_string()),
@@ -2488,9 +2495,12 @@ mod tests {
 
         let session2 = "cdcdcdcd-2222-4333-8444-555555555555";
         let argv_log2 = tmp.path().join("argv2.log");
-        unsafe {
-            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log2);
-        }
+        // Nested guard: restores to `argv_log1` on drop, and the outer guard
+        // then restores whatever the process had before the test.
+        let _second_argv_log = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_ARGV_LOG",
+            argv_log2.to_str(),
+        )]);
         let args2 = ExecArgs {
             agent: Some("claude".to_string()),
             session_id: Some(session2.to_string()),
@@ -2503,10 +2513,6 @@ mod tests {
         };
         let mut out2 = Vec::new();
         let code2 = run_with(&args2, &mut out2, tmp.path(), &|k| env.get(k).cloned());
-        unsafe {
-            std::env::remove_var("FAKE_AGENT_MODE");
-            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
-        }
         assert_eq!(code2.expect("second launch runs"), 0);
         let argv2 = std::fs::read_to_string(&argv_log2).expect("argv recorded");
         assert!(

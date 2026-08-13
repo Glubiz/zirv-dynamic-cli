@@ -159,6 +159,35 @@ pub(crate) mod testenv {
         }
     }
 
+    /// Enters `dir` and returns to the previous working directory on drop --
+    /// including on a panicking assertion, which is the whole point.
+    ///
+    /// The process-wide working directory is the single most damaging thing a
+    /// test can leak: every later test that resolves a relative path, and
+    /// every child process spawned without an explicit `current_dir`, picks
+    /// it up. A `set_current_dir(original)` written at the *end* of a test
+    /// body restores it only when the test passes, which gets it exactly
+    /// backwards -- the failing test is the one that leaks, and the leak then
+    /// shows up as a cascade of unrelated failures (often against a temp
+    /// directory that no longer exists).
+    pub(crate) struct CwdGuard(Option<PathBuf>);
+
+    impl CwdGuard {
+        pub(crate) fn enter(dir: &Path) -> std::io::Result<Self> {
+            let previous = std::env::current_dir().ok();
+            std::env::set_current_dir(dir)?;
+            Ok(Self(previous))
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                let _ = std::env::set_current_dir(previous);
+            }
+        }
+    }
+
     /// `EnvGuard` without the working directory, which is all most tests need.
     pub(crate) struct HomeGuard(#[allow(dead_code)] EnvGuard);
 

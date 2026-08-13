@@ -281,14 +281,27 @@ mod tests {
         )
         .expect("write stub");
 
-        let status = std::process::Command::new(&zirv)
+        let mut command = std::process::Command::new(&zirv);
+        command
             .args(["ctx", "resume", "--agent", "claude"])
             .current_dir(tmp.path())
             .env("HOME", tmp.path().join("home"))
+            .env("USERPROFILE", tmp.path().join("home"))
             .env(STATE_ENV, state.root())
-            .env("ZIRV_CTX_AGENT_BIN", format!("sh {}", stub.display()))
-            .status()
-            .expect("resume runs");
+            .env("ZIRV_CTX_AGENT_BIN", format!("sh {}", stub.display()));
+        // NEW-4: hermetic against the developer's own environment. This
+        // spawns the real `zirv` binary, which reads the process environment,
+        // so a suite run from inside a supervised session would trip
+        // `resume`'s own nesting guard and fail on the refusal instead of
+        // testing attribution. The same scrub `wrap`'s pty harness does, for
+        // the same reason -- and the stub `ZIRV_CTX_AGENT_BIN` above means
+        // even a fully regressed guard can only ever reach the stub.
+        for key in crate::commands::ctx::sessions::SUPERVISION_ENV {
+            command.env_remove(key);
+        }
+        command.env_remove("CLAUDE_PID");
+        command.env_remove("CLAUDECODE");
+        let status = command.status().expect("resume runs");
         assert!(status.success(), "the launched agent exited cleanly");
 
         let exported = std::fs::read_to_string(&session_log)

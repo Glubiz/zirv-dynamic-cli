@@ -155,9 +155,15 @@ registry) notices its process is gone. `zirv ctx status` reports it under
 
 ```
 sessions:
-  abcdef12  claude  exec  pid 48213  3m  live  -work-my-repo
-  9a8b7c6d  claude  wrap  pid 19042  40m  stale  -work-my-repo
+  abcdef12  claude  exec  pid 48213  3m  live         -work-my-repo
+  9a8b7c6d  claude  wrap  pid 19042  40m  stale        -work-my-repo
+  1f2e3d4c  claude  wrap  pid 51120  5m  unreachable  -work-other-repo
 ```
+
+`unreachable` means the process is running but bound no turn-signal socket
+(`--no-supervise`, or the socket failed to bind), so it never checks for
+wake-ups: `zirv ctx nudge` refuses such a target and says so, while
+`zirv ctx send` still leaves a message for its next run.
 
 `<short>` is the same eight-character id `--to-session` and `zirv ctx nudge`
 resolve a prefix against. A socket left behind by an older zirv binary that

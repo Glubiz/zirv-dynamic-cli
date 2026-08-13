@@ -172,7 +172,6 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs::{create_dir_all, write};
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
@@ -234,8 +233,9 @@ commands: []
         let script_file = zirv_dir.join("test.yaml");
         write(&script_file, script_content)?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
         show_help(&mut buffer)?;
@@ -252,8 +252,6 @@ commands: []
             output.contains("Description:"),
             "Output should contain 'Description:'"
         );
-
-        env::set_current_dir(original_dir)?;
 
         Ok(())
     }
@@ -283,8 +281,9 @@ shortcuts:
         let shortcuts_file = zirv_dir.join(".shortcuts.yaml");
         write(&shortcuts_file, shortcuts_content)?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
         show_help(&mut buffer)?;
@@ -305,8 +304,6 @@ shortcuts:
             "Output should include the built-in commands"
         );
 
-        env::set_current_dir(original_dir)?;
-
         Ok(())
     }
 
@@ -323,11 +320,11 @@ shortcuts:
             "shortcuts:\n  t: \"test.yaml\"\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-        env::set_current_dir(original_dir)?;
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
@@ -371,13 +368,12 @@ shortcuts:
         )?;
         write(zirv_dir.join("ctx.toml"), "[score]\nwindow = 4\n")?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-
-        env::set_current_dir(original_dir)?;
 
         result?;
         let output = String::from_utf8(buffer.into_inner())?;
@@ -404,13 +400,12 @@ shortcuts:
             "[agents.codex]\nenabled = false\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-
-        env::set_current_dir(original_dir)?;
 
         result?;
         let output = String::from_utf8(buffer.into_inner())?;
@@ -439,13 +434,12 @@ shortcuts:
             "[agents.codex]\nenabled = false\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-
-        env::set_current_dir(original_dir)?;
 
         result?;
         let output = String::from_utf8(buffer.into_inner())?;
@@ -475,11 +469,11 @@ shortcuts:
             "name: \"Build\"\ncommands: []\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-        env::set_current_dir(original_dir)?;
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
@@ -522,11 +516,11 @@ shortcuts:
             "name: \"My Chat Script\"\ncommands: []\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-        env::set_current_dir(original_dir)?;
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
@@ -559,11 +553,11 @@ shortcuts:
             "shortcuts:\n  c: \"commit.yaml\"\n  gc: \"commit.yaml\"\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-        env::set_current_dir(original_dir)?;
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;

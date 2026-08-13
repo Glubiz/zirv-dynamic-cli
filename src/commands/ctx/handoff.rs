@@ -456,15 +456,14 @@ mod tests {
     #[test]
     fn the_distiller_receives_the_prompt_on_stdin() {
         let log = tempfile::NamedTempFile::new().expect("tempfile");
-        // SAFETY: CI runs tests single-threaded (`--test-threads=1`).
-        unsafe {
-            std::env::set_var("FAKE_MODEL_PROMPT_LOG", log.path());
-        }
+        // NEW-1: a guard -- `distill` below can panic via `expect`, which
+        // used to skip the restore entirely.
+        let _prompt_log = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_MODEL_PROMPT_LOG",
+            log.path().to_str(),
+        )]);
         let adapter = fake_model_adapter();
         distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT).expect("distills");
-        unsafe {
-            std::env::remove_var("FAKE_MODEL_PROMPT_LOG");
-        }
 
         let seen = std::fs::read_to_string(log.path()).expect("log");
         assert!(seen.contains("ship the webhook"), "got: {seen}");

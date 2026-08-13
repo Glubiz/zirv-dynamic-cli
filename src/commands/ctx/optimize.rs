@@ -3316,10 +3316,10 @@ mod tests {
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        // SAFETY: CI runs tests single-threaded.
-        unsafe {
-            std::env::set_var("FAKE_OPTIMIZER_MODE", "fail");
-        }
+        // NEW-1: a guard, so a failing assertion below cannot leave
+        // `FAKE_OPTIMIZER_MODE=fail` set for every later test.
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_OPTIMIZER_MODE", Some("fail"))]);
         let args = OptimizeArgs {
             agent: Some("claude".to_string()),
             no_model: false,
@@ -3328,9 +3328,6 @@ mod tests {
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
-        unsafe {
-            std::env::remove_var("FAKE_OPTIMIZER_MODE");
-        }
 
         assert_eq!(code, 0, "a dead model is not a failed analysis");
         let printed = String::from_utf8(out).expect("utf8");
@@ -3352,10 +3349,11 @@ mod tests {
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        // SAFETY: CI runs tests single-threaded.
-        unsafe {
-            std::env::set_var("FAKE_OPTIMIZER_PROMPT_LOG", &log);
-        }
+        // NEW-1: a guard; the old restore (if any) sat behind assertions.
+        let _prompt_log = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_OPTIMIZER_PROMPT_LOG",
+            log.to_str(),
+        )]);
         let args = OptimizeArgs {
             agent: Some("claude".to_string()),
             no_model: true,
@@ -3364,9 +3362,6 @@ mod tests {
         };
         let mut out = Vec::new();
         run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
-        unsafe {
-            std::env::remove_var("FAKE_OPTIMIZER_PROMPT_LOG");
-        }
 
         assert!(!log.exists(), "--no-model must not spawn the model at all");
     }

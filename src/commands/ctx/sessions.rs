@@ -185,6 +185,26 @@ pub struct Record {
     pub verb: Verb,
     pub pid: u32,
     pub started_at: u64,
+    /// NEW-3: whether this supervisor can actually *act* on a wake-up.
+    ///
+    /// A supervisor only claims nudge markers from its turn-signal arm, so
+    /// one that never bound a `SignalServer` (`wrap --no-supervise`, or a
+    /// bind that failed) can never notice a nudge -- not even to advise
+    /// about it. Such a session used to be dropped from the registry
+    /// entirely, which fixed the silent-nudge bug by making the session
+    /// invisible: it vanished from `zirv ctx status` too, so an operator
+    /// watching a bind-failed `wrap` simply could not see it was running.
+    ///
+    /// Recorded instead of hidden: `status` renders it as `unreachable`, and
+    /// `nudge` refuses it with a reason. `#[serde(default = ...)]` returns
+    /// `true` so a record written by an older build still parses as a normal
+    /// reachable session.
+    #[serde(default = "reachable_default")]
+    pub reachable: bool,
+}
+
+fn reachable_default() -> bool {
+    true
 }
 
 impl Record {
@@ -201,7 +221,20 @@ impl Record {
             verb,
             pid: std::process::id(),
             started_at: super::state::now_secs(),
+            // Reachable unless a caller says otherwise: every headless
+            // supervisor binds a socket as a matter of course, so only
+            // `wrap` (which can run `--no-supervise`, or fail to bind) has
+            // any reason to call `unreachable()` below.
+            reachable: true,
         }
+    }
+
+    /// Marks this record as one that can never act on a wake-up -- see the
+    /// `reachable` field. Chained onto `new` at the one call site that knows
+    /// whether a turn-signal socket actually bound.
+    pub fn unreachable(mut self) -> Self {
+        self.reachable = false;
+        self
     }
 }
 
@@ -282,14 +315,9 @@ impl SessionGuard {
     /// mail listing a supervisor performs on its own behalf is scoped to
     /// this, never to `short_id(current session)`.
     ///
-    /// `#[allow(dead_code)]` for the same reason `record()` above carries it:
-    /// the supervisors derive this value themselves before the guard exists
-    /// (`exec` needs it for its first mail listing, which happens before
-    /// registration; `run_loop` latches it on the first cycle), so nothing in
-    /// production reads it back out. It exists so the tests can pin the
-    /// stable-address invariant against the guard itself rather than against
-    /// a copy of the derivation.
-    #[allow(dead_code)]
+    /// Read back by `exec`'s nudge-relaunch mail listing specifically because
+    /// it is the one value demonstrably unaffected by the
+    /// `refresh_session` call immediately above it.
     pub fn short(&self) -> &str {
         &self.record.short
     }
@@ -530,6 +558,25 @@ pub fn claim_nudge_marker(state: &StateDir, short: &str) -> Option<String> {
     )
 }
 
+/// The `for_session` filter a supervisor passes to `mail::list` when listing
+/// mail *for itself*.
+///
+/// `latched` is the registry short once this run has registered -- the
+/// address senders actually resolved, stable for the whole run. `current` is
+/// the short of whatever session is running right now, used only in the
+/// window before registration (where it is, by construction, the address
+/// about to be registered).
+///
+/// Never returns `None`. `None` means "apply no session filter at all", which
+/// makes a supervisor read *and consume* every directed message in the repo,
+/// including ones addressed to other sessions. That is exactly what `loop`
+/// used to do, and it is why this is a named function rather than an inline
+/// `unwrap_or`: reverting any seam to `None` or to `short_id(current
+/// session)` should look wrong at the call site.
+pub fn delivery_filter<'a>(latched: Option<&'a str>, current: &'a str) -> Option<&'a str> {
+    Some(latched.unwrap_or(current))
+}
+
 /// How much of a short id `zirv ctx nudge` insists on. `resolve_prefix`
 /// accepts any *unique* prefix, which is the right rule for a read-only
 /// lookup but the wrong one for a write: a single mistyped character can
@@ -633,6 +680,23 @@ pub fn run_nudge_with<W: Write>(
     // as the same `NotFound`, naming what is actually there instead.
     let record =
         resolve_prefix(&state, &args.prefix).map_err(|e| format!("zirv ctx nudge: {e}"))?;
+
+    // NEW-3: a supervisor with no turn-signal socket claims no wake-up
+    // markers, so it cannot act on a nudge *or* advise about one -- the
+    // marker would simply sit on disk until swept. Refused with the reason,
+    // rather than accepted into a silence the operator has no way to
+    // distinguish from a bug. The mail path is still open to them: plain
+    // `zirv ctx send` stores a message the session's *next* run will read.
+    if !record.reachable {
+        return Err(format!(
+            "zirv ctx nudge: session {} ({}) is not reachable for nudges -- it is running \
+             without a turn-signal socket (`--no-supervise`, or the socket failed to bind), \
+             so it never checks for wake-ups and would not even show an advisory. \
+             Use `zirv ctx send --to-session {}` to leave a message for its next run.",
+            record.short, record.verb, record.short
+        )
+        .into());
+    }
 
     let body = resolve_nudge_message(args, stdin)?;
     if body.is_empty() {
@@ -1276,6 +1340,73 @@ mod tests {
         assert!(refusal.contains("none registered"), "got {refusal}");
     }
 
+    // NEW-2: the delivery address each supervisor lists its own mail under.
+    // Reverting a seam to `None` (loop's old behavior) or to
+    // `short_id(current session)` (exec's old behavior) has to break
+    // something, not just quietly change routing.
+
+    #[test]
+    fn the_delivery_filter_is_never_an_unfiltered_listing() {
+        // `None` means "no session filter at all", which makes a supervisor
+        // read *and consume* other sessions' directed mail.
+        assert!(delivery_filter(Some("aaaa1111"), "bbbb2222").is_some());
+        assert!(delivery_filter(None, "bbbb2222").is_some());
+    }
+
+    #[test]
+    fn the_loop_delivery_address_is_the_registry_short() {
+        // Before the first cycle registers there is nothing latched, so the
+        // address is the short about to be registered.
+        assert_eq!(delivery_filter(None, "cycle001"), Some("cycle001"));
+
+        // From then on the latched registry short wins over whatever short
+        // the current cycle happens to have minted.
+        assert_eq!(
+            delivery_filter(Some("cycle001"), "cycle002"),
+            Some("cycle001"),
+            "a loop must keep answering to the address a sender resolved,              not to this cycle's own fresh id"
+        );
+        assert_eq!(
+            delivery_filter(Some("cycle001"), "cycle009"),
+            Some("cycle001"),
+            "and must keep doing so however many cycles later"
+        );
+    }
+
+    /// The exec seam, expressed against a real guard: the address a sender
+    /// resolved has to keep working after the session underneath it rotates.
+    #[test]
+    fn the_exec_delivery_address_survives_session_rotation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = record_for("aaaa1111-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        let launch_short = record.short.clone();
+        let mut guard = SessionGuard::register(&state, record);
+
+        assert_eq!(
+            delivery_filter(Some(guard.short()), &launch_short),
+            Some(launch_short.as_str()),
+            "at launch the guard's address and the launch short agree"
+        );
+
+        // A restart mints a fresh session id...
+        let restarted = "bbbb2222-2222-4333-8444-555555555555";
+        guard.refresh_session(restarted);
+        let rotated_short = short_id(restarted);
+        assert_ne!(
+            rotated_short, launch_short,
+            "sanity: the session's own short really did change"
+        );
+
+        // ...and the delivery address does not follow it.
+        assert_eq!(
+            delivery_filter(Some(guard.short()), &rotated_short),
+            Some(launch_short.as_str()),
+            "mail addressed before the restart must still reach this run"
+        );
+    }
+
     // F2: the nesting guard.
 
     #[test]
@@ -1536,6 +1667,88 @@ mod tests {
                 .expect("utf8")
                 .contains("interactive"),
             "a headless worker is not advisory-only"
+        );
+    }
+
+    // NEW-3: a supervisor with no turn-signal socket stays *visible* but is
+    // refused as a nudge target, rather than being hidden from the registry
+    // (which cured the silent nudge by making the session invisible).
+
+    #[test]
+    fn an_unsupervised_wrap_is_not_a_nudge_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+
+        let record =
+            record_for("abcdef12-3456-4789-8abc-def012345678", &repo, Verb::Wrap).unreachable();
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+
+        // Still listed -- an operator must be able to see it running.
+        let listed = list(&state);
+        assert_eq!(listed.len(), 1, "an unreachable session is not hidden");
+        assert!(!listed[0].0.reachable);
+        assert_eq!(listed[0].1, Liveness::Live);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = NudgeArgs {
+            prefix: short.clone(),
+            message: Some("please look at this".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect_err("a session with no signal socket cannot act on a nudge");
+        let msg = err.to_string();
+        assert!(msg.contains("not reachable"), "got {msg}");
+        assert!(
+            msg.contains("turn-signal socket"),
+            "must say why, not just that: {msg}"
+        );
+        assert!(
+            msg.contains("zirv ctx send"),
+            "must offer the thing that does work: {msg}"
+        );
+
+        // Nothing was queued and no marker was left behind to be claimed by
+        // whatever registers under this address next.
+        let slug = super::super::state::repo_slug(&repo);
+        assert!(
+            super::super::mail::list(&state, &slug, None, Some(&short))
+                .expect("list")
+                .is_empty()
+        );
+        assert!(!nudge_marker_path(&state, &short).exists());
+    }
+
+    /// A record written by a build that predates the field must still parse,
+    /// and must be treated as an ordinary reachable session.
+    #[test]
+    fn a_record_without_the_reachable_field_parses_as_reachable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        super::super::state::create_private_dir_all(&state.sessions()).expect("mkdir");
+        let legacy = format!(
+            r#"{{"session":"abcdef12-3456-4789-8abc-def012345678","short":"abcdef12",
+               "agent":"claude","repo":"/work/repo","repo_slug":"-work-repo",
+               "verb":"wrap","pid":{},"started_at":1700000000}}"#,
+            std::process::id()
+        );
+        std::fs::write(state.sessions().join("abcdef12.json"), legacy).expect("write");
+
+        let found = list(&state);
+        assert_eq!(found.len(), 1, "the legacy record still parses: {found:?}");
+        assert!(
+            found[0].0.reachable,
+            "an older record has no opinion, so it is treated as reachable"
         );
     }
 

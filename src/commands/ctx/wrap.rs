@@ -900,14 +900,6 @@ pub fn run_with(
 
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = session.unwrap_or_else(super::event::SessionId::new_v4);
-    // Best-effort registration, released right after `pump` returns below --
-    // `wrap`'s own control flow always funnels through that one point,
-    // unlike `exec`'s scattered early returns, so a single release suffices
-    // here.
-    let mut session_guard = super::sessions::SessionGuard::register(
-        &state_dir,
-        super::sessions::Record::new(session.as_str(), adapter.name(), repo, verb),
-    );
 
     // `--no-supervise` promises pure passthrough (its own help text says so),
     // and so does a wrapped command that matches no adapter: injecting this
@@ -989,23 +981,37 @@ pub fn run_with(
         }
     };
 
-    // N6: a `wrap` session is only a reachable nudge target when it has a
-    // bound turn-signal socket. The pump claims nudge markers exclusively
-    // from its turn-signal arm (`if let Some(server) = server && ...`), so
-    // with no socket -- `--no-supervise`, or a bind that failed -- a marker
-    // written for this session is *never* claimed: `zirv ctx status` listed
-    // it, `zirv ctx nudge` happily resolved it, and the nudge then silently
-    // did nothing forever, leaving an orphaned marker behind. Better to not
-    // advertise a session that cannot answer.
+    // Registered here, after the bind, rather than earlier: the record has to
+    // say whether this session can act on a wake-up, and only the bind
+    // result knows.
     //
-    // Deliberately keyed on the socket rather than on `--no-supervise`/
-    // `--simple` as such: `--simple` only skips prompt injection, still
-    // binds a socket and still claims markers, so it stays a legitimate
-    // (advisory) target; and a bind failure under a plain `wrap` is just as
-    // unreachable as `--no-supervise` is.
-    if server.is_none() {
-        session_guard.release();
-    }
+    // N6/NEW-3: `wrap` claims nudge markers exclusively from its turn-signal
+    // arm (`if let Some(server) = server && ...`), so with no socket --
+    // `--no-supervise`, or a bind that failed -- a marker written for this
+    // session is never claimed, and the nudge silently does nothing forever.
+    // The first fix for that dropped such sessions from the registry
+    // entirely, which cured the silent nudge by making the session
+    // *invisible*: it disappeared from `zirv ctx status` too, so an operator
+    // whose `wrap` had failed to bind could not see it running at all.
+    // Recorded as `reachable: false` instead -- `status` shows it as
+    // `unreachable`, and `nudge` refuses it with a reason.
+    //
+    // Keyed on the socket rather than on `--no-supervise`/`--simple` as
+    // such: `--simple` only skips prompt injection, still binds a socket and
+    // still claims markers, so it stays a legitimate (advisory) target; and
+    // a bind failure under a plain `wrap` is exactly as unreachable as
+    // `--no-supervise` is.
+    //
+    // Best-effort, released right after `pump` returns below -- `wrap`'s own
+    // control flow always funnels through that one point, unlike `exec`'s
+    // scattered early returns, so a single release suffices here.
+    let record = super::sessions::Record::new(session.as_str(), adapter.name(), repo, verb);
+    let record = if server.is_some() {
+        record
+    } else {
+        record.unreachable()
+    };
+    let mut session_guard = super::sessions::SessionGuard::register(&state_dir, record);
 
     // Deliberately not derived from `session`: that id belongs to wrap, not to
     // the agent it spawns, so a derived path names a file nobody ever writes.

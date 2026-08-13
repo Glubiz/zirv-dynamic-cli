@@ -163,10 +163,9 @@ pub fn run_with<W: Write>(
         // session has actually started to see it.
         let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
             if composed.is_some() && cfg.mail.enabled {
-                let for_session = registry_short
-                    .clone()
-                    .unwrap_or_else(|| session_short.clone());
-                super::mail::list(&state, &mail_slug, Some(adapter.name()), Some(&for_session))
+                let for_session =
+                    super::sessions::delivery_filter(registry_short.as_deref(), &session_short);
+                super::mail::list(&state, &mail_slug, Some(adapter.name()), for_session)
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -1110,10 +1109,13 @@ mod tests {
         // The spawned script inherits the real process environment (not the
         // `env` closure above, which only feeds `CtxConfig::load`), so these
         // two have to be real process env vars.
-        unsafe {
-            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
-            std::env::set_var("CYCLE_MARKER", &marker);
-        }
+        // NEW-1: a guard, so the cleanup survives a panicking assertion (and
+        // the `writer.join().expect(...)` further down, which is exactly how
+        // this pattern leaked before).
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+            ("CYCLE_MARKER", marker.to_str()),
+        ]);
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
@@ -1149,10 +1151,6 @@ mod tests {
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         writer.join().expect("writer thread");
-        unsafe {
-            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
-            std::env::remove_var("CYCLE_MARKER");
-        }
         assert_eq!(code.expect("all three cycles run"), 0);
 
         // Each cycle's own session id, from `zirv ctx loop`'s own "cycle N
@@ -1219,10 +1217,13 @@ mod tests {
             format!("sh {}", script.display()),
         );
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        unsafe {
-            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
-            std::env::set_var("CYCLE_MARKER", &marker);
-        }
+        // NEW-1: a guard, so the cleanup survives a panicking assertion (and
+        // the `writer.join().expect(...)` further down, which is exactly how
+        // this pattern leaked before).
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+            ("CYCLE_MARKER", marker.to_str()),
+        ]);
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
@@ -1267,10 +1268,6 @@ mod tests {
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         writer.join().expect("writer thread");
-        unsafe {
-            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
-            std::env::remove_var("CYCLE_MARKER");
-        }
         assert_eq!(
             code.expect("all three cycles run, none killed by the nudge"),
             0

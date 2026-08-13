@@ -26,7 +26,7 @@ fn format_age(seconds: u64) -> String {
 }
 
 /// N7: one line per registry record (`<short> <agent> <verb> pid <pid> <age>
-/// live|stale <repo_slug>`), plus one line for any `s/*.sock` file that has
+/// live|unreachable|stale <repo_slug>`), plus one line for any `s/*.sock` file that has
 /// no matching registry record -- an older zirv binary that predates the
 /// registry still wrote sockets, and a mixed-version machine must not make
 /// those supervisors disappear from `status` entirely, just less detailed.
@@ -49,9 +49,16 @@ fn sessions_lines(state: &StateDir, now: u64) -> Vec<String> {
                 record.verb,
                 record.pid,
                 format_age(now.saturating_sub(record.started_at)),
-                match liveness {
-                    Liveness::Live => "live",
-                    Liveness::Stale => "stale",
+                // NEW-3: `unreachable` is a third state, not a flavour of
+                // live: the process is running, but it bound no turn-signal
+                // socket, so it can never notice a `zirv ctx nudge`. Showing
+                // it as plain `live` invited an operator to nudge something
+                // that would silently ignore them. A stale record still
+                // reports stale -- being gone outranks being unreachable.
+                match (liveness, record.reachable) {
+                    (Liveness::Stale, _) => "stale",
+                    (Liveness::Live, true) => "live",
+                    (Liveness::Live, false) => "unreachable",
                 },
                 record.repo_slug,
             )
@@ -540,6 +547,52 @@ mod tests {
     }
 
     // N7: the registry-backed `sessions:` block and the `memory:` line.
+
+    /// NEW-3: a `wrap` that bound no turn-signal socket is running but
+    /// cannot answer a nudge. It used to be dropped from the registry
+    /// outright, so it disappeared from `status` too and an operator whose
+    /// session had failed to bind could not see it at all. It must be
+    /// visible, and visibly different from a healthy one.
+    #[test]
+    fn status_shows_an_unreachable_session_rather_than_hiding_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let repo = tmp.path().join("repo");
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "abcdef12-3456-4789-8abc-def012345678",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Wrap,
+        )
+        .unreachable();
+        let short = record.short.clone();
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        let line = text
+            .lines()
+            .find(|l| l.contains(&short))
+            .unwrap_or_else(|| panic!("the session must still be listed: {text}"));
+        assert!(
+            line.contains("unreachable"),
+            "and must be marked unreachable: {line}"
+        );
+        assert!(
+            !line.contains("  live  "),
+            "it is not a healthy live session: {line}"
+        );
+        assert!(line.contains("wrap"), "still names the verb: {line}");
+        assert!(!text.contains("no supervised sessions"));
+    }
 
     #[test]
     fn status_lists_each_live_session_with_its_agent_verb_and_age() {

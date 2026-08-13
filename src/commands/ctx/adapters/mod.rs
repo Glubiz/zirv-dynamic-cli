@@ -602,17 +602,21 @@ mod tests {
 
         // Temporarily put the directory on PATH so the bare name resolves the
         // way the shell would, with `.PY` advertised on PATHEXT.
+        //
+        // NEW-1: a guard, not a manual restore. The restore used to sit after
+        // an `expect_err`, so a failing resolution left this process with a
+        // mangled `PATH` and a `PATHEXT` of `.EXE;.CMD;.PY` -- the highest
+        // blast radius of any leak in the suite, since every later test that
+        // spawns anything resolves its program through both.
         let path = std::env::var("PATH").unwrap_or_default();
-        let pathext = std::env::var("PATHEXT").unwrap_or_default();
-        unsafe {
-            std::env::set_var("PATH", format!("{};{}", dir.path().display(), path));
-            std::env::set_var("PATHEXT", ".EXE;.CMD;.PY");
-        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "PATH",
+                Some(format!("{};{}", dir.path().display(), path).as_str()),
+            ),
+            ("PATHEXT", Some(".EXE;.CMD;.PY")),
+        ]);
         let err = resolve_program("shim-agent").expect_err("no launcher for .py");
-        unsafe {
-            std::env::set_var("PATH", path);
-            std::env::set_var("PATHEXT", pathext);
-        }
 
         assert!(err.contains("shim-agent.py"), "the error names it: {err}");
         assert!(err.contains("shim-agent"), "and what was asked for: {err}");
