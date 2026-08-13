@@ -52,10 +52,45 @@ use super::CtxResult;
 /// scroll region is not, and that part needs no row number.
 const EMERGENCY_RESET: &[u8] = b"\x1b[r\x1b[?25h";
 
+/// What the dashboard owes the terminal on the way out, in the order a
+/// terminal wants it: show the cursor again (ratatui hides it on every frame
+/// it draws and `LeaveAlternateScreen` does **not** put it back), un-fence
+/// the scroll region, then leave the alternate screen.
+///
+/// A fixed constant for the same reason `EMERGENCY_RESET` is one: this runs
+/// from a console-control/signal handler as well as from the ordinary
+/// teardown path, and formatting there is not async-signal-safe. Shared by
+/// both so the panic hook, the external-kill handler and `teardown_terminal`
+/// can never drift apart -- the pre-F4 hook wrote
+/// `emergency_reset_bytes(false)`, which is the *empty* slice, and no path at
+/// all ever showed the cursor again.
+const DASH_RESET: &[u8] = b"\x1b[?25h\x1b[r\x1b[?1049l";
+
 /// Whether the chrome bar currently owns a reserved row, and therefore
 /// whether the handler owes the terminal a scroll-region reset. Set by `wrap`
 /// when it writes the scroll region, cleared when it resets the bar.
 static BAR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether a dashboard currently owns the alternate screen, and therefore
+/// whether the emergency handler owes the terminal [`DASH_RESET`]. Set by
+/// `dash::run_dashboard` right after it enters the alternate screen, cleared
+/// on every exit arm.
+static DASH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_dash_active(active: bool) {
+    DASH_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+pub fn dash_active() -> bool {
+    DASH_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// The bytes that put a terminal back after a dashboard session: cursor
+/// shown, scroll region reset, alternate screen left. Used by the dashboard's
+/// own teardown, its panic hook, and the external-kill handler alike.
+pub fn dash_reset_bytes() -> &'static [u8] {
+    DASH_RESET
+}
 
 /// Installed exactly once, however many guards are entered.
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -88,6 +123,42 @@ pub fn install_console_restore_handler() -> bool {
     true
 }
 
+/// Stashes the console's modes *as they are right now*, for a caller that
+/// puts the terminal into raw mode without going through `RawGuard` -- the
+/// dashboard uses crossterm's own `enable_raw_mode`, so nothing would
+/// otherwise ever fill the stash and the restore handler would have nothing
+/// to put back. Write-once like `stash_console_state` itself (it is the same
+/// stash), so calling it after a `RawGuard` is already up cannot overwrite
+/// the genuinely-original modes with already-raw ones. Returns whether this
+/// call did the stashing; a terminal-less process simply stashes nothing.
+#[cfg(windows)]
+pub fn stash_current_console() -> bool {
+    let Ok((input, output)) = windows::std_handles(STDIN_FD) else {
+        return false;
+    };
+    let (Ok(saved_input), Ok(saved_output)) =
+        (windows::console_mode(input), windows::console_mode(output))
+    else {
+        return false;
+    };
+    stash_console_state(input as usize, output as usize, saved_input, saved_output)
+}
+
+#[cfg(unix)]
+pub fn stash_current_console() -> bool {
+    // SAFETY: `saved` is only read after a successful tcgetattr.
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(STDIN_FD, &mut saved) } != 0 {
+        return false;
+    }
+    stash_console_state(STDIN_FD, saved)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn stash_current_console() -> bool {
+    false
+}
+
 /// The handler body, shared by both platforms. Async-signal-safe: no
 /// allocation, no locks, no formatting -- a raw write of a constant byte
 /// string and a direct mode-restoring syscall, both taken from state that was
@@ -96,6 +167,12 @@ fn restore_console_from_handler() {
     let reset = emergency_reset_bytes(bar_active());
     if !reset.is_empty() {
         write_stdout_raw(reset);
+    }
+    // A dashboard owns the *alternate* screen on top of whatever the bar
+    // did: without this the user is killed out of a full-screen TUI into a
+    // shell with no cursor, still on the alternate buffer.
+    if dash_active() {
+        write_stdout_raw(DASH_RESET);
     }
     restore_stashed_console_modes();
 }
@@ -790,6 +867,49 @@ mod tests {
         // Fixed, allocation-free bytes: this may run inside a POSIX signal
         // handler, where formatting a row number would not be safe.
         assert_eq!(owed, b"\x1b[r\x1b[?25h");
+    }
+
+    /// F4: the dashboard's own exit sequence. The pre-fix panic hook wrote
+    /// `emergency_reset_bytes(false)` -- the empty slice -- and no exit path
+    /// anywhere showed the cursor again, even though ratatui hides it on
+    /// every frame and `LeaveAlternateScreen` does not restore it. One
+    /// constant, shared by the teardown, the panic hook and the
+    /// external-kill handler, so the three cannot drift.
+    #[test]
+    fn the_dash_reset_shows_the_cursor_and_leaves_the_alternate_screen() {
+        let reset = dash_reset_bytes();
+        assert!(
+            reset.windows(6).any(|w| w == b"\x1b[?25h"),
+            "the cursor must be shown again: {reset:?}"
+        );
+        assert!(
+            reset.windows(8).any(|w| w == b"\x1b[?1049l"),
+            "the alternate screen must be left: {reset:?}"
+        );
+        assert!(
+            reset.windows(3).any(|w| w == b"\x1b[r"),
+            "the scroll region must be un-fenced: {reset:?}"
+        );
+        assert!(
+            !reset.is_empty(),
+            "the pre-F4 hook wrote an empty slice here"
+        );
+    }
+
+    #[test]
+    fn the_dash_active_flag_round_trips() {
+        struct DashFlagGuard(bool);
+        impl Drop for DashFlagGuard {
+            fn drop(&mut self) {
+                set_dash_active(self.0);
+            }
+        }
+        let _restore = DashFlagGuard(dash_active());
+
+        set_dash_active(true);
+        assert!(dash_active());
+        set_dash_active(false);
+        assert!(!dash_active());
     }
 
     #[test]

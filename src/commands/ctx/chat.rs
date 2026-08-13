@@ -299,14 +299,15 @@ pub fn run_with<W: Write, E: Write>(
         &cfg.dash,
         args.simple,
     ) {
-        let pane = PaneSpec {
-            agent_name: launch.agent_name,
-            argv: launch.argv,
-            role: launch.role,
-            verb: launch.verb,
-            session_id: session.as_str().to_string(),
-            title: "orch".to_string(),
-        };
+        let pane = dash_orchestrator_pane(
+            adapter.as_ref(),
+            launch,
+            &cfg,
+            &state,
+            repo,
+            session.as_str(),
+            args.simple,
+        );
         return dash::run_dashboard(&cfg, repo, &env, &state, pane);
     }
 
@@ -345,6 +346,79 @@ pub fn run_with<W: Write, E: Write>(
         Some(session),
         launch.verb,
     )
+}
+
+/// The dashboard's orchestrator pane, composed prompt and all.
+///
+/// F3: the dashboard branch used to hand `dash::run_dashboard` the bare
+/// `build_launch` argv, so the one session a human actually talks to was the
+/// only session in the whole codebase that got **no** zirv prompt at all --
+/// no shipped default layer, no harness meta-teaching, no user/repo/memory
+/// layers, and no injection log line -- while the `wrap` fallback below and
+/// every worker pane the dashboard spawns all get the full recipe. An
+/// operator could not tell the two launch paths apart from the outside, and
+/// the orchestrator is precisely the session that is supposed to know how to
+/// delegate.
+///
+/// This is `wrap::run_with`'s own recipe, in its order and with its
+/// arguments: memory lines, `prompt::compose` (as an `Orchestrator`),
+/// `merge_command_line_prompt` so an operator's own `--append-system-prompt`
+/// in `--` extras is folded in rather than silently duplicated,
+/// `injection_args_for_session`, then `log_injection`.
+///
+/// Deliberately **no** `prompt::with_mail_layer`, exactly like the `wrap`
+/// path it mirrors: an interactive Orchestrator session is never given mail
+/// bodies, only the one-line unread-count advisory the dashboard header
+/// already carries. Only a headless Worker session (`exec`/`loop`, and the
+/// worker panes `dash::fulfill_spawn_request` builds) is body-delivered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dash_orchestrator_pane(
+    adapter: &dyn AgentAdapter,
+    launch: ChatLaunch,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    simple: bool,
+) -> PaneSpec {
+    let slug = super::state::repo_slug(repo);
+    let memory_entries =
+        super::memory::render_for_prompt(state, &slug, cfg, super::state::now_secs());
+    let composed = super::prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        simple,
+        &cfg.prompt,
+        launch.role,
+        &memory_entries,
+        cfg.memory.max_injected_bytes,
+    );
+    let (mut argv, composed) =
+        super::prompt::merge_command_line_prompt(adapter, &launch.argv, composed, None);
+    let prompt_args = super::prompt::injection_args_for_session(
+        adapter,
+        &argv,
+        composed.as_ref(),
+        state,
+        session,
+    );
+    super::prompt::log_injection(
+        state,
+        "chat",
+        session,
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    );
+    argv.extend(prompt_args);
+
+    PaneSpec {
+        agent_name: launch.agent_name,
+        argv,
+        role: launch.role,
+        verb: launch.verb,
+        session_id: session.to_string(),
+        title: "orch".to_string(),
+    }
 }
 
 /// Splices `model_args` into `argv` immediately after the launch prefix --
@@ -515,6 +589,138 @@ mod tests {
         assert_eq!(
             build_launch(&adapter, Some("resume this"), &["--model".to_string()]).verb,
             crate::commands::ctx::sessions::Verb::Chat,
+        );
+    }
+
+    /// F3: the dashboard's orchestrator pane must carry the same composed
+    /// prompt the `wrap` fallback builds -- the shipped default layer proves
+    /// injection happened at all, and the harness meta-teaching layer proves
+    /// it happened as an *Orchestrator*. Before this fix the dashboard
+    /// branch handed `run_dashboard` the bare adapter argv, so the one
+    /// session a human talks to was the only unprompted one in the codebase.
+    #[test]
+    fn the_dash_orchestrator_pane_carries_the_composed_prompt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        // A binary that does not exist: the file-flag capability probe fails,
+        // so `injection_args_for_session` falls back to the inline
+        // `system_prompt_args` form and the prompt text itself is visible in
+        // argv -- which is what makes this assertable without a real agent.
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let launch = build_launch(&adapter, None, &[]);
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+        );
+
+        let argv = pane.argv.join(" ");
+        assert!(
+            argv.contains("zirv session conventions"),
+            "the shipped default layer proves injection happened: {argv}"
+        );
+        assert!(
+            argv.contains("zirv meta-harness"),
+            "an orchestrator session gets the harness delegation layer: {argv}"
+        );
+        assert_eq!(pane.role, PromptRole::Orchestrator);
+        assert_eq!(pane.verb, crate::commands::ctx::sessions::Verb::Chat);
+        assert_eq!(pane.title, "orch");
+        assert_eq!(
+            pane.argv.first().map(String::as_str),
+            Some("/nonexistent/fake-claude"),
+            "the launch program is still the adapter's own binary: {argv}"
+        );
+    }
+
+    /// The orchestrator is never body-delivered mail -- it gets the header's
+    /// one-line unread-count advisory instead. Same trust split `wrap`'s own
+    /// orchestrator path holds (it never calls `with_mail_layer` either);
+    /// only a headless Worker session is handed message bodies.
+    #[test]
+    fn the_dash_orchestrator_pane_is_never_given_mail_bodies() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "SECRET-MAIL-BODY-MARKER".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let launch = build_launch(&adapter, None, &[]);
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+        );
+
+        let argv = pane.argv.join(" ");
+        assert!(
+            !argv.contains("SECRET-MAIL-BODY-MARKER"),
+            "an interactive orchestrator never receives message bodies: {argv}"
+        );
+        assert!(
+            crate::commands::ctx::mail::list(&state, &slug, None, None)
+                .expect("list")
+                .len()
+                == 1,
+            "and nothing was consumed on its behalf either"
+        );
+    }
+
+    /// `--simple` promises no zirv-injected instruction at all. It also makes
+    /// the terminal dashboard-ineligible, so this path is unreachable in
+    /// practice today -- pinned anyway, because the flag's meaning must not
+    /// depend on which launch path happens to be taken.
+    #[test]
+    fn a_simple_dash_orchestrator_pane_carries_no_injected_prompt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let launch = build_launch(&adapter, None, &[]);
+        let plain_argv = launch.argv.clone();
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            true,
+        );
+        assert_eq!(
+            pane.argv, plain_argv,
+            "--simple leaves the adapter's own argv untouched"
         );
     }
 

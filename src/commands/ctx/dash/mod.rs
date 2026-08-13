@@ -232,13 +232,16 @@ const VIEW_ONLY_GLYPH: char = '\u{00b7}';
 /// listed a second time as a view-only row. Dead/stale registry entries
 /// (`Liveness::Stale`) are excluded outright: `sessions::list` already swept
 /// them from disk, and a dashboard has nothing useful to attach to or nudge
-/// there. `selected` indexes into the combined list this returns. Pure: no
-/// I/O of its own -- `registry` is whatever the caller already read via
-/// `sessions::list`.
+/// there. `selected` indexes into the combined list this returns; `focused`
+/// indexes into `panes` alone (see `ui::SidebarRow`'s own doc comment for
+/// why the two are separate), and is simply not marked when it is out of
+/// range -- an empty dashboard has nothing to focus. Pure: no I/O of its own
+/// -- `registry` is whatever the caller already read via `sessions::list`.
 fn assemble_sidebar(
     panes: &[PaneRowMeta],
     registry: &[(sessions::Record, sessions::Liveness)],
     selected: usize,
+    focused: usize,
 ) -> Vec<ui::SidebarRow> {
     let own_shorts: HashSet<&str> = panes.iter().map(|p| p.short.as_str()).collect();
 
@@ -251,8 +254,13 @@ fn assemble_sidebar(
             preview: p.preview.clone(),
             attached: true,
             selected: false,
+            focused: false,
         })
         .collect();
+
+    if let Some(row) = rows.get_mut(focused) {
+        row.focused = true;
+    }
 
     for (record, liveness) in registry {
         if *liveness != sessions::Liveness::Live {
@@ -268,6 +276,7 @@ fn assemble_sidebar(
             preview: String::new(),
             attached: false,
             selected: false,
+            focused: false,
         });
     }
 
@@ -275,6 +284,55 @@ fn assemble_sidebar(
         row.selected = true;
     }
     rows
+}
+
+/// Pure: one navigation action's effect on the `(selected, focused)` pair.
+///
+/// The split is the whole of F7. `selected` is the sidebar cursor over the
+/// *combined* row list (panes plus view-only registry rows) and is what a
+/// nudge is aimed at; `focused` is the pane whose grid is drawn and whose
+/// child gets every un-prefixed keystroke, so it may only ever name a pane.
+/// `prefix,Up`/`prefix,Down` therefore move `selected` alone -- walking onto
+/// a view-only row leaves the focused pane exactly where it was, rather than
+/// blanking the grid and swallowing all input the way a single shared index
+/// did. `prefix,Tab` and `prefix,<digit>` address panes, so they move both.
+///
+/// Every index stays clamped to something addressable: an empty dashboard
+/// (no panes at all) leaves both untouched.
+fn apply_navigation(
+    action: DashAction,
+    selected: usize,
+    focused: usize,
+    pane_count: usize,
+    total_rows: usize,
+) -> (usize, usize) {
+    match action {
+        DashAction::Switch(i) => {
+            if pane_count == 0 {
+                (selected, focused)
+            } else {
+                let target = i.min(pane_count - 1);
+                (target, target)
+            }
+        }
+        DashAction::NextPane => {
+            if pane_count == 0 {
+                (selected, focused)
+            } else {
+                let target = (focused + 1) % pane_count;
+                (target, target)
+            }
+        }
+        DashAction::SelectUp => (selected.saturating_sub(1), focused),
+        DashAction::SelectDown => {
+            if total_rows == 0 {
+                (selected, focused)
+            } else {
+                ((selected + 1).min(total_rows - 1), focused)
+            }
+        }
+        _ => (selected, focused),
+    }
 }
 
 /// `window::max_used_percentage`'s `0.0..=100.0` reading, rounded to the
@@ -433,33 +491,49 @@ fn push_error(errors: &mut Vec<String>, message: String) {
     }
 }
 
-/// Restores the shared terminal: leaves the alternate screen and disables
-/// raw mode. Idempotent (both crossterm calls are themselves idempotent) and
-/// called from every exit arm of `run_dashboard`, matching the `RawGuard`/
+/// Restores the shared terminal on the way out of `run_dashboard`: disables
+/// raw mode, then writes `term::dash_reset_bytes()` -- cursor shown, scroll
+/// region un-fenced, alternate screen left -- to **stdout**, which is the
+/// stream the alternate screen was entered on.
+///
+/// Showing the cursor is not optional and is not implied by leaving the
+/// alternate screen: ratatui hides it on every frame it draws, and
+/// `LeaveAlternateScreen` says nothing about cursor visibility, so before F4
+/// every clean exit handed the operator a shell with an invisible cursor.
+///
+/// Idempotent, and called from every exit arm, matching the `RawGuard`/
 /// `SessionGuard` precedent this plan's Global Constraints call for --
 /// `panic = "abort"` in the release profile means `Drop` is not a safety
 /// net here either.
 fn teardown_terminal() {
+    term::set_dash_active(false);
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(term::dash_reset_bytes());
+    let _ = stdout.flush();
+    // Belt and braces: crossterm's own sequence for the same thing, in case
+    // a future crossterm emits something extra alongside `\x1b[?1049l`.
+    // Leaving an alternate screen twice is a no-op.
+    let _ = execute!(stdout, LeaveAlternateScreen);
 }
 
-/// Bytes the panic hook writes directly to stderr before the process
-/// aborts: `\x1b[?1049l` leaves the alternate screen (the `LeaveAlternate
-/// Screen` sequence crossterm itself would emit), paired with `term::
-/// emergency_reset_bytes(false)` for the cursor-visibility/scroll-region
-/// reset every other supervisor's own emergency handler already writes.
-/// `false` because the dashboard never draws the `wrap`-style reserved
-/// status bar `bar_active()` tracks -- there is no bar to account for here.
-const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
-
+/// Puts the terminal back before the default hook prints its message and the
+/// process aborts. Three things the pre-F4 hook got wrong, all of which left
+/// a panicking dashboard's operator with an unusable console:
+///
+/// 1. Raw mode was never disabled, so the shell that inherited the console
+///    had no echo and no line editing.
+/// 2. It wrote `term::emergency_reset_bytes(false)`, which is the **empty**
+///    slice (see `term.rs`) -- so nothing was reset and the cursor was never
+///    shown again.
+/// 3. It wrote to stderr, but the alternate screen was entered on stdout.
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let mut stderr = io::stderr();
-        let _ = stderr.write_all(term::emergency_reset_bytes(false));
-        let _ = stderr.write_all(LEAVE_ALT_SCREEN);
-        let _ = stderr.flush();
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(term::dash_reset_bytes());
+        let _ = stdout.flush();
         default_hook(info);
     }));
 }
@@ -547,9 +621,35 @@ fn flatten_command(command: std::process::Command) -> Vec<String> {
     argv
 }
 
-/// Re-validates and fulfils one spawn request: gate refusal and adapter
-/// resolution first (a request is data, never authority -- the same checks
-/// an operator-issued `zirv ctx agent` invocation goes through), then builds
+/// The refusal text a prompt that would be misread as a flag gets. A request
+/// prompt is encoded *positionally* into `interactive_cmd`'s argv, so a
+/// prompt like `--dangerously-skip-permissions` would reach the real harness
+/// child as a flag rather than as the task text. Refused at the authority
+/// side -- here, where the pane is actually spawned -- rather than only at
+/// the requesting side, because a request is data, never authority.
+///
+/// Pure, so both ends of the channel (this one, and `agent.rs`'s own
+/// defense-in-depth check before it ever writes a request) can assert the
+/// same rule.
+pub(crate) fn argv_unsafe_prompt(prompt: &str) -> bool {
+    prompt.trim_start().starts_with('-')
+}
+
+pub(crate) const ARGV_GUARD_REFUSAL: &str = "prompt must not begin with '-' (argv injection guard)";
+
+/// Whether `a` and `b` name the same directory, canonicalising both when the
+/// filesystem allows it (a request carries whatever `cwd` the requester wrote
+/// down, which may be spelled differently from the dashboard's own repo path)
+/// and falling back to a literal comparison when it does not.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+/// Re-validates and fulfils one spawn request: the argv-safety guard, the
+/// requesting repo, the pane cap, the agent gate and adapter resolution
+/// first (a request is data, never authority -- the same checks an
+/// operator-issued `zirv ctx agent` invocation goes through), then builds
 /// a Worker pane's composed prompt and argv following `exec::run_with`'s own
 /// recipe (`memory::render_for_prompt` -> `prompt::compose` -> mail listing
 /// scoped to this fresh session's own short id -> `prompt::with_mail_layer`
@@ -575,6 +675,30 @@ fn fulfill_spawn_request(
     requests_dir: &Path,
     errors: &mut Vec<String>,
 ) -> Result<String, String> {
+    // Every one of these is checked before anything is spawned, resolved or
+    // written, in cheapest-and-most-hostile-first order.
+    if argv_unsafe_prompt(&req.prompt) {
+        return Err(ARGV_GUARD_REFUSAL.to_string());
+    }
+    // `cwd` used to be written by the requester and then never looked at.
+    // Honouring it would mean this dashboard spawning panes into a directory
+    // its operator never opened; ignoring it silently would mean a request
+    // from another repo quietly running here instead. Refusing is the honest
+    // contract, and it is the one the requester can see in the ack.
+    if !same_directory(&req.cwd, repo) {
+        return Err(format!(
+            "this dashboard only spawns panes in its own repo ({}); the request named {}",
+            repo.display(),
+            req.cwd.display()
+        ));
+    }
+    if panes.len() >= cfg.dash.max_panes {
+        return Err(format!(
+            "pane limit reached ({} panes, dash.max_panes = {})",
+            panes.len(),
+            cfg.dash.max_panes
+        ));
+    }
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
         return Err(reason);
     }
@@ -673,6 +797,19 @@ fn handle_spawn_requests(
         let Some(stem) = spawnreq::request_stem(&path) else {
             continue;
         };
+        // F10: claimed *before* fulfilment, not after. `take_requests` has
+        // already deleted the request file, and fulfilment (adapter
+        // resolution, a prompt file write, a real pty spawn) can easily
+        // outlast the requester's own ack timeout -- at which point the
+        // requester used to give up and run the same task headless as well,
+        // so one `zirv ctx agent` became two live sessions. A claim on disk
+        // is what lets that requester tell "nobody is listening" from "the
+        // dashboard has this, the answer is just slow". Cleaned up with the
+        // whole request directory on quit (`on_quit`), so a claim never
+        // outlives the dashboard that made it.
+        if let Err(e) = spawnreq::write_claim(requests_dir, &stem) {
+            push_error(errors, format!("spawn claim: {e}"));
+        }
         let ack = match fulfill_spawn_request(
             &req,
             panes,
@@ -790,6 +927,74 @@ pub fn mail_overlay_reduce(
             (Some(view), Some(ui::MailEffect::Consume(path)))
         }
         _ => (Some(view), None),
+    }
+}
+
+/// What confirming the spawn dialog asks the caller to do. `Submit` has
+/// already been split into its two required halves; `Notice` is a message for
+/// the header, with the dialog left open so the operator can fix what they
+/// typed rather than losing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnEffect {
+    Submit { agent: String, prompt: String },
+    Notice(String),
+}
+
+/// What a spawn line that cannot be used says. Both halves are required: an
+/// agent with no task is not a request, and a task with no agent has nowhere
+/// to go.
+pub(crate) const SPAWN_USAGE_NOTICE: &str =
+    "spawn: type <agent> <prompt>, e.g. `claude fix the failing tests`";
+
+/// Pure: one keystroke against the spawn dialog (`Ctrl+A s`), the same
+/// reducer shape every other overlay in this module already uses. `Enter`
+/// splits the typed line at its first run of whitespace -- first token is the
+/// agent name, the whole remainder is the prompt -- and closes the dialog;
+/// anything missing a half keeps the dialog open with a notice. `Esc`
+/// cancels outright.
+///
+/// Deliberately does **not** re-implement the argv guard, the pane cap or the
+/// agent gate: a submitted draft is routed through the exact same
+/// `fulfill_spawn_request` path a pane's own `zirv ctx agent` request takes,
+/// so there is one place those rules live and one place they can be wrong.
+pub fn spawn_overlay_reduce(
+    mut draft: ui::SpawnDraft,
+    key: KeyEvent,
+) -> (Option<ui::SpawnDraft>, Option<SpawnEffect>) {
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Enter => {
+            let line = draft.input.trim();
+            let Some((agent, prompt)) = line.split_once(char::is_whitespace) else {
+                return (
+                    Some(draft),
+                    Some(SpawnEffect::Notice(SPAWN_USAGE_NOTICE.to_string())),
+                );
+            };
+            let prompt = prompt.trim();
+            if agent.is_empty() || prompt.is_empty() {
+                return (
+                    Some(draft),
+                    Some(SpawnEffect::Notice(SPAWN_USAGE_NOTICE.to_string())),
+                );
+            }
+            (
+                None,
+                Some(SpawnEffect::Submit {
+                    agent: agent.to_string(),
+                    prompt: prompt.to_string(),
+                }),
+            )
+        }
+        KeyCode::Backspace => {
+            draft.input.pop();
+            (Some(draft), None)
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            draft.input.push(c);
+            (Some(draft), None)
+        }
+        _ => (Some(draft), None),
     }
 }
 
@@ -1191,11 +1396,57 @@ fn is_delivery_eligible(verb: sessions::Verb, state: &PaneState) -> bool {
     verb == sessions::Verb::Dash && matches!(state, PaneState::Idle)
 }
 
+/// One pane's share of a mail sweep: **at most one** message, injected
+/// visibly and consumed only if the injection itself succeeded. Returns
+/// whether anything was delivered.
+///
+/// One per tick, not the whole mailbox (F8): the idle gate is evaluated once,
+/// before the first injection, and injecting immediately puts the pane back
+/// to work -- so the second and later messages of a batch used to be typed
+/// into a session that was already mid-turn, which is exactly what the
+/// idle gate exists to prevent. The remainder stays on disk, unread, and the
+/// next tick's sweep sees it again once the pane is genuinely idle.
+///
+/// Takes an `Injector` rather than a `Pane` so the one-per-tick rule is
+/// testable without a real pty, the same seam `deliver_and_consume` already
+/// uses.
+fn sweep_one_pane<I: Injector>(
+    injector: &mut I,
+    state: &StateDir,
+    slug: &str,
+    agent: &str,
+    short: &str,
+    errors: &mut Vec<String>,
+) -> bool {
+    let messages = match mail::list(state, slug, Some(agent), Some(short)) {
+        Ok(m) => m,
+        Err(e) => {
+            push_error(errors, format!("mail sweep: {e}"));
+            return false;
+        }
+    };
+    let Some((path, msg)) = messages.into_iter().next() else {
+        return false;
+    };
+    let label = format!(
+        "mail from {}/{}",
+        msg.from_agent,
+        sessions::short_id(&msg.from_session)
+    );
+    match deliver_and_consume(injector, state, slug, &label, &path, &msg.body) {
+        Ok(()) => true,
+        Err(e) => {
+            push_error(errors, format!("mail sweep: {e}"));
+            false
+        }
+    }
+}
+
 /// Once-per-tick mail sweep: every attached worker pane that is `Idle` gets
-/// its own unread mail (the same per-session visibility `unread_counts`
-/// already applies: addressed to its agent, and either undirected or
-/// addressed to its own short id) injected visibly, one message at a time,
-/// each consumed only after a successful injection.
+/// the oldest of its own unread messages (the same per-session visibility
+/// `unread_counts` already applies: addressed to its agent, and either
+/// undirected or addressed to its own short id) injected visibly, and
+/// consumed only after that injection succeeded.
 fn mail_sweep(
     panes: &mut [Pane],
     cfg: &CtxConfig,
@@ -1213,23 +1464,7 @@ fn mail_sweep(
         }
         let agent = pane.agent().to_string();
         let short = pane.short().to_string();
-        let messages = match mail::list(state, &slug, Some(&agent), Some(&short)) {
-            Ok(m) => m,
-            Err(e) => {
-                push_error(errors, format!("mail sweep: {e}"));
-                continue;
-            }
-        };
-        for (path, msg) in messages {
-            let label = format!(
-                "mail from {}/{}",
-                msg.from_agent,
-                sessions::short_id(&msg.from_session)
-            );
-            if let Err(e) = deliver_and_consume(pane, state, &slug, &label, &path, &msg.body) {
-                push_error(errors, format!("mail sweep: {e}"));
-            }
-        }
+        sweep_one_pane(pane, state, &slug, &agent, &short, errors);
     }
 }
 
@@ -1328,9 +1563,13 @@ pub fn run_dashboard(
 ) -> CtxResult<i32> {
     let mut errors: Vec<String> = Vec::new();
 
-    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    // Mutable, and kept current by the `Event::Resize` arm below (F6): the
+    // zoom handler resizes every pane against `full`, so a `full` frozen at
+    // startup would restore panes to the terminal's *launch* geometry after
+    // any resize rather than to what it is now.
+    let (mut term_cols, mut term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let sidebar_cols = cfg.dash.sidebar_cols;
-    let full = Rect::new(0, 0, term_cols, term_rows);
+    let mut full = Rect::new(0, 0, term_cols, term_rows);
     let main = effective_main(full, sidebar_cols, false);
 
     let agent_name = first.agent_name.clone();
@@ -1392,6 +1631,15 @@ pub fn run_dashboard(
     .unwrap_or_default();
 
     install_panic_hook();
+    // F4(c): an external kill (`taskkill`, a Ctrl-Break, a closed window)
+    // reaches neither the panic hook nor any exit arm below. `RawGuard::
+    // enter` arms this for `wrap`; the dashboard drives raw mode through
+    // crossterm instead, so it has to stash the pre-raw console modes and
+    // install the same handler itself. Both are write-once/idempotent, and
+    // the return values are advisory only -- a process with no console of
+    // its own stashes nothing and still starts.
+    let _ = term::stash_current_console();
+    let _ = term::install_console_restore_handler();
     if let Err(e) = enable_raw_mode() {
         let _ = std::panic::take_hook();
         return Err(format!("dashboard: enable_raw_mode failed: {e}").into());
@@ -1401,6 +1649,10 @@ pub fn run_dashboard(
         let _ = std::panic::take_hook();
         return Err(format!("dashboard: EnterAlternateScreen failed: {e}").into());
     }
+    // From here on the emergency handler owes the terminal the alternate
+    // screen back, not just the console modes. Cleared by `teardown_terminal`
+    // on every exit arm below.
+    term::set_dash_active(true);
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = match Terminal::new(backend) {
@@ -1412,7 +1664,12 @@ pub fn run_dashboard(
         }
     };
 
+    // Two indices, not one (F7): `selected` walks the combined sidebar
+    // (panes plus view-only registry rows) and is what a nudge is aimed at;
+    // `focused` is the pane on screen and under the keyboard, and only ever
+    // names a pane. See `apply_navigation`.
     let mut selected: usize = 0;
+    let mut focused: usize = 0;
     let mut zoomed = false;
     let mut prefix_armed = false;
     let mut overlay = if restore_candidates.is_empty() {
@@ -1431,24 +1688,28 @@ pub fn run_dashboard(
         mail_sweep(&mut panes, cfg, state, repo, &mut errors);
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
 
-        {
-            let poll_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
-            let poll_main = effective_main(
-                Rect::new(0, 0, poll_size.0, poll_size.1),
+        // The geometry any pane spawned during this tick gets -- the terminal
+        // as it is now, at this tick's zoom level. Shared by the request
+        // channel below and the `Ctrl+A s` spawn dialog.
+        let pane_size = {
+            let now_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+            let m = effective_main(
+                Rect::new(0, 0, now_size.0, now_size.1),
                 sidebar_cols,
                 zoomed,
             );
-            handle_spawn_requests(
-                &requests_dir,
-                &mut panes,
-                &mut nudge_queues,
-                cfg,
-                state,
-                repo,
-                (poll_main.width.max(1), poll_main.height.max(1)),
-                &mut errors,
-            );
-        }
+            (m.width.max(1), m.height.max(1))
+        };
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut nudge_queues,
+            cfg,
+            state,
+            repo,
+            pane_size,
+            &mut errors,
+        );
 
         // Facts + sidebar rows, computed BEFORE input handling: the Nudge
         // dialog's attached-vs-view-only routing and the SelectUp/SelectDown
@@ -1466,8 +1727,17 @@ pub fn run_dashboard(
             &dashboard_short,
             Instant::now(),
         );
-        let rows = assemble_sidebar(&build_pane_rows(&panes), &facts_cache.registry, selected);
+        // A pane can have gone away (or arrived) since the last tick, so both
+        // indices are re-clamped before anything reads them.
+        focused = focused.min(panes.len().saturating_sub(1));
+        let rows = assemble_sidebar(
+            &build_pane_rows(&panes),
+            &facts_cache.registry,
+            selected,
+            focused,
+        );
         let total_rows = rows.len();
+        selected = selected.min(total_rows.saturating_sub(1));
 
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
@@ -1485,10 +1755,49 @@ pub fn run_dashboard(
                                 KeyCode::Esc => {}
                                 _ => overlay = ui::Overlay::QuitConfirm(working),
                             },
-                            ui::Overlay::Spawn(d) => match key.code {
-                                KeyCode::Esc => {}
-                                _ => overlay = ui::Overlay::Spawn(d),
-                            },
+                            ui::Overlay::Spawn(draft) => {
+                                let (next, effect) = spawn_overlay_reduce(draft, key);
+                                overlay = match next {
+                                    Some(d) => ui::Overlay::Spawn(d),
+                                    None => ui::Overlay::None,
+                                };
+                                match effect {
+                                    Some(SpawnEffect::Notice(note)) => {
+                                        push_error(&mut errors, note)
+                                    }
+                                    // Straight through the same validation
+                                    // and spawn path a pane's own `zirv ctx
+                                    // agent` request takes -- argv guard,
+                                    // repo check, pane cap, agent gate --
+                                    // rather than a second, parallel one.
+                                    Some(SpawnEffect::Submit { agent, prompt }) => {
+                                        let req = spawnreq::SpawnRequest {
+                                            agent,
+                                            prompt,
+                                            cwd: repo.to_path_buf(),
+                                            requested_by: dashboard_short.clone(),
+                                        };
+                                        match fulfill_spawn_request(
+                                            &req,
+                                            &mut panes,
+                                            &mut nudge_queues,
+                                            cfg,
+                                            state,
+                                            repo,
+                                            pane_size,
+                                            &requests_dir,
+                                            &mut errors,
+                                        ) {
+                                            Ok(short) => push_error(
+                                                &mut errors,
+                                                format!("spawned {} as {short}", req.agent),
+                                            ),
+                                            Err(reason) => push_error(&mut errors, reason),
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
                             ui::Overlay::Restore(view) => {
                                 let (next, effect) = restore_overlay_reduce(view, key);
                                 overlay = match next {
@@ -1505,7 +1814,7 @@ pub fn run_dashboard(
                                                 cfg,
                                                 state,
                                                 repo,
-                                                size,
+                                                pane_size,
                                                 &requests_dir,
                                                 &mut errors,
                                             );
@@ -1582,44 +1891,41 @@ pub fn run_dashboard(
                         prefix_armed = armed;
                         match verdict {
                             InputVerdict::Pending => {}
+                            // Typing always reaches the *focused* pane, never
+                            // the merely selected sidebar row (F7): walking
+                            // the sidebar onto a view-only session must not
+                            // swallow the operator's keystrokes.
                             InputVerdict::ToChild(bytes) => {
                                 if !bytes.is_empty()
-                                    && let Some(pane) = panes.get_mut(selected)
+                                    && let Some(pane) = panes.get_mut(focused)
                                     && let Err(e) = pane.write_input(&bytes)
                                 {
                                     push_error(&mut errors, format!("write_input: {e}"));
                                 }
                             }
                             InputVerdict::Dash(DashAction::LiteralPrefix) => {
-                                if let Some(pane) = panes.get_mut(selected)
+                                if let Some(pane) = panes.get_mut(focused)
                                     && let Err(e) = pane.write_input(&literal_prefix_bytes())
                                 {
                                     push_error(&mut errors, format!("write_input: {e}"));
                                 }
                             }
-                            InputVerdict::Dash(DashAction::Switch(i)) => {
-                                if !panes.is_empty() {
-                                    selected = i.min(panes.len() - 1);
-                                }
-                            }
-                            InputVerdict::Dash(DashAction::NextPane) => {
-                                if !panes.is_empty() {
-                                    selected = (selected + 1) % panes.len();
-                                }
-                            }
-                            InputVerdict::Dash(DashAction::SelectUp) => {
-                                selected = selected.saturating_sub(1);
-                            }
-                            InputVerdict::Dash(DashAction::SelectDown) => {
-                                // Clamped against the *combined* row count
-                                // (attached panes plus view-only registry
-                                // rows), not just `panes.len()`: Task 9's
-                                // Nudge dialog has to be able to select a
-                                // view-only row to route a nudge through
-                                // `sessions::run_nudge_with`.
-                                if total_rows > 0 {
-                                    selected = (selected + 1).min(total_rows - 1);
-                                }
+                            // Switch/NextPane address panes, so they move
+                            // both indices; SelectUp/SelectDown only walk the
+                            // combined sidebar. All four in one pure place.
+                            InputVerdict::Dash(
+                                action @ (DashAction::Switch(_)
+                                | DashAction::NextPane
+                                | DashAction::SelectUp
+                                | DashAction::SelectDown),
+                            ) => {
+                                (selected, focused) = apply_navigation(
+                                    action,
+                                    selected,
+                                    focused,
+                                    panes.len(),
+                                    total_rows,
+                                );
                             }
                             InputVerdict::Dash(DashAction::Zoom) => {
                                 zoomed = !zoomed;
@@ -1680,8 +1986,16 @@ pub fn run_dashboard(
                     }
                 }
                 Ok(Event::Resize(cols, term_h)) => {
-                    let new_full = Rect::new(0, 0, cols, term_h);
-                    let m = effective_main(new_full, sidebar_cols, zoomed);
+                    // F6: the loop's own idea of the terminal is updated
+                    // here, not just used locally. The zoom handler and the
+                    // fallback size of every `crossterm::terminal::size`
+                    // call below read these, so leaving them at the startup
+                    // geometry made un-zooming after a resize restore panes
+                    // to the size the terminal had at launch.
+                    term_cols = cols;
+                    term_rows = term_h;
+                    full = Rect::new(0, 0, cols, term_h);
+                    let m = effective_main(full, sidebar_cols, zoomed);
                     for pane in panes.iter_mut() {
                         if let Err(e) = pane.resize(m.height.max(1), m.width.max(1)) {
                             push_error(&mut errors, format!("resize: {e}"));
@@ -1697,13 +2011,24 @@ pub fn run_dashboard(
 
         let term_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
-        let (header_area, sidebar_area, main_area) = ui::layout(frame_area, sidebar_cols);
+        let (header_area, sidebar_area, _) = ui::layout(frame_area, sidebar_cols);
+        // F5: the grid and any overlay are drawn into the *effective* main
+        // rect, which is the whole frame while zoomed. Before this, zoom
+        // resized the pty (so the child re-laid itself out for a full-width
+        // terminal) but kept drawing into the un-zoomed `main` rect and left
+        // the header/sidebar columns blank -- the one thing zoom is for.
+        let main_area = effective_main(frame_area, sidebar_cols, zoomed);
 
         // Recomputed (facts_cache itself was already refreshed above, before
         // input handling) so the sidebar's own `.selected` highlight
         // reflects any selection change the keystroke just made -- cheap and
         // pure, unlike the disk-backed facts refresh it does not repeat.
-        let rows = assemble_sidebar(&build_pane_rows(&panes), &facts_cache.registry, selected);
+        let rows = assemble_sidebar(
+            &build_pane_rows(&panes),
+            &facts_cache.registry,
+            selected,
+            focused,
+        );
 
         let harness = if let Some(last) = errors.last() {
             format!("{agent_name}  \u{26a0} {last}")
@@ -1724,7 +2049,7 @@ pub fn run_dashboard(
                 ui::render_header(f, header_area, &facts);
                 ui::render_sidebar(f, sidebar_area, &rows);
             }
-            if let Some(pane) = panes.get(selected) {
+            if let Some(pane) = panes.get(focused) {
                 ui::render_grid(f, main_area, pane.screen());
             }
             ui::render_overlay(f, main_area, &overlay);
@@ -1904,6 +2229,87 @@ mod tests {
         assert_eq!(unzoomed, ui::layout(area, 24).2);
     }
 
+    /// F5: the draw target itself, not just the pty resize. Zoom used to
+    /// resize every pane's pty to the full terminal and then keep drawing
+    /// into the un-zoomed `main` rect, leaving the header and sidebar
+    /// columns blank and the grid clipped to a fraction of what the child
+    /// had just re-laid itself out for.
+    #[test]
+    fn the_zoomed_draw_target_is_the_whole_frame_not_the_sidebar_inset() {
+        let frame = Rect::new(0, 0, 100, 30);
+        let sidebar_cols = 24;
+
+        let zoomed_target = effective_main(frame, sidebar_cols, true);
+        assert_eq!(zoomed_target, frame, "zoom draws into the whole frame");
+
+        let plain_target = effective_main(frame, sidebar_cols, false);
+        assert_ne!(
+            plain_target, zoomed_target,
+            "and that is genuinely different from the un-zoomed rect"
+        );
+        assert_eq!(plain_target, ui::layout(frame, sidebar_cols).2);
+    }
+
+    // F7: focus (the pane on screen and under the keyboard) versus selection
+    // (the sidebar cursor, which may sit on a view-only session).
+
+    #[test]
+    fn digits_and_tab_move_both_the_selection_and_the_focus() {
+        // Three panes, five combined rows (two view-only sessions).
+        assert_eq!(apply_navigation(DashAction::Switch(2), 0, 0, 3, 5), (2, 2));
+        // A digit past the last pane clamps to the last pane, not to a
+        // view-only row: digits address panes.
+        assert_eq!(apply_navigation(DashAction::Switch(8), 0, 0, 3, 5), (2, 2));
+        assert_eq!(apply_navigation(DashAction::NextPane, 4, 2, 3, 5), (0, 0));
+        assert_eq!(apply_navigation(DashAction::NextPane, 0, 0, 3, 5), (1, 1));
+    }
+
+    #[test]
+    fn focus_stays_on_a_pane_when_selection_walks_into_view_only_rows() {
+        // One pane, three combined rows: rows 1 and 2 are view-only
+        // sessions this dashboard does not own.
+        let (mut selected, mut focused) = (0usize, 0usize);
+        for _ in 0..5 {
+            (selected, focused) = apply_navigation(DashAction::SelectDown, selected, focused, 1, 3);
+        }
+        assert_eq!(selected, 2, "the sidebar cursor reaches the last row");
+        assert_eq!(
+            focused, 0,
+            "but the focused pane -- the one being drawn and typed into -- never moves"
+        );
+
+        // And walking back up leaves focus alone too.
+        (selected, focused) = apply_navigation(DashAction::SelectUp, selected, focused, 1, 3);
+        assert_eq!((selected, focused), (1, 0));
+    }
+
+    #[test]
+    fn navigation_on_an_empty_dashboard_moves_nothing() {
+        assert_eq!(apply_navigation(DashAction::Switch(3), 0, 0, 0, 0), (0, 0));
+        assert_eq!(apply_navigation(DashAction::NextPane, 0, 0, 0, 0), (0, 0));
+        assert_eq!(apply_navigation(DashAction::SelectDown, 0, 0, 0, 0), (0, 0));
+        assert_eq!(apply_navigation(DashAction::SelectUp, 0, 0, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn assemble_sidebar_marks_the_focused_pane_separately_from_the_selection() {
+        let panes = vec![pane_row("aaa11111", "orch"), pane_row("bbb22222", "wrk")];
+        let registry = vec![(
+            registry_record("ccc33333", "codex"),
+            sessions::Liveness::Live,
+        )];
+        // Selection has walked onto the view-only row; focus is still pane 1.
+        let rows = assemble_sidebar(&panes, &registry, 2, 1);
+        assert!(
+            rows[2].selected,
+            "the sidebar cursor is on the view-only row"
+        );
+        assert!(!rows[2].focused, "a view-only row can never be focused");
+        assert!(rows[1].focused, "the focused pane is still marked as such");
+        assert!(!rows[1].selected);
+        assert!(!rows[0].focused && !rows[0].selected);
+    }
+
     #[test]
     fn push_error_keeps_only_the_most_recent_handful() {
         let mut errors = Vec::new();
@@ -1946,7 +2352,7 @@ mod tests {
             pane_row("aaa11111", "orch"),
             pane_row("bbb22222", "wrk claude"),
         ];
-        let rows = assemble_sidebar(&panes, &[], 0);
+        let rows = assemble_sidebar(&panes, &[], 0, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short, "aaa11111");
         assert!(rows[0].attached);
@@ -1961,7 +2367,7 @@ mod tests {
             registry_record("ccc33333", "codex"),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 0);
+        let rows = assemble_sidebar(&panes, &registry, 0, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].short, "ccc33333");
         assert!(!rows[1].attached, "a registry-only row is never attached");
@@ -1974,7 +2380,7 @@ mod tests {
             registry_record("aaa11111", "claude"),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 0);
+        let rows = assemble_sidebar(&panes, &registry, 0, 0);
         assert_eq!(
             rows.len(),
             1,
@@ -1989,7 +2395,7 @@ mod tests {
             registry_record("ddd44444", "codex"),
             sessions::Liveness::Stale,
         )];
-        let rows = assemble_sidebar(&[], &registry, 0);
+        let rows = assemble_sidebar(&[], &registry, 0, 0);
         assert!(
             rows.is_empty(),
             "a dead session must not appear as a view-only row"
@@ -2003,7 +2409,7 @@ mod tests {
             registry_record("ccc33333", "codex"),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 1);
+        let rows = assemble_sidebar(&panes, &registry, 1, 0);
         assert!(!rows[0].selected);
         assert!(rows[1].selected);
     }
@@ -2613,6 +3019,291 @@ mod tests {
             injector.calls,
             vec![("label".to_string(), "note".to_string())]
         );
+    }
+
+    // F8: one mail message per pane per tick.
+
+    /// The idle gate is checked once, before the first injection, and an
+    /// injection puts the pane straight back to work -- so a whole mailbox
+    /// delivered in one sweep typed messages two..N into a session that was
+    /// already mid-turn, which is precisely what the gate exists to prevent.
+    #[test]
+    fn a_sweep_delivers_exactly_one_message_per_pane_per_tick() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        for body in ["first", "second", "third"] {
+            mail::store(
+                &state,
+                slug,
+                &mail::Message {
+                    from_session: "s1".to_string(),
+                    from_agent: "claude".to_string(),
+                    to: "claude".to_string(),
+                    to_session: None,
+                    sent: 1,
+                    body: body.to_string(),
+                },
+                &cfg,
+            )
+            .expect("store");
+        }
+
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        let mut errors = Vec::new();
+        let delivered = sweep_one_pane(
+            &mut injector,
+            &state,
+            slug,
+            "claude",
+            "pane1234",
+            &mut errors,
+        );
+
+        assert!(delivered);
+        assert!(errors.is_empty(), "got errors: {errors:?}");
+        assert_eq!(
+            injector.calls.len(),
+            1,
+            "exactly one visible injection per tick, got {:?}",
+            injector.calls
+        );
+        assert_eq!(injector.calls[0].1, "first", "oldest first");
+        assert_eq!(
+            mail::list(&state, slug, Some("claude"), Some("pane1234"))
+                .expect("list")
+                .len(),
+            2,
+            "the rest stay unread for a later tick"
+        );
+    }
+
+    #[test]
+    fn a_sweep_of_an_empty_mailbox_delivers_nothing_and_reports_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        let mut errors = Vec::new();
+        assert!(!sweep_one_pane(
+            &mut injector,
+            &state,
+            "-work-repo",
+            "claude",
+            "pane1234",
+            &mut errors
+        ));
+        assert!(injector.calls.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    /// C7 again, through the sweep itself rather than `deliver_and_consume`
+    /// alone: a failed injection is reported and consumes nothing.
+    #[test]
+    fn a_sweep_whose_injection_fails_consumes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        mail::store(
+            &state,
+            slug,
+            &mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "claude".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "note".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut errors = Vec::new();
+        assert!(!sweep_one_pane(
+            &mut FailingInjector,
+            &state,
+            slug,
+            "claude",
+            "pane1234",
+            &mut errors
+        ));
+        assert_eq!(errors.len(), 1, "the failure is reported to the header");
+        assert_eq!(
+            mail::list(&state, slug, Some("claude"), Some("pane1234"))
+                .expect("list")
+                .len(),
+            1,
+            "a message never shown to the agent stays unread"
+        );
+    }
+
+    // F2/F9/F13: what `fulfill_spawn_request` refuses before anything is
+    // spawned. A request is data, never authority.
+
+    fn spawn_request(prompt: &str, cwd: &Path) -> spawnreq::SpawnRequest {
+        spawnreq::SpawnRequest {
+            agent: "claude".to_string(),
+            prompt: prompt.to_string(),
+            cwd: cwd.to_path_buf(),
+            requested_by: "aaaa1111".to_string(),
+        }
+    }
+
+    /// Runs `fulfill_spawn_request` against an empty pane list. Every
+    /// assertion below is on a refusal that happens *before* adapter
+    /// resolution or any spawn, so no agent -- real or fake -- is ever
+    /// launched.
+    fn refusal_for(req: &spawnreq::SpawnRequest, cfg: &CtxConfig, repo: &Path) -> String {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        fulfill_spawn_request(
+            req,
+            &mut panes,
+            &mut queues,
+            cfg,
+            &state,
+            repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("must refuse")
+    }
+
+    #[test]
+    fn argv_unsafe_prompt_flags_anything_that_would_be_read_as_a_flag() {
+        assert!(argv_unsafe_prompt("--dangerously-skip-permissions"));
+        assert!(argv_unsafe_prompt("  -p"));
+        assert!(argv_unsafe_prompt("-"));
+        assert!(!argv_unsafe_prompt("fix the failing tests"));
+        assert!(!argv_unsafe_prompt("re-run the -x flag investigation"));
+        assert!(!argv_unsafe_prompt(""));
+    }
+
+    /// F2 at the authority side: the request's prompt is encoded
+    /// positionally into `interactive_cmd`'s argv, so a prompt shaped like a
+    /// flag would reach the real harness child as one.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_prompt_that_would_land_as_a_flag() {
+        let repo = std::env::current_dir().expect("cwd");
+        let cfg = CtxConfig::default();
+        let reason = refusal_for(
+            &spawn_request("--dangerously-skip-permissions", &repo),
+            &cfg,
+            &repo,
+        );
+        assert_eq!(reason, ARGV_GUARD_REFUSAL, "got {reason}");
+    }
+
+    /// F9: `cwd` used to be written by the requester and never looked at.
+    /// Refusing is the honest contract -- this dashboard's panes live in this
+    /// dashboard's repo.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_request_naming_another_repo() {
+        let repo = std::env::current_dir().expect("cwd");
+        let cfg = CtxConfig::default();
+        let elsewhere = repo.join("definitely-not-this-repo");
+        let reason = refusal_for(&spawn_request("do the work", &elsewhere), &cfg, &repo);
+        assert!(
+            reason.contains("only spawns panes in its own repo"),
+            "got {reason}"
+        );
+        assert!(reason.contains("definitely-not-this-repo"), "got {reason}");
+    }
+
+    /// F13: the cap is enforced where a pane is created by something other
+    /// than the operator's own launch, so a pane child cannot fork-bomb its
+    /// own dashboard. `max_panes = 0` proves the refusal without spawning a
+    /// single real process.
+    #[test]
+    fn fulfill_spawn_request_refuses_once_the_pane_cap_is_reached() {
+        let repo = std::env::current_dir().expect("cwd");
+        let mut cfg = CtxConfig::default();
+        cfg.dash.max_panes = 0;
+        let reason = refusal_for(&spawn_request("do the work", &repo), &cfg, &repo);
+        assert!(reason.contains("pane limit reached"), "got {reason}");
+        assert!(reason.contains("dash.max_panes"), "got {reason}");
+    }
+
+    // F11: the spawn dialog's own reducer.
+
+    fn type_line(line: &str) -> ui::SpawnDraft {
+        let mut draft = ui::SpawnDraft::default();
+        for c in line.chars() {
+            let (next, effect) = spawn_overlay_reduce(draft, press(c));
+            assert!(effect.is_none(), "typing emits no effect");
+            draft = next.expect("typing keeps the dialog open");
+        }
+        draft
+    }
+
+    #[test]
+    fn spawn_dialog_enter_splits_the_agent_from_the_prompt() {
+        let draft = type_line("claude fix the failing tests");
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "a submitted dialog closes");
+        assert_eq!(
+            effect,
+            Some(SpawnEffect::Submit {
+                agent: "claude".to_string(),
+                prompt: "fix the failing tests".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn spawn_dialog_needs_both_an_agent_and_a_prompt() {
+        for line in ["", "   ", "claude", "claude   "] {
+            let draft = type_line(line);
+            let (next, effect) =
+                spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(
+                next.is_some(),
+                "the dialog stays open so the typed text is not lost: {line:?}"
+            );
+            assert_eq!(
+                effect,
+                Some(SpawnEffect::Notice(SPAWN_USAGE_NOTICE.to_string())),
+                "got no notice for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_dialog_backspace_edits_and_esc_cancels() {
+        let draft = type_line("claudex");
+        let (next, _) = spawn_overlay_reduce(draft, key(KeyCode::Backspace, KeyModifiers::NONE));
+        let draft = next.expect("stays open");
+        assert_eq!(draft.input, "claude");
+
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none(), "Esc closes the dialog");
+        assert!(effect.is_none(), "and asks for nothing");
+    }
+
+    /// The dialog does not re-implement the argv guard, the pane cap or the
+    /// agent gate: it submits, and the shared `fulfill_spawn_request` path
+    /// refuses. This pins that a flag-shaped prompt does reach that path
+    /// intact (rather than being silently mangled or split into flags here).
+    #[test]
+    fn spawn_dialog_submits_a_flag_shaped_prompt_for_the_shared_guard_to_refuse() {
+        let draft = type_line("claude --dangerously-skip-permissions");
+        let (_, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        match effect {
+            Some(SpawnEffect::Submit { prompt, .. }) => {
+                assert_eq!(prompt, "--dangerously-skip-permissions");
+                assert!(
+                    argv_unsafe_prompt(&prompt),
+                    "and the shared guard is what refuses it"
+                );
+            }
+            other => panic!("expected a Submit, got {other:?}"),
+        }
     }
 
     // Task 12: the startup restore dialog's pure reducer, `build_restore_view`,

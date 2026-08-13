@@ -36,6 +36,14 @@ pub struct HeaderFacts {
 
 /// One sidebar row: a dashboard pane (`attached: true`) or a view-only
 /// registry session this dashboard did not spawn (`attached: false`).
+///
+/// `selected` and `focused` are deliberately two different things (F7).
+/// `selected` is the sidebar cursor, which walks the *combined* row list --
+/// view-only registry rows included, so a nudge can be aimed at a session
+/// this dashboard does not own. `focused` is the pane whose grid is on
+/// screen and whose child receives every un-prefixed keystroke, and it can
+/// only ever be an attached pane. Before F7 the two were one index, so
+/// selecting a view-only row blanked the grid and swallowed all typing.
 pub struct SidebarRow {
     pub glyph: char,
     pub title: String,
@@ -43,6 +51,7 @@ pub struct SidebarRow {
     pub preview: String,
     pub attached: bool,
     pub selected: bool,
+    pub focused: bool,
 }
 
 /// A minimal draft/view struct shared by the overlay seams below. Only what
@@ -272,9 +281,14 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, rows: &[SidebarRow]) {
         .iter()
         .map(|row| {
             let attach_marker = if row.attached { ' ' } else { '~' };
+            // The keyboard-focus marker is separate from the reversed-style
+            // selection highlight: with F7 the two can sit on different
+            // rows, and the operator has to be able to see which pane their
+            // typing is actually reaching.
+            let focus_marker = if row.focused { '*' } else { ' ' };
             let text = format!(
-                "{} {}{:<8} {} {}",
-                row.glyph, attach_marker, row.short, row.title, row.preview
+                "{}{} {}{:<8} {} {}",
+                focus_marker, row.glyph, attach_marker, row.short, row.title, row.preview
             );
             let style = if row.selected {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -362,9 +376,29 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// The dialog box's own width inside `area`: four columns of margin when
+/// there is room for them, never zero, and never wider than `area` itself.
+///
+/// Deliberately **not** `area.width.saturating_sub(4).clamp(1, area.width)`:
+/// `Ord::clamp` asserts `min <= max` and panics when `area.width == 0`, which
+/// a real session reaches (a terminal narrowed to at most the sidebar width
+/// mid-session, or a `dash.sidebar_cols` wider than the terminal, both of
+/// which make `ui::layout`'s own `main` rect zero-width) -- and the release
+/// profile is `panic = "abort"`, so that takes the whole dashboard down with
+/// it. Pure, so the degenerate widths are testable without a frame.
+fn dialog_width(area_width: u16) -> u16 {
+    area_width.saturating_sub(4).max(1).min(area_width.max(1))
+}
+
 fn render_dialog(f: &mut Frame, area: Rect, title: &str, lines: &[String]) {
+    // Nothing to draw into: every renderer below would either be a no-op or
+    // have to reason about a zero-sized rect. One guard, at the one place
+    // every dialog funnels through.
+    if area.is_empty() {
+        return;
+    }
     let h = (lines.len() as u16 + 2).min(area.height);
-    let w = area.width.saturating_sub(4).clamp(1, area.width);
+    let w = dialog_width(area.width);
     let rect = centered(area, w, h);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -493,6 +527,13 @@ fn render_nudge_dialog(f: &mut Frame, area: Rect, draft: &NudgeDraft) {
 }
 
 pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
+    // A pane failure degrades the pane, never the dashboard: an overlay with
+    // no room to draw simply does not draw. Checked here as well as in
+    // `render_dialog` so a future overlay that renders without going through
+    // the shared dialog box inherits the same guarantee.
+    if area.is_empty() {
+        return;
+    }
     match overlay {
         Overlay::None => {}
         Overlay::QuitConfirm(working) => {
@@ -757,6 +798,93 @@ mod tests {
             text.contains("nothingtorestore") || text.contains("nothing to restore"),
             "got {text}"
         );
+    }
+
+    /// Every overlay variant, in a shape that has something to draw, so the
+    /// degenerate-area tests below exercise the full rendering path rather
+    /// than an early "nothing to show" branch.
+    fn every_overlay() -> Vec<Overlay> {
+        vec![
+            Overlay::None,
+            Overlay::QuitConfirm(vec!["wrk claude".to_string()]),
+            Overlay::Spawn(SpawnDraft {
+                input: "claude fix the tests".to_string(),
+                items: vec!["claude".to_string()],
+                cursor: 0,
+            }),
+            Overlay::Nudge(NudgeDraft {
+                target: NudgeTarget::AttachedPane(0),
+                input: "hello".to_string(),
+            }),
+            Overlay::Mail(MailView {
+                items: vec![(
+                    PathBuf::from("/mail/1.md"),
+                    "claude".to_string(),
+                    "a body".to_string(),
+                )],
+                cursor: 0,
+                compose: Some(ComposeDraft {
+                    to: "any".to_string(),
+                    body: "drafting".to_string(),
+                }),
+            }),
+            Overlay::Memory(MemoryView {
+                entries: vec![("k".to_string(), "age".to_string(), "body".to_string())],
+                cursor: 0,
+                input: Some("typing".to_string()),
+            }),
+            Overlay::Restore(RestoreView {
+                entries: vec![RestoreEntry {
+                    label: "wrk claude (aaaa1111)".to_string(),
+                    checked: true,
+                }],
+                cursor: 0,
+            }),
+        ]
+    }
+
+    /// F1: `dialog_width` used to be `saturating_sub(4).clamp(1, width)`,
+    /// and `Ord::clamp` panics when `min > max` -- which is every zero-width
+    /// area. A terminal narrowed to at most the sidebar width makes
+    /// `layout`'s own main rect exactly that, and the release profile is
+    /// `panic = "abort"`.
+    #[test]
+    fn dialog_width_never_panics_and_never_exceeds_the_area() {
+        assert_eq!(dialog_width(0), 1);
+        assert_eq!(dialog_width(1), 1);
+        assert_eq!(dialog_width(4), 1);
+        assert_eq!(dialog_width(5), 1);
+        assert_eq!(dialog_width(40), 36);
+        for w in 0..=64u16 {
+            assert!(dialog_width(w) >= 1);
+            assert!(dialog_width(w) <= w.max(1));
+        }
+    }
+
+    #[test]
+    fn every_overlay_renders_into_a_zero_sized_area_without_panicking() {
+        let backend = TestBackend::new(20, 10);
+        let mut term = Terminal::new(backend).expect("terminal");
+        for overlay in every_overlay() {
+            term.draw(|f| render_overlay(f, Rect::new(0, 0, 0, 0), &overlay))
+                .expect("draw");
+            // A zero-height-but-not-zero-width sliver, and its transpose:
+            // both used to reach the same clamp.
+            term.draw(|f| render_overlay(f, Rect::new(0, 0, 20, 0), &overlay))
+                .expect("draw");
+            term.draw(|f| render_overlay(f, Rect::new(0, 0, 0, 10), &overlay))
+                .expect("draw");
+        }
+    }
+
+    #[test]
+    fn every_overlay_renders_into_a_one_by_one_area_without_panicking() {
+        let backend = TestBackend::new(20, 10);
+        let mut term = Terminal::new(backend).expect("terminal");
+        for overlay in every_overlay() {
+            term.draw(|f| render_overlay(f, Rect::new(0, 0, 1, 1), &overlay))
+                .expect("draw");
+        }
     }
 
     /// `tests/fixtures/claude-session.raw` is a gitignored capture of a real

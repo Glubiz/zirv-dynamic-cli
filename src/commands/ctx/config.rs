@@ -309,6 +309,14 @@ pub struct DashConfig {
     /// How long a quit-time roster stays offered for restore before a fresh
     /// launch treats it as stale and ignores it.
     pub roster_max_age_secs: u64,
+    /// The most panes one dashboard will ever hold at once, counting the
+    /// orchestrator. Defaults to 9, matching `DashAction::Switch`'s own
+    /// `Ctrl+A 1..9` addressing: a pane nothing can select is a pane nobody
+    /// asked for. Enforced wherever a pane is created from something other
+    /// than the operator's own launch -- the spawn-request channel and the
+    /// `Ctrl+A s` dialog -- so a pane child cannot fork-bomb its own
+    /// dashboard into a machine full of harness processes.
+    pub max_panes: usize,
 }
 
 impl Default for DashConfig {
@@ -317,6 +325,7 @@ impl Default for DashConfig {
             enabled: true,
             sidebar_cols: 24,
             roster_max_age_secs: 604_800,
+            max_panes: 9,
         }
     }
 }
@@ -553,6 +562,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["dash", "roster_max_age_secs"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_DASH_MAX_PANES",
+        &["dash", "max_panes"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
 ];
 
@@ -663,14 +677,18 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
     ),
     // A repo checkout must not be able to switch its own dashboard on or off,
-    // resize the sidebar, or change how long a quit-time roster is offered
-    // for restore -- the operator's terminal, the operator's call.
+    // resize the sidebar, change how long a quit-time roster is offered for
+    // restore, or raise its own pane cap -- the operator's terminal, the
+    // operator's machine, the operator's call. `max_panes` in particular is
+    // the same trust asymmetry as `mail.max_delivered_bytes`: a checked-out
+    // repo raising its own limit is exactly the case the limit exists for.
     (&["dash", "enabled"], "ZIRV_CTX_DASH"),
     (&["dash", "sidebar_cols"], "ZIRV_CTX_DASH_SIDEBAR_COLS"),
     (
         &["dash", "roster_max_age_secs"],
         "ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS",
     ),
+    (&["dash", "max_panes"], "ZIRV_CTX_DASH_MAX_PANES"),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -1435,6 +1453,10 @@ mod tests {
         assert!(cfg.dash.enabled);
         assert_eq!(cfg.dash.sidebar_cols, 24);
         assert_eq!(cfg.dash.roster_max_age_secs, 604_800);
+        assert_eq!(
+            cfg.dash.max_panes, 9,
+            "the default cap matches Ctrl+A 1..9 addressing"
+        );
     }
 
     #[test]
@@ -1443,6 +1465,7 @@ mod tests {
             ("enabled", "false"),
             ("sidebar_cols", "80"),
             ("roster_max_age_secs", "1"),
+            ("max_panes", "999"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -1482,11 +1505,13 @@ mod tests {
             ("ZIRV_CTX_DASH", "false"),
             ("ZIRV_CTX_DASH_SIDEBAR_COLS", "30"),
             ("ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS", "60"),
+            ("ZIRV_CTX_DASH_MAX_PANES", "3"),
         ]);
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.dash.enabled, "the environment is the operator");
         assert_eq!(cfg.dash.sidebar_cols, 30);
         assert_eq!(cfg.dash.roster_max_age_secs, 60);
+        assert_eq!(cfg.dash.max_panes, 3);
     }
 
     #[test]

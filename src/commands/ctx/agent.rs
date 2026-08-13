@@ -101,23 +101,57 @@ const DASH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// delegation path in this codebase already holds), then waits up to
 /// `DASH_ACK_TIMEOUT` for the matching ack.
 ///
-/// `Some(result)` means the dashboard answered (or the request itself could
-/// not even be written) and the caller's own headless path must NOT run --
-/// a pane was spawned there instead, or the request was refused outright.
-/// `None` means either there is no dashboard to ask (env unset, or the
-/// directory is gone -- both **byte-for-byte** today's behavior, no notice
-/// printed) or a live one did not answer in time (a notice IS printed, since
-/// that case is a live channel that just did not respond), and either way
-/// the caller falls through to today's headless behavior unchanged.
+/// `Some(result)` means the dashboard gave a definitive answer -- a pane was
+/// spawned, the request was refused outright, or the request was *claimed*
+/// and the answer is merely slow -- and the caller's own headless path must
+/// NOT run.
+///
+/// `None` means the caller falls through to today's headless behavior
+/// unchanged, which covers: no dashboard to ask (env unset, or the directory
+/// is gone -- both silent, byte-for-byte the pre-Task-11 behavior); options a
+/// pane cannot honour (`--max-restarts`/`--timeout-secs`/`-- flags`, notice
+/// printed); a prompt that would be misread as a flag (notice printed); a
+/// request that could not even be written (notice printed); and an
+/// unclaimed ack timeout (notice printed, since that is a live channel that
+/// simply did not respond).
 fn try_join_dashboard<W: Write>(
-    name: &str,
+    args: &AgentArgs,
     prompt: &str,
     w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
+    ack_timeout: Duration,
 ) -> Option<CtxResult<i32>> {
     let dir = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from)?;
     if !dir.is_dir() {
+        return None;
+    }
+    // A pane is not a supervised headless run: the restart budget, the
+    // wall-clock limit and the trailing `-- flags` all belong to
+    // `exec::run_with`, and a `SpawnRequest` carries none of them. Silently
+    // dropping an operator's `--timeout-secs` would be worse than not using
+    // the dashboard at all, so this falls back to the path that honours them.
+    // `--quiet` is deliberately still allowed: it only shapes the
+    // announcement channel of a run that is not happening in this process
+    // anyway.
+    if args.max_restarts.is_some() || args.timeout_secs.is_some() || !args.flags.is_empty() {
+        eprintln!(
+            "zirv ctx agent: dashboard panes don't support --max-restarts/--timeout-secs/-- flags; \
+             running headless"
+        );
+        return None;
+    }
+    // Defense in depth for the same rule `dash::fulfill_spawn_request`
+    // enforces at the authority side: the request's prompt is encoded
+    // positionally into the pane's argv, so a prompt shaped like a flag
+    // would arrive at the real harness child as one. The headless path this
+    // falls back to is safe by construction -- there the prompt travels as
+    // the `-p <value>` data it is.
+    if super::dash::argv_unsafe_prompt(prompt) {
+        eprintln!(
+            "zirv ctx agent: a prompt beginning with '-' cannot be spawned as a dashboard pane; \
+             running headless"
+        );
         return None;
     }
     let requested_by = env(super::adapters::SESSION_ENV)
@@ -125,7 +159,7 @@ fn try_join_dashboard<W: Write>(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     let req = spawnreq::SpawnRequest {
-        agent: name.to_string(),
+        agent: args.name.clone(),
         prompt: prompt.to_string(),
         cwd: repo.to_path_buf(),
         requested_by,
@@ -141,7 +175,7 @@ fn try_join_dashboard<W: Write>(
         eprintln!("zirv ctx agent: dashboard did not answer; running headless");
         return None;
     };
-    match spawnreq::wait_for_ack(&dir, &stem, DASH_ACK_TIMEOUT) {
+    match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
         Some(ack) if ack.ok => {
             let short = ack.short.unwrap_or_default();
             Some(
@@ -156,6 +190,20 @@ fn try_join_dashboard<W: Write>(
                 .unwrap_or_else(|| "the dashboard refused this request".to_string());
             Some(writeln!(w, "{reason}").map(|_| 1).map_err(|e| e.into()))
         }
+        // F10: `take_requests` deletes the request the moment the dashboard
+        // picks it up, so a timeout here is ambiguous -- nobody was
+        // listening, or somebody took it and is still spawning. The claim
+        // file is what distinguishes the two. Without this check both ends
+        // ran the same task, and one `zirv ctx agent` became two live
+        // sessions working the same prompt.
+        None if spawnreq::is_claimed(&dir, &stem) => Some(
+            writeln!(
+                w,
+                "the dashboard accepted this request (ack pending); not falling back to headless"
+            )
+            .map(|_| 0)
+            .map_err(|e| e.into()),
+        ),
         None => {
             eprintln!("zirv ctx agent: dashboard did not answer; running headless");
             None
@@ -172,7 +220,7 @@ pub fn run_with<W: Write>(
     validate_flags(&args.flags)?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
 
-    if let Some(result) = try_join_dashboard(&args.name, &prompt, w, repo, env) {
+    if let Some(result) = try_join_dashboard(args, &prompt, w, repo, env, DASH_ACK_TIMEOUT) {
         return result;
     }
 
@@ -473,13 +521,17 @@ mod tests {
 
     // Task 11: joining a running dashboard instead of spawning headless.
 
-    /// Polls `dir` for a `req-*.json` file, writes `ack_body` as its matching
-    /// ack, and returns the request's own raw contents -- the same
-    /// "responder" shape every dashboard-join test below needs, since
-    /// `write_request` mints a random uuid filename the test cannot know in
-    /// advance. Never touches a real agent: this only ever races against
-    /// `try_join_dashboard`'s own polling loop, both confined to a tempdir.
-    fn respond_to_next_request(dir: std::path::PathBuf, ack_body: &'static str) -> String {
+    /// Polls `dir` for a `req-*.json` file and hands its file stem to
+    /// `respond` (which writes whatever answer the test wants), returning the
+    /// request's own raw contents -- the same "responder" shape every
+    /// dashboard-join test below needs, since `write_request` mints a random
+    /// uuid filename the test cannot know in advance. Never touches a real
+    /// agent: this only ever races against `try_join_dashboard`'s own polling
+    /// loop, both confined to a tempdir.
+    fn intercept_next_request(
+        dir: std::path::PathBuf,
+        respond: impl Fn(&std::path::Path, &str),
+    ) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -497,8 +549,7 @@ mod tests {
                             .and_then(|s| s.to_str())
                             .expect("file stem")
                             .to_string();
-                        std::fs::write(dir.join(format!("ack-{stem}.json")), ack_body)
-                            .expect("write ack");
+                        respond(&dir, &stem);
                         return contents;
                     }
                 }
@@ -508,6 +559,23 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    fn respond_to_next_request(dir: std::path::PathBuf, ack_body: &'static str) -> String {
+        intercept_next_request(dir, move |dir, stem| {
+            std::fs::write(dir.join(format!("ack-{stem}.json")), ack_body).expect("write ack");
+        })
+    }
+
+    /// The `AgentArgs` shape a dashboard join actually accepts: no restart
+    /// budget, no wall-clock limit, no trailing flags -- a pane carries none
+    /// of those, so `try_join_dashboard` deliberately falls back to headless
+    /// when any is set (F9).
+    fn joinable_args(name: &str, prompt: &str) -> AgentArgs {
+        let mut args = args_for(name, prompt);
+        args.max_restarts = None;
+        args.timeout_secs = None;
+        args
     }
 
     /// A live dashboard (env set, directory present) that acks `ok: true`
@@ -534,7 +602,7 @@ mod tests {
             move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
         });
 
-        let args = args_for("claude", "a specific delegated task");
+        let args = joinable_args("claude", "a specific delegated task");
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect("dashboard join runs");
@@ -581,7 +649,7 @@ mod tests {
             }
         });
 
-        let args = args_for("claude", "go");
+        let args = joinable_args("claude", "go");
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect("dashboard join runs");
@@ -590,6 +658,181 @@ mod tests {
         assert_eq!(code, 1);
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("disabled"), "got {output}");
+    }
+
+    /// A live requests directory, and the `AgentArgs`/env pair that reaches
+    /// it: the shape every `try_join_dashboard`-level test below shares.
+    fn live_dashboard_dir(root: &Path) -> (PathBuf, HashMap<String, String>) {
+        let requests_dir = root.join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+        let mut env = base_env(&root.join("state"));
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            requests_dir.display().to_string(),
+        );
+        (requests_dir, env)
+    }
+
+    /// F2 (defense in depth): the request's prompt is encoded positionally
+    /// into the pane's argv, so a prompt shaped like a flag would reach the
+    /// real harness child as one. The dashboard refuses such a request at the
+    /// authority side; this end refuses to even write it, and falls back to
+    /// the headless path, where the prompt travels as the `-p <value>` data
+    /// it is.
+    #[test]
+    fn a_prompt_that_begins_with_a_dash_is_never_written_as_a_spawn_request() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let args = joinable_args("claude", "--dangerously-skip-permissions");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_millis(200),
+        );
+
+        assert!(
+            joined.is_none(),
+            "must fall through to the safe headless path"
+        );
+        assert!(out.is_empty(), "nothing is reported as spawned");
+        let written: Vec<_> = std::fs::read_dir(&requests_dir)
+            .expect("read requests dir")
+            .flatten()
+            .collect();
+        assert!(
+            written.is_empty(),
+            "no request may be written at all: {written:?}"
+        );
+    }
+
+    /// F9: `--max-restarts`, `--timeout-secs` and trailing `-- flags` are all
+    /// honoured by `exec::run_with` and carried by nothing in a
+    /// `SpawnRequest`. Silently dropping them would be worse than not using
+    /// the dashboard, so the join declines and the headless path runs.
+    /// `--quiet` stays allowed: it only shapes an announcement channel.
+    #[test]
+    fn options_a_pane_cannot_honour_decline_the_dashboard_join() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        for mutate in [
+            (|a: &mut AgentArgs| a.max_restarts = Some(2)) as fn(&mut AgentArgs),
+            |a: &mut AgentArgs| a.timeout_secs = Some(90),
+            |a: &mut AgentArgs| a.flags = vec!["--model".to_string(), "opus".to_string()],
+        ] {
+            let mut args = joinable_args("claude", "go");
+            mutate(&mut args);
+            let mut out = Vec::new();
+            let joined = try_join_dashboard(
+                &args,
+                &args.prompt,
+                &mut out,
+                tmp.path(),
+                &|k| env.get(k).cloned(),
+                Duration::from_millis(200),
+            );
+            assert!(joined.is_none(), "must fall back to the headless path");
+            assert!(
+                std::fs::read_dir(&requests_dir)
+                    .expect("read requests dir")
+                    .flatten()
+                    .next()
+                    .is_none(),
+                "and must not have written a request either"
+            );
+        }
+
+        // The control: the same call with none of them set does reach the
+        // channel (it writes a request, then times out unanswered).
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_millis(200),
+        );
+        assert!(joined.is_none(), "an unanswered request still falls back");
+    }
+
+    /// F10: the dashboard deletes a request the instant it takes it, so an
+    /// ack timeout alone cannot tell "nobody is listening" from "somebody is
+    /// still spawning it". Without the claim check both ends ran the same
+    /// prompt.
+    #[test]
+    fn a_claimed_request_never_double_runs_headless() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        // Claims the request the way `handle_spawn_requests` does -- before
+        // fulfilment -- and then deliberately never acks.
+        let claimer = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || {
+                intercept_next_request(dir, |dir, stem| {
+                    crate::commands::ctx::dash::spawnreq::write_claim(dir, stem)
+                        .expect("write claim");
+                })
+            }
+        });
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_millis(300),
+        );
+        claimer.join().expect("claimer thread");
+
+        let code = joined
+            .expect("a claimed request must not fall back")
+            .expect("writes its line");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8_lossy(&out);
+        assert!(
+            printed.contains("accepted") && printed.contains("not falling back"),
+            "got {printed}"
+        );
+    }
+
+    /// The other half of F10: nothing claimed it, so the timeout still falls
+    /// back to headless exactly as before.
+    #[test]
+    fn an_unclaimed_timeout_still_falls_back_to_headless() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (_requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_millis(200),
+        );
+        assert!(joined.is_none());
+        assert!(out.is_empty());
     }
 
     /// `DASH_REQUESTS_ENV` set but naming a directory that does not exist --
@@ -624,7 +867,7 @@ mod tests {
                 .to_string(),
         );
 
-        let args = args_for("claude", "go");
+        let args = joinable_args("claude", "go");
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect_err("the configured binary does not exist, so the headless spawn must fail");

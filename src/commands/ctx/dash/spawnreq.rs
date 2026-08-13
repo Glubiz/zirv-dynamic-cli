@@ -42,6 +42,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// mirrors every other delegation path in this codebase). `requested_by` is
 /// advisory only (the caller's own session short, or `"unknown"`): nothing
 /// in the fulfilment path trusts it for anything but a label.
+///
+/// `cwd` is the repo the requester was invoked in, and it is **checked, not
+/// honoured**: `dash::fulfill_spawn_request` refuses outright when it names
+/// anything but the dashboard's own repo. Spawning a pane into a directory
+/// the operator never opened is not something a request gets to ask for, and
+/// silently ignoring the field would let a request from another repo run
+/// here without either side noticing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub agent: String,
@@ -165,6 +172,32 @@ pub fn write_ack(dir: &Path, request_stem: &str, ack: &SpawnAck) -> CtxResult<()
     Ok(())
 }
 
+/// `claim-<request_stem>`: written by the dashboard the moment
+/// [`take_requests`] hands it a request, before any fulfilment work starts.
+/// Deliberately extensionless so it can never be mistaken for a `req-*.json`
+/// or an `ack-*.json` by either side's own directory listing.
+fn claim_path(dir: &Path, request_stem: &str) -> PathBuf {
+    dir.join(format!("claim-{request_stem}"))
+}
+
+/// Records that this dashboard has taken responsibility for the request whose
+/// file stem is `request_stem`. See [`is_claimed`] for what the requester does
+/// with it. Contents are advisory only -- the file's existence is the whole
+/// signal -- so nothing ever parses it.
+pub fn write_claim(dir: &Path, request_stem: &str) -> CtxResult<()> {
+    super::super::state::create_private_dir_all(dir)?;
+    super::super::state::write_private(&claim_path(dir, request_stem), "claimed")?;
+    Ok(())
+}
+
+/// Whether some dashboard has claimed this request. Checked by the requester
+/// on an ack timeout: a claimed-but-unanswered request means the dashboard is
+/// still working on it (a slow spawn, a busy event loop), and running the same
+/// task headless as well would double-run it.
+pub fn is_claimed(dir: &Path, request_stem: &str) -> bool {
+    claim_path(dir, request_stem).exists()
+}
+
 /// Polls `dir` for `ack-<request_stem>.json`, up to `timeout`, sleeping
 /// [`POLL_INTERVAL`] between checks. Consumes (deletes) the file once found,
 /// so a stale ack can never be misread by a later, unrelated wait on the
@@ -263,6 +296,30 @@ mod tests {
 
         let absent = dir.join("does-not-exist");
         assert!(take_requests(&absent).is_empty());
+    }
+
+    /// F10: a claim is written before fulfilment and is neither a request nor
+    /// an ack, so neither side's own listing may pick it up.
+    #[test]
+    fn a_claim_is_visible_to_the_requester_and_invisible_to_take_requests() {
+        let (_tmp, dir) = dir();
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(!is_claimed(&dir, "req-abc"), "nothing is claimed yet");
+
+        write_claim(&dir, "req-abc").expect("write_claim");
+        assert!(is_claimed(&dir, "req-abc"));
+        assert!(
+            !is_claimed(&dir, "req-other"),
+            "a claim only covers its own request"
+        );
+        assert!(
+            take_requests(&dir).is_empty(),
+            "a claim file must never be read back as a request"
+        );
+        assert!(
+            wait_for_ack(&dir, "req-abc", Duration::from_millis(50)).is_none(),
+            "a claim is not an ack"
+        );
     }
 
     #[test]

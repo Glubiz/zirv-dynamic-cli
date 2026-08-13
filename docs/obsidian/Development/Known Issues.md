@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-13
+last-verified: 2026-08-14
 ---
 
 # Known Issues
@@ -14,9 +14,21 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-14 (feat/dashboard, review fixes): `Ord::clamp` panics on a zero-width rect -->
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## `x.saturating_sub(n).clamp(1, x)` panics when `x` is 0
+
+`Ord::clamp` asserts `min <= max` and panics otherwise, so the idiom
+"shrink by a margin, but keep at least 1 and never exceed the area" is a live
+panic whenever the area is zero -- which a real session reaches (a terminal
+narrowed to at most `dash.sidebar_cols` makes `ui::layout`'s own main rect
+zero-width, and `ZIRV_CTX_DASH_SIDEBAR_COLS` larger than the terminal does it
+at startup). The release profile is `panic = "abort"`, so this is not a
+recoverable error anywhere near a TUI. Use `.max(1).min(x.max(1))` instead
+(`ui::dialog_width`), and guard whole renderers with `Rect::is_empty`.
 
 ## A dashboard pane carries no rot score yet
 

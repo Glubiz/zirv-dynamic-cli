@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-13
+last-verified: 2026-08-14
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-08-13
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-14: dashboard adversarial-review fixes
+**What:** Closed thirteen findings from the review of the dashboard branch. The load-bearing ones: an `Ord::clamp` panic that took the whole dashboard down whenever any overlay was drawn into a zero-width rect; a spawn-request prompt beginning with `-` reaching the harness child as a flag (now refused at the authority side, and never even written by the requester); the dashboard's orchestrator pane getting **no** composed zirv prompt at all while every other launch path did; and terminal restore that disabled nothing, showed no cursor, and wrote to the wrong stream. Also: zoom now changes what is drawn (not just the pty size), sidebar *focus* is separate from *selection* so a view-only row no longer swallows all typing, the mail sweep delivers one message per pane per tick, the `Ctrl+A s` dialog is wired to the same spawn path a request takes, and a claimed-but-unanswered request no longer double-runs headless.
+**Key changes:** `dash/{mod,ui,spawnreq}.rs`, `chat.rs` (`dash_orchestrator_pane`), `agent.rs` (`try_join_dashboard`: option/argv/claim checks), `term.rs` (`dash_reset_bytes`, `set_dash_active`, `stash_current_console`), `config.rs` (`dash.max_panes`, default 9, `REPO_FORBIDDEN` + `ZIRV_CTX_DASH_MAX_PANES`).
+**Follow-up:** none; the pre-existing Windows os-193 test baseline (44 failures, fake-agent.sh + temp path length) is unchanged.
 
 ### 2026-08-13: `zirv chat` dashboard multiplexer
 **What:** `zirv chat`/bare `zirv` opens a ratatui/crossterm/vt100 session multiplexer on a capable terminal (>=80x20, both streams a tty, VT on, `cfg.dash.enabled`) instead of the plain `wrap` chrome — N panes, each a supervised ConPTY child behind its own embedded `vt100::Screen`. `Ctrl+A`-prefixed commands (digits/Tab/arrows switch panes, s/n/m/M open spawn/nudge/mail/memory overlays, z zooms, q quits with a confirm if any pane is `Working`). Idle-gated visible nudge/mail injection into attached panes; `zirv ctx agent` joins a running dashboard as a fresh pane via a capability-token spawn-request directory; quit writes a per-repo restore roster, offered once on the next launch.
