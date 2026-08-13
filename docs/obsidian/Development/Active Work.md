@@ -22,7 +22,7 @@ Entries use the format:
 
 ### Agent coordination: session registry, nudge, memory bank — coordination increment in review (`feat/agent-coordination`, 2026-08-13)
 **Status (2026-08-13):** Built on top of the zirv-chat sweep above. Landed in waves: session registry + `zirv ctx nudge` (`sessions.rs`), per-session mail addressing (`send --to-session`), the memory bank (`remember`/`recall`/`forget`, injected as its own prompt layer), and this increment's own wave 3 — opt-in handoff-to-memory harvesting (`[memory] harvest`, default off), `status`'s registry-backed `sessions:` block and `memory:` line, `optimize`'s memory-bank size summary (never quotes bank content), and the T12b bar's split broadcast/direct mail count. Full test suite green against the documented Windows os-193 baseline; fmt/clippy clean.
-**Next:** request review; no known follow-up work for this wave. Remaining roadmap items (codex adapter, cross-harness handoff provenance, per-agent model routing) are unchanged from the zirv-chat entry above.
+**Next:** PR #20 is up (stacked on #19). Merge order #17 -> #18 -> #19 -> #20. Remaining roadmap items (codex adapter, cross-harness handoff provenance, per-agent model routing) are unchanged from the zirv-chat entry above.
 
 ## Recently Completed
 
