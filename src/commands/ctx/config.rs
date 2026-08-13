@@ -300,6 +300,42 @@ impl Default for ChromeConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DashConfig {
+    pub enabled: bool,
+    /// Width, in columns, of the persistent sidebar listing every session.
+    pub sidebar_cols: u16,
+    /// How long a quit-time roster stays offered for restore before a fresh
+    /// launch treats it as stale and ignores it.
+    pub roster_max_age_secs: u64,
+}
+
+impl Default for DashConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sidebar_cols: 24,
+            roster_max_age_secs: 604_800,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChatConfig {
+    /// Model for the interactive orchestrator session, passed through
+    /// `AgentAdapter::model_args`. `None` leaves the agent's own default in
+    /// place. Deliberately **not** in `REPO_FORBIDDEN` -- see the comment
+    /// there and the spec's "Orchestrator model" section
+    /// (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
+    /// `handoff.model`/`optimize.model`, this only shapes a session the
+    /// operator deliberately launched interactively, and the choice is
+    /// displayed on screen at launch rather than spent silently in the
+    /// background.
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -315,6 +351,8 @@ pub struct CtxConfig {
     pub mail: MailConfig,
     pub memory: MemoryConfig,
     pub chrome: ChromeConfig,
+    pub dash: DashConfig,
+    pub chat: ChatConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -504,6 +542,18 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["chrome", "events"],
         EnvKind::NegatedBool,
     ),
+    ("ZIRV_CTX_DASH", &["dash", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_DASH_SIDEBAR_COLS",
+        &["dash", "sidebar_cols"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS",
+        &["dash", "roster_max_age_secs"],
+        EnvKind::Int,
+    ),
+    ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -612,6 +662,22 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["memory", "max_injected_bytes"],
         "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
     ),
+    // A repo checkout must not be able to switch its own dashboard on or off,
+    // resize the sidebar, or change how long a quit-time roster is offered
+    // for restore -- the operator's terminal, the operator's call.
+    (&["dash", "enabled"], "ZIRV_CTX_DASH"),
+    (&["dash", "sidebar_cols"], "ZIRV_CTX_DASH_SIDEBAR_COLS"),
+    (
+        &["dash", "roster_max_age_secs"],
+        "ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS",
+    ),
+    // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
+    // own doc comment and the spec's "Orchestrator model" section
+    // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
+    // every model key above, it only shapes an interactive session the
+    // operator deliberately launched, and the choice is displayed on screen
+    // rather than spent silently in the background. A repo checkout may set
+    // it -- do not "fix" this by adding it here.
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -1361,6 +1427,101 @@ mod tests {
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled, "the environment is the operator");
         assert_eq!(cfg.memory.max_entries, 5);
+    }
+
+    #[test]
+    fn dash_defaults_are_on_with_a_24_col_sidebar() {
+        let cfg = CtxConfig::default();
+        assert!(cfg.dash.enabled);
+        assert_eq!(cfg.dash.sidebar_cols, 24);
+        assert_eq!(cfg.dash.roster_max_age_secs, 604_800);
+    }
+
+    #[test]
+    fn repo_layer_cannot_touch_dash_keys() {
+        for (key, value) in [
+            ("enabled", "false"),
+            ("sidebar_cols", "80"),
+            ("roster_max_age_secs", "1"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[dash]\n{key} = {value}\n"),
+            )
+            .expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(&format!("dash.{key}")), "got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_DASH"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_can_disable_the_dashboard() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_DASH", "false")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.dash.enabled);
+    }
+
+    #[test]
+    fn the_operator_may_still_set_dash_keys() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_only.path());
+        let env = env_map(&[
+            ("ZIRV_CTX_DASH", "false"),
+            ("ZIRV_CTX_DASH_SIDEBAR_COLS", "30"),
+            ("ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS", "60"),
+        ]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.dash.enabled, "the environment is the operator");
+        assert_eq!(cfg.dash.sidebar_cols, 30);
+        assert_eq!(cfg.dash.roster_max_age_secs, 60);
+    }
+
+    #[test]
+    fn chat_model_defaults_to_none() {
+        assert_eq!(ChatConfig::default().model, None);
+    }
+
+    /// Unlike `handoff.model`/`optimize.model`, `chat.model` shapes an
+    /// interactive session the operator deliberately launched and the choice
+    /// is displayed on screen -- see `ChatConfig`'s own doc comment and the
+    /// spec's "Orchestrator model" section
+    /// (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md). A repo
+    /// checkout is therefore allowed to set it, unlike every other model key
+    /// in `REPO_FORBIDDEN`.
+    #[test]
+    fn a_repository_config_may_set_the_chat_model() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chat]\nmodel = \"opus\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.chat.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn env_overrides_the_chat_model() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", "sonnet")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.chat.model.as_deref(), Some("sonnet"));
     }
 
     #[test]

@@ -156,6 +156,11 @@ pub enum Verb {
     Loop,
     Wrap,
     Chat,
+    /// A dashboard worker pane (`zirv ctx dash`'s own supervised child):
+    /// distinct from `Chat`, which stays the dashboard's own orchestrator
+    /// pane, so a registry row can tell "the orchestrator" from "a pane the
+    /// dashboard spawned" apart.
+    Dash,
 }
 
 impl Verb {
@@ -165,6 +170,7 @@ impl Verb {
             Verb::Loop => "loop",
             Verb::Wrap => "wrap",
             Verb::Chat => "chat",
+            Verb::Dash => "dash",
         }
     }
 }
@@ -1119,7 +1125,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = state_in(tmp.path());
         let repo = tmp.path().join("repo");
-        for verb in [Verb::Exec, Verb::Loop, Verb::Wrap, Verb::Chat] {
+        for verb in [Verb::Exec, Verb::Loop, Verb::Wrap, Verb::Chat, Verb::Dash] {
             let record = record_for("00000000-2222-4333-8444-555555555555", &repo, verb);
             let path = write_record(&state, &record);
             let raw = std::fs::read_to_string(&path).expect("read");
@@ -1128,6 +1134,15 @@ mod tests {
                 "verb {verb} must serialize as its lowercase word: {raw}"
             );
         }
+    }
+
+    #[test]
+    fn verb_dash_serializes_lowercase() {
+        assert_eq!(Verb::Dash.as_str(), "dash");
+        let json = serde_json::to_string(&Verb::Dash).expect("serialize");
+        assert_eq!(json, "\"dash\"");
+        let back: Verb = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, Verb::Dash);
     }
 
     // N4: `zirv ctx nudge`.

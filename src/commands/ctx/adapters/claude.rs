@@ -606,6 +606,12 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
+    /// Verified against the real CLI (`claude --help`, v2.1.220): `--model
+    /// <MODEL>` is a real flag.
+    fn model_args(&self, model: &str) -> Vec<String> {
+        vec!["--model".to_string(), model.to_string()]
+    }
+
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup {
         TurnSignalSetup {
             env: vec![
@@ -1217,6 +1223,15 @@ mod tests {
     #[test]
     fn claude_advertises_the_capability() {
         assert!(ClaudeAdapter::new(None).capabilities().system_prompt);
+    }
+
+    #[test]
+    fn model_args_uses_the_verified_flag() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            adapter.model_args("opus"),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
     }
 
     #[test]

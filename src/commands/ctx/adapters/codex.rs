@@ -186,6 +186,14 @@ impl AgentAdapter for CodexAdapter {
         }
     }
 
+    /// Verified (docs/superpowers/notes/2026-07-31-codex-cli-facts.md, line
+    /// 139): `-m, --model <MODEL>` is present on top-level `codex --help`
+    /// with the same description as on `codex exec --help`, so the
+    /// interactive launch this feeds (`interactive_cmd`) accepts it too.
+    fn model_args(&self, model: &str) -> Vec<String> {
+        vec!["--model".to_string(), model.to_string()]
+    }
+
     fn register_turn_signal(&self, _session: &SessionRef, _socket: &Path) -> TurnSignalSetup {
         TurnSignalSetup {
             env: Vec::new(),
@@ -402,5 +410,17 @@ mod tests {
             cwd: std::path::PathBuf::from("/work/repo"),
         };
         assert_eq!(adapter.transcript_path(&session), expected);
+    }
+
+    /// `-m, --model <MODEL>` is verified on top-level `codex --help` too (see
+    /// the `model_args` doc comment), so the dashboard's orchestrator pane
+    /// can select a model on codex exactly as it does on claude.
+    #[test]
+    fn model_args_uses_the_verified_flag() {
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(
+            adapter.model_args("gpt-5.6-sol"),
+            vec!["--model".to_string(), "gpt-5.6-sol".to_string()]
+        );
     }
 }

@@ -120,6 +120,23 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup;
+
+    /// Argv tokens that select `model` for one interactive launch (the
+    /// dashboard's orchestrator pane, via `chat.model`/`ZIRV_CTX_CHAT_MODEL`).
+    /// Appended after the launch prefix, alongside any other `extra` argv
+    /// `interactive_cmd` receives. The default is empty, matching every other
+    /// "no verified mechanism" trait default on this trait
+    /// (`system_prompt_args`, `base_system_prompt`): an adapter with no
+    /// verified flag ships with no model selection rather than a guess.
+    ///
+    /// Both current adapters override this, so nothing calls the default body
+    /// through `dyn AgentAdapter` yet -- wired into the orchestrator pane's
+    /// argv when `chat.rs` builds it (dashboard Task 6).
+    #[allow(dead_code)]
+    fn model_args(&self, model: &str) -> Vec<String> {
+        let _ = model;
+        Vec::new()
+    }
 }
 
 /// The program invocation at the head of an argv: the binary plus the leading
