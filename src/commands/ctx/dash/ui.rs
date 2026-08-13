@@ -9,13 +9,6 @@
 //! here with only the fields rendering needs today (`input`, `items`,
 //! `cursor`); Tasks 8/9/12 own filling in whatever richer shape their own
 //! overlay reducers need next.
-//!
-//! Nothing in the binary calls any of this yet -- Task 5's event loop is
-//! what builds `HeaderFacts`/`SidebarRow` and calls through these renderers
-//! from a running `run_dashboard`. `#![allow(dead_code)]` covers this module
-//! until that wiring lands, the same precedent `pane.rs`'s own module-level
-//! attribute already set for Task 3.
-#![allow(dead_code)]
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
