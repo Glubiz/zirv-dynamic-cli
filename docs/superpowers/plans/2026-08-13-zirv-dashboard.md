@@ -387,7 +387,8 @@ fn encode_key_covers_the_terminal_basics() {
 
 [chat]
 # Model for the interactive orchestrator session (displayed in the banner/header).
-model = "opus"
+# User decision 2026-08-13: the orchestrator runs Fable (claude-fable-5).
+model = "fable"
 ```
 
 - [ ] **Step 7: HAND TO THE HUMAN** — separate Windows Terminal: `cargo run -- chat` (dashboard appears, orchestrator pane interactive AND running the configured model, prefix+z zoom, prefix+q quit, prefix+↑/↓ selection) and `cargo run -- chat --simple` (today's behavior). Report before continuing.
