@@ -170,6 +170,14 @@ impl StateDir {
         self.0.join("memory")
     }
 
+    /// The dashboard's own state: today, only the spawn-request capability-
+    /// token directories `super::dash::spawnreq::request_dir_for` names
+    /// under `<state>/dash/<dash_short>-<token>/requests`. A future roster
+    /// file (`super::dash::roster`) hangs off this same root.
+    pub fn dash(&self) -> PathBuf {
+        self.0.join("dash")
+    }
+
     /// Short on purpose: unix socket paths are capped near 104 bytes on macOS.
     pub fn sockets(&self) -> PathBuf {
         self.0.join("s")
@@ -389,5 +397,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.usage(), tmp.path().join("usage.json"));
+    }
+
+    #[test]
+    fn the_dash_dir_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.dash(), tmp.path().join("dash"));
     }
 }

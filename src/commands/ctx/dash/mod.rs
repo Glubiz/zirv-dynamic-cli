@@ -12,11 +12,12 @@
 //! in config) still reaches today's `wrap::run_with` passthrough instead.
 
 pub mod pane;
+pub mod spawnreq;
 pub mod ui;
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -34,7 +35,7 @@ use super::config::{CtxConfig, EnvLookup};
 use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
 use super::term;
-use super::{mail, memory, sessions, window};
+use super::{mail, memory, prompt, sessions, window};
 
 pub(crate) use pane::{Pane, PaneSpec, PaneState};
 
@@ -375,13 +376,20 @@ impl FactsCache {
     }
 }
 
-/// Task 12's own extension point: on quit, before any pane is torn down,
-/// persist a roster of live panes so the next launch can offer to restore
-/// them. A no-op today -- shutdown (quit-sequence, registry release, socket
-/// unpublish) happens in the caller right after this returns.
+/// Called on every quit path, before any pane is torn down (shutdown --
+/// quit-sequence, registry release, socket unpublish -- happens in the
+/// caller right after this returns). Removes the whole spawn-request
+/// directory this dashboard created at startup (`requests_dir`'s own
+/// parent, `<dash_short>-<token>`, not just the `requests` leaf, so no empty
+/// shell is left under `<state>/dash/`): once this dashboard is gone,
+/// nothing should still be able to reach a channel that nobody is polling
+/// any more. Task 12's own extension point for persisting a restore roster
+/// from `panes` -- a no-op on that front today.
 // roster: Task 12
-fn on_quit(panes: &mut [Pane]) {
+fn on_quit(panes: &mut [Pane], requests_dir: &Path) {
     let _ = panes;
+    let dir = requests_dir.parent().unwrap_or(requests_dir);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Caps how many hot-path error strings the header keeps around: the header
@@ -480,6 +488,188 @@ fn build_turn_env(
                 "dashboard: could not resolve adapter '{agent_name}' for turn signals: {e}"
             )),
         ),
+    }
+}
+
+// Task 10: the spawn-request channel. A pane's own `zirv ctx agent`
+// invocation (inheriting `DASH_REQUESTS_ENV` from its own turn_env, set up
+// below) writes a `spawnreq::SpawnRequest` rather than running headless in
+// the pane's own subshell; this dashboard fulfils it as a fresh worker pane
+// using exactly the composed-prompt recipe `exec::run_with` uses for its own
+// first launch (memory, then mail, then `with_mail_layer`), and answers with
+// a `spawnreq::SpawnAck`.
+
+/// A 16-hex-character capability token for this dashboard's own
+/// spawn-request directory (`spawnreq::request_dir_for`). Freshly minted per
+/// launch: unpredictable enough that a process never told this directory's
+/// path cannot guess it, so only a pane that actually inherited
+/// `DASH_REQUESTS_ENV` from this dashboard can reach its spawn channel.
+fn spawn_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+}
+
+/// `std::process::Command` -> the flat `program, arg, arg, ...` form
+/// `PaneSpec::argv` wants, matching `chat::build_launch`'s own flattening of
+/// `AgentAdapter::interactive_cmd`'s output exactly (duplicated rather than
+/// shared: pulling in `chat` here for one helper would make `dash` and
+/// `chat` depend on each other in both directions).
+fn flatten_command(command: std::process::Command) -> Vec<String> {
+    let mut argv = vec![command.get_program().to_string_lossy().to_string()];
+    argv.extend(command.get_args().map(|a| a.to_string_lossy().to_string()));
+    argv
+}
+
+/// Re-validates and fulfils one spawn request: gate refusal and adapter
+/// resolution first (a request is data, never authority -- the same checks
+/// an operator-issued `zirv ctx agent` invocation goes through), then builds
+/// a Worker pane's composed prompt and argv following `exec::run_with`'s own
+/// recipe (`memory::render_for_prompt` -> `prompt::compose` -> mail listing
+/// scoped to this fresh session's own short id -> `prompt::with_mail_layer`
+/// -> `prompt::injection_args_for_session`), and spawns it. `Ok(short)` is
+/// the freshly spawned pane's own registry short id; `Err(reason)` is
+/// exactly the text `spawnreq::SpawnAck::reason` carries back to the
+/// requester.
+///
+/// Pushes the new pane (and a matching empty nudge queue, keeping the two
+/// vectors the same length -- see `deliver_queued_nudges`'s own doc comment)
+/// on success. Delivered mail is consumed only after the pane has actually
+/// spawned, mirroring `exec::run_with`'s own "consume right after the spawn
+/// that carried it genuinely started" discipline.
+#[allow(clippy::too_many_arguments)]
+fn fulfill_spawn_request(
+    req: &spawnreq::SpawnRequest,
+    panes: &mut Vec<Pane>,
+    nudge_queues: &mut Vec<VecDeque<String>>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    size: (u16, u16),
+    requests_dir: &Path,
+    errors: &mut Vec<String>,
+) -> Result<String, String> {
+    if let Some(reason) = cfg.agents.refusal(&req.agent) {
+        return Err(reason);
+    }
+    let adapter = adapters::select(Some(&req.agent), &[], cfg).map_err(|e| e.to_string())?;
+
+    let session_id = SessionId::new_v4().to_string();
+    let registry_short = sessions::short_id(&session_id);
+    let slug = super::state::repo_slug(repo);
+    let memory_entries = memory::render_for_prompt(state, &slug, cfg, super::state::now_secs());
+    let composed = prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        false,
+        &cfg.prompt,
+        prompt::PromptRole::Worker,
+        &memory_entries,
+        cfg.memory.max_injected_bytes,
+    );
+    let mut mail_entries: Vec<(PathBuf, mail::Message)> = if composed.is_some() && cfg.mail.enabled
+    {
+        mail::list(
+            state,
+            &slug,
+            Some(adapter.name()),
+            sessions::delivery_filter(None, &registry_short),
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mail_messages: Vec<mail::Message> = mail_entries.iter().map(|(_, m)| m.clone()).collect();
+    let composed = prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
+
+    let prompt_args = prompt::injection_args_for_session(
+        adapter.as_ref(),
+        &[],
+        composed.as_ref(),
+        state,
+        &session_id,
+    );
+    prompt::log_injection(
+        state,
+        "dash",
+        &session_id,
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    );
+
+    let argv = flatten_command(adapter.interactive_cmd(Some(&req.prompt), &prompt_args));
+    let spec = PaneSpec {
+        agent_name: req.agent.clone(),
+        argv,
+        role: prompt::PromptRole::Worker,
+        verb: sessions::Verb::Dash,
+        session_id: session_id.clone(),
+        title: format!("wrk {}", req.agent),
+    };
+
+    let (mut turn_env, turn_env_err) = build_turn_env(cfg, state, repo, &req.agent, &session_id);
+    if let Some(e) = turn_env_err {
+        push_error(errors, e);
+    }
+    turn_env.push((
+        spawnreq::DASH_REQUESTS_ENV.to_string(),
+        requests_dir.display().to_string(),
+    ));
+
+    let pane = Pane::spawn(spec, state, repo, size, &turn_env).map_err(|e| e.to_string())?;
+    let short = pane.short().to_string();
+    panes.push(pane);
+    nudge_queues.push(VecDeque::new());
+
+    for (path, _) in mail_entries.drain(..) {
+        let _ = mail::consume(state, &slug, &path);
+    }
+
+    Ok(short)
+}
+
+/// Drains every request currently queued in `requests_dir` and answers each
+/// one, in order. Called once per tick, alongside `mail_sweep`/
+/// `deliver_queued_nudges`: a request is data sitting on disk, not something
+/// that needs sub-tick latency.
+#[allow(clippy::too_many_arguments)]
+fn handle_spawn_requests(
+    requests_dir: &Path,
+    panes: &mut Vec<Pane>,
+    nudge_queues: &mut Vec<VecDeque<String>>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    size: (u16, u16),
+    errors: &mut Vec<String>,
+) {
+    for (path, req) in spawnreq::take_requests(requests_dir) {
+        let Some(stem) = spawnreq::request_stem(&path) else {
+            continue;
+        };
+        let ack = match fulfill_spawn_request(
+            &req,
+            panes,
+            nudge_queues,
+            cfg,
+            state,
+            repo,
+            size,
+            requests_dir,
+            errors,
+        ) {
+            Ok(short) => spawnreq::SpawnAck {
+                ok: true,
+                short: Some(short),
+                reason: None,
+            },
+            Err(reason) => spawnreq::SpawnAck {
+                ok: false,
+                short: None,
+                reason: Some(reason),
+            },
+        };
+        if let Err(e) = spawnreq::write_ack(requests_dir, &stem, &ack) {
+            push_error(errors, format!("spawn ack: {e}"));
+        }
     }
 }
 
@@ -986,10 +1176,29 @@ pub fn run_dashboard(
 
     let agent_name = first.agent_name.clone();
     let session_id = first.session_id.clone();
-    let (turn_env, turn_env_err) = build_turn_env(cfg, state, repo, &agent_name, &session_id);
+    let (mut turn_env, turn_env_err) = build_turn_env(cfg, state, repo, &agent_name, &session_id);
     if let Some(e) = turn_env_err {
         push_error(&mut errors, e);
     }
+
+    // Task 10: the spawn-request channel. `dashboard_short` is derivable
+    // before any pane has actually spawned -- `Record::new`'s own `short`
+    // field is exactly `sessions::short_id(session)` -- so even the very
+    // first (orchestrator) pane's turn_env can already carry the request
+    // directory, the same as every pane spawned later through a request.
+    let dashboard_short = sessions::short_id(&session_id);
+    let requests_token = spawn_token();
+    let requests_dir = spawnreq::request_dir_for(state, &dashboard_short, &requests_token);
+    if let Err(e) = super::state::create_private_dir_all(&requests_dir) {
+        push_error(
+            &mut errors,
+            format!("dashboard: could not create the spawn-request directory: {e}"),
+        );
+    }
+    turn_env.push((
+        spawnreq::DASH_REQUESTS_ENV.to_string(),
+        requests_dir.display().to_string(),
+    ));
 
     let size = (main.width.max(1), main.height.max(1));
     let mut panes = vec![Pane::spawn(first, state, repo, size, &turn_env)?];
@@ -1035,6 +1244,25 @@ pub fn run_dashboard(
         mail_sweep(&mut panes, cfg, state, repo, &mut errors);
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
 
+        {
+            let poll_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+            let poll_main = effective_main(
+                Rect::new(0, 0, poll_size.0, poll_size.1),
+                sidebar_cols,
+                zoomed,
+            );
+            handle_spawn_requests(
+                &requests_dir,
+                &mut panes,
+                &mut nudge_queues,
+                cfg,
+                state,
+                repo,
+                (poll_main.width.max(1), poll_main.height.max(1)),
+                &mut errors,
+            );
+        }
+
         // Facts + sidebar rows, computed BEFORE input handling: the Nudge
         // dialog's attached-vs-view-only routing and the SelectUp/SelectDown
         // clamp both need this iteration's row layout, not a rendering-only
@@ -1063,7 +1291,7 @@ pub fn run_dashboard(
                             ui::Overlay::None => {}
                             ui::Overlay::QuitConfirm(working) => match key.code {
                                 KeyCode::Enter => {
-                                    on_quit(&mut panes);
+                                    on_quit(&mut panes, &requests_dir);
                                     shutdown_all(&mut panes, cfg, &mut errors);
                                     break 0;
                                 }
@@ -1202,7 +1430,7 @@ pub fn run_dashboard(
                                     .map(|p| p.title().to_string())
                                     .collect();
                                 if working.is_empty() {
-                                    on_quit(&mut panes);
+                                    on_quit(&mut panes, &requests_dir);
                                     shutdown_all(&mut panes, cfg, &mut errors);
                                     break 0;
                                 }

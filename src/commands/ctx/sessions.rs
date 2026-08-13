@@ -106,6 +106,21 @@ pub fn nested_session_evidence(env: super::config::EnvLookup<'_>) -> Option<Stri
     if non_empty(env(super::adapters::SOCKET_ENV)).is_some() {
         found.push(format!("{} is set", super::adapters::SOCKET_ENV));
     }
+    // A dashboard pane's own child inherits this (the dashboard exports it
+    // into every pane's turn_env, never into its own process environment --
+    // see `dash::run_dashboard`), so a set value here means a dashboard pane
+    // owns this terminal, and starting another interactive supervisor (or
+    // dashboard) inside it is exactly the nested-session hazard this guard
+    // exists to catch. Deliberately not added to `SUPERVISION_ENV`: a pane
+    // child's own further children (e.g. a nested `zirv ctx agent`) must
+    // still be able to reach the same spawn-request channel, which scrubbing
+    // it there would break.
+    if non_empty(env(super::dash::spawnreq::DASH_REQUESTS_ENV)).is_some() {
+        found.push(format!(
+            "{} is set (a dashboard pane owns this terminal)",
+            super::dash::spawnreq::DASH_REQUESTS_ENV
+        ));
+    }
     if non_empty(env(CLAUDE_PID_ENV)).is_some() && non_empty(env(CLAUDE_CODE_ENV)).is_some() {
         found.push(format!(
             "{CLAUDE_PID_ENV} and {CLAUDE_CODE_ENV} are set (a Claude Code session owns this terminal)"
@@ -1461,6 +1476,29 @@ mod tests {
         // An exported-but-empty variable is not evidence of anything.
         let blank = env_map(&[(super::super::adapters::SESSION_ENV, "  ")]);
         assert_eq!(nested_session_evidence(&|k| blank.get(k).cloned()), None);
+    }
+
+    /// A pane's own child inherits `DASH_REQUESTS_ENV` from the dashboard
+    /// that spawned it (see `dash::run_dashboard`'s own turn_env assembly);
+    /// this pins that the guard actually fires on it, the same as it does
+    /// for `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET` above. The dashboard's own
+    /// startup never has this set in its own process environment -- it only
+    /// ever exports it into a pane's turn_env, never its own -- so this is
+    /// evidence a *pane* owns the terminal, never a self-trip on the
+    /// dashboard's own launch.
+    #[test]
+    fn dash_requests_env_trips_the_nested_guard() {
+        let env = env_map(&[(
+            super::super::dash::spawnreq::DASH_REQUESTS_ENV,
+            "/tmp/dash/aaaa1111-0123456789abcdef/requests",
+        )]);
+        let evidence =
+            nested_session_evidence(&|k| env.get(k).cloned()).expect("a pane owns this terminal");
+        assert!(
+            evidence.contains(super::super::dash::spawnreq::DASH_REQUESTS_ENV),
+            "got {evidence}"
+        );
+        assert!(evidence.contains("dashboard pane"), "got {evidence}");
     }
 
     #[test]
