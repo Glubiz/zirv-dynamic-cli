@@ -54,6 +54,11 @@ pub struct ChatLaunch {
     pub agent_name: String,
     pub argv: Vec<String>,
     pub role: PromptRole,
+    /// Always `Verb::Chat`: a chat session's registry record must say so
+    /// rather than falling back to `wrap`'s own default, the same way
+    /// `role` is always `Orchestrator` regardless of resuming or extra
+    /// flags.
+    pub verb: super::sessions::Verb,
 }
 
 /// Builds the launch from the adapter rather than from any user-supplied
@@ -78,6 +83,7 @@ pub fn build_launch(
         agent_name: adapter.name().to_string(),
         argv,
         role: PromptRole::Orchestrator,
+        verb: super::sessions::Verb::Chat,
     }
 }
 
@@ -245,7 +251,14 @@ pub fn run_with<W: Write, E: Write>(
         command: launch.argv,
         simple: args.simple,
     };
-    wrap::run_with(&wrap_args, repo, &env, launch.role, Some(session))
+    wrap::run_with(
+        &wrap_args,
+        repo,
+        &env,
+        launch.role,
+        Some(session),
+        launch.verb,
+    )
 }
 
 /// `--quiet` on the `chat` and `agent` verbs is a CLI flag, not an
@@ -362,6 +375,27 @@ mod tests {
         assert_eq!(
             build_launch(&adapter, Some("resume this"), &["--model".to_string()]).role,
             PromptRole::Orchestrator
+        );
+    }
+
+    /// N1: a chat session's registry record must say "chat", not fall back to
+    /// `wrap`'s own default verb -- `wrap::run_with` takes a `verb` parameter
+    /// precisely so this can be threaded through explicitly rather than
+    /// guessed from `role` (the two are independent: role governs prompt
+    /// injection permissions, verb only names the calling verb for the
+    /// registry). Unit-tested here, on the same pure `build_launch` the role
+    /// assertions above already exercise, rather than through a real pty.
+    #[test]
+    fn chat_registers_as_chat_rather_than_wrap() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            build_launch(&adapter, None, &[]).verb,
+            crate::commands::ctx::sessions::Verb::Chat,
+        );
+        // Resuming or adding extra flags must not change that either.
+        assert_eq!(
+            build_launch(&adapter, Some("resume this"), &["--model".to_string()]).verb,
+            crate::commands::ctx::sessions::Verb::Chat,
         );
     }
 

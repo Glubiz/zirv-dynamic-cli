@@ -12,6 +12,7 @@ pub mod handoff;
 pub mod hook;
 pub mod log;
 pub mod mail;
+pub mod memory;
 pub mod optimize;
 pub mod pace;
 pub mod prompt;
@@ -19,6 +20,7 @@ pub mod resume;
 pub mod rot;
 pub mod run_loop;
 pub mod score;
+pub mod sessions;
 pub mod signal;
 pub mod state;
 pub mod status;
@@ -194,6 +196,12 @@ pub enum CtxVerb {
     Send(mail::SendArgs),
     /// Read notes other agent sessions left for this one.
     Inbox(mail::InboxArgs),
+    /// Store a durable fact in this repository's memory bank.
+    Remember(memory::RememberArgs),
+    /// List durable facts from this repository's memory bank.
+    Recall(memory::RecallArgs),
+    /// Remove one or all facts from this repository's memory bank.
+    Forget(memory::ForgetArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -275,6 +283,9 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Agent(a) => agent::run(a, &mut out),
         CtxVerb::Send(a) => mail::run_send(a, &mut out),
         CtxVerb::Inbox(a) => mail::run_inbox(a, &mut out),
+        CtxVerb::Remember(a) => memory::run_remember(a, &mut out),
+        CtxVerb::Recall(a) => memory::run_recall(a, &mut out),
+        CtxVerb::Forget(a) => memory::run_forget(a, &mut out),
     };
 
     match result {

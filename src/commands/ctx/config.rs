@@ -240,6 +240,36 @@ impl Default for MailConfig {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    /// Whether facts may be harvested automatically from distilled handoffs.
+    /// Off by default: an entry worth keeping across sessions is, for now, a
+    /// deliberate act, not an inferred one.
+    pub harvest: bool,
+    /// How many entries a repository's bank keeps before the oldest
+    /// (by `Written`) are pruned. Mirrors `mail.keep`.
+    pub max_entries: usize,
+    /// Cap on a single entry's body. Enforced by `memory::remember`, which
+    /// truncates rather than fails an oversize entry.
+    pub max_entry_bytes: usize,
+    /// Cap on how much of the bank is surfaced to a session at once.
+    pub max_injected_bytes: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            harvest: false,
+            max_entries: 50,
+            max_entry_bytes: 512,
+            max_injected_bytes: 2048,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ChromeConfig {
     /// The launch banner naming the resolved harness, the rule that chose it,
     /// and the session id.
@@ -273,6 +303,7 @@ pub struct CtxConfig {
     pub optimize: OptimizeConfig,
     pub prompt: PromptConfig,
     pub mail: MailConfig,
+    pub memory: MemoryConfig,
     pub chrome: ChromeConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
@@ -424,6 +455,27 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     ("ZIRV_CTX_MAIL_KEEP", &["mail", "keep"], EnvKind::Int),
+    ("ZIRV_CTX_MEMORY", &["memory", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_MEMORY_HARVEST",
+        &["memory", "harvest"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_MAX_ENTRIES",
+        &["memory", "max_entries"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES",
+        &["memory", "max_entry_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
+        &["memory", "max_injected_bytes"],
+        EnvKind::Int,
+    ),
     (
         "ZIRV_CTX_CHROME_BANNER",
         &["chrome", "banner"],
@@ -529,6 +581,22 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // for anyone running zirv there, with no operator-visible sign that it
     // happened.
     (&["chrome", "events"], "ZIRV_CTX_QUIET"),
+    // A repo checkout must not be able to seed the memory bank, grow its
+    // cap, or turn on automatic harvesting -- the same class of decision
+    // `prompt.max_repo_bytes` guards: something the checkout must not
+    // choose for itself, only the operator (`~/.zirv/ctx.toml`, `ZIRV_CTX_*`
+    // or flags) may.
+    (&["memory", "enabled"], "ZIRV_CTX_MEMORY"),
+    (&["memory", "harvest"], "ZIRV_CTX_MEMORY_HARVEST"),
+    (&["memory", "max_entries"], "ZIRV_CTX_MEMORY_MAX_ENTRIES"),
+    (
+        &["memory", "max_entry_bytes"],
+        "ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES",
+    ),
+    (
+        &["memory", "max_injected_bytes"],
+        "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -1168,6 +1236,85 @@ mod tests {
         assert!(!cfg.mail.enabled, "the environment is the operator");
         assert_eq!(cfg.mail.max_delivered_bytes, 9000);
         assert!(!cfg.chrome.events);
+    }
+
+    #[test]
+    fn memory_defaults_are_enabled_off_harvest_with_sane_caps() {
+        let memory = MemoryConfig::default();
+        assert!(memory.enabled, "the memory bank is on by default");
+        assert!(
+            !memory.harvest,
+            "automatic harvesting is off by default: remembering is a deliberate act"
+        );
+        assert_eq!(memory.max_entries, 50);
+        assert_eq!(memory.max_entry_bytes, 512);
+        assert_eq!(memory.max_injected_bytes, 2048);
+    }
+
+    #[test]
+    fn memory_env_overrides_every_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_MEMORY", "false"),
+            ("ZIRV_CTX_MEMORY_HARVEST", "true"),
+            ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "9"),
+            ("ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES", "128"),
+            ("ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES", "999"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.memory.enabled);
+        assert!(cfg.memory.harvest);
+        assert_eq!(cfg.memory.max_entries, 9);
+        assert_eq!(cfg.memory.max_entry_bytes, 128);
+        assert_eq!(cfg.memory.max_injected_bytes, 999);
+    }
+
+    /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and
+    /// `mail.max_delivered_bytes`: a repo checkout must not be able to seed
+    /// the bank, grow its own cap, or switch automatic harvesting on for
+    /// anyone who runs zirv there.
+    #[test]
+    fn a_repository_config_may_not_raise_a_memory_cap_or_enable_harvesting() {
+        for (key, value) in [
+            ("enabled", "true"),
+            ("harvest", "true"),
+            ("max_entries", "100000"),
+            ("max_entry_bytes", "100000"),
+            ("max_injected_bytes", "100000"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[memory]\n{key} = {value}\n"),
+            )
+            .expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(&format!("memory.{key}")), "got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_MEMORY"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operator_may_still_set_memory_keys() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_only.path());
+        let env = env_map(&[
+            ("ZIRV_CTX_MEMORY", "false"),
+            ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "5"),
+        ]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.memory.enabled, "the environment is the operator");
+        assert_eq!(cfg.memory.max_entries, 5);
     }
 
     #[test]

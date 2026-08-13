@@ -91,10 +91,20 @@ pub fn run_with<W: Write>(
     let mut failures = 0u32;
     let now_fn = now_secs;
     let sleep_fn = |d: Duration| std::thread::sleep(d);
+    // One registry record for the whole run, refreshed (not re-registered)
+    // each cycle since every cycle mints a fresh session id -- see
+    // `SessionGuard::refresh_session`. `None` until the first cycle actually
+    // has a session to register. Released explicitly at every arm that
+    // leaves this loop, matching the explicit-arm discipline `RawGuard`
+    // follows under this binary's `panic = "abort"` release profile.
+    let mut session_guard: Option<super::sessions::SessionGuard> = None;
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
         {
+            if let Some(guard) = session_guard.as_mut() {
+                guard.release();
+            }
             return Ok(0);
         }
         cycle += 1;
@@ -141,6 +151,20 @@ pub fn run_with<W: Write>(
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles.
         let session = SessionId::new_v4();
+        match session_guard.as_mut() {
+            Some(guard) => guard.refresh_session(session.as_str()),
+            None => {
+                session_guard = Some(super::sessions::SessionGuard::register(
+                    &state,
+                    super::sessions::Record::new(
+                        session.as_str(),
+                        adapter.name(),
+                        repo,
+                        super::sessions::Verb::Loop,
+                    ),
+                ));
+            }
+        }
         // M7: rebuilt per cycle because the private prompt file is named after
         // the session it belongs to, and every cycle is a new session. The
         // adapter builds this launch itself, so the probe gets an empty argv.
@@ -286,6 +310,9 @@ pub fn run_with<W: Write>(
             interval,
             &mut failures,
         )? {
+            if let Some(guard) = session_guard.as_mut() {
+                guard.release();
+            }
             return Ok(code);
         }
     }

@@ -458,6 +458,23 @@ pub fn run_with<W: Write>(
     let now_fn = now_secs;
     let sleep_fn = |d: Duration| std::thread::sleep(d);
 
+    // Best-effort registration: covers a hand-typed `zirv ctx exec` as well
+    // as `zirv ctx agent` and a script `agent:` step, both of which delegate
+    // to this same function. Refreshed (not re-registered) whenever a
+    // restart or a usage-limit park mints a fresh session id below, and
+    // released explicitly in every arm that leaves this loop -- the same
+    // explicit-arm discipline `RawGuard` follows, since this binary's
+    // release profile is `panic = "abort"` and `Drop` is not guaranteed.
+    let mut session_guard = super::sessions::SessionGuard::register(
+        &state,
+        super::sessions::Record::new(
+            session.as_str(),
+            adapter.name(),
+            repo,
+            super::sessions::Verb::Exec,
+        ),
+    );
+
     loop {
         pace::wait_for_window(
             w,
@@ -520,7 +537,10 @@ pub fn run_with<W: Write>(
         }
 
         match outcome {
-            Outcome::Exited(code) if !limit_hit => return Ok(code),
+            Outcome::Exited(code) if !limit_hit => {
+                session_guard.release();
+                return Ok(code);
+            }
             Outcome::Exited(_) | Outcome::TimedOut | Outcome::StoppedByTick(_) => {}
         }
 
@@ -558,11 +578,13 @@ pub fn run_with<W: Write>(
                     w,
                     "zirv ctx exec: usage limit hit and the original prompt is unknown, so it cannot relaunch. Pass --prompt to enable parking."
                 )?;
+                session_guard.release();
                 return Ok(EXIT_ROT_EXHAUSTED);
             };
 
             // A park is not a restart: the budget is for rot, not for waiting.
             session = SessionId::new_v4();
+            session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
             // M2: a park mints a new session id, just like a restart, so the
             // injection attribution is re-logged under it rather than only
@@ -630,6 +652,7 @@ pub fn run_with<W: Write>(
                     detail: "no prompt available for restart",
                 },
             );
+            session_guard.release();
             return Ok(exhausted_code);
         };
 
@@ -650,6 +673,7 @@ pub fn run_with<W: Write>(
                 w,
                 "zirv ctx exec: {reason} after {restarts} restarts, giving up with exit {exhausted_code}"
             )?;
+            session_guard.release();
             return Ok(exhausted_code);
         }
 
@@ -686,6 +710,7 @@ pub fn run_with<W: Write>(
         )?;
 
         session = SessionId::new_v4();
+        session_guard.refresh_session(session.as_str());
         // The new session writes somewhere new, so the next iteration's watcher
         // must follow it rather than the file the killed child left behind.
         transcript = derive_transcript(&session);

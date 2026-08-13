@@ -164,6 +164,12 @@ impl StateDir {
         self.0.join("mail")
     }
 
+    /// Cross-session memory bank: `<state>/memory/<repo_slug>/...`. See
+    /// `super::memory` for the storage layout and entry format.
+    pub fn memory(&self) -> PathBuf {
+        self.0.join("memory")
+    }
+
     /// Short on purpose: unix socket paths are capped near 104 bytes on macOS.
     pub fn sockets(&self) -> PathBuf {
         self.0.join("s")
@@ -183,6 +189,13 @@ impl StateDir {
     /// every turn, so the only place it can leave its parse position is a file.
     pub fn scoring(&self) -> PathBuf {
         self.0.join("scoring")
+    }
+
+    /// Session registry: `<state>/sessions/<short8>.json`, one file per live
+    /// supervisor. See `super::sessions` for the record format and the short
+    /// id derivation, which matches `socket_for`'s own exactly.
+    pub fn sessions(&self) -> PathBuf {
+        self.0.join("sessions")
     }
 
     /// First 8 hex characters of the session id keep the socket path short.

@@ -654,6 +654,7 @@ pub fn run_with(
     env: EnvLookup<'_>,
     role: PromptRole,
     session: Option<super::event::SessionId>,
+    verb: super::sessions::Verb,
 ) -> CtxResult<i32> {
     if args.command.is_empty() {
         return Err("no command to wrap; pass it after --".into());
@@ -713,6 +714,14 @@ pub fn run_with(
 
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = session.unwrap_or_else(super::event::SessionId::new_v4);
+    // Best-effort registration, released right after `pump` returns below --
+    // `wrap`'s own control flow always funnels through that one point,
+    // unlike `exec`'s scattered early returns, so a single release suffices
+    // here.
+    let mut session_guard = super::sessions::SessionGuard::register(
+        &state_dir,
+        super::sessions::Record::new(session.as_str(), adapter.name(), repo, verb),
+    );
 
     // `--no-supervise` promises pure passthrough (its own help text says so),
     // and so does a wrapped command that matches no adapter: injecting this
@@ -1018,6 +1027,7 @@ pub fn run_with(
         &announcer,
         &mut bar,
     );
+    session_guard.release();
 
     reset_bar(&bar);
     if let Some(guard) = raw.as_mut() {
@@ -1590,7 +1600,14 @@ fn pump(
 pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, &repo, &env, PromptRole::Worker, None)
+    run_with(
+        args,
+        &repo,
+        &env,
+        PromptRole::Worker,
+        None,
+        super::sessions::Verb::Wrap,
+    )
 }
 
 #[cfg(test)]
@@ -1814,8 +1831,15 @@ mod tests {
             command: Vec::new(),
             simple: false,
         };
-        let err = run_with(&args, tmp.path(), &|_| None, PromptRole::Worker, None)
-            .expect_err("nothing to wrap");
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("nothing to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
@@ -1834,8 +1858,15 @@ mod tests {
             command: vec!["echo".to_string(), "hello".to_string()],
             simple: false,
         };
-        let err = run_with(&args, tmp.path(), &|_| None, PromptRole::Worker, None)
-            .expect_err("echo matches no adapter");
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("echo matches no adapter");
         let msg = err.to_string();
         assert!(
             msg.contains("--agent"),
@@ -1867,8 +1898,15 @@ mod tests {
             command: vec!["--append-system-prompt".to_string(), "foo".to_string()],
             simple: false,
         };
-        let err = run_with(&args, tmp.path(), &|_| None, PromptRole::Worker, None)
-            .expect_err("nothing left to wrap");
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("nothing left to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
