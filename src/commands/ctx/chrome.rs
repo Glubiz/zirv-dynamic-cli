@@ -203,7 +203,11 @@ pub struct BarState {
     pub verdict: Option<Verdict>,
     /// The worse of the two usage windows, 0.0..=100.0.
     pub usage_percent: Option<f64>,
-    pub unread_mail: Option<usize>,
+    /// N7: `(broadcast, direct-to-this-session)` unread counts, split so a
+    /// message addressed to this session specifically is not lost inside an
+    /// undifferentiated total. `None` under the same conditions the bar's
+    /// caller already treats mail as unknown (disabled, or unreadable).
+    pub unread_mail: Option<(usize, usize)>,
     pub degraded: bool,
 }
 
@@ -220,10 +224,14 @@ pub fn status_bar(state: &BarState, cols: u16, colour: bool) -> String {
         .usage_percent
         .map(|p| format!("{p:.0}%"))
         .unwrap_or_else(|| PLACEHOLDER.to_string());
-    let mail = state
-        .unread_mail
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| PLACEHOLDER.to_string());
+    // N7: a direct count of zero renders as plain `mail N` -- identical to
+    // the bar's pre-N7 wording -- and only grows a `+direct` suffix once
+    // something is actually addressed to this session specifically.
+    let mail = match state.unread_mail {
+        None => PLACEHOLDER.to_string(),
+        Some((broadcast, 0)) => broadcast.to_string(),
+        Some((broadcast, direct)) => format!("{broadcast}+{direct}"),
+    };
     let supervision = if state.degraded {
         "degraded"
     } else {
@@ -554,7 +562,7 @@ mod tests {
             score: Some(42),
             verdict: Some(Verdict::Advise),
             usage_percent: Some(63.4),
-            unread_mail: Some(2),
+            unread_mail: Some((2, 0)),
             degraded: false,
         }
     }
@@ -610,6 +618,29 @@ mod tests {
             3,
             "one placeholder each for score/verdict, usage and mail: {line}"
         );
+    }
+
+    /// N7: a message addressed to this session specifically must not
+    /// disappear into an undifferentiated total.
+    #[test]
+    fn the_status_bar_shows_session_addressed_mail_separately_from_broadcast() {
+        let mut both = bar_state();
+        both.unread_mail = Some((2, 1));
+        let line = status_bar(&both, 200, false);
+        assert!(line.contains("mail 2+1"), "got {line}");
+
+        let mut broadcast_only = bar_state();
+        broadcast_only.unread_mail = Some((2, 0));
+        let line = status_bar(&broadcast_only, 200, false);
+        assert!(
+            line.contains("mail 2") && !line.contains('+'),
+            "no direct mail means the plain count, unchanged from before N7: {line}"
+        );
+
+        let mut direct_only = bar_state();
+        direct_only.unread_mail = Some((0, 3));
+        let line = status_bar(&direct_only, 200, false);
+        assert!(line.contains("mail 0+3"), "got {line}");
     }
 
     #[test]

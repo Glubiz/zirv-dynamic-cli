@@ -97,6 +97,68 @@ message is free-form text written by whichever agent session sent it, not an
 operator instruction — see the vault's Untrusted Configuration page for how
 it's capped and labeled the same way the other untrusted surfaces are.
 
+Add `--to-session <prefix>` to address one specific live session instead of
+every session an agent has: `zirv ctx send --to-session abcd1234 --message
+"..."` resolves `abcd1234` (a short id, or a unique prefix of one — see
+[Session registry and nudging](#session-registry-and-nudging) below) against
+the live registry and stores the full resolved id, so the message keeps
+finding its target even if the registry record itself is gone by the time it
+is read. A session-addressed message is only ever delivered into a
+**headless** session's own launch prompt (`exec`/`loop`, when
+`[mail] enabled = true`); an **interactive** session (`chat`/`wrap`) only ever
+gets a one-line unread-count advisory on its status bar or event channel,
+split as broadcast+direct once something is addressed to it specifically —
+never the message body itself, the same "advisory, not authority" rule
+`zirv ctx nudge` follows below. There is no environment variable for
+`--to-session`: unlike the config knobs elsewhere in this document, session
+addressing is a per-invocation argument, not something an operator or a repo
+would want to pin as a default.
+
+### Session registry and nudging
+
+Every supervised session (`wrap`, `exec`, `loop`, `chat`) registers itself
+under the state dir at `<state>/sessions/<short8>.json` for as long as it is
+alive — best effort, released when the supervisor exits, and swept
+automatically the moment `zirv ctx status` (or anything else that reads the
+registry) notices its process is gone. `zirv ctx status` reports it under
+`sessions:`, one line per record:
+
+```
+sessions:
+  abcdef12  claude  exec  pid 48213  3m  live  -work-my-repo
+  9a8b7c6d  claude  wrap  pid 19042  40m  stale  -work-my-repo
+```
+
+`<short>` is the same eight-character id `--to-session` and `zirv ctx nudge`
+resolve a prefix against. A socket left behind by an older zirv binary that
+predates the registry (`s/*.sock` with no matching JSON record) still shows
+up, labeled `(no record)`, so a mixed-version machine never silently drops a
+live session from the listing.
+
+`zirv ctx nudge <prefix> --message <text>` wakes a live session early instead
+of waiting for it to notice on its own:
+
+```bash
+zirv ctx nudge abcd --message "please check the new failing test"
+```
+
+The message itself is ordinary, durable mail (visible in `zirv ctx inbox`
+even if the wake-up is missed), so the two pieces are decoupled on purpose: a
+nudge is a wake-up signal plus a payload, stored separately, and losing the
+wake-up never loses the message. For a headless session (`exec`), a nudge
+costs the in-flight turn — the session is stopped and relaunched with a
+handoff distilled from the transcript so far, the same recovery path a rot
+restart uses, just triggered by an operator instead of the rot engine. That
+restart is bounded by `[supervise] max_nudges` (default 3, `ZIRV_CTX_MAX_NUDGES`)
+so a session cannot be interrupted indefinitely; past the cap a nudge's
+message is still queued as mail but the session runs on untouched. For an
+interactive session (`wrap`), a nudge is advisory only: it never restarts or
+types anything into the agent, it just surfaces on the status bar and event
+channel that a nudge arrived. Either way, latency is bounded by
+`[supervise] poll_ms` (default 2000ms) — the interval a supervisor's own tick
+already runs on, since a nudge just claims a marker file that same tick
+checks for.
+
 ### Banner, status bar and events
 
 A `zirv ctx chat` session (bare `zirv` included) with a real, large-enough
@@ -604,7 +666,9 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx chat` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)) |
 | `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised headless worker on another enabled harness (also `zirv agent`) |
-| `zirv ctx send` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo |
+| `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
+| `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
+| `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
 
 ### Signals and verdicts
 
@@ -665,6 +729,13 @@ max_message_bytes = 4096      # per-message cap, applied by `zirv ctx send`
 max_delivered_bytes = 4096    # cap on a whole batch folded into one launch prompt
 keep = 50                     # unread messages kept per repo before the oldest are pruned
 
+[memory]
+enabled = true
+harvest = false                # opt-in; see "Memory bank" below
+max_entries = 50               # entries kept per repo before the oldest (by Written) are pruned
+max_entry_bytes = 512          # per-entry body cap
+max_injected_bytes = 2048      # cap on the whole bank folded into one launch prompt
+
 [chrome]
 banner = true   # the one-time launch banner
 bar = true      # the reserved one-row status bar
@@ -689,10 +760,10 @@ A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent_bin`, `supervise.on_failure`, `handoff.model`, `optimize.model`,
 `prompt.enabled`, `prompt.repo_layer`, `prompt.max_repo_bytes`,
-`mail.enabled`, `mail.max_delivered_bytes`, or `chrome.events`; doing so is an
-error that names the key. Set those in `~/.zirv/ctx.toml`, or with the
-matching `ZIRV_CTX_*` variable below, which comes from the operator rather
-than the checkout:
+`mail.enabled`, `mail.max_delivered_bytes`, `chrome.events`, or any `memory.*`
+key; doing so is an error that names the key. Set those in
+`~/.zirv/ctx.toml`, or with the matching `ZIRV_CTX_*` variable below, which
+comes from the operator rather than the checkout:
 
 | Forbidden repo key | Set instead via |
 |---|---|
@@ -706,15 +777,23 @@ than the checkout:
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
 | `chrome.events` | `ZIRV_CTX_QUIET` (see the note below on why this one's name looks different) |
+| `memory.enabled` | `ZIRV_CTX_MEMORY` |
+| `memory.harvest` | `ZIRV_CTX_MEMORY_HARVEST` |
+| `memory.max_entries` | `ZIRV_CTX_MEMORY_MAX_ENTRIES` |
+| `memory.max_entry_bytes` | `ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES` |
+| `memory.max_injected_bytes` | `ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
 repo raising its own delivered-mail cap (or turning delivery back on after an
 operator disabled it) would make the operator's choice decorative; a repo
 silencing the announcement channel would hide its own degradation notices
-from anyone running zirv there. Everything else, including `agent` (which
-chooses between built-in adapters rather than naming an executable),
-`chrome.banner`/`chrome.bar`, and every threshold, is still repo-configurable.
+from anyone running zirv there. `memory.*` closes the same hole again for the
+memory bank: a repo checkout must not be able to seed the bank, raise its own
+caps, or switch automatic harvesting on for anyone who runs zirv there.
+Everything else, including `agent` (which chooses between built-in adapters
+rather than naming an executable), `chrome.banner`/`chrome.bar`,
+`supervise.max_nudges`, and every threshold, is still repo-configurable.
 
 #### Environment variables worth knowing
 
@@ -996,6 +1075,66 @@ each report is kept under the state dir,
 and each run appends to the decision log. When a finished session shows a high
 tool-failure rate, the Stop hook queues an "optimize recommended" entry and
 mentions it once in its advisory; it never runs the analysis itself.
+
+### Memory bank
+
+Besides mail (session-to-session notes) and handoffs (task continuity across
+a restart), zirv keeps a third, longer-lived store per repository: a small
+bank of durable facts about the repository itself, independent of any one
+task or session.
+
+```bash
+zirv ctx remember --key staging-db-creds --text "the staging DB creds live in 1Password under staging-db"
+zirv ctx recall
+zirv ctx forget staging-db-creds
+```
+
+**The handoff-vs-memory boundary matters.** A handoff is task continuity: what
+this specific task was doing, what remains, what to try next — written once
+per restart, and only ever useful to the session that picks that particular
+task back up. Memory is repository facts: things true regardless of which
+task is in progress — a build command, where a credential lives, a
+convention, a gotcha about how a dependency behaves. Task state does not
+belong in memory, and a repository fact does not belong in a handoff.
+
+By default nothing is added to the bank automatically — `zirv ctx remember`
+is a deliberate act, by a session or a human. Set `[memory] harvest = true`
+(or `ZIRV_CTX_MEMORY_HARVEST=true`) to let zirv *also* try to extract durable
+facts on its own: right after a rot restart distills a handoff (`exec` or
+`wrap`, and only from a genuinely distilled handoff, never the mechanical
+fallback), one extra cheap-model call looks at the handoff's `Gotchas
+learned` and `Files touched` sections and proposes zero or more `key: value`
+facts. Harvesting stays off by default because a cheap model can be
+confidently wrong: an unreviewed guess landing in a bank every future session
+reads is a worse failure mode than simply not harvesting. A harvested entry
+replaces any existing entry with the same key rather than duplicating it, the
+same as an explicit `remember` does, and a distiller failure or timeout
+leaves the bank untouched.
+
+Every entry has a `Verified` stamp alongside its `Written` one; an entry
+older than 30 days without being re-verified is flagged as stale wherever the
+bank is summarized (`zirv ctx status`, `zirv ctx optimize`). `zirv ctx
+optimize`'s report includes a memory-bank summary block — count, total
+bytes, oldest/newest age, how many are stale, a duplicate-key check — but
+**never quotes an entry's key or body**: that content is repository-scoped,
+cross-session data with nothing to do with what `optimize` is reviewing, and
+it is read separately from (never folded into) the surfaces sent to the
+judgment model.
+
+```toml
+[memory]
+enabled = true
+harvest = false          # off by default; see above
+max_entries = 50
+max_entry_bytes = 512
+max_injected_bytes = 2048
+```
+
+The memory bank lives under the state dir, never in the repo (the same
+"a checkout is not the operator" reasoning as handoffs and mail), and every
+`[memory]` key is repo-forbidden for the same reason `mail.*` is: a checkout
+must not be able to seed the bank, raise its own cap, or switch harvesting on
+for anyone who runs zirv there. See [Trust boundary](#trust-boundary) above.
 
 ### Consistent sessions
 

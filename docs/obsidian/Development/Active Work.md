@@ -18,7 +18,11 @@ Entries use the format:
 
 ### zirv chat, mail, and TUI chrome — in review (`feat/zirv-chat`, 2026-08-13)
 **Status (2026-08-13):** Full sweep landed and pushed as PR #19 (stacked on #18 → #17): bare-`zirv`/`zirv chat` supervised entry, registry-driven default-harness resolution, `zirv agent` delegation, `ctx send`/`inbox` mail with trust-split delivery, launch banner + reserved-row status bar + `zirv ▸` event channel. Two adversarial review rounds passed; exit-path audit done (every session end now announces why on stderr).
-**Next:** merge #17 → #18 → #19; manually verify the status bar under resize in a real Windows Terminal (ConPTY corner is not automatable here). Remaining roadmap: codex adapter completion (externally blocked on codex hooks contract), cross-harness handoff provenance, per-agent model routing, session registry.
+**Next:** merge #17 → #18 → #19; manually verify the status bar under resize in a real Windows Terminal (ConPTY corner is not automatable here). Remaining roadmap: codex adapter completion (externally blocked on codex hooks contract), cross-harness handoff provenance, per-agent model routing.
+
+### Agent coordination: session registry, nudge, memory bank — coordination increment in review (`feat/agent-coordination`, 2026-08-13)
+**Status (2026-08-13):** Built on top of the zirv-chat sweep above. Landed in waves: session registry + `zirv ctx nudge` (`sessions.rs`), per-session mail addressing (`send --to-session`), the memory bank (`remember`/`recall`/`forget`, injected as its own prompt layer), and this increment's own wave 3 — opt-in handoff-to-memory harvesting (`[memory] harvest`, default off), `status`'s registry-backed `sessions:` block and `memory:` line, `optimize`'s memory-bank size summary (never quotes bank content), and the T12b bar's split broadcast/direct mail count. Full test suite green against the documented Windows os-193 baseline; fmt/clippy clean.
+**Next:** request review; no known follow-up work for this wave. Remaining roadmap items (codex adapter, cross-harness handoff provenance, per-agent model routing) are unchanged from the zirv-chat entry above.
 
 ## Recently Completed
 

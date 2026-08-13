@@ -363,6 +363,38 @@ fn unread_mail_count(
     .map(|found| found.len())
 }
 
+/// N7: the same visible-to-this-session listing `unread_mail_count` reads,
+/// split into `(broadcast, direct-to-this-session)` rather than one combined
+/// total, for the T12b bar's own `mail 2+1` rendering. `None` under the same
+/// conditions `unread_mail_count` returns `None` for. Kept as a separate
+/// function rather than changing `unread_mail_count`'s own return type: the
+/// turn-signal arm's `mail_grew` advisory only ever needs a plain total and
+/// has its own tests pinned to that shape.
+fn unread_mail_counts(
+    state: &super::state::StateDir,
+    repo: &Path,
+    agent: &str,
+    session_short: &str,
+    mail_enabled: bool,
+) -> Option<(usize, usize)> {
+    if !mail_enabled {
+        return None;
+    }
+    let found = super::mail::list(
+        state,
+        &super::state::repo_slug(repo),
+        Some(agent),
+        Some(session_short),
+    )
+    .ok()?;
+    let direct = found
+        .iter()
+        .filter(|(_, msg)| msg.to_session.as_deref() == Some(session_short))
+        .count();
+    let broadcast = found.len() - direct;
+    Some((broadcast, direct))
+}
+
 pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
     // A TUI submits on carriage return, not newline.
     write!(sink, "{compact_command} {COMPACT_FOCUS}\r")?;
@@ -1030,6 +1062,8 @@ pub fn run_with(
         cfg.handoff.tail_items,
         &cfg.handoff.model,
         Duration::from_secs(cfg.handoff.timeout_secs),
+        &cfg,
+        &memory_slug,
         QUIT_GRACE,
         tx,
         generation,
@@ -1221,7 +1255,7 @@ fn redraw_bar_if_due(
         .fold(None, |acc: Option<f64>, p| {
             Some(acc.map_or(p, |a| a.max(p)))
         });
-    let unread_mail = unread_mail_count(
+    let unread_mail = unread_mail_counts(
         state_dir,
         repo,
         &bar.harness,
@@ -1276,6 +1310,11 @@ fn pump(
     tail_items: usize,
     distiller_model: &str,
     distiller_timeout: Duration,
+    // N6: read alongside `distiller_model`/`distiller_timeout` at the one
+    // restart site below (`Action::Restart`), never anywhere else in the
+    // pump -- the harvest call is gated on `cfg.memory.harvest` internally.
+    cfg: &CtxConfig,
+    memory_slug: &str,
     grace: Duration,
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1456,6 +1495,20 @@ fn pump(
                     distiller_timeout,
                 );
                 let stored = handoff::store(state_dir, repo, session.as_str(), &note);
+                // N6: opt-in (`cfg.memory.harvest`, default off) and only
+                // from a genuinely distilled handoff -- never the mechanical
+                // structural fallback. Best-effort: a harvest failure must
+                // never turn a successful restart into a failed one.
+                if source == "distilled" {
+                    let _ = super::memory::harvest_from_handoff(
+                        adapter,
+                        distiller_model,
+                        &note,
+                        state_dir,
+                        memory_slug,
+                        cfg,
+                    );
+                }
 
                 // The writer is taken first, and the generation is bumped only
                 // once this restart is genuinely under way. The two used to be

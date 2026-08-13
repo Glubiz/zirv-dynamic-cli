@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-13
 ---
 
 # Home
@@ -37,8 +37,8 @@ graph TB
 
 - [[Script Runner]] — parses and executes a `Script`: context building, step dispatch, shell/concurrent/agent steps.
 - [[Built-in Commands]] — `main.rs` dispatch table: `help`/`version`/`init`/`create`/`ctx`, the `chat`/`agent` top-level aliases, and the bare-`zirv` alias.
-- [[Ctx Subsystem]] — the `zirv ctx` hub: verb tree (including `chat`/`agent`/`send`/`inbox`), dispatch, layered config, state directory, decision log.
-- [[Ctx Supervisors]] — `loop`/`exec`/`wrap`, the three process supervisors, turn-signal sockets, raw-mode terminal handling, and the chat session's role/mail advisory/terminal chrome.
+- [[Ctx Subsystem]] — the `zirv ctx` hub: verb tree (including `chat`/`agent`/`send`/`inbox`/`nudge`/`remember`/`recall`/`forget`), dispatch, layered config, state directory, decision log, the session registry, and the memory bank.
+- [[Ctx Supervisors]] — `loop`/`exec`/`wrap`, the three process supervisors, turn-signal sockets, raw-mode terminal handling, nudge handling, and the chat session's role/mail advisory/terminal chrome.
 - [[Ctx Adapters]] — the `AgentAdapter` trait, the claude/codex implementations, and the registry/`resolve_default` selection logic.
 - [[Rot Engine]] — the pure, deterministic transcript-scoring core that produces a `Verdict`.
 - [[Usage and Pacing]] — rolling rate-limit windows, the pacing gate, and the statusline tee.
@@ -48,8 +48,8 @@ graph TB
 
 - [[Script Files]] — the YAML/JSON/TOML script format: params, secrets, command steps, chaining.
 - [[Shortcuts]] — `.shortcuts.yaml` short-key-to-script mapping and when it's consulted.
-- [[Context Management]] — why `zirv ctx` exists: the rot problem, the scoring approach, how the supervisors act on it, and zirv as a meta-harness (chat, delegation, mailbox).
-- [[Untrusted Configuration]] — the trust boundary around repo-provided config and prompt text, and around agent-authored mail.
+- [[Context Management]] — why `zirv ctx` exists: the rot problem, the scoring approach, how the supervisors act on it, zirv as a meta-harness (chat, delegation, mailbox, nudging), and the handoff-vs-memory boundary.
+- [[Untrusted Configuration]] — the trust boundary around repo-provided config and prompt text, around agent-authored mail, and around the memory bank (repo-forbidden keys, harvest opt-in).
 
 ### Development
 

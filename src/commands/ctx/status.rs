@@ -5,8 +5,82 @@ use super::adapters::{self, DefaultOrigin};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::handoff::latest_for_repo;
 use super::mail;
+use super::sessions::{self, Liveness};
 use super::state::{StateDir, repo_slug};
 use super::{CtxResult, log};
+
+/// One unit, whichever is largest without going to zero: seconds under a
+/// minute, then minutes, hours, days. A session registry entry's age is
+/// usually minutes to days old, never sub-second, so this deliberately does
+/// not go finer than seconds.
+fn format_age(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+/// N7: one line per registry record (`<short> <agent> <verb> pid <pid> <age>
+/// live|stale <repo_slug>`), plus one line for any `s/*.sock` file that has
+/// no matching registry record -- an older zirv binary that predates the
+/// registry still wrote sockets, and a mixed-version machine must not make
+/// those supervisors disappear from `status` entirely, just less detailed.
+fn sessions_lines(state: &StateDir, now: u64) -> Vec<String> {
+    let mut records = sessions::list(state);
+    records.sort_by(|a, b| a.0.short.cmp(&b.0.short));
+
+    let known: std::collections::BTreeSet<String> = records
+        .iter()
+        .map(|(record, _)| record.short.clone())
+        .collect();
+
+    let mut lines: Vec<String> = records
+        .iter()
+        .map(|(record, liveness)| {
+            format!(
+                "  {}  {}  {}  pid {}  {}  {}  {}",
+                record.short,
+                record.agent,
+                record.verb,
+                record.pid,
+                format_age(now.saturating_sub(record.started_at)),
+                match liveness {
+                    Liveness::Live => "live",
+                    Liveness::Stale => "stale",
+                },
+                record.repo_slug,
+            )
+        })
+        .collect();
+
+    let mut orphan_sockets: Vec<String> = std::fs::read_dir(state.sockets())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("sock"))
+                .filter_map(|e| {
+                    e.path()
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                })
+                .filter(|short| !known.contains(short))
+                .collect()
+        })
+        .unwrap_or_default();
+    orphan_sockets.sort();
+    lines.extend(
+        orphan_sockets
+            .into_iter()
+            .map(|short| format!("  {short}  (no record)")),
+    );
+
+    lines
+}
 
 /// The `chat:` status line: the adapter `zirv ctx chat` would launch and the
 /// rule that picked it (`adapters::resolve_default`'s own `DefaultOrigin`),
@@ -85,28 +159,34 @@ pub fn run_with<W: Write>(
         Err(_) => writeln!(w, "mail: (unreadable)")?,
     }
 
-    let mut sessions: Vec<String> = std::fs::read_dir(state.sockets())
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("sock"))
-                .filter_map(|e| {
-                    e.path()
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    sessions.sort();
-
-    writeln!(w, "\nsupervised sessions:")?;
-    if sessions.is_empty() {
+    writeln!(w, "\nsessions:")?;
+    let session_lines = sessions_lines(&state, crate::commands::ctx::state::now_secs());
+    if session_lines.is_empty() {
         writeln!(w, "  no supervised sessions")?;
     } else {
-        for session in &sessions {
-            writeln!(w, "  {session}")?;
+        for line in &session_lines {
+            writeln!(w, "{line}")?;
         }
+    }
+
+    // N7: the memory bank's own summary line, reusing `optimize::
+    // memory_bank_summary` (count, oldest age, staleness) rather than a
+    // second reader of the same on-disk format.
+    let memory_summary = super::optimize::memory_bank_summary(
+        &state,
+        &mail_slug,
+        crate::commands::ctx::state::now_secs(),
+    );
+    if memory_summary.count == 0 {
+        writeln!(w, "memory: empty")?;
+    } else {
+        writeln!(
+            w,
+            "memory: {} entries, oldest {}d, {} stale >30d",
+            memory_summary.count,
+            memory_summary.oldest_written_days.unwrap_or(0),
+            memory_summary.stale_count
+        )?;
     }
 
     let windows = crate::commands::ctx::window::load(&state);
@@ -457,5 +537,165 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("usage"), "got {text}");
         assert!(text.contains("77"), "got {text}");
+    }
+
+    // N7: the registry-backed `sessions:` block and the `memory:` line.
+
+    #[test]
+    fn status_lists_each_live_session_with_its_agent_verb_and_age() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let repo = tmp.path().join("repo");
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "abcdef12-3456-4789-8abc-def012345678",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Exec,
+        );
+        let short = record.short.clone();
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        let line = text.lines().find(|l| l.contains(&short)).unwrap_or("");
+        assert!(line.contains("claude"), "names the agent: {line}");
+        assert!(line.contains("exec"), "names the verb: {line}");
+        assert!(line.contains("pid"), "names the pid: {line}");
+        assert!(line.contains("live"), "reports live: {line}");
+        assert!(!text.contains("no supervised sessions"));
+    }
+
+    /// A pid guaranteed dead by the time it is used, the same idiom
+    /// `sessions.rs`'s own tests use.
+    fn dead_pid() -> u32 {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit", "0"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = cmd.spawn().expect("spawn a short-lived process");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
+    #[test]
+    fn status_marks_a_session_whose_process_is_gone_as_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let repo = tmp.path().join("repo");
+
+        let mut record = crate::commands::ctx::sessions::Record::new(
+            "dddddddd-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Loop,
+        );
+        record.pid = dead_pid();
+        let short = record.short.clone();
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        let line = text.lines().find(|l| l.contains(&short)).unwrap_or("");
+        assert!(line.contains("stale"), "got {line}");
+        assert!(!line.contains("live"), "got {line}");
+    }
+
+    #[test]
+    fn status_still_lists_a_socket_that_has_no_registry_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        // An older zirv wrote only the socket, never a registry record: the
+        // listing must still surface it, labeled as having none.
+        let _server =
+            crate::commands::ctx::signal::SignalServer::bind(&state.socket_for("abcdef12-3456"))
+                .expect("bind");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        let line = text.lines().find(|l| l.contains("abcdef12")).unwrap_or("");
+        assert!(
+            line.contains("no record"),
+            "a socket with no registry entry is still listed: {line}"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_memory_bank_size_and_its_oldest_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        assert!(
+            {
+                let mut out = Vec::new();
+                run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+                    env.get(k).cloned()
+                })
+                .expect("runs");
+                String::from_utf8(out)
+                    .expect("utf8")
+                    .contains("memory: empty")
+            },
+            "an empty bank reports empty"
+        );
+
+        let slug = repo_slug(tmp.path());
+        let cfg = CtxConfig::default();
+        let now = crate::commands::ctx::state::now_secs();
+        crate::commands::ctx::memory::remember(
+            &state,
+            &slug,
+            &crate::commands::ctx::memory::Entry {
+                key: "build-cmd".to_string(),
+                written_by: "claude".to_string(),
+                written: now - 5 * 86_400,
+                verified: now - 5 * 86_400,
+                source: "explicit".to_string(),
+                body: "cargo build --release".to_string(),
+            },
+            &cfg,
+        )
+        .expect("remember");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("memory:"))
+            .unwrap_or("");
+        assert!(line.contains('1'), "one entry: {line}");
+        assert!(line.contains("5d"), "the oldest entry's age: {line}");
     }
 }

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-13
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-08-12
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-13: Handoff harvest, richer `status`, and split mail counts (agent-coordination wave 3)
+**What:** Opt-in handoff-to-memory harvesting (`[memory] harvest`, default off): right after a *distilled* (never structural-fallback) rot restart, one extra cheap-model call extracts durable repository facts (`Gotchas learned`/`Files touched` only) as strict `key: body` lines, stored via `remember` with `source = "handoff"`. `zirv ctx status` gained a registry-backed `sessions:` block (agent/verb/pid/age/live-or-stale, plus orphaned sockets labeled `(no record)`) and a `memory:` summary line. `zirv ctx optimize`'s report now includes a memory-bank size summary that never quotes an entry's key or body. The T12b bar's mail count now splits broadcast from session-addressed (`mail 2+1`).
+**Key changes:** src/commands/ctx/memory.rs (`harvest_from_handoff`, `harvest_prompt`, `parse_harvest`), exec.rs/wrap.rs (harvest call sites in the rot-restart paths only, not nudge), status.rs (`sessions_lines`, `format_age`), optimize.rs (`MemorySummary`, `memory_bank_summary`, `render_memory_section`), chrome.rs/wrap.rs (`BarState::unread_mail` now `(broadcast, direct)`), tests/fixtures/fake-model.sh (`harvest` mode).
+**Follow-up:** none for this wave.
 
 ### 2026-08-12: `zirv chat`/`zirv agent`, bare-zirv alias, and `status`'s chat/mail lines
 **What:** Top-level routing for the "just run `zirv`" wave: bare `zirv` aliases to `zirv ctx chat` (repo has a `.zirv` dir, stdin is a tty) or `zirv help` otherwise, exiting 0 either way instead of clap's old usage-error exit 2. `zirv chat`/`zirv agent` are further top-level aliases for `zirv ctx chat`/`zirv ctx agent`, reserved so a script can never shadow them. `zirv ctx status` gained a `chat:` line (the adapter `chat` would launch and the rule that picked it, or why nothing qualifies) and a `mail: N unread` line, both degrading rather than failing the rest of the command.

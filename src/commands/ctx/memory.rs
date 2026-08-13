@@ -359,6 +359,119 @@ pub fn render_for_prompt(
         .collect()
 }
 
+// N6: harvesting durable repository facts out of a *distilled* handoff
+// (never the mechanical structural fallback -- see the `source == "distilled"`
+// gate at both call sites in exec.rs/wrap.rs), opt-in via `cfg.memory.harvest`
+// (default false: an entry worth keeping across sessions is a deliberate act,
+// not an inferred one). Reuses `handoff::run_model` -- the same one fresh,
+// cheap-model call handoff distillation itself makes, with the same
+// timeout/kill-deadline shape -- rather than inventing a second call
+// mechanism.
+
+pub const HARVEST_PROMPT_VERSION: &str = "v1";
+
+/// Same shape as `handoff::bullets`, duplicated locally for the same reason
+/// `strip_bullet` above is: this file's edits stay isolated from a module
+/// other tasks are actively working in.
+fn harvest_bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        return "(none)\n".to_string();
+    }
+    items.iter().map(|i| format!("- {i}\n")).collect()
+}
+
+/// The harvest prompt: durable repository facts only, drawn from `Gotchas
+/// learned` and `Files touched` -- never `Task`, `Done`, `Remaining` or `Next
+/// step`, which describe *this* task rather than the repository itself.
+/// Explicitly told to answer with nothing when nothing below is durable:
+/// task state slipping into a cross-session bank is worse than an empty
+/// answer, and a cheap model can be confidently wrong, so the instruction
+/// errs toward silence.
+pub fn harvest_prompt(handoff: &super::handoff::Handoff) -> String {
+    format!(
+        "You are extracting durable REPOSITORY FACTS ({HARVEST_PROMPT_VERSION}) from a handoff \
+note, for a long-lived memory bank that outlives any single task. A durable fact is true about \
+this repository regardless of which task is in progress: a build or test command, where a \
+credential or secret lives, a project convention, a gotcha about how a tool, API or dependency \
+behaves. Task state is NOT durable -- what was done, what remains, or what to do next for the \
+current task must not appear in your answer, even though it is shown below for context.\n\n\
+Answer with zero or more lines, each exactly `key: body`, one fact per line: key a short, \
+lowercase, kebab-case slug (letters, digits, hyphens only), body one plain sentence. If nothing \
+below is a durable repository fact, answer with nothing at all -- an empty answer is correct and \
+expected far more often than not. Do not invent a fact that is not evidenced below, and do not \
+answer in markdown, headings, or prose.\n\n\
+### Gotchas learned\n{gotchas}\
+### Files touched\n{files}",
+        gotchas = harvest_bullets(&handoff.gotchas),
+        files = harvest_bullets(&handoff.files_touched),
+    )
+}
+
+/// Strict `key: body` line parser: a line that is blank, has no colon, or
+/// whose key is not a lowercase kebab-case slug (the exact shape the prompt
+/// asks for) is dropped rather than guessed at -- the same "anything
+/// unparseable is nothing" rule `parse_markdown` applies to a whole entry,
+/// applied here per line.
+pub fn parse_harvest(answer: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in answer.lines() {
+        let Some((key, body)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let body = body.trim();
+        if key.is_empty() || body.is_empty() {
+            continue;
+        }
+        if !key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            continue;
+        }
+        out.push((key.to_string(), body.to_string()));
+    }
+    out
+}
+
+/// Runs one extra distiller call over an already-distilled handoff and
+/// stores whatever durable facts it returns, each through `remember` (so an
+/// existing key is refreshed, not duplicated) with `source = "handoff"`.
+///
+/// Gated on `cfg.memory.harvest` *first*, before anything about the model is
+/// touched, so a disabled operator never pays for a spawn. Any failure or
+/// timeout from the model call propagates as an `Err` and nothing is
+/// written: the answer is parsed and stored only after the whole call has
+/// already succeeded.
+pub fn harvest_from_handoff(
+    adapter: &dyn super::adapters::AgentAdapter,
+    model: &str,
+    handoff: &super::handoff::Handoff,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> CtxResult<usize> {
+    if !cfg.memory.harvest {
+        return Ok(0);
+    }
+    let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
+    let answer = super::handoff::run_model(adapter, model, &harvest_prompt(handoff), timeout)?;
+    let facts = parse_harvest(&answer);
+    let now = now_secs();
+    for (key, body) in &facts {
+        let entry = Entry {
+            key: key.clone(),
+            written_by: "harvest".to_string(),
+            written: now,
+            verified: now,
+            source: "handoff".to_string(),
+            body: body.clone(),
+        };
+        remember(state, slug, &entry, cfg)?;
+    }
+    Ok(facts.len())
+}
+
 #[derive(Debug, clap::Args)]
 pub struct RememberArgs {
     /// The fact's key, e.g. "staging-db-creds".
@@ -1048,6 +1161,237 @@ This should not appear in the body.\n";
         assert!(
             render_for_prompt(&state, "-work-repo", &disabled, 1_700_000_000).is_empty(),
             "a disabled bank must render nothing, however much is stored"
+        );
+    }
+
+    // N6: handoff -> memory harvest.
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn fake_model_adapter() -> crate::commands::ctx::adapters::claude::ClaudeAdapter {
+        crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some(
+            fixture("fake-model.sh").to_str().expect("utf8 path"),
+        ))
+    }
+
+    fn sample_handoff() -> super::super::handoff::Handoff {
+        super::super::handoff::Handoff {
+            task: "Wire the payments webhook".to_string(),
+            done: vec!["Added the route".to_string()],
+            remaining: vec!["Signature verification".to_string()],
+            next_step: "Add a failing test for an invalid signature".to_string(),
+            files_touched: vec!["src/routes/webhook.rs".to_string()],
+            gotchas: vec!["The provider sends two events per charge".to_string()],
+        }
+    }
+
+    /// Checked before anything about the model is touched: an adapter that
+    /// would fail to spawn at all is enough to prove nothing was spawned.
+    #[test]
+    fn harvesting_is_off_unless_the_operator_turns_it_on() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        assert!(!cfg.memory.harvest, "sanity: harvest defaults to off");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some(
+            "/nonexistent/model-binary",
+        ));
+
+        let count = harvest_from_handoff(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("a disabled harvest is not an error, just a no-op");
+        assert_eq!(count, 0);
+        assert!(list(&state, "-work-repo").expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_harvest_records_only_durable_repository_facts_not_task_state() {
+        let handoff = sample_handoff();
+        let prompt = harvest_prompt(&handoff);
+        assert!(prompt.contains("Gotchas learned"), "got {prompt}");
+        assert!(prompt.contains("Files touched"), "got {prompt}");
+        assert!(
+            prompt.contains("The provider sends two events per charge"),
+            "carries the gotcha context: {prompt}"
+        );
+        assert!(
+            prompt.to_lowercase().contains("not durable")
+                || prompt.to_lowercase().contains("must not appear"),
+            "the prompt must instruct that task state is excluded: {prompt}"
+        );
+        assert!(
+            prompt.to_lowercase().contains("answer with nothing"),
+            "the prompt must invite an empty answer: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## Task"),
+            "no handoff task section leaks in"
+        );
+
+        // Strict parse: only well-formed `key: body` lines with a lowercase
+        // kebab-case key survive; everything else -- prose, a capitalized
+        // key that looks like a handoff section, a missing key or body -- is
+        // dropped rather than guessed at.
+        let parsed = parse_harvest(
+            "build-cmd: cargo build --release\n\
+             Not a fact, just prose.\n\
+             Next Step: keep going\n\
+             : missing key\n\
+             trailing-colon:\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![("build-cmd".to_string(), "cargo build --release".to_string())],
+            "only the one well-formed line survives: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_harvest_that_returns_nothing_writes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+        let adapter = fake_model_adapter();
+
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "garbage");
+        }
+        let result = harvest_from_handoff(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            &state,
+            "-work-repo",
+            &cfg,
+        );
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+
+        assert_eq!(
+            result.expect("prose with no colon still succeeds, just empty"),
+            0
+        );
+        assert!(list(&state, "-work-repo").expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_distiller_failure_or_timeout_leaves_the_bank_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+        let adapter = fake_model_adapter();
+
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "fail");
+        }
+        let result = harvest_from_handoff(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            &state,
+            "-work-repo",
+            &cfg,
+        );
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+
+        assert!(
+            result.is_err(),
+            "a failing distiller call must surface as an error"
+        );
+        assert!(list(&state, "-work-repo").expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_harvested_entry_is_marked_as_coming_from_a_handoff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+        let adapter = fake_model_adapter();
+
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "harvest");
+        }
+        let count = harvest_from_handoff(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+
+        assert!(count > 0, "the fixture answers with well-formed facts");
+        let listed = list(&state, "-work-repo").expect("list");
+        assert!(!listed.is_empty());
+        assert!(
+            listed.iter().all(|(_, e)| e.source == "handoff"),
+            "every harvested entry is marked as coming from a handoff: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn harvesting_an_existing_key_refreshes_it_rather_than_duplicating_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+
+        let mut existing = sample("build-cmd", 1_700_000_000);
+        existing.body = "cargo build".to_string();
+        existing.source = "explicit".to_string();
+        remember(&state, "-work-repo", &existing, &cfg).expect("seed");
+
+        let adapter = fake_model_adapter();
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "harvest");
+        }
+        harvest_from_handoff(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+        unsafe {
+            std::env::remove_var("FAKE_MODEL_MODE");
+        }
+
+        let listed = list(&state, "-work-repo").expect("list");
+        let build_cmd: Vec<_> = listed
+            .iter()
+            .filter(|(_, e)| e.key == "build-cmd")
+            .collect();
+        assert_eq!(build_cmd.len(), 1, "refreshed, not duplicated: {listed:?}");
+        assert_eq!(
+            build_cmd[0].1.source, "handoff",
+            "the refreshed entry is now marked as harvested"
+        );
+        assert_ne!(
+            build_cmd[0].1.body, "cargo build",
+            "the body was refreshed too"
         );
     }
 }

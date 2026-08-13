@@ -94,7 +94,9 @@ pairs="$(printf '%s\t%s\n' \
   '^src/utils\.rs' 'docs/obsidian/Modules/Utilities.md' \
   '^src/commands/ctx/(optimize|prompt)\.rs' 'docs/obsidian/Modules/Utilities.md' \
   '^src/commands/ctx/(chat|agent|mail)\.rs' 'docs/obsidian/Modules/Ctx Subsystem.md' \
-  '^src/commands/ctx/(chrome|announce)\.rs' 'docs/obsidian/Modules/Ctx Supervisors.md')"
+  '^src/commands/ctx/(chrome|announce)\.rs' 'docs/obsidian/Modules/Ctx Supervisors.md' \
+  '^src/commands/ctx/sessions\.rs' 'docs/obsidian/Modules/Ctx Subsystem.md' \
+  '^src/commands/ctx/memory\.rs' 'docs/obsidian/Modules/Ctx Subsystem.md')"
 
 missing=""
 

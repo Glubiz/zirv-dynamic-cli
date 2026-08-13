@@ -39,6 +39,8 @@ cargo clippy --all-targets -- -D warnings
   - `chat.rs` — `zirv ctx chat`: an interactive orchestrator session built from the resolved adapter and driven through `wrap`
   - `agent.rs` — `zirv ctx agent <name> <prompt>`: one-shot delegation to a supervised headless worker, driven through `exec`
   - `mail.rs` — `zirv ctx send`/`zirv ctx inbox`: repo-scoped inter-session notes, read once then moved to `read/`
+  - `sessions.rs` — The live session registry (`<state>/sessions/<short8>.json`) plus `zirv ctx nudge`
+  - `memory.rs` — The cross-session memory bank (`zirv ctx remember`/`recall`/`forget`) and handoff-harvest opt-in
   - `chrome.rs` — Terminal chrome (launch banner, reserved status bar, colour) eligibility and pure renderers
   - `announce.rs` — The `zirv ▸` announcement channel on stderr
 

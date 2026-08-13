@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-13
 ---
 
 # Decision Log
@@ -44,3 +44,17 @@ last-verified: 2026-08-12
 **Rejected:** Deep-merging all layers into one table like `ctx.toml` does — collapses "repo said true, operator said nothing" and "repo said true, operator said false" into the same merged value, losing which layer to blame in the refusal message. Denying unknown agent names outright — breaks a future repo shipping a `.settings.toml` that names an adapter this build predates.
 **Consequences:** Any second `.settings.toml` section will need its own fold rule stated explicitly; the AND-fold here is specific to a boolean "may zirv use this" switch, not a general merge pattern to copy.
 **Spec / link:** `src/settings.rs` module doc.
+
+### 2026-08-13 — A nudge is two independent writes: durable mail plus a separate wake-up marker
+**Context:** `zirv ctx nudge` needed to interrupt a live session from outside its own poll loop without either losing the message (if the wake-up is missed) or making delivery depend on the supervisor being awake at the exact moment it's sent.
+**Decision:** `run_nudge_with` stores the nudge's text as an ordinary, durable, session-addressed mail message first (`mail::store`), then writes a separate empty marker file (`<short>.nudge`) second. `claim_nudge_marker` removes the marker atomically (`std::fs::remove_file` as the claim), so exactly one observer ever acts on a given wake-up. A supervisor's tick checks the marker in the same tick as its ordinary rot/limit checks, so latency is bounded by the existing poll interval rather than needing a new one.
+**Rejected:** A single combined write (message text inside the marker file itself) — couples the fast path (wake-up) to the durable path (message); losing or racing the one file loses both, and the message would no longer show up in `zirv ctx inbox` independent of whether the wake-up was ever claimed. A dedicated notification channel (new socket message type) — turn signals already exist for a different purpose (transcript-derived verdicts from *inside* the agent); a nudge originates *outside* it, from an operator, and reusing the socket would conflate the two origins.
+**Consequences:** Losing the marker (a crash between the two writes, or nobody claiming it before the state dir is swept) never loses the message — it's just picked up at the next natural poll or cycle instead of immediately. `exec`'s nudge-restart is budget-free by the same design split: it is not rot, so it must never spend the rot-restart budget.
+**Spec / link:** `src/commands/ctx/sessions.rs`'s N4 module doc comment; [[Ctx Subsystem]], [[Ctx Supervisors]].
+
+### 2026-08-13 — The memory bank lives in the state dir, not the repo
+**Context:** The memory bank needed a storage location, and the repo itself was one candidate (a checked-in file, versioned alongside the code it describes) versus the platform state dir zirv already uses for handoffs, mail, and the decision log.
+**Decision:** `<state>/memory/<repo_slug>/`, mirroring handoffs and mail exactly — one file per entry, keyed by key rather than by message, `0600`/`0700` on unix. Nothing under the repo checkout is ever consulted (`nothing_in_the_repository_checkout_can_seed_the_bank` pins this with a decoy file planted at the would-be repo path).
+**Rejected:** A repo-committed file (e.g. `.zirv/memory.toml`) — would make the bank part of the checkout, reopening exactly the trust boundary `REPO_FORBIDDEN` exists to close: anyone who can open a PR could seed facts every future session treats as established, with none of the "the checkout is not the operator" guardrails the rest of `zirv ctx` enforces. It would also force a choice between committing machine-specific or session-specific facts (a local DB port, a personal shortcut) into shared history, or maintaining a `.gitignore`d file that behaves like state pretending to be config.
+**Consequences:** The bank does not travel with `git clone` — a fresh checkout of an existing repo starts with an empty bank on a new machine, same as it starts with no handoffs or mail. `memory.*` joins `mail.*`/`prompt.*` in `REPO_FORBIDDEN`, closing the same class of hole (seeding, cap-raising, harvest-enabling) for the same reason.
+**Spec / link:** `src/commands/ctx/memory.rs`'s module doc comment; [[Untrusted Configuration]]'s "Memory" section, [[Ctx Subsystem]].

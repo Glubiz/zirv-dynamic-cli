@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-13
 ---
 
 # _system-context
@@ -37,7 +37,7 @@ Dispatch order matters: `ctx` and top-level `--help` are matched on **raw argv**
 | Built-ins & entry point | `src/main.rs`, `src/input.rs`, `src/commands/{mod,create,init,help,version}.rs` | [[Built-in Commands]] | Dispatch table; `help`/`version`/`init`/`create` and their aliases |
 | Utilities | `src/utils.rs` | [[Utilities]] | File parsing, reserved names, shortcuts struct, home dir, Levenshtein "did you mean" |
 | Ctx hub / verb tree | `src/commands/ctx/{mod,config,state,log}.rs` | [[Ctx Subsystem]] | `CtxCli`/`CtxVerb`, dispatch + parse-failure classification, layered `CtxConfig`, `StateDir`, decision log |
-| Ctx verb modules | `src/commands/ctx/{score,handoff,resume,hook,status}.rs` | [[Ctx Subsystem]] | One module per read-transcript/decide/maybe-write-state verb |
+| Ctx verb modules | `src/commands/ctx/{score,handoff,resume,hook,status,chat,agent,mail,sessions,memory}.rs` | [[Ctx Subsystem]] | One module per verb: read-transcript/decide/maybe-write-state, the meta-harness verbs (chat/agent/mail), the session registry + nudge, and the memory bank |
 | Ctx supervisors | `src/commands/ctx/{run_loop,exec,wrap}.rs` + `{signal,supervise,term}.rs` | [[Ctx Supervisors]] | The three process supervisors, turn-signal sockets, shared process/terminal primitives |
 | Ctx adapters | `src/commands/ctx/adapters/{mod,claude,codex}.rs` | [[Ctx Adapters]] | `AgentAdapter` trait; claude (implemented) and codex (not implemented, issue #11) |
 | Rot engine | `src/commands/ctx/{event,rot}.rs` | [[Rot Engine]] | Pure normalized-event scoring → `Verdict` |
@@ -55,7 +55,10 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 | `handoff` | Distill a transcript into a stored handoff document. |
 | `resume` | Start a clean interactive session with the latest handoff injected. |
 | `hook` | Agent hook entrypoints (`Stop`, `Prompt`, `PreCompact`, `Notify`); must never exit non-zero on `Stop`. |
-| `status` | Show live supervised sessions, scores, and the decision-log tail. |
+| `status` | Show the session registry, the memory bank, unread mail, scores, and the decision-log tail. |
+| `send` / `inbox` | Leave or read repo-scoped notes between sessions, optionally addressed to one live session (`--to-session`). |
+| `nudge` | Wake a live session early with a message, resolved against the session registry. |
+| `remember` / `recall` / `forget` | Read and write the repo-scoped memory bank of durable repository facts. |
 | `loop` | Stateless loop runner — a fresh headless session and `SessionId` every cycle. |
 | `exec` | Supervise one headless run; restart in place (bounded budget) on rot or a usage limit. |
 | `wrap` | Supervise an interactive TUI through a PTY; advise/compact/restart at verified turn boundaries. |

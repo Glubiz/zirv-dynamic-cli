@@ -870,6 +870,21 @@ pub fn run_with<W: Write>(
             Duration::from_secs(cfg.handoff.timeout_secs),
         );
         let stored = handoff::store(&state, repo, session.as_str(), &note)?;
+        // N6: opt-in (`cfg.memory.harvest`, default off) and only from a
+        // genuinely distilled handoff -- never the mechanical structural
+        // fallback, which has nothing durable to offer. Best-effort: a
+        // harvest failure must never turn a successful restart into a
+        // failed one.
+        if source == "distilled" {
+            let _ = super::memory::harvest_from_handoff(
+                adapter.as_ref(),
+                &cfg.handoff.model,
+                &note,
+                &state,
+                &mail_slug,
+                &cfg,
+            );
+        }
         announcer.emit(&super::announce::Event::Restart {
             style: source.to_string(),
             stored: stored.display().to_string(),
