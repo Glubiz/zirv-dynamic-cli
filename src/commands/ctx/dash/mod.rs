@@ -19,6 +19,7 @@ pub mod ui;
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -307,12 +308,16 @@ fn apply_navigation(
     total_rows: usize,
 ) -> (usize, usize) {
     match action {
+        // N2: a digit beyond the pane count is a no-op, not a jump to the
+        // last pane. `Ctrl+A 7` on a two-pane dashboard is a mistyped `1`
+        // far more often than it is a request for "whatever is last", and
+        // silently retargeting it moved the keyboard out from under the
+        // operator.
         DashAction::Switch(i) => {
-            if pane_count == 0 {
+            if i >= pane_count {
                 (selected, focused)
             } else {
-                let target = i.min(pane_count - 1);
-                (target, target)
+                (i, i)
             }
         }
         DashAction::NextPane => {
@@ -435,6 +440,24 @@ impl FactsCache {
     }
 }
 
+/// Pure: how many of `states` are still running. A pane is never removed from
+/// `panes` (index stability -- `focused`/`selected`, the nudge queues and
+/// `Ctrl+A <digit>` all address panes positionally), so `panes.len()` is a
+/// *lifetime* count, not a live one. Everything that asks "how many panes are
+/// there right now" -- the cap, the restore budget -- has to ask this instead
+/// (R2).
+fn live_count(states: &[PaneState]) -> usize {
+    states
+        .iter()
+        .filter(|state| !matches!(state, PaneState::Ended(_)))
+        .count()
+}
+
+/// [`live_count`] over real panes.
+fn live_pane_count(panes: &[Pane]) -> usize {
+    live_count(&panes.iter().map(|p| p.state()).collect::<Vec<_>>())
+}
+
 /// Called on every quit path, before any pane is torn down (shutdown --
 /// quit-sequence, registry release, socket unpublish -- happens in the
 /// caller right after this returns). Two things happen here, both
@@ -446,7 +469,8 @@ impl FactsCache {
 ///    records which is which (`roster::ROLE_ORCHESTRATOR`/`ROLE_WORKER`), so
 ///    a later startup restore can filter the orchestrator back out itself
 ///    rather than this write having to guess which pane index is safe to
-///    keep.
+///    keep. A pane whose child has already exited is left out entirely: there
+///    is nothing there to restore (R2).
 /// 2. Removes the whole spawn-request directory this dashboard created at
 ///    startup (`requests_dir`'s own parent, `<dash_short>-<token>`, not just
 ///    the `requests` leaf, so no empty shell is left under `<state>/dash/`):
@@ -457,6 +481,11 @@ fn on_quit(panes: &[Pane], requests_dir: &Path, state: &StateDir, repo: &Path) {
         written: super::state::now_secs(),
         panes: panes
             .iter()
+            // R2: a pane whose child already exited has nothing to restore.
+            // Offering it back would spawn a fresh session for something the
+            // operator watched finish, and would spend the next launch's pane
+            // budget doing it.
+            .filter(|pane| !matches!(pane.state(), PaneState::Ended(_)))
             .map(|pane| roster::RosterPane {
                 agent: pane.agent().to_string(),
                 session_id: pane.session_id().to_string(),
@@ -517,9 +546,15 @@ fn teardown_terminal() {
     let _ = execute!(stdout, LeaveAlternateScreen);
 }
 
-/// Puts the terminal back before the default hook prints its message and the
-/// process aborts. Three things the pre-F4 hook got wrong, all of which left
-/// a panicking dashboard's operator with an unusable console:
+/// The hook that was installed before the dashboard replaced it, shared
+/// between the dashboard's own hook (which chains into it) and
+/// `restore_panic_hook` (which puts it back).
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// Puts the terminal back before the previous hook prints its message and the
+/// process aborts, and hands back the hook it displaced so `restore_panic_hook`
+/// can put exactly that one back. Three things the pre-F4 hook got wrong, all
+/// of which left a panicking dashboard's operator with an unusable console:
 ///
 /// 1. Raw mode was never disabled, so the shell that inherited the console
 ///    had no echo and no line editing.
@@ -527,15 +562,31 @@ fn teardown_terminal() {
 ///    slice (see `term.rs`) -- so nothing was reset and the cursor was never
 ///    shown again.
 /// 3. It wrote to stderr, but the alternate screen was entered on stdout.
-fn install_panic_hook() {
-    let default_hook = std::panic::take_hook();
+fn install_panic_hook() -> Arc<PanicHook> {
+    let previous: Arc<PanicHook> = Arc::new(std::panic::take_hook());
+    let chained = Arc::clone(&previous);
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
         let _ = stdout.write_all(term::dash_reset_bytes());
         let _ = stdout.flush();
-        default_hook(info);
+        chained(info);
     }));
+    previous
+}
+
+/// Puts back the hook that was in place before `install_panic_hook` ran.
+///
+/// N1: every exit arm used to call a bare `std::panic::take_hook()`, which
+/// removes the dashboard's hook but installs **std's default** in its place --
+/// so any hook the process had already chained in before the dashboard opened
+/// (an outer supervisor's terminal restore, a test harness's own) was silently
+/// dropped for the rest of the process's life. Taking and then re-setting the
+/// captured one is what makes the dashboard's hook a genuine push/pop.
+fn restore_panic_hook(previous: &Arc<PanicHook>) {
+    let _ = std::panic::take_hook();
+    let previous = Arc::clone(previous);
+    std::panic::set_hook(Box::new(move |info| previous(info)));
 }
 
 /// The area a pane's grid actually renders into this frame: the full
@@ -692,10 +743,15 @@ fn fulfill_spawn_request(
             req.cwd.display()
         ));
     }
-    if panes.len() >= cfg.dash.max_panes {
+    // R2: live panes, not every pane this dashboard has ever held. Panes are
+    // never removed from the vector, so counting `len()` made the cap a
+    // lifetime budget -- a dashboard that had spawned and finished
+    // `max_panes` workers could never spawn another one, however empty it
+    // actually was.
+    let live = live_pane_count(panes);
+    if live >= cfg.dash.max_panes {
         return Err(format!(
-            "pane limit reached ({} panes, dash.max_panes = {})",
-            panes.len(),
+            "pane limit reached ({live} live panes, dash.max_panes = {})",
             cfg.dash.max_panes
         ));
     }
@@ -778,6 +834,43 @@ fn fulfill_spawn_request(
     Ok(short)
 }
 
+/// Claims every request in one taken batch *before* any of them is fulfilled,
+/// and returns them paired with their own file stems, in order.
+///
+/// R5: claiming used to be interleaved with fulfilment -- request B was only
+/// claimed once A had finished spawning. Fulfilling A is a real pty spawn and
+/// can easily outlast B's requester's ack timeout, and for that whole window B
+/// sat taken-but-unclaimed: `take_requests` had already deleted its file, so B's
+/// requester saw neither an ack nor a claim, concluded nobody was listening,
+/// and ran the same task headless as well. Writing all the claims first closes
+/// it: the batch is claimed the moment it is taken, whatever order it is then
+/// worked through.
+///
+/// A claim that cannot be written is reported and the request is still
+/// fulfilled: a missing claim risks a double-run, refusing to spawn guarantees
+/// a dropped one.
+fn claim_batch(
+    requests_dir: &Path,
+    batch: Vec<(PathBuf, spawnreq::SpawnRequest)>,
+    errors: &mut Vec<String>,
+) -> Vec<(String, spawnreq::SpawnRequest)> {
+    let mut claimed = Vec::with_capacity(batch.len());
+    for (path, req) in batch {
+        let Some(stem) = spawnreq::request_stem(&path) else {
+            continue;
+        };
+        // F10: a claim on disk is what lets a requester tell "nobody is
+        // listening" from "the dashboard has this, the answer is just slow".
+        // Cleaned up with the whole request directory on quit (`on_quit`), so
+        // a claim never outlives the dashboard that made it.
+        if let Err(e) = spawnreq::write_claim(requests_dir, &stem) {
+            push_error(errors, format!("spawn claim: {e}"));
+        }
+        claimed.push((stem, req));
+    }
+    claimed
+}
+
 /// Drains every request currently queued in `requests_dir` and answers each
 /// one, in order. Called once per tick, alongside `mail_sweep`/
 /// `deliver_queued_nudges`: a request is data sitting on disk, not something
@@ -793,23 +886,8 @@ fn handle_spawn_requests(
     size: (u16, u16),
     errors: &mut Vec<String>,
 ) {
-    for (path, req) in spawnreq::take_requests(requests_dir) {
-        let Some(stem) = spawnreq::request_stem(&path) else {
-            continue;
-        };
-        // F10: claimed *before* fulfilment, not after. `take_requests` has
-        // already deleted the request file, and fulfilment (adapter
-        // resolution, a prompt file write, a real pty spawn) can easily
-        // outlast the requester's own ack timeout -- at which point the
-        // requester used to give up and run the same task headless as well,
-        // so one `zirv ctx agent` became two live sessions. A claim on disk
-        // is what lets that requester tell "nobody is listening" from "the
-        // dashboard has this, the answer is just slow". Cleaned up with the
-        // whole request directory on quit (`on_quit`), so a claim never
-        // outlives the dashboard that made it.
-        if let Err(e) = spawnreq::write_claim(requests_dir, &stem) {
-            push_error(errors, format!("spawn claim: {e}"));
-        }
+    let batch = claim_batch(requests_dir, spawnreq::take_requests(requests_dir), errors);
+    for (stem, req) in batch {
         let ack = match fulfill_spawn_request(
             &req,
             panes,
@@ -826,11 +904,21 @@ fn handle_spawn_requests(
                 short: Some(short),
                 reason: None,
             },
-            Err(reason) => spawnreq::SpawnAck {
-                ok: false,
-                short: None,
-                reason: Some(reason),
-            },
+            Err(reason) => {
+                // R6: a refusal means no pane exists and none ever will, so
+                // the claim no longer stands for anything. Left in place, a
+                // requester whose ack timed out reads it as "the dashboard has
+                // this" and reports success for a spawn that never happened.
+                // Withdrawn only on an outright failure: when the spawn
+                // succeeded and only `write_ack` below failed, a pane really
+                // is running and the claim is exactly right.
+                spawnreq::remove_claim(requests_dir, &stem);
+                spawnreq::SpawnAck {
+                    ok: false,
+                    short: None,
+                    reason: Some(reason),
+                }
+            }
         };
         if let Err(e) = spawnreq::write_ack(requests_dir, &stem, &ack) {
             push_error(errors, format!("spawn ack: {e}"));
@@ -1274,6 +1362,21 @@ fn build_restore_view(candidates: &[roster::RosterPane]) -> ui::RestoreView {
     }
 }
 
+/// Pure: how many of `wanted` restore candidates fit alongside `live` panes
+/// already running, and how many are therefore skipped.
+///
+/// R7: restoring bypassed the pane cap entirely -- every other way a pane is
+/// created (the spawn-request channel, the `Ctrl+A s` dialog) goes through
+/// `fulfill_spawn_request`'s check, but the restore dialog spawned straight
+/// from the roster. A stale roster from a busy session could therefore reopen
+/// far more harness processes than `dash.max_panes` allows, at startup, before
+/// the operator had touched anything.
+fn restore_budget(live: usize, max_panes: usize, wanted: usize) -> (usize, usize) {
+    let room = max_panes.saturating_sub(live);
+    let take = wanted.min(room);
+    (take, wanted - take)
+}
+
 /// Spawns one roster candidate back as a fresh worker pane: resolves its
 /// adapter (re-checked against the live gate, same "data, never authority"
 /// discipline `fulfill_spawn_request` already holds a spawn request to --
@@ -1534,6 +1637,21 @@ fn submit_nudge(
     }
 }
 
+/// How many consecutive `event::poll`/`event::read` failures the dashboard
+/// tolerates before treating the input stream as gone. The loop polls on a
+/// 50ms timeout, but a *failing* poll returns immediately, so this is an
+/// upper bound of about five seconds and in practice much less -- long enough
+/// that a transient error (a resize racing a read, a signal) is ridden out,
+/// short enough that a dead console does not spin forever.
+const MAX_CONSECUTIVE_INPUT_ERRORS: usize = 100;
+
+/// Pure: whether `consecutive_errors` back-to-back input failures mean the
+/// stream is gone for good (R8). Any single success resets the count, so this
+/// only ever fires on an unbroken run.
+fn input_stream_is_dead(consecutive_errors: usize) -> bool {
+    consecutive_errors >= MAX_CONSECUTIVE_INPUT_ERRORS
+}
+
 /// The `PaneRowMeta` list for every pane this dashboard currently owns, in
 /// pane order -- shared by the pre-input (routing) and post-input
 /// (rendering) calls to `assemble_sidebar` each tick.
@@ -1606,14 +1724,56 @@ pub fn run_dashboard(
     // `VecDeque::new()` here too whenever it pushes a new pane).
     let mut nudge_queues: Vec<VecDeque<String>> = vec![VecDeque::new(); panes.len()];
 
+    let previous_panic_hook = install_panic_hook();
+    // F4(c): an external kill (`taskkill`, a Ctrl-Break, a closed window)
+    // reaches neither the panic hook nor any exit arm below. `RawGuard::
+    // enter` arms this for `wrap`; the dashboard drives raw mode through
+    // crossterm instead, so it has to stash the pre-raw console modes and
+    // install the same handler itself. Both are write-once/idempotent, and
+    // the return values are advisory only -- a process with no console of
+    // its own stashes nothing and still starts.
+    let _ = term::stash_current_console();
+    let _ = term::install_console_restore_handler();
+    if let Err(e) = enable_raw_mode() {
+        restore_panic_hook(&previous_panic_hook);
+        return Err(format!("dashboard: enable_raw_mode failed: {e}").into());
+    }
+    if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
+        teardown_terminal();
+        restore_panic_hook(&previous_panic_hook);
+        return Err(format!("dashboard: EnterAlternateScreen failed: {e}").into());
+    }
+    // From here on the emergency handler owes the terminal the alternate
+    // screen back, not just the console modes. Cleared by `teardown_terminal`
+    // on every exit arm below.
+    term::set_dash_active(true);
+
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            teardown_terminal();
+            restore_panic_hook(&previous_panic_hook);
+            return Err(format!("dashboard: could not attach to the terminal: {e}").into());
+        }
+    };
+
     // Task 12: offer back whatever this repo's previous quit left behind,
-    // once, before the terminal is ever touched -- a fresh roster within
-    // `cfg.dash.roster_max_age_secs` becomes the startup restore dialog
-    // below; anything else (absent, stale, already offered to some earlier
-    // launch) leaves `overlay` at its usual `Overlay::None` start. The
-    // orchestrator entry is filtered out here, not later: the `first` pane
-    // spawned just above already *is* this dashboard's orchestrator, so
-    // respawning a roster's own orchestrator entry would duplicate it.
+    // once -- a fresh roster within `cfg.dash.roster_max_age_secs` becomes the
+    // startup restore dialog below; anything else (absent, stale, already
+    // offered to some earlier launch) leaves `overlay` at its usual
+    // `Overlay::None` start. The orchestrator entry is filtered out here, not
+    // later: the `first` pane spawned above already *is* this dashboard's
+    // orchestrator, so respawning a roster's own orchestrator entry would
+    // duplicate it.
+    //
+    // R9: deliberately AFTER the terminal is claimed, not before. `take_roster`
+    // consumes the roster on read (read-once, by design), so running it ahead
+    // of `enable_raw_mode`/`EnterAlternateScreen`/`Terminal::new` meant any of
+    // those three failing threw the roster away without ever offering it --
+    // the operator lost the restore outright and the next launch found
+    // nothing. There is nothing to draw before the loop starts anyway: the
+    // dialog is rendered from inside it.
     let repo_slug = super::state::repo_slug(repo);
     let restore_candidates: Vec<roster::RosterPane> = roster::take_roster(
         state,
@@ -1630,40 +1790,6 @@ pub fn run_dashboard(
     })
     .unwrap_or_default();
 
-    install_panic_hook();
-    // F4(c): an external kill (`taskkill`, a Ctrl-Break, a closed window)
-    // reaches neither the panic hook nor any exit arm below. `RawGuard::
-    // enter` arms this for `wrap`; the dashboard drives raw mode through
-    // crossterm instead, so it has to stash the pre-raw console modes and
-    // install the same handler itself. Both are write-once/idempotent, and
-    // the return values are advisory only -- a process with no console of
-    // its own stashes nothing and still starts.
-    let _ = term::stash_current_console();
-    let _ = term::install_console_restore_handler();
-    if let Err(e) = enable_raw_mode() {
-        let _ = std::panic::take_hook();
-        return Err(format!("dashboard: enable_raw_mode failed: {e}").into());
-    }
-    if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
-        teardown_terminal();
-        let _ = std::panic::take_hook();
-        return Err(format!("dashboard: EnterAlternateScreen failed: {e}").into());
-    }
-    // From here on the emergency handler owes the terminal the alternate
-    // screen back, not just the console modes. Cleared by `teardown_terminal`
-    // on every exit arm below.
-    term::set_dash_active(true);
-
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = match Terminal::new(backend) {
-        Ok(t) => t,
-        Err(e) => {
-            teardown_terminal();
-            let _ = std::panic::take_hook();
-            return Err(format!("dashboard: could not attach to the terminal: {e}").into());
-        }
-    };
-
     // Two indices, not one (F7): `selected` walks the combined sidebar
     // (panes plus view-only registry rows) and is what a nudge is aimed at;
     // `focused` is the pane on screen and under the keyboard, and only ever
@@ -1678,6 +1804,8 @@ pub fn run_dashboard(
         ui::Overlay::Restore(build_restore_view(&restore_candidates))
     };
     let mut facts_cache = FactsCache::new(Instant::now());
+    // R8: see `input_stream_is_dead`.
+    let mut input_errors: usize = 0;
 
     let exit_code: i32 = loop {
         for pane in panes.iter_mut() {
@@ -1742,6 +1870,7 @@ pub fn run_dashboard(
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    input_errors = 0;
                     if !matches!(overlay, ui::Overlay::None) {
                         let current = std::mem::take(&mut overlay);
                         match current {
@@ -1805,7 +1934,17 @@ pub fn run_dashboard(
                                     None => ui::Overlay::None,
                                 };
                                 if let Some(RestoreEffect::Confirm(indices)) = effect {
-                                    for idx in indices {
+                                    // R7: the same live-pane cap every other
+                                    // spawn seam enforces. Restoring is still
+                                    // creating panes, and a roster from a busy
+                                    // session must not be able to reopen more
+                                    // of them than `dash.max_panes` allows.
+                                    let (take, skipped) = restore_budget(
+                                        live_pane_count(&panes),
+                                        cfg.dash.max_panes,
+                                        indices.len(),
+                                    );
+                                    for idx in indices.into_iter().take(take) {
                                         if let Some(candidate) = restore_candidates.get(idx) {
                                             spawn_restored_pane(
                                                 candidate,
@@ -1819,6 +1958,16 @@ pub fn run_dashboard(
                                                 &mut errors,
                                             );
                                         }
+                                    }
+                                    if skipped > 0 {
+                                        push_error(
+                                            &mut errors,
+                                            format!(
+                                                "restore: pane limit reached (dash.max_panes = \
+                                                 {}); {skipped} session(s) not restored",
+                                                cfg.dash.max_panes
+                                            ),
+                                        );
                                     }
                                 }
                             }
@@ -1986,6 +2135,7 @@ pub fn run_dashboard(
                     }
                 }
                 Ok(Event::Resize(cols, term_h)) => {
+                    input_errors = 0;
                     // F6: the loop's own idea of the terminal is updated
                     // here, not just used locally. The zoom handler and the
                     // fallback size of every `crossterm::terminal::size`
@@ -2002,11 +2152,33 @@ pub fn run_dashboard(
                         }
                     }
                 }
-                Ok(_) => {}
-                Err(e) => push_error(&mut errors, format!("event read: {e}")),
+                Ok(_) => input_errors = 0,
+                Err(e) => {
+                    input_errors = input_errors.saturating_add(1);
+                    push_error(&mut errors, format!("event read: {e}"));
+                }
             },
-            Ok(false) => {}
-            Err(e) => push_error(&mut errors, format!("event poll: {e}")),
+            Ok(false) => input_errors = 0,
+            Err(e) => {
+                input_errors = input_errors.saturating_add(1);
+                push_error(&mut errors, format!("event poll: {e}"));
+            }
+        }
+
+        // R8: a console handle that has gone away answers every poll with an
+        // error, instantly -- so the loop spun at full speed forever, pushing
+        // an error string per iteration and never reaching a quit path. There
+        // is no operator left to press `Ctrl+A q`, so the dashboard takes
+        // itself down the ordinary way: roster written, panes shut down with
+        // their own quit sequences, terminal restored.
+        if input_stream_is_dead(input_errors) {
+            push_error(
+                &mut errors,
+                "dashboard: the input stream stopped answering; quitting".to_string(),
+            );
+            on_quit(&panes, &requests_dir, state, repo);
+            shutdown_all(&mut panes, cfg, &mut errors);
+            break 0;
         }
 
         let term_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
@@ -2060,7 +2232,7 @@ pub fn run_dashboard(
     };
 
     teardown_terminal();
-    let _ = std::panic::take_hook();
+    restore_panic_hook(&previous_panic_hook);
     Ok(exit_code)
 }
 
@@ -2257,11 +2429,24 @@ mod tests {
     fn digits_and_tab_move_both_the_selection_and_the_focus() {
         // Three panes, five combined rows (two view-only sessions).
         assert_eq!(apply_navigation(DashAction::Switch(2), 0, 0, 3, 5), (2, 2));
-        // A digit past the last pane clamps to the last pane, not to a
-        // view-only row: digits address panes.
-        assert_eq!(apply_navigation(DashAction::Switch(8), 0, 0, 3, 5), (2, 2));
         assert_eq!(apply_navigation(DashAction::NextPane, 4, 2, 3, 5), (0, 0));
         assert_eq!(apply_navigation(DashAction::NextPane, 0, 0, 3, 5), (1, 1));
+    }
+
+    /// N2: `Ctrl+A 9` on a three-pane dashboard used to clamp to the last
+    /// pane, which moved the keyboard somewhere the operator never asked for
+    /// -- a mistyped digit is far more likely than a request for "whatever is
+    /// last". An out-of-range digit now changes nothing at all.
+    #[test]
+    fn a_digit_beyond_the_pane_count_is_a_noop() {
+        assert_eq!(
+            apply_navigation(DashAction::Switch(8), 1, 1, 3, 5),
+            (1, 1),
+            "an out-of-range digit leaves both indices exactly where they were"
+        );
+        assert_eq!(apply_navigation(DashAction::Switch(3), 0, 0, 3, 5), (0, 0));
+        // The last addressable pane is still addressable.
+        assert_eq!(apply_navigation(DashAction::Switch(2), 0, 0, 3, 5), (2, 2));
     }
 
     #[test]
@@ -3466,5 +3651,313 @@ mod tests {
         for pane in panes.iter_mut() {
             let _ = pane.shutdown("");
         }
+    }
+
+    // R2: the pane cap and the quit-time roster both have to count live
+    // panes, not every pane this dashboard has ever held.
+
+    #[test]
+    fn live_count_ignores_ended_panes() {
+        assert_eq!(live_count(&[]), 0);
+        assert_eq!(
+            live_count(&[
+                PaneState::Working,
+                PaneState::Ended(0),
+                PaneState::Idle,
+                PaneState::Ended(3),
+                PaneState::WaitingInput,
+            ]),
+            3
+        );
+        assert_eq!(
+            live_count(&[PaneState::Ended(0), PaneState::Ended(1)]),
+            0,
+            "a dashboard whose panes have all finished is empty, however long its vector is"
+        );
+    }
+
+    /// R2 on a real (immediately-exiting) child: the vector still holds the
+    /// pane -- index stability is the whole reason nothing is ever removed --
+    /// but the cap and the roster both see an empty dashboard.
+    #[test]
+    fn an_ended_pane_frees_its_slot_and_is_not_offered_for_restore() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "44444444-2222-4333-8444-555555555555".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && live_pane_count(&panes) > 0 {
+            panes[0].drain();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(panes.len(), 1, "the pane is never removed from the vector");
+        assert_eq!(
+            live_pane_count(&panes),
+            0,
+            "but it no longer occupies a slot against dash.max_panes"
+        );
+
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+        on_quit(&panes, &requests_dir, &state, &repo);
+
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("on_quit writes a roster");
+        assert!(
+            written.panes.is_empty(),
+            "an already-ended pane is not offered back for restore: {:?}",
+            written.panes
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// R3, at the seam the two same-tick injectors share: once a pane has
+    /// been injected into it is `Working`, so neither `mail_sweep`'s own
+    /// eligibility check nor `deliver_queued_nudges`' will act on it again
+    /// until its next turn signal.
+    #[test]
+    fn a_pane_with_a_pending_injection_is_eligible_for_neither_injector() {
+        assert!(is_delivery_eligible(sessions::Verb::Dash, &PaneState::Idle));
+        assert!(deliverable_now(&PaneState::Idle, 1));
+
+        assert!(
+            !is_delivery_eligible(sessions::Verb::Dash, &PaneState::Working),
+            "the mail sweep skips a pane that is already working"
+        );
+        assert!(
+            !deliverable_now(&PaneState::Working, 1),
+            "and so does the nudge drain -- the queue simply waits a tick"
+        );
+    }
+
+    /// R3, end to end through one tick's real sequence: `mail_sweep` runs
+    /// first and delivers a message; `deliver_queued_nudges` runs immediately
+    /// after and must find the pane busy, leaving its nudge queued rather than
+    /// typing a second line into a session that just started a turn.
+    #[test]
+    fn a_swept_message_and_a_queued_nudge_never_land_in_the_same_tick() {
+        use super::pane::tests::{long_lived_argv, signal_until_idle};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let slug = super::super::state::repo_slug(&repo);
+        let cfg = CtxConfig::default();
+
+        let session_id = "55555555-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        assert!(
+            signal_until_idle(&mut panes[0], &state, session_id),
+            "the pane must report a turn boundary before the sweep can mean anything"
+        );
+
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "aaaa1111".to_string(),
+                from_agent: "claude".to_string(),
+                to: "test-agent".to_string(),
+                to_session: None,
+                sent: super::super::state::now_secs(),
+                body: "the build is red".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::from(vec!["ping".to_string()])];
+        let mut errors = Vec::new();
+
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut errors);
+        assert!(
+            mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
+                .expect("list")
+                .is_empty(),
+            "the sweep delivered and consumed the message"
+        );
+
+        deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
+        assert_eq!(
+            queues[0].len(),
+            1,
+            "the nudge stays queued: the pane is mid-turn from the injection the sweep just made"
+        );
+
+        // And the next turn boundary is what releases it.
+        assert!(signal_until_idle(&mut panes[0], &state, session_id));
+        deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
+        assert!(
+            queues[0].is_empty(),
+            "once the injected turn ends the queued nudge is delivered"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    // R5/R6: claims are written for a whole batch before any of it is
+    // fulfilled, and withdrawn when fulfilment refuses outright.
+
+    #[test]
+    fn claim_batch_claims_every_request_before_any_fulfilment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("requests");
+        let repo = tmp.path().to_path_buf();
+
+        let a = spawnreq::write_request(&dir, &spawn_request("first", &repo)).expect("write a");
+        let b = spawnreq::write_request(&dir, &spawn_request("second", &repo)).expect("write b");
+        let stems: Vec<String> = [&a, &b]
+            .iter()
+            .map(|p| spawnreq::request_stem(p).expect("stem"))
+            .collect();
+
+        let mut errors = Vec::new();
+        let claimed = claim_batch(&dir, spawnreq::take_requests(&dir), &mut errors);
+
+        assert_eq!(claimed.len(), 2);
+        for stem in &stems {
+            assert!(
+                spawnreq::is_claimed(&dir, stem),
+                "every request in the batch is claimed before any of them is worked on: {stem}"
+            );
+        }
+        assert!(
+            spawnreq::wait_for_ack(&dir, &stems[0], Duration::from_millis(50)).is_none()
+                && spawnreq::wait_for_ack(&dir, &stems[1], Duration::from_millis(50)).is_none(),
+            "and nothing has been acked yet"
+        );
+    }
+
+    /// R6: a gate refusal means no pane exists and none ever will, so the
+    /// claim must not survive to tell a timed-out requester otherwise.
+    #[test]
+    fn a_refused_request_leaves_no_claim_behind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = std::env::current_dir().expect("cwd");
+        let dir = tmp.path().join("requests");
+
+        // Refused before adapter resolution or any spawn: the request names a
+        // repo that is not this dashboard's.
+        let elsewhere = repo.join("definitely-not-this-repo");
+        let path = spawnreq::write_request(&dir, &spawn_request("do the work", &elsewhere))
+            .expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+        );
+
+        assert!(
+            !spawnreq::is_claimed(&dir, &stem),
+            "a refusal withdraws its own claim"
+        );
+        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
+            .expect("the refusal is still acked");
+        assert!(!ack.ok);
+        assert!(panes.is_empty(), "and nothing was spawned");
+    }
+
+    // R7: restoring is creating panes, so it answers to the same cap.
+
+    #[test]
+    fn restore_budget_stops_at_the_pane_cap() {
+        assert_eq!(
+            restore_budget(0, 2, 3),
+            (2, 1),
+            "a roster of three under a cap of two restores two and reports one skipped"
+        );
+        assert_eq!(
+            restore_budget(1, 2, 3),
+            (1, 2),
+            "the orchestrator already occupies a slot"
+        );
+        assert_eq!(
+            restore_budget(2, 2, 3),
+            (0, 3),
+            "a full dashboard restores nothing"
+        );
+        assert_eq!(
+            restore_budget(5, 2, 3),
+            (0, 3),
+            "and saturates rather than wrapping"
+        );
+        assert_eq!(
+            restore_budget(0, 9, 3),
+            (3, 0),
+            "room for everything skips nothing"
+        );
+    }
+
+    // R8: the loop has to be able to give up on a dead input stream.
+
+    #[test]
+    fn input_stream_is_dead_only_after_an_unbroken_run_of_failures() {
+        assert!(!input_stream_is_dead(0));
+        assert!(!input_stream_is_dead(1));
+        assert!(!input_stream_is_dead(MAX_CONSECUTIVE_INPUT_ERRORS - 1));
+        assert!(input_stream_is_dead(MAX_CONSECUTIVE_INPUT_ERRORS));
+        assert!(input_stream_is_dead(MAX_CONSECUTIVE_INPUT_ERRORS + 1));
+    }
+
+    /// N1: teardown used to call a bare `take_hook()`, which installs **std's
+    /// default** rather than whatever was there before -- silently discarding
+    /// any hook the process had already chained in.
+    #[test]
+    fn the_panic_hook_is_restored_to_whatever_was_installed_before() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static OUTER_HOOK_RAN: AtomicBool = AtomicBool::new(false);
+
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| OUTER_HOOK_RAN.store(true, Ordering::SeqCst)));
+
+        let previous = install_panic_hook();
+        restore_panic_hook(&previous);
+
+        OUTER_HOOK_RAN.store(false, Ordering::SeqCst);
+        let _ = std::panic::catch_unwind(|| panic!("deliberate: exercising the restored hook"));
+        let ran = OUTER_HOOK_RAN.load(Ordering::SeqCst);
+
+        std::panic::set_hook(original);
+        assert!(
+            ran,
+            "the hook installed before the dashboard must be the one back in place afterwards"
+        );
     }
 }

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-13
+last-verified: 2026-08-14
 ---
 
 # Ctx Adapters
@@ -31,7 +31,7 @@ Defined in `mod.rs`, with `Debug` as a supertrait (so `Box<dyn AgentAdapter>` ca
 - `transcript_path(session)` — where this agent's own transcript file lives on disk.
 - `parse_events(jsonl)` / `structural_context(jsonl, last_n)` — turn a raw transcript into the ctx subsystem's normalized event stream and rolling structural summary. Must be line-local (each line's events depend only on that line), because `score.rs` feeds adapters only the bytes appended since the last incremental pass.
 - `compact_command()`, `quit_sequence()`, `capabilities()`, `register_turn_signal(session, socket)` — the remaining agent-specific knobs the supervisors need (whether the agent supports `/compact`, how to send it a clean quit, its `Capabilities` flags, and how to wire up the turn-signal socket via `TurnSignalSetup { env, instructions }`).
-- `model_args(model)` — argv tokens that select `model` for one interactive launch, appended right after the launch prefix; feeds the dashboard's orchestrator pane (`chat.model`/`ZIRV_CTX_CHAT_MODEL`, see [[Ctx Supervisors]] and [[Untrusted Configuration]]). Default is empty (no verified flag, no guess); both current adapters override it.
+- `model_args(model)` — argv tokens that select `model` for one interactive launch. `chat.rs::extra_with_model` folds them into the launch's **extra arguments**, so `interactive_cmd` emits them after the positional prompt; they are deliberately *not* spliced in at `launch_prefix_len()`, which counts only the argv the operator wrote and does not count the tokens `base()` prepends when it routes a `.cmd`/`.ps1` shim through a launcher (see [[Ctx Supervisors]] and [[Untrusted Configuration]]). Default is empty (no verified flag, no guess); both current adapters override it.
 - `resume_args(session_id)` — argv tokens that resume `session_id`'s own conversation, for the dashboard's quit/restore roster (`dash::roster::restore_argv`). Default `None` means this agent's resume story is unverified: a restore falls back to a plain prompt-carrying relaunch instead of a guessed flag; only `claude.rs` overrides it today (see below).
 
 Several methods have trait-default implementations that only `claude.rs` currently overrides: `base_system_prompt()` (`None` by default — an unverified agent gets no base layer, not another agent's instructions), `user_system_prompt_flag()`, `system_prompt_file_flag()`, `supports_system_prompt_file(launch)` (defaults to `false`, i.e. "fail open to argv delivery"), `launch_prefix_len()` (defaults to `1`, the count of leading argv tokens that are the program invocation itself rather than operator flags — used when a relaunch has to strip the program off an argv it didn't build), and `resume_args()` (see above).

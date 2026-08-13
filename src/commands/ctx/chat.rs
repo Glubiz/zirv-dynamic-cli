@@ -264,18 +264,12 @@ pub fn run_with<W: Write, E: Write>(
     let resuming = args.resume && initial_prompt.is_some();
     let session = SessionId::new_v4();
 
-    let mut launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &args.extra);
     // Applies to both branches below (the dashboard's orchestrator pane and
-    // the wrap fallback): `chat.model` shapes `zirv chat` generally, not
-    // only the dashboard, so the splice happens once, here, before either
-    // path reads `launch.argv`.
-    if let Some(model) = cfg.chat.model.as_deref() {
-        splice_model_args(
-            &mut launch.argv,
-            adapter.launch_prefix_len(),
-            adapter.model_args(model),
-        );
-    }
+    // the wrap fallback): `chat.model` shapes `zirv chat` generally, not only
+    // the dashboard, so the model flags are folded into the launch's own
+    // extra arguments once, here, before either path reads `launch.argv`.
+    let extra = extra_with_model(&cfg, adapter.as_ref(), &args.extra);
+    let launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &extra);
 
     if chrome.banner {
         let facts = BannerFacts {
@@ -421,20 +415,34 @@ pub(crate) fn dash_orchestrator_pane(
     }
 }
 
-/// Splices `model_args` into `argv` immediately after the launch prefix --
-/// the program invocation plus any leading `bin_args`
-/// (`AgentAdapter::launch_prefix_len`) -- so the model selection precedes
-/// the initial prompt and any operator-supplied extra flags. Applies
-/// uniformly wherever a chat launch's argv is used (the dashboard's
-/// orchestrator pane and the wrap fallback): `chat.model` shapes `zirv chat`
-/// generally, not only the dashboard. A no-op when `model_args` is empty --
-/// no configured model, or an adapter with no verified model flag.
-fn splice_model_args(argv: &mut Vec<String>, prefix_len: usize, model_args: Vec<String>) {
-    if model_args.is_empty() {
-        return;
-    }
-    let at = prefix_len.min(argv.len());
-    argv.splice(at..at, model_args);
+/// The extra arguments a chat launch is built with: the configured model's
+/// own flags (`AgentAdapter::model_args`) ahead of whatever the operator
+/// passed after `--`. Handing these to `build_launch`/`interactive_cmd` puts
+/// them *after* the positional initial prompt, which is where CLI flags are
+/// still perfectly valid and -- unlike splicing them into an already-built
+/// argv -- is the one placement that cannot land inside a launcher prefix.
+///
+/// R1: this used to splice `model_args` in at `launch_prefix_len()`, which
+/// deliberately counts only the argv the *operator* wrote (program plus
+/// `bin_args`) and explicitly does not count the tokens `ClaudeAdapter::base`
+/// prepends when it has to route an npm-installed `claude.cmd` through
+/// `cmd.exe /c` (see `claude.rs`'s own `launch_prefix_len` doc comment). On
+/// such a launch the real argv prefix is three tokens, not one, so the splice
+/// produced `["cmd.exe", "--model", "fable", "/c", "claude.cmd", ...]` --
+/// `cmd.exe` was handed the model flags and never started the agent at all.
+/// Appending as trailing extras removes the prefix arithmetic entirely, the
+/// same way `wrap::restart_launch_flags`'s output is carried into
+/// `relaunch_command`'s `extra` rather than spliced anywhere.
+///
+/// An adapter with no verified model flag, or no configured model, yields the
+/// operator's own extras unchanged.
+fn extra_with_model(cfg: &CtxConfig, adapter: &dyn AgentAdapter, extra: &[String]) -> Vec<String> {
+    let Some(model) = cfg.chat.model.as_deref() else {
+        return extra.to_vec();
+    };
+    let mut out = adapter.model_args(model);
+    out.extend_from_slice(extra);
+    out
 }
 
 /// The `wrap` invocation a resolved chat launch becomes. Pure, so what does
@@ -1074,37 +1082,101 @@ mod tests {
 
     // Task 6: dashboard wiring -- model splice and the wrap fallback.
 
-    /// `Some` lands right after the launch prefix, ahead of the initial
-    /// prompt and any extra flags; `None` (an empty `model_args`) leaves the
+    fn cfg_with_model(model: Option<&str>) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.chat.model = model.map(str::to_string);
+        cfg
+    }
+
+    /// The configured model's flags land after the positional prompt and
+    /// ahead of the operator's own `--` extras; no configured model leaves the
     /// argv byte-for-byte unchanged.
     #[test]
     fn orchestrator_argv_carries_the_configured_model() {
         let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
-        let prefix_len = adapter.launch_prefix_len();
 
-        let mut with_model = build_launch(&adapter, Some("hello"), &["--continue".to_string()]);
-        splice_model_args(&mut with_model.argv, prefix_len, adapter.model_args("opus"));
-        assert_eq!(
-            &with_model.argv[prefix_len..prefix_len + 2],
-            &["--model".to_string(), "opus".to_string()],
-            "model args land right after the launch prefix: {:?}",
-            with_model.argv
+        let extra = extra_with_model(
+            &cfg_with_model(Some("opus")),
+            &adapter,
+            &["--continue".to_string()],
         );
-        assert_eq!(with_model.argv[0], "/tmp/fake-claude");
-        assert!(with_model.argv.contains(&"hello".to_string()));
+        let with_model = build_launch(&adapter, Some("hello"), &extra);
         assert_eq!(
-            with_model.argv.last().map(String::as_str),
-            Some("--continue"),
-            "the operator's own extra flags still land last: {:?}",
-            with_model.argv
+            with_model.argv,
+            vec![
+                "/tmp/fake-claude".to_string(),
+                "hello".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+                "--continue".to_string(),
+            ],
+            "model flags follow the prompt, the operator's extras still land last"
         );
 
-        let mut without_model = build_launch(&adapter, Some("hello"), &["--continue".to_string()]);
-        let before = without_model.argv.clone();
-        splice_model_args(&mut without_model.argv, prefix_len, Vec::new());
+        let plain = extra_with_model(&cfg_with_model(None), &adapter, &["--continue".to_string()]);
+        let without_model = build_launch(&adapter, Some("hello"), &plain);
         assert_eq!(
-            without_model.argv, before,
+            without_model.argv,
+            build_launch(&adapter, Some("hello"), &["--continue".to_string()]).argv,
             "no configured model means the argv is untouched"
+        );
+    }
+
+    /// R1, the shape the old splice broke on: a program whose real argv
+    /// prefix is more than one token. `launch_prefix_len()` counts only what
+    /// the operator wrote, so splicing at it dropped the model flags *inside*
+    /// the launcher's own arguments. Appending them as trailing extras cannot:
+    /// whatever the prefix turns out to be, the flags land after the prompt.
+    #[test]
+    fn model_flags_never_land_inside_a_multi_token_launch_prefix() {
+        // `bin_args`: "sh /tmp/stub.sh" is program + one leading argument.
+        let adapter = ClaudeAdapter::new(Some("sh /tmp/stub.sh"));
+        let extra = extra_with_model(&cfg_with_model(Some("fable")), &adapter, &[]);
+        let launch = build_launch(&adapter, Some("do the work"), &extra);
+        assert_eq!(
+            launch.argv,
+            vec![
+                "sh".to_string(),
+                "/tmp/stub.sh".to_string(),
+                "do the work".to_string(),
+                "--model".to_string(),
+                "fable".to_string(),
+            ]
+        );
+    }
+
+    /// The Windows launcher rewrite specifically: an npm-installed
+    /// `claude.cmd` is spawned as `cmd.exe /c <shim> ...`, a three-token
+    /// prefix against a `launch_prefix_len()` of 1. The old splice put
+    /// `--model fable` between `cmd.exe` and `/c`, so `cmd.exe` was handed the
+    /// model flags and the agent never started.
+    #[cfg(windows)]
+    #[test]
+    fn model_flags_land_after_the_prompt_behind_the_windows_cmd_launcher() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("claude.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let adapter = ClaudeAdapter::new(Some(&shim.display().to_string()));
+        let extra = extra_with_model(&cfg_with_model(Some("fable")), &adapter, &[]);
+        let launch = build_launch(&adapter, Some("do the work"), &extra);
+
+        assert_eq!(
+            launch.argv,
+            vec![
+                launch.argv[0].clone(),
+                "/c".to_string(),
+                shim.display().to_string(),
+                "do the work".to_string(),
+                "--model".to_string(),
+                "fable".to_string(),
+            ],
+            "the launcher prefix stays intact and the model flags trail the prompt"
+        );
+        assert!(
+            launch.argv[0].to_lowercase().contains("cmd"),
+            "the shim is routed through cmd.exe: {:?}",
+            launch.argv[0]
         );
     }
 

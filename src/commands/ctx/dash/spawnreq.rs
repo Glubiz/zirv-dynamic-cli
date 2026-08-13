@@ -104,18 +104,51 @@ fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
     file.write_all(contents.as_bytes())
 }
 
-/// Writes `req` as a freshly created (never overwritten -- `create_new`, so
-/// a uuid collision fails loudly rather than silently clobbering another
-/// request) `req-<uuid>.json` file under `dir`, 0600 on unix via the same
-/// private-file discipline `state::write_private` uses elsewhere. Returns
-/// the path so the caller (`agent.rs`) can derive the request's own file
-/// stem, which [`wait_for_ack`] and [`write_ack`] both key off.
-pub fn write_request(dir: &Path, req: &SpawnRequest) -> CtxResult<PathBuf> {
+/// The infix every in-progress write in this directory carries while it is
+/// still being written. Both listings below skip anything containing it, so a
+/// 50ms poller can never read a half-written file: the visible name only ever
+/// appears via [`write_atomic_private`]'s own rename, which is atomic.
+const TMP_INFIX: &str = ".tmp-";
+
+/// Whether `name` is one of [`write_atomic_private`]'s in-flight temporaries.
+/// Belt and braces: a temporary is named `<final>.tmp-<uuid>`, so it already
+/// fails every `ends_with(".json")` check in this module -- but a listing that
+/// only *happens* to exclude a half-written file is not the same thing as one
+/// that says so.
+fn is_tmp_name(name: &str) -> bool {
+    name.contains(TMP_INFIX)
+}
+
+/// R10: creates `<dir>/<name>` by writing `<dir>/<name>.tmp-<uuid>` first and
+/// renaming it into place. Every file in this directory is polled for by the
+/// other side of the channel (`take_requests` every tick, `wait_for_ack` every
+/// 100ms), and a plain create-then-write is visible under its final name while
+/// still empty -- which a poller reads as a torn write and deletes. The rename
+/// is atomic on both platforms, so the final name never exists in a partial
+/// state. The temporary itself is still `create_new` + 0600, the same private
+/// -file discipline `state::write_private` holds elsewhere, and is cleaned up
+/// if the rename fails.
+fn write_atomic_private(dir: &Path, name: &str, contents: &str) -> CtxResult<PathBuf> {
     super::super::state::create_private_dir_all(dir)?;
-    let path = dir.join(format!("req-{}.json", uuid::Uuid::new_v4()));
-    let body = serde_json::to_string(req)?;
-    create_new_private(&path, &body)?;
+    let tmp = dir.join(format!("{name}{TMP_INFIX}{}", uuid::Uuid::new_v4()));
+    create_new_private(&tmp, contents)?;
+    let path = dir.join(name);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(path)
+}
+
+/// Writes `req` as a `req-<uuid>.json` file under `dir` through
+/// [`write_atomic_private`], so the request only ever becomes visible to the
+/// dashboard's own poller complete. Returns the path so the caller
+/// (`agent.rs`) can derive the request's own file stem, which [`wait_for_ack`]
+/// and [`write_ack`] both key off -- and so it can remove the request again if
+/// it gives up waiting before anybody claimed it.
+pub fn write_request(dir: &Path, req: &SpawnRequest) -> CtxResult<PathBuf> {
+    let body = serde_json::to_string(req)?;
+    write_atomic_private(dir, &format!("req-{}.json", uuid::Uuid::new_v4()), &body)
 }
 
 /// Every currently-queued request in `dir`: read, then deleted immediately
@@ -135,7 +168,9 @@ pub fn take_requests(dir: &Path) -> Vec<(PathBuf, SpawnRequest)> {
         let is_request = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|name| name.starts_with("req-") && name.ends_with(".json"));
+            .is_some_and(|name| {
+                name.starts_with("req-") && name.ends_with(".json") && !is_tmp_name(name)
+            });
         if !is_request {
             continue;
         }
@@ -165,10 +200,8 @@ pub fn request_stem(path: &Path) -> Option<String> {
 /// so [`wait_for_ack`]'s caller (who already knows its own request's stem)
 /// can find it deterministically without listing the directory.
 pub fn write_ack(dir: &Path, request_stem: &str, ack: &SpawnAck) -> CtxResult<()> {
-    super::super::state::create_private_dir_all(dir)?;
-    let path = dir.join(format!("ack-{request_stem}.json"));
     let body = serde_json::to_string(ack)?;
-    super::super::state::write_private(&path, &body)?;
+    write_atomic_private(dir, &format!("ack-{request_stem}.json"), &body)?;
     Ok(())
 }
 
@@ -185,9 +218,19 @@ fn claim_path(dir: &Path, request_stem: &str) -> PathBuf {
 /// with it. Contents are advisory only -- the file's existence is the whole
 /// signal -- so nothing ever parses it.
 pub fn write_claim(dir: &Path, request_stem: &str) -> CtxResult<()> {
-    super::super::state::create_private_dir_all(dir)?;
-    super::super::state::write_private(&claim_path(dir, request_stem), "claimed")?;
+    write_atomic_private(dir, &format!("claim-{request_stem}"), "claimed")?;
     Ok(())
+}
+
+/// Withdraws a claim: called when fulfilment *failed* outright, so the claim
+/// no longer stands for anything (R6). A requester that timed out reads a
+/// lingering claim as "the dashboard has this, the answer is just slow" and
+/// reports success -- for a pane that will never exist. A claim is kept when
+/// the spawn itself succeeded and only the ack write failed: there a pane
+/// genuinely does exist, and headless double-running it would be the worse
+/// outcome. Best-effort: an already-absent claim is not an error.
+pub fn remove_claim(dir: &Path, request_stem: &str) {
+    let _ = std::fs::remove_file(claim_path(dir, request_stem));
 }
 
 /// Whether some dashboard has claimed this request. Checked by the requester
@@ -328,6 +371,76 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let got = wait_for_ack(&dir, "req-never-answered", Duration::from_millis(150));
         assert!(got.is_none());
+    }
+
+    /// R10: every write in this directory lands through a rename, so a 50ms
+    /// poller never sees a file under its final name while it is still being
+    /// written -- and nothing is left behind under the temporary one.
+    #[test]
+    fn every_write_renames_into_place_and_leaves_no_temporary_behind() {
+        let (_tmp, dir) = dir();
+        let path = write_request(&dir, &sample_request()).expect("write_request");
+        assert!(path.is_file());
+        write_claim(&dir, "req-x").expect("write_claim");
+        write_ack(
+            &dir,
+            "req-x",
+            &SpawnAck {
+                ok: true,
+                short: Some("bbbb2222".to_string()),
+                reason: None,
+            },
+        )
+        .expect("write_ack");
+
+        let lingering: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|name| is_tmp_name(name))
+            .collect();
+        assert!(lingering.is_empty(), "got {lingering:?}");
+
+        // And the renamed files are all readable as themselves.
+        assert_eq!(take_requests(&dir).len(), 1);
+        assert!(is_claimed(&dir, "req-x"));
+        assert!(wait_for_ack(&dir, "req-x", Duration::from_millis(50)).is_some());
+    }
+
+    /// A temporary left by a crashed writer is not a request: it must be
+    /// neither returned nor consumed by a listing that walks past it.
+    #[test]
+    fn take_requests_ignores_a_lingering_temporary_file() {
+        let (_tmp, dir) = dir();
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let stray = dir.join(format!("req-abc.json{TMP_INFIX}0123"));
+        std::fs::write(
+            &stray,
+            r#"{"agent":"claude","prompt":"x","cwd":"/repo","requested_by":"y"}"#,
+        )
+        .expect("write stray");
+
+        assert!(
+            take_requests(&dir).is_empty(),
+            "a temporary is not a request"
+        );
+        assert!(
+            stray.exists(),
+            "and it is left for its own writer to finish or clean up, not consumed"
+        );
+    }
+
+    /// R6: a claim can be withdrawn, so a fulfilment that failed outright
+    /// stops telling a timed-out requester that a pane is on its way.
+    #[test]
+    fn remove_claim_withdraws_a_claim() {
+        let (_tmp, dir) = dir();
+        write_claim(&dir, "req-abc").expect("write_claim");
+        assert!(is_claimed(&dir, "req-abc"));
+        remove_claim(&dir, "req-abc");
+        assert!(!is_claimed(&dir, "req-abc"));
+        // Idempotent: withdrawing twice is not an error.
+        remove_claim(&dir, "req-abc");
     }
 
     #[test]

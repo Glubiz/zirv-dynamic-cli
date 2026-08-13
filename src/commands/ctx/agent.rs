@@ -205,6 +205,15 @@ fn try_join_dashboard<W: Write>(
             .map_err(|e| e.into()),
         ),
         None => {
+            // R5: nothing claimed it, so nothing is going to. Take the request
+            // file back before falling through: `take_requests` runs every
+            // tick, so a request left on disk would still be picked up by a
+            // dashboard that was merely slow to start polling -- and then the
+            // headless run below and that pane would both be working the same
+            // prompt. Best-effort; the file is usually already gone (that is
+            // exactly what makes an unclaimed timeout ambiguous), and the whole
+            // directory is removed on the dashboard's own quit either way.
+            let _ = std::fs::remove_file(&path);
             eprintln!("zirv ctx agent: dashboard did not answer; running headless");
             None
         }
@@ -764,6 +773,42 @@ mod tests {
             Duration::from_millis(200),
         );
         assert!(joined.is_none(), "an unanswered request still falls back");
+    }
+
+    /// R5: an unanswered, unclaimed request is taken back off disk before the
+    /// headless fallback starts. `take_requests` runs on the dashboard's own
+    /// tick, so a request left behind could still be picked up afterwards --
+    /// and then the headless run and that pane would both work the same
+    /// prompt, which is exactly the double-run the claim protocol exists to
+    /// prevent.
+    #[test]
+    fn an_unclaimed_timeout_takes_its_own_request_back_off_disk() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_millis(200),
+        );
+        assert!(joined.is_none(), "nobody answered, so this runs headless");
+
+        let leftover: Vec<PathBuf> = std::fs::read_dir(&requests_dir)
+            .expect("read requests dir")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the request must not be left for a later tick to pick up: {leftover:?}"
+        );
     }
 
     /// F10: the dashboard deletes a request the instant it takes it, so an

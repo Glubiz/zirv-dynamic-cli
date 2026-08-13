@@ -78,12 +78,27 @@ pub struct PaneSpec {
 }
 
 /// Pure: a pane's `PaneState` from whether a turn-boundary signal has been
-/// seen since the child's last output, and whether the child has exited.
+/// seen since the child's last output, whether the child has exited, and
+/// whether an injection is still waiting for the turn it started to end.
 /// Exit always wins -- a pane that exited mid-turn is still `Ended`, not
 /// `Working`.
-fn state_from(signal_seen_recently: bool, child_exit: Option<i32>) -> PaneState {
+///
+/// R3: `injected_awaiting_turn` is what stops two independent injections
+/// landing in the same tick. Injecting a line does not change
+/// `signal_seen_recently` (the child has not produced anything yet, and the
+/// next turn signal is still seconds away), so without this flag the mail
+/// sweep and the nudge drain -- which run back to back in one tick and both
+/// gate on `Idle` -- each saw the same idle pane and each typed into it.
+fn state_from(
+    signal_seen_recently: bool,
+    child_exit: Option<i32>,
+    injected_awaiting_turn: bool,
+) -> PaneState {
     if let Some(code) = child_exit {
         return PaneState::Ended(code);
+    }
+    if injected_awaiting_turn {
+        return PaneState::Working;
     }
     if signal_seen_recently {
         PaneState::Idle
@@ -111,12 +126,20 @@ fn last_line_of(screen: &vt100::Screen) -> String {
     String::new()
 }
 
-/// Pure: the exact bytes `inject_visible` writes for one labelled line,
+/// Pure: the exact text `inject_visible` writes for one labelled line,
 /// matching the `zirv ▸` announcement channel's own marker
 /// (`announce.rs`'s `Event::line`) so a visible injection reads as coming
 /// from the same voice as everything else zirv narrates to an operator.
+///
+/// R4: deliberately carries **no** control characters of its own. The
+/// framing used to be `"\r\n{line}\r\n"` plus a lone `"\r"`, and the leading
+/// `\r\n` submitted whatever the operator had half-typed at the prompt before
+/// the injected text was ever entered. `wrap::inject_compact` (`wrap.rs:477`)
+/// already establishes this codebase's convention for the same job -- write
+/// the text, then exactly one `\r`, because a TUI submits on carriage return
+/// -- and `inject_visible` now follows it.
 fn visible_injection_line(label: &str, body: &str) -> String {
-    format!("\r\n[zirv \u{25b8} {label}] {body}\r\n")
+    format!("[zirv \u{25b8} {label}] {body}")
 }
 
 /// A supervised ConPTY/pty child rendered through its own `vt100` screen.
@@ -142,6 +165,11 @@ pub struct Pane {
     /// bytes: "the last thing this pane told us was a turn boundary, and it
     /// has not produced anything since."
     signal_seen_recently: bool,
+    /// Set by a successful `inject_visible`, cleared by the next turn signal
+    /// (`on_turn_signal`): "this pane was handed something to do and has not
+    /// reported finishing it yet." See `state_from`'s own doc comment -- this
+    /// is what keeps two idle-gated injections out of the same tick.
+    injected_awaiting_turn: bool,
     exit_code: Option<i32>,
     /// Idempotency guard for `shutdown` -- the release profile is
     /// `panic = "abort"`, so `Drop` is not guaranteed and every exit arm
@@ -264,6 +292,7 @@ impl Pane {
             guard,
             state_dir: state.clone(),
             signal_seen_recently: false,
+            injected_awaiting_turn: false,
             exit_code: None,
             done: false,
         })
@@ -321,18 +350,26 @@ impl Pane {
     /// `drain`/`on_turn_signal`/`poll_exit` -- no I/O of its own, so it is
     /// cheap enough to call every frame.
     pub fn state(&self) -> PaneState {
-        state_from(self.signal_seen_recently, self.exit_code)
+        state_from(
+            self.signal_seen_recently,
+            self.exit_code,
+            self.injected_awaiting_turn,
+        )
     }
 
     /// Drains every turn signal currently queued on this pane's socket. Also
     /// polls the child's exit status, the same as `drain`: a turn boundary
     /// and a child exit are both "this pane stopped producing on its own",
     /// and either is a fine place to notice the other.
+    /// A fresh signal also clears `injected_awaiting_turn`: the turn an
+    /// injection started has now ended, so the pane is genuinely idle again
+    /// and eligible for the next one.
     pub fn on_turn_signal(&mut self) {
         self.poll_exit();
         if let Some(server) = &self.server {
             while server.try_recv().is_some() {
                 self.signal_seen_recently = true;
+                self.injected_awaiting_turn = false;
             }
         }
     }
@@ -370,19 +407,29 @@ impl Pane {
     }
 
     /// Writes a visible, clearly-labelled line into the child's own pty --
-    /// `"\r\n[zirv ▸ {label}] {body}\r\n"` followed by a lone `\r` to submit
-    /// it as input -- then a plain `write_input`. Used by Task 9's idle-gated
-    /// intervention (an operator nudge, or a swept mail message) to put text
-    /// in front of the agent the same way a human typing at the prompt
-    /// would, rather than any side channel the agent has to know to look for.
+    /// `"[zirv ▸ {label}] {body}"` followed by exactly one `\r` to submit it,
+    /// the same framing `wrap::inject_compact` uses. Used by Task 9's
+    /// idle-gated intervention (an operator nudge, or a swept mail message) to
+    /// put text in front of the agent the same way a human typing at the
+    /// prompt would, rather than any side channel the agent has to know to
+    /// look for.
     ///
     /// The caller must have already checked `state() == PaneState::Idle`:
     /// this method does not gate itself -- writing into a `Working` pane
     /// would interleave with whatever the agent is already sending, which is
     /// exactly the failure mode idle-gating exists to prevent.
+    ///
+    /// On success the pane reports `Working` until its next turn signal
+    /// (`injected_awaiting_turn`), so a second idle-gated caller later in the
+    /// same tick sees a busy pane rather than the stale `Idle` this one just
+    /// acted on. A failed write leaves the flag alone: nothing was typed, so
+    /// nothing is pending.
     pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
-        self.write_input(visible_injection_line(label, body).as_bytes())?;
-        self.write_input(b"\r")
+        let line = visible_injection_line(label, body);
+        self.write_input(line.as_bytes())?;
+        self.write_input(b"\r")?;
+        self.injected_awaiting_turn = true;
+        Ok(())
     }
 
     /// Idempotent: sends `quit_sequence` (grace period, then `kill`, exactly
@@ -422,15 +469,34 @@ impl Pane {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
     fn pane_state_maps_turn_signals_to_glyph_states() {
-        assert!(matches!(state_from(false, None), PaneState::Working));
-        assert!(matches!(state_from(true, None), PaneState::Idle));
-        assert!(matches!(state_from(true, Some(0)), PaneState::Ended(0)));
-        assert!(matches!(state_from(false, Some(3)), PaneState::Ended(3)));
+        assert!(matches!(state_from(false, None, false), PaneState::Working));
+        assert!(matches!(state_from(true, None, false), PaneState::Idle));
+        assert!(matches!(
+            state_from(true, Some(0), false),
+            PaneState::Ended(0)
+        ));
+        assert!(matches!(
+            state_from(false, Some(3), false),
+            PaneState::Ended(3)
+        ));
+    }
+
+    /// R3: a pane that was just injected into is `Working` even though its
+    /// last observed signal still says "idle" -- and an exit still wins over
+    /// both.
+    #[test]
+    fn a_pending_injection_reports_working_until_the_next_turn_signal() {
+        assert!(matches!(state_from(true, None, true), PaneState::Working));
+        assert!(matches!(state_from(false, None, true), PaneState::Working));
+        assert!(
+            matches!(state_from(true, Some(0), true), PaneState::Ended(0)),
+            "an exited pane is Ended regardless of a pending injection"
+        );
     }
 
     #[test]
@@ -446,13 +512,27 @@ mod tests {
         assert_eq!(last_line_of(parser.screen()), "");
     }
 
-    /// Pure: the exact bytes a visible injection writes, matching
+    /// Pure: the exact text a visible injection writes, matching
     /// `announce.rs`'s own `zirv ▸` marker.
     #[test]
     fn visible_injection_line_matches_the_zirv_announce_format() {
         assert_eq!(
             visible_injection_line("nudge from operator", "hello"),
-            "\r\n[zirv \u{25b8} nudge from operator] hello\r\n"
+            "[zirv \u{25b8} nudge from operator] hello"
+        );
+    }
+
+    /// R4: the line carries no control characters at all. A leading `\r\n`
+    /// used to submit whatever the operator had half-typed at the prompt
+    /// before the injected text was ever entered; the lone trailing `\r`
+    /// `inject_visible` adds is the only submission in the whole framing,
+    /// exactly as in `wrap::inject_compact`.
+    #[test]
+    fn visible_injection_line_submits_nothing_of_its_own() {
+        let line = visible_injection_line("mail from claude/aaaa1111", "check the build");
+        assert!(
+            !line.contains('\r') && !line.contains('\n'),
+            "no control characters may frame the line: {line:?}"
         );
     }
 
@@ -475,6 +555,52 @@ mod tests {
     #[cfg(unix)]
     fn trivial_argv() -> Vec<String> {
         vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()]
+    }
+
+    /// A trivial child that stays alive well past any of these tests' own
+    /// deadlines, and reaps itself if the test somehow never shuts it down.
+    /// Same never-a-real-agent rule and same platform split as `trivial_argv`;
+    /// `ping -n N 127.0.0.1` is already this codebase's own long-lived
+    /// Windows test child (`wrap.rs`'s turn-signal transport test).
+    #[cfg(windows)]
+    pub(crate) fn long_lived_argv() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "ping -n 60 127.0.0.1".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn long_lived_argv() -> Vec<String> {
+        vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()]
+    }
+
+    /// Drives one turn signal into `pane`'s own socket and waits, bounded,
+    /// for `on_turn_signal` to observe it. Returns whether it landed. Gives up
+    /// immediately if the child exited (`Ended` outranks every other state, so
+    /// no number of signals would ever move it back to `Idle`).
+    pub(crate) fn signal_until_idle(pane: &mut Pane, state: &StateDir, session_id: &str) -> bool {
+        let socket = state.socket_for(session_id);
+        let signal = crate::commands::ctx::signal::TurnSignal {
+            session_id: session_id.to_string(),
+            turn: 1,
+            score: 0,
+            verdict: crate::commands::ctx::rot::Verdict::Healthy,
+            transcript_path: None,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let _ = crate::commands::ctx::signal::send(&socket, &signal);
+            pane.on_turn_signal();
+            match pane.state() {
+                PaneState::Idle => return true,
+                PaneState::Ended(_) => return false,
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     fn test_spec(session_id: &str) -> PaneSpec {
@@ -526,6 +652,43 @@ mod tests {
 
         pane.shutdown("").expect("first shutdown");
         pane.shutdown("").expect("shutdown must be idempotent");
+    }
+
+    /// R3, end to end on a real supervised child: an idle pane that is
+    /// injected into reports `Working` immediately -- so a second idle-gated
+    /// caller in the same tick skips it -- and goes back to `Idle` only once
+    /// the turn the injection started reports finishing.
+    #[test]
+    fn an_injection_makes_a_pane_busy_until_its_next_turn_signal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "33333333-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+
+        assert!(
+            signal_until_idle(&mut pane, &state, session_id),
+            "the pane must report a turn boundary before this test can mean anything"
+        );
+
+        pane.inject_visible("nudge from operator", "hello")
+            .expect("inject");
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "a freshly injected pane is busy, not idle: {:?}",
+            pane.state()
+        );
+
+        assert!(
+            signal_until_idle(&mut pane, &state, session_id),
+            "the next turn signal must clear the pending injection"
+        );
+
+        pane.shutdown("").expect("shutdown");
     }
 
     #[test]
