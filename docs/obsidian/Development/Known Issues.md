@@ -14,7 +14,59 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## A markdown header block ends at the first blank line
+
+`mail::parse_markdown` and `memory::parse_markdown` both read a `## Message` /
+`## Memory` header of `- key: value` bullets followed by a free-form body. The
+header block ends at the **first blank line** -- the one `to_markdown` always
+writes after the last bullet -- and everything after it is body, verbatim.
+
+This is a trust boundary, not a formatting detail. Both bodies are
+agent-authored text. When a blank line merely `continue`d (leaving the parser
+in header mode), a body whose first line happened to be a `- key: value`
+bullet was absorbed as header: a mail message could re-address itself
+(`- To-session: victim`) or forge its sender, and a memory entry could rewrite
+the `Key` it is filed under or promote itself from `handoff` to `explicit`. It
+also silently ate any honest bulleted body (`- build: cargo build`), which is
+how it was first noticed.
+
+If either parser grows a new header field, keep the terminator rule intact.
+
+## A supervisor's registry short id is a stable address, not its session id
+
+`Record.short` is minted once at `SessionGuard::register` and deliberately
+**not** rotated by `refresh_session`, even though `Record.session` is. It is
+the address `resolve_prefix` hands a sender, what `send --to-session` and
+`zirv ctx nudge` store on a message, and what `zirv ctx status` prints.
+
+Rotating it (which is what `loop` did per cycle and `exec` per restart) made
+every message addressed to a live session undeliverable the instant that
+session was replaced -- the sender resolved a real address and the supervisor
+then stopped answering to it. Every mail listing a supervisor performs on its
+own behalf must therefore be scoped to the registry short, never to
+`short_id(current session)`.
+
+Consequences to preserve: `loop` filters on it too (passing `None` made a loop
+swallow *and consume* mail addressed to other sessions), and `exec`'s nudge
+marker is claimed under it (deriving it from `session` meant a nudge sent after
+the first restart was never claimed).
+
+## Anything spawned from a supervised session must have its supervision env scrubbed
+
+`sessions::SUPERVISION_ENV` (`ZIRV_CTX_SESSION`, `ZIRV_CTX_SOCKET`,
+`ZIRV_CTX_TRANSCRIPT`) has to be `env_remove`d from **every** child command
+before the spawner sets whichever of it it owns -- `portable_pty::CommandBuilder::new`
+and `std::process::Command` both inherit the parent environment, so "not set"
+means "inherited", not "absent".
+
+This is not limited to the supervisors' own agent children. It also covers
+`handoff::run_model` (the distiller, and therefore `memory::harvest_from_handoff`,
+which spawns through it) and `resume`'s hand-over launch. A distiller that
+inherits its parent's session id posts turn signals into the parent's own rot
+engine while the parent sits blocked waiting for that very call to return.
 <!-- Updated 2026-08-12 (feat/obsidian-vault, seeded): initial gotchas pulled from repo CLAUDE.md -->
 
 ## portable-pty's Windows `do_kill` inverts its own success check

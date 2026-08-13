@@ -98,6 +98,12 @@ pub fn run_with<W: Write>(
     // leaves this loop, matching the explicit-arm discipline `RawGuard`
     // follows under this binary's `panic = "abort"` release profile.
     let mut session_guard: Option<super::sessions::SessionGuard> = None;
+    // C7: this run's stable delivery address. The first cycle's short id
+    // becomes the registry key and stays put for the whole run (see
+    // `SessionGuard::refresh_session`), so `None` here only for the window
+    // before the first cycle has registered -- in which case this cycle's
+    // own short *is* the address about to be registered.
+    let mut registry_short: Option<String> = None;
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -139,28 +145,32 @@ pub fn run_with<W: Write>(
         // it.
         let session = SessionId::new_v4();
         let session_short = super::sessions::short_id(session.as_str());
-        // N3 scopes delivery to the live session's own short id everywhere
-        // else (`exec`, `wrap`'s advisory), but `loop` deliberately passes
-        // `None` here rather than `Some(&session_short)`: unlike those,
-        // `loop` has no stable session identity across a run -- every cycle
-        // mints a brand new one -- so a message addressed to *this* cycle's
-        // short id (a `zirv ctx nudge` sent while it is live, say) would
-        // otherwise become permanently unaddressable the moment the next
-        // cycle mints a different short id. `None` is what lets "the mail
-        // arrives at the natural next cycle" (this module's own nudge
-        // handling, a few lines down) actually hold.
+        // C7: scoped to this run's stable registry address. `loop` used to
+        // pass `None` here -- "no session filter at all" -- because its
+        // session id rotated every cycle and a directed message would
+        // otherwise become unaddressable the moment the next cycle started.
+        // The cost was that a `loop` swallowed and consumed mail addressed
+        // to *other* sessions entirely: `None` means every directed message
+        // in the repo is visible, and delivery consumes what it lists.
+        // Now that the registry short is stable for the whole run
+        // (`SessionGuard::refresh_session`), the narrow filter gives both
+        // properties at once -- this run's own directed mail stays
+        // addressable across cycles, and nobody else's is touched.
         //
         // `mut`: drained right after this cycle's own spawn actually
         // succeeds (Item 3), not here -- a launch that fails to spawn, or a
         // pacing park ahead of it, must not move mail to `read/` before any
         // session has actually started to see it.
-        let mut mail_entries: Vec<(PathBuf, super::mail::Message)> = if composed.is_some()
-            && cfg.mail.enabled
-        {
-            super::mail::list(&state, &mail_slug, Some(adapter.name()), None).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
+            if composed.is_some() && cfg.mail.enabled {
+                let for_session = registry_short
+                    .clone()
+                    .unwrap_or_else(|| session_short.clone());
+                super::mail::list(&state, &mail_slug, Some(adapter.name()), Some(&for_session))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
         let mail_messages: Vec<super::mail::Message> =
             mail_entries.iter().map(|(_, msg)| msg.clone()).collect();
         if !mail_messages.is_empty() {
@@ -176,6 +186,7 @@ pub fn run_with<W: Write>(
         match session_guard.as_mut() {
             Some(guard) => guard.refresh_session(session.as_str()),
             None => {
+                registry_short = Some(session_short.clone());
                 session_guard = Some(super::sessions::SessionGuard::register(
                     &state,
                     super::sessions::Record::new(
@@ -250,6 +261,12 @@ pub fn run_with<W: Write>(
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
         let mut limit_hit = false;
+        // C7: the stable registry address this run answers to, resolved once
+        // per cycle so the tick closure below borrows a plain `String`
+        // rather than the `Option` the loop keeps mutating.
+        let nudge_address = registry_short
+            .clone()
+            .unwrap_or_else(|| session_short.clone());
 
         let outcome = {
             let mut tick = || {
@@ -269,10 +286,15 @@ pub fn run_with<W: Write>(
                 // the nudge's payload arrives there regardless. Claiming the
                 // marker here only stops it from re-firing and lets the
                 // operator see that it arrived.
-                if super::sessions::claim_nudge_marker(&state, &session_short) {
+                // C7: claimed under the run's stable registry address, not
+                // this cycle's own short id -- a nudge is addressed to the
+                // supervisor, which outlives any one cycle.
+                // C4: `from` is the sender read out of the marker, not our
+                // own id.
+                if let Some(from) = super::sessions::claim_nudge_marker(&state, &nudge_address) {
                     announcer.emit(&super::announce::Event::Nudge {
-                        from: session_short.clone(),
-                        restarted: false,
+                        from,
+                        disposition: super::announce::NudgeDisposition::NextCycle,
                     });
                 }
                 match scorer.poll(adapter.as_ref(), &cfg.score) {

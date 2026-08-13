@@ -198,6 +198,19 @@ pub fn extra_launch_flags(
     out
 }
 
+/// C3: the consecutive-nudge budget after one supervised run.
+///
+/// `[supervise] max_nudges` has always been documented as bounding
+/// *consecutive* nudge restarts -- "a session cannot be interrupted
+/// indefinitely" -- but the counter was only ever incremented, so it actually
+/// bounded nudges for the whole lifetime of the run. A session nudged three
+/// times across an hour, doing real work between each, could never be nudged
+/// again. Progress (a turn boundary reported by the session itself) ends the
+/// consecutive run and restores the budget.
+pub fn nudges_after(used: u32, progressed: bool) -> u32 {
+    if progressed { 0 } else { used }
+}
+
 /// Compaction of a headless run is pointless (there is no TUI to type into), so
 /// only a restart verdict acts, and only for the session this supervisor owns:
 /// the socket is named after eight hex characters of a session id, so a stale
@@ -310,17 +323,24 @@ pub fn run_with<W: Write>(
     // that fails to spawn at all, or a long pacing park ahead of it, moved
     // it to `read/` with no session ever having seen it.
     //
-    // N3: scoped to this session's own short id, so a message addressed to a
+    // N3: scoped to this run's own short id, so a message addressed to a
     // different session (`send --to-session`) never leaks into this launch's
     // prompt just because the two share a repo and an agent name.
-    let session_short = super::sessions::short_id(session.as_str());
+    //
+    // C7: this is the *registry* short -- the address `SessionGuard` files
+    // this run under below and keeps stable for its whole lifetime (see
+    // `SessionGuard::refresh_session`). Every later listing in this function
+    // reuses this exact value rather than recomputing `short_id(session)`,
+    // which rotates on every restart and stranded any mail addressed to the
+    // session a sender had actually resolved.
+    let registry_short = super::sessions::short_id(session.as_str());
     let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
         if composed.is_some() && cfg.mail.enabled {
             super::mail::list(
                 &state,
                 &mail_slug,
                 Some(adapter.name()),
-                Some(&session_short),
+                Some(&registry_short),
             )
             .unwrap_or_default()
         } else {
@@ -343,6 +363,19 @@ pub fn run_with<W: Write>(
     // replaces this binding so any restart or park after it keeps using the
     // nudge-enriched prompt rather than silently reverting to the launch-time
     // one.
+    // PLAUSIBLE-1 (confirmed): captured here, at launch, because this is the
+    // only point the operator's own prompt flag is still present in argv.
+    // `merge_command_line_prompt` strips it, and every relaunch below holds
+    // the *cleaned* argv -- so re-running the merge on a relaunch found
+    // nothing and silently dropped the operator's instruction from the
+    // recomposed prompt. `relayer_recomposed` re-applies this instead.
+    let operator_prompt_text: Option<String> = if composed.is_some() {
+        super::prompt::extract_user_prompt_flag(adapter.as_ref(), &args.command, prompt_value_at)
+            .ok()
+            .and_then(|(_, text)| text)
+    } else {
+        None
+    };
     let (launch_command, mut composed) = super::prompt::merge_command_line_prompt(
         adapter.as_ref(),
         &args.command,
@@ -563,8 +596,10 @@ pub fn run_with<W: Write>(
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
         let mut limit_hit = false;
-        let mut nudged = false;
+        let mut nudged_by: Option<String> = None;
 
+        // C3: reset below whenever this run reported a turn of its own.
+        let mut progressed = false;
         let outcome = supervise_run(
             &mut child,
             Instant::now() + timeout,
@@ -575,14 +610,25 @@ pub fn run_with<W: Write>(
             &state,
             server.as_ref(),
             session.as_str(),
+            &registry_short,
             &mut rotted,
+            &mut progressed,
             &tap,
             &mut limit_hit,
-            &mut nudged,
+            &mut nudged_by,
             nudge_restarts,
             cfg.supervise.max_nudges,
             can_restart,
         )?;
+
+        // C3: the budget is *consecutive* nudge restarts, which is what
+        // `[supervise] max_nudges` has always been documented as. It was
+        // implemented cumulatively -- never reset -- so a long-lived session
+        // that was nudged three times over an hour, doing useful work in
+        // between each, permanently lost the ability to be nudged again.
+        // A turn boundary reported by this session is the evidence that it
+        // got somewhere, so the run of consecutive nudges is over.
+        nudge_restarts = nudges_after(nudge_restarts, progressed);
 
         // `supervise_child` checks the child's exit status before calling the
         // tick, so a fast limit-hit exit (print the notice, exit immediately,
@@ -612,8 +658,7 @@ pub fn run_with<W: Write>(
         // is actually possible (a known prompt) and under the consecutive
         // cap, so this arm always follows through rather than needing its
         // own "no prompt"/"over budget" fallbacks the way rot's restart does.
-        if nudged {
-            let nudged_short = super::sessions::short_id(session.as_str());
+        if let Some(nudged_from) = nudged_by.take() {
             let prompt_text = prompt
                 .clone()
                 .expect("supervise_run only sets `nudged` when a prompt is known");
@@ -650,17 +695,28 @@ pub fn run_with<W: Write>(
                 &memory_entries,
                 cfg.memory.max_injected_bytes,
             );
-            let nudge_mail: Vec<(PathBuf, super::mail::Message)> = if cfg.mail.enabled {
-                super::mail::list(
-                    &state,
-                    &mail_slug,
-                    Some(adapter.name()),
-                    Some(&nudged_short),
-                )
-                .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            // C7: `registry_short`, not `short_id(session)` -- `session`
+            // has just been rotated above, and the nudge's own payload was
+            // addressed to the stable registry address the sender resolved.
+            //
+            // N5: gated on `fresh.is_some()` as well as `cfg.mail.enabled`,
+            // exactly like the launch path's `composed.is_some()` gate. Under
+            // `--simple` there is no composed prompt for `with_mail_layer` to
+            // fold mail into, so listing it here only led to it being
+            // consumed (moved to `read/`) by the post-spawn drain below --
+            // silently marking a message read that no session ever saw.
+            let nudge_mail: Vec<(PathBuf, super::mail::Message)> =
+                if fresh.is_some() && cfg.mail.enabled {
+                    super::mail::list(
+                        &state,
+                        &mail_slug,
+                        Some(adapter.name()),
+                        Some(&registry_short),
+                    )
+                    .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
             let nudge_mail_msgs: Vec<super::mail::Message> =
                 nudge_mail.iter().map(|(_, msg)| msg.clone()).collect();
             if !nudge_mail_msgs.is_empty() {
@@ -673,11 +729,14 @@ pub fn run_with<W: Write>(
                 &nudge_mail_msgs,
                 cfg.mail.max_delivered_bytes,
             );
-            let (_, fresh) = super::prompt::merge_command_line_prompt(
+            // PLAUSIBLE-1: re-apply the adapter layer and the operator's own
+            // command-line instruction from the text captured at launch.
+            // `launch_command` is the cleaned argv, so merging against it
+            // again would find no flag and drop the instruction entirely.
+            let fresh = super::prompt::relayer_recomposed(
                 adapter.as_ref(),
-                &launch_command,
                 fresh,
-                prompt_value_at,
+                operator_prompt_text.as_deref(),
             );
             composed = fresh;
             prompt_args = super::prompt::injection_args_for_session(
@@ -705,8 +764,8 @@ pub fn run_with<W: Write>(
                 adapter.capabilities().system_prompt,
             ));
             announcer.emit(&super::announce::Event::Nudge {
-                from: nudged_short,
-                restarted: true,
+                from: nudged_from,
+                disposition: super::announce::NudgeDisposition::Relaunching,
             });
 
             nudge_restarts += 1;
@@ -962,15 +1021,22 @@ fn supervise_run(
     state: &StateDir,
     server: Option<&signal::SignalServer>,
     session: &str,
+    // C7: this run's stable registry short id, not `short_id(session)`.
+    // `zirv ctx nudge` writes its wake-up marker under the address it
+    // resolved from the registry, and that address does not rotate when a
+    // restart mints a fresh session -- deriving it from `session` here meant
+    // a nudge sent after the first restart was never claimed.
+    registry_short: &str,
     rotted: &mut bool,
+    // C3: set when this session reported a turn boundary of its own.
+    progressed: &mut bool,
     tap: &supervise::OutputTap,
     limit_hit: &mut bool,
-    nudged: &mut bool,
+    nudged_by: &mut Option<String>,
     nudges_used: u32,
     max_nudges: u32,
     can_restart: bool,
 ) -> CtxResult<Outcome> {
-    let session_short = super::sessions::short_id(session);
     let mut tick = || {
         if pace::scan_for_limit(
             &tap.try_lines(),
@@ -984,10 +1050,19 @@ fn supervise_run(
         }
         if let Some(server) = server
             && let Some(received) = server.try_recv()
-            && should_stop_for_signal(&received, session)
         {
-            *rotted = true;
-            return Tick::Stop("rot");
+            // C3: a turn boundary reported by *this* session is evidence it
+            // got somewhere since the last nudge relaunch, which is what
+            // makes the nudge budget consecutive rather than cumulative.
+            // Recorded for any verdict, including the Restart one handled
+            // just below: the session still did a turn's work.
+            if received.session_id == session {
+                *progressed = true;
+            }
+            if should_stop_for_signal(&received, session) {
+                *rotted = true;
+                return Tick::Stop("rot");
+            }
         }
         // N4: claiming the marker is atomic (`remove_file`), so exactly one
         // observer ever sees `true` -- important even within one process,
@@ -997,9 +1072,11 @@ fn supervise_run(
         // has not been reached; otherwise the marker is still claimed (so it
         // never re-triggers) but the child runs on untouched and the mail
         // stays unread -- `nudge-ignored` in the decision log says why.
-        if super::sessions::claim_nudge_marker(state, &session_short) {
+        if let Some(from) = super::sessions::claim_nudge_marker(state, registry_short) {
             if can_restart && nudges_used < max_nudges {
-                *nudged = true;
+                // C4: the sender's own short id, read out of the marker, so
+                // the announcement can name who actually nudged us.
+                *nudged_by = Some(from);
                 return Tick::Stop("nudge");
             }
             let _ = log::append(
@@ -1287,6 +1364,26 @@ mod tests {
     /// A trivial shell command rather than the fake agent: this test is about
     /// what `run_with` refuses, not about supervision, and it should stay
     /// runnable on both platforms.
+    /// C3: the cap counts *consecutive* nudge restarts, which is what
+    /// `[supervise] max_nudges` has always claimed to bound. It was
+    /// implemented cumulatively, so a long-lived session that did real work
+    /// between nudges permanently exhausted its budget anyway.
+    #[test]
+    fn the_nudge_cap_resets_once_the_session_makes_progress() {
+        // Without progress the budget is spent and stays spent.
+        assert_eq!(nudges_after(0, false), 0);
+        assert_eq!(nudges_after(2, false), 2);
+        assert_eq!(nudges_after(3, false), 3);
+
+        // A turn boundary from the session ends the consecutive run.
+        assert_eq!(
+            nudges_after(3, true),
+            0,
+            "a session that got somewhere may be nudged again"
+        );
+        assert_eq!(nudges_after(1, true), 0);
+    }
+
     #[test]
     fn a_headless_exec_is_not_subject_to_the_nesting_guard() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -2738,11 +2835,16 @@ mod tests {
         std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        unsafe {
-            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
-            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &session_log);
-        }
+        // C10: a guard, not a bare set/remove pair. The cleanup below used
+        // to sit *after* `writer.join().expect(...)`, so a panicking writer
+        // thread (or any failing assertion) skipped it entirely and leaked
+        // `FAKE_AGENT_*` into every later test in this process -- which then
+        // failed against a tempdir that no longer existed.
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+            ("FAKE_AGENT_SESSION_ENV_LOG", session_log.to_str()),
+        ]);
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
@@ -2772,11 +2874,6 @@ mod tests {
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         writer.join().expect("writer thread");
-        unsafe {
-            std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
-            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
-        }
         assert_eq!(
             code.expect("the second (healthy) launch finishes the run"),
             0
@@ -2823,10 +2920,15 @@ mod tests {
         std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        unsafe {
-            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &session_log);
-        }
+        // C10: a guard, not a bare set/remove pair. The cleanup below used
+        // to sit *after* `writer.join().expect(...)`, so a panicking writer
+        // thread (or any failing assertion) skipped it entirely and leaked
+        // `FAKE_AGENT_*` into every later test in this process -- which then
+        // failed against a tempdir that no longer existed.
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SESSION_ENV_LOG", session_log.to_str()),
+        ]);
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
@@ -2854,10 +2956,6 @@ mod tests {
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         writer.join().expect("writer thread");
-        unsafe {
-            std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
-        }
         assert_eq!(
             code.expect("a nudge restart with zero rot budget must still succeed"),
             0
@@ -2898,10 +2996,15 @@ mod tests {
         std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        unsafe {
-            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &session_log);
-        }
+        // C10: a guard, not a bare set/remove pair. The cleanup below used
+        // to sit *after* `writer.join().expect(...)`, so a panicking writer
+        // thread (or any failing assertion) skipped it entirely and leaked
+        // `FAKE_AGENT_*` into every later test in this process -- which then
+        // failed against a tempdir that no longer existed.
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SESSION_ENV_LOG", session_log.to_str()),
+        ]);
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
@@ -2927,10 +3030,6 @@ mod tests {
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         writer.join().expect("writer thread");
-        unsafe {
-            std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
-        }
         assert_eq!(code.expect("runs"), 0);
 
         let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
@@ -2977,10 +3076,15 @@ mod tests {
         std::fs::write(&modes, "hang\nhang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        unsafe {
-            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &session_log);
-        }
+        // C10: a guard, not a bare set/remove pair. The cleanup below used
+        // to sit *after* `writer.join().expect(...)`, so a panicking writer
+        // thread (or any failing assertion) skipped it entirely and leaked
+        // `FAKE_AGENT_*` into every later test in this process -- which then
+        // failed against a tempdir that no longer existed.
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SESSION_ENV_LOG", session_log.to_str()),
+        ]);
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
@@ -3020,10 +3124,6 @@ mod tests {
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         let sessions = writer.join().expect("writer thread");
-        unsafe {
-            std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
-        }
         assert_eq!(
             code.expect("runs"),
             EXIT_TIMEOUT,

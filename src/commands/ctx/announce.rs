@@ -81,13 +81,31 @@ pub enum Event {
     /// from a bug in `wrap` itself.
     SessionEnded { agent: String, code: i32 },
     /// A `zirv ctx nudge` wake-up marker was claimed. `from` names the
-    /// nudging session's own short id (best-effort, the same identity a mail
-    /// message carries), and `restarted` says which of the three ways this
-    /// session reacted: a headless worker (`exec`) that relaunched with the
-    /// guidance folded in, a `loop` cycle that only announces (mail arrives
-    /// at its own natural boundary), or an interactive session (`wrap`/
-    /// `chat`) that is advised only and never typed into.
-    Nudge { from: String, restarted: bool },
+    /// *sending* session's short id, read out of the marker file itself
+    /// (C4): every emitter used to pass its own short id here, so the line
+    /// always read "nudged by <myself>".
+    Nudge {
+        from: String,
+        disposition: NudgeDisposition,
+    },
+}
+
+/// What the nudged session is actually going to do about it -- the three
+/// dispositions are genuinely different promises to the operator, and
+/// collapsing them into one boolean (C4) told interactive sessions their
+/// nudge "will be picked up as mail", which is exactly what never happens
+/// there: `wrap`/`chat` are advised only and never receive message bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NudgeDisposition {
+    /// `exec`: stopping the child and relaunching with the guidance folded
+    /// into the fresh prompt.
+    Relaunching,
+    /// `loop`: the payload is ordinary mail and this cycle is already
+    /// running, so the next cycle's own listing picks it up.
+    NextCycle,
+    /// `wrap`/`chat`: an interactive session is never restarted and never
+    /// typed into, and never receives bodies -- a human has to go read it.
+    Advisory,
 }
 
 impl Event {
@@ -159,13 +177,17 @@ impl Event {
             Event::SessionEnded { agent, code } => {
                 format!("{agent} session ended (exit code {code})")
             }
-            Event::Nudge { from, restarted } => {
-                if *restarted {
+            Event::Nudge { from, disposition } => match disposition {
+                NudgeDisposition::Relaunching => {
                     format!("nudged by {from}; relaunching with the guidance")
-                } else {
-                    format!("nudged by {from}; will be picked up as mail")
                 }
-            }
+                NudgeDisposition::NextCycle => {
+                    format!("nudged by {from}; will be picked up as mail on the next cycle")
+                }
+                NudgeDisposition::Advisory => {
+                    format!("nudged by {from}; run `zirv ctx inbox` to read it")
+                }
+            },
         }
     }
 }
@@ -453,25 +475,52 @@ mod tests {
         assert!(line.contains("134"), "got {line}");
     }
 
+    /// C4: all three dispositions are distinct promises, and every one of
+    /// them names the *sender*. Collapsing the last two into one boolean is
+    /// what told an interactive session its nudge would "be picked up as
+    /// mail" -- the one thing that never happens there.
     #[test]
-    fn a_nudge_announcement_names_the_sender_and_whether_it_restarted() {
-        let restarted = Event::Nudge {
+    fn a_nudge_announcement_names_the_sender_and_what_will_happen_next() {
+        let relaunching = Event::Nudge {
             from: "aaaa1111".to_string(),
-            restarted: true,
+            disposition: NudgeDisposition::Relaunching,
         };
-        let line = restarted.line();
+        let line = relaunching.line();
         assert!(line.contains("aaaa1111"), "got {line}");
         assert!(line.contains("relaunching"), "got {line}");
 
-        let advised = Event::Nudge {
+        let next_cycle = Event::Nudge {
             from: "aaaa1111".to_string(),
-            restarted: false,
+            disposition: NudgeDisposition::NextCycle,
         };
-        let line = advised.line();
+        let line = next_cycle.line();
         assert!(line.contains("aaaa1111"), "got {line}");
         assert!(
             !line.contains("relaunching"),
-            "an unrestarted nudge must not claim it relaunched: {line}"
+            "a loop cycle must not claim it relaunched: {line}"
+        );
+        assert!(
+            line.contains("next cycle"),
+            "a loop says when it will pick the payload up: {line}"
+        );
+
+        let advisory = Event::Nudge {
+            from: "aaaa1111".to_string(),
+            disposition: NudgeDisposition::Advisory,
+        };
+        let line = advisory.line();
+        assert!(line.contains("aaaa1111"), "got {line}");
+        assert!(
+            !line.contains("relaunching"),
+            "an interactive session is never relaunched: {line}"
+        );
+        assert!(
+            line.contains("zirv ctx inbox"),
+            "an interactive session never receives bodies, so it must point at              inbox rather than promise delivery: {line}"
+        );
+        assert!(
+            !line.contains("picked up as mail"),
+            "the old wording promised a delivery that never happens here: {line}"
         );
     }
 
@@ -520,7 +569,7 @@ mod tests {
             },
             Event::Nudge {
                 from: "aaaa1111".to_string(),
-                restarted: true,
+                disposition: NudgeDisposition::Relaunching,
             },
         ];
         for event in sample {

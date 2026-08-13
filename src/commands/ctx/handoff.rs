@@ -185,6 +185,17 @@ pub fn run_model(
     timeout: Duration,
 ) -> CtxResult<String> {
     let mut command = adapter.distiller_cmd(model);
+    // C2: the distiller is a full agent process spawned from inside a
+    // supervised session, so without this it inherited that session's
+    // `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET`/`ZIRV_CTX_TRANSCRIPT` -- and any
+    // hook it ran would have posted turn signals into its *parent's* rot
+    // engine, under the parent's own session id, while the parent sat
+    // blocked waiting for this very call to return. It has no session of its
+    // own and needs none: it is a one-shot, stdin-to-stdout model call.
+    //
+    // Covers `memory::harvest_from_handoff` too, which spawns its harvest
+    // model through this same function rather than building its own command.
+    super::sessions::scrub_supervision_env_cmd(&mut command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

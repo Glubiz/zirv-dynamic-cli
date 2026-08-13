@@ -647,10 +647,21 @@ mod tests {
     #[test]
     fn chat_refuses_to_start_inside_a_supervised_session_and_names_the_evidence() {
         let repo = crate::commands::ctx::testenv::repo();
-        let env: std::collections::HashMap<String, String> = [(
-            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
-            "abcdef12-3456-4789-8abc-def012345678".to_string(),
-        )]
+        // The `ZIRV_CTX_AGENT_BIN` entry is a safety belt, not a fixture
+        // detail: `adapters::select`/`resolve_default` call `ready()`, so an
+        // agent_bin that cannot exist makes a launch structurally
+        // impossible. If the guard under test ever regresses, this fails on
+        // a missing binary rather than spawning a real nested agent.
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+                "abcdef12-3456-4789-8abc-def012345678".to_string(),
+            ),
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                "/nonexistent/agent-must-never-launch".to_string(),
+            ),
+        ]
         .into();
 
         let mut out = Vec::new();

@@ -94,7 +94,18 @@ pub fn parse_markdown(md: &str) -> Entry {
             continue;
         }
         if in_header {
+            // N2: the header block ends at the FIRST blank line after the
+            // `## Memory` heading -- the one `to_markdown` always writes
+            // after the last bullet. This used to `continue`, leaving the
+            // parser in header mode, so a body whose first line happened to
+            // be a `- key: value` bullet was absorbed as header. That let an
+            // entry's own body rewrite the Key it is filed under, or promote
+            // itself from `handoff` to `explicit`; it also silently ate any
+            // honest bulleted body (`- build: cargo build`). Bullets are
+            // header only until this line; everything after it is body,
+            // verbatim.
             if trimmed.is_empty() {
+                in_header = false;
                 continue;
             }
             if let Some(bullet) = strip_bullet(line)
@@ -354,6 +365,10 @@ pub fn render_for_prompt(
                 key: entry.key,
                 age: format!("written {written_days}d ago, verified {verified_days}d ago"),
                 body: entry.body,
+                // N3: carried through raw so the injection cap can rank
+                // entries newest-first; `prompt` itself stays clock-free.
+                verified: entry.verified,
+                written: entry.written,
             }
         })
         .collect()
@@ -451,14 +466,63 @@ pub fn harvest_from_handoff(
     slug: &str,
     cfg: &CtxConfig,
 ) -> CtxResult<usize> {
-    if !cfg.memory.harvest {
+    // N4: `harvest` is the opt-in for *this* behavior, but `enabled` is the
+    // switch for the bank as a whole -- an operator who turned the bank off
+    // was still having entries written into it, which then simply never got
+    // read back (`render_for_prompt` gates on `enabled` too). Writing to a
+    // store nobody reads is the worst of both: invisible growth, and a
+    // surprise the day the bank is switched back on.
+    if !cfg.memory.enabled || !cfg.memory.harvest {
         return Ok(0);
     }
     let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
     let answer = super::handoff::run_model(adapter, model, &harvest_prompt(handoff), timeout)?;
-    let facts = parse_harvest(&answer);
-    let now = now_secs();
-    for (key, body) in &facts {
+    write_harvested(state, slug, &parse_harvest(&answer), cfg, now_secs())
+}
+
+/// Writes the facts a harvest produced, returning how many actually landed.
+///
+/// Split out of `harvest_from_handoff` so the rule below is testable without
+/// spawning a model: everything above this point is one `run_model` call, and
+/// everything worth asserting about harvesting is here.
+///
+/// N4: an explicit entry is something a human or a session deliberately asked
+/// to remember; a harvested one is *inferred* from a distilled handoff.
+/// `remember` replaces by key, so an inferred fact could silently overwrite a
+/// deliberate one -- and the deliberate one has by far the stronger claim to
+/// be right. Skipped instead, and logged by key so the skip is visible rather
+/// than silent.
+fn write_harvested(
+    state: &StateDir,
+    slug: &str,
+    facts: &[(String, String)],
+    cfg: &CtxConfig,
+    now: u64,
+) -> CtxResult<usize> {
+    let existing_explicit: std::collections::HashSet<String> = list(state, slug)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, entry)| entry.source == "explicit")
+        .map(|(_, entry)| entry.key)
+        .collect();
+
+    let mut written = 0usize;
+    for (key, body) in facts {
+        if existing_explicit.contains(key) {
+            let _ = super::log::append(
+                state,
+                &super::log::Decision {
+                    ts: now,
+                    session: "n/a",
+                    verb: "memory",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "harvest-skipped",
+                    detail: &format!("'{key}' is already an explicit entry"),
+                },
+            );
+            continue;
+        }
         let entry = Entry {
             key: key.clone(),
             written_by: "harvest".to_string(),
@@ -468,8 +532,9 @@ pub fn harvest_from_handoff(
             body: body.clone(),
         };
         remember(state, slug, &entry, cfg)?;
+        written += 1;
     }
-    Ok(facts.len())
+    Ok(written)
 }
 
 #[derive(Debug, clap::Args)]
@@ -691,6 +756,75 @@ pub fn run_forget<W: Write>(args: &ForgetArgs, w: &mut W) -> CtxResult<i32> {
 mod tests {
     use super::super::state;
     use super::*;
+
+    // N2: the header block ends at the first blank line. Before this, a
+    // blank line only `continue`d, so the parser stayed in header mode and
+    // any body whose first line happened to be a `- key: value` bullet was
+    // absorbed as header -- letting an entry's own body rewrite the Key,
+    // Source or Written-by it is filed under.
+
+    #[test]
+    fn a_body_bullet_cannot_rewrite_the_header() {
+        let hijack = concat!(
+            "## Memory\n",
+            "- Key: real-key\n",
+            "- Written-by: claude\n",
+            "- Written: 100\n",
+            "- Verified: 100\n",
+            "- Source: handoff\n",
+            "\n",
+            "- Key: hijacked\n",
+            "- Source: explicit\n",
+            "- Written-by: somebody-else\n",
+            "the rest of the body\n",
+        );
+        let entry = parse_markdown(hijack);
+
+        assert_eq!(entry.key, "real-key", "the body must not rewrite the key");
+        assert_eq!(
+            entry.source, "handoff",
+            "the body must not promote itself to an explicit entry"
+        );
+        assert_eq!(entry.written_by, "claude");
+        assert!(
+            entry.body.starts_with("- Key: hijacked"),
+            "the would-be header lines stay in the body verbatim: {:?}",
+            entry.body
+        );
+        assert!(entry.body.contains("the rest of the body"));
+    }
+
+    /// The honest case the same bug broke: a perfectly ordinary body that
+    /// happens to be a bulleted list of `name: value` pairs.
+    #[test]
+    fn a_body_of_bullet_lines_round_trips_intact() {
+        let entry = Entry {
+            key: "commands".to_string(),
+            written_by: "claude".to_string(),
+            written: 42,
+            verified: 42,
+            source: "explicit".to_string(),
+            body: "- build: cargo build\n- test: cargo test".to_string(),
+        };
+        let parsed = parse_markdown(&entry.to_markdown());
+        assert_eq!(parsed, entry, "a bulleted body must survive a round trip");
+    }
+
+    /// A document with no blank line after the header (hand-written, or an
+    /// older writer) still has to parse: the first non-bullet line ends the
+    /// block, exactly as before.
+    #[test]
+    fn a_header_with_no_blank_separator_still_ends_at_the_first_prose_line() {
+        let md = concat!(
+            "## Memory\n",
+            "- Key: k\n",
+            "- Source: explicit\n",
+            "plain prose body\n",
+        );
+        let entry = parse_markdown(md);
+        assert_eq!(entry.key, "k");
+        assert_eq!(entry.body, "plain prose body");
+    }
 
     fn sample(key: &str, written: u64) -> Entry {
         Entry {
@@ -1257,6 +1391,146 @@ This should not appear in the body.\n";
         );
     }
 
+    /// N4: `harvest` is the opt-in for harvesting, but `enabled` governs the
+    /// bank as a whole. With the bank off, `render_for_prompt` returns
+    /// nothing -- so harvesting into it was writing to a store nobody reads.
+    ///
+    /// Runs everywhere: the gate short-circuits before `run_model`, so no
+    /// model is ever spawned (which is also why the fake-model adapter is
+    /// deliberately left unarmed here).
+    #[test]
+    fn harvest_is_inert_when_the_bank_is_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.enabled = false;
+        cfg.memory.harvest = true;
+        let adapter = fake_model_adapter();
+
+        let count = harvest_from_handoff(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("a disabled bank is not an error, just a no-op");
+
+        assert_eq!(count, 0);
+        assert!(
+            list(&state, "-work-repo").expect("list").is_empty(),
+            "nothing may be written into a bank the operator turned off"
+        );
+
+        // And the other half of the gate still holds on its own.
+        let mut harvest_off = CtxConfig::default();
+        harvest_off.memory.enabled = true;
+        harvest_off.memory.harvest = false;
+        assert_eq!(
+            harvest_from_handoff(
+                &adapter,
+                "haiku",
+                &sample_handoff(),
+                &state,
+                "-work-repo",
+                &harvest_off
+            )
+            .expect("no-op"),
+            0
+        );
+    }
+
+    /// N4: `remember` replaces by key, so an inferred fact could silently
+    /// overwrite one a human or a session deliberately asked to remember --
+    /// and the deliberate entry has by far the stronger claim to be right.
+    ///
+    /// Exercises `write_harvested` directly rather than through
+    /// `harvest_from_handoff`, so the rule is covered without spawning a
+    /// model (the spawn path is `sh`-based and unavailable on this platform).
+    #[test]
+    fn a_harvested_fact_never_overwrites_an_explicit_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let explicit = Entry {
+            key: "build-cmd".to_string(),
+            written_by: "claude".to_string(),
+            written: 1_000,
+            verified: 1_000,
+            source: "explicit".to_string(),
+            body: "cargo build --release   # the operator said so".to_string(),
+        };
+        remember(&state, "-work-repo", &explicit, &cfg).expect("remember");
+
+        let facts = vec![
+            (
+                "build-cmd".to_string(),
+                "cargo build (inferred)".to_string(),
+            ),
+            ("test-cmd".to_string(), "cargo test (inferred)".to_string()),
+        ];
+        let written =
+            write_harvested(&state, "-work-repo", &facts, &cfg, 2_000).expect("harvest writes");
+
+        assert_eq!(
+            written, 1,
+            "only the fact with no explicit entry is written"
+        );
+
+        let kept = get(&state, "-work-repo", "build-cmd")
+            .expect("find")
+            .expect("the explicit entry is still there");
+        assert_eq!(
+            kept.body, explicit.body,
+            "the deliberate entry survives untouched"
+        );
+        assert_eq!(kept.source, "explicit");
+        assert_eq!(kept.written, 1_000, "not even its timestamps are disturbed");
+
+        let added = get(&state, "-work-repo", "test-cmd")
+            .expect("find")
+            .expect("the un-contested fact is written");
+        assert_eq!(added.source, "handoff");
+
+        // The skip is visible rather than silent.
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("harvest-skipped") && log.contains("build-cmd"),
+            "the skipped key must be named in the decision log: {log}"
+        );
+    }
+
+    /// A harvested fact may still refresh an earlier *harvested* one -- the
+    /// protection is for deliberate entries only, not a freeze on the bank.
+    #[test]
+    fn a_harvested_fact_still_refreshes_an_earlier_harvested_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let earlier = Entry {
+            key: "build-cmd".to_string(),
+            written_by: "harvest".to_string(),
+            written: 1_000,
+            verified: 1_000,
+            source: "handoff".to_string(),
+            body: "old inference".to_string(),
+        };
+        remember(&state, "-work-repo", &earlier, &cfg).expect("remember");
+
+        let facts = vec![("build-cmd".to_string(), "new inference".to_string())];
+        assert_eq!(
+            write_harvested(&state, "-work-repo", &facts, &cfg, 2_000).expect("harvest"),
+            1
+        );
+        let refreshed = get(&state, "-work-repo", "build-cmd")
+            .expect("find")
+            .expect("still there");
+        assert_eq!(refreshed.body, "new inference");
+    }
+
     #[test]
     fn a_harvest_that_returns_nothing_writes_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1265,9 +1539,11 @@ This should not appear in the body.\n";
         cfg.memory.harvest = true;
         let adapter = fake_model_adapter();
 
-        unsafe {
-            std::env::set_var("FAKE_MODEL_MODE", "garbage");
-        }
+        // C10: a guard, not a bare `set_var`/`remove_var` pair -- an
+        // assertion failure below must not leak `FAKE_MODEL_MODE` into every
+        // later test in this process.
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("garbage"))]);
         let result = harvest_from_handoff(
             &adapter,
             "haiku",
@@ -1276,10 +1552,6 @@ This should not appear in the body.\n";
             "-work-repo",
             &cfg,
         );
-        unsafe {
-            std::env::remove_var("FAKE_MODEL_MODE");
-        }
-
         assert_eq!(
             result.expect("prose with no colon still succeeds, just empty"),
             0
@@ -1295,9 +1567,8 @@ This should not appear in the body.\n";
         cfg.memory.harvest = true;
         let adapter = fake_model_adapter();
 
-        unsafe {
-            std::env::set_var("FAKE_MODEL_MODE", "fail");
-        }
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("fail"))]);
         let result = harvest_from_handoff(
             &adapter,
             "haiku",
@@ -1306,9 +1577,6 @@ This should not appear in the body.\n";
             "-work-repo",
             &cfg,
         );
-        unsafe {
-            std::env::remove_var("FAKE_MODEL_MODE");
-        }
 
         assert!(
             result.is_err(),
@@ -1325,9 +1593,8 @@ This should not appear in the body.\n";
         cfg.memory.harvest = true;
         let adapter = fake_model_adapter();
 
-        unsafe {
-            std::env::set_var("FAKE_MODEL_MODE", "harvest");
-        }
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
         let count = harvest_from_handoff(
             &adapter,
             "haiku",
@@ -1337,9 +1604,6 @@ This should not appear in the body.\n";
             &cfg,
         )
         .expect("harvests");
-        unsafe {
-            std::env::remove_var("FAKE_MODEL_MODE");
-        }
 
         assert!(count > 0, "the fixture answers with well-formed facts");
         let listed = list(&state, "-work-repo").expect("list");
@@ -1363,9 +1627,8 @@ This should not appear in the body.\n";
         remember(&state, "-work-repo", &existing, &cfg).expect("seed");
 
         let adapter = fake_model_adapter();
-        unsafe {
-            std::env::set_var("FAKE_MODEL_MODE", "harvest");
-        }
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
         harvest_from_handoff(
             &adapter,
             "haiku",
@@ -1375,9 +1638,6 @@ This should not appear in the body.\n";
             &cfg,
         )
         .expect("harvests");
-        unsafe {
-            std::env::remove_var("FAKE_MODEL_MODE");
-        }
 
         let listed = list(&state, "-work-repo").expect("list");
         let build_cmd: Vec<_> = listed

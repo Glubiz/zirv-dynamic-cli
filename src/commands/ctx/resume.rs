@@ -26,6 +26,42 @@ pub struct ResumeArgs {
     /// default. Supervision, pacing and hooks still apply.
     #[arg(long, default_value_t = false)]
     pub simple: bool,
+    /// Start even though this process looks like it is already inside an
+    /// agent session. Off by default: a nested interactive session can take
+    /// the outer session down.
+    #[arg(long, default_value_t = false)]
+    pub allow_nested: bool,
+}
+
+/// The launch `resume` hands the terminal to.
+///
+/// Split out of `run_with` so the environment it gives the child is testable:
+/// `run_with` itself `exec`s on unix, which would replace the test binary.
+///
+/// N1: the scrub comes first and is unconditional. `resume` sets a fresh
+/// `SESSION_ENV` but used to leave `ZIRV_CTX_SOCKET` and
+/// `ZIRV_CTX_TRANSCRIPT` inherited from whatever session launched it, so the
+/// resumed agent's hooks reported their turn boundaries onto the *outer*
+/// supervisor's socket -- under a session id that supervisor had never heard
+/// of. Same rule the supervisors follow: a child speaks with its own
+/// identity or with none.
+fn launch_command(
+    adapter: &dyn adapters::AgentAdapter,
+    prompt: &str,
+    extra: &[String],
+    repo: &Path,
+    session: &str,
+    agent_name: &str,
+) -> std::process::Command {
+    let mut command = adapter.interactive_cmd(Some(prompt), extra);
+    command.current_dir(repo);
+    super::sessions::scrub_supervision_env_cmd(&mut command);
+    command.env(SESSION_ENV, session);
+    // Names the same fact `ctx.toml`'s own `agent` config key would, so a
+    // nested `zirv ctx ...` call inside this session's own children defaults
+    // to this session's own harness rather than re-resolving from scratch.
+    command.env(super::adapters::AGENT_ENV, agent_name);
+    command
 }
 
 pub fn resume_prompt(handoff: &Handoff) -> String {
@@ -43,6 +79,21 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    // N1, before any work: `resume` hands the terminal to an interactive
+    // agent (it `exec`s over itself on unix), so it is subject to the same
+    // nesting guard `wrap` and `chat` are -- it had no guard at all.
+    //
+    // `--print-prompt` is exempt: it launches nothing, prints the composed
+    // prompt and returns, so it is the read-only half of this verb (like
+    // `zirv ctx status`) and refusing it from inside a session would cost
+    // usability for no safety. Only the branch that actually takes the
+    // terminal over is gated.
+    if !args.print_prompt
+        && let Some(refusal) = super::sessions::nesting_refusal("resume", env, args.allow_nested)
+    {
+        return Err(refusal.into());
+    }
+
     let cfg = CtxConfig::load(repo, env)?;
     let state = StateDir::resolve(env)?;
 
@@ -102,13 +153,14 @@ pub fn run_with<W: Write>(
         .chain(prompt_args.iter().cloned())
         .collect();
 
-    let mut command = adapter.interactive_cmd(Some(&prompt), &extra);
-    command.current_dir(repo);
-    command.env(SESSION_ENV, session.as_str());
-    // Names the same fact `ctx.toml`'s own `agent` config key would, so a
-    // nested `zirv ctx ...` call inside this session's own children defaults
-    // to this session's own harness rather than re-resolving from scratch.
-    command.env(super::adapters::AGENT_ENV, adapter.name());
+    let mut command = launch_command(
+        adapter.as_ref(),
+        &prompt,
+        &extra,
+        repo,
+        session.as_str(),
+        adapter.name(),
+    );
     writeln!(w, "resuming from {}", path.display())?;
     w.flush()?;
 
@@ -184,6 +236,7 @@ mod tests {
             print_prompt: true,
             extra: Vec::new(),
             simple: false,
+            allow_nested: false,
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -254,6 +307,195 @@ mod tests {
         );
     }
 
+    // N1: `resume` hands the terminal to an interactive agent exactly like
+    // `wrap`/`chat` do (it `exec`s over itself on unix), so it needs both
+    // halves of the console fix -- it had neither.
+
+    #[test]
+    fn resume_refuses_inside_a_supervised_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        crate::commands::ctx::handoff::store(&state, tmp.path(), "sess", &handoff())
+            .expect("store");
+
+        let env: std::collections::HashMap<String, String> = [
+            (STATE_ENV.to_string(), state.root().display().to_string()),
+            (
+                crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+                "abcdef12-3456-4789-8abc-def012345678".to_string(),
+            ),
+            // Safety belt, not a fixture detail: `adapters::select` calls
+            // `ready()`, so an agent_bin that cannot exist makes a launch
+            // structurally impossible. If the guard under test ever
+            // regresses, this test fails on a missing binary instead of
+            // spawning a real nested agent into the developer's session.
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                "/nonexistent/agent-must-never-launch".to_string(),
+            ),
+        ]
+        .into();
+
+        let args = ResumeArgs {
+            agent: None,
+            print_prompt: false,
+            extra: Vec::new(),
+            simple: false,
+            allow_nested: false,
+        };
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("a resume inside a supervised session must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to start inside an existing agent session"),
+            "got {msg}"
+        );
+        assert!(msg.starts_with("zirv ctx resume:"), "names the verb: {msg}");
+        assert!(msg.contains("abcdef12"), "names the outer session: {msg}");
+        assert!(
+            msg.contains("--allow-nested"),
+            "says how to override: {msg}"
+        );
+        assert!(
+            out.is_empty(),
+            "it refuses before printing or launching anything"
+        );
+    }
+
+    #[test]
+    fn allow_nested_lets_a_resume_past_the_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                STATE_ENV.to_string(),
+                tmp.path().join("state").display().to_string(),
+            ),
+            (
+                crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+                "abcdef12-3456-4789-8abc-def012345678".to_string(),
+            ),
+            // Safety belt, not a fixture detail: `adapters::select` calls
+            // `ready()`, so an agent_bin that cannot exist makes a launch
+            // structurally impossible. If the guard under test ever
+            // regresses, this test fails on a missing binary instead of
+            // spawning a real nested agent into the developer's session.
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                "/nonexistent/agent-must-never-launch".to_string(),
+            ),
+        ]
+        .into();
+
+        // No handoff stored, so getting past the guard surfaces as the
+        // *next* refusal -- which is the evidence the guard was passed,
+        // without this test ever launching an agent.
+        let args = ResumeArgs {
+            agent: None,
+            print_prompt: true,
+            extra: Vec::new(),
+            simple: false,
+            allow_nested: true,
+        };
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("nothing to resume");
+        assert!(!err.to_string().contains("refusing to start inside"));
+        assert!(err.to_string().contains("no handoff"));
+    }
+
+    /// `--print-prompt` launches nothing -- it is the read-only half of the
+    /// verb, like `zirv ctx status` -- so it stays usable from inside a
+    /// session. Only the branch that actually hands the terminal over is
+    /// gated.
+    #[test]
+    fn print_prompt_is_not_gated_by_the_nesting_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        crate::commands::ctx::handoff::store(&state, tmp.path(), "sess", &handoff())
+            .expect("store");
+
+        let env: std::collections::HashMap<String, String> = [
+            (STATE_ENV.to_string(), state.root().display().to_string()),
+            (
+                crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+                "abcdef12-3456-4789-8abc-def012345678".to_string(),
+            ),
+            // Safety belt, not a fixture detail: `adapters::select` calls
+            // `ready()`, so an agent_bin that cannot exist makes a launch
+            // structurally impossible. If the guard under test ever
+            // regresses, this test fails on a missing binary instead of
+            // spawning a real nested agent into the developer's session.
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                "/nonexistent/agent-must-never-launch".to_string(),
+            ),
+        ]
+        .into();
+
+        let args = ResumeArgs {
+            agent: None,
+            print_prompt: true,
+            extra: Vec::new(),
+            simple: false,
+            allow_nested: false,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("printing a prompt launches nothing, so it is not gated");
+        assert_eq!(code, 0);
+        assert!(
+            String::from_utf8(out)
+                .expect("utf8")
+                .contains("Wire the payments webhook")
+        );
+    }
+
+    /// The launch `resume` `exec`s into must carry its own fresh session id
+    /// and nothing else: it used to set `ZIRV_CTX_SESSION` but leave the
+    /// outer session's `ZIRV_CTX_SOCKET`/`ZIRV_CTX_TRANSCRIPT` inherited, so
+    /// the resumed agent's hooks reported turn boundaries onto the *outer*
+    /// supervisor's socket.
+    #[test]
+    fn resume_never_leaks_the_outer_sessions_socket() {
+        let adapter =
+            crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let command = launch_command(
+            &adapter,
+            "carry on",
+            &[],
+            Path::new("/tmp/repo"),
+            "inner999-2222-4333-8444-555555555555",
+            "claude",
+        );
+
+        let mut removed: Vec<&str> = Vec::new();
+        let mut set: Vec<(&str, String)> = Vec::new();
+        for (key, value) in command.get_envs() {
+            let Some(key) = key.to_str() else { continue };
+            match value {
+                None => removed.push(key),
+                Some(v) => set.push((key, v.to_string_lossy().to_string())),
+            }
+        }
+
+        for key in [
+            crate::commands::ctx::adapters::SOCKET_ENV,
+            crate::commands::ctx::wrap::TRANSCRIPT_ENV,
+        ] {
+            assert!(
+                removed.contains(&key),
+                "{key} must be scrubbed, not inherited: removed={removed:?} set={set:?}"
+            );
+        }
+        assert!(
+            set.iter()
+                .any(|(k, v)| *k == crate::commands::ctx::adapters::SESSION_ENV
+                    && v == "inner999-2222-4333-8444-555555555555"),
+            "its own fresh session id still reaches the child: {set:?}"
+        );
+    }
+
     #[test]
     fn a_repo_with_no_handoff_reports_that_clearly() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -268,6 +510,7 @@ mod tests {
             print_prompt: true,
             extra: Vec::new(),
             simple: false,
+            allow_nested: false,
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())

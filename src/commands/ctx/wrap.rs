@@ -989,6 +989,24 @@ pub fn run_with(
         }
     };
 
+    // N6: a `wrap` session is only a reachable nudge target when it has a
+    // bound turn-signal socket. The pump claims nudge markers exclusively
+    // from its turn-signal arm (`if let Some(server) = server && ...`), so
+    // with no socket -- `--no-supervise`, or a bind that failed -- a marker
+    // written for this session is *never* claimed: `zirv ctx status` listed
+    // it, `zirv ctx nudge` happily resolved it, and the nudge then silently
+    // did nothing forever, leaving an orphaned marker behind. Better to not
+    // advertise a session that cannot answer.
+    //
+    // Deliberately keyed on the socket rather than on `--no-supervise`/
+    // `--simple` as such: `--simple` only skips prompt injection, still
+    // binds a socket and still claims markers, so it stays a legitimate
+    // (advisory) target; and a bind failure under a plain `wrap` is just as
+    // unreachable as `--no-supervise` is.
+    if server.is_none() {
+        session_guard.release();
+    }
+
     // Deliberately not derived from `session`: that id belongs to wrap, not to
     // the agent it spawns, so a derived path names a file nobody ever writes.
     let mut transcript = TranscriptSource::new(env(TRANSCRIPT_ENV).map(PathBuf::from));
@@ -1156,7 +1174,14 @@ pub fn run_with(
         stdout_lock.clone(),
         (cols, rows),
     );
-    if bar.chrome.bar {
+    // C5: `raw.is_some()` as well as `bar.chrome.bar`. `RawGuard::enter` is
+    // what stashes the console modes and installs the emergency restore
+    // handler (F4), so when it failed there is nothing armed to undo a
+    // scroll region -- writing one anyway would fence off the terminal's
+    // last row with no handler able to put it back, which is strictly worse
+    // than having no bar. A failed `enter` also means this is not a real
+    // terminal in the first place, so the bar has nothing to draw on.
+    if bar.chrome.bar && raw.is_some() {
         let region = super::chrome::scroll_region_sequence(bar.rows);
         let region_ok = match stdout_lock.lock() {
             Ok(_guard) => {
@@ -1559,10 +1584,15 @@ fn pump(
             // the marker here (rather than leaving it for a byte-pump or
             // per-tick path) matches `unread_mail_count`'s own throttling:
             // both only ever run from this turn-signal arm.
-            if super::sessions::claim_nudge_marker(state_dir, &bar.session_short) {
+            // C4: `from` is the *sender*, read out of the marker file, and
+            // the disposition is `Advisory` -- an interactive session never
+            // receives message bodies, so the line has to point the operator
+            // at `zirv ctx inbox` rather than promise the guidance will
+            // "be picked up as mail".
+            if let Some(from) = super::sessions::claim_nudge_marker(state_dir, &bar.session_short) {
                 announcer.emit(&Event::Nudge {
-                    from: bar.session_short.clone(),
-                    restarted: false,
+                    from,
+                    disposition: super::announce::NudgeDisposition::Advisory,
                 });
             }
         }
@@ -1833,9 +1863,16 @@ fn pump(
                     Err(_) => false,
                 };
                 bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
-                // F4: the resize rewrote the region, so the console is (still)
-                // fenced exactly when that write landed.
-                super::term::set_bar_active(region_ok);
+                // C5: set on success, never *cleared* on failure. A resize
+                // whose region write failed leaves whatever region was
+                // already in effect still fencing the console, so clearing
+                // the flag here would tell the emergency handler it owes the
+                // terminal nothing while the terminal was still fenced.
+                // `BAR_ACTIVE` means "we have set a region that is still
+                // outstanding", and only a successful `reset_bar` retires it.
+                if region_ok {
+                    super::term::set_bar_active(true);
+                }
                 if !bar.disabled {
                     // The bar's own row moved; the next throttle tick must
                     // redraw it even if the text is unchanged.
@@ -1987,6 +2024,10 @@ mod tests {
         pub reader: Box<dyn Read + Send>,
         pub writer: Box<dyn Write + Send>,
         pub child: Box<dyn portable_pty::Child + Send + Sync>,
+        /// C9: keeps the throwaway state/HOME directory alive for as long as
+        /// the wrapped subprocess is. Dropped with the harness, which is
+        /// after the child has been waited on in every test that uses one.
+        _sandbox: tempfile::TempDir,
     }
 
     /// The general form: `flags` are wrap's own arguments, inserted before the
@@ -2019,6 +2060,22 @@ mod tests {
             cmd.arg(arg);
         }
         cmd.env("TERM", "xterm");
+        // C9: a throwaway state dir and HOME by default. These tests spawn a
+        // real `zirv ctx wrap`, which resolves its state dir from the
+        // environment -- so without this they registered sessions, published
+        // socket paths, wrote decision logs and dropped handoffs straight
+        // into the developer's own `~/.zirv`/state directory, where a later
+        // real session would then read them. Applied *before* `extra_env`,
+        // so a test that pins its own `ZIRV_CTX_STATE_DIR` (most of them do,
+        // because they read it back) still wins.
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        cmd.env(
+            crate::commands::ctx::state::STATE_ENV,
+            sandbox.path().join("state").display().to_string(),
+        );
+        for home in ["HOME", "USERPROFILE"] {
+            cmd.env(home, sandbox.path().join("home").display().to_string());
+        }
         // Hermetic against the developer's own environment (F2): this spawns
         // the real `zirv` binary, which reads the process environment, so a
         // suite run from inside an agent session would otherwise trip the
@@ -2040,6 +2097,7 @@ mod tests {
             reader: pair.master.try_clone_reader().expect("reader"),
             writer: pair.master.take_writer().expect("writer"),
             child,
+            _sandbox: sandbox,
         }
     }
 
@@ -2216,6 +2274,26 @@ mod tests {
 
     // F2: the nesting guard.
 
+    /// An env map for the guard tests, always pinning `ZIRV_CTX_AGENT_BIN`
+    /// at a path that cannot exist.
+    ///
+    /// Safety belt, not a fixture detail. `adapters::select` calls `ready()`,
+    /// so an unusable agent_bin makes a launch structurally impossible: if
+    /// the guard under test ever regresses, these tests fail on a missing
+    /// binary instead of opening a pty and spawning a real nested agent into
+    /// whatever session the suite is running in.
+    fn nested_env(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        let mut env: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            "/nonexistent/agent-must-never-launch".to_string(),
+        );
+        env
+    }
+
     fn wrap_args_in(command: &[&str], allow_nested: bool) -> WrapArgs {
         WrapArgs {
             agent: Some("claude".to_string()),
@@ -2229,11 +2307,10 @@ mod tests {
     #[test]
     fn wrap_refuses_to_start_inside_a_supervised_session_and_names_the_evidence() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let env: std::collections::HashMap<String, String> = [(
-            adapters::SESSION_ENV.to_string(),
-            "abcdef12-3456-4789-8abc-def012345678".to_string(),
-        )]
-        .into();
+        let env = nested_env(&[(
+            adapters::SESSION_ENV,
+            "abcdef12-3456-4789-8abc-def012345678",
+        )]);
 
         let err = run_with(
             &wrap_args_in(&["claude"], false),
@@ -2267,11 +2344,7 @@ mod tests {
     #[test]
     fn wrap_refuses_inside_a_claude_code_session_too() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let env: std::collections::HashMap<String, String> = [
-            ("CLAUDE_PID".to_string(), "4242".to_string()),
-            ("CLAUDECODE".to_string(), "1".to_string()),
-        ]
-        .into();
+        let env = nested_env(&[("CLAUDE_PID", "4242"), ("CLAUDECODE", "1")]);
 
         let err = run_with(
             &wrap_args_in(&["claude"], false),

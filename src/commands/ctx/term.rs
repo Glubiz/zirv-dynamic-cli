@@ -185,6 +185,21 @@ fn restore_stashed_console_modes() {
     }
 }
 
+/// C6: whether a signal whose previous disposition was `previous` may be
+/// taken over by this process's own handler.
+///
+/// `SIG_IGN` is inherited across `fork`/`exec`, and is how a parent says
+/// "this child must not die of that signal" -- a `nohup`-style wrapper or a
+/// job runner ignoring `SIGHUP`/`SIGINT` before spawning. Installing a
+/// handler over it silently *un-ignores* the signal, so a `wrap` session
+/// started that way would begin dying of signals its parent had deliberately
+/// neutralised. Pure, so the rule is testable even though `libc::signal`
+/// itself is not.
+#[cfg(unix)]
+pub fn may_install_over(previous: libc::sighandler_t) -> bool {
+    previous != libc::SIG_IGN
+}
+
 #[cfg(unix)]
 extern "C" fn terminating_signal_handler(sig: libc::c_int) {
     restore_console_from_handler();
@@ -200,20 +215,16 @@ extern "C" fn terminating_signal_handler(sig: libc::c_int) {
 #[cfg(unix)]
 fn install_platform_handler() {
     // SAFETY: `signal` with a plain `extern "C"` handler; the handler itself
-    // does nothing that is not async-signal-safe.
+    // does nothing that is not async-signal-safe. The return value is the
+    // *previous* disposition, which C6 requires honouring: an inherited
+    // `SIG_IGN` is put straight back rather than quietly replaced.
     unsafe {
-        libc::signal(
-            libc::SIGINT,
-            terminating_signal_handler as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            terminating_signal_handler as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGHUP,
-            terminating_signal_handler as libc::sighandler_t,
-        );
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            let previous = libc::signal(signal, terminating_signal_handler as libc::sighandler_t);
+            if !may_install_over(previous) {
+                libc::signal(signal, previous);
+            }
+        }
     }
 }
 
@@ -783,14 +794,41 @@ mod tests {
 
     #[test]
     fn the_bar_active_flag_round_trips() {
-        let restore = bar_active();
+        // C10: a guard, so a failing assertion below cannot leave the
+        // process-global flag set for every later test.
+        struct BarFlagGuard(bool);
+        impl Drop for BarFlagGuard {
+            fn drop(&mut self) {
+                set_bar_active(self.0);
+            }
+        }
+        let _restore = BarFlagGuard(bar_active());
+
         set_bar_active(true);
         assert!(bar_active());
         assert_eq!(emergency_reset_bytes(bar_active()), EMERGENCY_RESET);
         set_bar_active(false);
         assert!(!bar_active());
         assert_eq!(emergency_reset_bytes(bar_active()), b"");
-        set_bar_active(restore);
+    }
+
+    /// C6: `SIG_IGN` is inherited across `fork`/`exec` and is how a parent
+    /// says "this child must not die of that signal". Installing over it
+    /// silently un-ignores the signal.
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_sig_ign_is_never_taken_over() {
+        assert!(
+            !may_install_over(libc::SIG_IGN),
+            "an ignored signal must be left ignored"
+        );
+        assert!(
+            may_install_over(libc::SIG_DFL),
+            "the default disposition is ours to replace"
+        );
+        // Any concrete handler address is likewise fair game -- only
+        // SIG_IGN carries the "deliberately neutralised" meaning.
+        assert!(may_install_over(1234 as libc::sighandler_t));
     }
 
     #[cfg(unix)]

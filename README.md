@@ -187,10 +187,15 @@ handoff distilled from the transcript so far, the same recovery path a rot
 restart uses, just triggered by an operator instead of the rot engine. That
 restart is bounded by `[supervise] max_nudges` (default 3, `ZIRV_CTX_MAX_NUDGES`)
 so a session cannot be interrupted indefinitely; past the cap a nudge's
-message is still queued as mail but the session runs on untouched. For an
-interactive session (`wrap`), a nudge is advisory only: it never restarts or
-types anything into the agent, it just surfaces on the status bar and event
-channel that a nudge arrived. Either way, latency is bounded by
+message is still queued as mail but the session runs on untouched. The cap
+counts *consecutive* nudges — it resets as soon as the session reports a turn
+of its own, so a long-running session that keeps making progress can keep
+being steered. For an interactive session (`wrap` or `chat`), a nudge is
+advisory only: it never restarts or types anything into the agent, and it
+never receives the message body — it just surfaces on the status bar and
+event channel that a nudge arrived, pointing at `zirv ctx inbox`. `zirv ctx
+nudge` says so at send time too when the target it resolved is interactive,
+so an advisory delivery never looks like a nudge that silently did nothing. Either way, latency is bounded by
 `[supervise] poll_ms` (default 2000ms) — the interval a supervisor's own tick
 already runs on, since a nudge just claims a marker file that same tick
 checks for.

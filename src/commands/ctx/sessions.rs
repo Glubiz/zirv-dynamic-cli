@@ -255,19 +255,43 @@ impl SessionGuard {
         &self.record
     }
 
-    /// `loop`'s per-cycle refresh: a fresh session id means a fresh short
-    /// id, so the previous cycle's file is removed and a new one written
-    /// under the new name -- one guard for the whole supervised run, not one
-    /// per cycle.
+    /// Points this run's record at a new session id: `loop`'s per-cycle
+    /// refresh, and `exec`'s per-restart one. One guard, and one record, for
+    /// the whole supervised run.
+    ///
+    /// C7: `short` and the record's path are deliberately **not** refreshed
+    /// with it. The short id is this supervisor's *address* -- what
+    /// `resolve_prefix` hands a sender, what `send --to-session` and `zirv
+    /// ctx nudge` store on a message, and what `zirv ctx status` prints for
+    /// a human to type. Rotating it every cycle or restart meant a message
+    /// addressed to a live session became permanently undeliverable the
+    /// moment that session was replaced, which is the whole "stranded mail"
+    /// class of bug: the sender resolved a real address, and the supervisor
+    /// then stopped answering to it. The session *id* rotates (that is the
+    /// point of a fresh session); the address it can be reached at does not.
     pub fn refresh_session(&mut self, new_session: &str) {
         if self.released {
             return;
         }
-        let _ = std::fs::remove_file(&self.path);
         self.record.session = new_session.to_string();
-        self.record.short = short_id(new_session);
         self.record.started_at = super::state::now_secs();
         self.path = write_record(&self.state, &self.record);
+    }
+
+    /// This run's stable delivery address -- see `refresh_session`. Every
+    /// mail listing a supervisor performs on its own behalf is scoped to
+    /// this, never to `short_id(current session)`.
+    ///
+    /// `#[allow(dead_code)]` for the same reason `record()` above carries it:
+    /// the supervisors derive this value themselves before the guard exists
+    /// (`exec` needs it for its first mail listing, which happens before
+    /// registration; `run_loop` latches it on the first cycle), so nothing in
+    /// production reads it back out. It exists so the tests can pin the
+    /// stable-address invariant against the guard itself rather than against
+    /// a copy of the derivation.
+    #[allow(dead_code)]
+    pub fn short(&self) -> &str {
+        &self.record.short
     }
 
     /// Idempotent, like `RawGuard::restore`.
@@ -355,7 +379,39 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
             found.push((record, Liveness::Stale));
         }
     }
+    sweep_orphaned_markers(state, &found);
     found
+}
+
+/// C8: a wake-up marker outlives its session whenever the supervisor died
+/// before its own poll could claim it (killed, crashed, or simply never
+/// bound a socket to notice). Left behind, it is claimed by the *next*
+/// supervisor that happens to register under the same short id -- which,
+/// now that short ids are stable addresses rather than per-cycle values, is
+/// a real possibility rather than a theoretical one. Swept alongside the
+/// stale record it belonged to, on the same read.
+///
+/// Only markers with no *live* record are removed: a marker whose session is
+/// alive is simply one that has not been claimed yet.
+fn sweep_orphaned_markers(state: &StateDir, found: &[(Record, Liveness)]) {
+    let Ok(entries) = std::fs::read_dir(state.sessions()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("nudge") {
+            continue;
+        }
+        let Some(short) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let has_live_record = found
+            .iter()
+            .any(|(record, liveness)| *liveness == Liveness::Live && record.short == short);
+        if !has_live_record {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -432,23 +488,46 @@ fn nudge_marker_path(state: &StateDir, short: &str) -> PathBuf {
     state.sessions().join(format!("{short}.nudge"))
 }
 
+/// What `claim_nudge_marker` reports when the marker carries no usable
+/// sender -- an empty or unreadable file, or one written by a build that
+/// predates C4.
+pub const UNKNOWN_SENDER: &str = "unknown";
+
 /// Best-effort, matching every other piece of state-dir housekeeping in this
 /// module: a marker that fails to write just means the wake-up is missed and
 /// the nudge's mail (already durable) is picked up at the next natural poll
 /// or cycle instead of immediately.
-fn write_nudge_marker(state: &StateDir, short: &str) {
+///
+/// C4: the marker's *contents* are the sender's own short id. The marker
+/// used to be empty, so the supervisor that claimed it had nothing to name
+/// and every announcement fell back to reporting the claiming session's own
+/// id -- "nudged by <myself>", which was simply false.
+fn write_nudge_marker(state: &StateDir, short: &str, from: &str) {
     let _ = super::state::create_private_dir_all(&state.sessions());
-    let _ = std::fs::write(nudge_marker_path(state, short), b"");
+    let _ = std::fs::write(nudge_marker_path(state, short), from.as_bytes());
 }
 
-/// Atomically claims the wake-up marker for `short`, if one is there.
+/// Atomically claims the wake-up marker for `short`, returning who sent it.
+///
 /// `std::fs::remove_file` is the atomic claim, the same idiom `mail::
 /// claim_and_write` and `mail::consume` build on: exactly one racing
 /// observer ever sees `Ok(())`, every other one sees `NotFound`, so two
 /// supervisors polling the same session at once cannot both act on the same
-/// wake-up.
-pub fn claim_nudge_marker(state: &StateDir, short: &str) -> bool {
-    std::fs::remove_file(nudge_marker_path(state, short)).is_ok()
+/// wake-up. The read happens *before* the claim (there is nothing left to
+/// read afterwards) and is best-effort: the remove is what decides who won,
+/// so a failed read only costs the sender's name, never the wake-up itself.
+pub fn claim_nudge_marker(state: &StateDir, short: &str) -> Option<String> {
+    let path = nudge_marker_path(state, short);
+    let contents = std::fs::read_to_string(&path).ok();
+    if std::fs::remove_file(&path).is_err() {
+        return None;
+    }
+    Some(
+        contents
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| UNKNOWN_SENDER.to_string()),
+    )
 }
 
 /// How much of a short id `zirv ctx nudge` insists on. `resolve_prefix`
@@ -563,26 +642,50 @@ pub fn run_nudge_with<W: Write>(
         );
     }
 
+    let from_session = super::mail::identity_or_unknown(env, super::adapters::SESSION_ENV);
     let msg = super::mail::Message {
-        from_session: super::mail::identity_or_unknown(env, super::adapters::SESSION_ENV),
+        from_session: from_session.clone(),
         from_agent: super::mail::identity_or_unknown(env, super::adapters::AGENT_ENV),
         to: record.agent.clone(),
         to_session: Some(record.short.clone()),
         sent: super::state::now_secs(),
         body,
     };
-    let slug = super::state::repo_slug(repo);
-    super::mail::store(&state, &slug, &msg, &cfg)?;
+    // C1: the *target's* repo slug, not the sender's cwd. The registry is
+    // machine-wide, so `resolve_prefix` happily returns a session running in
+    // another checkout -- and storing its mail under the sender's slug filed
+    // the message in a mailbox that session never reads. A nudge that
+    // resolves a session must deliver into that session's own repo.
+    super::mail::store(&state, &record.repo_slug, &msg, &cfg)?;
     // Written after the mail: losing the marker (crash, or a write failure)
     // must never mean the message itself was lost, only that it is picked up
     // at the next natural poll or cycle instead of immediately.
-    write_nudge_marker(&state, &record.short);
+    //
+    // C4: carries the sender's own short id so the woken supervisor can name
+    // who nudged it instead of reporting itself.
+    write_nudge_marker(&state, &record.short, &short_id(&from_session));
 
+    // C1: names the repo it was actually delivered into, so a cross-repo
+    // nudge is visible as one rather than looking like a local delivery that
+    // silently went somewhere else.
     writeln!(
         w,
-        "zirv ctx nudge: queued for {} ({})",
-        record.short, record.agent
+        "zirv ctx nudge: queued for {} ({}, {}) in {}",
+        record.short, record.agent, record.verb, record.repo_slug
     )?;
+    // N6: an interactive session is only ever *advised* of a nudge -- it is
+    // never restarted and never typed into, and it never receives message
+    // bodies. Saying so here is the difference between "nothing happened,
+    // the nudge is broken" and "the operator on the other end has to go read
+    // it", which is the actual contract.
+    if matches!(record.verb, Verb::Wrap | Verb::Chat) {
+        writeln!(
+            w,
+            "zirv ctx nudge: {} is an interactive session; the guidance is delivered as \
+             inbox mail plus an on-screen advisory, never typed into the agent",
+            record.short
+        )?;
+    }
     Ok(0)
 }
 
@@ -821,27 +924,43 @@ mod tests {
         assert!(matches!(err, ResolveError::NotFound { existing } if existing.is_empty()));
     }
 
+    /// C7: a refresh rotates the session *id* but keeps the record's short
+    /// id -- the supervisor's stable delivery address -- and therefore its
+    /// file. Rotating the address was what stranded mail addressed to a live
+    /// session the moment the next cycle or restart replaced it.
     #[test]
     fn a_loop_keeps_one_record_and_refreshes_the_session_id_each_cycle() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = state_in(tmp.path());
         let repo = tmp.path().join("repo");
         let first = record_for("eeeeeeee-2222-4333-8444-555555555555", &repo, Verb::Loop);
-        let first_path = record_path(&state, &first.short);
+        let stable_short = first.short.clone();
+        let record_file = record_path(&state, &stable_short);
 
         let mut guard = SessionGuard::register(&state, first);
-        assert!(first_path.is_file());
+        assert!(record_file.is_file());
 
         let second_session = "ffffffff-2222-4333-8444-555555555555";
         guard.refresh_session(second_session);
-        let second_path = record_path(&state, &short_id(second_session));
 
         assert!(
-            !first_path.exists(),
-            "the previous cycle's file is removed, not left behind"
+            record_file.is_file(),
+            "the record stays under its original short id -- that is its address"
         );
-        assert!(second_path.is_file(), "the new cycle's file is written");
-        assert_eq!(guard.record().session, second_session);
+        assert_eq!(
+            guard.short(),
+            stable_short,
+            "the delivery address survives a refresh"
+        );
+        assert!(
+            !record_path(&state, &short_id(second_session)).exists(),
+            "no second file appears under the new session's own short id"
+        );
+        assert_eq!(
+            guard.record().session,
+            second_session,
+            "the session id itself does rotate"
+        );
         assert_eq!(
             guard.record().verb,
             Verb::Loop,
@@ -853,7 +972,62 @@ mod tests {
         assert_eq!(found.len(), 1, "one record, not one per cycle: {found:?}");
 
         guard.release();
-        assert!(!second_path.exists());
+        assert!(!record_file.exists());
+    }
+
+    /// The point of the stable address, stated as the delivery property it
+    /// exists to protect: a sender resolves a live session, addresses a
+    /// message at the short id it got, and the supervisor still finds that
+    /// message after its session has rotated underneath it.
+    #[test]
+    fn directed_mail_survives_a_session_rotation_and_still_reaches_the_supervisor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = state_in(&tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(&repo);
+
+        let record = record_for("aaaa1111-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        let mut guard = SessionGuard::register(&state, record);
+
+        // A sender resolves the live session and addresses it, exactly as
+        // `send --to-session` / `nudge` do.
+        let addressed = super::super::sessions::resolve_prefix(&state, "aaaa1111")
+            .expect("the live session resolves");
+        let msg = super::super::mail::Message {
+            from_session: "bbbb2222".to_string(),
+            from_agent: "codex".to_string(),
+            to: "claude".to_string(),
+            to_session: Some(addressed.short.clone()),
+            sent: super::super::state::now_secs(),
+            body: "the webhook route moved".to_string(),
+        };
+        super::super::mail::store(&state, &slug, &msg, &cfg).expect("store");
+
+        // ... and then the supervisor restarts, minting a fresh session id.
+        guard.refresh_session("cccc3333-2222-4333-8444-555555555555");
+
+        let delivered =
+            super::super::mail::list(&state, &slug, Some("claude"), Some(guard.short()))
+                .expect("list");
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the message must still reach the supervisor it was addressed to"
+        );
+        assert_eq!(delivered[0].1.body, "the webhook route moved");
+
+        // And it is still *only* reachable by that address: a different
+        // supervisor must not pick it up.
+        let other = super::super::mail::list(&state, &slug, Some("claude"), Some("zzzz9999"))
+            .expect("list");
+        assert!(
+            other.is_empty(),
+            "directed mail stays directed: {:?}",
+            other
+        );
     }
 
     #[test]
@@ -944,15 +1118,94 @@ mod tests {
     fn the_marker_is_claimed_exactly_once_even_with_two_observers() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = state_in(tmp.path());
-        write_nudge_marker(&state, "aaaa1111");
+        write_nudge_marker(&state, "aaaa1111", "bbbb2222");
+
+        assert_eq!(
+            claim_nudge_marker(&state, "aaaa1111").as_deref(),
+            Some("bbbb2222"),
+            "the first observer claims it, and learns who sent it"
+        );
+        assert_eq!(
+            claim_nudge_marker(&state, "aaaa1111"),
+            None,
+            "a second observer finds nothing left to claim"
+        );
+    }
+
+    /// C4: the marker carries the *sender's* short id. Every emitter used to
+    /// pass its own id into `Event::Nudge`, so the announcement always read
+    /// "nudged by <myself>".
+    #[test]
+    fn claiming_a_marker_reports_who_sent_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+
+        write_nudge_marker(&state, "target01", "sender99");
+        assert_eq!(
+            claim_nudge_marker(&state, "target01").as_deref(),
+            Some("sender99")
+        );
+
+        // An empty marker (a pre-C4 writer, or a truncated write) still
+        // claims -- the wake-up matters more than the attribution.
+        super::super::state::create_private_dir_all(&state.sessions()).expect("mkdir");
+        std::fs::write(nudge_marker_path(&state, "target01"), b"").expect("write");
+        assert_eq!(
+            claim_nudge_marker(&state, "target01").as_deref(),
+            Some(UNKNOWN_SENDER)
+        );
+
+        // Whitespace is not a sender either.
+        std::fs::write(
+            nudge_marker_path(&state, "target01"),
+            b"  
+",
+        )
+        .expect("write");
+        assert_eq!(
+            claim_nudge_marker(&state, "target01").as_deref(),
+            Some(UNKNOWN_SENDER)
+        );
+    }
+
+    /// C8: a marker whose session is gone is swept with the record, on the
+    /// same read. Left behind, it would be claimed by whichever supervisor
+    /// next registers under that short id -- much likelier now that a short
+    /// id is a stable address rather than a per-cycle value.
+    #[test]
+    fn orphaned_markers_are_swept_with_their_records() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+
+        // One live session with an unclaimed marker, one dead session with
+        // one, and one marker whose record never existed at all.
+        let live = record_for("11111111-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        let live_short = live.short.clone();
+        write_record(&state, &live);
+        write_nudge_marker(&state, &live_short, "sender01");
+
+        let mut dead = record_for("22222222-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        dead.pid = dead_pid();
+        let dead_short = dead.short.clone();
+        write_record(&state, &dead);
+        write_nudge_marker(&state, &dead_short, "sender02");
+
+        write_nudge_marker(&state, "99999999", "sender03");
+
+        let _ = list(&state);
 
         assert!(
-            claim_nudge_marker(&state, "aaaa1111"),
-            "the first observer claims it"
+            nudge_marker_path(&state, &live_short).is_file(),
+            "a live session's unclaimed marker is left alone"
         );
         assert!(
-            !claim_nudge_marker(&state, "aaaa1111"),
-            "a second observer finds nothing left to claim"
+            !nudge_marker_path(&state, &dead_short).exists(),
+            "a dead session's marker is swept with its record"
+        );
+        assert!(
+            !nudge_marker_path(&state, "99999999").exists(),
+            "a marker with no record at all is swept too"
         );
     }
 
@@ -1142,6 +1395,148 @@ mod tests {
         for key in SUPERVISION_ENV {
             assert!(removed.contains(&key), "{key} must be removed: {removed:?}");
         }
+    }
+
+    /// C1: `resolve_prefix` searches the machine-wide registry, so a nudge
+    /// can land on a session running in a different checkout. Storing its
+    /// payload under the *sender's* repo slug filed it in a mailbox that
+    /// session never reads -- the wake-up fired, the message never arrived.
+    #[test]
+    fn a_cross_repo_nudge_delivers_into_the_targets_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+
+        let sender_repo = tmp.path().join("sender-repo");
+        let target_repo = tmp.path().join("target-repo");
+        let record = record_for(
+            "abcdef12-3456-4789-8abc-def012345678",
+            &target_repo,
+            Verb::Exec,
+        );
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = NudgeArgs {
+            prefix: short.clone(),
+            message: Some("please check the new failing test".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_nudge_with(
+            &args,
+            &mut out,
+            &sender_repo,
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("nudge");
+        assert_eq!(code, 0);
+
+        let delivered = super::super::mail::list(
+            &state,
+            &super::super::state::repo_slug(&target_repo),
+            None,
+            Some(&short),
+        )
+        .expect("list");
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the payload must land in the repo the target session actually reads"
+        );
+        assert_eq!(delivered[0].1.body, "please check the new failing test");
+
+        assert!(
+            super::super::mail::list(
+                &state,
+                &super::super::state::repo_slug(&sender_repo),
+                None,
+                None
+            )
+            .expect("list")
+            .is_empty(),
+            "nothing is filed under the sender's own repo"
+        );
+
+        // C1: the confirmation names the resolved target and where it went.
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains(&short), "names the session: {printed}");
+        assert!(
+            printed.contains(&super::super::state::repo_slug(&target_repo)),
+            "names the repo it was delivered into: {printed}"
+        );
+    }
+
+    /// N6: an interactive target is never restarted and never typed into, and
+    /// never receives message bodies. Saying so is the difference between
+    /// "the nudge is broken" and "a human has to go read it".
+    #[test]
+    fn nudging_an_interactive_session_says_it_is_advisory_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+
+        for verb in [Verb::Chat, Verb::Wrap] {
+            let record = record_for("abcdef12-3456-4789-8abc-def012345678", &repo, verb);
+            let short = record.short.clone();
+            let mut guard = SessionGuard::register(&state, record);
+
+            let args = NudgeArgs {
+                prefix: short.clone(),
+                message: Some("look at this".to_string()),
+                message_file: None,
+            };
+            let mut out = Vec::new();
+            let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+            run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+                .expect("nudge");
+            let printed = String::from_utf8(out).expect("utf8");
+            assert!(
+                printed.contains("interactive session"),
+                "{verb} must be called out as interactive: {printed}"
+            );
+            assert!(
+                printed.contains("inbox"),
+                "and must say where the guidance actually shows up: {printed}"
+            );
+            guard.release();
+        }
+
+        // A headless target says nothing of the sort -- it really does act
+        // on the guidance.
+        let record = record_for("bbbbbbbb-3456-4789-8abc-def012345678", &repo, Verb::Exec);
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+        let args = NudgeArgs {
+            prefix: short,
+            message: Some("look at this".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect("nudge");
+        assert!(
+            !String::from_utf8(out)
+                .expect("utf8")
+                .contains("interactive"),
+            "a headless worker is not advisory-only"
+        );
     }
 
     #[test]
