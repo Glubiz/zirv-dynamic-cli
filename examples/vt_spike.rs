@@ -225,7 +225,14 @@ fn encode_key(key: KeyEvent) -> Vec<u8> {
 }
 
 fn is_quit(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL)
+    // Windows delivers Ctrl+Q in several shapes depending on console mode:
+    // Char('q')+CONTROL (classic), Char('Q')+CONTROL (caps/shift), or the raw
+    // DC1 control byte Char('\x11') with no modifier flag (VT input mode).
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => key.modifiers.contains(KeyModifiers::CONTROL),
+        KeyCode::Char('\u{11}') => true,
+        _ => false,
+    }
 }
 
 fn render_grid(f: &mut Frame, area: Rect, screen: &vt100::Screen) {

@@ -118,6 +118,7 @@ Note: the `todo!` above is the ONE permitted stub in this plan — it is inside 
 
 **Interfaces:**
 - Produces: `pub struct DashConfig { pub enabled: bool, pub sidebar_cols: u16, pub roster_max_age_secs: u64 }` with `Default { enabled: true, sidebar_cols: 24, roster_max_age_secs: 604_800 }`; `CtxConfig.dash: DashConfig`; `Verb::Dash` serializing as `"dash"`.
+- ALSO produces: `pub struct ChatConfig { pub model: Option<String> }` (`Default: None`), `CtxConfig.chat: ChatConfig`, ENV_MAP entry `("ZIRV_CTX_CHAT_MODEL", &["chat","model"], EnvKind::String)`. **`chat.model` is deliberately NOT in REPO_FORBIDDEN** — the spec's "Orchestrator model" section records the rationale (interactive, operator-launched, displayed on screen; unlike the background `handoff.model`/`optimize.model`). Add a test proving the repo layer CAN set `chat.model` and a comment in REPO_FORBIDDEN pointing at the spec section so nobody "fixes" it later. And: `AgentAdapter::model_args(&self, model: &str) -> Vec<String>` default `vec!["--model".into(), model.into()]`-style per adapter — claude `["--model", m]`; codex: check `codex --help` for its flag (`-m`/`--model`), and if codex has none return `vec![]` with a doc-comment.
 - Note: the prefix key is NOT configurable in v1 (YAGNI — constant `Ctrl+A` in Task 5). If the spike note demanded different minimums, use those.
 
 - [ ] **Step 1: Write failing tests** in `config.rs` tests module (follow the existing MailConfig test shapes):
@@ -306,7 +307,7 @@ fn glyphs_match_the_spec() {
 ```rust
 pub const PREFIX: (KeyModifiers, KeyCode) = (KeyModifiers::CONTROL, KeyCode::Char('a'));
 pub enum InputVerdict { ToChild(Vec<u8>), Dash(DashAction), Pending /* prefix armed */ }
-pub enum DashAction { Switch(usize), NextPane, Spawn, Nudge, Mail, Memory, Zoom, Quit, LiteralPrefix }
+pub enum DashAction { Switch(usize), NextPane, SelectUp, SelectDown, Spawn, Nudge, Mail, Memory, Zoom, Quit, LiteralPrefix }
 pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict);
 pub fn encode_key(key: KeyEvent) -> Vec<u8>;  // crossterm KeyEvent -> child bytes (incl. arrows,
                                               // Tab, Enter, Ctrl-<x>, Alt-<x>, plain chars)
@@ -333,6 +334,18 @@ fn armed_tab_switches_and_disarms() { /* filter_key(true, Tab) -> (false, Dash(N
 fn armed_digit_switches_to_that_pane() { /* '1' -> Switch(0), '9' -> Switch(8) */ }
 #[test]
 fn armed_ctrl_a_sends_a_literal_ctrl_a() { /* -> ToChild(vec![0x01]) via LiteralPrefix */ }
+#[test]
+fn armed_arrows_move_the_pane_selection() {
+    /* filter_key(true, Up) -> (false, Dash(SelectUp)); Down -> SelectDown.
+       UNARMED arrows still pass to the child (claude uses them). */
+}
+#[test]
+fn prefix_matches_the_raw_control_byte_shape_too() {
+    /* Spike finding (docs/superpowers/notes/2026-08-13-vt100-spike.md): Windows can
+       deliver Ctrl+A as Char('\u{01}') with NO modifier flag. filter_key must arm
+       on both Char('a')+CONTROL and Char('\u{01}'). Same for any Ctrl-<x> in
+       encode_key. */
+}
 #[test]
 fn armed_unknown_key_disarms_and_forwards_nothing() { /* no stray bytes to the child */ }
 #[test]
@@ -363,10 +376,21 @@ fn encode_key_covers_the_terminal_basics() {
 - Consumes: `run_dashboard` (Task 5), `build_launch` (chat.rs:79), `resolve_adapter` (chat.rs:107).
 - Produces: `zirv chat` → dashboard when `dash_eligible`; `zirv chat --simple` or ineligible terminal → today's `wrap::run_with` path unchanged; refusal message points at `--simple`.
 
-- [ ] **Step 1: Failing tests:** `dash_eligible` truth table (tty/vt/size/enabled/simple axes — 6 cases incl. exactly-at-minimum and one-below-minimum); `chat` run_with test with `simple: true` still reaching the wrap path (existing test shape); non-tty stdin → `Help`/wrap unchanged.
+- [ ] **Step 1: Failing tests:** `dash_eligible` truth table (tty/vt/size/enabled/simple axes — 6 cases incl. exactly-at-minimum and one-below-minimum); `chat` run_with test with `simple: true` still reaching the wrap path (existing test shape); non-tty stdin → `Help`/wrap unchanged; `orchestrator_argv_carries_the_configured_model` (`cfg.chat.model = Some("opus")` → `build_launch`/PaneSpec argv contains `adapter.model_args("opus")` right after the launch prefix; `None` → argv unchanged); banner/header shows the model when set.
 - [ ] **Step 2: Red.** **Step 3: Implement**: in `chat.rs::run_with`, after adapter resolution and nesting guard, when `dash_eligible(...)` build the orchestrator `PaneSpec` from `build_launch` (`role: Orchestrator`, `verb: Verb::Chat`, fresh uuid, title `"orch"`) and call `dash::run_dashboard`; else fall through to the existing wrap delegation untouched. The composed prompt for the orchestrator pane goes through the same `wrap`-style injection the pane spawn provides via `turn_env`/argv (reuse `chat.rs`'s existing prompt flow — the argv from `build_launch` already carries it).
 - [ ] **Step 4: Green + clippy + fmt; run the FULL suite** and compare failures against the documented baseline. **Step 5: Commit** — `feat: zirv chat opens the dashboard when the terminal can carry it`
-- [ ] **Step 6: HAND TO THE HUMAN** — separate Windows Terminal: `cargo run -- chat` (dashboard appears, orchestrator pane interactive, prefix+z zoom, prefix+q quit) and `cargo run -- chat --simple` (today's behavior). Report before continuing.
+- [ ] **Step 6: Create this repo's own `.zirv/ctx.toml`** (dogfooding — the worked example of repo-layer configuration; remember `.zirv/ctx.toml` is excluded from script listing in help.rs, nothing else needed):
+
+```toml
+# Repo-layer zirv configuration (untrusted layer: operator config and env win;
+# keys listed in REPO_FORBIDDEN are ignored here by design).
+
+[chat]
+# Model for the interactive orchestrator session (displayed in the banner/header).
+model = "opus"
+```
+
+- [ ] **Step 7: HAND TO THE HUMAN** — separate Windows Terminal: `cargo run -- chat` (dashboard appears, orchestrator pane interactive AND running the configured model, prefix+z zoom, prefix+q quit, prefix+↑/↓ selection) and `cargo run -- chat --simple` (today's behavior). Report before continuing.
 
 ---
 

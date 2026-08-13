@@ -95,6 +95,7 @@ repo-forbidden). After the prefix:
 | Key | Action |
 |-----|--------|
 | `1`–`9`, `Tab` | switch pane |
+| `↑` / `↓` | move pane selection up/down the sidebar |
 | `s` | spawn dialog (harness + prompt) |
 | `n` | nudge dialog for the selected session |
 | `m` | mailbox overlay (read; compose send/send --to-session) |
@@ -103,7 +104,32 @@ repo-forbidden). After the prefix:
 | `q` | quit (confirm if work in flight) |
 | `Ctrl+A` | send a literal Ctrl+A to the child |
 
-Everything not prefixed passes to the active child untouched.
+Everything not prefixed passes to the active child untouched. Bare
+arrows/Tab can never switch panes — the child TUIs consume them (claude
+uses Tab and arrows itself), which is the entire reason the prefix
+exists. Windows note from the spike: control keys may arrive as raw
+control bytes (`Char('\x01')`) instead of `Char('a')+CONTROL` — the
+prefix matcher accepts both shapes.
+
+### Orchestrator model
+
+New `[chat]` config section with `model: Option<String>` (e.g.
+`model = "opus"`). When set, the orchestrator pane's launch argv gains
+the adapter's model flag via a new `AgentAdapter::model_args(&self,
+model: &str) -> Vec<String>` (claude: `["--model", m]`; codex: its
+equivalent). The chosen model is displayed in the launch banner and the
+dashboard header.
+
+**Trust rationale (differs from `handoff.model`/`optimize.model`):**
+`chat.model` IS settable from the repo's `.zirv/ctx.toml` layer. The
+background model keys stay repo-forbidden because they trigger
+automatic, unwatched spawns (silent cost). `chat.model` only affects
+the interactive session the operator deliberately launched and is
+displayed on screen at launch — a repo cannot spend money invisibly
+with it. Env override: `ZIRV_CTX_CHAT_MODEL`.
+
+This repo itself gains a `.zirv/ctx.toml` (dogfooding) as the worked
+example of repo-layer configuration.
 
 ### Header and sidebar
 
