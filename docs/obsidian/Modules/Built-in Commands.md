@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-13
 ---
 
 # Built-in Commands
@@ -10,7 +10,7 @@ last-verified: 2026-08-12
 - **Used by:** entry point — nothing calls into these except the OS invoking `zirv`
 - **Depends on:** [[Script Runner]] (`execute`), [[Utilities]] (`file_to_script`, `home_dir`, `Shortcuts`, `is_reserved_command`, `candidate_names_in_dir`, `suggest_matches`), [[Ctx Subsystem]] (`ctx::dispatch`, intercepted before clap runs at all)
 - **Tests:** inline `#[cfg(test)] mod tests` in each file (`main::tests`, `input::tests`, `create::tests`, `init::tests`, `help::tests`; `version.rs` has no dedicated module dependency beyond its own version string)
-- **If changed:** [[Script Resolution]], [[Shortcuts]], [[Getting Started]]
+- **If changed:** [[Script Resolution]], [[Shortcuts]], [[Getting Started]], [[Ctx Supervisors]] (the dashboard `zirv chat` opens on a capable terminal)
 - **Gotchas:** `zirv ctx …`, `zirv chat`/`zirv agent`, a bare `zirv`, and top-level `zirv --help`/`-h` are all matched against raw `argv` *before* clap parses anything — a `.zirv/ctx.yaml` (or `chat.yaml`/`agent.yaml`) script is permanently shadowed, and clap's own auto-generated help for the `Input` struct never fires. A bare `zirv` used to be a clap usage error (exit 2, missing the required `command` argument) — it is now an alias, a deliberate behavior change (see below).
 
 ## Purpose
@@ -23,7 +23,7 @@ last-verified: 2026-08-12
 
 1. **Raw-argv `ctx` check** — `argv[1] == "ctx"` routes straight to `commands::ctx::dispatch`, bypassing `Input`/clap entirely. This is why `.zirv/ctx.yaml` can never be reached as a script (see `help.rs`'s "shadowed" marker below) and why a malformed `.zirv/ctx.toml` never breaks script lookup — `main.rs` never gets that far for `ctx`.
 2. **Raw-argv `chat`/`agent` alias check** (`top_level_ctx_alias`) — `argv[1] == "chat"` or `"agent"` rewrites argv (`rewrite_ctx_alias_args`) into `["ctx", <verb>, ...rest]` and routes through the same `ctx::dispatch` the raw `ctx` check above uses, so the alias gets the full ctx verb tree for free: subcommand parsing, `--help` exiting 0, and the same parse-failure classification `zirv ctx chat --help` would get.
-3. **Bare invocation** (`argv.len() == 1`, i.e. no arguments at all) — `bare_invocation_target(zirv_dir_exists, stdin_is_tty)` is a pure function of two caller-supplied facts (`zirv_dir_present` checks `./.zirv` and `~/.zirv`; `std::io::IsTerminal` checks stdin) deciding `BareTarget::Chat` (routes to `ctx::dispatch(["ctx", "chat"])`) or `BareTarget::Help` (prints `show_help`, **exit 0**). This is the deliberate behavior change: before this, `Input::command` being a required positional meant a bare `zirv` was a clap usage error exiting 2.
+3. **Bare invocation** (`argv.len() == 1`, i.e. no arguments at all) — `bare_invocation_target(zirv_dir_exists, stdin_is_tty)` is a pure function of two caller-supplied facts (`zirv_dir_present` checks `./.zirv` and `~/.zirv`; `std::io::IsTerminal` checks stdin) deciding `BareTarget::Chat` (routes to `ctx::dispatch(["ctx", "chat"])`) or `BareTarget::Help` (prints `show_help`, **exit 0**). This is the deliberate behavior change: before this, `Input::command` being a required positional meant a bare `zirv` was a clap usage error exiting 2. As of the dashboard sweep, the `chat` this routes to is no longer always a plain `wrap` passthrough — see the note below.
 4. **Raw-argv top-level help check** (`is_top_level_help`) — `argv[1]` is exactly `--help` or `-h` (not a script's own `--help` parameter, which lands later). Bypasses clap so `zirv help`'s rich script listing runs instead of clap's generated help for `Input`. Argv length 2 here means this never overlaps with the bare-invocation check above (length 1) or the `ctx`/alias checks (which match on `argv[1]`'s value, not `--help`).
 5. **`Input::parse()`** — clap parses the rest.
 6. **`misplaced_create_flag` guard** — `--name`/`--shortcut`/`--global` live on the shared `Input` struct so clap accepts them for *every* command; used outside `create`/`c` they are refused with a named error instead of being silently swallowed as (and eating) the next positional argument.
@@ -53,3 +53,7 @@ An explicit `zirv chat`/`zirv agent` (step 2) is not subject to the bare-invocat
 ### `version` (`commands/version.rs`)
 
 One line: `Version: {CARGO_PKG_VERSION}`.
+
+### `zirv chat`/bare `zirv` default to the dashboard on a capable terminal
+
+`zirv chat` (and bare `zirv`, once step 3 above routes to it) no longer always lands on a plain `wrap` passthrough session: on a real terminal at least 80×20 with VT processing available and `cfg.dash.enabled` (the default), it opens the dashboard session multiplexer instead — see [[Ctx Supervisors]]'s "The dashboard (`dash`)" section for the pane model, prefix keys, and quit/restore roster. `--simple` (or a terminal too small, or `[dash] enabled = false`) falls back to today's plain `wrap` chrome unchanged; a too-small terminal that would otherwise qualify prints a one-line notice naming the floor before falling back. `[chat] model`/`ZIRV_CTX_CHAT_MODEL`, when set, selects the model for the orchestrator session either way (dashboard or plain `wrap`) and is shown in the launch banner/dashboard header — see [[Ctx Adapters]] and [[Untrusted Configuration]] for why this one model key is deliberately not repo-forbidden, unlike every other model key in `ctx.toml`.

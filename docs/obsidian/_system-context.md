@@ -38,7 +38,7 @@ Dispatch order matters: `ctx` and top-level `--help` are matched on **raw argv**
 | Utilities | `src/utils.rs` | [[Utilities]] | File parsing, reserved names, shortcuts struct, home dir, Levenshtein "did you mean" |
 | Ctx hub / verb tree | `src/commands/ctx/{mod,config,state,log}.rs` | [[Ctx Subsystem]] | `CtxCli`/`CtxVerb`, dispatch + parse-failure classification, layered `CtxConfig`, `StateDir`, decision log |
 | Ctx verb modules | `src/commands/ctx/{score,handoff,resume,hook,status,chat,agent,mail,sessions,memory}.rs` | [[Ctx Subsystem]] | One module per verb: read-transcript/decide/maybe-write-state, the meta-harness verbs (chat/agent/mail), the session registry + nudge, and the memory bank |
-| Ctx supervisors | `src/commands/ctx/{run_loop,exec,wrap}.rs` + `{signal,supervise,term}.rs` | [[Ctx Supervisors]] | The three process supervisors, turn-signal sockets, shared process/terminal primitives |
+| Ctx supervisors | `src/commands/ctx/{run_loop,exec,wrap}.rs` + `{signal,supervise,term}.rs` + `dash/{mod,pane,ui,spawnreq,roster}.rs` | [[Ctx Supervisors]] | The three process supervisors, turn-signal sockets, shared process/terminal primitives, and the `dash` session multiplexer `zirv chat` opens on a capable terminal |
 | Ctx adapters | `src/commands/ctx/adapters/{mod,claude,codex}.rs` | [[Ctx Adapters]] | `AgentAdapter` trait; claude (implemented) and codex (not implemented, issue #11) |
 | Rot engine | `src/commands/ctx/{event,rot}.rs` | [[Rot Engine]] | Pure normalized-event scoring → `Verdict` |
 | Usage & pacing | `src/commands/ctx/{window,usage,pace}.rs` | [[Usage and Pacing]] | Rolling rate-limit windows, the pacing gate, `usage` verb + statusline tee |

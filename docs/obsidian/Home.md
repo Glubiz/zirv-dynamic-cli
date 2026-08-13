@@ -38,7 +38,7 @@ graph TB
 - [[Script Runner]] — parses and executes a `Script`: context building, step dispatch, shell/concurrent/agent steps.
 - [[Built-in Commands]] — `main.rs` dispatch table: `help`/`version`/`init`/`create`/`ctx`, the `chat`/`agent` top-level aliases, and the bare-`zirv` alias.
 - [[Ctx Subsystem]] — the `zirv ctx` hub: verb tree (including `chat`/`agent`/`send`/`inbox`/`nudge`/`remember`/`recall`/`forget`), dispatch, layered config, state directory, decision log, the session registry, and the memory bank.
-- [[Ctx Supervisors]] — `loop`/`exec`/`wrap`, the three process supervisors, turn-signal sockets, raw-mode terminal handling, nudge handling, and the chat session's role/mail advisory/terminal chrome.
+- [[Ctx Supervisors]] — `loop`/`exec`/`wrap`, the three process supervisors, turn-signal sockets, raw-mode terminal handling, nudge handling, the chat session's role/mail advisory/terminal chrome, and the `dash` session multiplexer `zirv chat` opens on a capable terminal.
 - [[Ctx Adapters]] — the `AgentAdapter` trait, the claude/codex implementations, and the registry/`resolve_default` selection logic.
 - [[Rot Engine]] — the pure, deterministic transcript-scoring core that produces a `Verdict`.
 - [[Usage and Pacing]] — rolling rate-limit windows, the pacing gate, and the statusline tee.

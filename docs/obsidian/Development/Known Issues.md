@@ -14,8 +14,21 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## A dashboard pane carries no rot score yet
+
+`ui::HeaderFacts` has a `score: Option<u32>` field, and the header renders
+`score NN` when it's `Some`, but the dashboard's real render loop
+(`assemble_header_facts` in `run_dashboard`) always passes `None` -- no
+[[Rot Engine]] transcript scoring is wired up for a pane yet, unlike `wrap`'s
+own status bar. A pane still runs fully supervised otherwise (turn-signal env,
+quit sequence, quit/restore roster), it just never advises/compacts/restarts
+itself the way a plain `zirv ctx wrap` session does. Do not assume a pane
+attached in the dashboard is rot-monitored just because it looks identical to
+one running under `wrap` directly.
 
 ## A markdown header block ends at the first blank line
 

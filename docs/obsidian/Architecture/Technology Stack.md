@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-13
 ---
 
 # Technology Stack
@@ -39,8 +39,11 @@ last-verified: 2026-08-12
 | `futures` | 0.3.32 | Async combinators |
 | `slab` | 0.4.12 | Slot-keyed allocation, used in the `ctx` supervisor machinery |
 | `regex` | 1 | Detecting unresolved `${...}` placeholders after substitution |
-| `portable-pty` | 0.9.0 | Cross-platform PTY for `zirv ctx wrap`'s interactive supervision |
+| `portable-pty` | 0.9.0 | Cross-platform PTY for `zirv ctx wrap`'s interactive supervision, and for each of the dashboard's own panes (`dash::pane`) |
 | `uuid` (v4) | 1.24.0 | Session IDs for `ctx` transcripts and supervised runs |
+| `crossterm` | 0.29 | Terminal event/key input and raw-mode primitives for the dashboard's own event loop (`dash/mod.rs`) |
+| `ratatui` | 0.30 | Immediate-mode TUI rendering for the dashboard's header, sidebar, pane grid, and overlays (`dash/ui.rs`) |
+| `vt100` | 0.16 | Embedded terminal-screen emulation, one `vt100::Screen` per dashboard pane, so a pane's own child renders correctly without owning the real terminal |
 
 ### Platform-specific
 
