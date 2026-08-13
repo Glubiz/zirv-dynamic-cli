@@ -80,7 +80,7 @@ pub fn run_with<W: Write>(
     }
 
     let mail_slug = repo_slug(repo);
-    match mail::list(&state, &mail_slug, None) {
+    match mail::list(&state, &mail_slug, None, None) {
         Ok(messages) => writeln!(w, "mail: {} unread", messages.len())?,
         Err(_) => writeln!(w, "mail: (unreadable)")?,
     }
@@ -410,6 +410,7 @@ mod tests {
                     from_session: from_session.to_string(),
                     from_agent: "claude".to_string(),
                     to: "any".to_string(),
+                    to_session: None,
                     sent: 1_700_000_000,
                     body: "heads up".to_string(),
                 },

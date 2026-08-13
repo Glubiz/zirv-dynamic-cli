@@ -13,6 +13,7 @@ use serde::Serialize;
 use super::CtxResult;
 use super::adapters::{AGENT_ENV, SESSION_ENV};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::sessions;
 use super::state::{StateDir, now_secs, repo_slug};
 
 /// One mail message: a free-form markdown note plus who sent it, who it is
@@ -24,6 +25,12 @@ pub struct Message {
     /// Recipient agent name, or `"any"` for every agent. `"any"` is the
     /// default produced by `parse_markdown` when the header is absent.
     pub to: String,
+    /// Recipient session's short id (`sessions::short_id`'s own vocabulary),
+    /// or `None` for a message addressed to every session (the default
+    /// produced by `parse_markdown` when the `To-session` header is absent).
+    /// Combined with `to` by `list`: a message with `to_session = Some(s)`
+    /// is only ever visible to a caller asking for that exact session.
+    pub to_session: Option<String>,
     /// Unix seconds the message was authored.
     pub sent: u64,
     pub body: String,
@@ -31,11 +38,19 @@ pub struct Message {
 
 impl Message {
     /// Renders the `## Message` header block (From-session, From-agent, To,
-    /// Sent as list items) followed by the free markdown body.
+    /// To-session (only when addressed to one session), Sent as list items)
+    /// followed by the free markdown body. Omitting the `To-session` line
+    /// entirely when it is `None` is deliberate: every message stored before
+    /// this field existed round-trips through `parse_markdown` unchanged,
+    /// keeping the same "visible to everyone" meaning it always had.
     pub fn to_markdown(&self) -> String {
+        let to_session_line = match &self.to_session {
+            Some(short) => format!("- To-session: {short}\n"),
+            None => String::new(),
+        };
         format!(
-            "## Message\n- From-session: {}\n- From-agent: {}\n- To: {}\n- Sent: {}\n\n{}\n",
-            self.from_session, self.from_agent, self.to, self.sent, self.body
+            "## Message\n- From-session: {}\n- From-agent: {}\n- To: {}\n{}- Sent: {}\n\n{}\n",
+            self.from_session, self.from_agent, self.to, to_session_line, self.sent, self.body
         )
     }
 }
@@ -65,6 +80,7 @@ pub fn parse_markdown(md: &str) -> Message {
         from_session: String::new(),
         from_agent: String::new(),
         to: "any".to_string(),
+        to_session: None,
         sent: 0,
         body: String::new(),
     };
@@ -93,6 +109,7 @@ pub fn parse_markdown(md: &str) -> Message {
                     "from-session" => msg.from_session = value.trim().to_string(),
                     "from-agent" => msg.from_agent = value.trim().to_string(),
                     "to" => msg.to = value.trim().to_string(),
+                    "to-session" => msg.to_session = Some(value.trim().to_string()),
                     "sent" => msg.sent = value.trim().parse().unwrap_or(0),
                     // Unknown header inside the block: skipped, not an error.
                     _ => {}
@@ -205,13 +222,23 @@ pub fn store(
 }
 
 /// Lists unread messages for `repo_slug`, oldest first, visible to
-/// `for_agent` (or every message when `for_agent` is `None`). Individual
-/// files that cannot be read or parsed are skipped rather than failing the
-/// whole listing.
+/// `for_agent` (or every message when `for_agent` is `None`) AND visible to
+/// `for_session`. Individual files that cannot be read or parsed are skipped
+/// rather than failing the whole listing.
+///
+/// `for_session` is not symmetric with `for_agent`: `None` here means "apply
+/// no session filter at all" (a broad view, used by `zirv ctx status` and
+/// `zirv ctx inbox` for a total/human-facing count), not "only undirected
+/// messages". `Some(short)` is the narrow, per-session view every actual
+/// delivery seam (`exec`, `loop`, `wrap`'s mail advisory) uses: a message
+/// addressed to a specific session (`to_session = Some(s)`) is then visible
+/// only when `short == s`; a message with no `to_session` at all stays
+/// visible to every session regardless.
 pub fn list(
     state: &StateDir,
     repo_slug: &str,
     for_agent: Option<&str>,
+    for_session: Option<&str>,
 ) -> CtxResult<Vec<(PathBuf, Message)>> {
     let dir = state.mail().join(repo_slug);
     if !dir.is_dir() {
@@ -235,11 +262,16 @@ pub fn list(
             continue;
         };
         let msg = parse_markdown(&text);
-        let visible = match for_agent {
+        let agent_visible = match for_agent {
             None => true,
             Some(agent) => msg.to.eq_ignore_ascii_case("any") || msg.to.eq_ignore_ascii_case(agent),
         };
-        if visible {
+        let session_visible = match (for_session, &msg.to_session) {
+            (None, _) => true,
+            (Some(_), None) => true,
+            (Some(want), Some(addressed)) => addressed == want,
+        };
+        if agent_visible && session_visible {
             out.push((path, msg));
         }
     }
@@ -263,6 +295,12 @@ pub struct SendArgs {
     /// Recipient agent name, or "any" (the default) for every agent.
     #[arg(long)]
     pub to: Option<String>,
+    /// Recipient session id (or a unique prefix of one). Resolved against
+    /// the live session registry the same way every other session-prefix
+    /// argument in `zirv ctx` is: an unknown or ambiguous prefix refuses
+    /// with the resolver's own candidate-naming error.
+    #[arg(long = "to-session")]
+    pub to_session: Option<String>,
     /// Message text. When omitted, read from `--message-file`, else from
     /// stdin.
     #[arg(long)]
@@ -287,7 +325,7 @@ pub struct InboxArgs {
 /// session zirv cannot fully identify (a shell run directly, a hook context
 /// missing a variable), and it is the recipient's call whether an unknown
 /// sender is trustworthy, not `send`'s.
-fn identity_or_unknown(env: EnvLookup<'_>, key: &str) -> String {
+pub(crate) fn identity_or_unknown(env: EnvLookup<'_>, key: &str) -> String {
     env(key)
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_string())
@@ -333,10 +371,23 @@ pub fn run_send_with<W: Write>(
     }
 
     let state = StateDir::resolve(env)?;
+    // Resolved before the message is built: delivery must not depend on the
+    // registry surviving (a_message_survives_the_registry_record_being_
+    // removed), so what gets stored is the resolved short id itself, not a
+    // reference to the record that produced it.
+    let to_session = match &args.to_session {
+        Some(prefix) => Some(
+            sessions::resolve_prefix(&state, prefix)
+                .map_err(|e| format!("zirv ctx send: {e}"))?
+                .short,
+        ),
+        None => None,
+    };
     let msg = Message {
         from_session: identity_or_unknown(env, SESSION_ENV),
         from_agent: identity_or_unknown(env, AGENT_ENV),
         to: args.to.clone().unwrap_or_else(|| "any".to_string()),
+        to_session,
         sent: now_secs(),
         body,
     };
@@ -368,7 +419,11 @@ pub fn run_inbox_with<W: Write>(
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
     let for_agent = env(AGENT_ENV);
-    let messages = list(&state, &slug, for_agent.as_deref())?;
+    // `None` for the session filter: a human reading their inbox (or a
+    // session-addressed nudge payload arriving there) sees everything meant
+    // for their agent, not just what was addressed to one particular
+    // session id.
+    let messages = list(&state, &slug, for_agent.as_deref(), None)?;
 
     for (path, msg) in &messages {
         if args.json {
@@ -398,6 +453,7 @@ mod tests {
             from_session: from_session.to_string(),
             from_agent: "claude".to_string(),
             to: "any".to_string(),
+            to_session: None,
             sent,
             body: "Heads up: the webhook route moved to /v2/webhook.".to_string(),
         }
@@ -490,7 +546,7 @@ mod tests {
             "a same-second, same-sender collision must not reuse the first path"
         );
 
-        let listed = list(&state, "-work-repo", None).expect("list");
+        let listed = list(&state, "-work-repo", None, None).expect("list");
         assert_eq!(
             listed.len(),
             2,
@@ -527,7 +583,7 @@ mod tests {
         )
         .expect("write");
 
-        let listed = list(&state, "-work-a", None).expect("list");
+        let listed = list(&state, "-work-a", None, None).expect("list");
         assert_eq!(listed.len(), 2, "only repo a's messages, none from b");
         assert!(listed[0].0.ends_with("1700000000-aaaa.md"));
         assert!(listed[1].0.ends_with("1700000900-bbbb.md"));
@@ -552,7 +608,9 @@ mod tests {
             .join(path.file_name().expect("file name"));
         assert!(moved.exists(), "moved into read/, not deleted");
         assert!(
-            list(&state, "-work-repo", None).expect("list").is_empty(),
+            list(&state, "-work-repo", None, None)
+                .expect("list")
+                .is_empty(),
             "consumed messages are excluded from list"
         );
     }
@@ -588,11 +646,35 @@ mod tests {
             from_session: "11111111-2222".to_string(),
             from_agent: "claude".to_string(),
             to: "codex".to_string(),
+            to_session: None,
             sent: 1_700_000_000,
             body: "Heads up: schema migration landed on main.".to_string(),
         };
         let parsed = parse_markdown(&msg.to_markdown());
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn a_to_session_header_round_trips_and_is_absent_when_undirected() {
+        let directed = Message {
+            to_session: Some("aaaa1111".to_string()),
+            ..sample("s1", 1_700_000_000)
+        };
+        let parsed = parse_markdown(&directed.to_markdown());
+        assert_eq!(parsed, directed);
+        assert!(
+            directed.to_markdown().contains("- To-session: aaaa1111"),
+            "got {}",
+            directed.to_markdown()
+        );
+
+        let undirected = sample("s1", 1_700_000_000);
+        assert!(
+            !undirected.to_markdown().contains("To-session"),
+            "an undirected message must not emit the header at all, so an old message's markdown \
+             round-trips byte-for-byte through a version of this file that predates the field: {}",
+            undirected.to_markdown()
+        );
     }
 
     #[test]
@@ -632,7 +714,7 @@ This should not appear in the body.\n";
         for_any.to = "any".to_string();
         std::fs::write(dir.join("1700000100-s2.md"), for_any.to_markdown()).expect("write");
 
-        let for_codex = list(&state, "-work-repo", Some("codex")).expect("list");
+        let for_codex = list(&state, "-work-repo", Some("codex"), None).expect("list");
         assert_eq!(
             for_codex.len(),
             1,
@@ -640,7 +722,7 @@ This should not appear in the body.\n";
         );
         assert_eq!(for_codex[0].1.from_session, "s2");
 
-        let for_claude_listing = list(&state, "-work-repo", Some("claude")).expect("list");
+        let for_claude_listing = list(&state, "-work-repo", Some("claude"), None).expect("list");
         assert_eq!(
             for_claude_listing.len(),
             2,
@@ -671,7 +753,7 @@ This should not appear in the body.\n";
 
         store(&state, "-work-repo", &sample("new", 1_700_000_999), &cfg).expect("store");
 
-        let remaining = list(&state, "-work-repo", None).expect("list");
+        let remaining = list(&state, "-work-repo", None, None).expect("list");
         assert_eq!(
             remaining.len(),
             cfg.mail.keep,
@@ -689,6 +771,7 @@ This should not appear in the body.\n";
     fn send_args(message: &str) -> SendArgs {
         SendArgs {
             to: None,
+            to_session: None,
             message: Some(message.to_string()),
             message_file: None,
         }
@@ -722,7 +805,7 @@ This should not appear in the body.\n";
 
         let state = StateDir::from_root(state_dir);
         let slug = repo_slug(tmp.path());
-        let listed = list(&state, &slug, None).expect("list");
+        let listed = list(&state, &slug, None, None).expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].1.from_session, "sess-123");
         assert_eq!(listed[0].1.from_agent, "claude");
@@ -754,7 +837,7 @@ This should not appear in the body.\n";
 
         let state = StateDir::from_root(state_dir);
         let slug = repo_slug(tmp.path());
-        let listed = list(&state, &slug, None).expect("list");
+        let listed = list(&state, &slug, None, None).expect("list");
         assert_eq!(listed[0].1.from_session, "unknown");
         assert_eq!(listed[0].1.from_agent, "unknown");
     }
@@ -771,6 +854,7 @@ This should not appear in the body.\n";
         )]);
         let args = SendArgs {
             to: None,
+            to_session: None,
             message: None,
             message_file: None,
         };
@@ -787,7 +871,7 @@ This should not appear in the body.\n";
 
         let state = StateDir::from_root(state_dir);
         let slug = repo_slug(tmp.path());
-        let listed = list(&state, &slug, None).expect("list");
+        let listed = list(&state, &slug, None, None).expect("list");
         assert_eq!(listed[0].1.body, "note from stdin");
     }
 
@@ -926,6 +1010,220 @@ This should not appear in the body.\n";
         assert!(
             inbox_out.is_empty(),
             "a disabled mailbox reports empty even with mail sitting in storage: {inbox_out:?}"
+        );
+    }
+
+    // N3: per-session mail.
+
+    fn session_addressed(from_session: &str, to_session: &str, to: &str) -> Message {
+        let mut msg = sample(from_session, 1_700_000_000);
+        msg.to = to.to_string();
+        msg.to_session = Some(to_session.to_string());
+        msg
+    }
+
+    #[test]
+    fn a_message_addressed_to_a_session_is_invisible_to_every_other_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let msg = session_addressed("sender", "aaaa1111", "any");
+        store(&state, "-work-repo", &msg, &cfg).expect("store");
+
+        let for_other = list(&state, "-work-repo", None, Some("bbbb2222")).expect("list");
+        assert!(
+            for_other.is_empty(),
+            "a different session must never see it: {for_other:?}"
+        );
+
+        let for_owner = list(&state, "-work-repo", None, Some("aaaa1111")).expect("list");
+        assert_eq!(for_owner.len(), 1, "the addressed session sees it");
+    }
+
+    #[test]
+    fn a_session_addressed_message_is_still_filtered_by_the_recipient_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let msg = session_addressed("sender", "aaaa1111", "codex");
+        store(&state, "-work-repo", &msg, &cfg).expect("store");
+
+        let wrong_agent =
+            list(&state, "-work-repo", Some("claude"), Some("aaaa1111")).expect("list");
+        assert!(
+            wrong_agent.is_empty(),
+            "right session, wrong agent must still be filtered out: {wrong_agent:?}"
+        );
+
+        let right_agent =
+            list(&state, "-work-repo", Some("codex"), Some("aaaa1111")).expect("list");
+        assert_eq!(right_agent.len(), 1, "both filters agree, so it is visible");
+    }
+
+    #[test]
+    fn an_undirected_message_stays_visible_to_everyone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        store(&state, "-work-repo", &sample("sender", 1_700_000_000), &cfg).expect("store");
+
+        for session in ["aaaa1111", "bbbb2222", "zzzzzzzz"] {
+            let listed = list(&state, "-work-repo", None, Some(session)).expect("list");
+            assert_eq!(
+                listed.len(),
+                1,
+                "an undirected message must be visible to session {session}: {listed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_to_session_resolves_a_prefix_and_stores_the_full_short_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let record = sessions::Record::new(
+            "abcdef12-3456-4789-8abc-def012345678",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let full_short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to: None,
+            to_session: Some("abcd".to_string()),
+            message: Some("nudge payload".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send resolves the prefix");
+
+        let slug = repo_slug(tmp.path());
+        let listed = list(&state, &slug, None, None).expect("list");
+        assert_eq!(
+            listed[0].1.to_session,
+            Some(full_short),
+            "the resolved full short id is stored, not the prefix the operator typed"
+        );
+    }
+
+    #[test]
+    fn send_to_an_ambiguous_prefix_refuses_and_names_the_candidates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let one = sessions::Record::new(
+            "aaaa1111-xxxx-4xxx-8xxx-xxxxxxxxxxxx",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let two = sessions::Record::new(
+            "aaaa2222-yyyy-4yyy-8yyy-yyyyyyyyyyyy",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let (one_short, two_short) = (one.short.clone(), two.short.clone());
+        let _guard_one = sessions::SessionGuard::register(&state, one);
+        let _guard_two = sessions::SessionGuard::register(&state, two);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to: None,
+            to_session: Some("aaaa".to_string()),
+            message: Some("who gets this?".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("two live sessions share this prefix");
+        let msg = err.to_string();
+        assert!(msg.contains(&one_short), "names the first candidate: {msg}");
+        assert!(
+            msg.contains(&two_short),
+            "names the second candidate: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_message_survives_the_registry_record_being_removed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let record = sessions::Record::new(
+            "cccccccc-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let short = record.short.clone();
+        let mut guard = sessions::SessionGuard::register(&state, record);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to: None,
+            to_session: Some(short.clone()),
+            message: Some("still deliverable".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send");
+
+        // The session that received the message is gone from the registry --
+        // delivery must not depend on it surviving.
+        guard.release();
+
+        let slug = repo_slug(tmp.path());
+        let listed = list(&state, &slug, None, Some(&short)).expect("list");
+        assert_eq!(
+            listed.len(),
+            1,
+            "the message is still there and still addressed to the same short id: {listed:?}"
         );
     }
 }

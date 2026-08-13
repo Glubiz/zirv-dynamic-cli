@@ -202,6 +202,8 @@ pub enum CtxVerb {
     Recall(memory::RecallArgs),
     /// Remove one or all facts from this repository's memory bank.
     Forget(memory::ForgetArgs),
+    /// Interrupt a live session with a message: durable mail plus a wake-up.
+    Nudge(sessions::NudgeArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -286,6 +288,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Remember(a) => memory::run_remember(a, &mut out),
         CtxVerb::Recall(a) => memory::run_recall(a, &mut out),
         CtxVerb::Forget(a) => memory::run_forget(a, &mut out),
+        CtxVerb::Nudge(a) => sessions::run_nudge(a, &mut out),
     };
 
     match result {

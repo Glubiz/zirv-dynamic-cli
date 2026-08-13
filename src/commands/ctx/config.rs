@@ -77,6 +77,15 @@ pub struct SuperviseConfig {
     pub max_failures: u32,
     pub backoff_base_secs: u64,
     pub on_failure: Option<String>,
+    /// Consecutive `zirv ctx nudge`-driven restarts a single supervised run
+    /// (`exec`) will honor before it starts ignoring further nudges: a
+    /// separate cap from `max_restarts`, since a nudge-restart never spends
+    /// that budget (it is not rot). Past the cap the nudge's mail is left
+    /// unread rather than acted on, so it is still visible via `zirv ctx
+    /// inbox`. Not repo-forbidden: unlike `agent_bin` or `handoff.model`,
+    /// this names no binary, shell command, or model choice, only how many
+    /// times a session tolerates being interrupted.
+    pub max_nudges: u32,
 }
 
 impl Default for SuperviseConfig {
@@ -89,6 +98,7 @@ impl Default for SuperviseConfig {
             max_failures: 5,
             backoff_base_secs: 60,
             on_failure: None,
+            max_nudges: 3,
         }
     }
 }
@@ -378,6 +388,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_ON_FAILURE",
         &["supervise", "on_failure"],
         EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_MAX_NUDGES",
+        &["supervise", "max_nudges"],
+        EnvKind::Int,
     ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
@@ -710,6 +725,7 @@ mod tests {
         );
         assert_eq!(WrapConfig::default().debounce_ms, 3000);
         assert_eq!(SuperviseConfig::default().max_restarts, 2);
+        assert_eq!(SuperviseConfig::default().max_nudges, 3);
         assert_eq!(HandoffConfig::default().model, "haiku");
         assert_eq!(HandoffConfig::default().tail_items, 5);
         assert_eq!(HandoffConfig::default().timeout_secs, 30);
@@ -1267,6 +1283,36 @@ mod tests {
         assert_eq!(cfg.memory.max_entries, 9);
         assert_eq!(cfg.memory.max_entry_bytes, 128);
         assert_eq!(cfg.memory.max_injected_bytes, 999);
+    }
+
+    /// N4: `supervise.max_nudges` reads from its own env var like every
+    /// other `supervise.*` key.
+    #[test]
+    fn max_nudges_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_MAX_NUDGES", "7")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.max_nudges, 7);
+    }
+
+    /// Unlike `supervise.on_failure` (a shell command) or `agent_bin` (a
+    /// binary), `max_nudges` names no binary, shell command, or model
+    /// choice -- only how many times a session tolerates being interrupted
+    /// -- so a repository checkout may set it, the same trust level a repo's
+    /// `score.*` tuning already has.
+    #[test]
+    fn a_repository_config_may_set_max_nudges() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nmax_nudges = 5\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.max_nudges, 5);
     }
 
     /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and

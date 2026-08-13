@@ -61,12 +61,17 @@ pub fn run_with<W: Write>(
 
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
 
+    let memory_slug = super::state::repo_slug(repo);
+    let memory_entries =
+        super::memory::render_for_prompt(&state, &memory_slug, &cfg, super::state::now_secs());
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         args.simple,
         &cfg.prompt,
         super::prompt::PromptRole::Worker,
+        &memory_entries,
+        cfg.memory.max_injected_bytes,
     );
     let (user_extra, composed) =
         super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);

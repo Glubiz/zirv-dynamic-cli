@@ -80,6 +80,14 @@ pub enum Event {
     /// the session saw it end with no explanation at all, indistinguishable
     /// from a bug in `wrap` itself.
     SessionEnded { agent: String, code: i32 },
+    /// A `zirv ctx nudge` wake-up marker was claimed. `from` names the
+    /// nudging session's own short id (best-effort, the same identity a mail
+    /// message carries), and `restarted` says which of the three ways this
+    /// session reacted: a headless worker (`exec`) that relaunched with the
+    /// guidance folded in, a `loop` cycle that only announces (mail arrives
+    /// at its own natural boundary), or an interactive session (`wrap`/
+    /// `chat`) that is advised only and never typed into.
+    Nudge { from: String, restarted: bool },
 }
 
 impl Event {
@@ -150,6 +158,13 @@ impl Event {
             Event::DelegatedFinish { agent, meaning } => format!("{agent} finished: {meaning}"),
             Event::SessionEnded { agent, code } => {
                 format!("{agent} session ended (exit code {code})")
+            }
+            Event::Nudge { from, restarted } => {
+                if *restarted {
+                    format!("nudged by {from}; relaunching with the guidance")
+                } else {
+                    format!("nudged by {from}; will be picked up as mail")
+                }
             }
         }
     }
@@ -439,6 +454,28 @@ mod tests {
     }
 
     #[test]
+    fn a_nudge_announcement_names_the_sender_and_whether_it_restarted() {
+        let restarted = Event::Nudge {
+            from: "aaaa1111".to_string(),
+            restarted: true,
+        };
+        let line = restarted.line();
+        assert!(line.contains("aaaa1111"), "got {line}");
+        assert!(line.contains("relaunching"), "got {line}");
+
+        let advised = Event::Nudge {
+            from: "aaaa1111".to_string(),
+            restarted: false,
+        };
+        let line = advised.line();
+        assert!(line.contains("aaaa1111"), "got {line}");
+        assert!(
+            !line.contains("relaunching"),
+            "an unrestarted nudge must not claim it relaunched: {line}"
+        );
+    }
+
+    #[test]
     fn announcements_never_touch_the_reserved_bar_row() {
         let sample = [
             Event::InjectionComposed {
@@ -480,6 +517,10 @@ mod tests {
             Event::SessionEnded {
                 agent: "claude".to_string(),
                 code: 0,
+            },
+            Event::Nudge {
+                from: "aaaa1111".to_string(),
+                restarted: true,
             },
         ];
         for event in sample {

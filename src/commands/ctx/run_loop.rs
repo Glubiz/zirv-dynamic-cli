@@ -113,6 +113,12 @@ pub fn run_with<W: Write>(
             w, &state, &cfg.pace, "loop", "loop", &now_fn, &sleep_fn, None,
         );
 
+        let mail_slug = super::state::repo_slug(repo);
+        // N5: re-read every cycle, same as mail below -- each cycle is a
+        // fresh, stateless session, so a fact remembered or verified since
+        // the previous cycle must be picked up too, not a snapshot taken
+        // once before the loop started.
+        let memory_entries = super::memory::render_for_prompt(&state, &mail_slug, &cfg, now_fn());
         // Recomposed every cycle -- the same seam as `injection_args_for_
         // session` a few lines down -- because each cycle is a fresh,
         // stateless session: it must pick up whatever mail has arrived since
@@ -124,18 +130,37 @@ pub fn run_with<W: Write>(
             args.simple,
             &cfg.prompt,
             super::prompt::PromptRole::Worker,
+            &memory_entries,
+            cfg.memory.max_injected_bytes,
         );
-        let mail_slug = super::state::repo_slug(repo);
+        // A fresh session id per cycle is the whole point: the orchestrator
+        // never accumulates context across cycles. Minted here, ahead of
+        // mail listing and the nudge-marker check below, both of which need
+        // it.
+        let session = SessionId::new_v4();
+        let session_short = super::sessions::short_id(session.as_str());
+        // N3 scopes delivery to the live session's own short id everywhere
+        // else (`exec`, `wrap`'s advisory), but `loop` deliberately passes
+        // `None` here rather than `Some(&session_short)`: unlike those,
+        // `loop` has no stable session identity across a run -- every cycle
+        // mints a brand new one -- so a message addressed to *this* cycle's
+        // short id (a `zirv ctx nudge` sent while it is live, say) would
+        // otherwise become permanently unaddressable the moment the next
+        // cycle mints a different short id. `None` is what lets "the mail
+        // arrives at the natural next cycle" (this module's own nudge
+        // handling, a few lines down) actually hold.
+        //
         // `mut`: drained right after this cycle's own spawn actually
         // succeeds (Item 3), not here -- a launch that fails to spawn, or a
         // pacing park ahead of it, must not move mail to `read/` before any
         // session has actually started to see it.
-        let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
-            if composed.is_some() && cfg.mail.enabled {
-                super::mail::list(&state, &mail_slug, Some(adapter.name())).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+        let mut mail_entries: Vec<(PathBuf, super::mail::Message)> = if composed.is_some()
+            && cfg.mail.enabled
+        {
+            super::mail::list(&state, &mail_slug, Some(adapter.name()), None).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mail_messages: Vec<super::mail::Message> =
             mail_entries.iter().map(|(_, msg)| msg.clone()).collect();
         if !mail_messages.is_empty() {
@@ -148,9 +173,6 @@ pub fn run_with<W: Write>(
         let (user_extra, composed) =
             super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
 
-        // A fresh session id per cycle is the whole point: the orchestrator
-        // never accumulates context across cycles.
-        let session = SessionId::new_v4();
         match session_guard.as_mut() {
             Some(guard) => guard.refresh_session(session.as_str()),
             None => {
@@ -233,6 +255,18 @@ pub fn run_with<W: Write>(
                 ) {
                     limit_hit = true;
                     return Tick::Stop("limit");
+                }
+                // N4: `loop` never restarts for a nudge -- each cycle is
+                // already a fresh, stateless session that re-lists mail on
+                // its own natural boundary (see the mail block above), so
+                // the nudge's payload arrives there regardless. Claiming the
+                // marker here only stops it from re-firing and lets the
+                // operator see that it arrived.
+                if super::sessions::claim_nudge_marker(&state, &session_short) {
+                    announcer.emit(&super::announce::Event::Nudge {
+                        from: session_short.clone(),
+                        restarted: false,
+                    });
                 }
                 match scorer.poll(adapter.as_ref(), &cfg.score) {
                     Ok(Some(score)) if score.verdict == Verdict::Restart => {
@@ -960,6 +994,7 @@ mod tests {
                 from_session: "other-session".to_string(),
                 from_agent: "claude".to_string(),
                 to: "any".to_string(),
+                to_session: None,
                 sent: 1,
                 body: "a disabled notice".to_string(),
             },
@@ -991,7 +1026,7 @@ mod tests {
             "mail.enabled = false must gate delivery at the loop seam too: {argv}"
         );
 
-        let unread = crate::commands::ctx::mail::list(&state, &slug, None).expect("list");
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None, None).expect("list");
         assert_eq!(
             unread.len(),
             1,
@@ -1068,6 +1103,7 @@ mod tests {
                     from_session: "other-session".to_string(),
                     from_agent: "claude".to_string(),
                     to: "any".to_string(),
+                    to_session: None,
                     sent: 1,
                     body: "a fresh notice".to_string(),
                 },
@@ -1117,6 +1153,119 @@ mod tests {
             argv.matches("a fresh notice").count(),
             1,
             "delivered once in cycle 2, consumed, and must not reappear in cycle 3: {argv}"
+        );
+    }
+
+    /// N4: a nudge sent while cycle 1 is live must not restart or kill it
+    /// (`loop` never restarts for a nudge -- only `exec` does), and its
+    /// payload -- ordinary session-addressed mail -- must reach cycle 2, the
+    /// natural next boundary, the same way `each_loop_cycle_picks_up_mail_
+    /// that_arrived_since_the_previous_one` proves for an undirected
+    /// message.
+    #[test]
+    fn a_loop_cycle_reports_the_nudge_and_picks_it_up_at_its_own_boundary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let marker = tmp.path().join("cycle-marker");
+        let script = tmp.path().join("mid-loop-agent.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             set -eu\n\
+             [ -z \"${FAKE_AGENT_ARGV_LOG:-}\" ] || printf '%s\\n' \"$*\" >> \"$FAKE_AGENT_ARGV_LOG\"\n\
+             if [ ! -f \"$CYCLE_MARKER\" ]; then\n\
+             \ttouch \"$CYCLE_MARKER\"\n\
+             \tsleep 0.3\n\
+             fi\n\
+             exit 0\n",
+        )
+        .expect("write script");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", script.display()),
+        );
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+            std::env::set_var("CYCLE_MARKER", &marker);
+        }
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let marker_for_writer = marker.clone();
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !marker_for_writer.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer.clone());
+            // The empty prefix matches whichever session is currently live --
+            // `loop` keeps exactly one registry record at a time, refreshed
+            // each cycle, so this is cycle 1's own short id while it is
+            // still running.
+            let Ok(live) = crate::commands::ctx::sessions::resolve_prefix(&state, "") else {
+                return;
+            };
+            let env = [(
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_for_writer.display().to_string(),
+            )]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            let args = crate::commands::ctx::sessions::NudgeArgs {
+                prefix: live.short,
+                message: Some("switch focus".to_string()),
+                message_file: None,
+            };
+            let mut out = Vec::new();
+            let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+            let _ = crate::commands::ctx::sessions::run_nudge_with(
+                &args,
+                &mut out,
+                &repo_for_writer,
+                &|k| env.get(k).cloned(),
+                &mut stdin,
+            );
+        });
+
+        let mut args = args_for(3);
+        args.interval_secs = Some(0);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        writer.join().expect("writer thread");
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+            std::env::remove_var("CYCLE_MARKER");
+        }
+        assert_eq!(
+            code.expect("all three cycles run, none killed by the nudge"),
+            0
+        );
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let sessions: Vec<&str> = printed
+            .lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .collect();
+        assert_eq!(
+            sessions.len(),
+            3,
+            "the nudge must not shorten the run: {printed:?}"
+        );
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        let cycle2_at = argv.find(sessions[1]).expect("cycle 2's own invocation");
+        let mail_at = argv
+            .find("switch focus")
+            .expect("the nudge's payload must reach a launch's composed prompt");
+        assert!(
+            mail_at > cycle2_at,
+            "the nudge landed during cycle 1 and must reach cycle 2, its own next boundary: {argv}"
         );
     }
 }

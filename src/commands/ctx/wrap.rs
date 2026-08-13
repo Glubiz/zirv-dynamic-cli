@@ -347,14 +347,20 @@ fn unread_mail_count(
     state: &super::state::StateDir,
     repo: &Path,
     agent: &str,
+    session_short: &str,
     mail_enabled: bool,
 ) -> Option<usize> {
     if !mail_enabled {
         return None;
     }
-    super::mail::list(state, &super::state::repo_slug(repo), Some(agent))
-        .ok()
-        .map(|found| found.len())
+    super::mail::list(
+        state,
+        &super::state::repo_slug(repo),
+        Some(agent),
+        Some(session_short),
+    )
+    .ok()
+    .map(|found| found.len())
 }
 
 pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
@@ -733,12 +739,17 @@ pub fn run_with(
             agent_name.is_some(),
             &args.command,
         );
+    let memory_slug = super::state::repo_slug(repo);
+    let memory_entries =
+        super::memory::render_for_prompt(&state_dir, &memory_slug, &cfg, super::state::now_secs());
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         skip_injection,
         &cfg.prompt,
         role,
+        &memory_entries,
+        cfg.memory.max_injected_bytes,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -960,6 +971,7 @@ pub fn run_with(
     let mut bar = BarRuntime::new(
         chrome,
         adapter.name().to_string(),
+        super::sessions::short_id(session.as_str()),
         cfg.mail.enabled,
         stdout_lock.clone(),
         (cols, rows),
@@ -1071,6 +1083,10 @@ struct BarRuntime {
     last_text: Option<String>,
     last_draw: Instant,
     harness: String,
+    /// This session's own short id (`sessions::short_id`'s vocabulary), used
+    /// to scope the mail count `unread_mail_count` reads to messages this
+    /// session may actually see, not every session's mail in the repo.
+    session_short: String,
     mail_enabled: bool,
     stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
     rows: u16,
@@ -1081,6 +1097,7 @@ impl BarRuntime {
     fn new(
         chrome: super::chrome::Chrome,
         harness: String,
+        session_short: String,
         mail_enabled: bool,
         stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
         size: (u16, u16),
@@ -1100,6 +1117,7 @@ impl BarRuntime {
                 .checked_sub(BAR_THROTTLE)
                 .unwrap_or_else(Instant::now),
             harness,
+            session_short,
             mail_enabled,
             stdout_lock,
             cols: size.0,
@@ -1203,7 +1221,13 @@ fn redraw_bar_if_due(
         .fold(None, |acc: Option<f64>, p| {
             Some(acc.map_or(p, |a| a.max(p)))
         });
-    let unread_mail = unread_mail_count(state_dir, repo, &bar.harness, bar.mail_enabled);
+    let unread_mail = unread_mail_count(
+        state_dir,
+        repo,
+        &bar.harness,
+        &bar.session_short,
+        bar.mail_enabled,
+    );
 
     let state = super::chrome::BarState {
         harness: bar.harness.clone(),
@@ -1310,12 +1334,29 @@ fn pump(
             // `zirv ctx inbox`) and never writes to the pty, only to stderr.
             // A read error (including no mailbox at all) leaves `mail_seen`
             // where it was, so it neither advises nor errors.
-            if let Some(count) =
-                unread_mail_count(state_dir, repo, adapter.name(), bar.mail_enabled)
-                && mail_grew(mail_seen, count)
+            if let Some(count) = unread_mail_count(
+                state_dir,
+                repo,
+                adapter.name(),
+                &bar.session_short,
+                bar.mail_enabled,
+            ) && mail_grew(mail_seen, count)
             {
                 announcer.emit(&Event::MailWaiting { count });
                 mail_seen = count;
+            }
+
+            // N4: an interactive session is only ever advised of a nudge,
+            // never restarted and never typed into -- the same advisory-only
+            // contract the mail-waiting line above already follows. Claiming
+            // the marker here (rather than leaving it for a byte-pump or
+            // per-tick path) matches `unread_mail_count`'s own throttling:
+            // both only ever run from this turn-signal arm.
+            if super::sessions::claim_nudge_marker(state_dir, &bar.session_short) {
+                announcer.emit(&Event::Nudge {
+                    from: bar.session_short.clone(),
+                    restarted: false,
+                });
             }
         }
 
@@ -1630,6 +1671,7 @@ mod tests {
                 colour: false,
             },
             "claude".to_string(),
+            "sess0000".to_string(),
             true,
             std::sync::Arc::new(std::sync::Mutex::new(())),
             size,
@@ -2423,7 +2465,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
-        assert_eq!(unread_mail_count(&state, &repo, "claude", true), Some(0));
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            Some(0)
+        );
     }
 
     #[test]
@@ -2436,12 +2481,16 @@ mod tests {
             from_session: "other".to_string(),
             from_agent: "claude".to_string(),
             to: "any".to_string(),
+            to_session: None,
             sent: 1,
             body: "note".to_string(),
         };
         crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
             .expect("store");
-        assert_eq!(unread_mail_count(&state, &repo, "claude", true), Some(1));
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            Some(1)
+        );
     }
 
     /// B3: `cfg.mail.enabled = false` must gate this the same way it gates
@@ -2457,6 +2506,7 @@ mod tests {
             from_session: "other".to_string(),
             from_agent: "claude".to_string(),
             to: "any".to_string(),
+            to_session: None,
             sent: 1,
             body: "note".to_string(),
         };
@@ -2464,7 +2514,7 @@ mod tests {
             .expect("store");
 
         assert_eq!(
-            unread_mail_count(&state, &repo, "claude", false),
+            unread_mail_count(&state, &repo, "claude", "sess0000", false),
             None,
             "mail.enabled = false must silence the advisory entirely"
         );
@@ -2483,6 +2533,7 @@ mod tests {
             from_session: "other".to_string(),
             from_agent: "claude".to_string(),
             to: "codex".to_string(),
+            to_session: None,
             sent: 1,
             body: "note".to_string(),
         };
@@ -2490,11 +2541,14 @@ mod tests {
             .expect("store");
 
         assert_eq!(
-            unread_mail_count(&state, &repo, "claude", true),
+            unread_mail_count(&state, &repo, "claude", "sess0000", true),
             Some(0),
             "addressed to codex, not this claude session"
         );
-        assert_eq!(unread_mail_count(&state, &repo, "codex", true), Some(1));
+        assert_eq!(
+            unread_mail_count(&state, &repo, "codex", "sess0000", true),
+            Some(1)
+        );
     }
 
     /// `mail::list` itself treats "nothing there, or not a directory" as an
@@ -2510,7 +2564,10 @@ mod tests {
         // A plain file where `mail::list` expects a directory.
         std::fs::write(state.mail().join(&slug), "not a directory").expect("write");
 
-        assert_eq!(unread_mail_count(&state, &repo, "claude", true), Some(0));
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            Some(0)
+        );
     }
 
     /// A genuine read error -- unlike "missing" or "not a directory", which
@@ -2531,7 +2588,7 @@ mod tests {
         std::fs::create_dir_all(&mailbox).expect("mkdir");
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let result = unread_mail_count(&state, &repo, "claude", true);
+        let result = unread_mail_count(&state, &repo, "claude", "sess0000", true);
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o700))
@@ -2712,6 +2769,7 @@ mod tests {
                 from_session: "other-session".to_string(),
                 from_agent: "claude".to_string(),
                 to: "any".to_string(),
+                to_session: None,
                 sent: 1,
                 body: body.to_string(),
             },
@@ -2757,6 +2815,73 @@ mod tests {
         let _ = h.child.wait();
     }
 
+    /// N4: an interactive session (`wrap`/`chat`) reacts to a nudge exactly
+    /// like the T8 mail advisory it shares a turn-signal arm with -- named
+    /// on stderr, never restarted, and never typed into the wrapped agent.
+    /// Unlike `exec`'s headless worker, there is no relaunch to fold the
+    /// nudge's own message body into, so that text never has anywhere to
+    /// reach the pty at all; this pins that directly rather than only by
+    /// absence of an injection call.
+    #[cfg(unix)]
+    #[test]
+    fn an_interactive_session_is_only_advised_and_is_never_typed_into() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state_root.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        // The empty prefix matches whichever session is currently live --
+        // there is exactly one, the wrap subprocess `spawn_wrap` just
+        // started, registered under its own (real) pid.
+        let repo = std::env::current_dir().expect("cwd");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_root.display().to_string(),
+        )]
+        .into();
+        let args = crate::commands::ctx::sessions::NudgeArgs {
+            prefix: String::new(),
+            message: Some("do-not-type-this-guidance".to_string()),
+            message_file: None,
+        };
+        let mut nudge_out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        crate::commands::ctx::sessions::run_nudge_with(
+            &args,
+            &mut nudge_out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("nudge the live wrap session");
+
+        let socket = std::fs::read_to_string(state_root.join("socket-path")).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send turn signal");
+
+        let seen = read_until(&mut h.reader, "nudged by", Duration::from_secs(10));
+        assert!(seen.contains("nudged by"), "got {seen:?}");
+        assert!(
+            !seen.contains("do-not-type-this-guidance"),
+            "the nudge's own message body must never reach the wrapped agent's pty: {seen:?}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
     #[cfg(unix)]
     #[test]
     fn wrap_never_consumes_or_injects_mail() {
@@ -2793,7 +2918,7 @@ mod tests {
         let repo = std::env::current_dir().expect("cwd");
         let state_dir = crate::commands::ctx::state::StateDir::from_root(state.clone());
         let slug = crate::commands::ctx::state::repo_slug(&repo);
-        let unread = crate::commands::ctx::mail::list(&state_dir, &slug, None).expect("list");
+        let unread = crate::commands::ctx::mail::list(&state_dir, &slug, None, None).expect("list");
         assert_eq!(unread.len(), 1, "wrap must never consume mail on its own");
 
         h.writer.write_all(b"/exit\r").expect("write");

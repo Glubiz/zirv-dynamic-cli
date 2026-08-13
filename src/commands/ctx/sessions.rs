@@ -9,10 +9,13 @@
 //! module only ever calls `StateDir::sessions()` from there rather than
 //! reaching into its internals, so the two changes stay independent.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::CtxResult;
+use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::state::StateDir;
 
 /// Mirrors `StateDir::socket_for`'s own derivation exactly: the first eight
@@ -130,12 +133,11 @@ impl SessionGuard {
         }
     }
 
-    // Read side of the API (`record`, `list`, `resolve_prefix` and their
-    // supporting types below) has no production call site yet: N1 only
-    // wires up registration at the supervisors' own spawn points. A future
-    // `zirv ctx sessions` verb is the intended consumer; until it lands
-    // these are only exercised by this module's own tests, which a plain
-    // `cargo build` (no `#[cfg(test)]`) does not see.
+    // `list`/`resolve_prefix` and their supporting types below now have
+    // production call sites (`mail::run_send_with`'s `--to-session`,
+    // `sessions::run_nudge_with`'s own resolution). `record()` alone is
+    // still only exercised by this module's own tests -- nothing yet needs
+    // the whole `Record` back out of a live guard, only its side effects.
     #[allow(dead_code)]
     pub fn record(&self) -> &Record {
         &self.record
@@ -172,7 +174,6 @@ impl Drop for SessionGuard {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liveness {
     Live,
@@ -180,7 +181,6 @@ pub enum Liveness {
 }
 
 #[cfg(unix)]
-#[allow(dead_code)]
 fn is_alive(pid: u32) -> bool {
     // SAFETY: signal 0 sends nothing; it only probes existence and
     // permission, the same check `kill -0` makes from a shell.
@@ -188,7 +188,6 @@ fn is_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-#[allow(dead_code)]
 fn is_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
@@ -209,7 +208,6 @@ fn is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-#[allow(dead_code)]
 fn is_alive(_pid: u32) -> bool {
     // No portable liveness check: never sweep a record this platform cannot
     // actually verify.
@@ -222,7 +220,6 @@ fn is_alive(_pid: u32) -> bool {
 /// returned list so a caller can say what it just cleaned up. A file that
 /// fails to parse is skipped outright: one malformed record must never fail
 /// the whole listing.
-#[allow(dead_code)]
 pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
     let Ok(entries) = std::fs::read_dir(state.sessions()) else {
         return Vec::new();
@@ -249,7 +246,6 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
     found
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolveError {
     /// No live session's short id or full session id starts with the given
@@ -288,7 +284,6 @@ impl std::error::Error for ResolveError {}
 /// Resolves a short-id (or full session-id) prefix to the one live record it
 /// names. Only live records are candidates: a stale one has already been
 /// swept from disk by the time a caller could act on it.
-#[allow(dead_code)]
 pub fn resolve_prefix(state: &StateDir, prefix: &str) -> Result<Record, ResolveError> {
     let live: Vec<Record> = list(state)
         .into_iter()
@@ -309,6 +304,131 @@ pub fn resolve_prefix(state: &StateDir, prefix: &str) -> Result<Record, ResolveE
         1 => Ok(matches.into_iter().next().expect("checked len == 1")),
         _ => Err(ResolveError::Ambiguous(matches)),
     }
+}
+
+// N4: `zirv ctx nudge <prefix>`. A nudge is two independent pieces: a
+// payload (an ordinary, durable, session-addressed mail message, so it is
+// visible in `zirv ctx inbox` and survives however long it takes to be
+// picked up) and a wake-up (an empty marker file, so a supervisor that is
+// blocked on its own poll interval does not have to wait for it). The two
+// are stored separately on purpose -- losing the marker (a crash between the
+// two writes, or nobody claiming it before the state dir is swept) never
+// loses the message, it just means the message is picked up at the next
+// natural poll or cycle instead of immediately.
+
+fn nudge_marker_path(state: &StateDir, short: &str) -> PathBuf {
+    state.sessions().join(format!("{short}.nudge"))
+}
+
+/// Best-effort, matching every other piece of state-dir housekeeping in this
+/// module: a marker that fails to write just means the wake-up is missed and
+/// the nudge's mail (already durable) is picked up at the next natural poll
+/// or cycle instead of immediately.
+fn write_nudge_marker(state: &StateDir, short: &str) {
+    let _ = super::state::create_private_dir_all(&state.sessions());
+    let _ = std::fs::write(nudge_marker_path(state, short), b"");
+}
+
+/// Atomically claims the wake-up marker for `short`, if one is there.
+/// `std::fs::remove_file` is the atomic claim, the same idiom `mail::
+/// claim_and_write` and `mail::consume` build on: exactly one racing
+/// observer ever sees `Ok(())`, every other one sees `NotFound`, so two
+/// supervisors polling the same session at once cannot both act on the same
+/// wake-up.
+pub fn claim_nudge_marker(state: &StateDir, short: &str) -> bool {
+    std::fs::remove_file(nudge_marker_path(state, short)).is_ok()
+}
+
+#[derive(Debug, clap::Args)]
+pub struct NudgeArgs {
+    /// Short id (or a unique prefix of one) of the live session to nudge.
+    pub prefix: String,
+    /// Message text. When omitted, read from `--message-file`, else from
+    /// stdin.
+    #[arg(long)]
+    pub message: Option<String>,
+    /// Path to a file holding the message text.
+    #[arg(long)]
+    pub message_file: Option<PathBuf>,
+}
+
+/// `--message`, else `--message-file`, else stdin -- trimmed either way, the
+/// same convention `mail::resolve_message` uses.
+fn resolve_nudge_message(args: &NudgeArgs, stdin: &mut dyn Read) -> CtxResult<String> {
+    if let Some(text) = &args.message {
+        return Ok(text.trim().to_string());
+    }
+    if let Some(path) = &args.message_file {
+        return Ok(std::fs::read_to_string(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .trim()
+            .to_string());
+    }
+    let mut buffer = String::new();
+    stdin.read_to_string(&mut buffer)?;
+    Ok(buffer.trim().to_string())
+}
+
+pub fn run_nudge_with<W: Write>(
+    args: &NudgeArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    stdin: &mut dyn Read,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    if !cfg.mail.enabled {
+        // A nudge's payload is ordinary mail; without mail there is nothing
+        // durable left to deliver, and the marker alone (no message to
+        // explain why the session woke up) is worse than refusing outright.
+        return Err(
+            "zirv ctx nudge: mail is disabled (mail.enabled = false); nothing was sent".into(),
+        );
+    }
+
+    let state = StateDir::resolve(env)?;
+    // Only a live session is a valid nudge target: `resolve_prefix` already
+    // filters to live records (a stale one was swept from disk by the time a
+    // caller could act on it), so an unknown *or* dead session both surface
+    // as the same `NotFound`, naming what is actually there instead.
+    let record =
+        resolve_prefix(&state, &args.prefix).map_err(|e| format!("zirv ctx nudge: {e}"))?;
+
+    let body = resolve_nudge_message(args, stdin)?;
+    if body.is_empty() {
+        return Err(
+            "zirv ctx nudge: no message given; pass --message, --message-file, or pipe one on stdin"
+                .into(),
+        );
+    }
+
+    let msg = super::mail::Message {
+        from_session: super::mail::identity_or_unknown(env, super::adapters::SESSION_ENV),
+        from_agent: super::mail::identity_or_unknown(env, super::adapters::AGENT_ENV),
+        to: record.agent.clone(),
+        to_session: Some(record.short.clone()),
+        sent: super::state::now_secs(),
+        body,
+    };
+    let slug = super::state::repo_slug(repo);
+    super::mail::store(&state, &slug, &msg, &cfg)?;
+    // Written after the mail: losing the marker (crash, or a write failure)
+    // must never mean the message itself was lost, only that it is picked up
+    // at the next natural poll or cycle instead of immediately.
+    write_nudge_marker(&state, &record.short);
+
+    writeln!(
+        w,
+        "zirv ctx nudge: queued for {} ({})",
+        record.short, record.agent
+    )?;
+    Ok(0)
+}
+
+pub fn run_nudge<W: Write>(args: &NudgeArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_nudge_with(args, w, &repo, &env, &mut std::io::stdin())
 }
 
 #[cfg(test)]
@@ -609,5 +729,112 @@ mod tests {
                 "verb {verb} must serialize as its lowercase word: {raw}"
             );
         }
+    }
+
+    // N4: `zirv ctx nudge`.
+
+    fn env_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_nudge_stores_a_session_addressed_message_and_a_wake_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+        let record = record_for("abcdef12-3456-4789-8abc-def012345678", &repo, Verb::Exec);
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = NudgeArgs {
+            prefix: "abcd".to_string(),
+            message: Some("please check the new failing test".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect("nudge");
+        assert_eq!(code, 0);
+
+        let slug = super::super::state::repo_slug(&repo);
+        let listed = super::super::mail::list(&state, &slug, None, Some(&short)).expect("list");
+        assert_eq!(listed.len(), 1, "the payload is durable, ordinary mail");
+        assert_eq!(listed[0].1.to_session, Some(short.clone()));
+        assert_eq!(listed[0].1.body, "please check the new failing test");
+
+        assert!(
+            nudge_marker_path(&state, &short).is_file(),
+            "the wake-up marker exists alongside the payload"
+        );
+    }
+
+    #[test]
+    fn the_marker_is_claimed_exactly_once_even_with_two_observers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        write_nudge_marker(&state, "aaaa1111");
+
+        assert!(
+            claim_nudge_marker(&state, "aaaa1111"),
+            "the first observer claims it"
+        );
+        assert!(
+            !claim_nudge_marker(&state, "aaaa1111"),
+            "a second observer finds nothing left to claim"
+        );
+    }
+
+    #[test]
+    fn nudging_an_unknown_or_dead_session_is_an_error_that_says_so() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = NudgeArgs {
+            prefix: "zzzz".to_string(),
+            message: Some("hello?".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect_err("no session is registered at all");
+        assert!(err.to_string().contains("no session"), "got {err}");
+
+        // A dead session (its process gone) is swept from the registry on
+        // read, so it surfaces exactly the same way as unknown -- there is
+        // nothing left to disambiguate it from "never existed".
+        let state = state_in(&state_dir);
+        let mut dead = record_for("dddddddd-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        dead.pid = dead_pid();
+        write_record(&state, &dead);
+
+        let args = NudgeArgs {
+            prefix: "dddd".to_string(),
+            message: Some("hello?".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect_err("the only match is dead");
+        assert!(err.to_string().contains("no session"), "got {err}");
     }
 }

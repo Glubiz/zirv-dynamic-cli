@@ -1,13 +1,18 @@
 //! Supervises one headless run, restarting it on rot with a distilled
 //! handoff. Mail (`super::mail`) is delivered into the composed system
 //! prompt exactly once, at the very first launch computed in `run_with`: a
-//! restart or a usage-limit park reuses that same launch's `prompt_args`
-//! (the argv already carrying the composed text, whichever mechanism
-//! delivered it), it does not recompute the composed prompt or re-list mail.
-//! A message that arrives after the run has started is therefore not
-//! retroactively injected into it -- the next `zirv ctx exec` invocation (or
-//! a `zirv ctx loop` cycle, which re-lists mail every cycle by design) picks
-//! it up instead.
+//! rot/timeout restart or a usage-limit park reuses that same launch's
+//! `prompt_args` (the argv already carrying the composed text, whichever
+//! mechanism delivered it), it does not recompute the composed prompt or
+//! re-list mail. A message that arrives after the run has started is
+//! therefore not retroactively injected into it -- the next `zirv ctx exec`
+//! invocation (or a `zirv ctx loop` cycle, which re-lists mail every cycle
+//! by design) picks it up instead.
+//!
+//! N4's `zirv ctx nudge` is the one deliberate exception: a nudge relaunch
+//! recomposes the prompt and re-lists mail (scoped to the session that was
+//! nudged) precisely because that recompute is the whole point -- see the
+//! `nudged` branch in the main loop below.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -226,6 +231,18 @@ pub fn run_with<W: Write>(
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     let adapter = adapters::select(agent_name, &args.command, &cfg)?;
     let state = StateDir::resolve(env)?;
+    // Computed early (`mail_slug` further down reuses this exact value)
+    // because both the memory layer below and the mail layer need a slug,
+    // and the memory layer's own read has to happen before the first
+    // `compose` call.
+    let mail_slug = super::state::repo_slug(repo);
+    // N5: this run's memory bank, already rendered (age included) so
+    // `prompt::compose` itself never has to read a clock. Loaded once, here,
+    // and reused verbatim by the nudge-restart recompose below -- unlike
+    // mail, which is deliberately re-listed narrowly by session on that
+    // path, the memory bank is repo-wide and does not go stale within one
+    // `run_with` call the way a specific session's mailbox does.
+    let memory_entries = super::memory::render_for_prompt(&state, &mail_slug, &cfg, now_secs());
 
     // A wrapped command that matches no adapter (no explicit `--agent`,
     // detection came up empty) is not actually the agent whose flags we would
@@ -242,6 +259,8 @@ pub fn run_with<W: Write>(
         skip_injection,
         &cfg.prompt,
         super::prompt::PromptRole::Worker,
+        &memory_entries,
+        cfg.memory.max_injected_bytes,
     );
     // Known before argv is touched, because it decides how argv is read: the
     // token holding this exact text is the prompt, whatever it looks like.
@@ -269,20 +288,41 @@ pub fn run_with<W: Write>(
     let prompt_value_at = locate_prompt(&args.command, prefix, prompt.as_deref())
         .and_then(|(index, value)| value.map(|_| index + 1));
 
+    // Determined before mail is listed (N3: delivery is scoped to this
+    // session's own short id, so the id has to exist first) and before
+    // `prompt_args` (M7 needs a session id to name the private prompt file
+    // after) rather than after, as this used to be.
+    let session_raw = args
+        .session_id
+        .clone()
+        .unwrap_or_else(|| SessionId::new_v4().to_string());
+    let mut session = SessionId::parse(&session_raw);
+
     // Mail is delivered once, here, at the first launch: every restart below
     // reuses this same `composed` value (see the module doc), so a message
     // that arrives mid-run is not retroactively injected into an
     // already-running session. `run_loop`, by contrast, starts a fresh
     // session every cycle and re-lists mail on each one.
-    let mail_slug = super::state::repo_slug(repo);
+    //
     // `mut`: drained by the loop below, once, right after the first
     // successful spawn -- not here. Consuming this early (Item 3's fix) used
     // to mark the mail read before any child had actually started: a launch
     // that fails to spawn at all, or a long pacing park ahead of it, moved
     // it to `read/` with no session ever having seen it.
+    //
+    // N3: scoped to this session's own short id, so a message addressed to a
+    // different session (`send --to-session`) never leaks into this launch's
+    // prompt just because the two share a repo and an agent name.
+    let session_short = super::sessions::short_id(session.as_str());
     let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
         if composed.is_some() && cfg.mail.enabled {
-            super::mail::list(&state, &mail_slug, Some(adapter.name())).unwrap_or_default()
+            super::mail::list(
+                &state,
+                &mail_slug,
+                Some(adapter.name()),
+                Some(&session_short),
+            )
+            .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -299,7 +339,11 @@ pub fn run_with<W: Write>(
     // The first spawn's own argv may already carry the adapter's system-prompt
     // flag (e.g. `-- claude --append-system-prompt "..."`); merge it in rather
     // than letting `prompt_args` silently override it below.
-    let (launch_command, composed) = super::prompt::merge_command_line_prompt(
+    // `mut`: a nudge relaunch (N4) recomposes fresh, mail included, and
+    // replaces this binding so any restart or park after it keeps using the
+    // nudge-enriched prompt rather than silently reverting to the launch-time
+    // one.
+    let (launch_command, mut composed) = super::prompt::merge_command_line_prompt(
         adapter.as_ref(),
         &args.command,
         composed,
@@ -313,14 +357,6 @@ pub fn run_with<W: Write>(
     // silently dropping these.
     let user_extra = extra_launch_flags(&launch_command, prefix, prompt.as_deref());
 
-    // Determined before `prompt_args` (M7 needs a session id to name the
-    // private prompt file after) rather than after, as this used to be.
-    let session_raw = args
-        .session_id
-        .clone()
-        .unwrap_or_else(|| SessionId::new_v4().to_string());
-    let mut session = SessionId::parse(&session_raw);
-
     // The probe has to hit the binary that will actually be spawned. When the
     // argv names no program the adapter builds the launch, so there is nothing
     // in `launch_command` to probe -- it is flags, and `--model --help` is not
@@ -330,7 +366,8 @@ pub fn run_with<W: Write>(
     } else {
         &launch_command
     };
-    let prompt_args = super::prompt::injection_args_for_session(
+    // `mut`: recomputed by a nudge relaunch alongside `composed` above.
+    let mut prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),
         probe_target,
         composed.as_ref(),
@@ -455,6 +492,13 @@ pub fn run_with<W: Write>(
         command.env(key, value);
     }
     let mut restarts = 0;
+    // N4: consecutive `zirv ctx nudge`-driven restarts, capped by `cfg.
+    // supervise.max_nudges` -- a separate budget from `restarts` above,
+    // since a nudge is not rot and must never spend it. A relaunch (nudge or
+    // otherwise) needs a known prompt to carry forward; without one a nudge
+    // is claimed but ignored, the same as being over the cap.
+    let mut nudge_restarts = 0u32;
+    let can_restart = prompt.is_some();
     let now_fn = now_secs;
     let sleep_fn = |d: Duration| std::thread::sleep(d);
 
@@ -505,6 +549,7 @@ pub fn run_with<W: Write>(
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
         let mut limit_hit = false;
+        let mut nudged = false;
 
         let outcome = supervise_run(
             &mut child,
@@ -519,6 +564,10 @@ pub fn run_with<W: Write>(
             &mut rotted,
             &tap,
             &mut limit_hit,
+            &mut nudged,
+            nudge_restarts,
+            cfg.supervise.max_nudges,
+            can_restart,
         )?;
 
         // `supervise_child` checks the child's exit status before calling the
@@ -542,6 +591,141 @@ pub fn run_with<W: Write>(
                 return Ok(code);
             }
             Outcome::Exited(_) | Outcome::TimedOut | Outcome::StoppedByTick(_) => {}
+        }
+
+        // N4: a nudge relaunch is neither a limit park nor a rot restart --
+        // `supervise_run`'s own tick only ever sets `nudged` when a relaunch
+        // is actually possible (a known prompt) and under the consecutive
+        // cap, so this arm always follows through rather than needing its
+        // own "no prompt"/"over budget" fallbacks the way rot's restart does.
+        if nudged {
+            let nudged_short = super::sessions::short_id(session.as_str());
+            let prompt_text = prompt
+                .clone()
+                .expect("supervise_run only sets `nudged` when a prompt is known");
+
+            let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
+            let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+            let (note, source) = handoff::distill_or_structural(
+                adapter.as_ref(),
+                &cfg.handoff.model,
+                &ctx,
+                Duration::from_secs(cfg.handoff.timeout_secs),
+            );
+            let stored = handoff::store(&state, repo, session.as_str(), &note)?;
+
+            session = SessionId::new_v4();
+            session_guard.refresh_session(session.as_str());
+            transcript = derive_transcript(&session);
+
+            // Recompose fresh -- unlike an ordinary restart, which reuses
+            // the launch-time `composed`/`prompt_args` untouched (see this
+            // module's own doc comment), a nudge relaunch is explicitly the
+            // chance to pick up what prompted it: the nudge's own payload
+            // arrived as ordinary session-addressed mail (`sessions::run_
+            // nudge_with` stores it before writing the wake-up marker), so
+            // re-listing mail for the session that was just nudged and
+            // folding it in through `with_mail_layer` delivers it with zero
+            // new injection machinery.
+            let mut fresh = super::prompt::compose(
+                crate::utils::home_dir().ok().as_deref(),
+                repo,
+                skip_injection,
+                &cfg.prompt,
+                super::prompt::PromptRole::Worker,
+                &memory_entries,
+                cfg.memory.max_injected_bytes,
+            );
+            let nudge_mail: Vec<(PathBuf, super::mail::Message)> = if cfg.mail.enabled {
+                super::mail::list(
+                    &state,
+                    &mail_slug,
+                    Some(adapter.name()),
+                    Some(&nudged_short),
+                )
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let nudge_mail_msgs: Vec<super::mail::Message> =
+                nudge_mail.iter().map(|(_, msg)| msg.clone()).collect();
+            if !nudge_mail_msgs.is_empty() {
+                announcer.emit(&super::announce::Event::MailDelivered {
+                    count: nudge_mail_msgs.len(),
+                });
+            }
+            fresh = super::prompt::with_mail_layer(
+                fresh,
+                &nudge_mail_msgs,
+                cfg.mail.max_delivered_bytes,
+            );
+            let (_, fresh) = super::prompt::merge_command_line_prompt(
+                adapter.as_ref(),
+                &launch_command,
+                fresh,
+                prompt_value_at,
+            );
+            composed = fresh;
+            prompt_args = super::prompt::injection_args_for_session(
+                adapter.as_ref(),
+                probe_target,
+                composed.as_ref(),
+                &state,
+                session.as_str(),
+            );
+            // Folded into the prompt above, but only actually marked read
+            // once the relaunch that carries it genuinely spawns -- the same
+            // Item 3 discipline every other delivery seam in this function
+            // follows.
+            mail_entries = nudge_mail;
+
+            super::prompt::log_injection(
+                &state,
+                "exec",
+                session.as_str(),
+                composed.as_ref(),
+                adapter.capabilities().system_prompt,
+            );
+            announcer.emit(&super::prompt::injection_event(
+                composed.as_ref(),
+                adapter.capabilities().system_prompt,
+            ));
+            announcer.emit(&super::announce::Event::Nudge {
+                from: nudged_short,
+                restarted: true,
+            });
+
+            nudge_restarts += 1;
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: session.as_str(),
+                    verb: "exec",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "nudge-restart",
+                    detail: &format!("{source} handoff at {}", stored.display()),
+                },
+            );
+            writeln!(
+                w,
+                "zirv ctx exec: nudged ({nudge_restarts}/{}), restarting with a {source} handoff",
+                cfg.supervise.max_nudges
+            )?;
+
+            let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+            let extra: Vec<String> = user_extra
+                .iter()
+                .cloned()
+                .chain(prompt_args.iter().cloned())
+                .collect();
+            command = adapter.headless_cmd(&combined, &session, &extra);
+            command.current_dir(repo);
+            for (key, value) in turn_env_for(&session) {
+                command.env(key, value);
+            }
+            continue;
         }
 
         if limit_hit {
@@ -758,7 +942,12 @@ fn supervise_run(
     rotted: &mut bool,
     tap: &supervise::OutputTap,
     limit_hit: &mut bool,
+    nudged: &mut bool,
+    nudges_used: u32,
+    max_nudges: u32,
+    can_restart: bool,
 ) -> CtxResult<Outcome> {
+    let session_short = super::sessions::short_id(session);
     let mut tick = || {
         if pace::scan_for_limit(
             &tap.try_lines(),
@@ -776,6 +965,37 @@ fn supervise_run(
         {
             *rotted = true;
             return Tick::Stop("rot");
+        }
+        // N4: claiming the marker is atomic (`remove_file`), so exactly one
+        // observer ever sees `true` -- important even within one process,
+        // since a stale marker from a previous cycle must never re-fire.
+        // Gracefully stops the child (same `Tick::Stop` shape rot uses) only
+        // when a relaunch is actually possible and the consecutive-nudge cap
+        // has not been reached; otherwise the marker is still claimed (so it
+        // never re-triggers) but the child runs on untouched and the mail
+        // stays unread -- `nudge-ignored` in the decision log says why.
+        if super::sessions::claim_nudge_marker(state, &session_short) {
+            if can_restart && nudges_used < max_nudges {
+                *nudged = true;
+                return Tick::Stop("nudge");
+            }
+            let _ = log::append(
+                state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session,
+                    verb: "exec",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "nudge-ignored",
+                    detail: if can_restart {
+                        "consecutive nudge cap reached; message left unread"
+                    } else {
+                        "no prompt available for a nudge relaunch; message left unread"
+                    },
+                },
+            );
+            return Tick::Continue;
         }
         // A scoring failure must never kill a healthy run.
         match scorer.poll(adapter, score_cfg) {
@@ -1925,6 +2145,7 @@ mod tests {
                 from_session: "other-session".to_string(),
                 from_agent: "claude".to_string(),
                 to: "any".to_string(),
+                to_session: None,
                 sent: 1,
                 body: "heads up: the webhook route moved".to_string(),
             },
@@ -1988,6 +2209,7 @@ mod tests {
                 from_session: "other-session".to_string(),
                 from_agent: "claude".to_string(),
                 to: "any".to_string(),
+                to_session: None,
                 sent: 1,
                 body: "heads up: the webhook route moved".to_string(),
             },
@@ -2024,7 +2246,7 @@ mod tests {
             "mail.enabled = false must gate delivery, not just send/inbox: {argv}"
         );
 
-        let unread = crate::commands::ctx::mail::list(&state, &slug, None).expect("list");
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None, None).expect("list");
         assert_eq!(
             unread.len(),
             1,
@@ -2051,6 +2273,7 @@ mod tests {
                 from_session: "other-session".to_string(),
                 from_agent: "claude".to_string(),
                 to: "any".to_string(),
+                to_session: None,
                 sent: 1,
                 body: "heads up: the webhook route moved".to_string(),
             },
@@ -2137,6 +2360,7 @@ mod tests {
                 from_session: "other-session".to_string(),
                 from_agent: "claude".to_string(),
                 to: "any".to_string(),
+                to_session: None,
                 sent: 1,
                 body: "must stay unread".to_string(),
             },
@@ -2171,7 +2395,7 @@ mod tests {
         let result = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         assert!(result.is_err(), "the launch must fail to spawn: {result:?}");
 
-        let unread = crate::commands::ctx::mail::list(&state, &slug, None).expect("list");
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None, None).expect("list");
         assert_eq!(
             unread.len(),
             1,
@@ -2200,6 +2424,7 @@ mod tests {
                 from_session: "other-session".to_string(),
                 from_agent: "claude".to_string(),
                 to: "any".to_string(),
+                to_session: None,
                 sent: 1,
                 body: "heads up: the webhook route moved".to_string(),
             },
@@ -2340,5 +2565,415 @@ mod tests {
         assert_eq!(code.expect("runs"), 0);
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
         assert!(!log.contains("pace-wait"), "nothing to wait for: {log}");
+    }
+
+    // N4: `zirv ctx nudge` restarting a headless worker.
+    //
+    // Every test here drives a real `run_with` call whose first agent
+    // invocation hangs (`FAKE_AGENT_MODE_FILE` starting with "hang") and is
+    // nudged from a background thread once its transcript is up. Like every
+    // other test in this module that spawns `sh`/`fake-agent.sh`, these are
+    // blocked on Windows by the pre-existing os-193 spawn issue (see this
+    // module's other `sh`-spawning tests); written to the same standard the
+    // rest of this suite holds regardless.
+
+    /// Polls `path` until it has at least `n` lines or `timeout` elapses,
+    /// returning whatever was there either way -- the same "best effort,
+    /// bounded wait" shape `run_loop.rs`'s own synchronized tests use via a
+    /// marker file, adapted here to a growing log instead of a touch-once
+    /// marker since more than one invocation is expected.
+    fn wait_for_lines(path: &std::path::Path, n: usize, timeout: Duration) -> Vec<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+                if lines.len() >= n {
+                    return lines;
+                }
+            }
+            if Instant::now() >= deadline {
+                return std::fs::read_to_string(path)
+                    .map(|t| t.lines().map(|l| l.to_string()).collect())
+                    .unwrap_or_default();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Nudges whichever session is currently live. `exec` (like `loop`)
+    /// keeps exactly one registry record at a time, refreshed on every
+    /// restart or park, so an empty prefix (`starts_with("")` is always
+    /// true) always resolves to the run this test is driving without the
+    /// test needing to know that session's exact id.
+    fn nudge_live_session(state_dir: &std::path::Path, repo: &std::path::Path, message: &str) {
+        let env: HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.display().to_string(),
+        )]
+        .into();
+        let args = crate::commands::ctx::sessions::NudgeArgs {
+            prefix: String::new(),
+            message: Some(message.to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        crate::commands::ctx::sessions::run_nudge_with(
+            &args,
+            &mut out,
+            repo,
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("nudge the live session");
+    }
+
+    #[test]
+    fn a_headless_worker_stops_at_the_next_poll_and_relaunches_with_the_guidance() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session_log = tmp.path().join("session.log");
+        let session = "10101010-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &session_log);
+        }
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let session_log_for_writer = session_log.clone();
+        let writer = std::thread::spawn(move || {
+            let lines = wait_for_lines(&session_log_for_writer, 1, Duration::from_secs(5));
+            if lines.is_empty() {
+                return;
+            }
+            nudge_live_session(
+                &state_for_writer,
+                &repo_for_writer,
+                "switch to the new failing test",
+            );
+        });
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        writer.join().expect("writer thread");
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
+        }
+        assert_eq!(
+            code.expect("the second (healthy) launch finishes the run"),
+            0
+        );
+
+        let sessions = wait_for_lines(&session_log, 2, Duration::from_millis(1));
+        assert_eq!(
+            sessions.len(),
+            2,
+            "exactly one relaunch: the nudge, then a clean exit"
+        );
+        assert_ne!(
+            sessions[0], sessions[1],
+            "the relaunch mints a fresh session id"
+        );
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("switch to the new failing test"),
+            "the nudge's guidance must reach the relaunch's composed prompt: {argv}"
+        );
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"nudge-restart\""), "got {log}");
+    }
+
+    /// N4: a nudge-driven restart must never touch the rot restart budget --
+    /// with `max_restarts: 0`, an ordinary rot or timeout restart would
+    /// immediately "give up"; a nudge restart must succeed anyway, and the
+    /// normal rot-restart machinery (`"action":"restart"`, a `"rot"` or
+    /// `"timeout"` verdict) must never fire at all.
+    #[test]
+    fn a_nudge_restart_does_not_spend_the_rot_restart_budget() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let session_log = tmp.path().join("session.log");
+        let session = "20202020-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &session_log);
+        }
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let session_log_for_writer = session_log.clone();
+        let writer = std::thread::spawn(move || {
+            let lines = wait_for_lines(&session_log_for_writer, 1, Duration::from_secs(5));
+            if lines.is_empty() {
+                return;
+            }
+            nudge_live_session(&state_for_writer, &repo_for_writer, "keep going");
+        });
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            // Zero rot-restart budget: proves the nudge restart below is not
+            // drawing from it.
+            max_restarts: Some(0),
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        writer.join().expect("writer thread");
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
+        }
+        assert_eq!(
+            code.expect("a nudge restart with zero rot budget must still succeed"),
+            0
+        );
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"nudge-restart\""), "got {log}");
+        assert!(
+            !log.contains("\"action\":\"restart\""),
+            "the ordinary rot-restart action must never fire: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"give-up\""),
+            "zero budget only matters to rot/timeout, which never triggered: {log}"
+        );
+        assert!(
+            !log.contains("\"verdict\":\"rot\"") && !log.contains("\"verdict\":\"timeout\""),
+            "nothing here rotted or timed out: {log}"
+        );
+    }
+
+    /// N4: a nudge restart carries a handoff forward exactly like a rot or
+    /// timeout restart does -- distilled or structural, stored under the old
+    /// session, and named in the decision log detail the same way
+    /// `"{source} handoff at {path}"` already reads for the ordinary path.
+    #[test]
+    fn a_nudge_restart_carries_a_handoff_forward_like_every_other_restart() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let session_log = tmp.path().join("session.log");
+        let session = "30303030-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &session_log);
+        }
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let session_log_for_writer = session_log.clone();
+        let writer = std::thread::spawn(move || {
+            let lines = wait_for_lines(&session_log_for_writer, 1, Duration::from_secs(5));
+            if lines.is_empty() {
+                return;
+            }
+            nudge_live_session(&state_for_writer, &repo_for_writer, "keep going");
+        });
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        writer.join().expect("writer thread");
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        assert!(
+            crate::commands::ctx::handoff::latest_for_repo(&state, tmp.path())
+                .expect("handoff lookup")
+                .is_some(),
+            "a nudge restart must distill and store a handoff, like every other restart"
+        );
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        let nudge_restart_line = log
+            .lines()
+            .find(|l| l.contains("\"action\":\"nudge-restart\""))
+            .unwrap_or_else(|| panic!("no nudge-restart entry: {log}"));
+        assert!(
+            nudge_restart_line.contains("handoff at"),
+            "names the handoff the same way an ordinary restart does: {nudge_restart_line}"
+        );
+    }
+
+    /// N4: `cfg.supervise.max_nudges` caps consecutive nudge restarts. Past
+    /// the cap the marker is still claimed (so it does not keep re-firing)
+    /// but nothing is stopped or relaunched, and the nudge's own mail stays
+    /// unread -- still visible via `zirv ctx inbox` -- rather than being
+    /// silently dropped.
+    #[test]
+    fn consecutive_nudge_restarts_are_capped_and_the_message_is_left_unread() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let session_log = tmp.path().join("session.log");
+        let session = "40404040-2222-4333-8444-555555555555";
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
+        env.insert("ZIRV_CTX_MAX_NUDGES".to_string(), "1".to_string());
+
+        // Three potential runs scripted; only two are ever expected to
+        // start (the first nudge restarts once, the second is ignored, and
+        // the second run's own hang has to end some other way -- the
+        // `timeout_secs` below, with a zero rot budget, is what ends it).
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "hang\nhang\nhealthy\n").expect("write modes");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
+            std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &session_log);
+        }
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let session_log_for_writer = session_log.clone();
+        let writer = std::thread::spawn(move || -> Vec<String> {
+            let first = wait_for_lines(&session_log_for_writer, 1, Duration::from_secs(5));
+            if first.is_empty() {
+                return Vec::new();
+            }
+            nudge_live_session(&state_for_writer, &repo_for_writer, "first nudge, honored");
+
+            let second = wait_for_lines(&session_log_for_writer, 2, Duration::from_secs(5));
+            if second.len() < 2 {
+                return second;
+            }
+            nudge_live_session(
+                &state_for_writer,
+                &repo_for_writer,
+                "second nudge, should be ignored",
+            );
+            second
+        });
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            // Short enough that the second (ignored-nudge) hang ends the
+            // run on its own once the cap has been proven, rather than
+            // hanging the test forever.
+            timeout_secs: Some(3),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        let sessions = writer.join().expect("writer thread");
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE_FILE");
+            std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
+        }
+        assert_eq!(
+            code.expect("runs"),
+            EXIT_TIMEOUT,
+            "the second hang is never nudged into relaunching again, so it eventually times out \
+             with no rot budget left to restart on"
+        );
+
+        let all_sessions = wait_for_lines(&session_log, 2, Duration::from_millis(1));
+        assert_eq!(
+            all_sessions.len(),
+            2,
+            "exactly one relaunch (the first nudge); the second was ignored: {all_sessions:?}"
+        );
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.contains("\"action\":\"nudge-restart\""))
+                .count(),
+            1,
+            "only the first nudge restarts: {log}"
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.contains("\"action\":\"nudge-ignored\""))
+                .count(),
+            1,
+            "the second is claimed but ignored, not silently dropped: {log}"
+        );
+
+        // The second nudge's own mail must still be sitting there, unread.
+        let second_short = sessions
+            .get(1)
+            .map(|raw| crate::commands::ctx::sessions::short_id(raw))
+            .expect("the second session started");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None, Some(&second_short))
+            .expect("list");
+        assert_eq!(
+            unread.len(),
+            1,
+            "the ignored nudge's mail is left unread, still visible via `zirv ctx inbox`: {unread:?}"
+        );
+        assert_eq!(unread[0].1.body, "second nudge, should be ignored");
     }
 }

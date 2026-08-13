@@ -323,6 +323,42 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
     Ok(false)
 }
 
+/// Loads this repo's memory bank as already-rendered prompt lines
+/// (`prompt::MemoryLine`), gated on `cfg.memory.enabled` -- an empty vec
+/// when disabled, the same "disabled means nothing delivered" contract
+/// every mail delivery seam already follows for `cfg.mail.enabled`. `now` is
+/// a plain `u64` (`state::now_secs()`, read by the caller) rather than read
+/// in here: `prompt.rs` stays clock-free like `rot.rs`, so the one clock
+/// read for "how old is this entry" happens at this call, the last point
+/// before the rendered text crosses into that module.
+///
+/// The wording ("written Nd ago, verified Nd ago") matches `run_recall_
+/// with`'s own human-readable branch, so "how old" reads the same everywhere
+/// it appears.
+pub fn render_for_prompt(
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+    now: u64,
+) -> Vec<super::prompt::MemoryLine> {
+    if !cfg.memory.enabled {
+        return Vec::new();
+    }
+    list(state, slug)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, entry)| {
+            let written_days = now.saturating_sub(entry.written) / 86_400;
+            let verified_days = now.saturating_sub(entry.verified) / 86_400;
+            super::prompt::MemoryLine {
+                key: entry.key,
+                age: format!("written {written_days}d ago, verified {verified_days}d ago"),
+                body: entry.body,
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, clap::Args)]
 pub struct RememberArgs {
     /// The fact's key, e.g. "staging-db-creds".
@@ -967,5 +1003,51 @@ This should not appear in the body.\n";
         let err = run_forget_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect_err("neither a key nor --all was given");
         assert!(err.to_string().contains("--all"), "got {err}");
+    }
+
+    // N5: the memory prompt layer's own source, `render_for_prompt`.
+
+    #[test]
+    fn render_for_prompt_renders_the_key_and_age_of_every_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let now = 1_700_000_000u64;
+
+        let mut fresh = sample("build-cmd", now.saturating_sub(3 * 86_400));
+        fresh.verified = now.saturating_sub(86_400);
+        fresh.body = "cargo build --release".to_string();
+        remember(&state, "-work-repo", &fresh, &cfg).expect("remember");
+
+        let rendered = render_for_prompt(&state, "-work-repo", &cfg, now);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].key, "build-cmd");
+        assert_eq!(rendered[0].body, "cargo build --release");
+        assert_eq!(rendered[0].age, "written 3d ago, verified 1d ago");
+    }
+
+    #[test]
+    fn render_for_prompt_is_empty_when_memory_is_disabled_even_with_entries_stored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        remember(
+            &state,
+            "-work-repo",
+            &sample("build-cmd", 1_700_000_000),
+            &CtxConfig::default(),
+        )
+        .expect("remember");
+
+        let disabled = CtxConfig {
+            memory: super::super::config::MemoryConfig {
+                enabled: false,
+                ..super::super::config::MemoryConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        assert!(
+            render_for_prompt(&state, "-work-repo", &disabled, 1_700_000_000).is_empty(),
+            "a disabled bank must render nothing, however much is stored"
+        );
     }
 }
