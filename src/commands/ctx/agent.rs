@@ -14,11 +14,13 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use super::CtxResult;
 use super::announce::{Announcer, Event};
 use super::chat::quiet_env;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::dash::spawnreq;
 use super::event::SessionId;
 use super::exec::{self, ExecArgs};
 
@@ -81,6 +83,86 @@ pub fn exit_note(code: i32) -> Option<String> {
     matches!(code, exec::EXIT_ROT_EXHAUSTED | exec::EXIT_TIMEOUT).then(|| exec::describe_exit(code))
 }
 
+/// How long a delegated run waits for the dashboard's own answer before
+/// giving up and running headless instead. Generous enough for a live
+/// dashboard's own event loop (50ms poll, plus a once-per-tick request
+/// sweep) to notice the request and spawn a pane; short enough that an
+/// operator who is not actually running a dashboard right now (a stale
+/// `DASH_REQUESTS_ENV` inherited from a shell that used to be a pane, whose
+/// directory has not yet been reaped) is not kept waiting for long.
+const DASH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// When this process is itself a dashboard pane's own child
+/// (`spawnreq::DASH_REQUESTS_ENV` set, and the directory it names still
+/// exists -- the dashboard deletes it on quit, see `dash::on_quit`), asks
+/// the dashboard to spawn `name` as a fresh pane instead of running headless
+/// in this process's own subshell: writes a `spawnreq::SpawnRequest`
+/// carrying `prompt` as data (never argv, the same discipline every other
+/// delegation path in this codebase already holds), then waits up to
+/// `DASH_ACK_TIMEOUT` for the matching ack.
+///
+/// `Some(result)` means the dashboard answered (or the request itself could
+/// not even be written) and the caller's own headless path must NOT run --
+/// a pane was spawned there instead, or the request was refused outright.
+/// `None` means either there is no dashboard to ask (env unset, or the
+/// directory is gone -- both **byte-for-byte** today's behavior, no notice
+/// printed) or a live one did not answer in time (a notice IS printed, since
+/// that case is a live channel that just did not respond), and either way
+/// the caller falls through to today's headless behavior unchanged.
+fn try_join_dashboard<W: Write>(
+    name: &str,
+    prompt: &str,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Option<CtxResult<i32>> {
+    let dir = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from)?;
+    if !dir.is_dir() {
+        return None;
+    }
+    let requested_by = env(super::adapters::SESSION_ENV)
+        .map(|s| super::sessions::short_id(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let req = spawnreq::SpawnRequest {
+        agent: name.to_string(),
+        prompt: prompt.to_string(),
+        cwd: repo.to_path_buf(),
+        requested_by,
+    };
+    let path = match spawnreq::write_request(&dir, &req) {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("zirv ctx agent: dashboard did not answer; running headless");
+            return None;
+        }
+    };
+    let Some(stem) = spawnreq::request_stem(&path) else {
+        eprintln!("zirv ctx agent: dashboard did not answer; running headless");
+        return None;
+    };
+    match spawnreq::wait_for_ack(&dir, &stem, DASH_ACK_TIMEOUT) {
+        Some(ack) if ack.ok => {
+            let short = ack.short.unwrap_or_default();
+            Some(
+                writeln!(w, "spawned in dashboard as {short}")
+                    .map(|_| 0)
+                    .map_err(|e| e.into()),
+            )
+        }
+        Some(ack) => {
+            let reason = ack
+                .reason
+                .unwrap_or_else(|| "the dashboard refused this request".to_string());
+            Some(writeln!(w, "{reason}").map(|_| 1).map_err(|e| e.into()))
+        }
+        None => {
+            eprintln!("zirv ctx agent: dashboard did not answer; running headless");
+            None
+        }
+    }
+}
+
 pub fn run_with<W: Write>(
     args: &AgentArgs,
     w: &mut W,
@@ -89,6 +171,10 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
+
+    if let Some(result) = try_join_dashboard(&args.name, &prompt, w, repo, env) {
+        return result;
+    }
 
     // A second, independent config load just for the announcer: `exec::
     // run_with` below loads its own copy internally (the same pattern
@@ -383,5 +469,180 @@ mod tests {
             0,
             "--quiet must not change the outcome"
         );
+    }
+
+    // Task 11: joining a running dashboard instead of spawning headless.
+
+    /// Polls `dir` for a `req-*.json` file, writes `ack_body` as its matching
+    /// ack, and returns the request's own raw contents -- the same
+    /// "responder" shape every dashboard-join test below needs, since
+    /// `write_request` mints a random uuid filename the test cannot know in
+    /// advance. Never touches a real agent: this only ever races against
+    /// `try_join_dashboard`'s own polling loop, both confined to a tempdir.
+    fn respond_to_next_request(dir: std::path::PathBuf, ack_body: &'static str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if name.starts_with("req-") && name.ends_with(".json") {
+                        let contents = std::fs::read_to_string(&path).expect("read request");
+                        let stem = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .expect("file stem")
+                            .to_string();
+                        std::fs::write(dir.join(format!("ack-{stem}.json")), ack_body)
+                            .expect("write ack");
+                        return contents;
+                    }
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("no spawn request appeared within the deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A live dashboard (env set, directory present) that acks `ok: true`
+    /// short-circuits the headless path entirely: `run_with` reports the
+    /// pane's own short id and returns `Ok(0)`, and the request it wrote
+    /// carries the prompt as data, not argv.
+    #[test]
+    fn dashboard_join_spawns_a_pane_and_reports_its_short_id() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let requests_dir = tmp.path().join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            requests_dir.display().to_string(),
+        );
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
+        });
+
+        let args = args_for("claude", "a specific delegated task");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8_lossy(&out);
+        assert!(
+            output.contains("spawned in dashboard as abcd1234"),
+            "got {output}"
+        );
+        assert!(
+            request_body.contains("a specific delegated task"),
+            "the prompt must travel as data in the request file: {request_body}"
+        );
+    }
+
+    /// A refusal ack (the dashboard's own `cfg.agents.refusal` gate, or an
+    /// unknown/unready adapter) prints the reason and returns `Ok(1)` --
+    /// still short-circuiting the headless path, since the dashboard already
+    /// gave a definitive answer.
+    #[test]
+    fn dashboard_join_prints_the_refusal_reason_and_returns_exit_1() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let requests_dir = tmp.path().join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            requests_dir.display().to_string(),
+        );
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || {
+                respond_to_next_request(
+                    dir,
+                    r#"{"ok":false,"short":null,"reason":"claude is disabled by .zirv/.settings.toml"}"#,
+                )
+            }
+        });
+
+        let args = args_for("claude", "go");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        responder.join().expect("responder thread");
+
+        assert_eq!(code, 1);
+        let output = String::from_utf8_lossy(&out);
+        assert!(output.contains("disabled"), "got {output}");
+    }
+
+    /// `DASH_REQUESTS_ENV` set but naming a directory that does not exist --
+    /// the dashboard already quit and reaped it, or the value is stale --
+    /// must fall straight through to the existing headless path with no
+    /// notice printed (byte-for-byte the pre-Task-11 behavior for this
+    /// shape), the same fake-agent-bin pattern every other "reached the real
+    /// spawn attempt" test in this codebase uses to prove it without ever
+    /// launching a real agent.
+    #[test]
+    fn dashboard_join_falls_through_to_headless_when_the_directory_is_missing() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let mut env: HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                tmp.path().join("state").display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                "Z:/nonexistent/agent-bin".to_string(),
+            ),
+        ]
+        .into();
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            tmp.path()
+                .join("no-such-requests-dir")
+                .display()
+                .to_string(),
+        );
+
+        let args = args_for("claude", "go");
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("the configured binary does not exist, so the headless spawn must fail");
+        // Unlike `wrap`'s own pty-based spawn (which names the configured
+        // binary in its error text -- see `chat.rs`'s equivalent test), the
+        // headless path's plain `std::process::Command::spawn` failure is a
+        // bare OS error with no program name in it at all. So the proof here
+        // is what did NOT happen: `try_join_dashboard` short-circuits with
+        // `Ok(_)` and a message written to `out` on every path it actually
+        // takes (spawned, or refused) -- an `Err` with nothing ever written
+        // to `out` means neither happened, i.e. this genuinely fell through
+        // past the (missing) dashboard directory and into the real headless
+        // spawn attempt, which is what failed.
+        assert!(
+            out.is_empty(),
+            "a dashboard short-circuit always writes a line to `out`; nothing was written here"
+        );
+        let msg = err.to_string();
+        assert!(!msg.is_empty(), "got an error with no message at all");
     }
 }
