@@ -98,6 +98,22 @@ pub fn age_secs(window: &Window, now: u64) -> u64 {
     now.saturating_sub(window.observed_at)
 }
 
+/// The worse (higher) of the two subscription windows' `used_percentage`,
+/// or `None` when neither is known. Shared by wrap's status bar
+/// (`wrap.rs`'s `redraw_bar_if_due`) and the dashboard's header
+/// (`dash::mod::refresh_if_due`) so the two never compute this figure
+/// differently.
+pub fn max_used_percentage(windows: &UsageWindows) -> Option<f64> {
+    windows
+        .five_hour
+        .iter()
+        .chain(windows.seven_day.iter())
+        .map(|w| w.used_percentage)
+        .fold(None, |acc: Option<f64>, p| {
+            Some(acc.map_or(p, |a| a.max(p)))
+        })
+}
+
 pub const FIVE_HOUR_SECS: u64 = 5 * 3600;
 pub const SEVEN_DAY_SECS: u64 = 7 * 24 * 3600;
 
@@ -363,6 +379,49 @@ mod tests {
             five.resets_at, 0,
             "zero means unknown, callers use the fallback delay"
         );
+    }
+
+    fn window_at_pct(pct: f64) -> Window {
+        Window {
+            used_percentage: pct,
+            resets_at: 0,
+            observed_at: 0,
+        }
+    }
+
+    #[test]
+    fn max_used_percentage_is_none_when_neither_window_is_known() {
+        assert_eq!(max_used_percentage(&UsageWindows::default()), None);
+    }
+
+    #[test]
+    fn max_used_percentage_picks_the_worse_of_the_two_windows() {
+        let windows = UsageWindows {
+            five_hour: Some(window_at_pct(20.0)),
+            seven_day: Some(window_at_pct(75.0)),
+        };
+        assert_eq!(max_used_percentage(&windows), Some(75.0));
+
+        let flipped = UsageWindows {
+            five_hour: Some(window_at_pct(90.0)),
+            seven_day: Some(window_at_pct(10.0)),
+        };
+        assert_eq!(max_used_percentage(&flipped), Some(90.0));
+    }
+
+    #[test]
+    fn max_used_percentage_falls_back_to_whichever_window_is_present() {
+        let five_only = UsageWindows {
+            five_hour: Some(window_at_pct(42.0)),
+            seven_day: None,
+        };
+        assert_eq!(max_used_percentage(&five_only), Some(42.0));
+
+        let seven_only = UsageWindows {
+            five_hour: None,
+            seven_day: Some(window_at_pct(13.0)),
+        };
+        assert_eq!(max_used_percentage(&seven_only), Some(13.0));
     }
 
     #[test]

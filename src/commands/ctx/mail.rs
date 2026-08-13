@@ -289,6 +289,37 @@ pub fn list(
     Ok(out)
 }
 
+/// N7: unread mail for `repo`, filtered to what `agent`/`session_short`
+/// would see (the same visibility `list` already applies), split into
+/// `(broadcast, direct-to-this-session)` rather than one combined total --
+/// used by both wrap's status bar (`wrap.rs`'s T12b `redraw_bar_if_due`) and
+/// the dashboard's header (Task 7, `dash::mod::refresh_if_due`), so the two
+/// never disagree about what a session's own mail count is.
+///
+/// `None` when mail is disabled outright (`mail_enabled = false`, honored
+/// exactly like delivery does: an operator who turned mail off must never be
+/// told mail is waiting) or on any read error -- moved here, byte for byte,
+/// from `wrap.rs`'s own `unread_mail_counts` (T12b/N7), which now delegates
+/// to this function instead of keeping a second copy of the same logic.
+pub fn unread_counts(
+    state: &StateDir,
+    repo: &Path,
+    agent: &str,
+    session_short: &str,
+    mail_enabled: bool,
+) -> Option<(usize, usize)> {
+    if !mail_enabled {
+        return None;
+    }
+    let found = list(state, &repo_slug(repo), Some(agent), Some(session_short)).ok()?;
+    let direct = found
+        .iter()
+        .filter(|(_, msg)| msg.to_session.as_deref() == Some(session_short))
+        .count();
+    let broadcast = found.len() - direct;
+    Some((broadcast, direct))
+}
+
 /// Moves a message into `read/`, creating the subdirectory as needed.
 /// Consumed messages are never deleted.
 pub fn consume(state: &StateDir, repo_slug: &str, path: &Path) -> CtxResult<()> {
@@ -701,6 +732,136 @@ mod tests {
                 .expect("list")
                 .is_empty(),
             "consumed messages are excluded from list"
+        );
+    }
+
+    // `unread_counts`: moved here from `wrap.rs`'s own `unread_mail_count`/
+    // `unread_mail_counts` tests (T12b/N7) now that both delegate to this
+    // function; the dashboard's header facts (Task 7) share it too.
+
+    #[test]
+    fn unread_counts_is_zero_for_a_repo_with_no_mailbox_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        assert_eq!(
+            unread_counts(&state, &repo, "claude", "sess0000", true),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn unread_counts_splits_broadcast_from_direct() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = repo_slug(&repo);
+        let cfg = CtxConfig::default();
+        store(&state, &slug, &sample("other", 1), &cfg).expect("store broadcast");
+        let direct = Message {
+            from_session: "other2".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: Some("sess0000".to_string()),
+            sent: 2,
+            body: "note".to_string(),
+        };
+        store(&state, &slug, &direct, &cfg).expect("store direct");
+
+        assert_eq!(
+            unread_counts(&state, &repo, "claude", "sess0000", true),
+            Some((1, 1))
+        );
+    }
+
+    /// B3: `mail_enabled = false` must gate this the same way it gates
+    /// delivery -- an operator who turned mail off must never be told mail is
+    /// waiting.
+    #[test]
+    fn unread_counts_is_none_when_mail_is_disabled_even_with_stored_mail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = repo_slug(&repo);
+        store(&state, &slug, &sample("other", 1), &CtxConfig::default()).expect("store");
+
+        assert_eq!(
+            unread_counts(&state, &repo, "claude", "sess0000", false),
+            None,
+            "mail.enabled = false must silence the count entirely"
+        );
+    }
+
+    /// The same `for_agent` filter `list`'s delivery already applies: a
+    /// message addressed to a different agent by name must not count here.
+    #[test]
+    fn unread_counts_filters_by_the_sessions_own_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = repo_slug(&repo);
+        let msg = Message {
+            from_session: "other".to_string(),
+            from_agent: "claude".to_string(),
+            to: "codex".to_string(),
+            to_session: None,
+            sent: 1,
+            body: "note".to_string(),
+        };
+        store(&state, &slug, &msg, &CtxConfig::default()).expect("store");
+
+        assert_eq!(
+            unread_counts(&state, &repo, "claude", "sess0000", true),
+            Some((0, 0)),
+            "addressed to codex, not this claude session"
+        );
+        assert_eq!(
+            unread_counts(&state, &repo, "codex", "sess0000", true),
+            Some((1, 0))
+        );
+    }
+
+    /// `list` itself treats "nothing there, or not a directory" as an empty
+    /// mailbox rather than an error, so this is the ordinary case.
+    #[test]
+    fn unread_counts_reads_a_missing_or_non_directory_mailbox_as_zero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = repo_slug(&repo);
+        std::fs::create_dir_all(state.mail()).expect("mkdir");
+        std::fs::write(state.mail().join(&slug), "not a directory").expect("write");
+
+        assert_eq!(
+            unread_counts(&state, &repo, "claude", "sess0000", true),
+            Some((0, 0))
+        );
+    }
+
+    /// A genuine read error -- unlike "missing" or "not a directory" -- must
+    /// be reported as `None` rather than masquerading as an empty mailbox.
+    #[cfg(unix)]
+    #[test]
+    fn unread_counts_reports_none_for_a_mail_directory_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = repo_slug(&repo);
+        let mailbox = state.mail().join(&slug);
+        std::fs::create_dir_all(&mailbox).expect("mkdir");
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let result = unread_counts(&state, &repo, "claude", "sess0000", true);
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+
+        assert_eq!(
+            result, None,
+            "a genuine read error must never masquerade as an empty mailbox"
         );
     }
 

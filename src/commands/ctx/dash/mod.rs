@@ -14,9 +14,10 @@
 pub mod pane;
 pub mod ui;
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -33,6 +34,7 @@ use super::config::{CtxConfig, EnvLookup};
 use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
 use super::term;
+use super::{mail, memory, sessions, window};
 
 pub(crate) use pane::{Pane, PaneSpec, PaneState};
 
@@ -198,6 +200,179 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
 /// source of truth with `PREFIX`.
 fn literal_prefix_bytes() -> Vec<u8> {
     encode_key(KeyEvent::new(PREFIX.1, PREFIX.0))
+}
+
+// Task 7: sidebar row assembly (dashboard panes + view-only registry rows)
+// and the header's own live facts (mail, memory-bank size, usage, session
+// count), both refreshed at most once per second.
+
+/// One dashboard-owned pane's row inputs, decoupled from `Pane` itself so
+/// `assemble_sidebar` stays pure and testable without a real spawn.
+struct PaneRowMeta {
+    short: String,
+    title: String,
+    glyph: char,
+    preview: String,
+}
+
+/// The glyph a view-only registry row gets: this dashboard does not own that
+/// session's turn-signal stream, so `PaneState`'s Working/Idle distinction is
+/// genuinely unknown here -- only that the process is still alive
+/// (`assemble_sidebar`'s caller has already filtered to `Liveness::Live`).
+/// Deliberately distinct from every glyph `ui::glyph_for` produces, so a
+/// view-only row never claims to know a pane state it cannot see.
+const VIEW_ONLY_GLYPH: char = '\u{00b7}';
+
+/// Combines this dashboard's own panes (attached, in pane order) with every
+/// OTHER live session in the registry (view-only, `attached: false`), so the
+/// sidebar shows every registered session, not only the ones this process
+/// spawned. Deduped by short id -- a pane's own registry record is never
+/// listed a second time as a view-only row. Dead/stale registry entries
+/// (`Liveness::Stale`) are excluded outright: `sessions::list` already swept
+/// them from disk, and a dashboard has nothing useful to attach to or nudge
+/// there. `selected` indexes into the combined list this returns. Pure: no
+/// I/O of its own -- `registry` is whatever the caller already read via
+/// `sessions::list`.
+fn assemble_sidebar(
+    panes: &[PaneRowMeta],
+    registry: &[(sessions::Record, sessions::Liveness)],
+    selected: usize,
+) -> Vec<ui::SidebarRow> {
+    let own_shorts: HashSet<&str> = panes.iter().map(|p| p.short.as_str()).collect();
+
+    let mut rows: Vec<ui::SidebarRow> = panes
+        .iter()
+        .map(|p| ui::SidebarRow {
+            glyph: p.glyph,
+            title: p.title.clone(),
+            short: p.short.clone(),
+            preview: p.preview.clone(),
+            attached: true,
+            selected: false,
+        })
+        .collect();
+
+    for (record, liveness) in registry {
+        if *liveness != sessions::Liveness::Live {
+            continue;
+        }
+        if own_shorts.contains(record.short.as_str()) {
+            continue;
+        }
+        rows.push(ui::SidebarRow {
+            glyph: VIEW_ONLY_GLYPH,
+            title: format!("{} {}", record.verb.as_str(), record.agent),
+            short: record.short.clone(),
+            preview: String::new(),
+            attached: false,
+            selected: false,
+        });
+    }
+
+    if let Some(row) = rows.get_mut(selected) {
+        row.selected = true;
+    }
+    rows
+}
+
+/// `window::max_used_percentage`'s `0.0..=100.0` reading, rounded to the
+/// nearest whole percent for the header's compact `usage NN%` display and
+/// clamped defensively to the documented range. Mirrors `chrome::status_bar`'s
+/// own `{:.0}%` rounding so the dashboard header and wrap's status bar never
+/// disagree about the same underlying number.
+fn usage_pct_u8(percent: Option<f64>) -> Option<u8> {
+    percent.map(|p| p.round().clamp(0.0, 100.0) as u8)
+}
+
+/// Pure: assembles `ui::HeaderFacts` from already-computed ingredients. Kept
+/// separate from `FactsCache::refresh_if_due` (the impure disk-reading half)
+/// so the header's own rendering rule -- a disabled/absent mail read renders
+/// as no mail segment at all, never a hollow `mail 0+0` -- is exercised
+/// without a state dir. Mirrors `ui`'s own `HeaderFacts` field order.
+fn assemble_header_facts(
+    harness: String,
+    score: Option<u32>,
+    usage_pct: Option<u8>,
+    mail: Option<(usize, usize)>,
+    memory_count: usize,
+    sessions: usize,
+) -> ui::HeaderFacts {
+    let (mail_broadcast, mail_direct) = mail.unwrap_or((0, 0));
+    ui::HeaderFacts {
+        harness,
+        score,
+        usage_pct,
+        mail_broadcast,
+        mail_direct,
+        memory_count,
+        sessions,
+    }
+}
+
+/// How often the header's own disk-backed facts (mail, memory-bank size,
+/// usage) -- and the session registry the sidebar's view-only rows come
+/// from -- are re-read. Mirrors wrap's own `BAR_THROTTLE`/`BarRuntime::
+/// last_draw` pattern (`wrap.rs:1362`): the render loop polls every 50ms,
+/// but nothing here needs a disk hit that often.
+const FACTS_THROTTLE: Duration = Duration::from_secs(1);
+
+/// The disk-backed part of the header's facts: everything `FactsCache::
+/// refresh_if_due` re-reads on the throttle. Kept separate from
+/// `ui::HeaderFacts` itself because the harness/error line and the live
+/// session count are cheap, in-memory state recomputed fresh on every frame
+/// regardless -- only these fields, plus the registry listing below, cost an
+/// actual read.
+#[derive(Default)]
+struct DiskFacts {
+    usage_pct: Option<u8>,
+    mail: Option<(usize, usize)>,
+    memory_count: usize,
+}
+
+/// Caches every disk read the header and sidebar need -- usage, mail,
+/// memory-bank size, and the session registry itself -- refreshed at most
+/// once per `FACTS_THROTTLE` rather than on the render loop's own 50ms poll.
+struct FactsCache {
+    disk: DiskFacts,
+    registry: Vec<(sessions::Record, sessions::Liveness)>,
+    last_refresh: Instant,
+}
+
+impl FactsCache {
+    /// Never refreshed yet, so the very first check always reads through.
+    /// `checked_sub` (rather than a bare subtraction) degrades to "refresh
+    /// immediately" on a process uptime under a second, the same reasoning
+    /// `BarRuntime::new` documents for its own `last_draw`.
+    fn new(now: Instant) -> Self {
+        Self {
+            disk: DiskFacts::default(),
+            registry: Vec::new(),
+            last_refresh: now.checked_sub(FACTS_THROTTLE).unwrap_or(now),
+        }
+    }
+
+    fn refresh_if_due(
+        &mut self,
+        cfg: &CtxConfig,
+        state: &StateDir,
+        repo: &Path,
+        agent_name: &str,
+        session_short: &str,
+        now: Instant,
+    ) {
+        if now.duration_since(self.last_refresh) < FACTS_THROTTLE {
+            return;
+        }
+        self.last_refresh = now;
+
+        let windows = window::load(state);
+        self.disk.usage_pct = usage_pct_u8(window::max_used_percentage(&windows));
+        self.disk.mail =
+            mail::unread_counts(state, repo, agent_name, session_short, cfg.mail.enabled);
+        let slug = super::state::repo_slug(repo);
+        self.disk.memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
+        self.registry = sessions::list(state);
+    }
 }
 
 /// Task 12's own extension point: on quit, before any pane is torn down,
@@ -367,6 +542,7 @@ pub fn run_dashboard(
     let mut zoomed = false;
     let mut prefix_armed = false;
     let mut overlay = ui::Overlay::None;
+    let mut facts_cache = FactsCache::new(Instant::now());
 
     let exit_code: i32 = loop {
         for pane in panes.iter_mut() {
@@ -487,32 +663,47 @@ pub fn run_dashboard(
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
         let (header_area, sidebar_area, main_area) = ui::layout(frame_area, sidebar_cols);
 
+        // The dashboard's own mail address: the orchestrator pane (`panes[0]`,
+        // fixed for the loop's whole life -- panes are only ever appended,
+        // never reordered or removed before shutdown) is what a message
+        // addressed to this dashboard specifically would name.
+        let dashboard_short = panes
+            .first()
+            .map(|p| p.short().to_string())
+            .unwrap_or_default();
+        facts_cache.refresh_if_due(
+            cfg,
+            state,
+            repo,
+            &agent_name,
+            &dashboard_short,
+            Instant::now(),
+        );
+
+        let pane_rows: Vec<PaneRowMeta> = panes
+            .iter()
+            .map(|pane| PaneRowMeta {
+                short: pane.short().to_string(),
+                title: pane.title().to_string(),
+                glyph: ui::glyph_for(&pane.state()),
+                preview: pane.last_line(),
+            })
+            .collect();
+        let rows = assemble_sidebar(&pane_rows, &facts_cache.registry, selected);
+
         let harness = if let Some(last) = errors.last() {
             format!("{agent_name}  \u{26a0} {last}")
         } else {
             agent_name.clone()
         };
-        let facts = ui::HeaderFacts {
+        let facts = assemble_header_facts(
             harness,
-            score: None,
-            usage_pct: None,
-            mail_broadcast: 0,
-            mail_direct: 0,
-            memory_count: 0,
-            sessions: panes.len(),
-        };
-        let rows: Vec<ui::SidebarRow> = panes
-            .iter()
-            .enumerate()
-            .map(|(i, pane)| ui::SidebarRow {
-                glyph: ui::glyph_for(&pane.state()),
-                title: pane.title().to_string(),
-                short: pane.short().to_string(),
-                preview: pane.last_line(),
-                attached: true,
-                selected: i == selected,
-            })
-            .collect();
+            None,
+            facts_cache.disk.usage_pct,
+            facts_cache.disk.mail,
+            facts_cache.disk.memory_count,
+            rows.len(),
+        );
 
         let draw = terminal.draw(|f| {
             if !zoomed {
@@ -707,5 +898,175 @@ mod tests {
         assert_eq!(errors.len(), MAX_KEPT_ERRORS);
         assert_eq!(errors.last().unwrap(), "err9");
         assert_eq!(errors.first().unwrap(), "err5");
+    }
+
+    // Task 7: sidebar row assembly + header facts.
+
+    fn pane_row(short: &str, title: &str) -> PaneRowMeta {
+        PaneRowMeta {
+            short: short.to_string(),
+            title: title.to_string(),
+            glyph: '\u{25cf}',
+            preview: "hi".to_string(),
+        }
+    }
+
+    fn registry_record(short: &str, agent: &str) -> sessions::Record {
+        sessions::Record {
+            session: format!("session-{short}"),
+            short: short.to_string(),
+            agent: agent.to_string(),
+            repo: std::path::PathBuf::from("/repo"),
+            repo_slug: "-repo".to_string(),
+            verb: sessions::Verb::Wrap,
+            pid: 1,
+            started_at: 0,
+            reachable: true,
+        }
+    }
+
+    #[test]
+    fn assemble_sidebar_lists_dashboard_panes_first_in_pane_order() {
+        let panes = vec![
+            pane_row("aaa11111", "orch"),
+            pane_row("bbb22222", "wrk claude"),
+        ];
+        let rows = assemble_sidebar(&panes, &[], 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].short, "aaa11111");
+        assert!(rows[0].attached);
+        assert_eq!(rows[1].short, "bbb22222");
+        assert!(rows[1].attached);
+    }
+
+    #[test]
+    fn assemble_sidebar_appends_view_only_registry_rows_not_owned_by_this_dashboard() {
+        let panes = vec![pane_row("aaa11111", "orch")];
+        let registry = vec![(
+            registry_record("ccc33333", "codex"),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].short, "ccc33333");
+        assert!(!rows[1].attached, "a registry-only row is never attached");
+    }
+
+    #[test]
+    fn assemble_sidebar_dedupes_a_panes_own_registry_record() {
+        let panes = vec![pane_row("aaa11111", "orch")];
+        let registry = vec![(
+            registry_record("aaa11111", "claude"),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, 0);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the pane's own registry record must not appear a second time"
+        );
+        assert!(rows[0].attached);
+    }
+
+    #[test]
+    fn assemble_sidebar_excludes_stale_registry_entries() {
+        let registry = vec![(
+            registry_record("ddd44444", "codex"),
+            sessions::Liveness::Stale,
+        )];
+        let rows = assemble_sidebar(&[], &registry, 0);
+        assert!(
+            rows.is_empty(),
+            "a dead session must not appear as a view-only row"
+        );
+    }
+
+    #[test]
+    fn assemble_sidebar_marks_the_selected_index_in_the_combined_list() {
+        let panes = vec![pane_row("aaa11111", "orch")];
+        let registry = vec![(
+            registry_record("ccc33333", "codex"),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, 1);
+        assert!(!rows[0].selected);
+        assert!(rows[1].selected);
+    }
+
+    #[test]
+    fn assemble_header_facts_omits_mail_when_none() {
+        let facts = assemble_header_facts("claude".to_string(), None, Some(42), None, 3, 5);
+        assert_eq!(facts.mail_broadcast, 0);
+        assert_eq!(facts.mail_direct, 0);
+        assert_eq!(facts.usage_pct, Some(42));
+        assert_eq!(facts.memory_count, 3);
+        assert_eq!(facts.sessions, 5);
+    }
+
+    #[test]
+    fn assemble_header_facts_carries_the_broadcast_direct_split_through() {
+        let facts = assemble_header_facts("claude".to_string(), Some(12), None, Some((2, 1)), 0, 1);
+        assert_eq!(facts.mail_broadcast, 2);
+        assert_eq!(facts.mail_direct, 1);
+        assert_eq!(facts.score, Some(12));
+    }
+
+    #[test]
+    fn usage_pct_u8_rounds_and_clamps() {
+        assert_eq!(usage_pct_u8(None), None);
+        assert_eq!(usage_pct_u8(Some(63.4)), Some(63));
+        assert_eq!(usage_pct_u8(Some(63.5)), Some(64));
+        assert_eq!(usage_pct_u8(Some(150.0)), Some(100));
+        assert_eq!(usage_pct_u8(Some(-5.0)), Some(0));
+    }
+
+    #[test]
+    fn facts_cache_refreshes_immediately_then_honors_the_throttle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let now = Instant::now();
+
+        let mut cache = FactsCache::new(now);
+        cache.refresh_if_due(&cfg, &state, &repo, "claude", "sess0000", now);
+        assert_eq!(
+            cache.disk.mail,
+            Some((0, 0)),
+            "the first check must refresh even though `last_refresh` was just set"
+        );
+
+        // A message stored right after that first refresh must not be seen
+        // again until the throttle elapses.
+        let slug = super::super::state::repo_slug(&repo);
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "other".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "note".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        cache.refresh_if_due(&cfg, &state, &repo, "claude", "sess0000", now);
+        assert_eq!(
+            cache.disk.mail,
+            Some((0, 0)),
+            "within the throttle window, the cached facts must not change"
+        );
+
+        let later = now + FACTS_THROTTLE;
+        cache.refresh_if_due(&cfg, &state, &repo, "claude", "sess0000", later);
+        assert_eq!(
+            cache.disk.mail,
+            Some((1, 0)),
+            "once the throttle elapses, the disk-backed facts refresh"
+        );
     }
 }

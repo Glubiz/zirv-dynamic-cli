@@ -439,19 +439,16 @@ pub fn mail_grew(previous: usize, current: usize) -> bool {
     current > previous
 }
 
-/// Unread mail for `repo`, filtered to what this session's own harness would
-/// see (`mail::list`'s `for_agent`, the same filter delivery and `zirv ctx
-/// inbox` already use -- a message addressed to a different agent by name
-/// must not count here either). `None` when mail is disabled outright
-/// (`cfg.mail.enabled = false`, honored exactly like delivery does: an
-/// operator who turned mail off must never be told mail is waiting) or on any
-/// read error. Called from two throttled call sites -- the turn-signal arm,
-/// bounded by how often the agent reports a turn boundary, and (T12b) the
-/// bar's own 1s redraw throttle, never the raw byte-pump path -- so an
-/// unreadable mail directory (permissions, a stray non-directory file at that
-/// path) is silently ignored rather than degrading or interrupting the
-/// session: mail is advisory, and a wrapped session must never be made worse
-/// by it.
+/// A plain total over `mail::unread_counts`' `(broadcast, direct)` split, for
+/// the turn-signal arm's `mail_grew` advisory, which only ever needs a single
+/// number and has its own tests pinned to that shape. `None` under the same
+/// conditions `mail::unread_counts` returns `None` for (mail disabled, or a
+/// read error) -- an unreadable mail directory is silently ignored rather
+/// than degrading or interrupting the session: mail is advisory, and a
+/// wrapped session must never be made worse by it. Called from two throttled
+/// call sites -- the turn-signal arm, bounded by how often the agent reports
+/// a turn boundary, and (T12b) the bar's own 1s redraw throttle, never the
+/// raw byte-pump path.
 fn unread_mail_count(
     state: &super::state::StateDir,
     repo: &Path,
@@ -459,26 +456,14 @@ fn unread_mail_count(
     session_short: &str,
     mail_enabled: bool,
 ) -> Option<usize> {
-    if !mail_enabled {
-        return None;
-    }
-    super::mail::list(
-        state,
-        &super::state::repo_slug(repo),
-        Some(agent),
-        Some(session_short),
-    )
-    .ok()
-    .map(|found| found.len())
+    unread_mail_counts(state, repo, agent, session_short, mail_enabled)
+        .map(|(broadcast, direct)| broadcast + direct)
 }
 
-/// N7: the same visible-to-this-session listing `unread_mail_count` reads,
-/// split into `(broadcast, direct-to-this-session)` rather than one combined
-/// total, for the T12b bar's own `mail 2+1` rendering. `None` under the same
-/// conditions `unread_mail_count` returns `None` for. Kept as a separate
-/// function rather than changing `unread_mail_count`'s own return type: the
-/// turn-signal arm's `mail_grew` advisory only ever needs a plain total and
-/// has its own tests pinned to that shape.
+/// Thin delegate to `mail::unread_counts` (moved there in Task 7 so the
+/// dashboard's header facts can share it too): the T12b bar's own
+/// `mail 2+1` rendering reads the `(broadcast, direct-to-this-session)`
+/// split this returns.
 fn unread_mail_counts(
     state: &super::state::StateDir,
     repo: &Path,
@@ -486,22 +471,7 @@ fn unread_mail_counts(
     session_short: &str,
     mail_enabled: bool,
 ) -> Option<(usize, usize)> {
-    if !mail_enabled {
-        return None;
-    }
-    let found = super::mail::list(
-        state,
-        &super::state::repo_slug(repo),
-        Some(agent),
-        Some(session_short),
-    )
-    .ok()?;
-    let direct = found
-        .iter()
-        .filter(|(_, msg)| msg.to_session.as_deref() == Some(session_short))
-        .count();
-    let broadcast = found.len() - direct;
-    Some((broadcast, direct))
+    super::mail::unread_counts(state, repo, agent, session_short, mail_enabled)
 }
 
 pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
@@ -1450,14 +1420,7 @@ fn redraw_bar_if_due(
     bar.last_draw = now;
 
     let windows = super::window::load(state_dir);
-    let usage_percent = windows
-        .five_hour
-        .iter()
-        .chain(windows.seven_day.iter())
-        .map(|w| w.used_percentage)
-        .fold(None, |acc: Option<f64>, p| {
-            Some(acc.map_or(p, |a| a.max(p)))
-        });
+    let usage_percent = super::window::max_used_percentage(&windows);
     let unread_mail = unread_mail_counts(
         state_dir,
         repo,
