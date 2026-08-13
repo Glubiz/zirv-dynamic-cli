@@ -157,6 +157,11 @@ pub struct WrapArgs {
     /// default. Supervision, pacing and hooks still apply.
     #[arg(long, default_value_t = false)]
     pub simple: bool,
+    /// Start even though this process looks like it is already inside an
+    /// agent session. Off by default: a nested interactive supervisor can
+    /// take the outer session down.
+    #[arg(long, default_value_t = false)]
+    pub allow_nested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +262,107 @@ pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> b
 pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance criteria, the file paths touched so far, any unresolved errors or failing tests, and the exact next step. Drop resolved tangents and full file dumps.";
 
 pub const TRANSCRIPT_ENV: &str = "ZIRV_CTX_TRANSCRIPT";
+
+/// The pre-F5 name: one global file under the state dir root. Still *read*
+/// (see `read_socket_path`) so a supervisor started by an older build stays
+/// discoverable, but never written any more: two concurrent supervisors
+/// clobbered each other's entry, and whoever read it afterwards got a socket
+/// belonging to somebody else's session.
 pub const SOCKET_PATH_FILE: &str = "socket-path";
+
+/// `<state>/socket-path-<short8>`, one per supervisor, named after the same
+/// short id the socket itself and the session registry record already use.
+pub const SOCKET_PATH_PREFIX: &str = "socket-path-";
+
+pub fn socket_path_file_for(session: &str) -> String {
+    format!("{SOCKET_PATH_PREFIX}{}", super::sessions::short_id(session))
+}
+
+/// Publishes where this supervisor bound its turn-signal socket, so `zirv ctx
+/// status`, external tooling and the pty tests can find it. Best-effort, like
+/// every other piece of state-dir housekeeping: failing to publish must never
+/// fail a launch.
+pub fn publish_socket_path(state: &StateDir, session: &str, socket: &Path) {
+    let _ = super::state::create_private_dir_all(state.root());
+    let _ = super::state::write_private(
+        &state.root().join(socket_path_file_for(session)),
+        &socket.display().to_string(),
+    );
+}
+
+/// Removes this supervisor's published socket path. Paired with
+/// `publish_socket_path` at the one place `wrap` leaves the pump, so a dead
+/// session's file does not linger to be picked as "the newest" by a later
+/// reader with no session of its own.
+pub fn unpublish_socket_path(state: &StateDir, session: &str) {
+    let _ = std::fs::remove_file(state.root().join(socket_path_file_for(session)));
+}
+
+/// Resolves the socket path a reader should use.
+///
+/// `session` is the reader's own `ZIRV_CTX_SESSION` (or whichever session it
+/// is asking about). When it is given, only *that* session's file is
+/// considered: silently handing back a different live session's socket is
+/// precisely the cross-session confusion F5 exists to end, so a named session
+/// with no file of its own falls through to the legacy file and then to
+/// `None`, never to a neighbour's socket.
+///
+/// With no session -- an operator at a shell, or a test that never learned
+/// the id -- the newest published file wins, which is the closest honest
+/// approximation of "the session I am looking at" available without one.
+///
+/// The legacy global file is the last fallback either way, so a supervisor
+/// left over from a pre-F5 build is still reachable.
+///
+/// No production caller inside this binary reads it back today -- `wrap` is
+/// the only writer, and everything downstream of it already holds the socket
+/// path directly. It exists because publishing the file is a *contract with
+/// external tooling* (that is why it is written at all), and shipping a
+/// writer whose naming scheme has no canonical reader is how the pre-F5
+/// global file's semantics got lost in the first place. The pty tests are its
+/// in-tree consumer.
+#[allow(dead_code)]
+pub fn read_socket_path(state: &StateDir, session: Option<&str>) -> Option<String> {
+    let read = |path: PathBuf| -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    if let Some(session) = session {
+        return read(state.root().join(socket_path_file_for(session)))
+            .or_else(|| read(state.root().join(SOCKET_PATH_FILE)));
+    }
+
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(entries) = std::fs::read_dir(state.root()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_published = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(SOCKET_PATH_PREFIX));
+            if !is_published {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if newest.as_ref().is_none_or(|(seen, _)| modified >= *seen) {
+                newest = Some((modified, path));
+            }
+        }
+    }
+    if let Some((_, path)) = newest
+        && let Some(found) = read(path)
+    {
+        return Some(found);
+    }
+
+    read(state.root().join(SOCKET_PATH_FILE))
+}
 
 /// Which file wrap watches for compactions and reads handoff context from.
 ///
@@ -477,6 +582,27 @@ fn wait_for_exit(
 
 /// Ask the TUI to quit, then escalate. A TUI that will not leave politely is
 /// killed rather than left running under a supervisor that has moved on.
+///
+/// Two rungs, deliberately: the adapter's own quit sequence, then
+/// `child.kill()`. There is **no Ctrl-C rung**, and one must never be added
+/// back (F1).
+///
+/// Writing `\x03` into the pty master is not a signal to *this* child. On
+/// Windows the master is a ConPTY, and conhost turns that byte into a console
+/// control event that it broadcasts to **every** process attached to the
+/// pseudoconsole -- and portable-pty 0.9.0 spawns without
+/// `CREATE_NEW_PROCESS_GROUP`, so there is no group to narrow the broadcast
+/// to. A `wrap` that had been launched inside another zirv session therefore
+/// took the *outer* session's agent down with the child it meant to quit.
+/// (On unix the byte is only marginally better behaved: the line discipline
+/// delivers SIGINT to the whole foreground process group of that pty.)
+///
+/// `child.kill()` is the narrow primitive that has none of that reach: a
+/// `TerminateProcess`/`kill` against the one handle this supervisor owns.
+/// Note that portable-pty's Windows `do_kill` inverts its own success check
+/// and `kill` swallows the result, so a failed kill is invisible here -- see
+/// Known Issues; that is a reason to be conservative about what else we try,
+/// not a reason to reach for a console-wide broadcast.
 pub fn quit_child(
     sink: &mut dyn Write,
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -492,16 +618,28 @@ pub fn quit_child(
         return Ok(());
     }
 
-    // Ctrl-C twice is the conventional escape hatch before force.
-    let _ = write!(sink, "\x03\x03");
-    let _ = sink.flush();
-    if wait_for_exit(child, Instant::now() + grace)? {
-        return Ok(());
-    }
-
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+/// Builds a child's supervision environment: scrub first, then set whatever
+/// this supervisor actually owns. The single place both the initial launch
+/// and every relaunch go through, so the scrub cannot be forgotten on one of
+/// them (F3).
+///
+/// The scrub is unconditional, and that is the whole point. `turn_env` is
+/// empty whenever the socket bind failed -- and without the scrub the child
+/// then inherited the *outer* session's `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET`
+/// straight out of this process's environment (`CommandBuilder::new` seeds
+/// itself from `std::env::vars_os`), so its hooks reported turn boundaries
+/// into a supervisor that belonged to somebody else's session. "No socket of
+/// my own" has to degrade to unsupervised, never to supervised-by-another.
+fn apply_session_env(builder: &mut CommandBuilder, turn_env: &[(String, String)]) {
+    super::sessions::scrub_supervision_env(builder);
+    for (key, value) in turn_env {
+        builder.env(key, value);
+    }
 }
 
 /// Pumps one pty master's output to stdout for as long as `generation` still
@@ -650,10 +788,9 @@ fn relaunch(
     }
     builder.cwd(repo);
     // Without this the fresh session has no socket to report turn boundaries
-    // on, and supervision would silently end at the first restart.
-    for (key, value) in turn_env {
-        builder.env(key, value);
-    }
+    // on, and supervision would silently end at the first restart. Scrubbed
+    // first either way -- see `apply_session_env`.
+    apply_session_env(&mut builder, turn_env);
 
     // Before the spawn, and before anything else touches this pty: on Windows
     // the console host will not service the child at all until it is answered.
@@ -696,6 +833,17 @@ pub fn run_with(
 ) -> CtxResult<i32> {
     if args.command.is_empty() {
         return Err("no command to wrap; pass it after --".into());
+    }
+
+    // F2, before anything reads config, resolves an adapter, or touches the
+    // terminal: an interactive supervisor started *inside* another agent's
+    // session can take that outer session down (see
+    // `sessions::nested_session_evidence`). Returned as an `Err` rather than
+    // printed here, because `run_with` deliberately has no writer of its own
+    // (see this function's doc comment); `ctx`'s dispatch prints it on
+    // stderr through `output::error`.
+    if let Some(refusal) = super::sessions::nesting_refusal("wrap", env, args.allow_nested) {
+        return Err(refusal.into());
     }
 
     let cfg = CtxConfig::load(repo, env)?;
@@ -823,12 +971,10 @@ pub fn run_with(
     } else {
         match super::signal::SignalServer::bind(&state_dir.socket_for(session.as_str())) {
             Ok(server) => {
-                // Publish the path so `zirv ctx status` and tests can find it.
-                let _ = super::state::create_private_dir_all(state_dir.root());
-                let _ = super::state::write_private(
-                    &state_dir.root().join(SOCKET_PATH_FILE),
-                    &server.path().display().to_string(),
-                );
+                // Published per session (F5): the pre-F5 global file meant a
+                // second supervisor overwrote the first one's entry, and a
+                // reader then found somebody else's socket under it.
+                publish_socket_path(&state_dir, session.as_str(), server.path());
                 Some(server)
             }
             Err(_) => {
@@ -910,9 +1056,11 @@ pub fn run_with(
         })
         .unwrap_or_default();
     turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
-    for (key, value) in &turn_env {
-        command.env(key, value);
-    }
+    // Scrubbed before any of it is applied -- see `apply_session_env`. When
+    // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
+    // scrub is the only thing standing between this child and the outer
+    // session's identity.
+    apply_session_env(&mut command, &turn_env);
 
     // One writer, shared: the stdin pump and (from Task C4) the injector both
     // need it, and `take_writer` can only be called once. Its contents (not
@@ -1024,6 +1172,11 @@ pub fn run_with(
         // that never actually got set must not leave the bar thinking it is
         // still safely confining the child.
         bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
+        // F4: from here the real console has a scroll region fencing off its
+        // last row, so an external kill owes it a `CSI r` on the way out.
+        // Only when the write actually landed -- a region that was never set
+        // needs no reset.
+        super::term::set_bar_active(region_ok);
     }
 
     let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
@@ -1074,6 +1227,11 @@ pub fn run_with(
         &mut bar,
     );
     session_guard.release();
+    // Paired with `publish_socket_path` above, at the same single point every
+    // other per-session artifact is released: a dead supervisor's file must
+    // not linger to be picked as "the newest" by a later `read_socket_path`
+    // that has no session id of its own.
+    unpublish_socket_path(&state_dir, session.as_str());
 
     reset_bar(&bar);
     if let Some(guard) = raw.as_mut() {
@@ -1194,10 +1352,20 @@ fn reset_bar(bar: &BarRuntime) {
         return;
     }
     let sequence = super::chrome::bar_reset_sequence(bar.rows);
+    let mut reset_ok = false;
     if let Ok(_guard) = bar.stdout_lock.lock() {
         let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(sequence.as_bytes());
-        let _ = stdout.flush();
+        reset_ok = stdout
+            .write_all(sequence.as_bytes())
+            .and_then(|()| stdout.flush())
+            .is_ok();
+    }
+    // F4: `BAR_ACTIVE` means "the real console currently has a scroll region
+    // we set", so it is cleared only once the undo actually landed. A reset
+    // that failed leaves the console still fenced, and the emergency handler
+    // still owes it a `CSI r`.
+    if reset_ok {
+        super::term::set_bar_active(false);
     }
 }
 
@@ -1665,6 +1833,9 @@ fn pump(
                     Err(_) => false,
                 };
                 bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
+                // F4: the resize rewrote the region, so the console is (still)
+                // fenced exactly when that write landed.
+                super::term::set_bar_active(region_ok);
                 if !bar.disabled {
                     // The bar's own row moved; the next throttle tick must
                     // redraw it even if the text is unchanged.
@@ -1848,6 +2019,17 @@ mod tests {
             cmd.arg(arg);
         }
         cmd.env("TERM", "xterm");
+        // Hermetic against the developer's own environment (F2): this spawns
+        // the real `zirv` binary, which reads the process environment, so a
+        // suite run from inside an agent session would otherwise trip the
+        // nesting guard instead of running the test. Removed *before*
+        // `extra_env`, which several tests use to pin `ZIRV_CTX_TRANSCRIPT`
+        // deliberately.
+        for key in super::super::sessions::SUPERVISION_ENV {
+            cmd.env_remove(key);
+        }
+        cmd.env_remove("CLAUDE_PID");
+        cmd.env_remove("CLAUDECODE");
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -1917,6 +2099,449 @@ mod tests {
         assert_eq!(flag_value(seen, "--session-id"), None);
     }
 
+    // F1: `quit_child` must never write a console control byte into the pty.
+
+    /// A child that never exits on its own, so `quit_child` has to walk its
+    /// whole ladder, and that records whether it was killed.
+    ///
+    /// A stub rather than a real pty child on purpose: the sink is then a
+    /// plain `Vec<u8>` whose exact bytes can be asserted on (the whole point
+    /// of the test), and it runs on Windows too -- which is the platform the
+    /// `\x03\x03` rung was actually dangerous on, and where every other
+    /// `quit_child` test is `cfg(unix)`-gated away.
+    #[derive(Debug, Clone, Default)]
+    struct KillFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl KillFlag {
+        fn killed(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubbornChild {
+        killed: KillFlag,
+    }
+
+    impl portable_pty::ChildKiller for StubbornChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed
+                .0
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(StubbornChild {
+                killed: self.killed.clone(),
+            })
+        }
+    }
+
+    impl portable_pty::Child for StubbornChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(self
+                .killed
+                .killed()
+                .then(|| portable_pty::ExitStatus::with_exit_code(1)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(1))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    fn stubborn_child() -> (Box<dyn portable_pty::Child + Send + Sync>, KillFlag) {
+        let killed = KillFlag::default();
+        (
+            Box::new(StubbornChild {
+                killed: killed.clone(),
+            }),
+            killed,
+        )
+    }
+
+    /// The regression this whole round exists for. On Windows the pty master
+    /// is a ConPTY, and conhost turns a `\x03` written into it into a console
+    /// control event broadcast to *every* process attached to the
+    /// pseudoconsole -- with no `CREATE_NEW_PROCESS_GROUP` to narrow it to,
+    /// because portable-pty 0.9.0 does not spawn with one. A nested `wrap`
+    /// quitting its own child therefore killed the outer session's agent
+    /// too. The ladder is now the adapter's quit sequence, then the single
+    /// narrow `child.kill()`, and nothing in between.
+    #[test]
+    fn quit_child_never_writes_a_control_c_into_the_pty() {
+        let (mut child, killed) = stubborn_child();
+        let mut sink: Vec<u8> = Vec::new();
+
+        quit_child(&mut sink, &mut child, "/exit\r", Duration::from_millis(10)).expect("quit");
+
+        assert!(
+            !sink.contains(&0x03),
+            "no console control byte may reach the pty: {sink:?}"
+        );
+        assert_eq!(
+            sink,
+            b"/exit\r".to_vec(),
+            "only the adapter's own quit sequence is written: {:?}",
+            String::from_utf8_lossy(&sink)
+        );
+        assert!(
+            killed.killed(),
+            "a child that ignores the quit sequence escalates straight to the narrow kill"
+        );
+    }
+
+    #[test]
+    fn quit_child_writes_nothing_at_all_to_a_child_that_has_already_exited() {
+        let (mut child, killed) = stubborn_child();
+        // Already dead before `quit_child` is called.
+        portable_pty::ChildKiller::kill(&mut *child).expect("kill");
+        let mut sink: Vec<u8> = Vec::new();
+
+        quit_child(&mut sink, &mut child, "/exit\r", Duration::from_millis(10)).expect("quit");
+
+        assert!(sink.is_empty(), "nothing to say to a dead child: {sink:?}");
+        assert!(killed.killed());
+    }
+
+    // F2: the nesting guard.
+
+    fn wrap_args_in(command: &[&str], allow_nested: bool) -> WrapArgs {
+        WrapArgs {
+            agent: Some("claude".to_string()),
+            no_supervise: false,
+            command: command.iter().map(|s| (*s).to_string()).collect(),
+            simple: false,
+            allow_nested,
+        }
+    }
+
+    #[test]
+    fn wrap_refuses_to_start_inside_a_supervised_session_and_names_the_evidence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [(
+            adapters::SESSION_ENV.to_string(),
+            "abcdef12-3456-4789-8abc-def012345678".to_string(),
+        )]
+        .into();
+
+        let err = run_with(
+            &wrap_args_in(&["claude"], false),
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("a wrap inside a supervised session must refuse");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to start inside an existing agent session"),
+            "got {msg}"
+        );
+        assert!(
+            msg.contains("abcdef12"),
+            "names the outer session it found: {msg}"
+        );
+        assert!(
+            msg.contains("--allow-nested"),
+            "says how to override: {msg}"
+        );
+    }
+
+    /// The Claude Code marker pair is the second, independent source of
+    /// evidence: a `zirv chat` typed into a Claude Code session's own shell
+    /// exports no `ZIRV_CTX_*` at all when that session was started outside
+    /// zirv, but it is still nested.
+    #[test]
+    fn wrap_refuses_inside_a_claude_code_session_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [
+            ("CLAUDE_PID".to_string(), "4242".to_string()),
+            ("CLAUDECODE".to_string(), "1".to_string()),
+        ]
+        .into();
+
+        let err = run_with(
+            &wrap_args_in(&["claude"], false),
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("refuses");
+        assert!(err.to_string().contains("Claude Code"), "got {err}");
+    }
+
+    /// With the override on, the guard is out of the way and the run reaches
+    /// the *next* refusal in `run_with` -- the undetected-command one. That
+    /// specific later error is the evidence the guard was passed, without
+    /// this test ever having to spawn a pty or an agent.
+    #[test]
+    fn allow_nested_overrides_the_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [(
+            adapters::SESSION_ENV.to_string(),
+            "abcdef12-3456-4789-8abc-def012345678".to_string(),
+        )]
+        .into();
+        let mut args = wrap_args_in(&["echo", "hello"], true);
+        args.agent = None;
+
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("gets past the nesting guard, then fails on the undetected command");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("refusing to start inside"),
+            "the guard was overridden: {msg}"
+        );
+        assert!(msg.contains("could not tell which agent"), "got {msg}");
+    }
+
+    /// And the environment variable is the second, equivalent override, for
+    /// an operator who cannot reach the command line (a wrapper script, a
+    /// CI job).
+    #[test]
+    fn the_allow_nested_environment_variable_overrides_the_guard_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SESSION_ENV.to_string(),
+                "abcdef12-3456-4789-8abc-def012345678".to_string(),
+            ),
+            (
+                super::super::sessions::ALLOW_NESTED_ENV.to_string(),
+                "true".to_string(),
+            ),
+        ]
+        .into();
+        let mut args = wrap_args_in(&["echo", "hello"], false);
+        args.agent = None;
+
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("past the guard, onto the undetected command");
+        assert!(
+            !err.to_string().contains("refusing to start inside"),
+            "got {err}"
+        );
+    }
+
+    /// A plain terminal is not nested, and nothing about the guard changes
+    /// what a normal run does: the same undetected-command refusal, reached
+    /// the same way.
+    #[test]
+    fn a_wrap_outside_any_session_is_not_gated() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut args = wrap_args_in(&["echo", "hello"], false);
+        args.agent = None;
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("echo matches no adapter");
+        assert!(
+            !err.to_string().contains("refusing to start inside"),
+            "got {err}"
+        );
+    }
+
+    // F3: a child never inherits another session's identity.
+
+    /// The bind-failure case, which is the one that actually bit: `wrap`
+    /// binds no socket, so it has no turn-signal env of its own to set, and
+    /// every `ZIRV_CTX_*` the child sees would otherwise be the *outer*
+    /// session's -- inherited straight out of this process's environment,
+    /// because `CommandBuilder::new` seeds itself from `std::env::vars_os`.
+    #[test]
+    fn a_child_never_inherits_the_outer_sessions_socket_or_id() {
+        let _outer = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                adapters::SESSION_ENV,
+                Some("outer111-2222-4333-8444-555555555555"),
+            ),
+            (adapters::SOCKET_ENV, Some("/tmp/outer.sock")),
+            (TRANSCRIPT_ENV, Some("/tmp/outer.jsonl")),
+        ]);
+
+        // Sanity, and the reason the scrub has to be explicit: an untouched
+        // builder really does carry the outer session's values.
+        let inherited = CommandBuilder::new("echo");
+        assert_eq!(
+            inherited
+                .get_env(adapters::SESSION_ENV)
+                .and_then(|v| v.to_str()),
+            Some("outer111-2222-4333-8444-555555555555"),
+            "sanity: portable-pty seeds a builder from the process environment"
+        );
+
+        // No socket of its own: every supervision variable must be *absent*,
+        // not inherited.
+        let mut no_socket = CommandBuilder::new("echo");
+        apply_session_env(&mut no_socket, &[]);
+        for key in super::super::sessions::SUPERVISION_ENV {
+            assert_eq!(
+                no_socket.get_env(key),
+                None,
+                "{key} must not reach a child of an unsupervised wrap"
+            );
+        }
+
+        // And with a socket of its own, only its own values reach the child.
+        let mut supervised = CommandBuilder::new("echo");
+        apply_session_env(
+            &mut supervised,
+            &[(
+                adapters::SESSION_ENV.to_string(),
+                "inner999-2222-4333-8444-555555555555".to_string(),
+            )],
+        );
+        assert_eq!(
+            supervised
+                .get_env(adapters::SESSION_ENV)
+                .and_then(|v| v.to_str()),
+            Some("inner999-2222-4333-8444-555555555555"),
+        );
+        assert_eq!(
+            supervised.get_env(adapters::SOCKET_ENV),
+            None,
+            "the outer socket must not survive alongside the inner id"
+        );
+        assert_eq!(supervised.get_env(TRANSCRIPT_ENV), None);
+    }
+
+    // F5: one published socket path per session.
+
+    #[test]
+    fn two_concurrent_wraps_do_not_clobber_each_others_socket_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let one = "aaaa1111-2222-4333-8444-555555555555";
+        let two = "bbbb2222-2222-4333-8444-555555555555";
+
+        publish_socket_path(&state, one, Path::new("/tmp/one.sock"));
+        publish_socket_path(&state, two, Path::new("/tmp/two.sock"));
+
+        assert_eq!(
+            read_socket_path(&state, Some(one)).as_deref(),
+            Some("/tmp/one.sock"),
+            "the second launch must not have overwritten the first"
+        );
+        assert_eq!(
+            read_socket_path(&state, Some(two)).as_deref(),
+            Some("/tmp/two.sock")
+        );
+        assert!(
+            !state.root().join(SOCKET_PATH_FILE).exists(),
+            "the clobber-prone global file is never written any more"
+        );
+
+        // And releasing one leaves the other reachable.
+        unpublish_socket_path(&state, one);
+        assert_eq!(read_socket_path(&state, Some(one)), None);
+        assert_eq!(
+            read_socket_path(&state, Some(two)).as_deref(),
+            Some("/tmp/two.sock")
+        );
+    }
+
+    #[test]
+    fn a_reader_resolves_its_own_sessions_socket_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mine = "cccc3333-2222-4333-8444-555555555555";
+        let theirs = "dddd4444-2222-4333-8444-555555555555";
+
+        publish_socket_path(&state, mine, Path::new("/tmp/mine.sock"));
+        publish_socket_path(&state, theirs, Path::new("/tmp/theirs.sock"));
+
+        assert_eq!(
+            read_socket_path(&state, Some(mine)).as_deref(),
+            Some("/tmp/mine.sock"),
+            "a reader that knows its own session id never gets somebody else's socket"
+        );
+        // A short id resolves the same file the full session id does.
+        assert_eq!(
+            read_socket_path(&state, Some("cccc3333")).as_deref(),
+            Some("/tmp/mine.sock")
+        );
+        // With no session to go on, *some* published socket is the best
+        // honest answer -- but only one of the two real ones, never a mix.
+        let anonymous = read_socket_path(&state, None).expect("a published socket");
+        assert!(
+            anonymous == "/tmp/mine.sock" || anonymous == "/tmp/theirs.sock",
+            "got {anonymous}"
+        );
+    }
+
+    /// Backward tolerance: a supervisor from a pre-F5 build published the
+    /// global file and nothing else. A reader must still find it.
+    #[test]
+    fn a_reader_still_falls_back_to_the_legacy_global_socket_path_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        super::super::state::create_private_dir_all(state.root()).expect("mkdir");
+        std::fs::write(state.root().join(SOCKET_PATH_FILE), "/tmp/legacy.sock").expect("write");
+
+        assert_eq!(
+            read_socket_path(&state, None).as_deref(),
+            Some("/tmp/legacy.sock")
+        );
+        assert_eq!(
+            read_socket_path(&state, Some("cccc3333")).as_deref(),
+            Some("/tmp/legacy.sock"),
+            "a session with no file of its own still falls back"
+        );
+
+        // A per-session file wins over the legacy one for its own session.
+        publish_socket_path(
+            &state,
+            "cccc3333-2222-4333-8444-555555555555",
+            Path::new("/tmp/mine.sock"),
+        );
+        assert_eq!(
+            read_socket_path(&state, Some("cccc3333")).as_deref(),
+            Some("/tmp/mine.sock")
+        );
+    }
+
+    #[test]
+    fn reading_a_state_dir_with_nothing_published_is_none_rather_than_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        assert_eq!(read_socket_path(&state, None), None);
+        assert_eq!(read_socket_path(&state, Some("cccc3333")), None);
+    }
+
     #[test]
     fn wrap_needs_a_command() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1925,6 +2550,7 @@ mod tests {
             no_supervise: false,
             command: Vec::new(),
             simple: false,
+            allow_nested: false,
         };
         let err = run_with(
             &args,
@@ -1952,6 +2578,7 @@ mod tests {
             no_supervise: false,
             command: vec!["echo".to_string(), "hello".to_string()],
             simple: false,
+            allow_nested: false,
         };
         let err = run_with(
             &args,
@@ -1992,6 +2619,7 @@ mod tests {
             no_supervise: false,
             command: vec!["--append-system-prompt".to_string(), "foo".to_string()],
             simple: false,
+            allow_nested: false,
         };
         let err = run_with(
             &args,
@@ -2777,12 +3405,8 @@ mod tests {
 
         // A turn boundary is what unlocks injection, and the hook is what
         // reports one, so drive it exactly the way the real hook does.
-        let socket =
-            std::fs::read_to_string(tmp.path().join("state/socket-path")).unwrap_or_default();
-        assert!(
-            !socket.trim().is_empty(),
-            "wrap must publish its socket path"
-        );
+        let socket = read_socket_path(&StateDir::from_root(tmp.path().join("state")), None)
+            .expect("wrap must publish its socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(3, Verdict::Compact),
@@ -2848,7 +3472,8 @@ mod tests {
 
         store_mail_for_cwd(&state, "note");
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(3, Verdict::Healthy),
@@ -2890,17 +3515,25 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        // The empty prefix matches whichever session is currently live --
-        // there is exactly one, the wrap subprocess `spawn_wrap` just
-        // started, registered under its own (real) pid.
+        // Resolved from the registry rather than passed as an empty prefix:
+        // there is exactly one live session, the wrap subprocess `spawn_wrap`
+        // just started under its own (real) pid, and F6 makes `zirv ctx
+        // nudge` refuse any prefix shorter than four characters -- an empty
+        // one most of all.
         let repo = std::env::current_dir().expect("cwd");
+        let state = super::super::state::StateDir::from_root(state_root.clone());
+        let short = super::super::sessions::list(&state)
+            .into_iter()
+            .find(|(_, liveness)| *liveness == super::super::sessions::Liveness::Live)
+            .map(|(record, _)| record.short)
+            .expect("the wrap subprocess registered a live session");
         let env: std::collections::HashMap<String, String> = [(
             crate::commands::ctx::state::STATE_ENV.to_string(),
             state_root.display().to_string(),
         )]
         .into();
         let args = crate::commands::ctx::sessions::NudgeArgs {
-            prefix: String::new(),
+            prefix: short,
             message: Some("do-not-type-this-guidance".to_string()),
             message_file: None,
         };
@@ -2915,7 +3548,8 @@ mod tests {
         )
         .expect("nudge the live wrap session");
 
-        let socket = std::fs::read_to_string(state_root.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state_root.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(3, Verdict::Healthy),
@@ -2952,7 +3586,8 @@ mod tests {
 
         store_mail_for_cwd(&state, "do-not-type-this-body");
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(3, Verdict::Healthy),
@@ -2997,7 +3632,8 @@ mod tests {
 
         store_mail_for_cwd(&state, "note");
 
-        let socket_path = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket_path =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         let socket = std::path::PathBuf::from(socket_path.trim());
 
         crate::commands::ctx::signal::send(&socket, &turn_signal(3, Verdict::Healthy))
@@ -3050,7 +3686,8 @@ mod tests {
         std::fs::create_dir_all(&mailbox).expect("mkdir");
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(3, Verdict::Healthy),
@@ -3180,7 +3817,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal_for(3, Verdict::Compact, &transcript),
@@ -3254,7 +3892,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket_path = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket_path =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         let socket = std::path::PathBuf::from(socket_path.trim());
         crate::commands::ctx::signal::send(&socket, &turn_signal_for(5, Verdict::Restart, &first))
             .expect("send");
@@ -3438,7 +4077,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(5, Verdict::Restart),
@@ -3540,7 +4180,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(5, Verdict::Restart),
@@ -3647,7 +4288,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket = std::fs::read_to_string(tmp.path().join("state/socket-path")).expect("path");
+        let socket =
+            read_socket_path(&StateDir::from_root(tmp.path().join("state")), None).expect("path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(2, Verdict::Compact),
@@ -3701,8 +4343,9 @@ mod tests {
 
         let seen = read_until(&mut reader, "stub-tui ready", Duration::from_secs(10));
         assert!(seen.contains("stub-tui ready"));
-        assert!(
-            !tmp.path().join("state/socket-path").exists(),
+        assert_eq!(
+            read_socket_path(&StateDir::from_root(tmp.path().join("state")), None),
+            None,
             "no socket is bound when supervision is off"
         );
 
@@ -3885,6 +4528,17 @@ mod tests {
             cmd.arg("--");
             cmd.args(wrapped);
             cmd.env(crate::commands::ctx::state::STATE_ENV, state);
+            // Hermetic against the *developer's* own environment (F2): these
+            // tests spawn the real `zirv` binary, which reads the process
+            // environment, so a suite run from inside an agent session would
+            // otherwise trip the nesting guard and see exit code 1 instead of
+            // whatever the test is actually about. The guard has its own
+            // dedicated coverage above; here it is noise.
+            for key in super::super::super::sessions::SUPERVISION_ENV {
+                cmd.env_remove(key);
+            }
+            cmd.env_remove("CLAUDE_PID");
+            cmd.env_remove("CLAUDECODE");
             // No terminal: this is also the CI/piped case, which is exactly
             // why the synthetic cursor report cannot be left to a real
             // terminal to send.

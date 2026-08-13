@@ -82,6 +82,36 @@ having a separate one, not a bug in the alias routing itself.
   hand-written invocation, as one command. Pass `-` as the prompt to read it
   from stdin instead.
 
+#### Nested sessions are refused
+
+`zirv chat` (and `zirv ctx wrap`) refuse to start when they can tell they are
+already running *inside* an agent session — `ZIRV_CTX_SESSION` or
+`ZIRV_CTX_SOCKET` is set, or Claude Code's own `CLAUDE_PID`+`CLAUDECODE`
+pair is:
+
+```
+zirv ctx chat: refusing to start inside an existing agent session
+(ZIRV_CTX_SESSION=abcdef12). A nested interactive session can post turn
+signals into the outer supervisor and get the outer session compacted,
+restarted or killed. Run it from a plain terminal, or pass --allow-nested
+(or set ZIRV_ALLOW_NESTED=true) to override.
+```
+
+This is not a tidiness rule. A nested interactive supervisor shares the outer
+session's console, and if its own turn-signal socket fails to bind, its child
+would report turn boundaries into the **outer** supervisor's rot engine —
+which eventually verdicts a restart and ends the session the human was
+actually talking to. Pass `--allow-nested`, or set `ZIRV_ALLOW_NESTED=true`,
+if you mean it.
+
+The **headless** verbs — `zirv ctx exec`, `zirv ctx loop` and `zirv agent` —
+are deliberately *not* gated: delegating a task to a worker from inside a
+session is exactly what they are for, and a worker never takes the shared
+console over. Each of them still scrubs `ZIRV_CTX_SESSION`,
+`ZIRV_CTX_SOCKET` and `ZIRV_CTX_TRANSCRIPT` off every child it launches
+before setting its own, so a worker can never inherit another session's
+identity.
+
 ### Sending mail between sessions
 
 Agent sessions running on the same machine can leave each other short notes,
@@ -141,6 +171,12 @@ of waiting for it to notice on its own:
 ```bash
 zirv ctx nudge abcd --message "please check the new failing test"
 ```
+
+A nudge prefix must be at least four characters (or a session's whole short
+id) — unlike `--to-session`, which only addresses a message, a nudge wakes
+and can restart what it resolves to, and on a machine running one session a
+single mistyped character is still "unique". A shorter prefix is refused and
+the live sessions are named back to you.
 
 The message itself is ordinary, durable mail (visible in `zirv ctx inbox`
 even if the wake-up is missed), so the two pieces are decoupled on purpose: a

@@ -116,6 +116,49 @@ pub(crate) mod testenv {
         }
     }
 
+    /// Sets (or clears) arbitrary environment variables for the duration of a
+    /// test, putting every one of them back on drop -- including on a
+    /// panicking assertion, for the same reason `EnvGuard` restores there.
+    ///
+    /// Needed by the tests that pin *inheritance* behavior: what a child
+    /// process inherits is a fact about the real process environment, and
+    /// `portable_pty::CommandBuilder::new` reads `std::env::vars_os` directly
+    /// rather than through any injectable lookup, so there is nothing to fake.
+    pub(crate) struct VarGuard(Vec<(String, Option<OsString>)>);
+
+    impl VarGuard {
+        pub(crate) fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let previous = vars
+                .iter()
+                .map(|(key, _)| ((*key).to_string(), std::env::var_os(key)))
+                .collect();
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                for (key, value) in vars {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(previous) => std::env::set_var(&key, previous),
+                        None => std::env::remove_var(&key),
+                    }
+                }
+            }
+        }
+    }
+
     /// `EnvGuard` without the working directory, which is all most tests need.
     pub(crate) struct HomeGuard(#[allow(dead_code)] EnvGuard);
 

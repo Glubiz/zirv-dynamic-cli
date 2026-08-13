@@ -32,6 +32,118 @@ pub fn short_id(session: &str) -> String {
         .collect()
 }
 
+/// The environment variables that carry one supervised session's *identity*
+/// into everything it spawns: which session id turn signals should claim,
+/// which socket to post them on, and which transcript file the supervisor is
+/// watching. A child that inherits these from an outer session reports its
+/// own turns as if they belonged to that outer session -- which is exactly
+/// how a nested launch drove the outer rot engine to a `Restart` verdict and
+/// had it kill the outer agent (see `nested_session_evidence`).
+///
+/// Every supervisor scrubs all three off a child command builder before
+/// setting whichever of them it actually owns, so "no socket of my own"
+/// degrades to *unsupervised*, never to *supervised by somebody else*.
+pub const SUPERVISION_ENV: [&str; 3] = [
+    super::adapters::SESSION_ENV,
+    super::adapters::SOCKET_ENV,
+    super::wrap::TRANSCRIPT_ENV,
+];
+
+/// `portable_pty::CommandBuilder::new` seeds itself from `std::env::vars_os`,
+/// so an unset key on the builder still means "inherit". Only an explicit
+/// `env_remove` actually keeps the value out of the child.
+pub fn scrub_supervision_env(builder: &mut portable_pty::CommandBuilder) {
+    for key in SUPERVISION_ENV {
+        builder.env_remove(key);
+    }
+}
+
+/// The `std::process::Command` counterpart, for the headless supervisors.
+pub fn scrub_supervision_env_cmd(command: &mut std::process::Command) {
+    for key in SUPERVISION_ENV {
+        command.env_remove(key);
+    }
+}
+
+/// Set to `true` to bypass the interactive nesting guard, for the operator
+/// who genuinely means to run a session inside a session. Mirrored by
+/// `--allow-nested` on `wrap` and `chat`.
+pub const ALLOW_NESTED_ENV: &str = "ZIRV_ALLOW_NESTED";
+
+/// Claude Code exports both of these into every process it spawns; either one
+/// alone is too weak to key on (`CLAUDECODE` is a plain flag a user could
+/// export by hand), so the pair is required together.
+const CLAUDE_PID_ENV: &str = "CLAUDE_PID";
+const CLAUDE_CODE_ENV: &str = "CLAUDECODE";
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Why this process looks like it is already running *inside* an agent
+/// session, or `None` when nothing says so. Pure: it reads the caller's
+/// `EnvLookup` only, never the process environment or the filesystem.
+///
+/// Interactive supervision nested inside an existing session is not merely
+/// redundant, it is destructive. The nested `wrap` binds its own turn-signal
+/// socket, but when that bind fails it still spawns a child -- and that child
+/// inherits the *outer* `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET`, so its hooks
+/// post phantom turns into the outer supervisor's rot engine until the outer
+/// engine verdicts `Restart` and kills its own child: the session the user
+/// was actually talking to. `SUPERVISION_ENV` scrubbing closes the inherit
+/// half of that; this closes the "should we be here at all" half.
+pub fn nested_session_evidence(env: super::config::EnvLookup<'_>) -> Option<String> {
+    let mut found: Vec<String> = Vec::new();
+    if let Some(id) = non_empty(env(super::adapters::SESSION_ENV)) {
+        found.push(format!(
+            "{}={}",
+            super::adapters::SESSION_ENV,
+            short_id(&id)
+        ));
+    }
+    if non_empty(env(super::adapters::SOCKET_ENV)).is_some() {
+        found.push(format!("{} is set", super::adapters::SOCKET_ENV));
+    }
+    if non_empty(env(CLAUDE_PID_ENV)).is_some() && non_empty(env(CLAUDE_CODE_ENV)).is_some() {
+        found.push(format!(
+            "{CLAUDE_PID_ENV} and {CLAUDE_CODE_ENV} are set (a Claude Code session owns this terminal)"
+        ));
+    }
+    (!found.is_empty()).then(|| found.join("; "))
+}
+
+/// The refusal message an interactive verb prints, or `None` when it may
+/// start. `allow_nested` is the verb's own `--allow-nested` flag; the
+/// `ZIRV_ALLOW_NESTED` environment variable is the second, equivalent
+/// override (strict `true`, matching every other boolean this codebase reads
+/// out of the environment).
+///
+/// Only the interactive verbs (`wrap`, `chat`) call this. Headless workers
+/// (`exec`, `loop`, `agent`) legitimately run inside a session -- delegating
+/// to one is the whole point of `zirv ctx agent` -- and they never take over
+/// the shared console, so they are deliberately not gated.
+pub fn nesting_refusal(
+    verb: &str,
+    env: super::config::EnvLookup<'_>,
+    allow_nested: bool,
+) -> Option<String> {
+    let overridden = allow_nested
+        || non_empty(env(ALLOW_NESTED_ENV))
+            .is_some_and(|v| v.to_ascii_lowercase().parse::<bool>() == Ok(true));
+    if overridden {
+        return None;
+    }
+    let evidence = nested_session_evidence(env)?;
+    Some(format!(
+        "zirv ctx {verb}: refusing to start inside an existing agent session ({evidence}). \
+         A nested interactive session can post turn signals into the outer supervisor and \
+         get the outer session compacted, restarted or killed. Run it from a plain terminal, \
+         or pass --allow-nested (or set {ALLOW_NESTED_ENV}=true) to override."
+    ))
+}
+
 /// Which supervisor filed a record. `Chat` is `wrap`'s own orchestrator
 /// launch, threaded through as a distinct verb from `chat.rs` rather than
 /// derived from `PromptRole`: the two are independent facts about a session
@@ -339,9 +451,51 @@ pub fn claim_nudge_marker(state: &StateDir, short: &str) -> bool {
     std::fs::remove_file(nudge_marker_path(state, short)).is_ok()
 }
 
+/// How much of a short id `zirv ctx nudge` insists on. `resolve_prefix`
+/// accepts any *unique* prefix, which is the right rule for a read-only
+/// lookup but the wrong one for a write: a single mistyped character can
+/// still be unique, and the nudge then wakes -- and can restart -- a session
+/// the operator never meant to touch. Four characters is 16 bits of the
+/// eight-hex-character short id, enough that a typo lands on "no session
+/// matches" rather than on a neighbour.
+pub const MIN_NUDGE_PREFIX: usize = 4;
+
+/// The refusal for a too-short nudge target, or `None` when the prefix is
+/// long enough to act on. Pure, so the rule is testable without a registry
+/// on disk. A prefix that *equals* a live session's whole short id always
+/// passes, however short that short id happens to be.
+pub fn nudge_prefix_too_short(prefix: &str, live_shorts: &[String]) -> Option<String> {
+    if prefix.chars().count() >= MIN_NUDGE_PREFIX {
+        return None;
+    }
+    if live_shorts.iter().any(|short| short == prefix) {
+        return None;
+    }
+    let listed = if live_shorts.is_empty() {
+        "none registered".to_string()
+    } else {
+        live_shorts.join(", ")
+    };
+    Some(format!(
+        "prefix too short (a nudge needs at least {MIN_NUDGE_PREFIX} characters, \
+         or a session's whole short id); sessions: {listed}"
+    ))
+}
+
+/// Every live session's short id, in the order `list` found them. The list a
+/// refusal names back to the operator.
+fn live_shorts(state: &StateDir) -> Vec<String> {
+    list(state)
+        .into_iter()
+        .filter(|(_, liveness)| *liveness == Liveness::Live)
+        .map(|(record, _)| record.short)
+        .collect()
+}
+
 #[derive(Debug, clap::Args)]
 pub struct NudgeArgs {
-    /// Short id (or a unique prefix of one) of the live session to nudge.
+    /// Short id (or a unique prefix of one, at least four characters) of the
+    /// live session to nudge.
     pub prefix: String,
     /// Message text. When omitted, read from `--message-file`, else from
     /// stdin.
@@ -387,6 +541,13 @@ pub fn run_nudge_with<W: Write>(
     }
 
     let state = StateDir::resolve(env)?;
+    // Checked before `resolve_prefix`, not after: a one- or two-character
+    // prefix is very often *unique* on a machine running a single session, so
+    // resolution would happily succeed and nudge (and potentially restart) a
+    // session the operator only half-typed.
+    if let Some(refusal) = nudge_prefix_too_short(&args.prefix, &live_shorts(&state)) {
+        return Err(format!("zirv ctx nudge: {refusal}").into());
+    }
     // Only a live session is a valid nudge target: `resolve_prefix` already
     // filters to live records (a stale one was swept from disk by the time a
     // caller could act on it), so an unknown *or* dead session both surface
@@ -793,6 +954,194 @@ mod tests {
             !claim_nudge_marker(&state, "aaaa1111"),
             "a second observer finds nothing left to claim"
         );
+    }
+
+    // F6: a unique-but-mistyped prefix must not be actionable.
+
+    #[test]
+    fn a_nudge_prefix_shorter_than_four_characters_is_refused_with_the_session_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+        let record = record_for("abcdef12-3456-4789-8abc-def012345678", &repo, Verb::Chat);
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        // "abc" is *unique* here -- exactly the shape that used to resolve and
+        // nudge the wrong session on a typo.
+        let args = NudgeArgs {
+            prefix: "abc".to_string(),
+            message: Some("wake up".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect_err("three characters is not enough to nudge on");
+        let msg = err.to_string();
+        assert!(msg.contains("prefix too short"), "got {msg}");
+        assert!(msg.contains(&short), "names what could be typed: {msg}");
+
+        // Nothing was queued and nothing was woken.
+        let slug = super::super::state::repo_slug(&repo);
+        assert!(
+            super::super::mail::list(&state, &slug, None, Some(&short))
+                .expect("list")
+                .is_empty(),
+            "a refused nudge must not store a message"
+        );
+        assert!(!nudge_marker_path(&state, &short).exists());
+
+        // Four characters, and the whole short id, both still work.
+        let args = NudgeArgs {
+            prefix: "abcd".to_string(),
+            message: Some("wake up".to_string()),
+            message_file: None,
+        };
+        let code = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect("four characters is enough");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn the_minimum_prefix_rule_still_admits_a_whole_short_id() {
+        // Pure rule, no registry: a session whose entire short id is shorter
+        // than the minimum is still addressable by that whole id, and only by
+        // it.
+        let shorts = vec!["ab".to_string()];
+        assert_eq!(nudge_prefix_too_short("ab", &shorts), None);
+        assert!(nudge_prefix_too_short("a", &shorts).is_some());
+        assert_eq!(nudge_prefix_too_short("abcd", &[]), None);
+        let refusal = nudge_prefix_too_short("x", &[]).expect("refused");
+        assert!(refusal.contains("none registered"), "got {refusal}");
+    }
+
+    // F2: the nesting guard.
+
+    #[test]
+    fn nested_session_evidence_names_every_signal_it_found() {
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        assert_eq!(
+            nested_session_evidence(&|k| empty.get(k).cloned()),
+            None,
+            "a plain terminal is not nested"
+        );
+
+        let env = env_map(&[(
+            super::super::adapters::SESSION_ENV,
+            "abcdef12-3456-4789-8abc-def012345678",
+        )]);
+        let evidence = nested_session_evidence(&|k| env.get(k).cloned()).expect("nested");
+        assert!(evidence.contains("ZIRV_CTX_SESSION"), "got {evidence}");
+        assert!(
+            evidence.contains("abcdef12"),
+            "names the outer session: {evidence}"
+        );
+
+        let env = env_map(&[(super::super::adapters::SOCKET_ENV, "/tmp/sock")]);
+        let evidence = nested_session_evidence(&|k| env.get(k).cloned()).expect("nested");
+        assert!(evidence.contains("ZIRV_CTX_SOCKET"), "got {evidence}");
+
+        // Either Claude Code marker alone is too weak; the pair is not.
+        let only_flag = env_map(&[("CLAUDECODE", "1")]);
+        assert_eq!(
+            nested_session_evidence(&|k| only_flag.get(k).cloned()),
+            None
+        );
+        let pair = env_map(&[("CLAUDECODE", "1"), ("CLAUDE_PID", "4242")]);
+        let evidence = nested_session_evidence(&|k| pair.get(k).cloned()).expect("nested");
+        assert!(evidence.contains("Claude Code"), "got {evidence}");
+
+        // An exported-but-empty variable is not evidence of anything.
+        let blank = env_map(&[(super::super::adapters::SESSION_ENV, "  ")]);
+        assert_eq!(nested_session_evidence(&|k| blank.get(k).cloned()), None);
+    }
+
+    #[test]
+    fn allow_nested_overrides_the_guard() {
+        let env = env_map(&[(
+            super::super::adapters::SESSION_ENV,
+            "abcdef12-3456-4789-8abc-def012345678",
+        )]);
+        let lookup = |k: &str| env.get(k).cloned();
+        assert!(
+            nesting_refusal("chat", &lookup, false).is_some(),
+            "nested by default"
+        );
+        assert_eq!(
+            nesting_refusal("chat", &lookup, true),
+            None,
+            "--allow-nested is an override"
+        );
+
+        let env = env_map(&[
+            (
+                super::super::adapters::SESSION_ENV,
+                "abcdef12-3456-4789-8abc-def012345678",
+            ),
+            (ALLOW_NESTED_ENV, "true"),
+        ]);
+        assert_eq!(
+            nesting_refusal("chat", &|k| env.get(k).cloned(), false),
+            None,
+            "ZIRV_ALLOW_NESTED=true is the second override"
+        );
+
+        // Strict, like every other boolean read out of the environment here.
+        let env = env_map(&[
+            (
+                super::super::adapters::SESSION_ENV,
+                "abcdef12-3456-4789-8abc-def012345678",
+            ),
+            (ALLOW_NESTED_ENV, "maybe"),
+        ]);
+        assert!(nesting_refusal("chat", &|k| env.get(k).cloned(), false).is_some());
+    }
+
+    #[test]
+    fn the_refusal_names_the_verb_the_evidence_and_the_override() {
+        let env = env_map(&[(super::super::adapters::SOCKET_ENV, "/tmp/sock")]);
+        let msg = nesting_refusal("wrap", &|k| env.get(k).cloned(), false).expect("refused");
+        assert!(msg.starts_with("zirv ctx wrap:"), "got {msg}");
+        assert!(msg.contains("ZIRV_CTX_SOCKET"), "got {msg}");
+        assert!(msg.contains("--allow-nested"), "got {msg}");
+        assert!(msg.contains(ALLOW_NESTED_ENV), "got {msg}");
+    }
+
+    // F3: no child ever inherits another session's identity.
+
+    #[test]
+    fn scrubbing_removes_every_supervision_variable_from_a_pty_builder() {
+        let mut builder = portable_pty::CommandBuilder::new("echo");
+        for key in SUPERVISION_ENV {
+            builder.env(key, "inherited-from-the-outer-session");
+            assert!(builder.get_env(key).is_some(), "sanity: {key} was set");
+        }
+        scrub_supervision_env(&mut builder);
+        for key in SUPERVISION_ENV {
+            assert_eq!(builder.get_env(key), None, "{key} must not reach the child");
+        }
+    }
+
+    #[test]
+    fn scrubbing_removes_every_supervision_variable_from_a_process_command() {
+        let mut command = std::process::Command::new("echo");
+        scrub_supervision_env_cmd(&mut command);
+        let removed: Vec<&str> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .filter_map(|(key, _)| key.to_str())
+            .collect();
+        for key in SUPERVISION_ENV {
+            assert!(removed.contains(&key), "{key} must be removed: {removed:?}");
+        }
     }
 
     #[test]

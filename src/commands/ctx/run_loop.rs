@@ -222,6 +222,13 @@ pub fn run_with<W: Write>(
 
         let mut command = adapter.headless_cmd(&prompt, &session, &extra);
         command.current_dir(repo);
+        // F3: `loop` binds no turn-signal socket of its own, so it has no
+        // session identity to set here at all -- which is precisely why the
+        // scrub matters. Without it, a cycle launched from inside another
+        // agent's session inherited that session's `ZIRV_CTX_SESSION` and
+        // `ZIRV_CTX_SOCKET` and reported its own turn boundaries into the
+        // outer supervisor's rot engine.
+        super::sessions::scrub_supervision_env_cmd(&mut command);
         // Names the same fact `ctx.toml`'s own `agent` key would, so a nested
         // `zirv ctx ...` call inside this cycle's own child processes
         // defaults to this cycle's harness rather than re-resolving from

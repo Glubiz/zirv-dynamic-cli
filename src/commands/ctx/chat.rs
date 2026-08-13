@@ -38,6 +38,11 @@ pub struct ChatArgs {
     /// `[chrome]` toggles.
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
+    /// Start even though this process looks like it is already inside an
+    /// agent session. Off by default: a nested interactive supervisor can
+    /// take the outer session down.
+    #[arg(long, default_value_t = false)]
+    pub allow_nested: bool,
     /// Extra arguments passed through to the agent, after `--`.
     //
     // `allow_hyphen_values`, because what gets passed through here is the
@@ -190,6 +195,24 @@ pub fn run_with<W: Write, E: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    // F2, first of all: before any config load, adapter resolution, terminal
+    // probe or VT mode change. A `chat` started inside an existing agent
+    // session can take that outer session down (see
+    // `sessions::nested_session_evidence`), so it must refuse without having
+    // touched the shared console at all.
+    //
+    // Printed on `stderr` and reported as exit code 1 rather than returned
+    // as an `Err`, matching every other refusal in this function: a returned
+    // `Err` would be printed a second time, unstyled, by `ctx`'s own
+    // dispatch. `wrap::run_with` re-checks this independently (it has no
+    // writer of its own, so it returns the `Err` there), which is what keeps
+    // the guard holding even if this path were bypassed -- and why
+    // `allow_nested` has to be threaded into `WrapArgs` below.
+    if let Some(refusal) = super::sessions::nesting_refusal("chat", env, args.allow_nested) {
+        writeln!(stderr, "{refusal}")?;
+        return Ok(1);
+    }
+
     let cfg = CtxConfig::load(repo, env)?;
     // Held for the rest of this function: dropping it early would restore
     // the console's original VT mode before `wrap`'s own raw-mode session
@@ -245,12 +268,7 @@ pub fn run_with<W: Write, E: Write>(
     let launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &args.extra);
 
     let env = quiet_env(env, args.quiet);
-    let wrap_args = WrapArgs {
-        agent: Some(launch.agent_name),
-        no_supervise: false,
-        command: launch.argv,
-        simple: args.simple,
-    };
+    let wrap_args = wrap_args_for(args, launch.clone());
     wrap::run_with(
         &wrap_args,
         repo,
@@ -259,6 +277,23 @@ pub fn run_with<W: Write, E: Write>(
         Some(session),
         launch.verb,
     )
+}
+
+/// The `wrap` invocation a resolved chat launch becomes. Pure, so what does
+/// and does not survive the hand-off is testable without a pty.
+///
+/// `allow_nested` is threaded through rather than re-derived: `wrap::run_with`
+/// runs the same nesting guard again against the same environment, so an
+/// override honored here but dropped here would simply be refused one layer
+/// down.
+pub fn wrap_args_for(args: &ChatArgs, launch: ChatLaunch) -> WrapArgs {
+    WrapArgs {
+        agent: Some(launch.agent_name),
+        no_supervise: false,
+        command: launch.argv,
+        simple: args.simple,
+        allow_nested: args.allow_nested,
+    }
 }
 
 /// `--quiet` on the `chat` and `agent` verbs is a CLI flag, not an
@@ -475,6 +510,7 @@ mod tests {
             resume: false,
             simple: false,
             quiet: false,
+            allow_nested: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -516,6 +552,7 @@ mod tests {
             resume: false,
             simple: false,
             quiet: false,
+            allow_nested: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -570,6 +607,7 @@ mod tests {
             resume: false,
             simple: false,
             quiet: false,
+            allow_nested: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -587,6 +625,122 @@ mod tests {
         );
         let printed = String::from_utf8(err_out).expect("utf8");
         assert!(printed.contains("disabled"), "got {printed}");
+    }
+
+    // F2: the nesting guard, checked before anything touches the terminal.
+
+    fn chat_args(allow_nested: bool) -> ChatArgs {
+        ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested,
+            extra: Vec::new(),
+        }
+    }
+
+    /// The refusal comes out on `stderr` as exit code 1, the same shape every
+    /// other `chat` refusal uses (a returned `Err` would be printed a second
+    /// time by `ctx`'s own dispatch), and it names the outer session so the
+    /// operator can see *which* one they were about to endanger.
+    #[test]
+    fn chat_refuses_to_start_inside_a_supervised_session_and_names_the_evidence() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "abcdef12-3456-4789-8abc-def012345678".to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_with(
+            &chat_args(false),
+            &mut out,
+            &mut err_out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("refuses by printing and exiting 1, not by propagating an Err");
+
+        assert_eq!(code, 1);
+        assert!(
+            String::from_utf8(out).expect("utf8").is_empty(),
+            "nothing goes to stdout on this path -- not even a banner"
+        );
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert!(
+            msg.contains("refusing to start inside an existing agent session"),
+            "got {msg}"
+        );
+        assert!(msg.contains("abcdef12"), "names the outer session: {msg}");
+        assert!(
+            msg.contains("--allow-nested"),
+            "says how to override: {msg}"
+        );
+    }
+
+    /// With the override on, the guard is out of the way and resolution
+    /// proceeds -- reaching the disabled-agent refusal instead. That specific
+    /// later message is the evidence the guard was passed, without this test
+    /// ever launching an agent.
+    #[test]
+    fn allow_nested_overrides_the_guard() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "abcdef12-3456-4789-8abc-def012345678".to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_with(
+            &chat_args(true),
+            &mut out,
+            &mut err_out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("past the guard, onto adapter resolution");
+        assert_eq!(code, 1);
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert!(
+            !msg.contains("refusing to start inside"),
+            "the guard was overridden: {msg}"
+        );
+        assert!(msg.contains("disabled"), "got {msg}");
+    }
+
+    /// `--allow-nested` has to reach `wrap` too: `wrap::run_with` runs the
+    /// identical guard against the identical environment, so an override that
+    /// stopped here would simply be refused one layer down.
+    #[test]
+    fn the_override_is_threaded_through_to_the_wrap_arguments() {
+        let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let launch = build_launch(&adapter, None, &[]);
+        for allow_nested in [false, true] {
+            let wrap_args = wrap_args_for(&chat_args(allow_nested), launch.clone());
+            assert_eq!(
+                wrap_args.allow_nested, allow_nested,
+                "chat's own override has to reach wrap's identical guard"
+            );
+            assert_eq!(wrap_args.agent.as_deref(), Some("claude"));
+            assert!(
+                !wrap_args.no_supervise,
+                "a chat session is always supervised"
+            );
+        }
     }
 
     #[test]

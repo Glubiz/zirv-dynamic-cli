@@ -1,4 +1,320 @@
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::CtxResult;
+
+// ---------------------------------------------------------------------------
+// F4: putting the shared console back when this process is killed from
+// outside.
+//
+// `RawGuard`/`VtGuard` mutate the *user's own* console, not a private handle,
+// and `restore` only runs on a path this process actually reaches. An
+// external kill -- `taskkill`, a parent supervisor's `TerminateProcess`, a
+// Ctrl-C at the shell, closing the window -- reaches none of them, and the
+// release profile is `panic = "abort"`, so `Drop` is no safety net either.
+// What is left behind is a console with no echo, no line editing, and (when
+// the chrome bar was up) a scroll region pinned one row short of the bottom:
+// unusable until the user finds `reset` or opens a new window.
+//
+// So the modes are also stashed in a process-global the moment they are
+// changed, and a handler that restores them is installed once. The handler
+// runs *before* default handling and then lets it proceed.
+//
+// What this cannot cover: `TerminateProcess` (Windows) and `SIGKILL` (unix)
+// run no user code at all, by design. Nothing in userspace can. The stash is
+// still worth having for every other route, which is most of them.
+//
+// Manual verification recipe (not automatable -- it needs a real console and
+// an external killer, and this repo's own test process is frequently itself
+// running under `zirv ctx wrap`, where a stray console control event would
+// take the developer's session down):
+//
+//   1. In a *detached* console:  cmd /c start zirv chat
+//      (unix: run it in a separate terminal emulator window)
+//   2. From another shell, once the bar is drawn:
+//        Windows:  taskkill /PID <pid>            (no /F -- /F is
+//                  TerminateProcess and runs no handler)
+//        unix:     kill -TERM <pid>
+//   3. In the detached console, type: echo hello
+//      Before F4 the characters do not echo and the bottom row is fenced off.
+//      After F4 the console echoes normally and scrolls to the last row.
+// ---------------------------------------------------------------------------
+
+/// Written to the real stdout from the handler when the chrome bar was up:
+/// `CSI r` resets the scroll region to the full screen (the thing that
+/// actually wedges a terminal), and `CSI ?25h` shows a cursor the TUI may
+/// have hidden.
+///
+/// Deliberately a fixed constant rather than `chrome::bar_reset_sequence`,
+/// which formats the current row count into the string: formatting allocates,
+/// and this may run in a POSIX signal handler where allocation is not
+/// async-signal-safe. Clearing the reserved row is cosmetic; un-fencing the
+/// scroll region is not, and that part needs no row number.
+const EMERGENCY_RESET: &[u8] = b"\x1b[r\x1b[?25h";
+
+/// Whether the chrome bar currently owns a reserved row, and therefore
+/// whether the handler owes the terminal a scroll-region reset. Set by `wrap`
+/// when it writes the scroll region, cleared when it resets the bar.
+static BAR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Installed exactly once, however many guards are entered.
+static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_bar_active(active: bool) {
+    BAR_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+pub fn bar_active() -> bool {
+    BAR_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// What the handler writes to stdout, given whether the bar was up. Pure, so
+/// the decision is testable even though invoking the handler itself is not.
+pub fn emergency_reset_bytes(bar_active: bool) -> &'static [u8] {
+    if bar_active { EMERGENCY_RESET } else { b"" }
+}
+
+/// Installs the console-restore handler, returning whether *this* call was
+/// the one that installed it. Idempotent: every later call is a no-op and
+/// returns `false`, so `RawGuard::enter` can call it unconditionally.
+pub fn install_console_restore_handler() -> bool {
+    if HANDLER_INSTALLED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    install_platform_handler();
+    true
+}
+
+/// The handler body, shared by both platforms. Async-signal-safe: no
+/// allocation, no locks, no formatting -- a raw write of a constant byte
+/// string and a direct mode-restoring syscall, both taken from state that was
+/// stashed before any signal could arrive.
+fn restore_console_from_handler() {
+    let reset = emergency_reset_bytes(bar_active());
+    if !reset.is_empty() {
+        write_stdout_raw(reset);
+    }
+    restore_stashed_console_modes();
+}
+
+#[cfg(unix)]
+fn write_stdout_raw(bytes: &[u8]) {
+    // SAFETY: a plain write of a borrowed slice to fd 1; `write` is
+    // async-signal-safe and the result is deliberately ignored (there is
+    // nothing useful to do about a failed emergency reset).
+    unsafe {
+        let _ = libc::write(1, bytes.as_ptr() as *const libc::c_void, bytes.len());
+    }
+}
+
+#[cfg(windows)]
+fn write_stdout_raw(bytes: &[u8]) {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: `GetStdHandle` takes no pointers; `WriteFile` gets a live
+    // borrowed buffer, a live out-param and a null OVERLAPPED (a synchronous
+    // write). A failure has nothing useful to fall back to.
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut written: u32 = 0;
+        let _ = WriteFile(
+            handle,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_stdout_raw(_bytes: &[u8]) {}
+
+// -- unix: the saved termios, and a minimal SIGINT/SIGTERM handler ----------
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct StashedConsole {
+    fd: i32,
+    saved: libc::termios,
+}
+
+// `termios` is plain POSIX data with no interior pointers, and the stash is
+// written once and only ever read; the raw `libc` type simply carries no
+// `Send`/`Sync` impls of its own.
+#[cfg(unix)]
+unsafe impl Send for StashedConsole {}
+#[cfg(unix)]
+unsafe impl Sync for StashedConsole {}
+
+#[cfg(unix)]
+static STASHED_CONSOLE: OnceLock<StashedConsole> = OnceLock::new();
+
+/// Write-once, by design: the *first* mode this process ever saw is the one
+/// the user started with, and the one they must get back. A later guard
+/// (`wrap` restarting its bar, say) would otherwise stash an already-raw mode
+/// and "restore" the console into it. Returns whether this call did the
+/// stashing.
+#[cfg(unix)]
+pub fn stash_console_state(fd: i32, saved: libc::termios) -> bool {
+    STASHED_CONSOLE.set(StashedConsole { fd, saved }).is_ok()
+}
+
+/// Only this module's own tests need to ask; the production path just calls
+/// `stash_console_state` and ignores the answer. Kept as a named probe rather
+/// than reaching into the `OnceLock` from the test module, so the invariant
+/// under test ("write-once") is expressed against the same surface production
+/// uses.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn console_state_is_stashed() -> bool {
+    STASHED_CONSOLE.get().is_some()
+}
+
+#[cfg(unix)]
+fn restore_stashed_console_modes() {
+    if let Some(stashed) = STASHED_CONSOLE.get() {
+        // SAFETY: `tcsetattr` is async-signal-safe and the stashed value was
+        // filled by a successful `tcgetattr` on this same descriptor.
+        unsafe {
+            libc::tcsetattr(stashed.fd, libc::TCSANOW, &stashed.saved);
+        }
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn terminating_signal_handler(sig: libc::c_int) {
+    restore_console_from_handler();
+    // Re-raise under the default disposition, so the process still dies of
+    // the signal it was sent (and reports the right status to its parent)
+    // rather than silently swallowing it.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+#[cfg(unix)]
+fn install_platform_handler() {
+    // SAFETY: `signal` with a plain `extern "C"` handler; the handler itself
+    // does nothing that is not async-signal-safe.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            terminating_signal_handler as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            terminating_signal_handler as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            terminating_signal_handler as libc::sighandler_t,
+        );
+    }
+}
+
+// -- windows: the saved console modes, and a console control handler --------
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StashedConsole {
+    /// Held as `usize` rather than `HANDLE`: these are process-wide console
+    /// handles valid for the life of the process, not owned resources, and
+    /// the raw-pointer type would otherwise make the global `!Send`/`!Sync`
+    /// for no reason.
+    input: usize,
+    output: usize,
+    saved_input: u32,
+    saved_output: u32,
+}
+
+#[cfg(windows)]
+static STASHED_CONSOLE: OnceLock<StashedConsole> = OnceLock::new();
+
+/// Write-once; see the unix counterpart for why. Returns whether this call
+/// did the stashing.
+#[cfg(windows)]
+pub fn stash_console_state(
+    input: usize,
+    output: usize,
+    saved_input: u32,
+    saved_output: u32,
+) -> bool {
+    STASHED_CONSOLE
+        .set(StashedConsole {
+            input,
+            output,
+            saved_input,
+            saved_output,
+        })
+        .is_ok()
+}
+
+/// See the unix counterpart: a test-only probe over the production surface.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub fn console_state_is_stashed() -> bool {
+    STASHED_CONSOLE.get().is_some()
+}
+
+/// The stashed modes, for tests that need to prove the stash is write-once.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub fn stashed_console_state() -> Option<(usize, usize, u32, u32)> {
+    STASHED_CONSOLE
+        .get()
+        .map(|s| (s.input, s.output, s.saved_input, s.saved_output))
+}
+
+#[cfg(windows)]
+fn restore_stashed_console_modes() {
+    use windows_sys::Win32::System::Console::SetConsoleMode;
+    if let Some(stashed) = STASHED_CONSOLE.get() {
+        // SAFETY: both handles came from `GetStdHandle` in `std_handles` and
+        // are valid for the life of the process. Both are restored even if
+        // the first fails: a console left echoing but without VT processing
+        // is worse than either alone.
+        unsafe {
+            SetConsoleMode(stashed.input as _, stashed.saved_input);
+            SetConsoleMode(stashed.output as _, stashed.saved_output);
+        }
+    }
+}
+
+/// Returns FALSE so the next handler in the chain -- ultimately the default
+/// one, which terminates the process -- still runs. This exists to put the
+/// console back on the way out, not to swallow the event.
+#[cfg(windows)]
+unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> windows_sys::core::BOOL {
+    restore_console_from_handler();
+    0
+}
+
+#[cfg(windows)]
+fn install_platform_handler() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: registering a plain `extern "system"` function pointer. A
+    // failure here only means the emergency restore will not run; there is
+    // nothing to fall back to and nothing to report on.
+    unsafe {
+        SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restore_stashed_console_modes() {}
+
+#[cfg(not(any(unix, windows)))]
+fn install_platform_handler() {}
+
+#[cfg(not(any(unix, windows)))]
+pub fn console_state_is_stashed() -> bool {
+    false
+}
 
 /// The terminal `wrap` drives. On unix this is literally stdin's file
 /// descriptor. On Windows there are no fds at this layer at all: the value is
@@ -30,6 +346,11 @@ impl RawGuard {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err("tcsetattr failed: could not enter raw mode".into());
         }
+        // F4: the guard's own `restore` only runs on a path this process
+        // reaches. Stash the pre-raw mode and arm the handler so an external
+        // kill does not leave the user's shell without echo.
+        stash_console_state(fd, saved);
+        install_console_restore_handler();
         Ok(Self {
             fd,
             saved,
@@ -184,6 +505,13 @@ impl RawGuard {
         let (input, output) = windows::std_handles(fd)?;
         let saved_input = windows::console_mode(input)?;
         let saved_output = windows::console_mode(output)?;
+
+        // F4: stashed *before* either mode is changed, so what the handler
+        // restores is genuinely what the user started with even if `enter`
+        // fails half way through below. The guard's own `restore` only runs
+        // on a path this process reaches; an external kill reaches none.
+        stash_console_state(input as usize, output as usize, saved_input, saved_output);
+        install_console_restore_handler();
 
         windows::set_console_mode(input, windows::raw_input_mode(saved_input))
             .map_err(|_| "could not put the console input into raw mode")?;
@@ -365,6 +693,105 @@ pub fn enable_vt_output() -> CtxResult<VtGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // F4. The handler itself can only be exercised against a real console
+    // with a real external killer, which is what the manual recipe at the top
+    // of this file is for. What *is* testable -- and is what actually broke
+    // in review -- are the three invariants underneath it: the stash is
+    // write-once, the handler is installed once, and the reset sequence is
+    // owed exactly when the bar is up.
+
+    /// Installing has to be idempotent: `RawGuard::enter` calls it
+    /// unconditionally, and `wrap` enters a guard once per session while the
+    /// test binary runs many sessions in one process.
+    ///
+    /// Written so it does not care whether some earlier test already
+    /// installed the handler -- the invariant is "after any call, no later
+    /// call installs again", not "this test is the installer".
+    #[test]
+    fn the_console_restore_handler_is_installed_exactly_once() {
+        let _ = install_console_restore_handler();
+        assert!(
+            !install_console_restore_handler(),
+            "a second call must be a no-op"
+        );
+        assert!(!install_console_restore_handler());
+    }
+
+    /// The stash must keep the *first* mode it ever saw. A later guard would
+    /// otherwise stash an already-raw mode, and the emergency restore would
+    /// put the console back into raw mode instead of out of it.
+    #[test]
+    fn the_stashed_console_state_is_write_once() {
+        // May or may not already be stashed depending on test order and
+        // whether this process owns a console; either way the invariant below
+        // is the same.
+        let already = console_state_is_stashed();
+
+        #[cfg(windows)]
+        {
+            let first = stash_console_state(1, 2, 0xAAAA, 0xBBBB);
+            assert_eq!(first, !already, "it stashes iff nothing had stashed before");
+            let snapshot = stashed_console_state().expect("something is stashed now");
+            assert!(
+                !stash_console_state(9, 9, 0xFFFF, 0xFFFF),
+                "a second stash must be refused"
+            );
+            assert_eq!(
+                stashed_console_state(),
+                Some(snapshot),
+                "and must not have overwritten the first"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            // SAFETY: a zeroed termios is never read back here -- only its
+            // presence in the stash is asserted on.
+            let blank: libc::termios = unsafe { std::mem::zeroed() };
+            let first = stash_console_state(7, blank);
+            assert_eq!(first, !already);
+            assert!(
+                !stash_console_state(9, blank),
+                "a second stash must be refused"
+            );
+        }
+
+        assert!(console_state_is_stashed());
+    }
+
+    /// The handler owes the terminal a scroll-region reset exactly when the
+    /// chrome bar had fenced its last row off, and nothing otherwise: a
+    /// bar-less session's console was never touched beyond its modes.
+    #[test]
+    fn the_emergency_reset_is_owed_only_while_the_bar_is_up() {
+        assert_eq!(emergency_reset_bytes(false), b"");
+
+        let owed = emergency_reset_bytes(true);
+        assert!(
+            owed.starts_with(b"\x1b[r"),
+            "CSI r is what un-fences the scroll region: {owed:?}"
+        );
+        assert!(
+            owed.ends_with(b"\x1b[?25h"),
+            "and the cursor is put back on: {owed:?}"
+        );
+        // Fixed, allocation-free bytes: this may run inside a POSIX signal
+        // handler, where formatting a row number would not be safe.
+        assert_eq!(owed, b"\x1b[r\x1b[?25h");
+    }
+
+    #[test]
+    fn the_bar_active_flag_round_trips() {
+        let restore = bar_active();
+        set_bar_active(true);
+        assert!(bar_active());
+        assert_eq!(emergency_reset_bytes(bar_active()), EMERGENCY_RESET);
+        set_bar_active(false);
+        assert!(!bar_active());
+        assert_eq!(emergency_reset_bytes(bar_active()), b"");
+        set_bar_active(restore);
+    }
 
     #[cfg(unix)]
     #[test]

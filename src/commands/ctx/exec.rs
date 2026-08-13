@@ -464,6 +464,22 @@ pub fn run_with<W: Write>(
         env
     };
 
+    // F3: the one place a launch's session identity is applied, so the scrub
+    // can never be forgotten on one of the four relaunch paths below. The
+    // scrub is unconditional and comes first: `turn_env_for` yields nothing
+    // when the socket bind failed, and without this the child inherited the
+    // *outer* session's `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET` from this
+    // process's own environment and reported its turns into somebody else's
+    // supervisor. A worker legitimately runs inside a session (that is what
+    // `zirv ctx agent` is), but it must still speak with its own identity or
+    // none at all.
+    let apply_session_env = |command: &mut Command, session: &SessionId| {
+        super::sessions::scrub_supervision_env_cmd(command);
+        for (key, value) in turn_env_for(session) {
+            command.env(key, value);
+        }
+    };
+
     // With no argv to pass through, the first launch is built exactly the way
     // every relaunch builds one. That symmetry is the point: a caller holding
     // the prompt as data never encodes it into argv for this function to
@@ -488,9 +504,7 @@ pub fn run_with<W: Write>(
         }
         command
     };
-    for (key, value) in turn_env_for(&session) {
-        command.env(key, value);
-    }
+    apply_session_env(&mut command, &session);
     let mut restarts = 0;
     // N4: consecutive `zirv ctx nudge`-driven restarts, capped by `cfg.
     // supervise.max_nudges` -- a separate budget from `restarts` above,
@@ -722,9 +736,7 @@ pub fn run_with<W: Write>(
                 .collect();
             command = adapter.headless_cmd(&combined, &session, &extra);
             command.current_dir(repo);
-            for (key, value) in turn_env_for(&session) {
-                command.env(key, value);
-            }
+            apply_session_env(&mut command, &session);
             continue;
         }
 
@@ -793,9 +805,7 @@ pub fn run_with<W: Write>(
                 .collect();
             command = adapter.headless_cmd(&prompt_text, &session, &extra);
             command.current_dir(repo);
-            for (key, value) in turn_env_for(&session) {
-                command.env(key, value);
-            }
+            apply_session_env(&mut command, &session);
             continue;
         }
 
@@ -937,9 +947,7 @@ pub fn run_with<W: Write>(
             .collect();
         command = adapter.headless_cmd(&combined, &session, &extra);
         command.current_dir(repo);
-        for (key, value) in turn_env_for(&session) {
-            command.env(key, value);
-        }
+        apply_session_env(&mut command, &session);
     }
 }
 
@@ -1267,6 +1275,64 @@ mod tests {
         assert_eq!(
             extra_launch_flags(&cmd, 1, None),
             vec!["--model".to_string(), "gpt".to_string()]
+        );
+    }
+
+    /// F2: the nesting guard gates the *interactive* verbs only. Delegating
+    /// to a headless worker from inside a session is the entire point of
+    /// `zirv ctx agent`, and a worker never takes the shared console over,
+    /// so `exec` must run normally with every piece of evidence the guard
+    /// keys on present at once.
+    ///
+    /// A trivial shell command rather than the fake agent: this test is about
+    /// what `run_with` refuses, not about supervision, and it should stay
+    /// runnable on both platforms.
+    #[test]
+    fn a_headless_exec_is_not_subject_to_the_nesting_guard() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let mut env = base_env(&tmp.path().join("state"));
+        for (key, value) in [
+            (
+                adapters::SESSION_ENV,
+                "abcdef12-3456-4789-8abc-def012345678",
+            ),
+            (adapters::SOCKET_ENV, "/tmp/outer.sock"),
+            ("CLAUDE_PID", "4242"),
+            ("CLAUDECODE", "1"),
+        ] {
+            env.insert(key.to_string(), value.to_string());
+        }
+
+        let command: Vec<String> = if cfg!(windows) {
+            ["cmd", "/c", "exit", "0"]
+        } else {
+            ["sh", "-c", "exit 0", "--"]
+        }
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let args = ExecArgs {
+            agent: None,
+            session_id: None,
+            transcript: None,
+            prompt: None,
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: true,
+            command,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a headless worker legitimately runs inside a session");
+        assert_eq!(
+            code,
+            0,
+            "exec ran the child rather than refusing: {}",
+            String::from_utf8_lossy(&out)
         );
     }
 
@@ -2617,17 +2683,30 @@ mod tests {
 
     /// Nudges whichever session is currently live. `exec` (like `loop`)
     /// keeps exactly one registry record at a time, refreshed on every
-    /// restart or park, so an empty prefix (`starts_with("")` is always
-    /// true) always resolves to the run this test is driving without the
-    /// test needing to know that session's exact id.
+    /// restart or park, so resolving the registry is how this test finds the
+    /// run it is driving without knowing that session's id up front.
+    ///
+    /// This used to pass an empty prefix and lean on `starts_with("")`
+    /// matching everything. F6 made `zirv ctx nudge` refuse any prefix
+    /// shorter than four characters -- a unique-but-mistyped prefix could
+    /// otherwise wake, and in `exec`'s case restart, a session the operator
+    /// never named -- and an empty prefix is the extreme case of exactly
+    /// that. The helper now resolves the live short id and passes it whole,
+    /// which is what an operator reading `zirv ctx status` would type.
     fn nudge_live_session(state_dir: &std::path::Path, repo: &std::path::Path, message: &str) {
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.to_path_buf());
+        let prefix = crate::commands::ctx::sessions::list(&state)
+            .into_iter()
+            .find(|(_, liveness)| *liveness == crate::commands::ctx::sessions::Liveness::Live)
+            .map(|(record, _)| record.short)
+            .expect("exactly one live session to nudge");
         let env: HashMap<String, String> = [(
             crate::commands::ctx::state::STATE_ENV.to_string(),
             state_dir.display().to_string(),
         )]
         .into();
         let args = crate::commands::ctx::sessions::NudgeArgs {
-            prefix: String::new(),
+            prefix,
             message: Some(message.to_string()),
             message_file: None,
         };
