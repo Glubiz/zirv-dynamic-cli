@@ -10,11 +10,14 @@
 //! `cursor`); Tasks 8/9/12 own filling in whatever richer shape their own
 //! overlay reducers need next.
 
+use std::path::PathBuf;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
+use super::super::mail::Message;
 use super::pane::PaneState;
 
 /// The header row's live facts. `mail_broadcast`/`mail_direct` render as
@@ -43,9 +46,8 @@ pub struct SidebarRow {
 }
 
 /// A minimal draft/view struct shared by the overlay seams below. Only what
-/// `render_overlay` needs to draw something today; Tasks 8/9/12 fill in
-/// richer fields (mail items as `(from, body)` pairs, a compose sub-draft,
-/// and so on) as they wire up each overlay's own reducer.
+/// `render_overlay` needs to draw something today; Task 12 fills in richer
+/// fields as it wires up the restore dialog's own reducer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpawnDraft {
     pub input: String,
@@ -60,18 +62,60 @@ pub struct NudgeDraft {
     pub cursor: usize,
 }
 
+/// One message-in-progress: `to` defaults to `"any"` when left blank (the
+/// same default `mail::SendArgs` uses), `body` is what the operator types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MailView {
-    pub input: String,
-    pub items: Vec<String>,
-    pub cursor: usize,
+pub struct ComposeDraft {
+    pub to: String,
+    pub body: String,
 }
 
+/// The mail overlay's own state: every unread message visible to the
+/// dashboard operator (`(path, from_agent, body_preview)`, oldest first --
+/// the same order `mail::list` already returns), which one is selected, and
+/// an in-progress compose draft when the operator is writing a new one
+/// rather than browsing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailView {
+    pub items: Vec<(PathBuf, String, String)>,
+    pub cursor: usize,
+    pub compose: Option<ComposeDraft>,
+}
+
+/// What executing a `MailView` reducer's emitted action actually does to
+/// storage -- executed by `dash::mod`'s own `apply_mail_effect`, never by the
+/// reducer itself (the reducer stays pure). `Send`'s `Message` carries
+/// placeholder `from_session`/`from_agent`/`sent` fields the executor
+/// overwrites right before `mail::store`, keeping the reducer itself
+/// identity- and clock-free, the same discipline `rot.rs` and `prompt.rs`
+/// already hold themselves to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MailEffect {
+    Consume(PathBuf),
+    Send(Message),
+}
+
+/// The memory overlay's own state: every entry in this repo's bank
+/// (`(key, age, body)`, oldest-written first -- the same order `memory::list`
+/// already returns), which one is selected, and an in-progress edit buffer
+/// when the operator is remembering new text for the selected key rather
+/// than browsing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryView {
-    pub input: String,
-    pub items: Vec<String>,
+    pub entries: Vec<(String, String, String)>,
     pub cursor: usize,
+    pub input: Option<String>,
+}
+
+/// What executing a `MemoryView` reducer's emitted action does to storage --
+/// executed by `dash::mod`'s own `apply_memory_effect`. `Remember` carries
+/// only `key`/`body`: `written_by`/timestamps/`source` are filled in by the
+/// executor the same way `run_remember_with` fills them for the CLI verb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryEffect {
+    Remember { key: String, body: String },
+    Forget(String),
+    Verify(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -314,6 +358,76 @@ fn render_draft_dialog(
     render_dialog(f, area, title, &lines);
 }
 
+/// Truncates a body preview to a single-line, human-scanning length. Shared
+/// by the mail and memory dialogs so a long message or entry never blows out
+/// the fixed-height dialog box `render_dialog` centres on screen.
+fn preview(text: &str, max_chars: usize) -> String {
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line.chars().count() <= max_chars {
+        first_line.to_string()
+    } else {
+        let mut truncated: String = first_line.chars().take(max_chars).collect();
+        truncated.push('\u{2026}');
+        truncated
+    }
+}
+
+fn render_mail_dialog(f: &mut Frame, area: Rect, view: &MailView) {
+    let lines = if let Some(draft) = &view.compose {
+        vec![
+            format!(
+                "compose to: {}",
+                if draft.to.trim().is_empty() {
+                    "any"
+                } else {
+                    draft.to.as_str()
+                }
+            ),
+            format!("> {}", draft.body),
+            "Enter to send, Esc to cancel".to_string(),
+        ]
+    } else if view.items.is_empty() {
+        vec!["(no mail)".to_string(), "c compose, Esc close".to_string()]
+    } else {
+        let mut lines: Vec<String> = view
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, (_, from, body))| {
+                let marker = if i == view.cursor { '>' } else { ' ' };
+                format!("{marker} {from}: {}", preview(body, 60))
+            })
+            .collect();
+        lines.push("Enter read+consume, c compose, Esc close".to_string());
+        lines
+    };
+    render_dialog(f, area, "mail", &lines);
+}
+
+fn render_memory_dialog(f: &mut Frame, area: Rect, view: &MemoryView) {
+    let lines = if let Some(input) = &view.input {
+        vec![
+            format!("> {input}"),
+            "Enter to save, Esc to cancel".to_string(),
+        ]
+    } else if view.entries.is_empty() {
+        vec!["(no memory entries)".to_string(), "Esc close".to_string()]
+    } else {
+        let mut lines: Vec<String> = view
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, (key, age, body))| {
+                let marker = if i == view.cursor { '>' } else { ' ' };
+                format!("{marker} {key} ({age}) {}", preview(body, 40))
+            })
+            .collect();
+        lines.push("r remember, d forget, v verify, Esc close".to_string());
+        lines
+    };
+    render_dialog(f, area, "memory", &lines);
+}
+
 pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
     match overlay {
         Overlay::None => {}
@@ -325,8 +439,8 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
         }
         Overlay::Spawn(d) => render_draft_dialog(f, area, "spawn", &d.input, &d.items, d.cursor),
         Overlay::Nudge(d) => render_draft_dialog(f, area, "nudge", &d.input, &d.items, d.cursor),
-        Overlay::Mail(d) => render_draft_dialog(f, area, "mail", &d.input, &d.items, d.cursor),
-        Overlay::Memory(d) => render_draft_dialog(f, area, "memory", &d.input, &d.items, d.cursor),
+        Overlay::Mail(d) => render_mail_dialog(f, area, d),
+        Overlay::Memory(d) => render_memory_dialog(f, area, d),
         Overlay::Restore(d) => {
             render_draft_dialog(f, area, "restore", &d.input, &d.items, d.cursor)
         }
@@ -469,6 +583,63 @@ mod tests {
         let area = Rect::new(0, 0, 40, 10);
         let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
         assert!(text.contains("wrkclaude") || text.contains("wrk claude"));
+    }
+
+    #[test]
+    fn mail_dialog_shows_the_selected_message_and_the_key_hints() {
+        let view = MailView {
+            items: vec![(
+                PathBuf::from("/mail/1.md"),
+                "claude".to_string(),
+                "the webhook route moved".to_string(),
+            )],
+            cursor: 0,
+            compose: None,
+        };
+        let overlay = Overlay::Mail(view);
+        let area = Rect::new(0, 0, 60, 10);
+        let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
+        assert!(text.contains("claude"), "got {text}");
+        assert!(
+            text.contains("webhookroute") || text.contains("webhook route"),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn mail_dialog_shows_the_compose_draft_when_composing() {
+        let view = MailView {
+            items: Vec::new(),
+            cursor: 0,
+            compose: Some(ComposeDraft {
+                to: String::new(),
+                body: "heads up".to_string(),
+            }),
+        };
+        let overlay = Overlay::Mail(view);
+        let area = Rect::new(0, 0, 60, 10);
+        let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
+        assert!(
+            text.contains("headsup") || text.contains("heads up"),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn memory_dialog_lists_entries_with_key_and_age() {
+        let view = MemoryView {
+            entries: vec![(
+                "build-cmd".to_string(),
+                "written 3d ago, verified 1d ago".to_string(),
+                "cargo build --release".to_string(),
+            )],
+            cursor: 0,
+            input: None,
+        };
+        let overlay = Overlay::Memory(view);
+        let area = Rect::new(0, 0, 60, 10);
+        let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
+        assert!(text.contains("build-cmd"), "got {text}");
     }
 
     /// `tests/fixtures/claude-session.raw` is a gitignored capture of a real

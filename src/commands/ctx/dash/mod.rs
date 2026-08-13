@@ -483,14 +483,305 @@ fn build_turn_env(
     }
 }
 
+// Task 8: mail + memory overlays, driven by the same pure-reducer pattern
+// `filter_key`/`encode_key` already established -- typing and navigation are
+// pure functions from `(view, key)` to `(next view or close, effect)`; only
+// the effect (a mail send/consume, a memory remember/forget/verify) touches
+// disk, and only from `run_dashboard`'s own loop, through the exact same
+// library functions the CLI verbs call.
+
+/// Clamps a cursor into `0..len` (or `0` on an empty list) -- shared by every
+/// browsing-mode reducer below so "move past the last row" and "the list
+/// just shrank out from under the cursor" (an item consumed/forgotten while
+/// selected) both land on a valid index.
+fn clamp_cursor(cursor: usize, len: usize) -> usize {
+    if len == 0 { 0 } else { cursor.min(len - 1) }
+}
+
+/// Pure: one keystroke against the mail overlay's current state. Returns the
+/// overlay's next state (`None` closes it -- Esc while browsing) alongside
+/// any effect the caller must execute against real storage. Esc while
+/// composing cancels only the compose draft, not the whole overlay.
+pub fn mail_overlay_reduce(
+    mut view: ui::MailView,
+    key: KeyEvent,
+) -> (Option<ui::MailView>, Option<ui::MailEffect>) {
+    if let Some(draft) = view.compose.as_mut() {
+        return match key.code {
+            KeyCode::Esc => {
+                view.compose = None;
+                (Some(view), None)
+            }
+            KeyCode::Enter => {
+                if draft.body.trim().is_empty() {
+                    return (Some(view), None);
+                }
+                let to = if draft.to.trim().is_empty() {
+                    "any".to_string()
+                } else {
+                    draft.to.clone()
+                };
+                let body = draft.body.clone();
+                view.compose = None;
+                let msg = mail::Message {
+                    // Placeholders: `apply_mail_effect` overwrites all three
+                    // right before `mail::store` -- see `ui::MailEffect`'s
+                    // own doc comment for why the reducer never touches
+                    // identity or the clock itself.
+                    from_session: String::new(),
+                    from_agent: String::new(),
+                    to,
+                    to_session: None,
+                    sent: 0,
+                    body,
+                };
+                (Some(view), Some(ui::MailEffect::Send(msg)))
+            }
+            KeyCode::Backspace => {
+                draft.body.pop();
+                (Some(view), None)
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                draft.body.push(c);
+                (Some(view), None)
+            }
+            _ => (Some(view), None),
+        };
+    }
+
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = clamp_cursor(view.cursor + 1, view.items.len());
+            (Some(view), None)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = view.cursor.saturating_sub(1);
+            (Some(view), None)
+        }
+        KeyCode::Char('c') => {
+            view.compose = Some(ui::ComposeDraft::default());
+            (Some(view), None)
+        }
+        KeyCode::Enter => {
+            if view.items.is_empty() {
+                return (Some(view), None);
+            }
+            let (path, _, _) = view.items.remove(view.cursor);
+            view.cursor = clamp_cursor(view.cursor, view.items.len());
+            (Some(view), Some(ui::MailEffect::Consume(path)))
+        }
+        _ => (Some(view), None),
+    }
+}
+
+/// Pure: the same shape as `mail_overlay_reduce`, for the memory bank. `r`
+/// (remember) seeds the edit buffer with the selected entry's current body
+/// so the operator edits rather than retypes; `d`/`v` (forget/verify) act on
+/// the selected entry immediately, no confirmation dialog.
+pub fn memory_overlay_reduce(
+    mut view: ui::MemoryView,
+    key: KeyEvent,
+) -> (Option<ui::MemoryView>, Option<ui::MemoryEffect>) {
+    if let Some(input) = view.input.as_mut() {
+        return match key.code {
+            KeyCode::Esc => {
+                view.input = None;
+                (Some(view), None)
+            }
+            KeyCode::Enter => {
+                if input.trim().is_empty() {
+                    return (Some(view), None);
+                }
+                let Some((key_name, _, _)) = view.entries.get(view.cursor).cloned() else {
+                    view.input = None;
+                    return (Some(view), None);
+                };
+                let body = input.clone();
+                view.input = None;
+                (
+                    Some(view),
+                    Some(ui::MemoryEffect::Remember {
+                        key: key_name,
+                        body,
+                    }),
+                )
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                (Some(view), None)
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.push(c);
+                (Some(view), None)
+            }
+            _ => (Some(view), None),
+        };
+    }
+
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = clamp_cursor(view.cursor + 1, view.entries.len());
+            (Some(view), None)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = view.cursor.saturating_sub(1);
+            (Some(view), None)
+        }
+        KeyCode::Char('r') => {
+            if let Some((_, _, body)) = view.entries.get(view.cursor) {
+                view.input = Some(body.clone());
+            }
+            (Some(view), None)
+        }
+        KeyCode::Char('d') => {
+            if view.entries.is_empty() {
+                return (Some(view), None);
+            }
+            let (key_name, _, _) = view.entries.remove(view.cursor);
+            view.cursor = clamp_cursor(view.cursor, view.entries.len());
+            (Some(view), Some(ui::MemoryEffect::Forget(key_name)))
+        }
+        KeyCode::Char('v') => match view.entries.get(view.cursor) {
+            Some((key_name, _, _)) => {
+                let effect = ui::MemoryEffect::Verify(key_name.clone());
+                (Some(view), Some(effect))
+            }
+            None => (Some(view), None),
+        },
+        _ => (Some(view), None),
+    }
+}
+
+/// Executes a `MailEffect` against real storage -- the only place either
+/// reducer's output actually touches disk. `from_session`/`from_agent` are
+/// this dashboard's own identity (the orchestrator pane's short id and this
+/// session's agent name), stamped onto a `Send` right before `mail::store`.
+fn apply_mail_effect(
+    effect: ui::MailEffect,
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    from_session: &str,
+    from_agent: &str,
+    errors: &mut Vec<String>,
+) {
+    let slug = super::state::repo_slug(repo);
+    match effect {
+        ui::MailEffect::Consume(path) => {
+            if let Err(e) = mail::consume(state, &slug, &path) {
+                push_error(errors, format!("mail consume: {e}"));
+            }
+        }
+        ui::MailEffect::Send(mut msg) => {
+            msg.from_session = from_session.to_string();
+            msg.from_agent = from_agent.to_string();
+            msg.sent = super::state::now_secs();
+            if let Err(e) = mail::store(state, &slug, &msg, cfg) {
+                push_error(errors, format!("mail send: {e}"));
+            }
+        }
+    }
+}
+
+/// Executes a `MemoryEffect` against real storage. `written_by` is this
+/// dashboard's own agent name, the same convention `run_remember_with` uses
+/// for `AGENT_ENV`.
+fn apply_memory_effect(
+    effect: ui::MemoryEffect,
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    written_by: &str,
+    errors: &mut Vec<String>,
+) {
+    let slug = super::state::repo_slug(repo);
+    match effect {
+        ui::MemoryEffect::Remember { key, body } => {
+            let now = super::state::now_secs();
+            let entry = memory::Entry {
+                key,
+                written_by: written_by.to_string(),
+                written: now,
+                verified: now,
+                source: "explicit".to_string(),
+                body,
+            };
+            if let Err(e) = memory::remember(state, &slug, &entry, cfg) {
+                push_error(errors, format!("memory remember: {e}"));
+            }
+        }
+        ui::MemoryEffect::Forget(key) => {
+            if let Err(e) = memory::forget(state, &slug, &key) {
+                push_error(errors, format!("memory forget: {e}"));
+            }
+        }
+        ui::MemoryEffect::Verify(key) => {
+            if let Err(e) = memory::verify(state, &slug, &key) {
+                push_error(errors, format!("memory verify: {e}"));
+            }
+        }
+    }
+}
+
+/// A single-line preview of a body: its first line, capped short enough to
+/// fit the overlay dialog next to a `from`/`key` label.
+fn mail_preview(body: &str) -> String {
+    body.lines().next().unwrap_or("").chars().take(60).collect()
+}
+
+/// Builds a freshly-populated `MailView` from every message currently
+/// visible to the dashboard operator -- `for_agent`/`for_session` both
+/// `None`, the same broad "everything in this repo's mailbox" view
+/// `zirv ctx inbox` gives a human, not the narrow per-session filter a
+/// delivery seam applies. A read error degrades to an empty view rather than
+/// failing the overlay open.
+fn build_mail_view(state: &StateDir, repo: &Path) -> ui::MailView {
+    let slug = super::state::repo_slug(repo);
+    let items = mail::list(state, &slug, None, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(path, msg)| (path, msg.from_agent, mail_preview(&msg.body)))
+        .collect();
+    ui::MailView {
+        items,
+        cursor: 0,
+        compose: None,
+    }
+}
+
+/// Builds a freshly-populated `MemoryView` from this repo's whole memory
+/// bank. The age wording matches `memory::render_for_prompt`'s own
+/// convention ("written Nd ago, verified Nd ago") so it reads the same
+/// everywhere it appears.
+fn build_memory_view(state: &StateDir, repo: &Path) -> ui::MemoryView {
+    let slug = super::state::repo_slug(repo);
+    let now = super::state::now_secs();
+    let entries = memory::list(state, &slug)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, entry)| {
+            let age = format!(
+                "written {}d ago, verified {}d ago",
+                now.saturating_sub(entry.written) / 86_400,
+                now.saturating_sub(entry.verified) / 86_400,
+            );
+            (entry.key, age, entry.body)
+        })
+        .collect();
+    ui::MemoryView {
+        entries,
+        cursor: 0,
+        input: None,
+    }
+}
+
 /// Runs the dashboard until the operator quits, owning `first` (the
 /// orchestrator pane the caller already built via `build_launch`) plus
 /// whatever additional panes get spawned along the way. Nesting is the
 /// caller's job (`chat.rs::run_with` checks `sessions::nesting_refusal`
-/// before calling this at all) -- `env` is accepted for interface
-/// completeness with the rest of the launch pipeline and for the
-/// roster/spawn-request env lookups Tasks 10-12 add, but this task's own
-/// body does not read it.
+/// before calling this at all).
 pub fn run_dashboard(
     cfg: &CtxConfig,
     repo: &Path,
@@ -498,6 +789,8 @@ pub fn run_dashboard(
     state: &StateDir,
     first: PaneSpec,
 ) -> CtxResult<i32> {
+    // Not read by this task's own body; Task 9's nudge-to-view-only-session
+    // routing (`sessions::run_nudge_with`) is the first thing that needs it.
     let _ = env;
 
     let mut errors: Vec<String> = Vec::new();
@@ -550,18 +843,81 @@ pub fn run_dashboard(
             pane.on_turn_signal();
         }
 
+        // The dashboard's own mail address: the orchestrator pane (`panes[0]`,
+        // fixed for the loop's whole life -- panes are only ever appended,
+        // never reordered or removed before shutdown) is what a message sent
+        // through the mail overlay's compose draft is stamped as coming from.
+        let dashboard_short = panes
+            .first()
+            .map(|p| p.short().to_string())
+            .unwrap_or_default();
+
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     if !matches!(overlay, ui::Overlay::None) {
-                        match key.code {
-                            KeyCode::Enter if matches!(overlay, ui::Overlay::QuitConfirm(_)) => {
-                                on_quit(&mut panes);
-                                shutdown_all(&mut panes, cfg, &mut errors);
-                                break 0;
+                        let current = std::mem::take(&mut overlay);
+                        match current {
+                            ui::Overlay::None => {}
+                            ui::Overlay::QuitConfirm(working) => match key.code {
+                                KeyCode::Enter => {
+                                    on_quit(&mut panes);
+                                    shutdown_all(&mut panes, cfg, &mut errors);
+                                    break 0;
+                                }
+                                KeyCode::Esc => {}
+                                _ => overlay = ui::Overlay::QuitConfirm(working),
+                            },
+                            ui::Overlay::Spawn(d) => match key.code {
+                                KeyCode::Esc => {}
+                                _ => overlay = ui::Overlay::Spawn(d),
+                            },
+                            ui::Overlay::Restore(d) => match key.code {
+                                KeyCode::Esc => {}
+                                _ => overlay = ui::Overlay::Restore(d),
+                            },
+                            ui::Overlay::Mail(view) => {
+                                let (next, effect) = mail_overlay_reduce(view, key);
+                                overlay = match next {
+                                    Some(v) => ui::Overlay::Mail(v),
+                                    None => ui::Overlay::None,
+                                };
+                                if let Some(effect) = effect {
+                                    apply_mail_effect(
+                                        effect,
+                                        state,
+                                        repo,
+                                        cfg,
+                                        &dashboard_short,
+                                        &agent_name,
+                                        &mut errors,
+                                    );
+                                }
                             }
-                            KeyCode::Esc => overlay = ui::Overlay::None,
-                            _ => {}
+                            ui::Overlay::Memory(view) => {
+                                let (next, effect) = memory_overlay_reduce(view, key);
+                                overlay = match next {
+                                    Some(v) => ui::Overlay::Memory(v),
+                                    None => ui::Overlay::None,
+                                };
+                                if let Some(effect) = effect {
+                                    apply_memory_effect(
+                                        effect,
+                                        state,
+                                        repo,
+                                        cfg,
+                                        &agent_name,
+                                        &mut errors,
+                                    );
+                                }
+                            }
+                            // Nudge's own reducer (typing, idle-gated
+                            // delivery vs. queueing) is Task 9's; Esc closes
+                            // it in the meantime, same as Spawn/Restore.
+                            ui::Overlay::Nudge(d) => match key.code {
+                                KeyCode::Esc => {}
+                                _ => overlay = ui::Overlay::Nudge(d),
+                            },
                         }
                     } else {
                         let (armed, verdict) = filter_key(prefix_armed, key);
@@ -624,10 +980,9 @@ pub fn run_dashboard(
                                 overlay = ui::Overlay::QuitConfirm(working);
                             }
                             // Opens the corresponding overlay seam Task 4
-                            // defined; Tasks 8/9/10 own the reducer that
-                            // actually drives it (compose, cursor movement,
-                            // submit). Esc (handled in the overlay-active
-                            // branch above) closes any of these today.
+                            // defined. Spawn's own reducer is Task 10/11's;
+                            // Esc (handled in the overlay-active branch
+                            // above) closes it in the meantime.
                             InputVerdict::Dash(DashAction::Spawn) => {
                                 overlay = ui::Overlay::Spawn(ui::SpawnDraft::default());
                             }
@@ -635,16 +990,16 @@ pub fn run_dashboard(
                                 overlay = ui::Overlay::Nudge(ui::NudgeDraft::default());
                             }
                             InputVerdict::Dash(DashAction::Mail) => {
-                                overlay = ui::Overlay::Mail(ui::MailView::default());
+                                overlay = ui::Overlay::Mail(build_mail_view(state, repo));
                             }
                             InputVerdict::Dash(DashAction::Memory) => {
-                                overlay = ui::Overlay::Memory(ui::MemoryView::default());
+                                overlay = ui::Overlay::Memory(build_memory_view(state, repo));
                             }
                         }
                     }
                 }
-                Ok(Event::Resize(cols, rows)) => {
-                    let new_full = Rect::new(0, 0, cols, rows);
+                Ok(Event::Resize(cols, term_h)) => {
+                    let new_full = Rect::new(0, 0, cols, term_h);
                     let m = effective_main(new_full, sidebar_cols, zoomed);
                     for pane in panes.iter_mut() {
                         if let Err(e) = pane.resize(m.height.max(1), m.width.max(1)) {
@@ -663,14 +1018,6 @@ pub fn run_dashboard(
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
         let (header_area, sidebar_area, main_area) = ui::layout(frame_area, sidebar_cols);
 
-        // The dashboard's own mail address: the orchestrator pane (`panes[0]`,
-        // fixed for the loop's whole life -- panes are only ever appended,
-        // never reordered or removed before shutdown) is what a message
-        // addressed to this dashboard specifically would name.
-        let dashboard_short = panes
-            .first()
-            .map(|p| p.short().to_string())
-            .unwrap_or_default();
         facts_cache.refresh_if_due(
             cfg,
             state,
@@ -742,6 +1089,7 @@ fn shutdown_all(panes: &mut [Pane], cfg: &CtxConfig, errors: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1068,5 +1416,409 @@ mod tests {
             Some((1, 0)),
             "once the throttle elapses, the disk-backed facts refresh"
         );
+    }
+
+    // Task 8: mail + memory overlay reducers -- pure, no I/O.
+
+    fn press(c: char) -> KeyEvent {
+        key(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn mail_overlay_esc_while_browsing_closes_the_overlay() {
+        let (next, effect) = mail_overlay_reduce(
+            ui::MailView::default(),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn mail_overlay_cursor_clamps_within_bounds() {
+        let view = ui::MailView {
+            items: vec![
+                (PathBuf::from("/a"), "claude".to_string(), "one".to_string()),
+                (PathBuf::from("/b"), "codex".to_string(), "two".to_string()),
+            ],
+            cursor: 0,
+            compose: None,
+        };
+
+        let (next, _) = mail_overlay_reduce(view.clone(), key(KeyCode::Down, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.cursor, 1);
+
+        // Past the last row: clamps rather than overflowing.
+        let (next, _) = mail_overlay_reduce(next, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(next.expect("stays open").cursor, 1);
+
+        // Up from row 0 saturates at 0.
+        let (next, _) = mail_overlay_reduce(view, key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(next.expect("stays open").cursor, 0);
+    }
+
+    #[test]
+    fn mail_overlay_c_opens_compose_and_typing_accumulates_the_draft() {
+        let (next, effect) = mail_overlay_reduce(ui::MailView::default(), press('c'));
+        let next = next.expect("stays open");
+        assert!(next.compose.is_some(), "c opens the compose draft");
+        assert!(effect.is_none());
+
+        let (next, _) = mail_overlay_reduce(next, press('h'));
+        let (next, _) = mail_overlay_reduce(next.expect("stays open"), press('i'));
+        let draft = next.expect("stays open").compose.expect("still composing");
+        assert_eq!(draft.body, "hi");
+    }
+
+    #[test]
+    fn mail_overlay_backspace_edits_the_compose_draft() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "hix".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, _) = mail_overlay_reduce(view, key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            next.expect("stays open")
+                .compose
+                .expect("still composing")
+                .body,
+            "hi"
+        );
+    }
+
+    #[test]
+    fn mail_overlay_esc_while_composing_cancels_only_the_draft() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "half-written".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        let next = next.expect("overlay stays open; only the draft is cancelled");
+        assert!(next.compose.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn mail_overlay_enter_on_an_empty_compose_body_is_a_noop() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft::default()),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert!(next.compose.is_some(), "still composing, nothing was sent");
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn mail_overlay_enter_while_composing_emits_a_send_effect() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "heads up".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("overlay stays open");
+        assert!(next.compose.is_none(), "compose closes on submit");
+        match effect {
+            Some(ui::MailEffect::Send(msg)) => {
+                assert_eq!(msg.to, "any");
+                assert_eq!(msg.body, "heads up");
+            }
+            other => panic!("expected a Send effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mail_overlay_enter_on_an_item_emits_consume_and_removes_it_from_the_list() {
+        let view = ui::MailView {
+            items: vec![(PathBuf::from("/a"), "claude".to_string(), "one".to_string())],
+            cursor: 0,
+            compose: None,
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert!(
+            next.items.is_empty(),
+            "the read item is removed from the view"
+        );
+        assert_eq!(effect, Some(ui::MailEffect::Consume(PathBuf::from("/a"))));
+    }
+
+    #[test]
+    fn mail_overlay_enter_on_an_empty_list_is_a_noop() {
+        let (next, effect) = mail_overlay_reduce(
+            ui::MailView::default(),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(next.is_some());
+        assert!(effect.is_none());
+    }
+
+    fn memory_view(entries: Vec<(&str, &str, &str)>) -> ui::MemoryView {
+        ui::MemoryView {
+            entries: entries
+                .into_iter()
+                .map(|(k, a, b)| (k.to_string(), a.to_string(), b.to_string()))
+                .collect(),
+            cursor: 0,
+            input: None,
+        }
+    }
+
+    #[test]
+    fn memory_overlay_esc_while_browsing_closes_the_overlay() {
+        let (next, effect) = memory_overlay_reduce(
+            ui::MemoryView::default(),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn memory_overlay_cursor_clamps_on_an_empty_list() {
+        let (next, _) = memory_overlay_reduce(
+            ui::MemoryView::default(),
+            key(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(next.expect("stays open").cursor, 0);
+    }
+
+    #[test]
+    fn memory_overlay_r_prefills_input_from_the_selected_entrys_body() {
+        let view = memory_view(vec![(
+            "build-cmd",
+            "written 1d ago, verified 1d ago",
+            "cargo build",
+        )]);
+        let (next, effect) = memory_overlay_reduce(view, press('r'));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, Some("cargo build".to_string()));
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn memory_overlay_esc_while_editing_cancels_only_the_edit() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("half-typed".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        let next = next.expect("overlay stays open");
+        assert!(next.input.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn memory_overlay_enter_while_editing_emits_remember_and_exits_edit_mode() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("new body".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert!(next.input.is_none());
+        assert_eq!(
+            effect,
+            Some(ui::MemoryEffect::Remember {
+                key: "build-cmd".to_string(),
+                body: "new body".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn memory_overlay_d_emits_forget_and_removes_the_entry_locally() {
+        let view = memory_view(vec![("drop-me", "age", "body")]);
+        let (next, effect) = memory_overlay_reduce(view, press('d'));
+        let next = next.expect("stays open");
+        assert!(next.entries.is_empty());
+        assert_eq!(
+            effect,
+            Some(ui::MemoryEffect::Forget("drop-me".to_string()))
+        );
+    }
+
+    #[test]
+    fn memory_overlay_v_emits_verify_without_changing_the_list() {
+        let view = memory_view(vec![("build-cmd", "age", "body")]);
+        let (next, effect) = memory_overlay_reduce(view, press('v'));
+        let next = next.expect("stays open");
+        assert_eq!(next.entries.len(), 1, "verify does not remove the entry");
+        assert_eq!(
+            effect,
+            Some(ui::MemoryEffect::Verify("build-cmd".to_string()))
+        );
+    }
+
+    // The disk-reading half: `build_mail_view`/`build_memory_view`.
+
+    #[test]
+    fn build_mail_view_lists_every_message_visible_to_the_operator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(&repo);
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "hello world".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let view = build_mail_view(&state, &repo);
+        assert_eq!(view.items.len(), 1);
+        assert_eq!(view.items[0].1, "claude");
+        assert_eq!(view.items[0].2, "hello world");
+    }
+
+    #[test]
+    fn build_memory_view_lists_every_entry_with_its_age() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(&repo);
+        let now = super::super::state::now_secs();
+        memory::remember(
+            &state,
+            &slug,
+            &memory::Entry {
+                key: "build-cmd".to_string(),
+                written_by: "claude".to_string(),
+                written: now,
+                verified: now,
+                source: "explicit".to_string(),
+                body: "cargo build".to_string(),
+            },
+            &cfg,
+        )
+        .expect("remember");
+
+        let view = build_memory_view(&state, &repo);
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.entries[0].0, "build-cmd");
+        assert_eq!(view.entries[0].2, "cargo build");
+        assert!(view.entries[0].1.contains("written"));
+    }
+
+    // The executor half: `apply_mail_effect`/`apply_memory_effect`.
+
+    #[test]
+    fn apply_mail_effect_send_stamps_identity_and_stores_the_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let mut errors = Vec::new();
+
+        let msg = mail::Message {
+            from_session: String::new(),
+            from_agent: String::new(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 0,
+            body: "heads up".to_string(),
+        };
+        apply_mail_effect(
+            ui::MailEffect::Send(msg),
+            &state,
+            &repo,
+            &cfg,
+            "orch1234",
+            "claude",
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "got errors: {errors:?}");
+
+        let slug = super::super::state::repo_slug(&repo);
+        let listed = mail::list(&state, &slug, None, None).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.from_session, "orch1234");
+        assert_eq!(listed[0].1.from_agent, "claude");
+    }
+
+    #[test]
+    fn apply_mail_effect_consume_moves_the_message_to_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(&repo);
+        let path = mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "note".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut errors = Vec::new();
+        apply_mail_effect(
+            ui::MailEffect::Consume(path.clone()),
+            &state,
+            &repo,
+            &cfg,
+            "orch1234",
+            "claude",
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "got errors: {errors:?}");
+        assert!(!path.exists());
+        assert!(
+            mail::list(&state, &slug, None, None)
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn apply_memory_effect_remember_writes_an_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let mut errors = Vec::new();
+
+        apply_memory_effect(
+            ui::MemoryEffect::Remember {
+                key: "build-cmd".to_string(),
+                body: "cargo build".to_string(),
+            },
+            &state,
+            &repo,
+            &cfg,
+            "claude",
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "got errors: {errors:?}");
+
+        let slug = super::super::state::repo_slug(&repo);
+        let listed = memory::list(&state, &slug).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.key, "build-cmd");
+        assert_eq!(listed[0].1.written_by, "claude");
     }
 }
