@@ -116,7 +116,11 @@ pub fn run_with<W: Write>(
             super::prompt::PromptRole::Worker,
         );
         let mail_slug = super::state::repo_slug(repo);
-        let mail_entries: Vec<(PathBuf, super::mail::Message)> =
+        // `mut`: drained right after this cycle's own spawn actually
+        // succeeds (Item 3), not here -- a launch that fails to spawn, or a
+        // pacing park ahead of it, must not move mail to `read/` before any
+        // session has actually started to see it.
+        let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
             if composed.is_some() && cfg.mail.enabled {
                 super::mail::list(&state, &mail_slug, Some(adapter.name())).unwrap_or_default()
             } else {
@@ -131,14 +135,6 @@ pub fn run_with<W: Write>(
         }
         let composed =
             super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
-        // Consumed right after being folded into this cycle's prompt, so the
-        // next cycle's own fresh `mail::list` does not pick the same message
-        // up again. A failed consume must not stop the cycle: the mail has
-        // already reached the prompt either way, and housekeeping failures
-        // are best-effort throughout the state dir.
-        for (path, _) in &mail_entries {
-            let _ = super::mail::consume(&state, &mail_slug, path);
-        }
         let (user_extra, composed) =
             super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
 
@@ -188,6 +184,16 @@ pub fn run_with<W: Write>(
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
         let (mut child, tap) = supervise::spawn_tapped(command)?;
+        // Item 3: consumed right after this cycle's own spawn has actually
+        // succeeded, so the next cycle's fresh `mail::list` does not pick
+        // the same message up again -- but a launch that never got this far
+        // (spawn_tapped failed, or `?` above already returned) leaves it
+        // unread. A failed consume must not stop the cycle: the mail has
+        // already reached the prompt either way, and housekeeping failures
+        // are best-effort throughout the state dir.
+        for (path, _) in mail_entries.drain(..) {
+            let _ = super::mail::consume(&state, &mail_slug, &path);
+        }
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
         let mut limit_hit = false;

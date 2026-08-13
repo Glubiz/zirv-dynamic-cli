@@ -275,7 +275,12 @@ pub fn run_with<W: Write>(
     // already-running session. `run_loop`, by contrast, starts a fresh
     // session every cycle and re-lists mail on each one.
     let mail_slug = super::state::repo_slug(repo);
-    let mail_entries: Vec<(PathBuf, super::mail::Message)> =
+    // `mut`: drained by the loop below, once, right after the first
+    // successful spawn -- not here. Consuming this early (Item 3's fix) used
+    // to mark the mail read before any child had actually started: a launch
+    // that fails to spawn at all, or a long pacing park ahead of it, moved
+    // it to `read/` with no session ever having seen it.
+    let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
         if composed.is_some() && cfg.mail.enabled {
             super::mail::list(&state, &mail_slug, Some(adapter.name())).unwrap_or_default()
         } else {
@@ -290,15 +295,6 @@ pub fn run_with<W: Write>(
     }
     let composed =
         super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
-    // The messages just folded into the launch prompt are consumed now, so a
-    // later launch does not redeliver them (see the module doc: this is the
-    // one place `exec` composes mail at all). A failed consume must not fail
-    // the launch itself -- best effort, like the rest of state-dir
-    // housekeeping -- since the mail has already reached the prompt either
-    // way.
-    for (path, _) in &mail_entries {
-        let _ = super::mail::consume(&state, &mail_slug, path);
-    }
 
     // The first spawn's own argv may already carry the adapter's system-prompt
     // flag (e.g. `-- claude --append-system-prompt "..."`); merge it in rather
@@ -475,6 +471,19 @@ pub fn run_with<W: Write>(
         );
 
         let (mut child, tap) = supervise::spawn_tapped(command)?;
+        // Item 3: the messages folded into the launch prompt are consumed
+        // here, right after the spawn that actually carried them has
+        // genuinely started -- not before pacing or the spawn itself, where
+        // a park or a failed launch would have moved them to `read/` with no
+        // session ever having seen them. Drains to empty on the first
+        // successful spawn, so a later restart's own iteration through this
+        // same loop finds nothing left to consume and is a no-op. A failed
+        // consume must not fail the launch itself -- best effort, like the
+        // rest of state-dir housekeeping -- since the mail has already
+        // reached the prompt either way.
+        for (path, _) in mail_entries.drain(..) {
+            let _ = super::mail::consume(&state, &mail_slug, &path);
+        }
         // Fresh scorer per iteration, over the current session's transcript.
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
@@ -2077,6 +2086,71 @@ mod tests {
         assert!(
             !argv2.contains("heads up: the webhook route moved"),
             "the mail was already delivered once and must not be redelivered: {argv2}"
+        );
+    }
+
+    /// Item 3 (regression): a launch that never actually spawns must not
+    /// consume the mail it would have delivered -- no session ever saw it,
+    /// so it must stay unread for whichever later invocation actually gets
+    /// one running. The old ordering consumed mail immediately after
+    /// composing the prompt, well before `spawn_tapped` (and the pacing
+    /// gate ahead of it) ever ran.
+    #[test]
+    fn mail_is_not_consumed_when_the_launch_fails_before_spawning() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                sent: 1,
+                body: "must stay unread".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let session = "12312312-2222-4333-8444-555555555555";
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            // `adapters::select` still resolves and readies "claude" (via
+            // `ZIRV_CTX_AGENT_BIN` in `base_env`, unaffected by this); only
+            // the actual spawn of *this* program has to fail, deterministically
+            // and without depending on any real binary's own behavior.
+            command: vec![
+                "zirv-test-binary-that-does-not-exist-anywhere".to_string(),
+                "-p".to_string(),
+                "do the work".to_string(),
+                "--session-id".to_string(),
+                session.to_string(),
+            ],
+        };
+        let mut out = Vec::new();
+        let result = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert!(result.is_err(), "the launch must fail to spawn: {result:?}");
+
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None).expect("list");
+        assert_eq!(
+            unread.len(),
+            1,
+            "a launch that never spawned must not have consumed the mail"
         );
     }
 

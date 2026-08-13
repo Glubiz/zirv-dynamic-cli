@@ -172,9 +172,15 @@ fn probe_terminal() -> (bool, bool, (u16, u16), Option<term::VtGuard>) {
     (stdout_is_tty, vt_ok, size, vt_guard)
 }
 
-pub fn run_with<W: Write>(
+/// `stderr` is a second, explicit writer -- not `std::io::stderr()` reached
+/// for directly -- so the one diagnostic this function ever prints on its
+/// own (the no-adapter/config error below) stays testable the same way
+/// every message on `w` already is, without resorting to capturing the real
+/// process stream.
+pub fn run_with<W: Write, E: Write>(
     args: &ChatArgs,
     w: &mut W,
+    stderr: &mut E,
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
@@ -192,18 +198,22 @@ pub fn run_with<W: Write>(
             // ctx`'s own top-level dispatch prints any returned `Err` a
             // second time, unstyled, through `output::error`. Styling only
             // when `chrome.colour` (not gating whether this prints at all
-            // on `chrome.banner`, the old bug -- a piped or redirected run
+            // on `chrome.banner`, an old bug -- a piped or redirected run
             // still needs to see why it refused to start) and returning
             // `Ok(1)` instead is what keeps this to one printed copy;
             // main.rs's own early-exit branches use the same shape,
             // printing their own message and choosing the exit code
             // directly rather than bubbling an error up to be printed
-            // again. Goes through `w` -- this verb's own narration channel,
-            // the same one `resolve_initial_prompt`'s "starting fresh" note
-            // already uses -- rather than stderr directly, so it stays
-            // testable the same way every other message here is.
+            // again.
+            //
+            // On `stderr`, not `w`: `w` is stdout, and `zirv chat > log`
+            // must still show the operator *something* on the terminal
+            // when it refuses to start, exactly like `output::error`
+            // elsewhere in this codebase -- an error silently landing only
+            // in a redirected stdout file is indistinguishable from a
+            // session that hung or was killed.
             writeln!(
-                w,
+                stderr,
                 "{}",
                 chrome::style_no_adapter_error(&err.to_string(), chrome.colour)
             )?;
@@ -235,7 +245,7 @@ pub fn run_with<W: Write>(
         command: launch.argv,
         simple: args.simple,
     };
-    wrap::run_with(&wrap_args, w, repo, &env, launch.role, Some(session))
+    wrap::run_with(&wrap_args, repo, &env, launch.role, Some(session))
 }
 
 /// `--quiet` on the `chat` and `agent` verbs is a CLI flag, not an
@@ -262,7 +272,7 @@ pub(crate) fn quiet_env<'a>(
 pub fn run<W: Write>(args: &ChatArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env)
+    run_with(args, w, &mut std::io::stderr(), &repo, &env)
 }
 
 #[cfg(test)]
@@ -408,9 +418,11 @@ mod tests {
     /// The registry's own aggregated error (naming every candidate and why it
     /// was skipped) is the message shown when nothing is both enabled and
     /// ready -- the same one `adapters::resolve_default` produces on its own.
-    /// Printed through `w` and reported via exit code 1 rather than a
-    /// returned `Err`: propagating it would have `zirv ctx`'s own dispatch
-    /// print the same text a second time, unstyled, through `output::error`.
+    /// Printed to `stderr` (not `w`/stdout: `zirv chat > log` must still show
+    /// the operator something on the terminal, matching `output::error`'s own
+    /// stream) and reported via exit code 1 rather than a returned `Err`:
+    /// propagating it would have `zirv ctx`'s own dispatch print the same
+    /// text a second time, unstyled, through `output::error`.
     #[test]
     fn chat_with_no_enabled_and_ready_adapter_names_each_candidate_and_its_reason() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -432,10 +444,14 @@ mod tests {
             extra: Vec::new(),
         };
         let mut out = Vec::new();
-        let code = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
-            .expect("prints and exits 1 rather than propagating an Err");
+        let mut err_out = Vec::new();
+        let code = run_with(&args, &mut out, &mut err_out, repo.path(), &|k| {
+            empty.get(k).cloned()
+        })
+        .expect("prints and exits 1 rather than propagating an Err");
         assert_eq!(code, 1, "nothing is both enabled and ready");
-        let msg = String::from_utf8(out).expect("utf8");
+        assert!(out.is_empty(), "nothing prints to stdout on this path");
+        let msg = String::from_utf8(err_out).expect("utf8");
         assert!(msg.contains("claude"), "must name claude: {msg}");
         assert!(msg.contains("codex"), "must name codex: {msg}");
         assert!(msg.contains("disabled"), "must say why: {msg}");
@@ -469,10 +485,13 @@ mod tests {
             extra: Vec::new(),
         };
         let mut out = Vec::new();
-        let code = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
-            .expect("prints and exits 1");
+        let mut err_out = Vec::new();
+        let code = run_with(&args, &mut out, &mut err_out, repo.path(), &|k| {
+            empty.get(k).cloned()
+        })
+        .expect("prints and exits 1");
         assert_eq!(code, 1, "claude is disabled");
-        let msg = String::from_utf8(out).expect("utf8");
+        let msg = String::from_utf8(err_out).expect("utf8");
         assert!(msg.contains("claude"), "got {msg}");
         assert!(msg.contains("disabled"), "got {msg}");
     }
@@ -520,17 +539,20 @@ mod tests {
             extra: Vec::new(),
         };
         let mut out = Vec::new();
+        let mut err_out = Vec::new();
         // Reaching this line at all -- rather than a panic from the probe --
         // is the main thing this test pins.
-        let code = run_with(&args, &mut out, repo.path(), &|k| empty.get(k).cloned())
-            .expect("prints and exits 1, no panic");
+        let code = run_with(&args, &mut out, &mut err_out, repo.path(), &|k| {
+            empty.get(k).cloned()
+        })
+        .expect("prints and exits 1, no panic");
         assert_eq!(code, 1);
-        let printed = String::from_utf8(out).expect("utf8");
-        assert!(printed.contains("disabled"), "got {printed}");
         assert!(
-            !printed.contains("zirv chat"),
-            "no terminal means no banner, and resolution failed before the banner code anyway: {printed}"
+            String::from_utf8(out).expect("utf8").is_empty(),
+            "no terminal means no banner, and resolution failed before the banner code anyway"
         );
+        let printed = String::from_utf8(err_out).expect("utf8");
+        assert!(printed.contains("disabled"), "got {printed}");
     }
 
     #[test]

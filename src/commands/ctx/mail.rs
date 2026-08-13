@@ -109,28 +109,63 @@ pub fn parse_markdown(md: &str) -> Message {
     msg
 }
 
-/// The first collision-free path for `<dir>/<base>.md`: `<base>.md` itself
-/// if nothing is there yet, else `<base>_001.md`, `<base>_002.md`, ... . Two
-/// messages from the same sender landing in the same wall-clock second
-/// (`now_secs()` has one-second granularity) used to produce the identical
-/// base and silently overwrite one another via `write_private`; this keeps
-/// every one of them. `_NNN` (not `-N`) is deliberate: `-` (0x2D) sorts
-/// *before* `.` (0x2E), which would put a collision's suffixed file ahead of
-/// the unsuffixed one it collided with; `_` (0x5F) sorts after, so the
-/// zero-padded seconds prefix this shares with every other mail filename
-/// keeps sorting messages oldest-first even across a same-second collision.
-fn next_available_mail_path(dir: &Path, base: &str) -> PathBuf {
-    let unsuffixed = dir.join(format!("{base}.md"));
-    if !unsuffixed.exists() {
-        return unsuffixed;
-    }
-    let mut n = 1u32;
+/// Atomically claims the first collision-free path for `<dir>/<base>.md`
+/// (`<base>.md` itself if nothing is there yet, else `<base>_001.md`,
+/// `<base>_002.md`, ...) and writes `contents` into it as part of the same
+/// open, returning the path it landed at.
+///
+/// Item 4 (TOCTOU fix): the previous version (`next_available_mail_path`)
+/// checked `.exists()` in a loop and then handed the winning path to
+/// `state::write_private`, which opens with plain `create(true)` -- an
+/// unconditional overwrite. Two zirv processes racing to store mail in the
+/// same wall-clock second (`now_secs()` has one-second granularity, and two
+/// real sends this close together is common, not a rare edge case) could
+/// both observe the same candidate as free between the check and the write,
+/// and the second writer would silently clobber the first message rather
+/// than fall through to the next suffix. `OpenOptions::create_new` makes the
+/// open itself the atomic claim: it fails with `AlreadyExists` rather than
+/// truncating a winner, so a genuine race is what drives the retry onto the
+/// next suffix, the same guarantee a single process already had.
+///
+/// `_NNN` (not `-N`) is deliberate: `-` (0x2D) sorts *before* `.` (0x2E),
+/// which would put a collision's suffixed file ahead of the unsuffixed one
+/// it collided with; `_` (0x5F) sorts after, so the zero-padded seconds
+/// prefix this shares with every other mail filename keeps sorting messages
+/// oldest-first even across a same-second collision.
+fn claim_and_write(dir: &Path, base: &str, contents: &str) -> std::io::Result<PathBuf> {
+    let mut n = 0u32;
     loop {
-        let candidate = dir.join(format!("{base}_{n:03}.md"));
-        if !candidate.exists() {
-            return candidate;
+        let candidate = if n == 0 {
+            dir.join(format!("{base}.md"))
+        } else {
+            dir.join(format!("{base}_{n:03}.md"))
+        };
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
-        n += 1;
+
+        match opts.open(&candidate) {
+            Ok(mut file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+                file.write_all(contents.as_bytes())?;
+                return Ok(candidate);
+            }
+            // Lost the race (or a genuine same-second collision, the single-
+            // process case this always had to handle): try the next suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -163,8 +198,7 @@ pub fn store(
         .take(8)
         .collect();
     let base = format!("{:010}-{}", now_secs(), short);
-    let path = next_available_mail_path(&dir, &base);
-    super::state::write_private(&path, &msg.to_markdown())?;
+    let path = claim_and_write(&dir, &base, &msg.to_markdown())?;
 
     super::state::prune_to_newest(&dir, cfg.mail.keep);
     Ok(path)
@@ -367,6 +401,37 @@ mod tests {
             sent,
             body: "Heads up: the webhook route moved to /v2/webhook.".to_string(),
         }
+    }
+
+    /// Item 4 (TOCTOU fix): `claim_and_write` must never overwrite a file
+    /// that already exists at a candidate path -- it has to notice the
+    /// collision (via `create_new`'s own `AlreadyExists`, not a separate
+    /// `.exists()` check that a concurrent writer could race past) and fall
+    /// through to the next `_NNN` suffix instead.
+    #[test]
+    fn claim_and_write_retries_past_a_path_that_already_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("mail");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Simulates the other writer having already won the unsuffixed
+        // path, exactly as a genuine race (or a real same-second collision)
+        // would leave things by the time this call runs.
+        std::fs::write(dir.join("0000000001-abc.md"), "already here").expect("seed collision");
+
+        let path = claim_and_write(&dir, "0000000001-abc", "new content").expect("claim");
+
+        assert_eq!(
+            path,
+            dir.join("0000000001-abc_001.md"),
+            "the unsuffixed path was taken, so this must land on the first suffix"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("0000000001-abc.md")).expect("read"),
+            "already here",
+            "the existing winner's content must survive untouched"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new content");
     }
 
     #[test]

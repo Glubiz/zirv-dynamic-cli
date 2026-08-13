@@ -73,6 +73,13 @@ pub enum Event {
     /// exit (`exec::describe_exit`'s own text for the two supervisor exit
     /// codes, or a plain "exited with code N" otherwise).
     DelegatedFinish { agent: String, meaning: String },
+    /// Item 6 audit: `wrap`'s pump loop ends the wrapped session, propagating
+    /// the wrapped agent's own exit code, the moment the child exits --
+    /// whether that is the agent quitting cleanly or crashing. Previously
+    /// silent: nothing printed when this happened, so a maintainer watching
+    /// the session saw it end with no explanation at all, indistinguishable
+    /// from a bug in `wrap` itself.
+    SessionEnded { agent: String, code: i32 },
 }
 
 impl Event {
@@ -141,6 +148,9 @@ impl Event {
             ),
             Event::DelegatedStart { agent } => format!("delegating to {agent}"),
             Event::DelegatedFinish { agent, meaning } => format!("{agent} finished: {meaning}"),
+            Event::SessionEnded { agent, code } => {
+                format!("{agent} session ended (exit code {code})")
+            }
         }
     }
 }
@@ -405,6 +415,29 @@ mod tests {
         assert!(line.contains("restart budget ran out"), "got {line}");
     }
 
+    /// Item 6 (audit): `wrap`'s pump loop used to end the wrapped session
+    /// with no narration at all -- the child's own exit code and nothing
+    /// else. This is the announcement that fixes it, naming both the agent
+    /// and the exit code so it reads as an event, not a silent stop.
+    #[test]
+    fn a_session_ended_announcement_names_the_agent_and_the_exit_code() {
+        let clean = Event::SessionEnded {
+            agent: "claude".to_string(),
+            code: 0,
+        };
+        let line = clean.line();
+        assert!(line.contains("claude"), "got {line}");
+        assert!(line.contains('0'), "got {line}");
+
+        let crashed = Event::SessionEnded {
+            agent: "codex".to_string(),
+            code: 134,
+        };
+        let line = crashed.line();
+        assert!(line.contains("codex"), "got {line}");
+        assert!(line.contains("134"), "got {line}");
+    }
+
     #[test]
     fn announcements_never_touch_the_reserved_bar_row() {
         let sample = [
@@ -443,6 +476,10 @@ mod tests {
             Event::DelegatedFinish {
                 agent: "claude".to_string(),
                 meaning: "exited with code 0".to_string(),
+            },
+            Event::SessionEnded {
+                agent: "claude".to_string(),
+                code: 0,
             },
         ];
         for event in sample {

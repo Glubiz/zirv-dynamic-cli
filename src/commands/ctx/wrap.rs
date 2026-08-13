@@ -579,6 +579,17 @@ fn restart_launch_flags(adapter: &dyn AgentAdapter, launch_command: &[String]) -
     super::exec::extra_launch_flags(launch_command, prefix, None)
 }
 
+/// Item 5 (regression fix): the pty size a restart's fresh session opens at
+/// -- reserved when the bar is still alive, exactly like the initial launch
+/// and every ordinary resize while it stays that way, so a mid-session
+/// restart cannot hand the child the reserved row the bar is about to keep
+/// drawing over. The raw terminal size otherwise (the bar was never
+/// eligible, or has already degraded, in which case the pty tracks full
+/// size like a bar-less session -- see B1's `resize_decision`).
+fn relaunch_size(bar: &BarRuntime, terminal_size: (u16, u16)) -> (u16, u16) {
+    super::chrome::reserved_pty_size(terminal_size, bar.active())
+}
+
 fn relaunch(
     adapter: &dyn AgentAdapter,
     repo: &Path,
@@ -630,9 +641,15 @@ fn relaunch(
 /// called) hand it in rather than have two different ids exist for the same
 /// launch. `None` (every caller but `chat`) keeps today's behavior: a fresh
 /// id minted here.
-pub fn run_with<W: Write>(
+///
+/// No writer parameter: this function never had anything of its own to print
+/// on a healthy path, and its one former write (a rare internal pump
+/// failure) went to `output::error` on stderr instead (item 6 audit) --
+/// printing it to a caller-supplied stdout writer, the same stream the
+/// wrapped session's own pty bytes already occupy, is exactly the kind of
+/// silently-lost diagnostic that motivated the fix.
+pub fn run_with(
     args: &WrapArgs,
-    w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
     role: PromptRole,
@@ -1013,7 +1030,16 @@ pub fn run_with<W: Write>(
     match exit {
         Ok(code) => Ok(code),
         Err(e) => {
-            writeln!(w, "zirv ctx wrap: {e}")?;
+            // Item 6 audit: `w` is stdout in production, the same stream the
+            // wrapped session's own pty bytes are already occupying -- a
+            // rare internal pump failure (a `try_wait`/`wait` I/O error) used
+            // to print its only diagnostic there, where it could be scrolled
+            // off, overwritten by the child's own next redraw, or -- for
+            // `zirv chat > log` -- land only in a redirected file instead of
+            // the operator's own terminal. `output::error` matches
+            // `output::error`'s own stream and styling, the same fix as
+            // chat.rs's no-adapter diagnostic (item 1).
+            crate::output::error(format!("zirv ctx wrap: {e}"));
             Ok(1)
         }
     }
@@ -1079,6 +1105,22 @@ impl BarRuntime {
 /// The 1s redraw throttle: usage and mail are read from disk only when this
 /// has elapsed, never on the byte-pump path.
 const BAR_THROTTLE: Duration = Duration::from_secs(1);
+
+/// Item 2 (regression fix): applies a `ResizeDecision::disables_bar` outcome
+/// to `bar`'s own bookkeeping. The dims move to the *current* size *before*
+/// `disabled` flips, not after or never: `reset_bar`'s later `bar_reset_
+/// sequence(bar.rows)` (both the recovery call right after a disabling
+/// resize, and the final session cleanup) addresses `bar.rows` to clear the
+/// reserved row, and a stale, larger row number left over from before the
+/// shrink points past the now-smaller terminal. A real terminal clamps an
+/// out-of-range cursor move to its own last row and blanks a line of the
+/// child's own live output there instead of the row that actually used to
+/// hold the bar.
+fn disable_bar_at_current_size(bar: &mut BarRuntime, size: (u16, u16)) {
+    bar.cols = size.0;
+    bar.rows = size.1;
+    bar.disabled = true;
+}
 
 /// Writes the reset sequence: region cleared, reserved row blanked. Called
 /// from two places -- the final cleanup alongside `RawGuard::restore`, and
@@ -1218,13 +1260,26 @@ fn pump(
         if let Some(status) = child.try_wait()? {
             // Let the reader thread flush whatever is still buffered.
             while rx.recv_timeout(Duration::from_millis(50)).is_ok() {}
-            return Ok(status.exit_code() as i32);
+            let code = status.exit_code() as i32;
+            // Item 6 audit: the wrapped session just ended, whether the
+            // agent quit cleanly or crashed. Previously silent -- nothing
+            // printed at all, so the session appeared to just stop.
+            announcer.emit(&Event::SessionEnded {
+                agent: adapter.name().to_string(),
+                code,
+            });
+            return Ok(code);
         }
 
         while let Ok(event) = rx.try_recv() {
             if event == PumpEvent::PtyClosed {
                 let status = child.wait()?;
-                return Ok(status.exit_code() as i32);
+                let code = status.exit_code() as i32;
+                announcer.emit(&Event::SessionEnded {
+                    agent: adapter.name().to_string(),
+                    code,
+                });
+                return Ok(code);
             }
             supervision.on_event(event, Instant::now());
         }
@@ -1382,9 +1437,22 @@ fn pump(
                 // file, and the replacement reports its own on its first turn.
                 transcript.forget();
 
+                // Item 6 audit: captured so `note_failure`'s own announcement
+                // can name *why* the restart failed -- quit/writer-lock
+                // trouble, or the fresh pty/spawn itself -- rather than the
+                // same generic "relaunch failed" either way. Neither error
+                // used to be kept past this match at all.
+                let mut relaunch_error = quit.as_ref().err().cloned();
                 let relaunched = match (new_generation, quit.is_ok()) {
                     (Some(new_generation), true) => {
-                        match relaunch(adapter, repo, &note, extra, turn_env, last_size) {
+                        match relaunch(
+                            adapter,
+                            repo,
+                            &note,
+                            extra,
+                            turn_env,
+                            relaunch_size(bar, last_size),
+                        ) {
                             Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
                                 spawn_output_thread(
                                     fresh_reader,
@@ -1406,7 +1474,10 @@ fn pump(
                                 *child = fresh_child;
                                 true
                             }
-                            Err(_) => false,
+                            Err(e) => {
+                                relaunch_error = Some(e.to_string());
+                                false
+                            }
                         }
                     }
                     _ => false,
@@ -1421,10 +1492,11 @@ fn pump(
                         },
                     });
                 } else {
+                    let reason = relaunch_error.unwrap_or_else(|| "relaunch failed".to_string());
                     note_failure(
                         supervision,
                         Some((state_dir, session.as_str())),
-                        "relaunch failed",
+                        &reason,
                         announcer,
                     );
                 }
@@ -1449,7 +1521,15 @@ fn pump(
                 );
                 if !relaunched {
                     let status = child.wait()?;
-                    return Ok(status.exit_code() as i32);
+                    let code = status.exit_code() as i32;
+                    // The `Degraded` announcement just above already said
+                    // *why* (the relaunch failure reason); this says the
+                    // session is over, the same as every other exit point.
+                    announcer.emit(&Event::SessionEnded {
+                        agent: adapter.name().to_string(),
+                        code,
+                    });
+                    return Ok(code);
                 }
             }
         }
@@ -1465,7 +1545,7 @@ fn pump(
             // forever, even once the terminal widened back out).
             let decision = super::chrome::resize_decision(bar.active(), size);
             if decision.disables_bar {
-                bar.disabled = true;
+                disable_bar_at_current_size(bar, size);
             } else if decision.set_scroll_region {
                 bar.cols = size.0;
                 bar.rows = size.1;
@@ -1507,10 +1587,10 @@ fn pump(
     }
 }
 
-pub fn run<W: Write>(args: &WrapArgs, w: &mut W) -> CtxResult<i32> {
+pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env, PromptRole::Worker, None)
+    run_with(args, &repo, &env, PromptRole::Worker, None)
 }
 
 #[cfg(test)]
@@ -1524,6 +1604,78 @@ mod tests {
     use std::io::Read;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn test_bar(size: (u16, u16)) -> BarRuntime {
+        BarRuntime::new(
+            super::super::chrome::Chrome {
+                banner: true,
+                bar: true,
+                colour: false,
+            },
+            "claude".to_string(),
+            true,
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+            size,
+        )
+    }
+
+    /// Item 2 (regression): a shrink that disables the bar must move
+    /// `bar.rows`/`bar.cols` to the *current* size before disabling, so the
+    /// reset sequence that follows (recovery, or the final session cleanup)
+    /// addresses the row that is actually still on screen. Left stale (the
+    /// old, larger row number), the real terminal clamps the out-of-range
+    /// cursor move to its own last row and blanks a line of the child's own
+    /// live output there.
+    #[test]
+    fn reset_after_a_shrink_degrade_targets_the_current_last_row() {
+        let mut bar = test_bar((100, 30));
+        assert_eq!(bar.rows, 30, "launched tall");
+
+        disable_bar_at_current_size(&mut bar, (100, 5));
+
+        assert_eq!(
+            bar.rows, 5,
+            "the dims move to the current size before disabling"
+        );
+        assert_eq!(bar.cols, 100);
+        assert!(bar.disabled);
+
+        let reset = super::super::chrome::bar_reset_sequence(bar.rows);
+        assert!(
+            reset.contains("\x1b[5;1H"),
+            "the reset must address the CURRENT last row: {reset:?}"
+        );
+        assert!(
+            !reset.contains("\x1b[30;1H"),
+            "must not address the stale, now out-of-range row: {reset:?}"
+        );
+    }
+
+    /// Item 5 (regression): a restart's fresh pty has to reserve the bottom
+    /// row while the bar is still alive, exactly like the initial launch
+    /// and an ordinary resize -- otherwise the freshly relaunched child gets
+    /// the full terminal height and the bar immediately starts drawing over
+    /// its own last line.
+    #[test]
+    fn a_relaunch_while_the_bar_is_active_keeps_the_reserved_row() {
+        let bar = test_bar((100, 30));
+        assert!(bar.active(), "sanity: freshly constructed and eligible");
+        assert_eq!(
+            relaunch_size(&bar, (100, 30)),
+            (100, 29),
+            "the relaunch must reserve the same row the live session already has"
+        );
+    }
+
+    /// And once the bar has degraded, a restart is ordinary full-size
+    /// forwarding, exactly like every other pty operation once `bar.active()`
+    /// is false (B1).
+    #[test]
+    fn a_relaunch_after_the_bar_has_degraded_uses_the_full_size() {
+        let mut bar = test_bar((100, 30));
+        bar.disabled = true;
+        assert_eq!(relaunch_size(&bar, (100, 30)), (100, 30));
+    }
 
     #[cfg(any(unix, windows))]
     pub(crate) fn zirv_bin() -> PathBuf {
@@ -1662,16 +1814,8 @@ mod tests {
             command: Vec::new(),
             simple: false,
         };
-        let mut out = Vec::new();
-        let err = run_with(
-            &args,
-            &mut out,
-            tmp.path(),
-            &|_| None,
-            PromptRole::Worker,
-            None,
-        )
-        .expect_err("nothing to wrap");
+        let err = run_with(&args, tmp.path(), &|_| None, PromptRole::Worker, None)
+            .expect_err("nothing to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
@@ -1690,16 +1834,8 @@ mod tests {
             command: vec!["echo".to_string(), "hello".to_string()],
             simple: false,
         };
-        let mut out = Vec::new();
-        let err = run_with(
-            &args,
-            &mut out,
-            tmp.path(),
-            &|_| None,
-            PromptRole::Worker,
-            None,
-        )
-        .expect_err("echo matches no adapter");
+        let err = run_with(&args, tmp.path(), &|_| None, PromptRole::Worker, None)
+            .expect_err("echo matches no adapter");
         let msg = err.to_string();
         assert!(
             msg.contains("--agent"),
@@ -1731,16 +1867,8 @@ mod tests {
             command: vec!["--append-system-prompt".to_string(), "foo".to_string()],
             simple: false,
         };
-        let mut out = Vec::new();
-        let err = run_with(
-            &args,
-            &mut out,
-            tmp.path(),
-            &|_| None,
-            PromptRole::Worker,
-            None,
-        )
-        .expect_err("nothing left to wrap");
+        let err = run_with(&args, tmp.path(), &|_| None, PromptRole::Worker, None)
+            .expect_err("nothing left to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
