@@ -49,7 +49,11 @@ const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
 /// Answers the `PSUEDOCONSOLE_INHERIT_CURSOR` probe described on
 /// `CURSOR_POSITION_REPORT`. A no-op everywhere else: no other platform's pty
 /// asks anything before it will run a child.
-fn answer_inherit_cursor_probe(writer: &mut (dyn Write + Send)) {
+///
+/// `pub(in crate::commands::ctx)` rather than private: `dash::pane`'s own PTY
+/// spawn (the same deadlock, same fix) reuses this exact function instead of
+/// duplicating it.
+pub(in crate::commands::ctx) fn answer_inherit_cursor_probe(writer: &mut (dyn Write + Send)) {
     #[cfg(windows)]
     {
         let _ = writer.write_all(CURSOR_POSITION_REPORT);
