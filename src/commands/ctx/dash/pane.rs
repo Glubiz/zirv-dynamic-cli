@@ -111,10 +111,24 @@ fn last_line_of(screen: &vt100::Screen) -> String {
     String::new()
 }
 
+/// Pure: the exact bytes `inject_visible` writes for one labelled line,
+/// matching the `zirv ▸` announcement channel's own marker
+/// (`announce.rs`'s `Event::line`) so a visible injection reads as coming
+/// from the same voice as everything else zirv narrates to an operator.
+fn visible_injection_line(label: &str, body: &str) -> String {
+    format!("\r\n[zirv \u{25b8} {label}] {body}\r\n")
+}
+
 /// A supervised ConPTY/pty child rendered through its own `vt100` screen.
 pub struct Pane {
     title: String,
     agent_name: String,
+    /// The registry verb this pane was spawned with (`Verb::Chat` for the
+    /// dashboard's own orchestrator pane, `Verb::Dash` for a worker pane) --
+    /// Task 9's mail sweep uses this to tell the two apart: an orchestrator
+    /// pane is never body-injected, only a worker pane is (the trust split
+    /// the spec calls for; `dash::mod::is_delivery_eligible`).
+    verb: Verb,
     session_id: String,
     parser: vt100::Parser,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -239,6 +253,7 @@ impl Pane {
         Ok(Pane {
             title,
             agent_name,
+            verb,
             session_id,
             parser: vt100::Parser::new(rows, cols, 0),
             master,
@@ -335,10 +350,32 @@ impl Pane {
         &self.agent_name
     }
 
+    /// This pane's registry verb (`Verb::Chat` for the orchestrator,
+    /// `Verb::Dash` for a worker pane) -- see the field's own doc comment.
+    pub fn verb(&self) -> Verb {
+        self.verb
+    }
+
     /// The sidebar's one-line preview: the bottom-most non-blank row of this
     /// pane's current screen.
     pub fn last_line(&self) -> String {
         last_line_of(self.screen())
+    }
+
+    /// Writes a visible, clearly-labelled line into the child's own pty --
+    /// `"\r\n[zirv ▸ {label}] {body}\r\n"` followed by a lone `\r` to submit
+    /// it as input -- then a plain `write_input`. Used by Task 9's idle-gated
+    /// intervention (an operator nudge, or a swept mail message) to put text
+    /// in front of the agent the same way a human typing at the prompt
+    /// would, rather than any side channel the agent has to know to look for.
+    ///
+    /// The caller must have already checked `state() == PaneState::Idle`:
+    /// this method does not gate itself -- writing into a `Working` pane
+    /// would interleave with whatever the agent is already sending, which is
+    /// exactly the failure mode idle-gating exists to prevent.
+    pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        self.write_input(visible_injection_line(label, body).as_bytes())?;
+        self.write_input(b"\r")
     }
 
     /// Idempotent: sends `quit_sequence` (grace period, then `kill`, exactly
@@ -402,6 +439,16 @@ mod tests {
         assert_eq!(last_line_of(parser.screen()), "");
     }
 
+    /// Pure: the exact bytes a visible injection writes, matching
+    /// `announce.rs`'s own `zirv ▸` marker.
+    #[test]
+    fn visible_injection_line_matches_the_zirv_announce_format() {
+        assert_eq!(
+            visible_injection_line("nudge from operator", "hello"),
+            "\r\n[zirv \u{25b8} nudge from operator] hello\r\n"
+        );
+    }
+
     /// A trivial, immediately-exiting command: never a real agent (the
     /// ABSOLUTE rule this plan spells out), just enough of a child for
     /// `Pane::spawn` to have something real to supervise. Mirrors the
@@ -447,6 +494,14 @@ mod tests {
         assert_eq!(pane.agent(), "test-agent");
         assert_eq!(pane.title(), "wrk test");
         assert!(!pane.short().is_empty());
+        assert_eq!(pane.verb(), Verb::Dash);
+
+        // Smoke test: a live pane's writer accepts a visible injection
+        // (content correctness is covered separately by
+        // `visible_injection_line_matches_the_zirv_announce_format`, which
+        // does not need a real child at all).
+        pane.inject_visible("nudge from operator", "hello")
+            .expect("inject_visible must succeed while the child is alive");
 
         // The child exits immediately; give it a bounded window to be
         // reaped rather than asserting on the very first poll.

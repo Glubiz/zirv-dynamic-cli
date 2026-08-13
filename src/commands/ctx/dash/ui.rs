@@ -55,11 +55,24 @@ pub struct SpawnDraft {
     pub cursor: usize,
 }
 
+/// Where a submitted nudge goes: an attached pane this dashboard owns
+/// (`AttachedPane`, indexing into the live `panes` vec -- idle-gated visible
+/// injection, or queued if the pane is still `Working`), or a session this
+/// dashboard did not spawn (`ViewOnlySession`, routed through
+/// `sessions::run_nudge_with`'s existing headless marker+mail semantics).
+/// `None` when nothing was selected at the moment `prefix,n` was pressed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NudgeTarget {
+    #[default]
+    None,
+    AttachedPane(usize),
+    ViewOnlySession(String),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NudgeDraft {
+    pub target: NudgeTarget,
     pub input: String,
-    pub items: Vec<String>,
-    pub cursor: usize,
 }
 
 /// One message-in-progress: `to` defaults to `"any"` when left blank (the
@@ -428,6 +441,20 @@ fn render_memory_dialog(f: &mut Frame, area: Rect, view: &MemoryView) {
     render_dialog(f, area, "memory", &lines);
 }
 
+fn render_nudge_dialog(f: &mut Frame, area: Rect, draft: &NudgeDraft) {
+    let target = match &draft.target {
+        NudgeTarget::AttachedPane(i) => format!("pane #{}", i + 1),
+        NudgeTarget::ViewOnlySession(short) => format!("session {short} (headless)"),
+        NudgeTarget::None => "(no target selected)".to_string(),
+    };
+    let lines = vec![
+        format!("to: {target}"),
+        format!("> {}", draft.input),
+        "Enter to send, Esc to cancel".to_string(),
+    ];
+    render_dialog(f, area, "nudge", &lines);
+}
+
 pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
     match overlay {
         Overlay::None => {}
@@ -438,7 +465,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
             render_dialog(f, area, "quit", &lines);
         }
         Overlay::Spawn(d) => render_draft_dialog(f, area, "spawn", &d.input, &d.items, d.cursor),
-        Overlay::Nudge(d) => render_draft_dialog(f, area, "nudge", &d.input, &d.items, d.cursor),
+        Overlay::Nudge(d) => render_nudge_dialog(f, area, d),
         Overlay::Mail(d) => render_mail_dialog(f, area, d),
         Overlay::Memory(d) => render_memory_dialog(f, area, d),
         Overlay::Restore(d) => {
@@ -640,6 +667,21 @@ mod tests {
         let area = Rect::new(0, 0, 60, 10);
         let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
         assert!(text.contains("build-cmd"), "got {text}");
+    }
+
+    #[test]
+    fn nudge_dialog_names_an_attached_pane_target() {
+        let draft = NudgeDraft {
+            target: NudgeTarget::AttachedPane(1),
+            input: "hello".to_string(),
+        };
+        let overlay = Overlay::Nudge(draft);
+        let area = Rect::new(0, 0, 60, 10);
+        let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
+        assert!(
+            text.contains("pane#2") || text.contains("pane #2"),
+            "got {text}"
+        );
     }
 
     /// `tests/fixtures/claude-session.raw` is a gitignored capture of a real

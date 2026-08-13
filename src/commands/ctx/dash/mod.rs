@@ -14,7 +14,7 @@
 pub mod pane;
 pub mod ui;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -777,6 +777,194 @@ fn build_memory_view(state: &StateDir, repo: &Path) -> ui::MemoryView {
     }
 }
 
+// Task 9: idle-gated visible intervention -- a per-pane nudge queue drained
+// only once the pane is `Idle`, plus a once-per-tick mail sweep that injects
+// swept mail the same visible way. Both share the same read-once discipline
+// mail delivery already holds itself to elsewhere (`exec`/`loop`): a message
+// is only ever marked consumed after it was actually shown to the agent.
+
+/// Pure: whether a pane with `queued` nudges waiting should have the next one
+/// delivered right now -- idle, and there is something to deliver.
+pub fn deliverable_now(state: &PaneState, queued: usize) -> bool {
+    matches!(state, PaneState::Idle) && queued > 0
+}
+
+/// Pops the next queued nudge for one pane if `deliverable_now` allows it;
+/// otherwise leaves the queue untouched. Pure aside from the `VecDeque`
+/// mutation -- no pane, no I/O -- so the FIFO-drain-on-idle rule is testable
+/// without a real spawn.
+fn next_deliverable(queue: &mut VecDeque<String>, state: &PaneState) -> Option<String> {
+    if deliverable_now(state, queue.len()) {
+        queue.pop_front()
+    } else {
+        None
+    }
+}
+
+/// Thin seam over `Pane::inject_visible` so the mail sweep's "consume only
+/// after a successful visible injection" rule can be exercised without a
+/// real pty writer: `Pane` is the only production implementer; a test-only
+/// double can force an `Err` to prove a failed write leaves the source
+/// message file untouched (C7 discipline -- a message never actually shown
+/// to the agent must not be marked read).
+pub(crate) trait Injector {
+    fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()>;
+}
+
+impl Injector for Pane {
+    fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        self.inject_visible(label, body)
+    }
+}
+
+/// Delivers one mail message visibly into `injector`, consuming the source
+/// file (moving it to `read/`) ONLY if the injection itself returned `Ok`.
+fn deliver_and_consume<I: Injector>(
+    injector: &mut I,
+    state: &StateDir,
+    slug: &str,
+    label: &str,
+    path: &Path,
+    body: &str,
+) -> CtxResult<()> {
+    injector.try_inject(label, body)?;
+    mail::consume(state, slug, path)
+}
+
+/// Pure: whether a pane in `verb`/`state` is a valid mail-sweep target --
+/// only an attached *worker* pane (`Verb::Dash`) that is currently `Idle`.
+/// The orchestrator pane (`Verb::Chat`) is deliberately excluded here, not
+/// just skipped by convention: it is never body-injected, only ever told a
+/// one-line unread-count advisory (the header's own mail segment) -- the
+/// same trust split every other mail delivery seam in this codebase already
+/// holds for an interactive Orchestrator session.
+fn is_delivery_eligible(verb: sessions::Verb, state: &PaneState) -> bool {
+    verb == sessions::Verb::Dash && matches!(state, PaneState::Idle)
+}
+
+/// Once-per-tick mail sweep: every attached worker pane that is `Idle` gets
+/// its own unread mail (the same per-session visibility `unread_counts`
+/// already applies: addressed to its agent, and either undirected or
+/// addressed to its own short id) injected visibly, one message at a time,
+/// each consumed only after a successful injection.
+fn mail_sweep(
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    errors: &mut Vec<String>,
+) {
+    if !cfg.mail.enabled {
+        return;
+    }
+    let slug = super::state::repo_slug(repo);
+    for pane in panes.iter_mut() {
+        if !is_delivery_eligible(pane.verb(), &pane.state()) {
+            continue;
+        }
+        let agent = pane.agent().to_string();
+        let short = pane.short().to_string();
+        let messages = match mail::list(state, &slug, Some(&agent), Some(&short)) {
+            Ok(m) => m,
+            Err(e) => {
+                push_error(errors, format!("mail sweep: {e}"));
+                continue;
+            }
+        };
+        for (path, msg) in messages {
+            let label = format!(
+                "mail from {}/{}",
+                msg.from_agent,
+                sessions::short_id(&msg.from_session)
+            );
+            if let Err(e) = deliver_and_consume(pane, state, &slug, &label, &path, &msg.body) {
+                push_error(errors, format!("mail sweep: {e}"));
+            }
+        }
+    }
+}
+
+/// Once-per-tick FIFO drain: for every pane whose queue has something
+/// deliverable right now, injects exactly the next one (never the whole
+/// queue at once -- one visible line per tick keeps the child's input
+/// stream readable). `panes` and `queues` are kept the same length by every
+/// caller that grows `panes` (today, only the initial spawn in
+/// `run_dashboard`; a future spawn seam -- Tasks 10/11 -- must push a
+/// matching `VecDeque::new()` here too).
+fn deliver_queued_nudges(
+    panes: &mut [Pane],
+    queues: &mut [VecDeque<String>],
+    errors: &mut Vec<String>,
+) {
+    for (pane, queue) in panes.iter_mut().zip(queues.iter_mut()) {
+        if let Some(text) = next_deliverable(queue, &pane.state())
+            && let Err(e) = pane.inject_visible("nudge from operator", &text)
+        {
+            push_error(errors, format!("nudge delivery: {e}"));
+        }
+    }
+}
+
+/// Handles a submitted `NudgeDraft`: an attached pane gets `inject_visible`
+/// immediately if `Idle`, or is queued (FIFO, drained by
+/// `deliver_queued_nudges` once it goes idle) if still `Working`; a
+/// view-only row is routed through the existing headless
+/// `sessions::run_nudge_with` (marker + mail + restart, unchanged). `target
+/// == None` (nothing was selected when the dialog opened) is a no-op.
+fn submit_nudge(
+    target: ui::NudgeTarget,
+    text: &str,
+    panes: &mut [Pane],
+    queues: &mut [VecDeque<String>],
+    repo: &Path,
+    env: EnvLookup<'_>,
+    errors: &mut Vec<String>,
+) {
+    match target {
+        ui::NudgeTarget::AttachedPane(i) => {
+            let Some(pane) = panes.get_mut(i) else {
+                return;
+            };
+            if matches!(pane.state(), PaneState::Idle) {
+                if let Err(e) = pane.inject_visible("nudge from operator", text) {
+                    push_error(errors, format!("nudge: {e}"));
+                }
+            } else if let Some(queue) = queues.get_mut(i) {
+                queue.push_back(text.to_string());
+                push_error(errors, "nudge queued -- delivers when idle".to_string());
+            }
+        }
+        ui::NudgeTarget::ViewOnlySession(short) => {
+            let args = sessions::NudgeArgs {
+                prefix: short,
+                message: Some(text.to_string()),
+                message_file: None,
+            };
+            let mut sink = Vec::new();
+            let mut stdin = std::io::empty();
+            if let Err(e) = sessions::run_nudge_with(&args, &mut sink, repo, env, &mut stdin) {
+                push_error(errors, format!("nudge: {e}"));
+            }
+        }
+        ui::NudgeTarget::None => {}
+    }
+}
+
+/// The `PaneRowMeta` list for every pane this dashboard currently owns, in
+/// pane order -- shared by the pre-input (routing) and post-input
+/// (rendering) calls to `assemble_sidebar` each tick.
+fn build_pane_rows(panes: &[Pane]) -> Vec<PaneRowMeta> {
+    panes
+        .iter()
+        .map(|pane| PaneRowMeta {
+            short: pane.short().to_string(),
+            title: pane.title().to_string(),
+            glyph: ui::glyph_for(&pane.state()),
+            preview: pane.last_line(),
+        })
+        .collect()
+}
+
 /// Runs the dashboard until the operator quits, owning `first` (the
 /// orchestrator pane the caller already built via `build_launch`) plus
 /// whatever additional panes get spawned along the way. Nesting is the
@@ -789,10 +977,6 @@ pub fn run_dashboard(
     state: &StateDir,
     first: PaneSpec,
 ) -> CtxResult<i32> {
-    // Not read by this task's own body; Task 9's nudge-to-view-only-session
-    // routing (`sessions::run_nudge_with`) is the first thing that needs it.
-    let _ = env;
-
     let mut errors: Vec<String> = Vec::new();
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -809,6 +993,11 @@ pub fn run_dashboard(
 
     let size = (main.width.max(1), main.height.max(1));
     let mut panes = vec![Pane::spawn(first, state, repo, size, &turn_env)?];
+    // Task 9: one FIFO nudge queue per pane, kept the same length as `panes`.
+    // Nothing in this task's scope ever grows `panes` after this point (a
+    // future spawn seam -- Tasks 10/11 -- must push a matching
+    // `VecDeque::new()` here too whenever it pushes a new pane).
+    let mut nudge_queues: Vec<VecDeque<String>> = vec![VecDeque::new(); panes.len()];
 
     install_panic_hook();
     if let Err(e) = enable_raw_mode() {
@@ -843,14 +1032,27 @@ pub fn run_dashboard(
             pane.on_turn_signal();
         }
 
-        // The dashboard's own mail address: the orchestrator pane (`panes[0]`,
-        // fixed for the loop's whole life -- panes are only ever appended,
-        // never reordered or removed before shutdown) is what a message sent
-        // through the mail overlay's compose draft is stamped as coming from.
+        mail_sweep(&mut panes, cfg, state, repo, &mut errors);
+        deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
+
+        // Facts + sidebar rows, computed BEFORE input handling: the Nudge
+        // dialog's attached-vs-view-only routing and the SelectUp/SelectDown
+        // clamp both need this iteration's row layout, not a rendering-only
+        // snapshot taken after the keystroke that needs it.
         let dashboard_short = panes
             .first()
             .map(|p| p.short().to_string())
             .unwrap_or_default();
+        facts_cache.refresh_if_due(
+            cfg,
+            state,
+            repo,
+            &agent_name,
+            &dashboard_short,
+            Instant::now(),
+        );
+        let rows = assemble_sidebar(&build_pane_rows(&panes), &facts_cache.registry, selected);
+        let total_rows = rows.len();
 
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
@@ -911,12 +1113,33 @@ pub fn run_dashboard(
                                     );
                                 }
                             }
-                            // Nudge's own reducer (typing, idle-gated
-                            // delivery vs. queueing) is Task 9's; Esc closes
-                            // it in the meantime, same as Spawn/Restore.
-                            ui::Overlay::Nudge(d) => match key.code {
+                            ui::Overlay::Nudge(mut draft) => match key.code {
                                 KeyCode::Esc => {}
-                                _ => overlay = ui::Overlay::Nudge(d),
+                                KeyCode::Enter => {
+                                    let text = draft.input.trim().to_string();
+                                    if !text.is_empty() {
+                                        submit_nudge(
+                                            draft.target,
+                                            &text,
+                                            &mut panes,
+                                            &mut nudge_queues,
+                                            repo,
+                                            env,
+                                            &mut errors,
+                                        );
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    draft.input.pop();
+                                    overlay = ui::Overlay::Nudge(draft);
+                                }
+                                KeyCode::Char(c)
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    draft.input.push(c);
+                                    overlay = ui::Overlay::Nudge(draft);
+                                }
+                                _ => overlay = ui::Overlay::Nudge(draft),
                             },
                         }
                     } else {
@@ -953,8 +1176,14 @@ pub fn run_dashboard(
                                 selected = selected.saturating_sub(1);
                             }
                             InputVerdict::Dash(DashAction::SelectDown) => {
-                                if !panes.is_empty() {
-                                    selected = (selected + 1).min(panes.len() - 1);
+                                // Clamped against the *combined* row count
+                                // (attached panes plus view-only registry
+                                // rows), not just `panes.len()`: Task 9's
+                                // Nudge dialog has to be able to select a
+                                // view-only row to route a nudge through
+                                // `sessions::run_nudge_with`.
+                                if total_rows > 0 {
+                                    selected = (selected + 1).min(total_rows - 1);
                                 }
                             }
                             InputVerdict::Dash(DashAction::Zoom) => {
@@ -987,7 +1216,24 @@ pub fn run_dashboard(
                                 overlay = ui::Overlay::Spawn(ui::SpawnDraft::default());
                             }
                             InputVerdict::Dash(DashAction::Nudge) => {
-                                overlay = ui::Overlay::Nudge(ui::NudgeDraft::default());
+                                // `selected` addresses the combined row list
+                                // (`rows`, this iteration's): an index below
+                                // `panes.len()` is an attached pane, at or
+                                // above it is a view-only registry row named
+                                // by that same index in `rows`.
+                                let target = if selected < panes.len() {
+                                    ui::NudgeTarget::AttachedPane(selected)
+                                } else {
+                                    rows.get(selected)
+                                        .map(|row| {
+                                            ui::NudgeTarget::ViewOnlySession(row.short.clone())
+                                        })
+                                        .unwrap_or(ui::NudgeTarget::None)
+                                };
+                                overlay = ui::Overlay::Nudge(ui::NudgeDraft {
+                                    target,
+                                    input: String::new(),
+                                });
                             }
                             InputVerdict::Dash(DashAction::Mail) => {
                                 overlay = ui::Overlay::Mail(build_mail_view(state, repo));
@@ -1018,25 +1264,11 @@ pub fn run_dashboard(
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
         let (header_area, sidebar_area, main_area) = ui::layout(frame_area, sidebar_cols);
 
-        facts_cache.refresh_if_due(
-            cfg,
-            state,
-            repo,
-            &agent_name,
-            &dashboard_short,
-            Instant::now(),
-        );
-
-        let pane_rows: Vec<PaneRowMeta> = panes
-            .iter()
-            .map(|pane| PaneRowMeta {
-                short: pane.short().to_string(),
-                title: pane.title().to_string(),
-                glyph: ui::glyph_for(&pane.state()),
-                preview: pane.last_line(),
-            })
-            .collect();
-        let rows = assemble_sidebar(&pane_rows, &facts_cache.registry, selected);
+        // Recomputed (facts_cache itself was already refreshed above, before
+        // input handling) so the sidebar's own `.selected` highlight
+        // reflects any selection change the keystroke just made -- cheap and
+        // pure, unlike the disk-backed facts refresh it does not repeat.
+        let rows = assemble_sidebar(&build_pane_rows(&panes), &facts_cache.registry, selected);
 
         let harness = if let Some(last) = errors.last() {
             format!("{agent_name}  \u{26a0} {last}")
@@ -1820,5 +2052,131 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].1.key, "build-cmd");
         assert_eq!(listed[0].1.written_by, "claude");
+    }
+
+    // Task 9: idle-gated visible intervention.
+
+    #[test]
+    fn deliverable_now_truth_table() {
+        assert!(!deliverable_now(&PaneState::Working, 1));
+        assert!(!deliverable_now(&PaneState::Idle, 0));
+        assert!(deliverable_now(&PaneState::Idle, 1));
+        assert!(!deliverable_now(&PaneState::Ended(0), 1));
+        assert!(!deliverable_now(&PaneState::WaitingInput, 1));
+    }
+
+    #[test]
+    fn queue_drains_fifo_only_while_idle() {
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back("first".to_string());
+        queue.push_back("second".to_string());
+
+        assert_eq!(next_deliverable(&mut queue, &PaneState::Working), None);
+        assert_eq!(queue.len(), 2, "nothing is popped while working");
+        assert_eq!(
+            next_deliverable(&mut queue, &PaneState::Idle),
+            Some("first".to_string())
+        );
+        assert_eq!(
+            next_deliverable(&mut queue, &PaneState::Idle),
+            Some("second".to_string())
+        );
+        assert_eq!(next_deliverable(&mut queue, &PaneState::Idle), None);
+    }
+
+    #[test]
+    fn orchestrator_pane_is_excluded_from_mail_delivery() {
+        assert!(!is_delivery_eligible(
+            sessions::Verb::Chat,
+            &PaneState::Idle
+        ));
+        assert!(is_delivery_eligible(sessions::Verb::Dash, &PaneState::Idle));
+        assert!(!is_delivery_eligible(
+            sessions::Verb::Dash,
+            &PaneState::Working
+        ));
+    }
+
+    struct FailingInjector;
+    impl Injector for FailingInjector {
+        fn try_inject(&mut self, _label: &str, _body: &str) -> CtxResult<()> {
+            Err("simulated injection failure".into())
+        }
+    }
+
+    struct SucceedingInjector {
+        calls: Vec<(String, String)>,
+    }
+    impl Injector for SucceedingInjector {
+        fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+            self.calls.push((label.to_string(), body.to_string()));
+            Ok(())
+        }
+    }
+
+    /// C7 discipline: a message that was never actually shown to the agent
+    /// (the injection failed) must not be marked read.
+    #[test]
+    fn a_failed_injection_leaves_the_mail_file_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        let path = mail::store(
+            &state,
+            slug,
+            &mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "note".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut injector = FailingInjector;
+        let result = deliver_and_consume(&mut injector, &state, slug, "label", &path, "note");
+
+        assert!(result.is_err());
+        assert!(
+            path.exists(),
+            "the message file must be untouched after a failed injection"
+        );
+        assert_eq!(mail::list(&state, slug, None, None).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn a_successful_injection_consumes_the_mail_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        let path = mail::store(
+            &state,
+            slug,
+            &mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "note".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        let result = deliver_and_consume(&mut injector, &state, slug, "label", &path, "note");
+
+        assert!(result.is_ok());
+        assert!(!path.exists(), "consumed on a successful injection");
+        assert_eq!(
+            injector.calls,
+            vec![("label".to_string(), "note".to_string())]
+        );
     }
 }
