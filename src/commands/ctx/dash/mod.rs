@@ -12,6 +12,7 @@
 //! in config) still reaches today's `wrap::run_with` passthrough instead.
 
 pub mod pane;
+pub mod roster;
 pub mod spawnreq;
 pub mod ui;
 
@@ -378,16 +379,43 @@ impl FactsCache {
 
 /// Called on every quit path, before any pane is torn down (shutdown --
 /// quit-sequence, registry release, socket unpublish -- happens in the
-/// caller right after this returns). Removes the whole spawn-request
-/// directory this dashboard created at startup (`requests_dir`'s own
-/// parent, `<dash_short>-<token>`, not just the `requests` leaf, so no empty
-/// shell is left under `<state>/dash/`): once this dashboard is gone,
-/// nothing should still be able to reach a channel that nobody is polling
-/// any more. Task 12's own extension point for persisting a restore roster
-/// from `panes` -- a no-op on that front today.
-// roster: Task 12
-fn on_quit(panes: &mut [Pane], requests_dir: &Path) {
-    let _ = panes;
+/// caller right after this returns). Two things happen here, both
+/// best-effort (the dashboard is exiting either way, and there is nothing
+/// left to report a failure to):
+///
+/// 1. Writes this repo's own restore roster (`roster::write_roster`) from
+///    every pane still alive, orchestrator included -- `RosterPane::role`
+///    records which is which (`roster::ROLE_ORCHESTRATOR`/`ROLE_WORKER`), so
+///    a later startup restore can filter the orchestrator back out itself
+///    rather than this write having to guess which pane index is safe to
+///    keep.
+/// 2. Removes the whole spawn-request directory this dashboard created at
+///    startup (`requests_dir`'s own parent, `<dash_short>-<token>`, not just
+///    the `requests` leaf, so no empty shell is left under `<state>/dash/`):
+///    once this dashboard is gone, nothing should still be able to reach a
+///    channel that nobody is polling any more.
+fn on_quit(panes: &[Pane], requests_dir: &Path, state: &StateDir, repo: &Path) {
+    let roster = roster::Roster {
+        written: super::state::now_secs(),
+        panes: panes
+            .iter()
+            .map(|pane| roster::RosterPane {
+                agent: pane.agent().to_string(),
+                session_id: pane.session_id().to_string(),
+                role: if pane.verb() == sessions::Verb::Chat {
+                    roster::ROLE_ORCHESTRATOR
+                } else {
+                    roster::ROLE_WORKER
+                }
+                .to_string(),
+                short: pane.short().to_string(),
+                title: pane.title().to_string(),
+            })
+            .collect(),
+    };
+    let slug = super::state::repo_slug(repo);
+    let _ = roster::write_roster(state, &slug, &roster);
+
     let dir = requests_dir.parent().unwrap_or(requests_dir);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -967,6 +995,137 @@ fn build_memory_view(state: &StateDir, repo: &Path) -> ui::MemoryView {
     }
 }
 
+// Task 12: the startup restore dialog -- same pure-reducer shape as Task 8's
+// mail/memory overlays. `restore_overlay_reduce` never touches a roster or a
+// pane itself; it only tracks which checkboxes are on and, on Enter, reports
+// back *which* entries were checked (by index) for the caller to act on.
+
+/// What confirming the restore dialog (Enter) reports back: the indices,
+/// into whatever candidate list the caller built the view's entries from in
+/// the same order, that were checked at the moment of confirmation. `Esc`
+/// (skip everything) yields no effect at all -- see `restore_overlay_reduce`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreEffect {
+    Confirm(Vec<usize>),
+}
+
+/// Pure: one keystroke against the restore dialog's current state. `Space`
+/// toggles the entry under the cursor; `Enter` closes the dialog and reports
+/// every currently-checked index as a `Confirm` effect (an empty roster, or
+/// everything unchecked, is still a valid confirm -- it simply restores
+/// nothing); `Esc` closes the dialog with no effect, skipping the restore
+/// entirely. Arrow keys and `j`/`k` move the cursor, clamped the same way
+/// every other browsing-mode reducer in this module already is.
+pub fn restore_overlay_reduce(
+    mut view: ui::RestoreView,
+    key: KeyEvent,
+) -> (Option<ui::RestoreView>, Option<RestoreEffect>) {
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Enter => {
+            let checked = view
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.checked)
+                .map(|(i, _)| i)
+                .collect();
+            (None, Some(RestoreEffect::Confirm(checked)))
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = clamp_cursor(view.cursor + 1, view.entries.len());
+            (Some(view), None)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = view.cursor.saturating_sub(1);
+            (Some(view), None)
+        }
+        KeyCode::Char(' ') => {
+            if let Some(entry) = view.entries.get_mut(view.cursor) {
+                entry.checked = !entry.checked;
+            }
+            (Some(view), None)
+        }
+        _ => (Some(view), None),
+    }
+}
+
+/// Builds the restore dialog's own view from every roster candidate the
+/// caller already filtered down to workers only (`run_dashboard`'s startup
+/// path excludes `roster::ROLE_ORCHESTRATOR` before this is ever called).
+/// Every entry defaults to checked, so a bare Enter restores the whole
+/// roster -- the common case -- and unchecking is the exception the operator
+/// opts into.
+fn build_restore_view(candidates: &[roster::RosterPane]) -> ui::RestoreView {
+    ui::RestoreView {
+        entries: candidates
+            .iter()
+            .map(|pane| ui::RestoreEntry {
+                label: format!("{} {} ({})", pane.title, pane.agent, pane.short),
+                checked: true,
+            })
+            .collect(),
+        cursor: 0,
+    }
+}
+
+/// Spawns one roster candidate back as a fresh worker pane: resolves its
+/// adapter (re-checked against the live gate, same "data, never authority"
+/// discipline `fulfill_spawn_request` already holds a spawn request to --
+/// an agent an operator disabled since the last quit must not come back just
+/// because it was in the roster), builds its argv via `roster::restore_argv`,
+/// and spawns it reusing the roster entry's own `session_id` (so its
+/// registry short id, and the address mail/nudge reach it at, are the same
+/// as before the quit -- restoring is continuing the same session, not
+/// starting a new one with the old one's history).
+#[allow(clippy::too_many_arguments)]
+fn spawn_restored_pane(
+    candidate: &roster::RosterPane,
+    panes: &mut Vec<Pane>,
+    nudge_queues: &mut Vec<VecDeque<String>>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    size: (u16, u16),
+    requests_dir: &Path,
+    errors: &mut Vec<String>,
+) {
+    let adapter = match adapters::select(Some(&candidate.agent), &[], cfg) {
+        Ok(adapter) => adapter,
+        Err(e) => {
+            push_error(errors, format!("restore {}: {e}", candidate.short));
+            return;
+        }
+    };
+    let argv = roster::restore_argv(adapter.as_ref(), candidate);
+    let spec = PaneSpec {
+        agent_name: candidate.agent.clone(),
+        argv,
+        role: prompt::PromptRole::Worker,
+        verb: sessions::Verb::Dash,
+        session_id: candidate.session_id.clone(),
+        title: candidate.title.clone(),
+    };
+
+    let (mut turn_env, turn_env_err) =
+        build_turn_env(cfg, state, repo, &candidate.agent, &candidate.session_id);
+    if let Some(e) = turn_env_err {
+        push_error(errors, e);
+    }
+    turn_env.push((
+        spawnreq::DASH_REQUESTS_ENV.to_string(),
+        requests_dir.display().to_string(),
+    ));
+
+    match Pane::spawn(spec, state, repo, size, &turn_env) {
+        Ok(pane) => {
+            panes.push(pane);
+            nudge_queues.push(VecDeque::new());
+        }
+        Err(e) => push_error(errors, format!("restore {}: {e}", candidate.short)),
+    }
+}
+
 // Task 9: idle-gated visible intervention -- a per-pane nudge queue drained
 // only once the pane is `Idle`, plus a once-per-tick mail sweep that injects
 // swept mail the same visible way. Both share the same read-once discipline
@@ -1208,6 +1367,30 @@ pub fn run_dashboard(
     // `VecDeque::new()` here too whenever it pushes a new pane).
     let mut nudge_queues: Vec<VecDeque<String>> = vec![VecDeque::new(); panes.len()];
 
+    // Task 12: offer back whatever this repo's previous quit left behind,
+    // once, before the terminal is ever touched -- a fresh roster within
+    // `cfg.dash.roster_max_age_secs` becomes the startup restore dialog
+    // below; anything else (absent, stale, already offered to some earlier
+    // launch) leaves `overlay` at its usual `Overlay::None` start. The
+    // orchestrator entry is filtered out here, not later: the `first` pane
+    // spawned just above already *is* this dashboard's orchestrator, so
+    // respawning a roster's own orchestrator entry would duplicate it.
+    let repo_slug = super::state::repo_slug(repo);
+    let restore_candidates: Vec<roster::RosterPane> = roster::take_roster(
+        state,
+        &repo_slug,
+        super::state::now_secs(),
+        cfg.dash.roster_max_age_secs,
+    )
+    .map(|taken| {
+        taken
+            .panes
+            .into_iter()
+            .filter(|pane| pane.role != roster::ROLE_ORCHESTRATOR)
+            .collect()
+    })
+    .unwrap_or_default();
+
     install_panic_hook();
     if let Err(e) = enable_raw_mode() {
         let _ = std::panic::take_hook();
@@ -1232,7 +1415,11 @@ pub fn run_dashboard(
     let mut selected: usize = 0;
     let mut zoomed = false;
     let mut prefix_armed = false;
-    let mut overlay = ui::Overlay::None;
+    let mut overlay = if restore_candidates.is_empty() {
+        ui::Overlay::None
+    } else {
+        ui::Overlay::Restore(build_restore_view(&restore_candidates))
+    };
     let mut facts_cache = FactsCache::new(Instant::now());
 
     let exit_code: i32 = loop {
@@ -1291,7 +1478,7 @@ pub fn run_dashboard(
                             ui::Overlay::None => {}
                             ui::Overlay::QuitConfirm(working) => match key.code {
                                 KeyCode::Enter => {
-                                    on_quit(&mut panes, &requests_dir);
+                                    on_quit(&panes, &requests_dir, state, repo);
                                     shutdown_all(&mut panes, cfg, &mut errors);
                                     break 0;
                                 }
@@ -1302,10 +1489,30 @@ pub fn run_dashboard(
                                 KeyCode::Esc => {}
                                 _ => overlay = ui::Overlay::Spawn(d),
                             },
-                            ui::Overlay::Restore(d) => match key.code {
-                                KeyCode::Esc => {}
-                                _ => overlay = ui::Overlay::Restore(d),
-                            },
+                            ui::Overlay::Restore(view) => {
+                                let (next, effect) = restore_overlay_reduce(view, key);
+                                overlay = match next {
+                                    Some(v) => ui::Overlay::Restore(v),
+                                    None => ui::Overlay::None,
+                                };
+                                if let Some(RestoreEffect::Confirm(indices)) = effect {
+                                    for idx in indices {
+                                        if let Some(candidate) = restore_candidates.get(idx) {
+                                            spawn_restored_pane(
+                                                candidate,
+                                                &mut panes,
+                                                &mut nudge_queues,
+                                                cfg,
+                                                state,
+                                                repo,
+                                                size,
+                                                &requests_dir,
+                                                &mut errors,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             ui::Overlay::Mail(view) => {
                                 let (next, effect) = mail_overlay_reduce(view, key);
                                 overlay = match next {
@@ -1430,7 +1637,7 @@ pub fn run_dashboard(
                                     .map(|p| p.title().to_string())
                                     .collect();
                                 if working.is_empty() {
-                                    on_quit(&mut panes, &requests_dir);
+                                    on_quit(&panes, &requests_dir, state, repo);
                                     shutdown_all(&mut panes, cfg, &mut errors);
                                     break 0;
                                 }
@@ -2406,5 +2613,167 @@ mod tests {
             injector.calls,
             vec![("label".to_string(), "note".to_string())]
         );
+    }
+
+    // Task 12: the startup restore dialog's pure reducer, `build_restore_view`,
+    // and `on_quit`'s own roster write.
+
+    fn restore_entry(label: &str, checked: bool) -> ui::RestoreEntry {
+        ui::RestoreEntry {
+            label: label.to_string(),
+            checked,
+        }
+    }
+
+    #[test]
+    fn restore_overlay_esc_skips_with_no_effect() {
+        let view = ui::RestoreView {
+            entries: vec![restore_entry("a", true)],
+            cursor: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn restore_overlay_space_toggles_the_entry_under_the_cursor() {
+        let view = ui::RestoreView {
+            entries: vec![restore_entry("a", true), restore_entry("b", true)],
+            cursor: 1,
+        };
+        let (next, effect) = restore_overlay_reduce(view, press(' '));
+        let next = next.expect("stays open");
+        assert!(next.entries[0].checked, "untouched entry stays checked");
+        assert!(
+            !next.entries[1].checked,
+            "entry under the cursor toggles off"
+        );
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn restore_overlay_enter_confirms_only_the_checked_indices() {
+        let view = ui::RestoreView {
+            entries: vec![
+                restore_entry("a", true),
+                restore_entry("b", false),
+                restore_entry("c", true),
+            ],
+            cursor: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "confirming closes the dialog");
+        assert_eq!(effect, Some(RestoreEffect::Confirm(vec![0, 2])));
+    }
+
+    #[test]
+    fn restore_overlay_enter_with_nothing_checked_still_confirms_an_empty_set() {
+        let view = ui::RestoreView {
+            entries: vec![restore_entry("a", false)],
+            cursor: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert_eq!(effect, Some(RestoreEffect::Confirm(Vec::new())));
+    }
+
+    #[test]
+    fn restore_overlay_cursor_clamps_within_bounds() {
+        let view = ui::RestoreView {
+            entries: vec![restore_entry("a", true), restore_entry("b", true)],
+            cursor: 0,
+        };
+        let (next, _) = restore_overlay_reduce(view, key(KeyCode::Down, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.cursor, 1);
+
+        let (next, _) = restore_overlay_reduce(next, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            next.expect("stays open").cursor,
+            1,
+            "past the last row clamps rather than overflowing"
+        );
+    }
+
+    #[test]
+    fn build_restore_view_defaults_every_entry_to_checked_and_labels_it() {
+        let candidates = vec![roster::RosterPane {
+            agent: "claude".to_string(),
+            session_id: "sess-1".to_string(),
+            role: roster::ROLE_WORKER.to_string(),
+            short: "aaaa1111".to_string(),
+            title: "wrk claude".to_string(),
+        }];
+        let view = build_restore_view(&candidates);
+        assert_eq!(view.entries.len(), 1);
+        assert!(view.entries[0].checked);
+        assert!(
+            view.entries[0].label.contains("aaaa1111"),
+            "got {}",
+            view.entries[0].label
+        );
+    }
+
+    #[cfg(windows)]
+    fn trivial_argv() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "exit".to_string(),
+            "0".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn trivial_argv() -> Vec<String> {
+        vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()]
+    }
+
+    /// A trivial, immediately-exiting child -- never a real agent (the
+    /// ABSOLUTE rule this plan spells out) -- just enough of a process for
+    /// `Pane::spawn` to have something real to supervise, matching
+    /// `pane.rs`'s own test pattern.
+    #[test]
+    fn on_quit_writes_this_repos_roster_before_removing_the_requests_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        on_quit(&panes, &requests_dir, &state, &repo);
+
+        assert!(
+            !requests_dir
+                .parent()
+                .expect("requests dir has a parent")
+                .exists(),
+            "the whole capability-token directory is removed on quit"
+        );
+
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("on_quit must have written a roster");
+        assert_eq!(written.panes.len(), 1);
+        assert_eq!(written.panes[0].agent, "test-agent");
+        assert_eq!(written.panes[0].short, panes[0].short());
+        assert_eq!(written.panes[0].role, roster::ROLE_WORKER);
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
     }
 }

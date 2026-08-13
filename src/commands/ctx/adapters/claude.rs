@@ -612,6 +612,16 @@ impl AgentAdapter for ClaudeAdapter {
         vec!["--model".to_string(), model.to_string()]
     }
 
+    /// `--resume <SESSION_ID>` is already a fact this codebase relies on
+    /// elsewhere -- `wrap::extra_launch_flags` strips it (among the flags
+    /// that pin a launch to an existing conversation) on every restart, and
+    /// `exec.rs`'s own `RESUME_FLAGS_WITH_VALUE` treats it as a two-token
+    /// flag -- so this is wiring up an already-verified flag for the
+    /// dashboard's own restore path, not a fresh claim.
+    fn resume_args(&self, session_id: &str) -> Option<Vec<String>> {
+        Some(vec!["--resume".to_string(), session_id.to_string()])
+    }
+
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup {
         TurnSignalSetup {
             env: vec![
@@ -1231,6 +1241,15 @@ mod tests {
         assert_eq!(
             adapter.model_args("opus"),
             vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    #[test]
+    fn resume_args_uses_the_verified_flag() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            adapter.resume_args("sess-1"),
+            Some(vec!["--resume".to_string(), "sess-1".to_string()])
         );
     }
 

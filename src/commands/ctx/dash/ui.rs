@@ -5,10 +5,10 @@
 //! through here, and every renderer is exercised with `ratatui::backend::
 //! TestBackend` precisely because there is nothing else to stub.
 //!
-//! `SpawnDraft`/`NudgeDraft`/`MailView`/`MemoryView`/`RestoreView` are seeded
-//! here with only the fields rendering needs today (`input`, `items`,
-//! `cursor`); Tasks 8/9/12 own filling in whatever richer shape their own
-//! overlay reducers need next.
+//! `SpawnDraft`/`NudgeDraft`/`MailView`/`MemoryView`/`RestoreView` carry
+//! whatever shape their own overlay reducer needs (Tasks 8/9/12, in
+//! `dash::mod`); `SpawnDraft` is still the Task 4 placeholder -- Spawn's own
+//! reducer is out of this plan's scope.
 
 use std::path::PathBuf;
 
@@ -131,10 +131,27 @@ pub enum MemoryEffect {
     Verify(String),
 }
 
+/// One roster candidate offered in the restore dialog: a human-readable
+/// `label` (title/agent/short, assembled by `dash::mod` from the roster
+/// entry it mirrors) and whether the operator currently has it checked for
+/// restore. Indices into `RestoreView::entries` line up 1:1 with the
+/// `Vec<roster::RosterPane>` candidate list `dash::mod` keeps alongside the
+/// view -- neither list is ever reordered, only toggled -- so an effect that
+/// names indices is enough for the caller to find the roster data back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreEntry {
+    pub label: String,
+    pub checked: bool,
+}
+
+/// The startup restore dialog's own state: every worker pane offered back
+/// from the previous quit's roster (the orchestrator is excluded before this
+/// view is ever built -- see `dash::mod::run_dashboard`'s own doc comment),
+/// each independently checked/unchecked, defaulting to checked so Enter
+/// alone restores everything.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreView {
-    pub input: String,
-    pub items: Vec<String>,
+    pub entries: Vec<RestoreEntry>,
     pub cursor: usize,
 }
 
@@ -150,9 +167,9 @@ pub enum Overlay {
     Nudge(NudgeDraft),
     Mail(MailView),
     Memory(MemoryView),
-    /// Constructed only by Task 12's own startup restore dialog -- nothing
-    /// in this plan's Task 5 scope has a roster to offer yet.
-    #[allow(dead_code)]
+    /// The startup restore dialog, built once from the previous quit's
+    /// roster (`dash::mod::run_dashboard`); never re-opened later in a
+    /// session's life the way the other overlays are.
     Restore(RestoreView),
 }
 
@@ -441,6 +458,26 @@ fn render_memory_dialog(f: &mut Frame, area: Rect, view: &MemoryView) {
     render_dialog(f, area, "memory", &lines);
 }
 
+fn render_restore_dialog(f: &mut Frame, area: Rect, view: &RestoreView) {
+    let lines = if view.entries.is_empty() {
+        vec!["(nothing to restore)".to_string(), "Esc close".to_string()]
+    } else {
+        let mut lines: Vec<String> = view
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let cursor = if i == view.cursor { '>' } else { ' ' };
+                let check = if entry.checked { 'x' } else { ' ' };
+                format!("{cursor} [{check}] {}", entry.label)
+            })
+            .collect();
+        lines.push("space toggle, Enter restore checked, Esc skip".to_string());
+        lines
+    };
+    render_dialog(f, area, "restore", &lines);
+}
+
 fn render_nudge_dialog(f: &mut Frame, area: Rect, draft: &NudgeDraft) {
     let target = match &draft.target {
         NudgeTarget::AttachedPane(i) => format!("pane #{}", i + 1),
@@ -468,9 +505,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
         Overlay::Nudge(d) => render_nudge_dialog(f, area, d),
         Overlay::Mail(d) => render_mail_dialog(f, area, d),
         Overlay::Memory(d) => render_memory_dialog(f, area, d),
-        Overlay::Restore(d) => {
-            render_draft_dialog(f, area, "restore", &d.input, &d.items, d.cursor)
-        }
+        Overlay::Restore(d) => render_restore_dialog(f, area, d),
     }
 }
 
@@ -680,6 +715,46 @@ mod tests {
         let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
         assert!(
             text.contains("pane#2") || text.contains("pane #2"),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn restore_dialog_shows_checked_and_unchecked_entries() {
+        let view = RestoreView {
+            entries: vec![
+                RestoreEntry {
+                    label: "wrk claude (aaaa1111)".to_string(),
+                    checked: true,
+                },
+                RestoreEntry {
+                    label: "wrk codex (bbbb2222)".to_string(),
+                    checked: false,
+                },
+            ],
+            cursor: 0,
+        };
+        let overlay = Overlay::Restore(view);
+        let area = Rect::new(0, 0, 60, 10);
+        let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
+        assert!(
+            text.contains("[x]"),
+            "checked entry missing its mark: {text}"
+        );
+        assert!(text.contains("[ ]"), "unchecked entry missing: {text}");
+        assert!(
+            text.contains("wrkclaude") || text.contains("wrk claude"),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn restore_dialog_on_an_empty_roster_says_so() {
+        let overlay = Overlay::Restore(RestoreView::default());
+        let area = Rect::new(0, 0, 60, 10);
+        let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
+        assert!(
+            text.contains("nothingtorestore") || text.contains("nothing to restore"),
             "got {text}"
         );
     }

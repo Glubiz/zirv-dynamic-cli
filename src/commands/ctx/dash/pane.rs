@@ -350,6 +350,13 @@ impl Pane {
         &self.agent_name
     }
 
+    /// This pane's own zirv session id (the uuid `PaneSpec::session_id`
+    /// carried in) -- the roster's own `RosterPane::session_id`, and what a
+    /// verified adapter's `resume_args` is asked to resume.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// This pane's registry verb (`Verb::Chat` for the orchestrator,
     /// `Verb::Dash` for a worker pane) -- see the field's own doc comment.
     pub fn verb(&self) -> Verb {

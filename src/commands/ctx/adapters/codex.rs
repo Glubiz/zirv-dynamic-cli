@@ -200,6 +200,12 @@ impl AgentAdapter for CodexAdapter {
             instructions: String::new(),
         }
     }
+
+    // No `resume_args` override: codex's own resume story (a `--last`/
+    // session-id flag for the interactive launch) is unverified against the
+    // real CLI, unlike `model_args` above. The trait default (`None`) is
+    // correct here -- `dash::roster::restore_argv` falls back to a plain
+    // prompt-carrying relaunch for this adapter rather than a guessed flag.
 }
 
 #[cfg(test)]

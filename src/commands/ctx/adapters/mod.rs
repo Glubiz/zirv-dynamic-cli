@@ -137,6 +137,20 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = model;
         Vec::new()
     }
+
+    /// Argv tokens that resume `session_id`'s own conversation, for the
+    /// dashboard's quit/restore roster (`dash::roster::restore_argv`, called
+    /// through `dyn AgentAdapter` -- unlike `model_args` above, both
+    /// adapters reach this default body today, since codex does not
+    /// override it). `None` -- the default, and every "no verified
+    /// mechanism" trait default's own answer -- means this agent's resume
+    /// story is unverified: a restore falls back to a fresh launch carrying
+    /// a plain one-line "resuming after a dashboard restart" prompt instead
+    /// of trying to guess a flag.
+    fn resume_args(&self, session_id: &str) -> Option<Vec<String>> {
+        let _ = session_id;
+        None
+    }
 }
 
 /// The program invocation at the head of an argv: the binary plus the leading
