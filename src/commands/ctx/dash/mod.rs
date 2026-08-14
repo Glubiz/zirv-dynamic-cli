@@ -1667,6 +1667,14 @@ fn partition_restore_selection(
 /// registry short id, and the address mail/nudge reach it at, are the same
 /// as before the quit -- restoring is continuing the same session, not
 /// starting a new one with the old one's history).
+///
+/// H3: on either failure path the candidate is pushed into `deferred_restore`
+/// -- the same vec G3 added for candidates the pane cap skipped. Without
+/// this, a candidate whose spawn failed (a harness binary gone missing, an
+/// adapter disabled since the last quit) was already consumed out of the
+/// roster by `roster::take_roster` and, once `errors` scrolled off screen,
+/// gone for good: `on_quit` only ever writes back *live* panes plus whatever
+/// this vec carries, and a failed spawn is neither.
 #[allow(clippy::too_many_arguments)]
 fn spawn_restored_pane(
     candidate: &roster::RosterPane,
@@ -1678,11 +1686,13 @@ fn spawn_restored_pane(
     size: (u16, u16),
     requests_dir: &Path,
     errors: &mut Vec<String>,
+    deferred_restore: &mut Vec<roster::RosterPane>,
 ) {
     let adapter = match adapters::select(Some(&candidate.agent), &[], cfg) {
         Ok(adapter) => adapter,
         Err(e) => {
             push_error(errors, format!("restore {}: {e}", candidate.short));
+            deferred_restore.push(candidate.clone());
             return;
         }
     };
@@ -1711,7 +1721,10 @@ fn spawn_restored_pane(
             panes.push(pane);
             nudge_queues.push(VecDeque::new());
         }
-        Err(e) => push_error(errors, format!("restore {}: {e}", candidate.short)),
+        Err(e) => {
+            push_error(errors, format!("restore {}: {e}", candidate.short));
+            deferred_restore.push(candidate.clone());
+        }
     }
 }
 
@@ -1933,8 +1946,8 @@ fn pane_index_by_short(shorts: &[&str], short: &str) -> Option<usize> {
 }
 
 /// Handles a submitted `NudgeDraft`: an attached pane gets `inject_visible`
-/// immediately if `Idle`, or is queued (FIFO, drained by
-/// `deliver_queued_nudges` once it goes idle) if still `Working`; a
+/// immediately if [`Pane::injectable`], or is queued (FIFO, drained by
+/// `deliver_queued_nudges` once it becomes injectable again) otherwise; a
 /// view-only row is routed through the existing headless
 /// `sessions::run_nudge_with` (marker + mail + restart, unchanged). `target
 /// == None` (nothing was selected when the dialog opened) is a no-op.
@@ -1943,6 +1956,11 @@ fn pane_index_by_short(shorts: &[&str], short: &str) -> Option<usize> {
 /// to the operator and injected nowhere. Silently dropping it would be the
 /// second-best outcome; injecting into whatever pane now sits where that one
 /// used to be is the failure this resolution exists to prevent.
+///
+/// H1: gated on `injectable()`, not `state() == Idle` -- a pane can render
+/// `Idle` while the operator is mid-composing in it (`user_typed_since_turn`),
+/// and a nudge submitted right then must queue rather than land on top of the
+/// half-typed prompt, same as the sweep/drain path G1 already covers.
 fn submit_nudge(
     target: ui::NudgeTarget,
     text: &str,
@@ -1965,7 +1983,7 @@ fn submit_nudge(
             let Some(pane) = panes.get_mut(i) else {
                 return;
             };
-            if matches!(pane.state(), PaneState::Idle) {
+            if pane.injectable() {
                 if let Err(e) = pane.inject_visible("nudge from operator", text) {
                     push_error(errors, format!("nudge: {e}"));
                 }
@@ -2455,6 +2473,7 @@ pub fn run_dashboard(
                                             pane_size,
                                             &requests_dir,
                                             &mut errors,
+                                            &mut deferred_restore,
                                         );
                                     }
                                     deferred_restore.extend(deferred);
@@ -4752,6 +4771,89 @@ mod tests {
         assert_eq!(pane_index_by_short(&[], "aaaa"), None);
     }
 
+    /// H1: `submit_nudge` used to gate its immediate-injection branch on
+    /// `state() == Idle`, which G1 made no longer enough on its own -- a pane
+    /// the operator is mid-composing in still renders `Idle`. A nudge
+    /// submitted at that moment must queue, exactly like the mail sweep and
+    /// the nudge drain already do, and only land once the pane's next turn
+    /// signal clears `user_typed_since_turn` and makes it `injectable()`
+    /// again.
+    #[test]
+    fn a_nudge_at_a_pane_mid_composition_queues_instead_of_injecting() {
+        use super::pane::tests::{long_lived_argv, signal_until_idle};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "cccccccc-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk mid-compose".to_string(),
+        };
+        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let short = panes[0].short().to_string();
+
+        assert!(
+            signal_until_idle(&mut panes[0], &state, session_id),
+            "the pane must report a turn boundary before this test can mean anything"
+        );
+
+        // The operator starts typing but has not submitted anything yet.
+        panes[0]
+            .write_operator_input(b"half a thought")
+            .expect("forwarding a keystroke must succeed while the child is alive");
+        assert!(
+            matches!(panes[0].state(), PaneState::Idle),
+            "the displayed state stays Idle while mid-thought (G1)"
+        );
+
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        let mut errors = Vec::new();
+        let env = |_: &str| None;
+
+        submit_nudge(
+            ui::NudgeTarget::AttachedPane(short.clone()),
+            "restart the build",
+            &mut panes,
+            &mut queues,
+            &repo,
+            &env,
+            &mut errors,
+        );
+
+        assert_eq!(
+            queues[0].front().map(String::as_str),
+            Some("restart the build"),
+            "a nudge submitted mid-composition queues rather than injecting: {errors:?}"
+        );
+
+        // The next turn boundary clears the operator-typing flag, and the
+        // queued nudge becomes deliverable.
+        assert!(
+            signal_until_idle(&mut panes[0], &state, session_id),
+            "the pane must reach Idle again after its next turn signal"
+        );
+        assert!(
+            panes[0].injectable(),
+            "and it is a valid injection target again"
+        );
+        deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
+        assert!(
+            queues[0].is_empty(),
+            "the queued nudge was drained once the pane became injectable again"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
     /// D4: with every pane reaped there is nothing left to draw, supervise or
     /// type into, so the loop quits through its ordinary exit path rather than
     /// holding the alternate screen open on a blank frame forever.
@@ -5433,6 +5535,73 @@ mod tests {
             written.panes,
             vec![deferred],
             "the cap-deferred candidate is offered again next launch"
+        );
+    }
+
+    /// H3: a restore candidate whose spawn fails must not simply vanish. It
+    /// was already taken out of the on-disk roster by `roster::take_roster`
+    /// before this launch ever tried to spawn it, so if `spawn_restored_pane`
+    /// only reports an error and does not push the candidate into
+    /// `deferred_restore`, `on_quit` never sees it again and the session is
+    /// lost for good -- the same failure mode G3 fixed for cap-skipped
+    /// candidates, but for spawn-failed ones instead.
+    ///
+    /// Forces the failure through `adapters::select` (an agent name the
+    /// permissive test `CtxConfig` does not recognise) rather than a real
+    /// `Pane::spawn` failure, since that is the deterministic, no-process
+    /// path through the same function -- both of `spawn_restored_pane`'s
+    /// error arms push into `deferred_restore` identically.
+    #[test]
+    fn spawn_restored_pane_writes_a_failed_candidate_back_for_next_launch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.agent = "not-a-real-agent".to_string();
+        let cfg = CtxConfig::default();
+
+        let mut panes = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = Vec::new();
+        let mut deferred_restore = Vec::new();
+
+        spawn_restored_pane(
+            &candidate,
+            &mut panes,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert!(panes.is_empty(), "the failed candidate spawned no pane");
+        assert!(
+            errors.iter().any(|e| e.contains("cccc3333")),
+            "the operator is told the restore failed: {errors:?}"
+        );
+        assert_eq!(
+            deferred_restore,
+            vec![candidate],
+            "the failed candidate is carried forward for the next launch's roster"
+        );
+
+        // And it actually round-trips through `on_quit`, same as the
+        // cap-skipped case above.
+        on_quit(&panes, &[], &deferred_restore, &requests_dir, &state, &repo);
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is still written");
+        assert_eq!(
+            written.panes, deferred_restore,
+            "the spawn-failed candidate is offered again next launch"
         );
     }
 
