@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-14 (feat/dashboard, round-9 review): closed the help-probe RCE and the case-folded reserved-name bypass; Windows tree-kill, atomic state writes, and memory-prune parse safety; dashboard cursor/key-encoding/quit-latency fixes and the ⏸ glyph's removal -->
 <!-- Updated 2026-08-14 (feat/dashboard, security round): cmd.exe argv-reparse injection class recorded, with the two shipped defenses and the deferred file-preference hardening -->
 <!-- Updated 2026-08-14 (feat/agent-coordination, mail trust round): two latent traps recorded -- exec/loop's mail gate keys off prompt composition; wrap's status bar paints without raw mode -->
 <!-- Updated 2026-08-14 (feat/dashboard, review fixes): `Ord::clamp` panics on a zero-width rect -->
@@ -74,10 +75,43 @@ argv** rather than try to quote around cmd.exe. Defenses that ship:
    `resume` handoff prompt, a dash worker task) — operator/zirv-generated and
    rarely metachar-bearing. A no-op off Windows and for any non-shim program.
 
+**Round-9 fixes to the above (2026-08-14) — two gaps found by adversarial
+review, both now closed:**
+
+5. **The `--help` capability probe was itself unguarded.** `detect_help_flag`
+   spawned `cmd.exe /c <shim> <bin_args> --help` to test for
+   `--append-system-prompt-file` support *before* FIX A/B/D's own logic ever
+   ran — and `program_invocation` forwards every positional before the first
+   flag, so on `zirv chat --resume` (whose handoff summary is distilled from
+   the untrusted checkout) a repo-controlled metacharacter reached `cmd.exe`
+   inside the probe itself. This was a live RCE independent of fixes 1-4.
+   `detect_help_flag` now runs `guard_cmd_shim_reparse` against the exact
+   probe argv before spawning, reporting "unsupported" on rejection.
+6. **FIX A/B never actually engaged on the launches that most needed them.**
+   `adapters::launches_through_cmd_shim` re-resolved `launch.first()` and saw
+   a plain `cmd.exe` with an empty prefix, returning `false` — so the forced
+   file-form injection was inert on `zirv chat`, bare `zirv`, and the
+   dashboard's orchestrator pane (defense present but never applied), and
+   `zirv chat --resume` was then hard-refused by the FIX-D backstop with no
+   way to succeed. `adapters::launch_reparses_through_shim` now also
+   recognises an **already-resolved** `cmd.exe /c <shim>` (or
+   `powershell -File`) argv, not just one `resolve_program` would still
+   rewrite.
+
 **Residual (usability, not security):** an *interactive* initial prompt that
 contains a raw cmd.exe metacharacter is still refused by the backstop on a
 Windows npm `.cmd` install (rephrase it). Headless is the common automation
 path and is not subject to this (FIX B delivers it via stdin).
+
+**The codex adapter has the same shim gap claude had before the round-9
+fix, but it's inert.** `CodexAdapter::base()` does not route through
+`resolve_program` and overrides neither `launches_through_cmd_shim` nor
+`system_prompt_file_flag` — harmless today only because `codex::ready()`
+always errors, so no codex launch ever reaches a spawn. When codex becomes a
+completed adapter it **must** mirror claude (`resolve_program` + shim
+detection + forced system-prompt-file delivery), or completing it
+reintroduces this exact Windows `.cmd` reparse RCE class. See [[Ctx
+Adapters]].
 
 ## `x.saturating_sub(n).clamp(1, x)` panics when `x` is 0
 
@@ -101,6 +135,33 @@ quit sequence, quit/restore roster), it just never advises/compacts/restarts
 itself the way a plain `zirv ctx wrap` session does. Do not assume a pane
 attached in the dashboard is rot-monitored just because it looks identical to
 one running under `wrap` directly.
+
+## Dashboard special-key encoding must carry the xterm modifier parameter, and crossterm's own control-key pre-mapping must be undone explicitly
+
+Special keys (arrows, Home/End/PageUp/…) used to be encoded with no modifier
+information at all (`CSI <final>` / `CSI <n>~`), so e.g. Ctrl+Left reached
+the child as a plain unmodified Left — word-wise movement was unreachable in
+any pane. Fixed: they now carry the xterm modifier parameter (`CSI
+1;<mod><final>` / `CSI <n>;<mod>~`, `mod = 1 + shift + 2*alt + 4*ctrl`).
+Separately, crossterm pre-maps several control combinations to plain `Char`
+events before zirv ever sees them (`Ctrl+Space` arrives as `Char(' ')`,
+`Ctrl+\` as `Char('\\')`, etc.), so encoding those literally typed the
+visible character instead of sending a control byte. The pane's key encoder
+now special-cases them back to their real bytes: Ctrl+Space→`0x00`,
+Ctrl+\→`0x1c`, Ctrl+]→`0x1d`, Ctrl+^→`0x1e`, Ctrl+_→`0x1f`. Shift+Enter sends
+`ESC CR` (does not submit); bare Enter still sends `\r` and submits — see the
+[[Decision Log]] entry for why `ESC CR` was chosen over CSI-u. Any future
+terminal-input feature must check both failure modes — a missing modifier
+parameter, and a control combination crossterm already collapsed to a bare
+character — not just the common `Char` + `CONTROL` shape.
+
+## `PaneState::WaitingInput` and its `⏸` glyph do not exist
+
+Removed 2026-08-14 (round-9 review): the variant had no producer and never
+rendered in the real dashboard render loop, so the sidebar could never show
+it. Real glyphs are `●` working, `○` idle, `·` view-only, `✕` ended. A true
+"waiting on input" indicator would need a new turn-signal kind end-to-end,
+not just a state variant — do not re-add the enum case without one.
 
 ## `exec`/`loop` gate mail on prompt composition, not on adapter capability
 
@@ -174,6 +235,38 @@ inherits its parent's session id posts turn signals into the parent's own rot
 engine while the parent sits blocked waiting for that very call to return.
 <!-- Updated 2026-08-12 (feat/obsidian-vault, seeded): initial gotchas pulled from repo CLAUDE.md -->
 
+## `supervise::terminate` on Windows used to kill only the direct child, not the tree
+
+On an npm-installed `claude`, the process a supervisor spawns is
+`cmd.exe /c claude.cmd`, and `claude.cmd` runs node — so the direct child is
+the launcher, not the agent. `terminate`'s non-unix arm called `child.kill()`
+(`TerminateProcess` on that one pid), so every rot verdict, timeout, and
+nudge relaunch killed the launcher, `try_wait` reported success, and the
+supervisor spawned a **second** agent against the same repo while the first
+kept running underneath — two live sessions burning quota and writing files,
+invisible to each other. Fixed 2026-08-14: the Windows arm now runs
+`taskkill /T /F /PID <pid>` (a numeric pid, no shell, no new dependency)
+first and falls back to `child.kill()` only if that fails.
+
+## `state::write_private` used to leave a zero-length window a concurrent reader could observe
+
+Writing was create-truncate-then-write. A read landing in that window (e.g.
+`sessions::list`) saw a zero-byte file — indistinguishable from "record
+absent" — and `sweep_orphaned_markers` then deleted that session's pending
+`.nudge` as orphaned, silently losing the wake-up. Fixed 2026-08-14:
+`write_private` now writes a temp sibling and renames over the target
+(atomic on both platforms), with the unix `0600` forcing moved onto the temp
+file so writing over a pre-existing world-readable file still lands private.
+
+**Residual, by design, not a bug:** `memory::prune_to_cap` now refuses to
+delete any entry it cannot confidently parse (a partial read used to score
+`written=0`, sort first, and get evicted — so a racing `verify` could lose an
+entry outright), and `remember`'s best-effort duplicate-collapse for one key
+is not a lock. A genuine two-writer race can still transiently leave two
+files for the same key on disk; the next list-based operation (`recall`,
+`prune_to_cap`) converges back to one, and reads stay deterministic
+meanwhile — but don't assume "one file per key" holds at every instant.
+
 ## portable-pty's Windows `do_kill` inverts its own success check
 
 `WinChild::do_kill` in portable-pty 0.9.0 (`src/win/mod.rs`, lines 41–50) reads:
@@ -231,6 +324,18 @@ same process.
 `.zirv/ctx.yaml` script named `ctx` is silently shadowed and never runs.
 `.zirv/ctx.toml` is a different file — it's the ctx config, and it's excluded
 from script listing in `help.rs`.
+
+**Reserved-name interception must fold case, and must gate every dispatch
+path, not just the pre-clap one.** Fixed 2026-08-14 (round-9 review): the
+pre-clap `ctx`/`chat`/`agent` interception in `main.rs` compared `argv[1]`
+case-sensitively, while `utils::is_reserved_command` (case-insensitive) was
+never consulted from the built-in lookup path — so `zirv Chat` fell through
+to script lookup and ran a repo `.zirv/Chat.yaml`, a file `zirv help`
+simultaneously reported as "shadowed by a built-in, unreachable." Both now
+fold case, and `is_reserved_command` gates script dispatch before
+`get_file_path()` for the clap-dispatched built-ins too. Deliberate UX change
+worth knowing: a mis-cased built-in like `zirv Help` now exits 1 with
+"reserved command name" rather than printing help.
 
 ## Tests must run with `--test-threads=1`
 

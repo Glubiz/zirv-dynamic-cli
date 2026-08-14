@@ -257,14 +257,37 @@ itself), **not** switch panes. This is the entire reason the prefix exists.
 **Sidebar glyphs** (verify while testing): `●` working, `○` idle, `✕` ended; a
 **view-only** registry row (a session this dashboard did not spawn) shows a
 middot `·` instead, and the **focused** row is marked with a leading `*`
-separate from the selection highlight. (A `⏸` waiting-input glyph exists in the
-model but is **reserved** — no producer sets `PaneState::WaitingInput` yet, so
-you will not currently see it. Do not treat its absence as a failure.)
+separate from the selection highlight. (`PaneState::WaitingInput` and its `⏸`
+glyph were **removed** 2026-08-14 — they had no producer and never rendered.
+Do not expect to see a `⏸` anywhere; if you do, that's a regression, not an
+untested reservation. A real "waiting on input" indicator would need a new
+turn-signal kind end-to-end.)
 
 **Windows control-byte note:** on Windows in VT input mode, `Ctrl+A` may arrive
 as the raw control byte `\x01` with no modifier flag. The matcher accepts both
 shapes, so the prefix must work identically on Windows Terminal, conhost, and
 VS Code — confirm in each (matrix §4).
+
+**Key encoding into a pane's child (fixed 2026-08-14 — verify, don't assume):**
+
+| Keystroke (in a focused pane, not prefixed) | Expected observation |
+|---|---|
+| `Ctrl+Left` / `Ctrl+Right` in claude's editor | Moves **word-wise**, not one character. (Special keys now carry the xterm modifier parameter; a build that regresses this sends the bare unmodified arrow instead.) |
+| `Ctrl+Space` | Sends a true NUL (`0x00`), not a literal space character. |
+| `Ctrl+\`, `Ctrl+]`, `Ctrl+^`, `Ctrl+_` | Each sends its real control byte (`0x1c`/`0x1d`/`0x1e`/`0x1f`), not the literal printable character. |
+| `Shift+Enter` | Inserts a newline in the prompt and does **not** submit. Bare `Enter` still submits as `\r`. |
+
+- **PASS:** all four rows behave as described. **FAIL:** any of them types the
+  literal character instead of sending the control byte, or `Ctrl`+arrow moves
+  one character instead of by word.
+
+**Cursor visibility (fixed 2026-08-14):** while typing into the focused pane, a
+visible terminal cursor tracks the pane's own insertion point (translated from
+the child's `vt100` cursor into frame coordinates). It disappears while an
+overlay (spawn/nudge/mail/memory/quit-confirm) owns input, and reappears when
+the overlay closes.
+- **PASS:** a caret is visible in the focused pane while typing. **FAIL:** no
+  cursor is visible anywhere in the dashboard.
 
 ---
 
