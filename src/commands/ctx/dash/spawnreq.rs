@@ -261,10 +261,16 @@ pub fn remove_claim(dir: &Path, request_stem: &str) {
     let _ = std::fs::remove_file(claim_path(dir, request_stem));
 }
 
-/// Whether some dashboard has claimed this request. Checked by the requester
-/// on an ack timeout: a claimed-but-unanswered request means the dashboard is
-/// still working on it (a slow spawn, a busy event loop), and running the same
-/// task headless as well would double-run it.
+/// Whether some dashboard has claimed this request.
+///
+/// F2: no longer consulted by the requester. Reading the claim and *then*
+/// acting on that reading is check-then-act against a dashboard whose claim is
+/// a rename of the request file itself, so `agent.rs` now makes its own
+/// `remove_file` of that same file the decision -- exactly one of the two
+/// operations can win, with no window in between. Kept as the claim
+/// protocol's own observable, which is what its tests (here and in
+/// `dash::mod`) assert against.
+#[cfg(test)]
 pub fn is_claimed(dir: &Path, request_stem: &str) -> bool {
     claim_path(dir, request_stem).exists()
 }

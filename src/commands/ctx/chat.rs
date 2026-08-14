@@ -456,8 +456,19 @@ pub(crate) fn dash_orchestrator_pane(
     // --resume <id>` is an explicit instruction about which conversation this
     // seat is, and appending a fresh `--session-id` on top of it hands the
     // harness two contradictory ids and gets the launch refused. The
-    // operator's own flag wins; the roster then simply records the id they
-    // named, which is the one `--resume` can find anyway.
+    // operator's own flag wins.
+    //
+    // F6: the roster then does **not** record the conversation the operator
+    // named. `PaneSpec::session_id` below is zirv's own `session` uuid either
+    // way -- nothing reads the operator's `--resume` value back out of the
+    // argv -- so for a pin-suppressed launch the id in the roster and the
+    // harness's actual conversation id genuinely differ. That is inert only
+    // because this pane is the orchestrator: `dash::on_quit` stamps it
+    // `roster::ROLE_ORCHESTRATOR` and `dash::restorable_candidates` filters
+    // that role out before `roster::restore_argv` is ever called, so no
+    // `--resume <uuid zirv invented>` is ever issued from this entry. A worker
+    // pane has no such escape hatch, which is why `dash::fulfill_spawn_request`
+    // pins unconditionally.
     if !super::exec::pins_an_existing_conversation(&argv) {
         argv.extend(adapter.session_pin_args(session));
     }
@@ -869,6 +880,49 @@ mod tests {
                 pane.argv
             );
         }
+    }
+
+    /// F6: what the roster actually records when the pin is suppressed. The
+    /// `PaneSpec` keeps zirv's own uuid whatever the operator pinned, so the
+    /// stored id and the harness's real conversation id differ -- and the only
+    /// thing that makes that inert is the orchestrator being excluded from
+    /// restore (`dash::restorable_candidates`, pinned by its own test). This
+    /// test is the other end of that pair: it states the mismatch plainly, so
+    /// a future change that starts restoring orchestrators has to face it.
+    #[test]
+    fn a_pin_suppressed_orchestrator_pane_still_carries_zirvs_own_session_id() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let session = "11111111-2222-4333-8444-555555555555";
+        let existing = "99999999-8888-4777-8666-555555555555";
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let launch = build_launch(
+            &adapter,
+            None,
+            &["--resume".to_string(), existing.to_string()],
+        );
+        let pane =
+            dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false);
+
+        assert_eq!(
+            pane.session_id, session,
+            "the pane -- and so the roster entry built from it -- keeps zirv's own uuid"
+        );
+        assert!(
+            pane.argv.iter().any(|a| a == existing),
+            "while the harness is actually resuming the operator's conversation: {:?}",
+            pane.argv
+        );
+        assert_eq!(
+            pane.verb,
+            crate::commands::ctx::sessions::Verb::Chat,
+            "and it is the verb `on_quit` stamps ROLE_ORCHESTRATOR from, which is what keeps \
+             the mismatch out of any restore"
+        );
     }
 
     // The `chat.model` disclosure. `chat.model` is repo-settable because the

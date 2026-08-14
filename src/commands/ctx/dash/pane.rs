@@ -88,27 +88,36 @@ pub struct PaneSpec {
 pub(crate) const IDLE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Pure: whether the turn signal at `signal_at` still stands as of `now`,
-/// given the child's most recent output at `output_at`.
+/// given the child's most recent output at `output_at` -- that is, whether a
+/// turn boundary has been reported and the child has since been quiet for
+/// `debounce`.
 ///
 /// O1: `drain` used to clear the signal on **any** byte the child produced, so
 /// a single post-turn repaint latched the pane into `Working` until the *next*
 /// turn signal -- which, for a harness sitting idle at its prompt waiting for
-/// input, never comes. Queued nudges and swept mail then never delivered at
-/// all. The four cases here are the whole rule:
+/// input, never comes.
+///
+/// F1: the first fix for that measured the quiet window from the **signal**,
+/// which was wrong on both sides of the window. Any output landing more than
+/// `debounce` after a signal (a zoom or resize repaint, the operator's own
+/// keystrokes echoing back, an async status line) re-latched the pane into
+/// `Working` until a next signal that never came, killing delivery to it for
+/// the rest of the session; and inside the window it flipped to `Idle` at
+/// `signal + debounce` even while bytes were still streaming, because it never
+/// looked at the output again.
+///
+/// Quiet is therefore measured from the **last output**, exactly as
+/// `wrap::may_inject` already measures it for its own injections
+/// (`now - last_output >= debounce`, `wrap.rs:256-262`): a burst keeps pushing
+/// the deadline out for as long as it lasts, and one debounce after the last
+/// byte the pane is idle again however long the burst ran. The two remaining
+/// cases:
 ///
 /// * no signal ever seen -- not idle (unchanged: a pane is `Working` until it
-///   first reports a turn boundary);
-/// * no output since the signal -- idle;
-/// * output that continued **beyond** the debounce window after the signal --
-///   the child is genuinely producing again, so the signal is spent and the
-///   pane is `Working` until the next one. This latches: a later lull does not
-///   make a running turn idle, which is what keeps an injection out of the
-///   middle of somebody's turn;
-/// * output inside the window -- a repaint. The pane goes back to idle, but
-///   only once the window itself has elapsed: until then nothing yet
-///   distinguishes a two-line repaint from the first two lines of a burst, and
-///   waiting 500ms costs one tick where guessing wrong costs a mid-turn
-///   injection.
+///   first reports a turn boundary), whatever it has been printing;
+/// * a signal with no output recorded since -- the quiet window runs from the
+///   signal itself, which is the same instant `wrap`'s own `last_output`
+///   starts from when a session begins.
 pub(crate) fn signal_still_stands(
     signal_at: Option<Instant>,
     output_at: Option<Instant>,
@@ -118,16 +127,9 @@ pub(crate) fn signal_still_stands(
     let Some(signal) = signal_at else {
         return false;
     };
-    let Some(output) = output_at else {
-        return true;
-    };
-    if output <= signal {
-        return true;
-    }
-    if output.duration_since(signal) > debounce {
-        return false;
-    }
-    now.duration_since(signal) >= debounce
+    // Output from *before* the signal is what the signal already accounted
+    // for, and measuring from it only makes the pane idle sooner, never later.
+    now.duration_since(output_at.unwrap_or(signal)) >= debounce
 }
 
 /// Pure: a pane's `PaneState` from whether its last turn-boundary signal still
@@ -141,15 +143,24 @@ pub(crate) fn signal_still_stands(
 /// signal is still seconds away), so without this flag the mail sweep and the
 /// nudge drain -- which run back to back in one tick and both gate on `Idle`
 /// -- each saw the same idle pane and each typed into it.
+///
+/// F1: `user_typed_since_turn` is the other precondition `wrap::may_inject`
+/// holds and this pane did not (`!state.user_typed_since_turn`,
+/// `wrap.rs:259`). An operator who has typed into this pane since its last
+/// turn boundary is mid-thought at a half-composed prompt, and an injected
+/// line submits itself -- taking whatever they had typed with it. Set by
+/// `write_operator_input` and cleared by the next turn signal, exactly like
+/// the injection flag beside it.
 fn state_from(
     signal_stands: bool,
     child_exit: Option<i32>,
     injected_awaiting_turn: bool,
+    user_typed_since_turn: bool,
 ) -> PaneState {
     if let Some(code) = child_exit {
         return PaneState::Ended(code);
     }
-    if injected_awaiting_turn {
+    if injected_awaiting_turn || user_typed_since_turn {
         return PaneState::Working;
     }
     if signal_stands {
@@ -326,6 +337,11 @@ pub struct Pane {
     /// reported finishing it yet." See `state_from`'s own doc comment -- this
     /// is what keeps two idle-gated injections out of the same tick.
     injected_awaiting_turn: bool,
+    /// Set by `write_operator_input` (every keystroke the dashboard forwards
+    /// to this pane), cleared by the next turn signal: "the operator is
+    /// mid-thought in this pane." See `state_from`'s own doc comment -- the
+    /// same precondition `wrap::may_inject` holds before it types anything.
+    user_typed_since_turn: bool,
     exit_code: Option<i32>,
     /// Idempotency guard for `shutdown` -- the release profile is
     /// `panic = "abort"`, so `Drop` is not guaranteed and every exit arm
@@ -450,6 +466,7 @@ impl Pane {
             last_signal_at: None,
             last_output_at: None,
             injected_awaiting_turn: false,
+            user_typed_since_turn: false,
             exit_code: None,
             done: false,
         })
@@ -480,6 +497,20 @@ impl Pane {
     /// The current screen, for `dash::ui`'s renderers.
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// Forwards operator keystrokes into the child's pty and records that the
+    /// operator has typed since this pane's last turn boundary
+    /// (`user_typed_since_turn`), so no idle-gated injection lands in the
+    /// middle of a half-composed prompt. Every keystroke `run_dashboard`
+    /// routes to the focused pane goes through here; `inject_visible`
+    /// deliberately does not, since it is the thing being gated.
+    ///
+    /// The flag is set before the write, not after: a write that failed part
+    /// way through has still put bytes in front of the operator's cursor.
+    pub fn write_operator_input(&mut self, bytes: &[u8]) -> CtxResult<()> {
+        self.user_typed_since_turn = true;
+        self.write_input(bytes)
     }
 
     /// Writes raw bytes into the child's pty, e.g. forwarded key input or
@@ -520,6 +551,7 @@ impl Pane {
             ),
             self.exit_code,
             self.injected_awaiting_turn,
+            self.user_typed_since_turn,
         )
     }
 
@@ -527,15 +559,18 @@ impl Pane {
     /// polls the child's exit status, the same as `drain`: a turn boundary
     /// and a child exit are both "this pane stopped producing on its own",
     /// and either is a fine place to notice the other.
-    /// A fresh signal also clears `injected_awaiting_turn`: the turn an
-    /// injection started has now ended, so the pane is genuinely idle again
-    /// and eligible for the next one.
+    /// A fresh signal also clears `injected_awaiting_turn` and
+    /// `user_typed_since_turn`: the turn an injection (or the operator's own
+    /// typing) started has now ended, so the pane is genuinely idle again and
+    /// eligible for the next one. Both are cleared on a turn boundary for the
+    /// same reason `wrap::InjectionState::on_turn` clears its own.
     pub fn on_turn_signal(&mut self) {
         self.poll_exit();
         if let Some(server) = &self.server {
             while server.try_recv().is_some() {
                 self.last_signal_at = Some(Instant::now());
                 self.injected_awaiting_turn = false;
+                self.user_typed_since_turn = false;
             }
         }
     }
@@ -642,14 +677,20 @@ pub(crate) mod tests {
 
     #[test]
     fn pane_state_maps_turn_signals_to_glyph_states() {
-        assert!(matches!(state_from(false, None, false), PaneState::Working));
-        assert!(matches!(state_from(true, None, false), PaneState::Idle));
         assert!(matches!(
-            state_from(true, Some(0), false),
+            state_from(false, None, false, false),
+            PaneState::Working
+        ));
+        assert!(matches!(
+            state_from(true, None, false, false),
+            PaneState::Idle
+        ));
+        assert!(matches!(
+            state_from(true, Some(0), false, false),
             PaneState::Ended(0)
         ));
         assert!(matches!(
-            state_from(false, Some(3), false),
+            state_from(false, Some(3), false, false),
             PaneState::Ended(3)
         ));
     }
@@ -690,28 +731,59 @@ pub(crate) mod tests {
         );
     }
 
-    /// Output that keeps coming past the window is a new turn, not a repaint:
-    /// the signal is spent, and stays spent until the next one.
+    /// F1: output that keeps coming keeps the pane `Working` for as long as it
+    /// lasts -- the quiet window restarts on every byte, so a burst that runs
+    /// for a minute never looks idle part way through it.
     #[test]
-    fn sustained_output_after_a_turn_signal_flips_the_pane_back_to_working() {
+    fn continuous_output_after_a_turn_signal_keeps_the_pane_working() {
         let debounce = Duration::from_millis(500);
         let signal = Instant::now();
-        let still_going = signal + Duration::from_millis(900);
 
-        assert!(!signal_still_stands(
-            Some(signal),
-            Some(still_going),
-            still_going,
-            debounce
-        ));
+        // A byte every 100ms for three seconds: at no point is the pane idle,
+        // because the last byte is never more than 100ms old.
+        for step in 1..=30u64 {
+            let at = signal + Duration::from_millis(100 * step);
+            assert!(
+                !signal_still_stands(Some(signal), Some(at), at, debounce),
+                "streaming output at +{}ms must not read as idle",
+                100 * step
+            );
+        }
+    }
+
+    /// F1, the bug the old rule had on the far side of the window: output
+    /// arriving *after* `signal + debounce` used to latch the pane into
+    /// `Working` until a next turn signal that, for a harness sitting at its
+    /// prompt, never comes -- so a zoom repaint or an echoed keystroke killed
+    /// delivery to that pane for the rest of the session. A burst is now just
+    /// a burst: once it stops, one debounce later the pane is idle again.
+    #[test]
+    fn a_late_repaint_burst_goes_idle_again_once_it_stops() {
+        let debounce = Duration::from_millis(500);
+        let signal = Instant::now();
+        let burst_end = signal + Duration::from_millis(900);
+
         assert!(
-            !signal_still_stands(
+            !signal_still_stands(Some(signal), Some(burst_end), burst_end, debounce),
+            "while the burst is running the pane is working"
+        );
+        assert!(
+            signal_still_stands(
                 Some(signal),
-                Some(still_going),
-                signal + Duration::from_secs(30),
+                Some(burst_end),
+                burst_end + Duration::from_millis(600),
                 debounce
             ),
-            "and a later lull must not make a running turn look idle again"
+            "and a debounce after the last byte it is reachable again"
+        );
+        assert!(
+            signal_still_stands(
+                Some(signal),
+                Some(burst_end),
+                burst_end + Duration::from_secs(300),
+                debounce
+            ),
+            "it does not decay back to working with nothing further happening"
         );
     }
 
@@ -725,12 +797,39 @@ pub(crate) mod tests {
             "output alone never makes a pane idle"
         );
         assert!(
-            signal_still_stands(Some(now), None, now, debounce),
-            "a signal with no output since is idle immediately"
+            !signal_still_stands(None, None, now + Duration::from_secs(30), debounce),
+            "and no amount of quiet substitutes for a turn boundary"
+        );
+        assert!(
+            !signal_still_stands(Some(now), None, now, debounce),
+            "a fresh signal with no output recorded measures its quiet from the signal"
+        );
+        assert!(
+            signal_still_stands(Some(now), None, now + Duration::from_millis(600), debounce),
+            "and is idle once that window elapses"
         );
         assert!(
             signal_still_stands(Some(now), Some(now - Duration::from_secs(5)), now, debounce),
             "output from before the signal is what the signal already accounted for"
+        );
+    }
+
+    /// F1: the operator typing into a pane is the same "do not inject" signal
+    /// `wrap::may_inject` already honours -- a half-composed prompt must not be
+    /// submitted by an injected line landing on top of it.
+    #[test]
+    fn operator_typing_keeps_a_pane_out_of_reach_until_the_next_turn_signal() {
+        assert!(matches!(
+            state_from(true, None, false, true),
+            PaneState::Working
+        ));
+        assert!(
+            matches!(state_from(true, None, false, false), PaneState::Idle),
+            "and the very next turn boundary, which clears the flag, makes it reachable again"
+        );
+        assert!(
+            matches!(state_from(true, Some(0), false, true), PaneState::Ended(0)),
+            "an exited pane is Ended regardless of what the operator was typing"
         );
     }
 
@@ -739,10 +838,16 @@ pub(crate) mod tests {
     /// both.
     #[test]
     fn a_pending_injection_reports_working_until_the_next_turn_signal() {
-        assert!(matches!(state_from(true, None, true), PaneState::Working));
-        assert!(matches!(state_from(false, None, true), PaneState::Working));
+        assert!(matches!(
+            state_from(true, None, true, false),
+            PaneState::Working
+        ));
+        assert!(matches!(
+            state_from(false, None, true, false),
+            PaneState::Working
+        ));
         assert!(
-            matches!(state_from(true, Some(0), true), PaneState::Ended(0)),
+            matches!(state_from(true, Some(0), true, false), PaneState::Ended(0)),
             "an exited pane is Ended regardless of a pending injection"
         );
     }
@@ -896,10 +1001,16 @@ pub(crate) mod tests {
         vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()]
     }
 
-    /// Drives one turn signal into `pane`'s own socket and waits, bounded,
-    /// for `on_turn_signal` to observe it. Returns whether it landed. Gives up
+    /// Drives one turn signal into `pane`'s own socket and waits, bounded, for
+    /// the pane to report `Idle`. Returns whether it got there. Gives up
     /// immediately if the child exited (`Ended` outranks every other state, so
     /// no number of signals would ever move it back to `Idle`).
+    ///
+    /// Two phases, because of F1: idleness is now "quiet for a debounce",
+    /// measured from the last output or, with none recorded, from the signal
+    /// itself. So the retry loop stops sending the moment a signal has been
+    /// observed -- each further signal would restart the quiet window and this
+    /// helper would spin until its own deadline.
     pub(crate) fn signal_until_idle(pane: &mut Pane, state: &StateDir, session_id: &str) -> bool {
         let socket = state.socket_for(session_id);
         let signal = crate::commands::ctx::signal::TurnSignal {
@@ -910,8 +1021,24 @@ pub(crate) mod tests {
             transcript_path: None,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let before = pane.last_signal_at;
+
+        // Phase 1: land exactly one signal, retrying until the pane observes
+        // a newer one than it already had.
         while std::time::Instant::now() < deadline {
+            pane.on_turn_signal();
+            if matches!(pane.state(), PaneState::Ended(_)) {
+                return false;
+            }
+            if pane.last_signal_at != before {
+                break;
+            }
             let _ = crate::commands::ctx::signal::send(&socket, &signal);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Phase 2: wait out the debounce with nothing further sent.
+        while std::time::Instant::now() < deadline {
             pane.on_turn_signal();
             match pane.state() {
                 PaneState::Idle => return true,
@@ -1006,6 +1133,43 @@ pub(crate) mod tests {
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
             "the next turn signal must clear the pending injection"
+        );
+
+        pane.shutdown("").expect("shutdown");
+    }
+
+    /// F1, end to end on a real supervised child: a keystroke the dashboard
+    /// forwards to a pane takes it out of reach of both idle-gated injectors
+    /// until the pane reports its next turn boundary. Same rule `wrap` holds
+    /// with `user_typed_since_turn`, and the same clearing point.
+    #[test]
+    fn operator_typing_makes_a_pane_ineligible_until_its_next_turn_signal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "44444444-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+
+        assert!(
+            signal_until_idle(&mut pane, &state, session_id),
+            "the pane must report a turn boundary before this test can mean anything"
+        );
+
+        pane.write_operator_input(b"half a thought")
+            .expect("forwarding a keystroke must succeed while the child is alive");
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "an operator mid-thought is not an injection target: {:?}",
+            pane.state()
+        );
+
+        assert!(
+            signal_until_idle(&mut pane, &state, session_id),
+            "the next turn boundary clears the operator-typing flag"
         );
 
         pane.shutdown("").expect("shutdown");

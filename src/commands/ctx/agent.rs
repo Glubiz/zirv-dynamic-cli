@@ -253,26 +253,35 @@ fn try_join_dashboard<W: Write>(
     match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
         Some(ack) => answer_for_ack(ack, w),
         // F10: `take_requests` takes the request the moment the dashboard
-        // picks it up, so a timeout here is ambiguous -- nobody was
-        // listening, or somebody took it and is still spawning. The claim
-        // file is what distinguishes the two. Without this check both ends
-        // ran the same task, and one `zirv ctx agent` became two live
-        // sessions working the same prompt.
-        None if spawnreq::is_claimed(&dir, &stem) => {
-            wait_out_a_claimed_request(&dir, &stem, claim_extension, w)
-        }
+        // picks it up, so a timeout here is ambiguous -- nobody was listening,
+        // or somebody took it and is still spawning. Both ends acting on that
+        // ambiguity is how one `zirv ctx agent` became two live sessions
+        // working the same prompt.
+        //
+        // F2: the **removal is the decision**, not a check followed by one.
+        // This used to ask `is_claimed` and then remove the request, which is
+        // check-then-act against a dashboard doing exactly one thing: renaming
+        // this very file into its claim (`spawnreq::take_requests`). A claim
+        // landing between the check and the remove sent this side headless
+        // while the dashboard was already spawning the same prompt. Removing
+        // first collapses the two into one atomic operation that only one side
+        // can win:
+        //
+        // * `Ok` -- this process took its own request back off disk before
+        //   anybody claimed it, and a dashboard's later rename now finds
+        //   nothing, so the headless fallback cannot double-run it;
+        // * `Err`, for any reason -- the file is no longer where this process
+        //   left it (or cannot be removed), and the thing that moves it is a
+        //   claim. Waiting the claim out is the safe reading: the worst case
+        //   is an honest "claimed but never confirmed" failure for a request
+        //   whose directory vanished with a quitting dashboard, against a
+        //   double-run of the operator's task if this guessed the other way.
         None => {
-            // R5: nothing claimed it, so nothing is going to. Take the request
-            // file back before falling through: `take_requests` runs every
-            // tick, so a request left on disk would still be picked up by a
-            // dashboard that was merely slow to start polling -- and then the
-            // headless run below and that pane would both be working the same
-            // prompt. Best-effort; the file is usually already gone (that is
-            // exactly what makes an unclaimed timeout ambiguous), and the whole
-            // directory is removed on the dashboard's own quit either way.
-            let _ = std::fs::remove_file(&path);
-            eprintln!("zirv ctx agent: dashboard did not answer; running headless");
-            None
+            if std::fs::remove_file(&path).is_ok() {
+                eprintln!("zirv ctx agent: dashboard did not answer; running headless");
+                return None;
+            }
+            wait_out_a_claimed_request(&dir, &stem, claim_extension, w)
         }
     }
 }
@@ -877,6 +886,75 @@ mod tests {
         assert!(
             leftover.is_empty(),
             "the request must not be left for a later tick to pick up: {leftover:?}"
+        );
+    }
+
+    /// F2: the request's removal is what decides which way an unanswered
+    /// timeout goes, so a request that is no longer where this process left it
+    /// is waited out as claimed -- even with no `claim-*` file to be seen. The
+    /// old `is_claimed` pre-check read the claim a moment before acting on it,
+    /// and a claim landing inside that window sent this side headless while the
+    /// dashboard was already spawning the same prompt.
+    #[test]
+    fn a_request_that_vanished_without_a_claim_file_is_waited_out_not_double_run() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        // Moves the request aside to a name that is neither a request nor a
+        // claim, and never acks: exactly what `is_claimed` would have read as
+        // "nobody has this", and what `remove_file` reads as "not mine any
+        // more".
+        let taker = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let found = std::fs::read_dir(&dir)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.path())
+                        .find(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| n.starts_with("req-") && n.ends_with(".json"))
+                        });
+                    if let Some(path) = found {
+                        std::fs::rename(&path, dir.join("taken-elsewhere")).expect("rename");
+                        return;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        panic!("no spawn request appeared within the deadline");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        });
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        );
+        taker.join().expect("taker thread");
+
+        let code = joined
+            .expect("a request this process could not take back must not fall back to headless")
+            .expect("writes its line");
+        assert_eq!(code, 1, "an unconfirmed spawn is a failure, not a success");
+        assert!(
+            String::from_utf8_lossy(&out).contains("claimed the request but never confirmed"),
+            "got {}",
+            String::from_utf8_lossy(&out)
         );
     }
 

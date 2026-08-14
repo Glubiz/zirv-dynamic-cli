@@ -477,6 +477,13 @@ fn reap_fixup(removed: usize, focused: usize, selected: usize) -> (usize, usize)
 ///
 /// Called once per tick, right after every pane has been drained and polled,
 /// so `state()` is as fresh as it gets.
+///
+/// F4: every reaped pane's own exit code is recorded in `reaped_codes`, in
+/// reap order. The dashboard's own exit status is a fold over that list
+/// (`empty_exit_code`) once the last pane is gone: a dashboard whose sessions
+/// all died badly used to exit 0 regardless, which is the same dishonest exit
+/// `exec`/`wrap` are careful never to report.
+#[allow(clippy::too_many_arguments)]
 fn reap_ended_panes(
     panes: &mut Vec<Pane>,
     queues: &mut Vec<VecDeque<String>>,
@@ -484,6 +491,7 @@ fn reap_ended_panes(
     focused: &mut usize,
     selected: &mut usize,
     errors: &mut Vec<String>,
+    reaped_codes: &mut Vec<i32>,
 ) {
     let mut index = 0;
     while index < panes.len() {
@@ -501,6 +509,7 @@ fn reap_ended_panes(
         if index < queues.len() {
             queues.remove(index);
         }
+        reaped_codes.push(code);
         push_error(
             errors,
             format!(
@@ -533,34 +542,83 @@ fn reap_ended_panes(
 ///    the `requests` leaf, so no empty shell is left under `<state>/dash/`):
 ///    once this dashboard is gone, nothing should still be able to reach a
 ///    channel that nobody is polling any more.
-fn on_quit(panes: &[Pane], requests_dir: &Path, state: &StateDir, repo: &Path) {
+///
+/// F5: `unoffered` is whatever this launch took out of the previous roster and
+/// never actually put to the operator -- the restore dialog still sitting
+/// unanswered when the dashboard exited. `roster::take_roster` consumes on
+/// read, so without writing those candidates back this quit's fresh roster
+/// overwrote them and the sessions were lost for good, unoffered twice over.
+fn on_quit(
+    panes: &[Pane],
+    unoffered: &[roster::RosterPane],
+    requests_dir: &Path,
+    state: &StateDir,
+    repo: &Path,
+) {
+    let live: Vec<roster::RosterPane> = panes
+        .iter()
+        // R2: a pane whose child already exited has nothing to restore.
+        // Offering it back would spawn a fresh session for something the
+        // operator watched finish, and would spend the next launch's pane
+        // budget doing it.
+        .filter(|pane| !matches!(pane.state(), PaneState::Ended(_)))
+        .map(|pane| roster::RosterPane {
+            agent: pane.agent().to_string(),
+            session_id: pane.session_id().to_string(),
+            role: if pane.verb() == sessions::Verb::Chat {
+                roster::ROLE_ORCHESTRATOR
+            } else {
+                roster::ROLE_WORKER
+            }
+            .to_string(),
+            short: pane.short().to_string(),
+            title: pane.title().to_string(),
+        })
+        .collect();
     let roster = roster::Roster {
         written: super::state::now_secs(),
-        panes: panes
-            .iter()
-            // R2: a pane whose child already exited has nothing to restore.
-            // Offering it back would spawn a fresh session for something the
-            // operator watched finish, and would spend the next launch's pane
-            // budget doing it.
-            .filter(|pane| !matches!(pane.state(), PaneState::Ended(_)))
-            .map(|pane| roster::RosterPane {
-                agent: pane.agent().to_string(),
-                session_id: pane.session_id().to_string(),
-                role: if pane.verb() == sessions::Verb::Chat {
-                    roster::ROLE_ORCHESTRATOR
-                } else {
-                    roster::ROLE_WORKER
-                }
-                .to_string(),
-                short: pane.short().to_string(),
-                title: pane.title().to_string(),
-            })
-            .collect(),
+        panes: merge_unoffered(live, unoffered),
     };
     let slug = super::state::repo_slug(repo);
     let _ = roster::write_roster(state, &slug, &roster);
 
     remove_request_dir(requests_dir);
+}
+
+/// Pure: this quit's own live panes, plus every candidate this launch took out
+/// of the previous roster and never offered, minus any duplicate.
+///
+/// Deduped on `session_id` because that is the identity a restore actually
+/// resumes (`roster::restore_argv` feeds it to `resume_args`): a candidate that
+/// somehow *is* live again must be written once, as the live pane, not twice.
+fn merge_unoffered(
+    mut live: Vec<roster::RosterPane>,
+    unoffered: &[roster::RosterPane],
+) -> Vec<roster::RosterPane> {
+    for candidate in unoffered {
+        if !live
+            .iter()
+            .any(|pane| pane.session_id == candidate.session_id)
+        {
+            live.push(candidate.clone());
+        }
+    }
+    live
+}
+
+/// The restore candidates a quit still owes the next launch: everything, while
+/// the startup restore dialog is still open and unanswered, and nothing once
+/// the operator has answered it (`Enter` restored what they chose, `Esc` said
+/// no). See `on_quit`'s own `unoffered` parameter (F5).
+fn unoffered_candidates<'a>(
+    overlay: &ui::Overlay,
+    candidates: &'a [roster::RosterPane],
+) -> &'a [roster::RosterPane] {
+    if matches!(overlay, ui::Overlay::Restore(_)) {
+        candidates
+    } else {
+        &[]
+    }
 }
 
 /// Removes the whole capability-token directory this dashboard created for its
@@ -843,6 +901,61 @@ impl SpawnRefusal {
     }
 }
 
+/// The composed prompt one freshly requested worker pane launches with, and
+/// the mail entries that went into it (returned so the caller can consume them
+/// only once the pane has actually spawned -- `exec::run_with`'s own
+/// discipline).
+///
+/// Follows `exec::run_with`'s recipe exactly (`memory::render_for_prompt` ->
+/// `prompt::compose` -> mail listing scoped to this fresh session's own short
+/// id -> `prompt::with_mail_layer`), then adds the one layer that is the
+/// dashboard's alone: `prompt::with_report_back_layer`, which tells the worker
+/// how to mail its outcome back to the session that requested it (F3).
+///
+/// Split out of `fulfill_spawn_request` so what a worker pane is actually told
+/// is testable without spawning a pty -- the rest of that function is the
+/// spawn itself.
+fn compose_worker_prompt(
+    req: &spawnreq::SpawnRequest,
+    adapter_name: &str,
+    registry_short: &str,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    slug: &str,
+) -> (
+    Option<prompt::ComposedPrompt>,
+    Vec<(PathBuf, mail::Message)>,
+) {
+    let memory_entries = memory::render_for_prompt(state, slug, cfg, super::state::now_secs());
+    let composed = prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        false,
+        &cfg.prompt,
+        prompt::PromptRole::Worker,
+        &memory_entries,
+        cfg.memory.max_injected_bytes,
+    );
+    let mail_entries: Vec<(PathBuf, mail::Message)> = if composed.is_some() && cfg.mail.enabled {
+        mail::list(
+            state,
+            slug,
+            Some(adapter_name),
+            sessions::delivery_filter(None, registry_short),
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mail_messages: Vec<mail::Message> = mail_entries.iter().map(|(_, m)| m.clone()).collect();
+    let composed = prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
+    // Last, and after the mail layer on purpose: this is zirv's own plumbing,
+    // not something another session's message is allowed to sit on top of.
+    let composed = prompt::with_report_back_layer(composed, &req.requested_by);
+    (composed, mail_entries)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fulfill_spawn_request(
     req: &spawnreq::SpawnRequest,
@@ -896,30 +1009,15 @@ fn fulfill_spawn_request(
     let session_id = SessionId::new_v4().to_string();
     let registry_short = sessions::short_id(&session_id);
     let slug = super::state::repo_slug(repo);
-    let memory_entries = memory::render_for_prompt(state, &slug, cfg, super::state::now_secs());
-    let composed = prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
+    let (composed, mut mail_entries) = compose_worker_prompt(
+        req,
+        adapter.name(),
+        &registry_short,
+        cfg,
+        state,
         repo,
-        false,
-        &cfg.prompt,
-        prompt::PromptRole::Worker,
-        &memory_entries,
-        cfg.memory.max_injected_bytes,
+        &slug,
     );
-    let mut mail_entries: Vec<(PathBuf, mail::Message)> = if composed.is_some() && cfg.mail.enabled
-    {
-        mail::list(
-            state,
-            &slug,
-            Some(adapter.name()),
-            sessions::delivery_filter(None, &registry_short),
-        )
-        .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let mail_messages: Vec<mail::Message> = mail_entries.iter().map(|(_, m)| m.clone()).collect();
-    let composed = prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
 
     let prompt_args = prompt::injection_args_for_session(
         adapter.as_ref(),
@@ -1849,8 +1947,44 @@ fn input_stream_is_dead(consecutive_errors: usize) -> bool {
 /// spawns its first pane before the loop is ever entered and returns `Err` if
 /// that fails, so "no panes" can only ever mean "every pane that existed has
 /// now ended", never "none has started yet".
-fn should_exit_empty(live_panes: usize) -> bool {
-    live_panes == 0
+///
+/// F5: an unanswered restore dialog holds the exit off. A launch whose panes
+/// all die early (a misconfigured harness binary, say) reached this before the
+/// operator had answered the dialog offering the *previous* session's panes
+/// back -- and quit, taking the offer with it. The dashboard has a question on
+/// screen; idling on it costs nothing, and `Esc` is one keystroke away from the
+/// same exit.
+fn should_exit_empty(live_panes: usize, restore_pending: bool) -> bool {
+    live_panes == 0 && !restore_pending
+}
+
+/// Pure: the dashboard's exit code once its last pane is gone -- 1 if any pane
+/// it reaped exited nonzero, else 0.
+///
+/// F4: this arm used to `break 0` unconditionally, so a dashboard whose
+/// sessions all failed reported success to whatever started it. Honest exits
+/// are the same rule `exec::describe_exit` and `wrap` already hold themselves
+/// to; a dashboard is not exempt just because its children were interactive.
+fn empty_exit_code(reaped_codes: &[i32]) -> i32 {
+    i32::from(reaped_codes.iter().any(|code| *code != 0))
+}
+
+/// The roster entries a startup restore may actually offer: everything except
+/// the orchestrator.
+///
+/// F6: the `first` `PaneSpec` a launch already built *is* this dashboard's
+/// orchestrator, so respawning a roster's own orchestrator entry would
+/// duplicate it -- and its stored `session_id` is zirv's own uuid even when the
+/// operator pinned the conversation themselves with `--resume`
+/// (`chat::dash_orchestrator_pane`), so resuming from it would ask the harness
+/// for a conversation that never existed under that id. Filtered here, once,
+/// before `build_restore_view` or `roster::restore_argv` ever see a candidate.
+fn restorable_candidates(taken: roster::Roster) -> Vec<roster::RosterPane> {
+    taken
+        .panes
+        .into_iter()
+        .filter(|pane| pane.role != roster::ROLE_ORCHESTRATOR)
+        .collect()
 }
 
 /// The `PaneRowMeta` list for every pane this dashboard currently owns, in
@@ -2006,13 +2140,7 @@ pub fn run_dashboard(
         super::state::now_secs(),
         cfg.dash.roster_max_age_secs,
     )
-    .map(|taken| {
-        taken
-            .panes
-            .into_iter()
-            .filter(|pane| pane.role != roster::ROLE_ORCHESTRATOR)
-            .collect()
-    })
+    .map(restorable_candidates)
     .unwrap_or_default();
 
     // Two indices, not one (F7): `selected` walks the combined sidebar
@@ -2034,6 +2162,9 @@ pub fn run_dashboard(
     // D4: set by the "every pane ended" exit arm, so the closing line is
     // printed to a terminal that has already been handed back.
     let mut all_panes_ended = false;
+    // F4: every reaped pane's exit code, in reap order -- the empty exit's own
+    // status is a fold over this (`empty_exit_code`).
+    let mut reaped_codes: Vec<i32> = Vec::new();
 
     let exit_code: i32 = loop {
         for pane in panes.iter_mut() {
@@ -2050,6 +2181,7 @@ pub fn run_dashboard(
             &mut focused,
             &mut selected,
             &mut errors,
+            &mut reaped_codes,
         );
         // D4: with the last pane gone there is nothing left to supervise, draw
         // or type into -- `/exit` in the orchestrator used to leave the
@@ -2059,11 +2191,22 @@ pub fn run_dashboard(
         // would. Reachable only from inside the loop, which the first pane's
         // own spawn already precedes, so an empty startup is still the
         // caller's `Err`, not a silent exit 0.
-        if should_exit_empty(panes.len()) {
-            on_quit(&panes, &requests_dir, state, repo);
+        //
+        // F5: held off while the startup restore dialog is still unanswered --
+        // the operator has a decision open, and quitting under it would consume
+        // the offer without ever making it. F4: and the exit status is what
+        // actually happened to those panes, not a flat 0.
+        if should_exit_empty(panes.len(), matches!(overlay, ui::Overlay::Restore(_))) {
+            on_quit(
+                &panes,
+                unoffered_candidates(&overlay, &restore_candidates),
+                &requests_dir,
+                state,
+                repo,
+            );
             shutdown_all(&mut panes, cfg, &mut errors);
             all_panes_ended = true;
-            break 0;
+            break empty_exit_code(&reaped_codes);
         }
 
         mail_sweep(&mut panes, cfg, state, repo, &mut errors);
@@ -2136,7 +2279,10 @@ pub fn run_dashboard(
                             ui::Overlay::None => {}
                             ui::Overlay::QuitConfirm(working) => match key.code {
                                 KeyCode::Enter => {
-                                    on_quit(&panes, &requests_dir, state, repo);
+                                    // `overlay` was taken above, so this is the
+                                    // one quit path that cannot have a restore
+                                    // dialog pending: it *is* the open overlay.
+                                    on_quit(&panes, &[], &requests_dir, state, repo);
                                     shutdown_all(&mut panes, cfg, &mut errors);
                                     break 0;
                                 }
@@ -2303,17 +2449,25 @@ pub fn run_dashboard(
                             // the merely selected sidebar row (F7): walking
                             // the sidebar onto a view-only session must not
                             // swallow the operator's keystrokes.
+                            //
+                            // F1: `write_operator_input`, not `write_input` --
+                            // it records that the operator has typed since
+                            // this pane's last turn boundary, which takes the
+                            // pane out of reach of the idle-gated injectors
+                            // until it reports the next one. A line injected
+                            // on top of a half-composed prompt submits it.
                             InputVerdict::ToChild(bytes) => {
                                 if !bytes.is_empty()
                                     && let Some(pane) = panes.get_mut(focused)
-                                    && let Err(e) = pane.write_input(&bytes)
+                                    && let Err(e) = pane.write_operator_input(&bytes)
                                 {
                                     push_error(&mut errors, format!("write_input: {e}"));
                                 }
                             }
                             InputVerdict::Dash(DashAction::LiteralPrefix) => {
                                 if let Some(pane) = panes.get_mut(focused)
-                                    && let Err(e) = pane.write_input(&literal_prefix_bytes())
+                                    && let Err(e) =
+                                        pane.write_operator_input(&literal_prefix_bytes())
                                 {
                                     push_error(&mut errors, format!("write_input: {e}"));
                                 }
@@ -2351,7 +2505,10 @@ pub fn run_dashboard(
                                     .map(|p| p.title().to_string())
                                     .collect();
                                 if working.is_empty() {
-                                    on_quit(&panes, &requests_dir, state, repo);
+                                    // Reached only with no overlay open (this
+                                    // arm is the no-overlay branch), so there
+                                    // is nothing unoffered to hand back.
+                                    on_quit(&panes, &[], &requests_dir, state, repo);
                                     shutdown_all(&mut panes, cfg, &mut errors);
                                     break 0;
                                 }
@@ -2445,7 +2602,16 @@ pub fn run_dashboard(
                 &mut errors,
                 "dashboard: the input stream stopped answering; quitting".to_string(),
             );
-            on_quit(&panes, &requests_dir, state, repo);
+            // F5: the operator never got to answer the restore dialog and now
+            // never will, so its candidates go back into the roster for the
+            // next launch rather than being overwritten by this quit's own.
+            on_quit(
+                &panes,
+                unoffered_candidates(&overlay, &restore_candidates),
+                &requests_dir,
+                state,
+                repo,
+            );
             shutdown_all(&mut panes, cfg, &mut errors);
             break 0;
         }
@@ -2506,6 +2672,14 @@ pub fn run_dashboard(
     // this lands in the operator's own scrollback rather than on a surface
     // about to be discarded.
     if all_panes_ended {
+        // F4: the header's notice channel is the only place these were ever
+        // shown, and the header goes away with the alternate screen -- so an
+        // operator whose panes all died learned nothing about how or why. The
+        // most recent handful (`MAX_KEPT_ERRORS`) is what the channel kept;
+        // they land in the scrollback, one per line, ahead of the closing line.
+        for notice in &errors {
+            eprintln!("{notice}");
+        }
         eprintln!("all sessions ended; dashboard closed");
     }
     Ok(exit_code)
@@ -3355,6 +3529,7 @@ mod tests {
                 &mut focused,
                 &mut selected,
                 &mut errors,
+                &mut Vec::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -3749,6 +3924,74 @@ mod tests {
         .reason
     }
 
+    /// F3: the harness layer promises an orchestrator that a pane's results
+    /// come back by mail. This is the half that makes it true -- the worker's
+    /// own composed prompt carries the exact `zirv ctx send` command, addressed
+    /// to the session that asked for the task.
+    #[test]
+    fn a_worker_panes_composed_prompt_carries_the_report_back_line() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+
+        let (composed, mail_entries) = compose_worker_prompt(
+            &spawn_request("do the work", repo),
+            "claude",
+            "cccc3333",
+            &cfg,
+            &state,
+            repo,
+            &slug,
+        );
+
+        let composed = composed.expect("a worker pane composes a prompt");
+        assert!(
+            composed
+                .text
+                .contains("zirv ctx send --to-session aaaa1111 --message '<summary>'"),
+            "the worker is told how to report back to its requester:\n{}",
+            composed.text
+        );
+        assert!(
+            composed.sources.contains(&prompt::PromptSource::ReportBack),
+            "and the layer is attributable: {:?}",
+            composed.sources
+        );
+        assert!(mail_entries.is_empty(), "no mail was waiting for this pane");
+    }
+
+    /// The other half: `agent.rs` writes `"unknown"` when it cannot identify
+    /// the requesting session, and an address zirv cannot vouch for is no
+    /// address at all -- telling a worker to mail it would only produce a
+    /// failed command at the end of every task.
+    #[test]
+    fn a_worker_panes_prompt_omits_the_report_back_line_for_an_unknown_requester() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+
+        let mut req = spawn_request("do the work", repo);
+        req.requested_by = "unknown".to_string();
+        let (composed, _) =
+            compose_worker_prompt(&req, "claude", "cccc3333", &cfg, &state, repo, &slug);
+
+        let composed = composed.expect("a worker pane composes a prompt");
+        assert!(
+            !composed.text.contains("zirv ctx send --to-session"),
+            "no report-back instruction is given without a requester to send it to:\n{}",
+            composed.text
+        );
+        assert!(!composed.sources.contains(&prompt::PromptSource::ReportBack));
+    }
+
     #[test]
     fn argv_unsafe_prompt_flags_anything_that_would_be_read_as_a_flag() {
         assert!(argv_unsafe_prompt("--dangerously-skip-permissions"));
@@ -4019,7 +4262,7 @@ mod tests {
         let requests_dir = state.dash().join("aaaa1111-token").join("requests");
         std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
 
-        on_quit(&panes, &requests_dir, &state, &repo);
+        on_quit(&panes, &[], &requests_dir, &state, &repo);
 
         assert!(
             !requests_dir
@@ -4379,9 +4622,158 @@ mod tests {
     /// holding the alternate screen open on a blank frame forever.
     #[test]
     fn an_empty_pane_list_is_a_quit() {
-        assert!(should_exit_empty(0));
-        assert!(!should_exit_empty(1));
-        assert!(!should_exit_empty(4));
+        assert!(should_exit_empty(0, false));
+        assert!(!should_exit_empty(1, false));
+        assert!(!should_exit_empty(4, false));
+    }
+
+    /// F5: not while the operator still has the startup restore dialog open.
+    /// A launch whose panes all die early used to quit out from under that
+    /// dialog -- and `take_roster` had already consumed the roster, so the
+    /// offer was gone for good.
+    #[test]
+    fn an_unanswered_restore_dialog_holds_the_empty_exit_off() {
+        assert!(
+            !should_exit_empty(0, true),
+            "the dashboard idles on an open question rather than answering it by quitting"
+        );
+        assert!(
+            should_exit_empty(0, false),
+            "and exits as usual once the dialog has been answered"
+        );
+    }
+
+    /// F4: the empty exit used to be a flat 0 however its panes died.
+    #[test]
+    fn the_empty_exit_reports_failure_when_any_pane_ended_badly() {
+        assert_eq!(empty_exit_code(&[]), 0, "nothing reaped, nothing to report");
+        assert_eq!(empty_exit_code(&[0]), 0);
+        assert_eq!(empty_exit_code(&[0, 0, 0]), 0);
+        assert_eq!(empty_exit_code(&[0, 3, 0]), 1, "one bad exit is enough");
+        assert_eq!(empty_exit_code(&[1]), 1);
+        assert_eq!(empty_exit_code(&[-1]), 1, "a signal death counts too");
+    }
+
+    /// F6: an orchestrator roster entry never reaches `build_restore_view` or
+    /// `roster::restore_argv`. Its stored `session_id` is zirv's own uuid even
+    /// when the operator pinned the conversation themselves (see
+    /// `chat::dash_orchestrator_pane`), so resuming from it would ask the
+    /// harness for a conversation that never existed under that id -- and the
+    /// fresh launch has already spawned its own orchestrator anyway.
+    #[test]
+    fn the_orchestrator_is_never_offered_for_restore() {
+        let orchestrator = roster::RosterPane {
+            agent: "claude".to_string(),
+            session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            role: roster::ROLE_ORCHESTRATOR.to_string(),
+            short: "aaaa1111".to_string(),
+            title: "orch".to_string(),
+        };
+        let worker = roster::RosterPane {
+            agent: "codex".to_string(),
+            session_id: "22222222-2222-4333-8444-555555555555".to_string(),
+            role: roster::ROLE_WORKER.to_string(),
+            short: "bbbb2222".to_string(),
+            title: "wrk codex".to_string(),
+        };
+        let taken = roster::Roster {
+            written: 1_000,
+            panes: vec![orchestrator, worker.clone()],
+        };
+
+        let candidates = restorable_candidates(taken);
+        assert_eq!(
+            candidates,
+            vec![worker],
+            "only workers survive the filter, so only workers ever reach restore_argv"
+        );
+        let view = build_restore_view(&candidates);
+        assert_eq!(view.entries.len(), 1);
+        assert!(
+            !view.entries[0].label.contains("orch"),
+            "and the dialog never offers one either: {:?}",
+            view.entries[0].label
+        );
+    }
+
+    /// F5: a candidate this launch took but never offered goes back into the
+    /// roster on the way out, deduped against whatever is still live.
+    #[test]
+    fn merge_unoffered_adds_back_only_what_is_not_already_there() {
+        let live = roster::RosterPane {
+            agent: "claude".to_string(),
+            session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            role: roster::ROLE_WORKER.to_string(),
+            short: "aaaa1111".to_string(),
+            title: "wrk claude".to_string(),
+        };
+        let unoffered = roster::RosterPane {
+            agent: "codex".to_string(),
+            session_id: "22222222-2222-4333-8444-555555555555".to_string(),
+            role: roster::ROLE_WORKER.to_string(),
+            short: "bbbb2222".to_string(),
+            title: "wrk codex".to_string(),
+        };
+
+        assert_eq!(
+            merge_unoffered(vec![live.clone()], std::slice::from_ref(&unoffered)),
+            vec![live.clone(), unoffered.clone()]
+        );
+        assert_eq!(
+            merge_unoffered(vec![live.clone()], std::slice::from_ref(&live)),
+            vec![live.clone()],
+            "a candidate that is live again is written once, as the live pane"
+        );
+        assert_eq!(merge_unoffered(Vec::new(), &[]), Vec::new());
+    }
+
+    /// F5, end to end through the file: a dashboard that exits with the
+    /// restore dialog still unanswered must leave the offer where the next
+    /// launch will find it, rather than overwriting it with its own (here
+    /// empty) set of live panes.
+    #[test]
+    fn an_unanswered_restore_dialog_round_trips_through_the_roster() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let candidate = roster::RosterPane {
+            agent: "codex".to_string(),
+            session_id: "22222222-2222-4333-8444-555555555555".to_string(),
+            role: roster::ROLE_WORKER.to_string(),
+            short: "bbbb2222".to_string(),
+            title: "wrk codex".to_string(),
+        };
+        let pending = ui::Overlay::Restore(build_restore_view(std::slice::from_ref(&candidate)));
+        let answered = ui::Overlay::None;
+        let candidates = vec![candidate.clone()];
+
+        // No panes at all: exactly the early-total-death shape that lost the
+        // roster before F5.
+        on_quit(
+            &[],
+            unoffered_candidates(&pending, &candidates),
+            &requests_dir,
+            &state,
+            &repo,
+        );
+
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is still written");
+        assert_eq!(
+            written.panes,
+            vec![candidate],
+            "the unoffered candidate is offered again next launch"
+        );
+
+        assert!(
+            unoffered_candidates(&answered, &candidates).is_empty(),
+            "an answered dialog owes the next launch nothing"
+        );
     }
 
     /// R2 on a real (immediately-exiting) child: once the pane reports
@@ -4416,6 +4808,7 @@ mod tests {
         let cfg = CtxConfig::default();
         let (mut focused, mut selected) = (0usize, 0usize);
         let mut errors = Vec::new();
+        let mut reaped_codes: Vec<i32> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline && !panes.is_empty() {
             for pane in panes.iter_mut() {
@@ -4428,6 +4821,7 @@ mod tests {
                 &mut focused,
                 &mut selected,
                 &mut errors,
+                &mut reaped_codes,
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -4440,6 +4834,19 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("ended (exit")),
             "the operator is told which pane ended: {errors:?}"
+        );
+        // F4: the notice is retained for the exit to print (the header it was
+        // written for goes away with the alternate screen), and the exit code
+        // it carried is recorded for `empty_exit_code` to fold.
+        assert_eq!(
+            reaped_codes,
+            vec![0],
+            "the reaped pane's own exit code is what the dashboard's exit is built from"
+        );
+        assert_eq!(
+            empty_exit_code(&reaped_codes),
+            0,
+            "a clean exit stays a clean exit"
         );
         assert!(
             !state.sessions().join(format!("{short}.json")).exists(),
