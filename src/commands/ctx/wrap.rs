@@ -435,6 +435,24 @@ pub fn mail_grew(previous: usize, current: usize) -> bool {
     current > previous
 }
 
+/// Folds one successful mailbox observation into `seen`, returning whether it
+/// is worth advising about.
+///
+/// M4: `seen` used to be assigned *only* inside the "did it grow" arm, which
+/// made it an all-time high-water mark rather than a record of the last
+/// observation. Once a session had been told about 3 messages, reading and
+/// consuming all 3 left the watermark at 3, so the next two arrivals counted
+/// as a shrink and the advisory could never fire again short of exceeding the
+/// old peak. Recording every observation makes growth mean "more than last
+/// time I looked", which is what the advisory has always claimed to report.
+/// A failed read still leaves `seen` untouched (the caller only reaches here
+/// on `Some`), so an unreadable mailbox never fakes a drain.
+pub fn observe_mail(seen: &mut usize, current: usize) -> bool {
+    let grew = mail_grew(*seen, current);
+    *seen = current;
+    grew
+}
+
 /// Unread mail for `repo`, filtered to what this session's own harness would
 /// see (`mail::list`'s `for_agent`, the same filter delivery and `zirv ctx
 /// inbox` already use -- a message addressed to a different agent by name
@@ -1572,16 +1590,20 @@ fn pump(
             // `zirv ctx inbox`) and never writes to the pty, only to stderr.
             // A read error (including no mailbox at all) leaves `mail_seen`
             // where it was, so it neither advises nor errors.
+            //
+            // M4: `observe_mail` records *every* successful read, so the
+            // advisory measures growth against the previous observation
+            // rather than an all-time high that a consumed mailbox could
+            // never fall back below.
             if let Some(count) = unread_mail_count(
                 state_dir,
                 repo,
                 adapter.name(),
                 &bar.session_short,
                 bar.mail_enabled,
-            ) && mail_grew(mail_seen, count)
+            ) && observe_mail(&mut mail_seen, count)
             {
                 announcer.emit(&Event::MailWaiting { count });
-                mail_seen = count;
             }
 
             // N4: an interactive session is only ever advised of a nudge,
@@ -3218,6 +3240,29 @@ mod tests {
             !mail_grew(3, 1),
             "a shrink (consumed elsewhere) is not growth"
         );
+    }
+
+    /// M4: the watermark used to only ever ratchet upward -- it was assigned
+    /// solely inside the "did it grow" arm, so once it had seen 3 messages a
+    /// drained mailbox that filled back up to 2 could never advise again.
+    #[test]
+    fn the_mail_watermark_follows_the_last_observation_not_the_high_water_mark() {
+        let mut seen = 0usize;
+
+        assert!(observe_mail(&mut seen, 3), "first mail advises");
+        assert!(
+            !observe_mail(&mut seen, 3),
+            "the same three do not re-advise"
+        );
+        assert!(
+            !observe_mail(&mut seen, 0),
+            "draining the mailbox is not growth"
+        );
+        assert!(
+            observe_mail(&mut seen, 2),
+            "two new messages after a drain must advise again"
+        );
+        assert_eq!(seen, 2, "the watermark tracks what was last observed");
     }
 
     #[test]
