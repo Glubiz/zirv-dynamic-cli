@@ -767,11 +767,15 @@ pub fn injection_args_for_session(
     // identical on every platform. `guard_cmd_shim_reparse` remains the
     // fail-closed backstop for the interactive positional prompt, the one
     // free-text slot still on a reparsed argv.
-    let through_cmd_shim = if let Some(program) = launch.first() {
-        super::adapters::launches_through_cmd_shim(program)
-    } else {
+    let through_cmd_shim = if launch.is_empty() {
         // No passthrough argv: the adapter builds its own launch, so ask it.
         adapter.launches_through_cmd_shim()
+    } else {
+        // The passthrough argv may already be resolved to `cmd.exe /c <shim>`
+        // (which is exactly what `chat::build_launch`/`ClaudeAdapter::base`
+        // produce for the interactive path), so detection has to recognise the
+        // launcher structure itself, not just re-resolve `launch.first()`.
+        super::adapters::launch_reparses_through_shim(launch)
     };
 
     if let Some(flag) = adapter.system_prompt_file_flag()
@@ -829,12 +833,39 @@ fn live_prompt_files() -> &'static Mutex<HashSet<PathBuf>> {
     LIVE_PROMPT_FILES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Reduces a session id to a filesystem-safe stem: `[A-Za-z0-9-]` kept, every
+/// other character mapped to `-`, mirroring `state::repo_slug`. A value that
+/// sanitizes to nothing at all falls back to a fixed stem so the filename can
+/// never collapse to a bare `.md`.
+fn sanitize_session_filename(session: &str) -> String {
+    let safe: String = session
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        "session".to_string()
+    } else {
+        safe
+    }
+}
+
 /// Writes the composed prompt to a private (0600) file under the state dir,
 /// named for the session it belongs to.
 fn write_prompt_file(state: &StateDir, session: &str, text: &str) -> std::io::Result<PathBuf> {
     let dir = state.root().join("prompts");
     super::state::create_private_dir_all(&dir)?;
-    let path = dir.join(format!("{session}.md"));
+    // Defensive: `session` is normally a zirv-minted uuid, but it must never be
+    // trusted to be one. Filtering to `[A-Za-z0-9-]` (the `state::repo_slug`
+    // rule) collapses any path separator, `..`, or `.md`-toggling character to
+    // `-`, so the filename can only ever land directly inside `dir`.
+    let safe: String = sanitize_session_filename(session);
+    let path = dir.join(format!("{safe}.md"));
     super::state::write_private(&path, text)?;
     // Registered before the prune, so this call can never be the one that
     // deletes the file it is about to return.
@@ -1074,6 +1105,91 @@ mod tests {
             "the argv path carries no cmd.exe metacharacter: {}",
             args[1]
         );
+    }
+
+    /// FINDING 3: the interactive path (`chat`/dashboard orchestrator) hands
+    /// `injection_args_for_session` an argv that is **already resolved** to the
+    /// `cmd.exe /c <shim>` launcher form. Detection must recognise that shape
+    /// -- re-resolving the literal head `cmd.exe` would find a plain `.exe` and
+    /// wrongly report "not a shim", leaving the forced file form inert and the
+    /// inline form (repo text on a reparsed argv) chosen instead. With the fix,
+    /// the file form is forced and no launch is spuriously refused. The shim
+    /// path here need not exist on disk: detection is purely structural.
+    #[cfg(windows)]
+    #[test]
+    fn an_already_resolved_cmd_shim_argv_forces_the_file_form() {
+        let (_tmp, home, repo) = tree();
+        std::fs::write(repo.join(".zirv/system-prompt.md"), "danger & payload").expect("write");
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Orchestrator,
+            &[],
+            0,
+        );
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        // A plain (non-shim) adapter, forced to report the flag unsupported:
+        // only the resolved-argv shape below can make `through_cmd_shim` true.
+        let adapter =
+            ClaudeAdapter::new(Some("/nonexistent/fake-claude")).with_file_support_forced(false);
+        // The resolved launcher argv `chat::build_launch` hands to `wrap`.
+        let launch = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+            "the initial prompt".to_string(),
+        ];
+
+        let args =
+            injection_args_for_session(&adapter, &launch, composed.as_ref(), &state, "sess-r")
+                .expect("a benign resolved-shim launch is not refused");
+        assert_eq!(
+            args[0], "--append-system-prompt-file",
+            "the file form is forced on the resolved-shim argv"
+        );
+        assert_ne!(args[0], "--append-system-prompt", "never the inline form");
+        let contents = std::fs::read_to_string(PathBuf::from(&args[1])).expect("prompt file");
+        assert!(
+            contents.contains('&'),
+            "the metachar text lives in the file, off argv"
+        );
+    }
+
+    /// FINDING 5: `write_prompt_file` names the file after the session id. A
+    /// session id carrying a path separator or `..` must not let the write
+    /// escape the prompts directory; the id is sanitized to `[A-Za-z0-9-]`
+    /// first, so the file always lands directly inside `dir`.
+    #[test]
+    fn a_prompt_file_session_id_cannot_escape_the_prompts_dir() {
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let dir = state.root().join("prompts");
+
+        for evil in ["../../etc/passwd", "..\\..\\win", "a/b/c", "..", ""] {
+            let path = write_prompt_file(&state, evil, "body").expect("write");
+            assert_eq!(
+                path.parent(),
+                Some(dir.as_path()),
+                "'{evil}' must stay directly inside the prompts dir, got {path:?}"
+            );
+            // Nothing was created outside the prompts dir.
+            assert!(path.starts_with(&dir), "escaped: {path:?}");
+        }
+    }
+
+    /// The sanitizer keeps a real uuid intact (its hyphens survive) while
+    /// collapsing every path-relevant character to `-`.
+    #[test]
+    fn the_session_filename_sanitizer_keeps_uuids_and_neutralizes_separators() {
+        assert_eq!(
+            sanitize_session_filename("11111111-2222-4333-8444-555555555555"),
+            "11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(sanitize_session_filename("../a\\b/c"), "---a-b-c");
+        assert_eq!(sanitize_session_filename(""), "session");
     }
 
     /// M7: when the probe reports support, the composed prompt must be

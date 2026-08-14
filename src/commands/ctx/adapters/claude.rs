@@ -405,6 +405,27 @@ fn detect_help_flag(program: &str, bin_args: &[String]) -> bool {
     // the launch there, for two different reasons.
     let resolved =
         super::resolve_program(program).unwrap_or_else(|_| ResolvedProgram::direct(program));
+
+    // SECURITY (FINDING 1): `bin_args` carries repo-controlled tokens on the
+    // interactive path (`program_invocation` forwards every positional before
+    // the first flag, e.g. `zirv chat --resume`'s handoff summary). When
+    // `resolve_program` routes an npm-installed `claude.cmd` through
+    // `cmd.exe /c <shim>`, cmd.exe reparses this whole probe command line, so a
+    // metacharacter in `bin_args` would execute *here*, before the real launch
+    // ever reaches its own `guard_cmd_shim_reparse`. Run the identical
+    // fail-closed guard against the exact argv about to be spawned, and on a
+    // rejection report "unsupported" (the same value every probe failure
+    // yields) WITHOUT spawning -- the caller keeps argv delivery and the
+    // payload is never executed.
+    let mut probe_args: Vec<String> =
+        Vec::with_capacity(resolved.prefix.len() + bin_args.len() + 1);
+    probe_args.extend(resolved.prefix.iter().cloned());
+    probe_args.extend(bin_args.iter().cloned());
+    probe_args.push("--help".to_string());
+    if super::guard_cmd_shim_reparse(&resolved.program, &probe_args).is_err() {
+        return false;
+    }
+
     let Ok(mut child) = Command::new(&resolved.program)
         .args(&resolved.prefix)
         .args(bin_args)
@@ -676,6 +697,42 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(name)
+    }
+
+    /// SECURITY (FINDING 1): `detect_help_flag` forwards `bin_args` (repo-
+    /// controlled on the interactive path) into the `--help` probe argv. When
+    /// the program resolves to the Windows `cmd.exe /c <shim>` form, cmd.exe
+    /// would reparse a metacharacter in `bin_args` as a command -- so the probe
+    /// must run the fail-closed `guard_cmd_shim_reparse` check *before* it
+    /// spawns, and report "unsupported" (`false`) on rejection without ever
+    /// executing anything. Proven by a shim that writes a sentinel next to
+    /// itself if it ever runs: a metachar `bin_arg` leaves the sentinel absent,
+    /// while a clean one spawns and creates it.
+    #[cfg(windows)]
+    #[test]
+    fn detect_help_flag_refuses_to_spawn_when_a_bin_arg_would_be_reparsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("claude.cmd");
+        // `%~dp0` is the shim's own directory, so the sentinel lands there
+        // regardless of the probe's cwd. If this batch file ever runs, the
+        // sentinel exists.
+        std::fs::write(&shim, "@echo off\r\necho ran> \"%~dp0ran.marker\"\r\n")
+            .expect("write shim");
+        let sentinel = dir.path().join("ran.marker");
+
+        // A metacharacter-bearing bin_arg: the guard must refuse before spawn.
+        let detected = detect_help_flag(&shim.display().to_string(), &["foo&calc".to_string()]);
+        assert!(!detected, "a rejected probe reports unsupported");
+        assert!(!sentinel.exists(), "the shim must never have been spawned");
+
+        // Control: a clean bin_arg passes the guard and does spawn the shim
+        // (which then creates the sentinel), confirming the guard -- not some
+        // unrelated failure -- is what stopped the metachar case above.
+        let _ = detect_help_flag(&shim.display().to_string(), &["--model".to_string()]);
+        assert!(
+            sentinel.exists(),
+            "a clean bin_arg is allowed through and the shim runs"
+        );
     }
 
     /// The needles track `scripts/record-claude-fixture.py`'s SECRET pattern.

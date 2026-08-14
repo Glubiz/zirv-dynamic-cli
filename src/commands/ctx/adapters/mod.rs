@@ -429,6 +429,43 @@ pub fn launches_through_cmd_shim(program: &str) -> bool {
     }
 }
 
+/// Whether spawning the argv `launch` puts its downstream tokens through a
+/// Windows launcher that reparses them -- either the `cmd.exe /c <shim>` form
+/// (an npm-installed `.cmd`) or the `powershell -File <script>` form (a
+/// `.ps1`). Unlike [`launches_through_cmd_shim`], which is given only a bare
+/// program name to re-resolve, this handles an argv that is **already
+/// resolved** to a launcher: `chat::build_launch`/`ClaudeAdapter::base` hand
+/// `wrap`/`dash_orchestrator_pane` an argv whose head is literally `cmd.exe`
+/// (or `powershell`), so re-resolving that head finds a plain `.exe` and would
+/// wrongly report "not a shim", leaving the forced-file-form defence inert on
+/// the interactive path. Recognising the resolved launcher structure directly
+/// (via [`reparse_launcher_prefix`]) is what keeps that defence engaged.
+///
+/// Falls back to resolving the head program for an argv that has *not* been
+/// resolved yet (a raw `wrap` command such as `["claude", "--resume"]`), so
+/// both call shapes reach the same verdict. Always `false` off Windows.
+pub fn launch_reparses_through_shim(launch: &[String]) -> bool {
+    #[cfg(windows)]
+    {
+        let Some((program, rest)) = launch.split_first() else {
+            return false;
+        };
+        // An already-resolved `cmd.exe /c <shim>` or `powershell -File <script>`
+        // argv: the launcher reparses everything past its own prefix.
+        if reparse_launcher_prefix(program, rest).is_some() {
+            return true;
+        }
+        // Otherwise the head is an ordinary program name that `resolve_program`
+        // may still route through a launcher.
+        launches_through_cmd_shim(program)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = launch;
+        false
+    }
+}
+
 /// `PATH` plus `PATHEXT`, the search the Windows shell performs and
 /// `std::process::Command` does not. A program that already carries a
 /// directory is looked for where it says, not on `PATH`; the flag reports
@@ -930,6 +967,49 @@ mod tests {
         assert!(guard_cmd_shim_reparse("claude.exe", &args).is_ok());
         assert!(guard_cmd_shim_reparse("/opt/homebrew/bin/claude", &args).is_ok());
         assert!(guard_cmd_shim_reparse("sh", &["/tmp/fake-agent.sh".to_string()]).is_ok());
+    }
+
+    /// FINDING 3: an argv that is *already resolved* to the `cmd.exe /c <shim>`
+    /// launcher form (what the interactive path hands `injection_args_for_
+    /// session`) is recognised as reparsing, where re-resolving the literal
+    /// head `cmd.exe` would have found a plain `.exe` and missed it. A direct
+    /// `.exe` argv is not a launcher form and is not flagged.
+    #[cfg(windows)]
+    #[test]
+    fn an_already_resolved_launcher_argv_is_recognised_as_reparsing() {
+        let resolved_cmd = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+            "the prompt".to_string(),
+        ];
+        assert!(launch_reparses_through_shim(&resolved_cmd));
+
+        let resolved_ps = vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            "C:\\tools\\agent.ps1".to_string(),
+            "arg".to_string(),
+        ];
+        assert!(launch_reparses_through_shim(&resolved_ps));
+
+        let direct = vec!["C:\\tools\\claude.exe".to_string(), "--resume".to_string()];
+        assert!(!launch_reparses_through_shim(&direct));
+    }
+
+    /// Off Windows there is no launcher reparse, so the detection is always
+    /// `false` -- including for an argv that structurally looks like one.
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_reparse_detection_is_a_noop_off_windows() {
+        let looks_like_cmd = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "claude.cmd".to_string(),
+        ];
+        assert!(!launch_reparses_through_shim(&looks_like_cmd));
+        assert!(!launch_reparses_through_shim(&[]));
     }
 
     /// The trait default: an agent zirv has verified nothing about receives

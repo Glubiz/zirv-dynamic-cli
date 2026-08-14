@@ -816,13 +816,19 @@ impl CtxConfig {
         if let Some(model) = cfg.chat.model.as_deref()
             && (model.is_empty()
                 || model.len() > 128
+                // A leading `-` would let the value pose as its own flag on the
+                // launch argv (`--model --dangerously-skip-permissions`), so it
+                // is rejected even though `-` is otherwise a legal model-id
+                // character. Anchored here rather than dropped from the charset,
+                // since a hyphen mid-id (`claude-opus-5`) is legitimate.
+                || model.starts_with('-')
                 || !model.chars().all(|c| {
                     c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/' | '@')
                 }))
         {
             return Err(format!(
                 "invalid ctx config: `chat.model` may contain only ASCII letters, digits and \
-                 `-._:/@`, got '{model}'"
+                 `-._:/@` and may not begin with `-`, got '{model}'"
             )
             .into());
         }
@@ -1652,6 +1658,28 @@ mod tests {
             let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
                 .unwrap_or_else(|e| panic!("'{model}' should load: {e}"));
             assert_eq!(cfg.chat.model.as_deref(), Some(model));
+        }
+    }
+
+    /// SECURITY: a leading-dash model value would reach the launch argv as its
+    /// own flag (`--model --dangerously-skip-permissions`), so it is rejected at
+    /// load, while an ordinary hyphenated id (`claude-opus-5`) that only uses a
+    /// hyphen mid-token still loads cleanly.
+    #[test]
+    fn a_leading_dash_chat_model_is_rejected() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", "--dangerously-skip-permissions")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a leading-dash model must fail the load");
+        assert!(err.to_string().contains("chat.model"), "got {err}");
+
+        for good in ["fable", "claude-opus-5"] {
+            let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", good)]);
+            let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+                .unwrap_or_else(|e| panic!("'{good}' should load: {e}"));
+            assert_eq!(cfg.chat.model.as_deref(), Some(good));
         }
     }
 

@@ -45,6 +45,20 @@ impl CodexAdapter {
 
     /// Every command starts here so the program and its leading arguments are
     /// applied uniformly to headless, interactive and distiller invocations.
+    ///
+    /// SECURITY (FINDING 6): unlike `ClaudeAdapter::base`, this does **not**
+    /// route the program through `super::resolve_program`, and codex overrides
+    /// neither `launches_through_cmd_shim` nor `system_prompt_file_flag`. That
+    /// is safe *only* because codex's `ready()` always errors, so no launch
+    /// this adapter builds is ever spawned. When codex is finished and starts
+    /// returning `Ok` from `ready()`, this MUST be updated to mirror claude:
+    /// run the program through `resolve_program` (so an npm-installed `.cmd`
+    /// shim launches at all on Windows), and wire up the cmd.exe-shim detection
+    /// (`launches_through_cmd_shim`) and the forced system-prompt-file delivery
+    /// -- otherwise repo-controlled prompt/argv text would reach a reparsed
+    /// `cmd.exe /c <shim>` command line unguarded. No functional change is made
+    /// here: this is a comment marking the required work, since codex is not a
+    /// completed adapter.
     fn base(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.bin_args);
