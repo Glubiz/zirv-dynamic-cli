@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-13
+last-verified: 2026-08-14
 ---
 
 # Decision Log
@@ -33,9 +33,10 @@ last-verified: 2026-08-13
 
 ### 2026-08-13 — `chat.model` is repo-settable; every other model key stays repo-forbidden
 **Context:** The dashboard's orchestrator pane needed a way to pick a model (`AgentAdapter::model_args`), and every existing model key in `ctx.toml` (`handoff.model`, `optimize.model`) is `REPO_FORBIDDEN` because it drives an automatic, unwatched background spawn — a repo checkout must not be able to spend the operator's tokens silently.
-**Decision:** `[chat] model`/`ZIRV_CTX_CHAT_MODEL` is a new config key that is deliberately **not** added to `REPO_FORBIDDEN`. It only shapes an interactive session the operator deliberately launched (`zirv ctx chat`, dashboard or plain `wrap`), and the chosen model is displayed on screen at launch — the banner, or the dashboard header — rather than spent invisibly in the background the way the forbidden keys are. This repo's own `.zirv/ctx.toml` sets `[chat] model = "fable"` as the worked example of a repo layer actually using this one allowed key.
+**Decision:** `[chat] model`/`ZIRV_CTX_CHAT_MODEL` is a new config key that is deliberately **not** added to `REPO_FORBIDDEN`. It only shapes an interactive session the operator deliberately launched (`zirv ctx chat`, dashboard or plain `wrap`), and the chosen model is disclosed at launch on the `zirv ▸` events channel (`chat::announce_model_choice`, emitted before either launch path), plus the banner and the dashboard header, rather than spent invisibly in the background the way the forbidden keys are. This repo's own `.zirv/ctx.toml` sets `[chat] model = "fable"` as the worked example of a repo layer actually using this one allowed key.
 **Rejected:** Forbidding it by the same blanket rule as `handoff.model`/`optimize.model` — would block a legitimate, repo-scoped, human-visible preference ("this repo's orchestrator should default to model X") for no trust benefit, since the human at the keyboard sees and can override the choice before spending anything.
-**Consequences:** Any future interactive-only config key can cite this same test ("does a human see it before it spends anything?") rather than defaulting to repo-forbidden out of caution; a future *headless* per-run model key would not qualify and belongs back in `REPO_FORBIDDEN`.
+**Amended 2026-08-14:** the disclosure originally rested on the banner alone, and `chrome.banner` is not repo-forbidden — so one repo layer could set the model *and* hide it. The exemption now rests on `chrome.events`, which is repo-forbidden; a repo-settable key whose justification is visibility must be disclosed on a channel the repo cannot also turn off.
+**Consequences:** Any future interactive-only config key can cite this same test ("does a human see it, on a surface the repo cannot silence, before it spends anything?") rather than defaulting to repo-forbidden out of caution; a future *headless* per-run model key would not qualify and belongs back in `REPO_FORBIDDEN`.
 **Spec / link:** `docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md` ("Orchestrator model"), `src/commands/ctx/config.rs`'s `ChatConfig` doc comment; [[Untrusted Configuration]], [[Ctx Subsystem]].
 
 ### 2026-08-13 — A supervisor's registry short id is its stable delivery address

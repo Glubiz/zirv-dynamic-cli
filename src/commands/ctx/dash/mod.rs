@@ -1792,6 +1792,16 @@ pub fn run_dashboard(
     let main = effective_main(full, sidebar_cols, false);
 
     let agent_name = first.agent_name.clone();
+    // The header's own standing disclosure of a configured model
+    // (`harness_label`, built once): `chat.model` is repo-settable on the
+    // strength of the choice being visible, and the dashboard's header is the
+    // surface that stays on screen for the whole session. `chat.rs` announces
+    // it once on the events channel as well -- that is the repo-unsilenceable
+    // half; this is the persistent half.
+    let harness_label = match &cfg.chat.model {
+        Some(model) => format!("{agent_name} ({model})"),
+        None => agent_name.clone(),
+    };
     let session_id = first.session_id.clone();
     let (mut turn_env, turn_env_err) = build_turn_env(cfg, state, repo, &agent_name, &session_id);
     if let Some(e) = turn_env_err {
@@ -2318,9 +2328,9 @@ pub fn run_dashboard(
         );
 
         let harness = if let Some(last) = errors.last() {
-            format!("{agent_name}  \u{26a0} {last}")
+            format!("{harness_label}  \u{26a0} {last}")
         } else {
-            agent_name.clone()
+            harness_label.clone()
         };
         let facts = assemble_header_facts(
             harness,

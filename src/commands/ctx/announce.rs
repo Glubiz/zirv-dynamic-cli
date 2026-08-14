@@ -80,6 +80,21 @@ pub enum Event {
     /// the session saw it end with no explanation at all, indistinguishable
     /// from a bug in `wrap` itself.
     SessionEnded { agent: String, code: i32 },
+    /// An interactive session is launching with a model chosen by
+    /// configuration rather than by the operator's own command line
+    /// (`chat.model`/`ZIRV_CTX_CHAT_MODEL`).
+    ///
+    /// `chat.model` is one of the few keys a **repo** `ctx.toml` may set, and
+    /// the exemption was granted on the strength of the choice being visible
+    /// on screen. It was not: the only disclosure was `chrome::banner`, and
+    /// `chrome.banner` is *not* `REPO_FORBIDDEN`, so a checked-out repo could
+    /// set `[chrome] banner = false` alongside `[chat] model = ...` and pick
+    /// the model with nothing shown anywhere (the `wrap` fallback shows it
+    /// nowhere else at all). `chrome.events` **is** `REPO_FORBIDDEN`, so
+    /// announcing it here is a disclosure a repo cannot silence -- only the
+    /// operator can, with `--quiet`/`ZIRV_CTX_QUIET`, which is exactly the
+    /// trust asymmetry the rest of this codebase already holds.
+    ChatModel { model: String },
     /// A `zirv ctx nudge` wake-up marker was claimed. `from` names the
     /// *sending* session's short id, read out of the marker file itself
     /// (C4): every emitter used to pass its own short id here, so the line
@@ -177,6 +192,7 @@ impl Event {
             Event::SessionEnded { agent, code } => {
                 format!("{agent} session ended (exit code {code})")
             }
+            Event::ChatModel { model } => format!("chat model '{model}' (from config)"),
             Event::Nudge { from, disposition } => match disposition {
                 NudgeDisposition::Relaunching => {
                     format!("nudged by {from}; relaunching with the guidance")
@@ -347,6 +363,20 @@ mod tests {
         };
         assert!(
             event.line().contains("simple run or prompt disabled"),
+            "got {}",
+            event.line()
+        );
+    }
+
+    /// The disclosure a repo cannot silence: `chrome.events` is
+    /// `REPO_FORBIDDEN`, `chrome.banner` is not.
+    #[test]
+    fn the_chat_model_announcement_names_the_model_and_where_it_came_from() {
+        let event = Event::ChatModel {
+            model: "fable".to_string(),
+        };
+        assert!(
+            event.line().contains("chat model 'fable' (from config)"),
             "got {}",
             event.line()
         );

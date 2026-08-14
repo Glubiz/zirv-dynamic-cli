@@ -340,8 +340,19 @@ pub struct ChatConfig {
     /// (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
     /// `handoff.model`/`optimize.model`, this only shapes a session the
     /// operator deliberately launched interactively, and the choice is
-    /// displayed on screen at launch rather than spent silently in the
+    /// disclosed on screen at launch rather than spent silently in the
     /// background.
+    ///
+    /// That disclosure is `chat.rs::announce_model_choice`, on the `zirv
+    /// \u{25b8}` announcement channel, **not** the launch banner. The banner
+    /// alone was not enough to carry the exemption: `chrome.banner` is not
+    /// `REPO_FORBIDDEN`, so the same repo layer that set this key could set
+    /// `[chrome] banner = false` beside it and choose the model with nothing
+    /// shown anywhere (the `wrap` fallback has no other model surface at
+    /// all). `chrome.events` **is** `REPO_FORBIDDEN`, so the announcement is
+    /// one a repo cannot silence -- only the operator can, with
+    /// `--quiet`/`ZIRV_CTX_QUIET`. The banner and the dashboard header still
+    /// show it too, as the standing on-screen copy.
     pub model: Option<String>,
 }
 
@@ -693,9 +704,12 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
     // every model key above, it only shapes an interactive session the
-    // operator deliberately launched, and the choice is displayed on screen
-    // rather than spent silently in the background. A repo checkout may set
-    // it -- do not "fix" this by adding it here.
+    // operator deliberately launched, and the choice is disclosed on the
+    // `zirv \u{25b8}` announcement channel (`chat::announce_model_choice`) --
+    // which `chrome.events`, right above, keeps repo-unsilenceable -- rather
+    // than spent silently in the background. A repo checkout may set it -- do
+    // not "fix" this by adding it here, and do not remove `chrome.events`
+    // from this list, which is what the exemption rests on.
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {

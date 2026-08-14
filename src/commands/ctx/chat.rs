@@ -285,6 +285,11 @@ pub fn run_with<W: Write, E: Write>(
 
     let env = quiet_env(env, args.quiet);
 
+    // Emitted here -- after `quiet_env`, before either launch path -- so the
+    // dashboard branch and the `wrap` fallback disclose identically, and
+    // independently of whether a banner was printed at all.
+    announce_model_choice(stderr, &cfg, args.quiet);
+
     if chrome::dash_eligible(
         stdout_is_tty,
         stdin_is_tty,
@@ -340,6 +345,42 @@ pub fn run_with<W: Write, E: Write>(
         Some(session),
         launch.verb,
     )
+}
+
+/// Discloses a configured model on the `zirv \u{25b8}` announcement channel, once,
+/// before the launch path is chosen. A no-op when no model is configured.
+///
+/// `chat.model` is one of the few keys a **repo** `ctx.toml` may set, and that
+/// exemption was granted on the strength of the choice being visible on
+/// screen. It was not: the only disclosure was `chrome::banner`, and
+/// `chrome.banner` is **not** `REPO_FORBIDDEN` -- so a checked-out repo could
+/// pair `[chrome] banner = false` with `[chat] model = "..."` and select the
+/// model for every session with nothing shown anywhere at all (the `wrap`
+/// fallback carries no other model surface; the dashboard header carries one,
+/// but only the dashboard has one).
+///
+/// `chrome.events` **is** `REPO_FORBIDDEN`, so this line survives any repo
+/// configuration. The operator's own `--quiet`/`ZIRV_CTX_QUIET` still silences
+/// it -- operator over repo, the same asymmetry every other trust decision in
+/// this codebase makes.
+///
+/// `quiet` is passed separately because `cfg` was loaded before `--quiet` was
+/// folded into the environment (`quiet_env`), so `cfg.chrome.events` alone
+/// knows about `ZIRV_CTX_QUIET` and `[chrome] events` but not about the flag.
+fn announce_model_choice<E: Write>(stderr: &mut E, cfg: &CtxConfig, quiet: bool) {
+    let Some(model) = &cfg.chat.model else {
+        return;
+    };
+    super::announce::Announcer::new(
+        cfg.chrome.events && !quiet,
+        console::colors_enabled_stderr(),
+    )
+    .emit_to(
+        stderr,
+        &super::announce::Event::ChatModel {
+            model: model.clone(),
+        },
+    );
 }
 
 /// The dashboard's orchestrator pane, composed prompt and all.
@@ -773,6 +814,160 @@ mod tests {
             Some(session),
             "the pinned id is the pane's own registry session id: {:?}",
             pane.argv
+        );
+    }
+
+    // The `chat.model` disclosure. `chat.model` is repo-settable because the
+    // choice is supposed to be visible; `chrome.banner` is not
+    // `REPO_FORBIDDEN`, so the banner alone could be turned off by the same
+    // repo that chose the model. `chrome.events` is.
+
+    // `cfg_with_model` is the shared helper defined further down with the
+    // Task 6 model-splice tests.
+
+    #[test]
+    fn a_configured_chat_model_is_disclosed_on_the_events_channel() {
+        let mut err = Vec::new();
+        announce_model_choice(&mut err, &cfg_with_model(Some("fable")), false);
+        let text = String::from_utf8(err).expect("utf8");
+        assert!(
+            text.contains("chat model 'fable' (from config)"),
+            "got {text:?}"
+        );
+    }
+
+    #[test]
+    fn no_configured_model_discloses_nothing() {
+        let mut err = Vec::new();
+        announce_model_choice(&mut err, &cfg_with_model(None), false);
+        assert!(err.is_empty(), "got {err:?}");
+    }
+
+    /// The operator may silence it; a repo may not. `--quiet` reaches this as
+    /// the flag (config was loaded before it was folded into the environment),
+    /// `ZIRV_CTX_QUIET`/`[chrome] events = false` reach it as
+    /// `cfg.chrome.events` -- both are operator-controlled surfaces.
+    #[test]
+    fn the_operator_can_silence_the_model_disclosure_but_a_repo_cannot() {
+        let mut err = Vec::new();
+        announce_model_choice(&mut err, &cfg_with_model(Some("fable")), true);
+        assert!(err.is_empty(), "--quiet silences it: {err:?}");
+
+        let mut quiet_cfg = cfg_with_model(Some("fable"));
+        quiet_cfg.chrome.events = false;
+        let mut err = Vec::new();
+        announce_model_choice(&mut err, &quiet_cfg, false);
+        assert!(
+            err.is_empty(),
+            "ZIRV_CTX_QUIET / [chrome] events = false silences it too: {err:?}"
+        );
+
+        // And the repo's own lever does not: `chrome.banner` is not
+        // `REPO_FORBIDDEN`, so a repo can turn the banner off -- the events
+        // line is emitted regardless of it.
+        let mut bannerless = cfg_with_model(Some("fable"));
+        bannerless.chrome.banner = false;
+        let mut err = Vec::new();
+        announce_model_choice(&mut err, &bannerless, false);
+        assert!(
+            String::from_utf8(err).expect("utf8").contains("fable"),
+            "a repo-disabled banner must not take the disclosure with it"
+        );
+    }
+
+    /// The exact scenario the finding describes, end to end through the real
+    /// config loader: a repo turns its banner off and picks a model. It may do
+    /// both -- neither key is repo-forbidden -- and the events line is what
+    /// discloses the choice anyway. A repo that tries to silence *that* channel
+    /// does not get a quiet session, it gets a refusal.
+    #[test]
+    fn a_repo_can_hide_the_banner_and_pick_a_model_but_cannot_hide_the_disclosure() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv");
+        std::fs::create_dir_all(&dir).expect("mkdir .zirv");
+        std::fs::write(
+            dir.join("ctx.toml"),
+            "[chrome]\nbanner = false\n\n[chat]\nmodel = \"sneaky\"\n",
+        )
+        .expect("write repo ctx.toml");
+        let env: std::collections::HashMap<String, String> = Default::default();
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+
+        assert!(!cfg.chrome.banner, "a repo may turn the banner off");
+        assert_eq!(
+            cfg.chat.model.as_deref(),
+            Some("sneaky"),
+            "and it may still choose the model"
+        );
+        assert!(
+            cfg.chrome.events,
+            "but the announcement channel is still on"
+        );
+
+        let mut err = Vec::new();
+        announce_model_choice(&mut err, &cfg, false);
+        assert!(
+            String::from_utf8(err).expect("utf8").contains("sneaky"),
+            "so the choice is disclosed anyway"
+        );
+
+        // And the channel itself is `REPO_FORBIDDEN`: a repo reaching for it
+        // fails the load outright rather than quietly winning.
+        std::fs::write(
+            dir.join("ctx.toml"),
+            "[chrome]\nevents = false\n\n[chat]\nmodel = \"sneaky\"\n",
+        )
+        .expect("write repo ctx.toml");
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a repo may not set chrome.events");
+        assert!(
+            err.to_string().contains("chrome.events"),
+            "the refusal names the key: {err}"
+        );
+    }
+
+    /// End to end through `run_with`'s own stderr writer, on the `wrap`
+    /// fallback path (the only one reachable under `cargo test`'s piped
+    /// stdio). The dashboard branch cannot be driven from a test, which is
+    /// precisely why the emit sits *before* the branch: one call site, both
+    /// paths.
+    #[test]
+    fn run_with_discloses_the_model_before_it_picks_a_launch_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                "Z:/nonexistent/agent-bin".to_string(),
+            ),
+            ("ZIRV_CTX_CHAT_MODEL".to_string(), "fable".to_string()),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_tmp.path().display().to_string(),
+            ),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        // The launch itself fails (the configured binary does not exist),
+        // which is fine and is what the neighbouring tests already pin: the
+        // disclosure happens before the launch either way.
+        let _ = run_with(
+            &chat_args(false),
+            &mut out,
+            &mut err_out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        );
+
+        let text = String::from_utf8(err_out).expect("utf8");
+        assert!(
+            text.contains("chat model 'fable' (from config)"),
+            "the disclosure must reach stderr on the wrap fallback path: {text:?}"
         );
     }
 
