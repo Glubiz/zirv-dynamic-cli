@@ -622,6 +622,15 @@ impl AgentAdapter for ClaudeAdapter {
         Some(vec!["--resume".to_string(), session_id.to_string()])
     }
 
+    /// The same `--session-id <uuid>` flag `headless_cmd` already pins every
+    /// headless run with (verified against the real CLI), offered here so an
+    /// *interactive* dashboard pane can be pinned too. That is what makes the
+    /// roster's stored uuid the claude conversation id, and therefore what
+    /// makes `resume_args` above resolve to a real conversation after a quit.
+    fn session_pin_args(&self, session: &str) -> Vec<String> {
+        vec!["--session-id".to_string(), session.to_string()]
+    }
+
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup {
         TurnSignalSetup {
             env: vec![

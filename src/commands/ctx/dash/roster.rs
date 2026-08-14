@@ -79,16 +79,28 @@ pub fn write_roster(state: &StateDir, repo_slug: &str, roster: &Roster) -> CtxRe
     Ok(())
 }
 
-/// Reads and consumes this repo's roster, if one is there: renamed to its
-/// `.consumed` path immediately on read (before the age check, and even if
-/// the JSON fails to parse) so it is never offered again -- a *stale* roster
-/// still must not linger to be picked up by some later, larger `max_age`.
-/// `None` covers every reason there is nothing to restore: absent, unreadable,
-/// malformed, or older than `max_age` as of `now`.
+/// Reads and consumes this repo's roster, if one is there. The rename to the
+/// `.consumed` path is the **claim**, and it happens first, before the read
+/// and before the age check: exactly the idiom `sessions::claim_nudge_marker`
+/// and `mail::consume` already use, where the single atomic filesystem
+/// operation is what decides who got it. A rename that fails means somebody
+/// else claimed it (or it was never there), and the answer is `None`.
+///
+/// N3: reading first and renaming afterwards -- with the rename's own error
+/// discarded -- made consume-at-most-once best-effort in both directions: two
+/// dashboards launching together both read the same roster and both restored
+/// it, and a rename that failed left the roster to be offered again on every
+/// later launch.
+///
+/// `None` covers every reason there is nothing to restore: absent, already
+/// claimed, unreadable, malformed, or older than `max_age` as of `now`. A
+/// stale roster is still consumed -- it must not linger to be picked up by
+/// some later, larger `max_age`.
 pub fn take_roster(state: &StateDir, repo_slug: &str, now: u64, max_age: u64) -> Option<Roster> {
     let path = roster_path(state, repo_slug);
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::rename(&path, consumed_path(state, repo_slug));
+    let consumed = consumed_path(state, repo_slug);
+    std::fs::rename(&path, &consumed).ok()?;
+    let contents = std::fs::read_to_string(&consumed).ok()?;
     let roster: Roster = serde_json::from_str(&contents).ok()?;
     if now.saturating_sub(roster.written) > max_age {
         return None;
@@ -214,6 +226,41 @@ mod tests {
         assert!(take_roster(&state, "-repo", 1_000, 1_000).is_none());
     }
 
+    /// N3: the rename *is* the claim, so it happens before the read -- the
+    /// roster that comes back was parsed out of the already-claimed path, and
+    /// nothing is left at the offering path for a concurrent launch to read.
+    #[test]
+    fn take_roster_claims_the_file_before_reading_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        write_roster(&state, "-repo", &sample_roster()).expect("write_roster");
+
+        let got = take_roster(&state, "-repo", 1_500, 1_000).expect("roster present");
+        assert_eq!(got, sample_roster());
+        assert!(
+            !roster_path(&state, "-repo").exists(),
+            "the offering path is gone the moment it is claimed"
+        );
+        let claimed: Roster =
+            serde_json::from_str(&std::fs::read_to_string(consumed_path(&state, "-repo")).unwrap())
+                .expect("the claimed copy still holds the roster that was read");
+        assert_eq!(claimed, sample_roster());
+    }
+
+    /// N3: a claim that cannot be made -- nothing there to rename -- is `None`,
+    /// never a read of a file this call does not own.
+    #[test]
+    fn an_unclaimable_roster_is_never_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        write_roster(&state, "-repo", &sample_roster()).expect("write_roster");
+
+        assert!(take_roster(&state, "-repo", 1_500, 1_000).is_some());
+        // The second caller loses the race: the rename fails, and it reads
+        // nothing at all rather than the copy the winner is already restoring.
+        assert!(take_roster(&state, "-repo", 1_500, 1_000).is_none());
+    }
+
     #[test]
     fn restore_argv_uses_claudes_verified_resume_flag() {
         let adapter = ClaudeAdapter::new(None);
@@ -232,6 +279,29 @@ mod tests {
                 "--resume".to_string(),
                 "11111111-2222-4333-8444-555555555555".to_string(),
             ]
+        );
+    }
+
+    /// R1: a *fresh* dashboard pane pins its conversation with
+    /// `session_pin_args` so this restore can find it later -- but a restored
+    /// pane must not carry both. `--resume` picks the conversation up;
+    /// `--session-id` asks for a new one under that id, and the two together
+    /// are a contradiction the harness would refuse.
+    #[test]
+    fn a_restored_pane_resumes_and_never_re_pins_the_session_id() {
+        let adapter = ClaudeAdapter::new(None);
+        let pane = RosterPane {
+            agent: "claude".to_string(),
+            session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            role: ROLE_WORKER.to_string(),
+            short: "aaaa1111".to_string(),
+            title: "wrk claude".to_string(),
+        };
+        let argv = restore_argv(&adapter, &pane);
+        assert!(argv.iter().any(|a| a == "--resume"), "got {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--session-id"),
+            "a resumed conversation is never re-pinned: {argv:?}"
         );
     }
 

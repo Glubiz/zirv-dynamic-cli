@@ -691,7 +691,11 @@ pub fn run_recall_with<W: Write>(
         entries.retain(|entry| &entry.key == key);
     }
     if let Some(days) = args.stale {
-        let threshold = now_secs().saturating_sub(days * 86_400);
+        // Saturating, not plain multiplication: `--stale` is an operator-typed
+        // `u64`, and anything past `u64::MAX / 86_400` overflowed -- a panic in
+        // a debug build, a wrapped (tiny) threshold in a release one, which
+        // silently reported every entry as fresh.
+        let threshold = now_secs().saturating_sub(days.saturating_mul(86_400));
         entries.retain(|entry| entry.verified < threshold);
     }
 
@@ -1074,6 +1078,41 @@ This should not appear in the body.\n";
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("\"key\":\"stale\""), "got {text}");
         assert!(!text.contains("\"key\":\"fresh\""), "got {text}");
+    }
+
+    /// R5: `--stale` is an operator-typed `u64` and the day-to-second
+    /// conversion used to be a plain multiplication -- a panic in a debug
+    /// build, a wrapped (tiny) threshold in a release one, where "everything
+    /// is stale" quietly became "nothing is".
+    #[test]
+    fn an_absurd_staleness_threshold_saturates_rather_than_overflowing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let slug = repo_slug(repo.path());
+
+        let now = now_secs();
+        let mut ancient = sample("ancient", now.saturating_sub(900 * 86_400));
+        ancient.verified = now.saturating_sub(900 * 86_400);
+        remember(&state, &slug, &ancient, &cfg).expect("remember");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        for stale in [u64::MAX / 2, u64::MAX] {
+            let args = RecallArgs {
+                key: None,
+                stale: Some(stale),
+                json: true,
+            };
+            let mut out = Vec::new();
+            run_recall_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned())
+                .expect("recall must not panic on an absurd --stale");
+            assert!(
+                String::from_utf8(out).expect("utf8").is_empty(),
+                "the threshold saturates to zero, so nothing is older than it"
+            );
+        }
     }
 
     #[test]

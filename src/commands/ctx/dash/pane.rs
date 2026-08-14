@@ -142,6 +142,71 @@ fn visible_injection_line(label: &str, body: &str) -> String {
     format!("[zirv \u{25b8} {label}] {body}")
 }
 
+/// The suffix `body_for_injection` appends when it had to cut a body short,
+/// so the agent can tell a message that ended from one that was clipped.
+const TRUNCATION_MARKER: &str = " \u{2026}[truncated]";
+
+/// Pure: `text` with every C0 control character (`\r`, `\n`, `ESC`, and every
+/// other byte below `0x20`) and `DEL` replaced by a single space, runs
+/// collapsed to one space.
+///
+/// R3: this is the only thing standing between an untrusted mail body and the
+/// child's own terminal. An interior `\r` submits the message mid-way and
+/// leaves its tail typed at a fresh prompt as if the operator had written it;
+/// an `ESC` reaches the child TUI as an escape sequence rather than as text.
+/// A control character in text zirv is *relaying* is never meaningful, so it
+/// is replaced rather than escaped: this is quoted input, not a wire format.
+fn scrub_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for ch in text.chars() {
+        if ch.is_control() {
+            if !in_run {
+                out.push(' ');
+                in_run = true;
+            }
+        } else {
+            out.push(ch);
+            in_run = false;
+        }
+    }
+    out
+}
+
+/// Pure: an untrusted body made safe to type into a child's pty -- scrubbed of
+/// every control character (`scrub_controls`) and capped at `cap` bytes on a
+/// char boundary, with `TRUNCATION_MARKER` appended when anything was cut.
+///
+/// R3: the pane-injection seam applied neither the delivered-mail cap
+/// (`cfg.mail.max_delivered_bytes`) every other mail seam applies nor any
+/// scrub at all, so a stored body -- itself already carrying `mail::store`'s
+/// own literal `"\n[truncated]"` marker once it was long enough -- went into
+/// the pty verbatim.
+pub(crate) fn body_for_injection(body: &str, cap: usize) -> String {
+    let scrubbed = scrub_controls(body);
+    if scrubbed.len() <= cap {
+        return scrubbed;
+    }
+    let mut kept = crate::utils::truncate_bytes(scrubbed, Some(cap));
+    kept.push_str(TRUNCATION_MARKER);
+    kept
+}
+
+/// Pure: the exact bytes one visible injection writes into the child's pty --
+/// the labelled line, then exactly one `\r` to submit it.
+///
+/// Both the label and the body are scrubbed here as a floor, whatever the
+/// caller did: the label carries a sender-supplied agent name and the body is
+/// whatever another session wrote, so neither may be trusted to be
+/// control-free. The single trailing `\r` is then the *only* control byte in
+/// the whole write, which is what makes an injection exactly one submission.
+fn injection_bytes(label: &str, body: &str) -> Vec<u8> {
+    let line = visible_injection_line(&scrub_controls(label), &scrub_controls(body));
+    let mut bytes = line.into_bytes();
+    bytes.push(b'\r');
+    bytes
+}
+
 /// A supervised ConPTY/pty child rendered through its own `vt100` screen.
 pub struct Pane {
     title: String,
@@ -425,9 +490,11 @@ impl Pane {
     /// acted on. A failed write leaves the flag alone: nothing was typed, so
     /// nothing is pending.
     pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
-        let line = visible_injection_line(label, body);
-        self.write_input(line.as_bytes())?;
-        self.write_input(b"\r")?;
+        // One write, not two (line then `\r`): a single `write_all` cannot
+        // leave a half-typed line behind if the second write fails. The
+        // control-character scrub is applied inside `injection_bytes` for
+        // every caller, mail sweep and operator nudge alike (R3).
+        self.write_input(&injection_bytes(label, body))?;
         self.injected_awaiting_turn = true;
         Ok(())
     }
@@ -534,6 +601,78 @@ pub(crate) mod tests {
             !line.contains('\r') && !line.contains('\n'),
             "no control characters may frame the line: {line:?}"
         );
+    }
+
+    /// R3: every control character in an untrusted body becomes one space,
+    /// and a run of them becomes one space, not several.
+    #[test]
+    fn body_for_injection_scrubs_every_control_character() {
+        assert_eq!(
+            body_for_injection("first\r\nsecond", 4096),
+            "first second",
+            "an interior CRLF must not survive to submit the message halfway"
+        );
+        assert_eq!(body_for_injection("a\rb", 4096), "a b");
+        assert_eq!(
+            body_for_injection("a\u{1b}[31mred\u{7f}", 4096),
+            "a [31mred ",
+            "ESC and DEL are text to be quoted, never bytes for the child TUI"
+        );
+        assert_eq!(
+            body_for_injection("a\r\n\r\n\tb", 4096),
+            "a b",
+            "a run of control characters collapses to a single space"
+        );
+        assert_eq!(
+            body_for_injection("plain text", 4096),
+            "plain text",
+            "an ordinary body is passed through untouched"
+        );
+    }
+
+    /// R3: the delivered-mail cap (`cfg.mail.max_delivered_bytes`) applies at
+    /// this seam too, and cutting never splits a char.
+    #[test]
+    fn body_for_injection_truncates_at_the_cap_on_a_char_boundary() {
+        let long = "x".repeat(100);
+        let got = body_for_injection(&long, 10);
+        assert_eq!(got, format!("{}{TRUNCATION_MARKER}", "x".repeat(10)));
+
+        // 'é' is two bytes: a cap landing inside it drops the whole char.
+        let got = body_for_injection("aé", 2);
+        assert_eq!(got, format!("a{TRUNCATION_MARKER}"));
+
+        assert_eq!(
+            body_for_injection("short", 5),
+            "short",
+            "a body exactly at the cap is not marked truncated"
+        );
+    }
+
+    /// R3, at the byte level: whatever control characters an untrusted body
+    /// carries, the write that lands in the pty contains exactly one -- the
+    /// trailing `\r` that submits it. Anything else would be a second
+    /// submission (an interior `\r`) or an escape sequence typed at the child.
+    #[test]
+    fn an_injection_writes_exactly_one_control_byte() {
+        let bytes = injection_bytes(
+            "mail from claude\r/aaaa1111",
+            "line one\r\nline two\u{1b}[2Jline three\u{7f}",
+        );
+        let controls: Vec<usize> = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b < 0x20 || **b == 0x7f)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            controls.len(),
+            1,
+            "exactly one control byte may reach the pty: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(controls[0], bytes.len() - 1, "and it is the last byte");
+        assert_eq!(bytes[bytes.len() - 1], b'\r', "and it is the submission");
     }
 
     /// A trivial, immediately-exiting command: never a real agent (the

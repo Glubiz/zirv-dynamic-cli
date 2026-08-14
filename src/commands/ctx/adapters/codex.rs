@@ -206,6 +206,12 @@ impl AgentAdapter for CodexAdapter {
     // real CLI, unlike `model_args` above. The trait default (`None`) is
     // correct here -- `dash::roster::restore_argv` falls back to a plain
     // prompt-carrying relaunch for this adapter rather than a guessed flag.
+    //
+    // No `session_pin_args` override either, for the same reason and one
+    // stronger: `headless_cmd` above already records the verified fact that
+    // codex has no `--session-id` flag at all and always mints its own id, so
+    // there is nothing to pin an interactive dashboard pane with. The trait
+    // default (empty) is what "no verified mechanism" has to ship as.
 }
 
 #[cfg(test)]

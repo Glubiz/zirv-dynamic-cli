@@ -404,6 +404,13 @@ pub(crate) fn dash_orchestrator_pane(
         adapter.capabilities().system_prompt,
     );
     argv.extend(prompt_args);
+    // R1: a dashboard pane -- and only a dashboard pane -- pins the harness's
+    // own conversation to zirv's session uuid, so the quit roster's stored id
+    // is the id `AgentAdapter::resume_args` is later asked to resume. The
+    // `wrap` fallback below deliberately does not: its relaunches expect the
+    // harness to mint a fresh conversation each time. Empty for any adapter
+    // with no verified pin flag (codex).
+    argv.extend(adapter.session_pin_args(session));
 
     PaneSpec {
         agent_name: launch.agent_name,
@@ -716,7 +723,7 @@ mod tests {
 
         let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
         let launch = build_launch(&adapter, None, &[]);
-        let plain_argv = launch.argv.clone();
+        let mut expected = launch.argv.clone();
         let pane = dash_orchestrator_pane(
             &adapter,
             launch,
@@ -726,9 +733,61 @@ mod tests {
             "11111111-2222-4333-8444-555555555555",
             true,
         );
+        // R1: the session pin is launch plumbing, not injected instruction --
+        // `--simple` promises the agent no zirv-authored text, and a pane that
+        // cannot be resumed after a quit is not what it is asking for. Every
+        // other argument is still exactly the adapter's own.
+        expected.extend(adapter.session_pin_args("11111111-2222-4333-8444-555555555555"));
         assert_eq!(
-            pane.argv, plain_argv,
-            "--simple leaves the adapter's own argv untouched"
+            pane.argv, expected,
+            "--simple leaves the adapter's own argv untouched apart from the session pin"
+        );
+    }
+
+    /// R1: the roster stores zirv's own uuid, so a dashboard pane has to make
+    /// the harness adopt it as the conversation id -- otherwise the next
+    /// launch's restore runs `claude --resume <uuid zirv invented>` and the
+    /// restored pane dies with "no conversation found" before it draws a
+    /// frame.
+    #[test]
+    fn the_dash_orchestrator_pane_pins_the_harness_session_to_zirvs_own_uuid() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let session = "11111111-2222-4333-8444-555555555555";
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let launch = build_launch(&adapter, None, &[]);
+        let pane =
+            dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false);
+
+        let pin = pane
+            .argv
+            .iter()
+            .position(|a| a == "--session-id")
+            .unwrap_or_else(|| panic!("no --session-id in {:?}", pane.argv));
+        assert_eq!(
+            pane.argv.get(pin + 1).map(String::as_str),
+            Some(session),
+            "the pinned id is the pane's own registry session id: {:?}",
+            pane.argv
+        );
+    }
+
+    /// R1, the other half: `wrap` is untouched. Its relaunch path expects the
+    /// harness to mint a fresh conversation on every restart, so the pin lives
+    /// at the dashboard-pane seam and never inside `interactive_cmd`/
+    /// `build_launch`.
+    #[test]
+    fn the_wrap_fallback_launch_is_never_session_pinned() {
+        let adapter = ClaudeAdapter::new(None);
+        let launch = build_launch(&adapter, Some("do the thing"), &["--model".to_string()]);
+        assert!(
+            !launch.argv.iter().any(|a| a == "--session-id"),
+            "the plain chat/wrap launch carries no pin: {:?}",
+            launch.argv
         );
     }
 

@@ -151,6 +151,27 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = session_id;
         None
     }
+
+    /// Argv tokens that make this agent adopt zirv's own `session` uuid as the
+    /// id of the conversation it is about to start, so a later
+    /// [`resume_args`](Self::resume_args) against that same uuid finds
+    /// something. Empty -- the default -- means the agent mints its own
+    /// conversation id and zirv's uuid is only ever a zirv-side handle.
+    ///
+    /// Appended **only** to a dashboard pane's launch (`chat.rs::
+    /// dash_orchestrator_pane` and `dash::fulfill_spawn_request`, both of
+    /// which own a freshly minted uuid), never inside `interactive_cmd`
+    /// itself: `wrap`'s relaunch path deliberately lets the harness mint a
+    /// fresh conversation on every restart, and a restored pane already
+    /// carries `resume_args`, which would conflict with a pin.
+    ///
+    /// Without this, the dashboard's restore roster stored a uuid the agent
+    /// had never heard of: `claude --resume <zirv-uuid>` answered "no
+    /// conversation found" and the restored pane died immediately.
+    fn session_pin_args(&self, session: &str) -> Vec<String> {
+        let _ = session;
+        Vec::new()
+    }
 }
 
 /// The program invocation at the head of an argv: the binary plus the leading
