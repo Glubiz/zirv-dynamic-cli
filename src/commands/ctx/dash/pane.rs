@@ -43,14 +43,10 @@ use super::super::wrap;
 const QUIT_GRACE: Duration = Duration::from_secs(5);
 
 /// A pane's display state, driven by turn signals and the child's own exit.
-/// `WaitingInput` is reserved for a future, more specific signal (a prompt
-/// pattern detected in the screen, say) than anything Task 3 derives; no
-/// producer sets it yet, and `state_from` never returns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneState {
     Working,
     Idle,
-    WaitingInput,
     Ended(i32),
 }
 
@@ -330,6 +326,43 @@ fn injection_bytes(label: &str, body: &str) -> Vec<u8> {
     bytes
 }
 
+/// The most bytes one [`Pane::drain`] feeds the vt100 parser before it yields
+/// back to the event loop (M10). 256 KiB is many screens' worth of output --
+/// far more than a redraw ever shows -- so a normal burst still drains in one
+/// call, while a firehose (`cat big.log`) is bounded to this per tick.
+const DRAIN_BUDGET_BYTES: usize = 256 * 1024;
+
+/// Pure-ish: pumps queued messages from `rx` into `parser` until either the
+/// channel is empty or `budget` bytes have been processed. Returns
+/// `(any, more)` -- whether anything was processed, and whether the budget cut
+/// the drain short (bytes may still be queued). Separated from [`Pane::drain`]
+/// so the budget behaviour is testable against a plain `mpsc` channel without
+/// a real pty child.
+fn drain_into(
+    rx: &mpsc::Receiver<Vec<u8>>,
+    parser: &mut vt100::Parser,
+    budget: usize,
+) -> (bool, bool) {
+    let mut processed = 0usize;
+    let mut any = false;
+    loop {
+        if processed >= budget {
+            // Stopped on the budget, not on an empty channel: treat as
+            // "more may remain" so the loop returns here next tick.
+            return (any, true);
+        }
+        match rx.try_recv() {
+            Ok(bytes) => {
+                processed += bytes.len();
+                parser.process(&bytes);
+                any = true;
+            }
+            // Empty or Disconnected: nothing more to take right now.
+            Err(_) => return (any, false),
+        }
+    }
+}
+
 /// A supervised ConPTY/pty child rendered through its own `vt100` screen.
 pub struct Pane {
     title: String,
@@ -472,7 +505,15 @@ impl Pane {
             wrap::publish_socket_path(state, &session_id, server.path());
         }
 
-        let record = Record::new(&session_id, &agent_name, repo, verb);
+        let mut record = Record::new(&session_id, &agent_name, repo, verb);
+        // `Record::new` stamps `std::process::id()` -- the dashboard's own pid,
+        // identical for every pane, so liveness could not tell one pane's child
+        // from another's. Stamp the child's real pid instead. `process_id`
+        // returns `None` on a platform that cannot report it; there we leave
+        // the dashboard's pid rather than a bogus one.
+        if let Some(child_pid) = child.process_id() {
+            record.pid = child_pid;
+        }
         let record = if server.is_some() {
             record
         } else {
@@ -502,18 +543,21 @@ impl Pane {
         })
     }
 
-    /// Pumps every byte currently queued on the reader channel into the
-    /// `vt100` parser. Returns whether any new bytes arrived, so a caller
-    /// can decide whether a redraw is worth doing. Also polls the child's
-    /// exit status (see `poll_exit`): a pane's own output is the natural
-    /// place to notice it has stopped producing any.
+    /// Pumps queued reader-channel bytes into the `vt100` parser, up to
+    /// [`DRAIN_BUDGET_BYTES`] per call, and returns whether the budget cut the
+    /// drain short with bytes still queued -- so the event loop knows to come
+    /// back to this pane next tick rather than blocking on it now. Also polls
+    /// the child's exit status (see `poll_exit`): a pane's own output is the
+    /// natural place to notice it has stopped producing any.
+    ///
+    /// M10: the drain used to loop until the channel was empty. A `cat` of a
+    /// large file fills the unbounded channel faster than `vt100` parses it, so
+    /// the drain never returned and the whole event loop -- input included, so
+    /// `Ctrl+A q` too -- was unreachable for the duration. The budget bounds
+    /// one call's work; the remainder waits for the next tick.
     pub fn drain(&mut self) -> bool {
         self.poll_exit();
-        let mut any = false;
-        while let Ok(bytes) = self.rx.try_recv() {
-            self.parser.process(&bytes);
-            any = true;
-        }
+        let (any, more) = drain_into(&self.rx, &mut self.parser, DRAIN_BUDGET_BYTES);
         if any {
             // O1: recorded, not acted on. Whether these bytes mean "a new turn
             // started" or "the harness repainted the one that just ended" is
@@ -521,7 +565,7 @@ impl Pane {
             // make it.
             self.last_output_at = Some(Instant::now());
         }
-        any
+        more
     }
 
     /// The current screen, for `dash::ui`'s renderers.
@@ -693,6 +737,51 @@ impl Pane {
                 .map_err(|_| "dashboard pane: writer lock poisoned")?;
             let sink: &mut dyn Write = &mut **writer;
             wrap::quit_child(sink, &mut self.child, quit_sequence, QUIT_GRACE)?;
+        }
+        wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
+        self.guard.release();
+        Ok(())
+    }
+
+    /// M9: the first half of a *batched* shutdown -- sends this pane's harness
+    /// quit sequence and returns immediately, without waiting out any grace.
+    /// A caller shutting down many panes calls this on every pane first, then
+    /// waits on all of them together against one shared budget
+    /// ([`Pane::try_exited`]/[`Pane::finish_shutdown`]), rather than paying a
+    /// full grace period per pane serially. Best-effort and idempotent: a
+    /// no-op once the pane is already `done` or its child has exited.
+    pub fn request_quit(&mut self, quit_sequence: &str) {
+        if self.done {
+            return;
+        }
+        self.poll_exit();
+        if self.exit_code.is_some() {
+            return;
+        }
+        let _ = self.write_input(quit_sequence.as_bytes());
+    }
+
+    /// Whether this pane's child has exited (polls once). The batched-shutdown
+    /// wait loop polls every pane through here within its shared grace window.
+    pub fn try_exited(&mut self) -> bool {
+        self.poll_exit();
+        self.exit_code.is_some()
+    }
+
+    /// The escalation half of a batched shutdown, run once the shared grace
+    /// window has elapsed: kills the child if it has not exited on its own,
+    /// then releases this pane's registry record and unpublishes its socket.
+    /// Idempotent via `done`, exactly like [`Pane::shutdown`] -- calling both
+    /// is safe, the second is a no-op.
+    pub fn finish_shutdown(&mut self) -> CtxResult<()> {
+        if self.done {
+            return Ok(());
+        }
+        self.done = true;
+        self.poll_exit();
+        if self.exit_code.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
         self.guard.release();
@@ -1256,5 +1345,76 @@ pub(crate) mod tests {
         pane.shutdown("")
             .expect("second shutdown is a no-op, not an error");
         assert!(!record_path.exists());
+    }
+
+    /// M10: a drain stops once it has processed its byte budget and reports
+    /// that more remains, so the event loop is never starved by a firehose.
+    #[test]
+    fn drain_into_stops_at_the_budget_and_reports_more_remaining() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        // Five 4-byte messages = 20 bytes; a 10-byte budget stops partway.
+        for _ in 0..5 {
+            tx.send(b"abcd".to_vec()).expect("send");
+        }
+        let mut parser = vt100::Parser::new(4, 40, 0);
+        let (any, more) = drain_into(&rx, &mut parser, 10);
+        assert!(any, "some bytes were processed");
+        assert!(
+            more,
+            "the budget cut the drain short with bytes still queued"
+        );
+        assert!(rx.try_recv().is_ok(), "messages remain on the channel");
+    }
+
+    /// A channel that empties under budget reports nothing remaining; a drained
+    /// (and disconnected) channel reports neither work done nor more remaining.
+    #[test]
+    fn drain_into_reports_no_more_when_the_channel_empties() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"hi".to_vec()).expect("send");
+        let mut parser = vt100::Parser::new(4, 40, 0);
+        let (any, more) = drain_into(&rx, &mut parser, 1024);
+        assert!(any);
+        assert!(
+            !more,
+            "an emptied channel under budget has nothing remaining"
+        );
+
+        drop(tx);
+        let (any2, more2) = drain_into(&rx, &mut parser, 1024);
+        assert!(!any2 && !more2, "a drained, closed channel is quiet");
+    }
+
+    /// M9: the batched-shutdown primitives -- ask to quit without waiting, then
+    /// escalate and release the record -- take a live pane down and free its
+    /// registry entry, idempotently.
+    #[test]
+    fn request_quit_then_finish_shutdown_releases_the_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut spec = test_spec("66666666-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let short = pane.short().to_string();
+        let record_path = state.sessions().join(format!("{short}.json"));
+        assert!(
+            record_path.exists(),
+            "the record exists while the pane runs"
+        );
+
+        // No real quit sequence for a sleep/ping child, so the escalation half
+        // (kill) is what ends it; either way the record must be released.
+        pane.request_quit("");
+        pane.finish_shutdown().expect("finish_shutdown");
+        assert!(!record_path.exists(), "the record is released");
+
+        // Idempotent, and interchangeable with `shutdown`.
+        pane.finish_shutdown()
+            .expect("finish_shutdown is idempotent");
+        pane.shutdown("")
+            .expect("shutdown after finish_shutdown is a no-op");
     }
 }

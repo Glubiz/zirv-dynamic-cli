@@ -94,6 +94,24 @@ pub fn request_dir_for(state: &StateDir, dash_short: &str, token: &str) -> PathB
         .join("requests")
 }
 
+/// The owner-pid file for a dashboard's spawn-request channel: the token
+/// directory's own `owner.pid`, i.e. the PARENT of `requests_dir` joined with
+/// `owner.pid` (`<state>/dash/<dash_short>-<token>/owner.pid`). It holds the
+/// dashboard's process id as decimal ASCII text and nothing else.
+///
+/// The dashboard writes it at startup and `sessions::nested_session_evidence`
+/// reads it: a token dir whose `owner.pid` names a dead (or missing) pid is a
+/// leak from a dashboard that exited abnormally, and must NOT be read as a
+/// live dashboard owning the terminal -- otherwise the leaked dir wedges every
+/// future `zirv chat`. On a clean quit the whole token dir (this file with it)
+/// is removed by `dash::mod::remove_request_dir`.
+pub fn owner_pid_path(requests_dir: &Path) -> PathBuf {
+    requests_dir
+        .parent()
+        .unwrap_or(requests_dir)
+        .join("owner.pid")
+}
+
 #[cfg(unix)]
 fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -311,6 +329,20 @@ mod tests {
             cwd: PathBuf::from("/repo"),
             requested_by: "abcd1234".to_string(),
         }
+    }
+
+    #[test]
+    fn owner_pid_path_is_the_token_dir_sibling_of_requests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let requests = request_dir_for(&state, "aaaa1111", "0123456789abcdef");
+        assert_eq!(
+            owner_pid_path(&requests),
+            tmp.path()
+                .join("dash")
+                .join("aaaa1111-0123456789abcdef")
+                .join("owner.pid")
+        );
     }
 
     #[test]

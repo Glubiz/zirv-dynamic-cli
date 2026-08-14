@@ -131,9 +131,55 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
     }
 }
 
+/// Pure: the xterm modifier parameter for a modified special key --
+/// `1 + Shift + 2*Alt + 4*Ctrl` -- or `None` when no modifier of interest is
+/// set, so the caller emits the bare, unmodified escape. This is the standard
+/// `CSI 1 ; <mod> <final>` / `CSI <n> ; <mod> ~` encoding every terminal and
+/// harness reads (M7).
+fn xterm_modifier(mods: KeyModifiers) -> Option<u8> {
+    let mut bits = 0u8;
+    if mods.contains(KeyModifiers::SHIFT) {
+        bits |= 1;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        bits |= 2;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        bits |= 4;
+    }
+    if bits == 0 { None } else { Some(1 + bits) }
+}
+
+/// A cursor/navigation key that ends in a letter final (`A`/`B`/`C`/`D` for the
+/// arrows, `H`/`F` for Home/End): bare `CSI <final>` when unmodified, the
+/// modified `CSI 1 ; <mod> <final>` form otherwise (M7).
+fn csi_letter_final(final_byte: u8, mods: KeyModifiers) -> Vec<u8> {
+    match xterm_modifier(mods) {
+        Some(m) => format!("\x1b[1;{m}{}", final_byte as char).into_bytes(),
+        None => vec![0x1b, b'[', final_byte],
+    }
+}
+
+/// A navigation key that ends in a tilde (`CSI <n> ~`, e.g. PageUp `5`,
+/// PageDown `6`, Delete `3`, Insert `2`): the modified `CSI <n> ; <mod> ~`
+/// form when a modifier is held, the bare `CSI <n> ~` otherwise (M7).
+fn csi_tilde(n: u8, mods: KeyModifiers) -> Vec<u8> {
+    match xterm_modifier(mods) {
+        Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
+        None => format!("\x1b[{n}~").into_bytes(),
+    }
+}
+
 /// `crossterm::event::KeyEvent` -> bytes to write to the active pane's pty.
 /// Covers the terminal basics: `Enter`, arrows, `Tab`/`BackTab`, navigation
 /// keys, function keys, `Alt-<x>`, `Ctrl-<x>`, and plain/UTF-8 characters.
+///
+/// M7: the special keys (arrows, Home/End, PageUp/Down, Delete/Insert) carry
+/// their held modifiers through the standard xterm `CSI 1 ; <mod> <final>` /
+/// `CSI <n> ; <mod> ~` forms, so `Ctrl+Left` moves a word rather than one
+/// character. M8: the CONTROL arm maps the non-alphabetic control combinations
+/// crossterm pre-maps to a plain char (Ctrl+Space, Ctrl+\`]^_`) to their real
+/// C0 bytes, so they no longer type a literal digit or space.
 ///
 /// Deliberately makes no special case for a raw control byte arriving as
 /// `KeyCode::Char('\u{01}')` (or any other `Char('\u{0N}')`) with no
@@ -151,20 +197,35 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
         return bytes;
     }
     match key.code {
-        KeyCode::Enter => b"\r".to_vec(),
+        // Bare Enter submits (`\r`); Shift+Enter must NOT -- it inserts a
+        // newline. The encoding is `ESC CR`, deliberately *not* the CSI-u form
+        // (`ESC [ 13 ; 2 u`): CSI-u belongs to the kitty keyboard protocol,
+        // which a terminal may only emit once the application has negotiated
+        // it, and a harness that has not would read the bytes as ESC plus a
+        // literal `[13;2u` typed into its prompt. `ESC CR` is what Claude
+        // Code's own `/terminal-setup` binds Shift+Enter to, and it is the
+        // long-standing Meta+Enter convention, so it degrades to "newline"
+        // rather than to garbage. Other modifiers on Enter still submit.
+        KeyCode::Enter => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                b"\x1b\r".to_vec()
+            } else {
+                b"\r".to_vec()
+            }
+        }
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => b"\t".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::Left => csi_letter_final(b'D', key.modifiers),
+        KeyCode::Right => csi_letter_final(b'C', key.modifiers),
+        KeyCode::Up => csi_letter_final(b'A', key.modifiers),
+        KeyCode::Down => csi_letter_final(b'B', key.modifiers),
+        KeyCode::Home => csi_letter_final(b'H', key.modifiers),
+        KeyCode::End => csi_letter_final(b'F', key.modifiers),
+        KeyCode::PageUp => csi_tilde(5, key.modifiers),
+        KeyCode::PageDown => csi_tilde(6, key.modifiers),
+        KeyCode::Delete => csi_tilde(3, key.modifiers),
+        KeyCode::Insert => csi_tilde(2, key.modifiers),
         KeyCode::Esc => vec![0x1b],
         KeyCode::F(n) => match n {
             1 => b"\x1bOP".to_vec(),
@@ -182,12 +243,24 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
             _ => Vec::new(),
         },
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let upper = c.to_ascii_uppercase();
-            if upper.is_ascii_alphabetic() {
-                vec![(upper as u8) & 0x1f]
-            } else {
-                let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf).as_bytes().to_vec()
+            // M8: the non-alphabetic control combinations crossterm pre-maps to
+            // a plain char. Without these they typed a literal `4`/`7`/space
+            // instead of the C0 byte the operator meant.
+            match c {
+                ' ' => vec![0x00], // Ctrl+Space -> NUL
+                '4' => vec![0x1c], // Ctrl+\  (delivered as Char('4'))
+                '5' => vec![0x1d], // Ctrl+]
+                '6' => vec![0x1e], // Ctrl+^
+                '7' => vec![0x1f], // Ctrl+_
+                _ => {
+                    let upper = c.to_ascii_uppercase();
+                    if upper.is_ascii_alphabetic() {
+                        vec![(upper as u8) & 0x1f]
+                    } else {
+                        let mut buf = [0u8; 4];
+                        c.encode_utf8(&mut buf).as_bytes().to_vec()
+                    }
+                }
             }
         }
         KeyCode::Char(c) => {
@@ -381,6 +454,15 @@ fn assemble_header_facts(
 /// but nothing here needs a disk hit that often.
 const FACTS_THROTTLE: Duration = Duration::from_secs(1);
 
+/// Pure: whether an action last performed at `last` is due again as of `now`,
+/// given how often it may run (`interval`). Shared by the header facts refresh
+/// pattern (`FactsCache::refresh_if_due`) and the mail sweep throttle (H3):
+/// both are disk-backed housekeeping that must not run on the render loop's
+/// own 50ms cadence.
+fn due(last: Instant, now: Instant, interval: Duration) -> bool {
+    now.duration_since(last) >= interval
+}
+
 /// The disk-backed part of the header's facts: everything `FactsCache::
 /// refresh_if_due` re-reads on the throttle. Kept separate from
 /// `ui::HeaderFacts` itself because the harness/error line and the live
@@ -425,7 +507,7 @@ impl FactsCache {
         session_short: &str,
         now: Instant,
     ) {
-        if now.duration_since(self.last_refresh) < FACTS_THROTTLE {
+        if !due(self.last_refresh, now, FACTS_THROTTLE) {
             return;
         }
         self.last_refresh = now;
@@ -468,6 +550,25 @@ fn reap_fixup(removed: usize, focused: usize, selected: usize) -> (usize, usize)
     (focused, selected)
 }
 
+/// Pure: `selected` after `new_pane_count - old_pane_count` panes were
+/// appended to `panes`. `selected` indexes the combined sidebar (panes first,
+/// then view-only registry rows), so appending a pane pushes every view-only
+/// row -- and any selection sitting on one -- down by the number appended.
+///
+/// M4: the mirror of [`reap_fixup`] for insertion. Removal was fixed up;
+/// insertion was not, so `fulfill_spawn_request`/`spawn_restored_pane` pushing
+/// onto `panes` silently re-aimed a view-only selection (e.g. `Ctrl+A n`) at a
+/// different session. A selection already on a pane (index below the old pane
+/// count) keeps naming that same pane.
+fn insert_fixup(old_pane_count: usize, new_pane_count: usize, selected: usize) -> usize {
+    let added = new_pane_count.saturating_sub(old_pane_count);
+    if selected >= old_pane_count {
+        selected + added
+    } else {
+        selected
+    }
+}
+
 /// Removes every pane whose child has exited, in place: each one is shut down
 /// first (`Pane::shutdown` -- idempotent, and with the child already gone the
 /// quit ladder is a no-op, so this is really "release the registry record and
@@ -492,6 +593,7 @@ fn reap_ended_panes(
     selected: &mut usize,
     errors: &mut Vec<String>,
     reaped_codes: &mut Vec<i32>,
+    reaped_recent: &mut HashSet<String>,
 ) {
     let mut index = 0;
     while index < panes.len() {
@@ -509,6 +611,12 @@ fn reap_ended_panes(
         if index < queues.len() {
             queues.remove(index);
         }
+        // L19: `shutdown` above released the registry record immediately, but
+        // `facts_cache.registry` is up to ~1s stale, so the dead session would
+        // re-list as a view-only (nudge-targetable) row until the next refresh.
+        // Remember its short and exclude it from the view-only rows until the
+        // registry snapshot no longer carries it.
+        reaped_recent.insert(pane.short().to_string());
         reaped_codes.push(code);
         push_error(
             errors,
@@ -660,6 +768,64 @@ fn push_error(errors: &mut Vec<String>, message: String) {
     }
 }
 
+/// How long a transient header notice stays on screen before it expires (L13).
+const NOTICE_TTL: Duration = Duration::from_secs(4);
+
+/// One informational, auto-expiring header notice: its text and the instant it
+/// stops being shown.
+///
+/// L13: distinct from the sticky `errors` channel (which the header renders
+/// behind a `⚠`). Informational pushes -- "spawned claude as …", "nudge
+/// queued …", "nudge received …" -- used to go through the error channel,
+/// where nothing ever cleared them, so they pinned behind a warning glyph for
+/// the rest of the session. A notice reads as plain text and disappears on its
+/// own a few seconds later.
+struct Notice {
+    text: String,
+    expires_at: Instant,
+}
+
+fn push_notice(notices: &mut Vec<Notice>, now: Instant, text: String) {
+    notices.push(Notice {
+        text,
+        expires_at: now + NOTICE_TTL,
+    });
+    if notices.len() > MAX_KEPT_ERRORS {
+        let drop = notices.len() - MAX_KEPT_ERRORS;
+        notices.drain(0..drop);
+    }
+}
+
+/// Pure: the most recent notice still live as of `now`, if any. The header
+/// prefers a live notice over the sticky error line, so the latest action's
+/// confirmation is what the operator sees while it is fresh; once it expires
+/// the underlying error (if any) shows through again.
+fn live_notice(notices: &[Notice], now: Instant) -> Option<&str> {
+    notices
+        .iter()
+        .rev()
+        .find(|n| n.expires_at > now)
+        .map(|n| n.text.as_str())
+}
+
+/// Best-effort: claims any `<short>.nudge` markers written for this
+/// dashboard's own live panes and turns each into a header notice. The
+/// nudger has already delivered the message body to the pane's inbox (mail);
+/// this only surfaces the wake-up so the operator knows to look. Throttled by
+/// the caller (once per `FACTS_THROTTLE`), the same as every other disk read
+/// here.
+fn claim_pane_nudges(panes: &[Pane], state: &StateDir, notices: &mut Vec<Notice>, now: Instant) {
+    for pane in panes {
+        if sessions::claim_nudge_marker(state, pane.short()).is_some() {
+            push_notice(
+                notices,
+                now,
+                format!("nudge received for {} -- see inbox", pane.short()),
+            );
+        }
+    }
+}
+
 /// Restores the shared terminal on the way out of `run_dashboard`: disables
 /// raw mode, then writes `term::dash_reset_bytes()` -- cursor shown, scroll
 /// region un-fenced, alternate screen left -- to **stdout**, which is the
@@ -740,6 +906,38 @@ fn effective_main(area: Rect, sidebar_cols: u16, zoomed: bool) -> Rect {
     }
 }
 
+/// Applies a new terminal size: stores it (`term_cols`/`term_rows`/`full`,
+/// which the zoom handler and every `terminal::size` fallback read) and
+/// resizes every pane's pty+parser to this size's effective main geometry.
+///
+/// M6: factored out of the `Event::Resize` arm so the render loop can call it
+/// too. crossterm can coalesce or miss a resize event (a tmux SIGWINCH race, a
+/// conhost buffer change), which used to leave the ptys pinned at the old
+/// geometry forever; the renderer now compares the freshly-queried size to the
+/// stored one every frame and reconciles through here when they differ.
+#[allow(clippy::too_many_arguments)]
+fn apply_terminal_resize(
+    cols: u16,
+    rows: u16,
+    sidebar_cols: u16,
+    zoomed: bool,
+    term_cols: &mut u16,
+    term_rows: &mut u16,
+    full: &mut Rect,
+    panes: &mut [Pane],
+    errors: &mut Vec<String>,
+) {
+    *term_cols = cols;
+    *term_rows = rows;
+    *full = Rect::new(0, 0, cols, rows);
+    let m = effective_main(*full, sidebar_cols, zoomed);
+    for pane in panes.iter_mut() {
+        if let Err(e) = pane.resize(m.height.max(1), m.width.max(1)) {
+            push_error(errors, format!("resize: {e}"));
+        }
+    }
+}
+
 /// Builds the env a freshly spawned pane's child needs to report its own
 /// turn boundaries: `adapter.register_turn_signal` against the pane's own
 /// deterministic socket path (`state.socket_for`, the same derivation
@@ -799,6 +997,78 @@ fn build_turn_env(
 /// `DASH_REQUESTS_ENV` from this dashboard can reach its spawn channel.
 fn spawn_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+}
+
+/// Best-effort process-liveness probe, replicated from `sessions::is_alive`
+/// (private there) so the dashboard's stale-token-dir sweep can decide whether
+/// an `owner.pid` still names a live dashboard without reaching into another
+/// module. Same semantics: an unverifiable platform never reports "dead", so a
+/// dir is never swept on a guess.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing; it only probes existence/permission, the
+    // same check `kill -0` makes from a shell.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: `handle` is null-checked before any further call, and `code` is
+    // only read after a successful `GetExitCodeProcess`.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pid_alive(_pid: u32) -> bool {
+    // No portable probe: never sweep a token dir this platform cannot verify.
+    true
+}
+
+/// CROSS-CUTTING (shared with the supervisor): removes every
+/// `<state>/dash/<short>-<token>` token directory whose `owner.pid` names a
+/// process no longer alive -- a leak from a dashboard that exited abnormally
+/// (external kill, closed window, panic). Left behind, such a dir (and the
+/// `ZIRV_CTX_DASH_REQUESTS` a surviving pane shell still carries) reads to
+/// `nested_session_evidence` as a live dashboard owning this terminal, and
+/// refuses every future `zirv chat`.
+///
+/// Best-effort throughout: a dir with no `owner.pid` (a roster file, a token
+/// dir still mid-creation), an unreadable or non-numeric pid, or a live one is
+/// left untouched, and every filesystem error is ignored. Run at startup after
+/// this dashboard has written its own `owner.pid`, so its own live dir is
+/// always kept.
+fn sweep_stale_token_dirs(state: &StateDir) {
+    let Ok(entries) = std::fs::read_dir(state.dash()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(dir.join("owner.pid")) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<u32>() else {
+            continue;
+        };
+        if !pid_alive(pid) {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// `std::process::Command` -> the flat `program, arg, arg, ...` form
@@ -1962,6 +2232,7 @@ fn pane_index_by_short(shorts: &[&str], short: &str) -> Option<usize> {
 /// `Idle` while the operator is mid-composing in it (`user_typed_since_turn`),
 /// and a nudge submitted right then must queue rather than land on top of the
 /// half-typed prompt, same as the sweep/drain path G1 already covers.
+#[allow(clippy::too_many_arguments)]
 fn submit_nudge(
     target: ui::NudgeTarget,
     text: &str,
@@ -1970,6 +2241,8 @@ fn submit_nudge(
     repo: &Path,
     env: EnvLookup<'_>,
     errors: &mut Vec<String>,
+    notices: &mut Vec<Notice>,
+    now: Instant,
 ) {
     match target {
         ui::NudgeTarget::AttachedPane(short) => {
@@ -1990,7 +2263,13 @@ fn submit_nudge(
                 }
             } else if let Some(queue) = queues.get_mut(i) {
                 queue.push_back(text.to_string());
-                push_error(errors, "nudge queued -- delivers when idle".to_string());
+                // L13: informational, not a failure -- goes to the transient
+                // notice channel, not the sticky ⚠ error line.
+                push_notice(
+                    notices,
+                    now,
+                    "nudge queued -- delivers when idle".to_string(),
+                );
             }
         }
         ui::NudgeTarget::ViewOnlySession(short) => {
@@ -2001,13 +2280,36 @@ fn submit_nudge(
             };
             let mut sink = Vec::new();
             let mut stdin = std::io::empty();
-            if let Err(e) = sessions::run_nudge_with(&args, &mut sink, repo, env, &mut stdin) {
-                push_error(errors, format!("nudge: {e}"));
+            match sessions::run_nudge_with(&args, &mut sink, repo, env, &mut stdin) {
+                Err(e) => push_error(errors, format!("nudge: {e}")),
+                // L14: the sink carries the "queued for …" confirmation the
+                // CLI verb prints; surface its first non-empty line as a
+                // notice so a successful view-only nudge is not silent.
+                Ok(_) => {
+                    let confirmation = String::from_utf8_lossy(&sink);
+                    let line = confirmation
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("nudge queued")
+                        .to_string();
+                    push_notice(notices, now, line);
+                }
             }
         }
         ui::NudgeTarget::None => {}
     }
 }
+
+/// HIGH-2: the most input events one tick drains before it stops to do its
+/// per-tick maintenance and redraw. A paste is delivered as one key event per
+/// character, so without a per-tick drain the loop ran a full maintenance pass
+/// (per-pane drains, reap, mail sweep, two `terminal::size` calls, a
+/// `read_dir` for spawn requests, two full-screen sidebar scans, a draw) for
+/// every single pasted character. Draining the whole queue in one tick fixes
+/// that; the cap keeps a firehose (a process spewing input) from starving the
+/// maintenance and redraw the same way an unbounded pane drain would (M10).
+const MAX_INPUT_DRAIN_PER_TICK: usize = 4096;
 
 /// How many consecutive `event::poll`/`event::read` failures the dashboard
 /// tolerates before treating the input stream as gone. The loop polls on a
@@ -2144,6 +2446,19 @@ pub fn run_dashboard(
         spawnreq::DASH_REQUESTS_ENV.to_string(),
         requests_dir.display().to_string(),
     ));
+    // CROSS-CUTTING: the owner-pid file. `nested_session_evidence` reads it to
+    // tell a live dashboard from a token dir a crashed one leaked; without it,
+    // a leaked dir (plus a surviving pane's inherited `ZIRV_CTX_DASH_REQUESTS`)
+    // would wedge every future `zirv chat`. Written right after the dir exists
+    // and the env is set; removed with the whole token dir on a clean quit.
+    let _ = super::state::write_private(
+        &spawnreq::owner_pid_path(&requests_dir),
+        &std::process::id().to_string(),
+    );
+    // And clear any sibling token dirs a previously-crashed dashboard left
+    // whose owner pid is no longer alive (best-effort). Our own dir, whose pid
+    // we just wrote and is alive, is never swept.
+    sweep_stale_token_dirs(state);
 
     let size = (main.width.max(1), main.height.max(1));
     // O7: the request directory exists from here on, so the one startup step
@@ -2241,6 +2556,17 @@ pub fn run_dashboard(
         ui::Overlay::Restore(build_restore_view(&restore_candidates))
     };
     let mut facts_cache = FactsCache::new(Instant::now());
+    // L13: transient, auto-expiring header notices (info), kept apart from the
+    // sticky `errors` channel (⚠) so a confirmation like "spawned … as …"
+    // shows briefly and then clears instead of pinning behind a warning glyph.
+    let mut notices: Vec<Notice> = Vec::new();
+    // H3: the mail sweep is disk-backed (`mail::list` = read_dir + read per
+    // .md) and used to run every 50ms tick; throttled to the same ~1s cadence
+    // as the header facts. Seeded a full interval in the past so the first
+    // tick sweeps immediately (same reasoning as `FactsCache::new`).
+    let mut last_mail_sweep = Instant::now()
+        .checked_sub(FACTS_THROTTLE)
+        .unwrap_or_else(Instant::now);
     // R8: see `input_stream_is_dead`.
     let mut input_errors: usize = 0;
     // D4: set by the "every pane ended" exit arm, so the closing line is
@@ -2256,8 +2582,12 @@ pub fn run_dashboard(
     // lost just because the restore dialog that offered them has long since
     // closed.
     let mut deferred_restore: Vec<roster::RosterPane> = Vec::new();
+    // L19: shorts of panes reaped since the last registry refresh, excluded
+    // from the view-only sidebar rows so a just-released session does not
+    // re-list (and become nudge-targetable) off the up-to-1s-stale snapshot.
+    let mut reaped_recent: HashSet<String> = HashSet::new();
 
-    let exit_code: i32 = loop {
+    let exit_code: i32 = 'main: loop {
         for pane in panes.iter_mut() {
             pane.drain();
             pane.on_turn_signal();
@@ -2273,7 +2603,40 @@ pub fn run_dashboard(
             &mut selected,
             &mut errors,
             &mut reaped_codes,
+            &mut reaped_recent,
         );
+
+        // The geometry any pane spawned during this tick gets -- the terminal
+        // as it is now, at this tick's zoom level. Shared by the request
+        // channel here and the `Ctrl+A s` spawn dialog / restore below.
+        let pane_size = {
+            let now_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+            let m = effective_main(
+                Rect::new(0, 0, now_size.0, now_size.1),
+                sidebar_cols,
+                zoomed,
+            );
+            (m.width.max(1), m.height.max(1))
+        };
+        // L17: fulfil pending spawn requests BEFORE the empty-exit decision.
+        // A request arriving on the very tick the last pane ended used to be
+        // stranded -- the dashboard exited first, and the requester burned its
+        // ack timeout against a channel nobody would ever poll again.
+        let panes_before_requests = panes.len();
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut nudge_queues,
+            cfg,
+            state,
+            repo,
+            pane_size,
+            &mut errors,
+        );
+        // M4: a request fulfilled this tick appended panes, shifting every
+        // view-only sidebar row (and any selection on one) down.
+        selected = insert_fixup(panes_before_requests, panes.len(), selected);
+
         // D4: with the last pane gone there is nothing left to supervise, draw
         // or type into -- `/exit` in the orchestrator used to leave the
         // operator staring at a blank alternate screen with no pane to press
@@ -2301,31 +2664,17 @@ pub fn run_dashboard(
             break empty_exit_code(&reaped_codes);
         }
 
-        mail_sweep(&mut panes, cfg, state, repo, &mut errors);
+        // H3: the disk-backed sweep and the nudge-marker claim run at most
+        // once per `FACTS_THROTTLE`, not on every 50ms tick. The in-memory
+        // nudge-queue drain below stays every tick: it is cheap and delivers
+        // an operator's queued nudge the moment its pane goes idle.
+        let sweep_now = Instant::now();
+        if due(last_mail_sweep, sweep_now, FACTS_THROTTLE) {
+            last_mail_sweep = sweep_now;
+            mail_sweep(&mut panes, cfg, state, repo, &mut errors);
+            claim_pane_nudges(&panes, state, &mut notices, sweep_now);
+        }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
-
-        // The geometry any pane spawned during this tick gets -- the terminal
-        // as it is now, at this tick's zoom level. Shared by the request
-        // channel below and the `Ctrl+A s` spawn dialog.
-        let pane_size = {
-            let now_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
-            let m = effective_main(
-                Rect::new(0, 0, now_size.0, now_size.1),
-                sidebar_cols,
-                zoomed,
-            );
-            (m.width.max(1), m.height.max(1))
-        };
-        handle_spawn_requests(
-            &requests_dir,
-            &mut panes,
-            &mut nudge_queues,
-            cfg,
-            state,
-            repo,
-            pane_size,
-            &mut errors,
-        );
 
         // Facts + sidebar rows, computed BEFORE input handling: the Nudge
         // dialog's attached-vs-view-only routing and the SelectUp/SelectDown
@@ -2349,369 +2698,433 @@ pub fn run_dashboard(
             &dashboard_short,
             Instant::now(),
         );
+        // L19: drop any recently-reaped short the registry snapshot no longer
+        // carries -- once a refresh clears the released record, the exclusion
+        // is no longer needed. What remains is the set the (still-stale)
+        // snapshot would otherwise re-list as a ghost view-only row.
+        reaped_recent.retain(|short| {
+            facts_cache
+                .registry
+                .iter()
+                .any(|(record, _)| &record.short == short)
+        });
+        let visible_registry: Vec<(sessions::Record, sessions::Liveness)> = facts_cache
+            .registry
+            .iter()
+            .filter(|(record, _)| !reaped_recent.contains(&record.short))
+            .cloned()
+            .collect();
         // A pane can have gone away (or arrived) since the last tick, so both
         // indices are re-clamped before anything reads them.
         focused = focused.min(panes.len().saturating_sub(1));
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
-            &facts_cache.registry,
+            &visible_registry,
             selected,
             focused,
         );
         let total_rows = rows.len();
         selected = selected.min(total_rows.saturating_sub(1));
 
-        match event::poll(Duration::from_millis(50)) {
-            Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                    input_errors = 0;
-                    if !matches!(overlay, ui::Overlay::None) {
-                        let current = std::mem::take(&mut overlay);
-                        match current {
-                            ui::Overlay::None => {}
-                            ui::Overlay::QuitConfirm(working) => match key.code {
-                                KeyCode::Enter => {
-                                    // `overlay` was taken above, so this is the
-                                    // one quit path that cannot have a restore
-                                    // dialog pending: it *is* the open overlay.
-                                    // `deferred_restore` (G3) is independent of
-                                    // that and still owed regardless.
-                                    on_quit(
-                                        &panes,
-                                        &[],
-                                        &deferred_restore,
-                                        &requests_dir,
-                                        state,
-                                        repo,
-                                    );
-                                    shutdown_all(&mut panes, cfg, &mut errors);
-                                    break 0;
-                                }
-                                KeyCode::Esc => {}
-                                _ => overlay = ui::Overlay::QuitConfirm(working),
-                            },
-                            ui::Overlay::Spawn(draft) => {
-                                let (next, effect) = spawn_overlay_reduce(draft, key);
-                                overlay = match next {
-                                    Some(d) => ui::Overlay::Spawn(d),
-                                    None => ui::Overlay::None,
-                                };
-                                match effect {
-                                    Some(SpawnEffect::Notice(note)) => {
-                                        push_error(&mut errors, note)
-                                    }
-                                    // Straight through the same validation
-                                    // and spawn path a pane's own `zirv ctx
-                                    // agent` request takes -- argv guard,
-                                    // repo check, pane cap, agent gate --
-                                    // rather than a second, parallel one.
-                                    Some(SpawnEffect::Submit { agent, prompt }) => {
-                                        let req = spawnreq::SpawnRequest {
-                                            agent,
-                                            prompt,
-                                            cwd: repo.to_path_buf(),
-                                            requested_by: dashboard_short.clone(),
-                                        };
-                                        match fulfill_spawn_request(
-                                            &req,
-                                            &mut panes,
-                                            &mut nudge_queues,
-                                            cfg,
+        // HIGH-2: block up to 50ms for the first event, then drain every
+        // event already queued behind it (bounded) before falling through to
+        // the maintenance/redraw at the bottom of the tick. A 2000-character
+        // paste is 2000 key events; handling them one-per-tick meant 2000 full
+        // maintenance passes and redraws.
+        let mut drained = 0usize;
+        while drained < MAX_INPUT_DRAIN_PER_TICK {
+            let wait = if drained == 0 {
+                Duration::from_millis(50)
+            } else {
+                Duration::ZERO
+            };
+            match event::poll(wait) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                        input_errors = 0;
+                        if !matches!(overlay, ui::Overlay::None) {
+                            let current = std::mem::take(&mut overlay);
+                            match current {
+                                ui::Overlay::None => {}
+                                ui::Overlay::QuitConfirm(working) => match key.code {
+                                    KeyCode::Enter => {
+                                        // `overlay` was taken above, so this is the
+                                        // one quit path that cannot have a restore
+                                        // dialog pending: it *is* the open overlay.
+                                        // `deferred_restore` (G3) is independent of
+                                        // that and still owed regardless.
+                                        on_quit(
+                                            &panes,
+                                            &[],
+                                            &deferred_restore,
+                                            &requests_dir,
                                             state,
                                             repo,
-                                            pane_size,
-                                            &requests_dir,
-                                            &mut errors,
-                                        ) {
-                                            Ok(short) => push_error(
+                                        );
+                                        render_shutting_down(&mut terminal, panes.len());
+                                        shutdown_all(&mut panes, cfg, &mut errors);
+                                        break 'main 0;
+                                    }
+                                    KeyCode::Esc => {}
+                                    _ => overlay = ui::Overlay::QuitConfirm(working),
+                                },
+                                ui::Overlay::Spawn(draft) => {
+                                    let (next, effect) = spawn_overlay_reduce(draft, key);
+                                    overlay = match next {
+                                        Some(d) => ui::Overlay::Spawn(d),
+                                        None => ui::Overlay::None,
+                                    };
+                                    match effect {
+                                        Some(SpawnEffect::Notice(note)) => {
+                                            push_error(&mut errors, note)
+                                        }
+                                        // Straight through the same validation
+                                        // and spawn path a pane's own `zirv ctx
+                                        // agent` request takes -- argv guard,
+                                        // repo check, pane cap, agent gate --
+                                        // rather than a second, parallel one.
+                                        Some(SpawnEffect::Submit { agent, prompt }) => {
+                                            let req = spawnreq::SpawnRequest {
+                                                agent,
+                                                prompt,
+                                                cwd: repo.to_path_buf(),
+                                                requested_by: dashboard_short.clone(),
+                                            };
+                                            let panes_before_spawn = panes.len();
+                                            let fulfilled = fulfill_spawn_request(
+                                                &req,
+                                                &mut panes,
+                                                &mut nudge_queues,
+                                                cfg,
+                                                state,
+                                                repo,
+                                                pane_size,
+                                                &requests_dir,
                                                 &mut errors,
-                                                format!("spawned {} as {short}", req.agent),
-                                            ),
-                                            Err(refusal) => push_error(&mut errors, refusal.reason),
+                                            );
+                                            // M4: keep a view-only selection on the
+                                            // same logical row after the append.
+                                            selected = insert_fixup(
+                                                panes_before_spawn,
+                                                panes.len(),
+                                                selected,
+                                            );
+                                            match fulfilled {
+                                                // L13: a spawn confirmation is
+                                                // information, not a warning.
+                                                Ok(short) => push_notice(
+                                                    &mut notices,
+                                                    Instant::now(),
+                                                    format!("spawned {} as {short}", req.agent),
+                                                ),
+                                                Err(refusal) => {
+                                                    push_error(&mut errors, refusal.reason)
+                                                }
+                                            }
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                ui::Overlay::Restore(view) => {
+                                    let (next, effect) = restore_overlay_reduce(view, key);
+                                    overlay = match next {
+                                        Some(v) => ui::Overlay::Restore(v),
+                                        None => ui::Overlay::None,
+                                    };
+                                    if let Some(RestoreEffect::Confirm(indices)) = effect {
+                                        // R7: the same live-pane cap every other
+                                        // spawn seam enforces. Restoring is still
+                                        // creating panes, and a roster from a busy
+                                        // session must not be able to reopen more
+                                        // of them than `dash.max_panes` allows.
+                                        let (take, skipped) = restore_budget(
+                                            panes.len(),
+                                            cfg.dash.max_panes,
+                                            indices.len(),
+                                        );
+                                        // G3: the cap-skipped half is not just
+                                        // dropped -- it is carried in
+                                        // `deferred_restore` so `on_quit` can
+                                        // still offer those sessions to the next
+                                        // launch, even though this dialog closes
+                                        // (and `restore_candidates` stops being
+                                        // consulted) right after this effect is
+                                        // handled.
+                                        let (to_spawn, deferred) = partition_restore_selection(
+                                            indices,
+                                            &restore_candidates,
+                                            take,
+                                        );
+                                        let panes_before_restore = panes.len();
+                                        for candidate in &to_spawn {
+                                            spawn_restored_pane(
+                                                candidate,
+                                                &mut panes,
+                                                &mut nudge_queues,
+                                                cfg,
+                                                state,
+                                                repo,
+                                                pane_size,
+                                                &requests_dir,
+                                                &mut errors,
+                                                &mut deferred_restore,
+                                            );
+                                        }
+                                        // M4: restored panes were appended too.
+                                        selected = insert_fixup(
+                                            panes_before_restore,
+                                            panes.len(),
+                                            selected,
+                                        );
+                                        deferred_restore.extend(deferred);
+                                        if skipped > 0 {
+                                            push_error(
+                                                &mut errors,
+                                                format!(
+                                                    "restore: pane limit reached (dash.max_panes = \
+                                                 {}); {skipped} session(s) not restored",
+                                                    cfg.dash.max_panes
+                                                ),
+                                            );
                                         }
                                     }
-                                    None => {}
                                 }
-                            }
-                            ui::Overlay::Restore(view) => {
-                                let (next, effect) = restore_overlay_reduce(view, key);
-                                overlay = match next {
-                                    Some(v) => ui::Overlay::Restore(v),
-                                    None => ui::Overlay::None,
-                                };
-                                if let Some(RestoreEffect::Confirm(indices)) = effect {
-                                    // R7: the same live-pane cap every other
-                                    // spawn seam enforces. Restoring is still
-                                    // creating panes, and a roster from a busy
-                                    // session must not be able to reopen more
-                                    // of them than `dash.max_panes` allows.
-                                    let (take, skipped) = restore_budget(
-                                        panes.len(),
-                                        cfg.dash.max_panes,
-                                        indices.len(),
-                                    );
-                                    // G3: the cap-skipped half is not just
-                                    // dropped -- it is carried in
-                                    // `deferred_restore` so `on_quit` can
-                                    // still offer those sessions to the next
-                                    // launch, even though this dialog closes
-                                    // (and `restore_candidates` stops being
-                                    // consulted) right after this effect is
-                                    // handled.
-                                    let (to_spawn, deferred) = partition_restore_selection(
-                                        indices,
-                                        &restore_candidates,
-                                        take,
-                                    );
-                                    for candidate in &to_spawn {
-                                        spawn_restored_pane(
-                                            candidate,
-                                            &mut panes,
-                                            &mut nudge_queues,
-                                            cfg,
+                                ui::Overlay::Mail(view) => {
+                                    let (next, effect) = mail_overlay_reduce(view, key);
+                                    overlay = match next {
+                                        Some(v) => ui::Overlay::Mail(v),
+                                        None => ui::Overlay::None,
+                                    };
+                                    if let Some(effect) = effect {
+                                        apply_mail_effect(
+                                            effect,
                                             state,
                                             repo,
-                                            pane_size,
-                                            &requests_dir,
+                                            cfg,
+                                            &dashboard_short,
+                                            &agent_name,
                                             &mut errors,
-                                            &mut deferred_restore,
-                                        );
-                                    }
-                                    deferred_restore.extend(deferred);
-                                    if skipped > 0 {
-                                        push_error(
-                                            &mut errors,
-                                            format!(
-                                                "restore: pane limit reached (dash.max_panes = \
-                                                 {}); {skipped} session(s) not restored",
-                                                cfg.dash.max_panes
-                                            ),
                                         );
                                     }
                                 }
-                            }
-                            ui::Overlay::Mail(view) => {
-                                let (next, effect) = mail_overlay_reduce(view, key);
-                                overlay = match next {
-                                    Some(v) => ui::Overlay::Mail(v),
-                                    None => ui::Overlay::None,
-                                };
-                                if let Some(effect) = effect {
-                                    apply_mail_effect(
-                                        effect,
-                                        state,
-                                        repo,
-                                        cfg,
-                                        &dashboard_short,
-                                        &agent_name,
-                                        &mut errors,
-                                    );
-                                }
-                            }
-                            ui::Overlay::Memory(view) => {
-                                let (next, effect) = memory_overlay_reduce(view, key);
-                                overlay = match next {
-                                    Some(v) => ui::Overlay::Memory(v),
-                                    None => ui::Overlay::None,
-                                };
-                                if let Some(effect) = effect {
-                                    apply_memory_effect(
-                                        effect,
-                                        state,
-                                        repo,
-                                        cfg,
-                                        &agent_name,
-                                        &mut errors,
-                                    );
-                                }
-                            }
-                            ui::Overlay::Nudge(mut draft) => match key.code {
-                                KeyCode::Esc => {}
-                                KeyCode::Enter => {
-                                    let text = draft.input.trim().to_string();
-                                    if !text.is_empty() {
-                                        submit_nudge(
-                                            draft.target,
-                                            &text,
-                                            &mut panes,
-                                            &mut nudge_queues,
+                                ui::Overlay::Memory(view) => {
+                                    let (next, effect) = memory_overlay_reduce(view, key);
+                                    overlay = match next {
+                                        Some(v) => ui::Overlay::Memory(v),
+                                        None => ui::Overlay::None,
+                                    };
+                                    if let Some(effect) = effect {
+                                        apply_memory_effect(
+                                            effect,
+                                            state,
                                             repo,
-                                            env,
+                                            cfg,
+                                            &agent_name,
                                             &mut errors,
                                         );
                                     }
                                 }
-                                KeyCode::Backspace => {
-                                    draft.input.pop();
-                                    overlay = ui::Overlay::Nudge(draft);
-                                }
-                                KeyCode::Char(c)
-                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    draft.input.push(c);
-                                    overlay = ui::Overlay::Nudge(draft);
-                                }
-                                _ => overlay = ui::Overlay::Nudge(draft),
-                            },
-                        }
-                    } else {
-                        let (armed, verdict) = filter_key(prefix_armed, key);
-                        prefix_armed = armed;
-                        match verdict {
-                            InputVerdict::Pending => {}
-                            // Typing always reaches the *focused* pane, never
-                            // the merely selected sidebar row (F7): walking
-                            // the sidebar onto a view-only session must not
-                            // swallow the operator's keystrokes.
-                            //
-                            // F1: `write_operator_input`, not `write_input` --
-                            // it records that the operator has typed since
-                            // this pane's last turn boundary, which takes the
-                            // pane out of reach of the idle-gated injectors
-                            // until it reports the next one. A line injected
-                            // on top of a half-composed prompt submits it.
-                            InputVerdict::ToChild(bytes) => {
-                                if !bytes.is_empty()
-                                    && let Some(pane) = panes.get_mut(focused)
-                                    && let Err(e) = pane.write_operator_input(&bytes)
-                                {
-                                    push_error(&mut errors, format!("write_input: {e}"));
-                                }
+                                ui::Overlay::Nudge(mut draft) => match key.code {
+                                    KeyCode::Esc => {}
+                                    KeyCode::Enter => {
+                                        let text = draft.input.trim().to_string();
+                                        if !text.is_empty() {
+                                            submit_nudge(
+                                                draft.target,
+                                                &text,
+                                                &mut panes,
+                                                &mut nudge_queues,
+                                                repo,
+                                                env,
+                                                &mut errors,
+                                                &mut notices,
+                                                Instant::now(),
+                                            );
+                                        }
+                                    }
+                                    KeyCode::Backspace => {
+                                        draft.input.pop();
+                                        overlay = ui::Overlay::Nudge(draft);
+                                    }
+                                    KeyCode::Char(c)
+                                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        draft.input.push(c);
+                                        overlay = ui::Overlay::Nudge(draft);
+                                    }
+                                    _ => overlay = ui::Overlay::Nudge(draft),
+                                },
                             }
-                            InputVerdict::Dash(DashAction::LiteralPrefix) => {
-                                if let Some(pane) = panes.get_mut(focused)
-                                    && let Err(e) =
-                                        pane.write_operator_input(&literal_prefix_bytes())
-                                {
-                                    push_error(&mut errors, format!("write_input: {e}"));
-                                }
-                            }
-                            // Switch/NextPane address panes, so they move
-                            // both indices; SelectUp/SelectDown only walk the
-                            // combined sidebar. All four in one pure place.
-                            InputVerdict::Dash(
-                                action @ (DashAction::Switch(_)
-                                | DashAction::NextPane
-                                | DashAction::SelectUp
-                                | DashAction::SelectDown),
-                            ) => {
-                                (selected, focused) = apply_navigation(
-                                    action,
-                                    selected,
-                                    focused,
-                                    panes.len(),
-                                    total_rows,
-                                );
-                            }
-                            InputVerdict::Dash(DashAction::Zoom) => {
-                                zoomed = !zoomed;
-                                let m = effective_main(full, sidebar_cols, zoomed);
-                                for pane in panes.iter_mut() {
-                                    if let Err(e) = pane.resize(m.height.max(1), m.width.max(1)) {
-                                        push_error(&mut errors, format!("resize: {e}"));
+                        } else {
+                            let (armed, verdict) = filter_key(prefix_armed, key);
+                            prefix_armed = armed;
+                            match verdict {
+                                InputVerdict::Pending => {}
+                                // Typing always reaches the *focused* pane, never
+                                // the merely selected sidebar row (F7): walking
+                                // the sidebar onto a view-only session must not
+                                // swallow the operator's keystrokes.
+                                //
+                                // F1: `write_operator_input`, not `write_input` --
+                                // it records that the operator has typed since
+                                // this pane's last turn boundary, which takes the
+                                // pane out of reach of the idle-gated injectors
+                                // until it reports the next one. A line injected
+                                // on top of a half-composed prompt submits it.
+                                InputVerdict::ToChild(bytes) => {
+                                    if !bytes.is_empty()
+                                        && let Some(pane) = panes.get_mut(focused)
+                                        && let Err(e) = pane.write_operator_input(&bytes)
+                                    {
+                                        push_error(&mut errors, format!("write_input: {e}"));
                                     }
                                 }
-                            }
-                            InputVerdict::Dash(DashAction::Quit) => {
-                                let working: Vec<String> = panes
-                                    .iter()
-                                    .filter(|p| matches!(p.state(), PaneState::Working))
-                                    .map(|p| p.title().to_string())
-                                    .collect();
-                                if working.is_empty() {
-                                    // Reached only with no overlay open (this
-                                    // arm is the no-overlay branch), so there
-                                    // is nothing unoffered to hand back --
-                                    // `deferred_restore` (G3) aside, which is
-                                    // still owed regardless of overlay state.
-                                    on_quit(
-                                        &panes,
-                                        &[],
-                                        &deferred_restore,
-                                        &requests_dir,
-                                        state,
-                                        repo,
-                                    );
-                                    shutdown_all(&mut panes, cfg, &mut errors);
-                                    break 0;
+                                InputVerdict::Dash(DashAction::LiteralPrefix) => {
+                                    if let Some(pane) = panes.get_mut(focused)
+                                        && let Err(e) =
+                                            pane.write_operator_input(&literal_prefix_bytes())
+                                    {
+                                        push_error(&mut errors, format!("write_input: {e}"));
+                                    }
                                 }
-                                overlay = ui::Overlay::QuitConfirm(working);
-                            }
-                            // Opens the corresponding overlay seam Task 4
-                            // defined. Spawn's own reducer is Task 10/11's;
-                            // Esc (handled in the overlay-active branch
-                            // above) closes it in the meantime.
-                            InputVerdict::Dash(DashAction::Spawn) => {
-                                overlay = ui::Overlay::Spawn(ui::SpawnDraft::default());
-                            }
-                            InputVerdict::Dash(DashAction::Nudge) => {
-                                // `selected` addresses the combined row list
-                                // (`rows`, this iteration's): an index below
-                                // `panes.len()` is an attached pane, at or
-                                // above it is a view-only registry row named
-                                // by that same index in `rows`.
-                                //
-                                // D1: either way the target is captured as a
-                                // short id, resolved again at Enter time --
-                                // `selected` is only used to pick *which*
-                                // session is meant, here and now.
-                                let target = if selected < panes.len() {
-                                    panes
-                                        .get(selected)
-                                        .map(|p| {
-                                            ui::NudgeTarget::AttachedPane(p.short().to_string())
-                                        })
-                                        .unwrap_or(ui::NudgeTarget::None)
-                                } else {
-                                    rows.get(selected)
-                                        .map(|row| {
-                                            ui::NudgeTarget::ViewOnlySession(row.short.clone())
-                                        })
-                                        .unwrap_or(ui::NudgeTarget::None)
-                                };
-                                overlay = ui::Overlay::Nudge(ui::NudgeDraft {
-                                    target,
-                                    input: String::new(),
-                                });
-                            }
-                            InputVerdict::Dash(DashAction::Mail) => {
-                                overlay = ui::Overlay::Mail(build_mail_view(state, repo));
-                            }
-                            InputVerdict::Dash(DashAction::Memory) => {
-                                overlay = ui::Overlay::Memory(build_memory_view(state, repo));
+                                // Switch/NextPane address panes, so they move
+                                // both indices; SelectUp/SelectDown only walk the
+                                // combined sidebar. All four in one pure place.
+                                InputVerdict::Dash(
+                                    action @ (DashAction::Switch(_)
+                                    | DashAction::NextPane
+                                    | DashAction::SelectUp
+                                    | DashAction::SelectDown),
+                                ) => {
+                                    (selected, focused) = apply_navigation(
+                                        action,
+                                        selected,
+                                        focused,
+                                        panes.len(),
+                                        total_rows,
+                                    );
+                                }
+                                InputVerdict::Dash(DashAction::Zoom) => {
+                                    zoomed = !zoomed;
+                                    let m = effective_main(full, sidebar_cols, zoomed);
+                                    for pane in panes.iter_mut() {
+                                        if let Err(e) = pane.resize(m.height.max(1), m.width.max(1))
+                                        {
+                                            push_error(&mut errors, format!("resize: {e}"));
+                                        }
+                                    }
+                                }
+                                InputVerdict::Dash(DashAction::Quit) => {
+                                    let working: Vec<String> = panes
+                                        .iter()
+                                        .filter(|p| matches!(p.state(), PaneState::Working))
+                                        .map(|p| p.title().to_string())
+                                        .collect();
+                                    if working.is_empty() {
+                                        // Reached only with no overlay open (this
+                                        // arm is the no-overlay branch), so there
+                                        // is nothing unoffered to hand back --
+                                        // `deferred_restore` (G3) aside, which is
+                                        // still owed regardless of overlay state.
+                                        on_quit(
+                                            &panes,
+                                            &[],
+                                            &deferred_restore,
+                                            &requests_dir,
+                                            state,
+                                            repo,
+                                        );
+                                        render_shutting_down(&mut terminal, panes.len());
+                                        shutdown_all(&mut panes, cfg, &mut errors);
+                                        break 'main 0;
+                                    }
+                                    overlay = ui::Overlay::QuitConfirm(working);
+                                }
+                                // Opens the corresponding overlay seam Task 4
+                                // defined. Spawn's own reducer is Task 10/11's;
+                                // Esc (handled in the overlay-active branch
+                                // above) closes it in the meantime.
+                                InputVerdict::Dash(DashAction::Spawn) => {
+                                    overlay = ui::Overlay::Spawn(ui::SpawnDraft::default());
+                                }
+                                InputVerdict::Dash(DashAction::Nudge) => {
+                                    // `selected` addresses the combined row list
+                                    // (`rows`, this iteration's): an index below
+                                    // `panes.len()` is an attached pane, at or
+                                    // above it is a view-only registry row named
+                                    // by that same index in `rows`.
+                                    //
+                                    // D1: either way the target is captured as a
+                                    // short id, resolved again at Enter time --
+                                    // `selected` is only used to pick *which*
+                                    // session is meant, here and now.
+                                    let target = if selected < panes.len() {
+                                        panes
+                                            .get(selected)
+                                            .map(|p| {
+                                                ui::NudgeTarget::AttachedPane(p.short().to_string())
+                                            })
+                                            .unwrap_or(ui::NudgeTarget::None)
+                                    } else {
+                                        rows.get(selected)
+                                            .map(|row| {
+                                                ui::NudgeTarget::ViewOnlySession(row.short.clone())
+                                            })
+                                            .unwrap_or(ui::NudgeTarget::None)
+                                    };
+                                    overlay = ui::Overlay::Nudge(ui::NudgeDraft {
+                                        target,
+                                        input: String::new(),
+                                    });
+                                }
+                                InputVerdict::Dash(DashAction::Mail) => {
+                                    overlay = ui::Overlay::Mail(build_mail_view(state, repo));
+                                }
+                                InputVerdict::Dash(DashAction::Memory) => {
+                                    overlay = ui::Overlay::Memory(build_memory_view(state, repo));
+                                }
                             }
                         }
                     }
-                }
-                Ok(Event::Resize(cols, term_h)) => {
+                    Ok(Event::Resize(cols, term_h)) => {
+                        input_errors = 0;
+                        // F6: the loop's own idea of the terminal is updated
+                        // here, not just used locally. The zoom handler and the
+                        // fallback size of every `crossterm::terminal::size`
+                        // call below read these, so leaving them at the startup
+                        // geometry made un-zooming after a resize restore panes
+                        // to the size the terminal had at launch.
+                        apply_terminal_resize(
+                            cols,
+                            term_h,
+                            sidebar_cols,
+                            zoomed,
+                            &mut term_cols,
+                            &mut term_rows,
+                            &mut full,
+                            &mut panes,
+                            &mut errors,
+                        );
+                    }
+                    Ok(_) => input_errors = 0,
+                    Err(e) => {
+                        input_errors = input_errors.saturating_add(1);
+                        push_error(&mut errors, format!("event read: {e}"));
+                    }
+                },
+                Ok(false) => {
+                    // No event ready within the wait: the queue is drained (or
+                    // was empty). Stop the drain and go do the tick's work.
                     input_errors = 0;
-                    // F6: the loop's own idea of the terminal is updated
-                    // here, not just used locally. The zoom handler and the
-                    // fallback size of every `crossterm::terminal::size`
-                    // call below read these, so leaving them at the startup
-                    // geometry made un-zooming after a resize restore panes
-                    // to the size the terminal had at launch.
-                    term_cols = cols;
-                    term_rows = term_h;
-                    full = Rect::new(0, 0, cols, term_h);
-                    let m = effective_main(full, sidebar_cols, zoomed);
-                    for pane in panes.iter_mut() {
-                        if let Err(e) = pane.resize(m.height.max(1), m.width.max(1)) {
-                            push_error(&mut errors, format!("resize: {e}"));
-                        }
-                    }
+                    break;
                 }
-                Ok(_) => input_errors = 0,
                 Err(e) => {
                     input_errors = input_errors.saturating_add(1);
-                    push_error(&mut errors, format!("event read: {e}"));
+                    push_error(&mut errors, format!("event poll: {e}"));
+                    break;
                 }
-            },
-            Ok(false) => input_errors = 0,
-            Err(e) => {
-                input_errors = input_errors.saturating_add(1);
-                push_error(&mut errors, format!("event poll: {e}"));
             }
+            drained += 1;
         }
 
         // R8: a console handle that has gone away answers every poll with an
@@ -2736,11 +3149,28 @@ pub fn run_dashboard(
                 state,
                 repo,
             );
+            render_shutting_down(&mut terminal, panes.len());
             shutdown_all(&mut panes, cfg, &mut errors);
             break 0;
         }
 
         let term_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+        // M6: reconcile a resize crossterm coalesced or dropped -- if the real
+        // terminal is not the size the ptys were last set to, apply it now so a
+        // missed SIGWINCH does not leave every pane pinned at the old geometry.
+        if term_size != (term_cols, term_rows) {
+            apply_terminal_resize(
+                term_size.0,
+                term_size.1,
+                sidebar_cols,
+                zoomed,
+                &mut term_cols,
+                &mut term_rows,
+                &mut full,
+                &mut panes,
+                &mut errors,
+            );
+        }
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
         let (header_area, sidebar_area, _) = ui::layout(frame_area, sidebar_cols);
         // F5: the grid and any overlay are drawn into the *effective* main
@@ -2754,14 +3184,22 @@ pub fn run_dashboard(
         // input handling) so the sidebar's own `.selected` highlight
         // reflects any selection change the keystroke just made -- cheap and
         // pure, unlike the disk-backed facts refresh it does not repeat.
+        // `visible_registry` (L19: ghost-reaped rows filtered) is reused from
+        // the pre-input pass -- the snapshot has not changed within the tick.
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
-            &facts_cache.registry,
+            &visible_registry,
             selected,
             focused,
         );
 
-        let harness = if let Some(last) = errors.last() {
+        // L13: a live notice (info) shows as plain text and takes precedence
+        // while fresh; once it expires the sticky error line (⚠) shows through
+        // again. Only genuine failures reach `errors` now -- informational
+        // confirmations go to `notices`.
+        let harness = if let Some(note) = live_notice(&notices, Instant::now()) {
+            format!("{harness_label}  {note}")
+        } else if let Some(last) = errors.last() {
             format!("{harness_label}  \u{26a0} {last}")
         } else {
             harness_label.clone()
@@ -2782,6 +3220,16 @@ pub fn run_dashboard(
             }
             if let Some(pane) = panes.get(focused) {
                 ui::render_grid(f, main_area, pane.screen());
+                // HIGH-1: the focused pane's own caret. ratatui hides the
+                // cursor on every frame whose `cursor_position` is left unset,
+                // so without this there is no caret anywhere for the whole
+                // session. An overlay is drawn on top below, but the caret is
+                // only set for the bare grid: an open dialog owns the screen.
+                if matches!(overlay, ui::Overlay::None)
+                    && let Some(pos) = ui::grid_cursor_position(main_area, pane.screen())
+                {
+                    f.set_cursor_position(pos);
+                }
             }
             ui::render_overlay(f, main_area, &overlay);
         });
@@ -2828,15 +3276,48 @@ fn abort_setup(panes: &mut [Pane], cfg: &CtxConfig, requests_dir: &Path) {
     remove_request_dir(requests_dir);
 }
 
+/// The single grace budget a batched shutdown shares across every pane (M9),
+/// matching `wrap::quit_child`'s own per-child `QUIT_GRACE`.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Draws a one-line "shutting down N pane(s)…" frame, called right before a
+/// quit path begins tearing panes down (M9). Best-effort: a draw failure just
+/// means the operator sees the last frame a moment longer, which is what used
+/// to happen for the whole grace window anyway.
+fn render_shutting_down(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, pane_count: usize) {
+    let msg = format!("shutting down {pane_count} pane(s)\u{2026}");
+    let _ = terminal.draw(|f| {
+        let area = f.area();
+        ui::render_center_message(f, area, &msg);
+    });
+}
+
 /// Shuts down every remaining pane with its own adapter's quit sequence,
 /// best-effort: a shutdown failure is logged into `errors`, never
 /// propagated -- the dashboard is exiting either way.
+///
+/// M9: one shared grace across all panes, not a full grace *per* pane run
+/// serially. Nine stuck panes used to freeze the operator on the alternate
+/// screen for up to 9x5s while `Pane::shutdown` waited out each one's ladder in
+/// turn. Now every pane is asked to quit first (`request_quit`, no wait), then
+/// all are polled for exit within one `SHUTDOWN_GRACE` window, and any
+/// straggler is killed at the end (`finish_shutdown`).
 fn shutdown_all(panes: &mut [Pane], cfg: &CtxConfig, errors: &mut Vec<String>) {
     for pane in panes.iter_mut() {
         let quit_sequence = adapters::select(Some(pane.agent()), &[], cfg)
             .map(|adapter| adapter.quit_sequence())
             .unwrap_or("");
-        if let Err(e) = pane.shutdown(quit_sequence) {
+        pane.request_quit(quit_sequence);
+    }
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
+    while Instant::now() < deadline {
+        if panes.iter_mut().all(|pane| pane.try_exited()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for pane in panes.iter_mut() {
+        if let Err(e) = pane.finish_shutdown() {
             push_error(errors, format!("shutdown {}: {e}", pane.short()));
         }
     }
@@ -3654,6 +4135,7 @@ mod tests {
                 &mut selected,
                 &mut errors,
                 &mut Vec::new(),
+                &mut HashSet::new(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -4708,6 +5190,8 @@ mod tests {
             &repo,
             &env,
             &mut errors,
+            &mut Vec::new(),
+            Instant::now(),
         );
 
         assert!(
@@ -4752,6 +5236,8 @@ mod tests {
             &repo,
             &env,
             &mut errors,
+            &mut Vec::new(),
+            Instant::now(),
         );
 
         assert_eq!(
@@ -4826,6 +5312,8 @@ mod tests {
             &repo,
             &env,
             &mut errors,
+            &mut Vec::new(),
+            Instant::now(),
         );
 
         assert_eq!(
@@ -5048,6 +5536,7 @@ mod tests {
         let (mut focused, mut selected) = (0usize, 0usize);
         let mut errors = Vec::new();
         let mut reaped_codes: Vec<i32> = Vec::new();
+        let mut reaped_recent: HashSet<String> = HashSet::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline && !panes.is_empty() {
             for pane in panes.iter_mut() {
@@ -5061,6 +5550,7 @@ mod tests {
                 &mut selected,
                 &mut errors,
                 &mut reaped_codes,
+                &mut reaped_recent,
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -5070,6 +5560,12 @@ mod tests {
             "the exited pane is removed from the vector"
         );
         assert!(queues.is_empty(), "and so is its nudge queue");
+        // L19: the reaped short is remembered so it can be excluded from the
+        // stale registry snapshot's view-only rows until the next refresh.
+        assert!(
+            reaped_recent.contains(&short),
+            "the reaped pane's short is tracked for ghost-row exclusion"
+        );
         assert!(
             errors.iter().any(|e| e.contains("ended (exit")),
             "the operator is told which pane ended: {errors:?}"
@@ -5640,5 +6136,256 @@ mod tests {
             ran,
             "the hook installed before the dashboard must be the one back in place afterwards"
         );
+    }
+
+    #[test]
+    fn due_fires_only_once_the_interval_has_elapsed() {
+        let now = Instant::now();
+        assert!(!due(now, now, Duration::from_secs(1)));
+        assert!(due(
+            now,
+            now + Duration::from_secs(1),
+            Duration::from_secs(1)
+        ));
+        assert!(due(
+            now,
+            now + Duration::from_secs(5),
+            Duration::from_secs(1)
+        ));
+    }
+
+    /// M7: a modified special key carries its modifiers through the standard
+    /// xterm `CSI 1 ; <mod> <final>` / `CSI <n> ; <mod> ~` forms, so `Ctrl+Left`
+    /// is a word-left rather than a bare one-character move.
+    #[test]
+    fn encode_key_carries_modifiers_on_special_keys() {
+        assert_eq!(
+            encode_key(key(KeyCode::Left, KeyModifiers::CONTROL)),
+            b"\x1b[1;5D"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Left, KeyModifiers::NONE)),
+            b"\x1b[D",
+            "an unmodified arrow is still the bare CSI form"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::PageUp, KeyModifiers::SHIFT)),
+            b"\x1b[5;2~"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Home, KeyModifiers::ALT)),
+            b"\x1b[1;3H"
+        );
+    }
+
+    /// M8: control combinations crossterm delivers as a plain char map to their
+    /// real C0 bytes instead of typing a literal `4`/`7`/space.
+    #[test]
+    fn encode_key_maps_non_alphabetic_control_combinations() {
+        assert_eq!(
+            encode_key(key(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+            vec![0x00],
+            "Ctrl+Space is NUL"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char('_'), KeyModifiers::CONTROL)),
+            vec![b'_'],
+            "Ctrl+_ arrives as a bare '_' on some terminals -- passed through"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char('7'), KeyModifiers::CONTROL)),
+            vec![0x1f],
+            "Ctrl+_ delivered as Char('7') is 0x1f"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char('4'), KeyModifiers::CONTROL)),
+            vec![0x1c]
+        );
+        // The alphabetic branch is untouched.
+        assert_eq!(
+            encode_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![0x03]
+        );
+    }
+
+    /// M7: bare Enter still submits (`\r`); Shift+Enter sends `ESC CR`, which
+    /// does not. `ESC CR` rather than the CSI-u form on purpose -- CSI-u is
+    /// only legal once the child has negotiated the kitty keyboard protocol,
+    /// so an un-negotiated harness would type a literal `[13;2u`, while
+    /// `ESC CR` is the Meta+Enter convention it already reads as a newline.
+    #[test]
+    fn plain_enter_submits_but_shift_enter_does_not() {
+        assert_eq!(encode_key(key(KeyCode::Enter, KeyModifiers::NONE)), b"\r");
+        let shift_enter = encode_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_ne!(shift_enter, b"\r", "Shift+Enter must not submit");
+        assert_eq!(shift_enter, b"\x1b\r");
+        // Never the CSI-u form: it would be typed literally by any harness
+        // that has not enabled the protocol.
+        assert!(!shift_enter.starts_with(b"\x1b["));
+    }
+
+    /// M4: appending panes shifts a view-only selection down by the number
+    /// appended; a selection on a pane keeps naming it.
+    #[test]
+    fn insert_fixup_shifts_a_view_only_selection_past_appended_panes() {
+        // 2 panes; selection on the first view-only row (index 2); append 1.
+        assert_eq!(insert_fixup(2, 3, 2), 3);
+        // A selection on a pane (index 0 or 1) is unchanged.
+        assert_eq!(insert_fixup(2, 3, 0), 0);
+        assert_eq!(insert_fixup(2, 3, 1), 1);
+        // Two appended shifts a view-only selection by two.
+        assert_eq!(insert_fixup(2, 4, 3), 5);
+        // Nothing appended is a no-op.
+        assert_eq!(insert_fixup(2, 2, 3), 3);
+    }
+
+    /// L13: a notice shows while live and disappears once past its TTL; the
+    /// header prefers the freshest live notice.
+    #[test]
+    fn notices_expire_after_their_ttl() {
+        let now = Instant::now();
+        let mut notices = Vec::new();
+        push_notice(&mut notices, now, "spawned claude".to_string());
+        assert_eq!(live_notice(&notices, now), Some("spawned claude"));
+        assert_eq!(
+            live_notice(&notices, now + NOTICE_TTL + Duration::from_millis(1)),
+            None,
+            "a notice past its TTL is gone"
+        );
+        push_notice(
+            &mut notices,
+            now + Duration::from_millis(10),
+            "nudge received".to_string(),
+        );
+        assert_eq!(
+            live_notice(&notices, now + Duration::from_millis(20)),
+            Some("nudge received"),
+            "the freshest live notice wins"
+        );
+    }
+
+    /// MED (reassigned): a nudge marker written for a live pane is claimed and
+    /// surfaced as a notice.
+    #[test]
+    fn a_claimed_pane_nudge_marker_becomes_a_notice() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: super::pane::tests::long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "dddddddd-2222-4333-8444-555555555555".to_string(),
+            title: "wrk nudge".to_string(),
+        };
+        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let short = panes[0].short().to_string();
+
+        // The nudger writes `<short>.nudge` into the sessions dir; write it
+        // directly here rather than driving a whole `zirv ctx nudge`.
+        std::fs::create_dir_all(state.sessions()).expect("mkdir sessions");
+        std::fs::write(state.sessions().join(format!("{short}.nudge")), b"operator")
+            .expect("write marker");
+
+        let mut notices = Vec::new();
+        claim_pane_nudges(&panes, &state, &mut notices, Instant::now());
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.text.contains("nudge received") && n.text.contains(&short)),
+            "a claimed marker surfaces a notice naming the pane"
+        );
+        // Idempotent: the marker was claimed (removed), so a second sweep is
+        // silent.
+        let mut again = Vec::new();
+        claim_pane_nudges(&panes, &state, &mut again, Instant::now());
+        assert!(again.is_empty(), "a claimed marker is not claimed twice");
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// M6: applying a resize resizes every pane's screen to the new effective
+    /// main geometry and updates the stored terminal size.
+    #[test]
+    fn apply_terminal_resize_reconciles_pane_geometry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: super::pane::tests::long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "eeeeeeee-2222-4333-8444-555555555555".to_string(),
+            title: "wrk resize".to_string(),
+        };
+        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+
+        let mut term_cols = 80u16;
+        let mut term_rows = 24u16;
+        let mut full = Rect::new(0, 0, 80, 24);
+        let mut errors = Vec::new();
+        // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height = 40 - 1.
+        apply_terminal_resize(
+            100,
+            40,
+            20,
+            false,
+            &mut term_cols,
+            &mut term_rows,
+            &mut full,
+            &mut panes,
+            &mut errors,
+        );
+        assert_eq!((term_cols, term_rows), (100, 40), "stored size updated");
+        assert_eq!(full, Rect::new(0, 0, 100, 40));
+        // vt100 `size()` returns (rows, cols).
+        assert_eq!(
+            panes[0].screen().size(),
+            (39, 79),
+            "the pane's screen was resized to the new inner geometry"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// CROSS-CUTTING: the stale-token-dir sweep removes a token dir whose
+    /// `owner.pid` names a dead process, and keeps one naming a live process.
+    #[test]
+    fn sweep_stale_token_dirs_removes_only_dead_owners() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        std::fs::create_dir_all(state.dash()).expect("mkdir dash");
+
+        let dead = state.dash().join("aaaa1111-deadtoken");
+        let live = state.dash().join("bbbb2222-livetoken");
+        std::fs::create_dir_all(&dead).expect("mkdir dead");
+        std::fs::create_dir_all(&live).expect("mkdir live");
+        std::fs::write(dead.join("owner.pid"), dead_pid().to_string()).expect("write dead pid");
+        std::fs::write(live.join("owner.pid"), std::process::id().to_string())
+            .expect("write live pid");
+
+        sweep_stale_token_dirs(&state);
+
+        assert!(!dead.exists(), "the dead-owner token dir is swept");
+        assert!(live.exists(), "the live-owner token dir is kept");
+    }
+
+    /// A pid guaranteed dead by the time it is used: a real child, waited on.
+    fn dead_pid() -> u32 {
+        let argv = trivial_argv();
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        let mut child = cmd.spawn().expect("spawn trivial child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
     }
 }

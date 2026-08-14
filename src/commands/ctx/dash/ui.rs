@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
@@ -373,6 +373,27 @@ pub fn render_grid(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
     }
 }
 
+/// Pure: the absolute frame position of `screen`'s text cursor when it should
+/// be shown, given the `area` its grid was rendered into. `render_grid` draws
+/// cell `(row, col)` at `(area.x + col, area.y + row)` with no border of its
+/// own, so the cursor translates the same way. Returns `None` when the cursor
+/// is hidden (`vt100::Screen::hide_cursor`) or falls outside `area` -- a caller
+/// that gets `None` leaves the frame cursor unset, which ratatui renders as no
+/// caret at all.
+///
+/// Only the *focused* pane's screen is ever passed here: a non-focused pane's
+/// grid is not on screen, so its cursor contributes nothing.
+pub fn grid_cursor_position(area: Rect, screen: &vt100::Screen) -> Option<Position> {
+    if screen.hide_cursor() {
+        return None;
+    }
+    let (row, col) = screen.cursor_position();
+    if col >= area.width || row >= area.height {
+        return None;
+    }
+    Some(Position::new(area.x + col, area.y + row))
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
@@ -534,6 +555,21 @@ fn render_nudge_dialog(f: &mut Frame, area: Rect, draft: &NudgeDraft) {
     render_dialog(f, area, "nudge", &lines);
 }
 
+/// A single centered status line over `area`. Used by the dashboard to show
+/// "shutting down N pane(s)…" the instant a quit begins, so the operator is
+/// not left staring at a frozen alternate screen while each pane's quit grace
+/// elapses (M9).
+pub fn render_center_message(f: &mut Frame, area: Rect, message: &str) {
+    if area.is_empty() {
+        return;
+    }
+    let rect = centered(area, area.width, 1.min(area.height));
+    f.render_widget(
+        Paragraph::new(message.to_string()).style(Style::default().add_modifier(Modifier::BOLD)),
+        rect,
+    );
+}
+
 pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
     // A pane failure degrades the pane, never the dashboard: an overlay with
     // no room to draw simply does not draw. Checked here as well as in
@@ -558,14 +594,13 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
     }
 }
 
-/// The sidebar/grid glyph for a pane's state: `●` Working, `○` Idle, `⏸`
-/// WaitingInput, `✕` Ended (the exit code is not part of the glyph -- the
-/// sidebar preview text carries it when it matters).
+/// The sidebar/grid glyph for a pane's state: `●` Working, `○` Idle, `✕`
+/// Ended (the exit code is not part of the glyph -- the sidebar preview text
+/// carries it when it matters).
 pub fn glyph_for(state: &PaneState) -> char {
     match state {
         PaneState::Working => '●',
         PaneState::Idle => '○',
-        PaneState::WaitingInput => '⏸',
         PaneState::Ended(_) => '✕',
     }
 }
@@ -607,6 +642,40 @@ mod tests {
         assert_eq!(buf[(1, 0)].symbol(), " ");
         assert_eq!(buf[(2, 0)].symbol(), "a");
         assert_eq!(buf[(3, 0)].symbol(), "b");
+    }
+
+    /// HIGH-1: the focused pane's cursor translates from a screen-relative
+    /// `(row, col)` to an absolute frame position by adding the grid area's
+    /// own origin, so a caret rendered at the pane's inner offset lands where
+    /// the child actually put it.
+    #[test]
+    fn grid_cursor_translates_screen_position_into_the_grid_area() {
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        // Two lines then a partial third: the cursor sits at row 2, col 5.
+        parser.process(b"line one\r\nline two\r\nabcde");
+        let (row, col) = parser.screen().cursor_position();
+        assert_eq!((row, col), (2, 5), "sanity: vt100 cursor is where we typed");
+
+        let area = Rect::new(3, 1, 40, 10);
+        let pos = grid_cursor_position(area, parser.screen()).expect("cursor is visible");
+        assert_eq!(pos, Position::new(3 + 5, 1 + 2));
+    }
+
+    /// A hidden cursor contributes no caret, and a cursor past the grid area's
+    /// own bounds is not drawn outside it.
+    #[test]
+    fn grid_cursor_is_none_when_hidden_or_out_of_bounds() {
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        // DECTCEM off: the harness has hidden its cursor.
+        parser.process(b"\x1b[?25l");
+        assert!(grid_cursor_position(Rect::new(0, 0, 40, 10), parser.screen()).is_none());
+
+        let mut visible = vt100::Parser::new(10, 40, 0);
+        visible.process(b"\x1b[?25h");
+        // A grid area narrower/shorter than the cursor's own coordinates: the
+        // caret would land outside the drawn cells, so it is suppressed.
+        visible.process(b"\r\n\r\n\r\nx");
+        assert!(grid_cursor_position(Rect::new(0, 0, 40, 2), visible.screen()).is_none());
     }
 
     #[test]
@@ -675,7 +744,6 @@ mod tests {
     fn glyphs_match_the_spec() {
         assert_eq!(glyph_for(&PaneState::Working), '●');
         assert_eq!(glyph_for(&PaneState::Idle), '○');
-        assert_eq!(glyph_for(&PaneState::WaitingInput), '⏸');
         assert_eq!(glyph_for(&PaneState::Ended(0)), '✕');
     }
 
