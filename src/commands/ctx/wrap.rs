@@ -774,6 +774,19 @@ fn relaunch(
     })?;
 
     let command = relaunch_command(adapter, handoff, extra);
+    // FIX 2a (command-injection defense): the relaunch rebuilds its own
+    // CommandBuilder from the adapter's Command, so -- like the first launch
+    // below and the dashboard pane -- it must clear the cmd.exe argv-reparse
+    // guard itself rather than rely on supervise::spawn_tapped (the pty path
+    // never reaches it). A no-op off Windows and for any non-shim program.
+    {
+        let program = command.get_program().to_string_lossy().to_string();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        adapters::guard_cmd_shim_reparse(&program, &args)?;
+    }
     let mut builder = CommandBuilder::new(command.get_program());
     for arg in command.get_args() {
         builder.arg(arg);
@@ -1040,6 +1053,16 @@ pub fn run_with(
         pixel_height: 0,
     })?;
 
+    // FIX 2a (command-injection defense): the first-launch pty assembly does
+    // not pass through supervise::spawn_tapped's guard either, so apply the
+    // same cmd.exe argv-reparse policy over the full downstream argv -- the
+    // wrapped command's own args plus zirv's injected prompt args, which carry
+    // repo-sourced text. A no-op off Windows and for any non-shim program.
+    {
+        let mut guarded: Vec<String> = rest.to_vec();
+        guarded.extend(prompt_args.iter().cloned());
+        adapters::guard_cmd_shim_reparse(program, &guarded)?;
+    }
     let mut command = CommandBuilder::new(program);
     for arg in rest {
         command.arg(arg);

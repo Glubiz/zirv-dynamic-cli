@@ -710,6 +710,16 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // than spent silently in the background. A repo checkout may set it -- do
     // not "fix" this by adding it here, and do not remove `chrome.events`
     // from this list, which is what the exemption rests on.
+    //
+    // The exemption is safe against the cmd.exe argv-reparse injection class
+    // because the value is *charset-validated* at the end of `CtxConfig::load`
+    // (only `[A-Za-z0-9-._:/@]`, max 128 bytes): a validated model string can
+    // express no shell/cmd metacharacter, so it can never carry a payload even
+    // though it reaches an argv that `resolve_program` may route through
+    // `cmd.exe /c` on Windows. The disclosed operator-in-repo model-choice
+    // purpose survives (real model ids only ever use that charset); the RCE
+    // does not. This is a narrower, correctness-preserving guard than banning
+    // the key outright, which is why it stays out of `REPO_FORBIDDEN`.
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -787,6 +797,36 @@ impl CtxConfig {
         let mut cfg: Self = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| format!("invalid ctx config: {e}"))?;
+
+        // SECURITY (command-injection defense): `chat.model` is one of the few
+        // keys a repo `ctx.toml` may set (see `REPO_FORBIDDEN`'s `chat.model`
+        // note), and it is appended to an interactive launch's argv via
+        // `AgentAdapter::model_args`. On Windows an npm-installed agent resolves
+        // to a `.cmd` shim that zirv routes through `cmd.exe /c`, which
+        // re-parses that argv -- so an unconstrained model string is a repo-
+        // controlled path into a shell command line. Constrain it to a charset
+        // that cannot express any shell/cmd metacharacter (space, quote,
+        // `& | ^ < > ( ) % ! ` backtick, newline are all excluded), so the
+        // repo-settable exemption cannot carry a payload. `:` `/` `@` are kept
+        // so Bedrock/Vertex ids (`us.anthropic.claude-...-v1:0`,
+        // `claude-...@20250101`) stay valid. The `ZIRV_CTX_CHAT_MODEL` env path
+        // merged above is validated identically, since it merges before here,
+        // and every downstream surface (banner, dashboard header, `model_args`)
+        // reads the value only after this point.
+        if let Some(model) = cfg.chat.model.as_deref()
+            && (model.is_empty()
+                || model.len() > 128
+                || !model.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/' | '@')
+                }))
+        {
+            return Err(format!(
+                "invalid ctx config: `chat.model` may contain only ASCII letters, digits and \
+                 `-._:/@`, got '{model}'"
+            )
+            .into());
+        }
+
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
         Ok(cfg)
     }
@@ -1561,6 +1601,86 @@ mod tests {
         let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", "sonnet")]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.chat.model.as_deref(), Some("sonnet"));
+    }
+
+    /// SECURITY (FIX 1): `chat.model` is repo-settable and reaches an argv that
+    /// `resolve_program` may route through `cmd.exe /c` on Windows, so a repo
+    /// value bearing a shell/cmd metacharacter must fail the load rather than
+    /// carry a command-injection payload into the launch.
+    #[test]
+    fn a_repo_chat_model_with_a_shell_metacharacter_is_rejected() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chat]\nmodel = \"sonnet&calc\"\n",
+        )
+        .expect("write");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a metacharacter model must fail the load");
+        assert!(
+            err.to_string().contains("chat.model"),
+            "the refusal names the key: {err}"
+        );
+    }
+
+    /// FIX 1: real model ids -- a Bedrock id with `:` `/` `.`, a Vertex id with
+    /// `@`, a hyphenated alias, a bare name -- use only the allowed charset and
+    /// load cleanly, so the exemption's disclosed operator-in-repo purpose
+    /// survives the guard.
+    #[test]
+    fn real_model_ids_are_accepted() {
+        for model in [
+            "us.anthropic.claude-sonnet-4-v1:0",
+            "claude-fable-5",
+            "fable",
+            "claude-sonnet-4@20250101",
+        ] {
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[chat]\nmodel = \"{model}\"\n"),
+            )
+            .expect("write");
+            let empty = env_map(&[]);
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .unwrap_or_else(|e| panic!("'{model}' should load: {e}"));
+            assert_eq!(cfg.chat.model.as_deref(), Some(model));
+        }
+    }
+
+    /// FIX 1: the `ZIRV_CTX_CHAT_MODEL` env path merges before the same
+    /// validation, so an operator-set metacharacter is rejected identically --
+    /// the check is on the merged value, not on which layer set it.
+    #[test]
+    fn the_env_chat_model_path_is_validated_identically() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", "sonnet | calc")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("an env metacharacter model must fail too");
+        assert!(err.to_string().contains("chat.model"), "got {err}");
+    }
+
+    /// FIX 1: an over-long model string is rejected before it can reach any
+    /// argv, bounding the value regardless of its charset.
+    #[test]
+    fn an_overlong_chat_model_is_rejected() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let long = "a".repeat(129);
+        let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", long.as_str())]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a 129-char model must fail");
+        assert!(err.to_string().contains("chat.model"), "got {err}");
     }
 
     #[test]

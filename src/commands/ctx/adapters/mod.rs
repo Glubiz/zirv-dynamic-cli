@@ -269,6 +269,85 @@ pub fn resolve_program(program: &str) -> Result<ResolvedProgram, String> {
     Ok(ResolvedProgram::direct(program))
 }
 
+/// The cmd.exe metacharacters that, appearing RAW in an argument, cmd.exe
+/// re-parses out of its own `/c` command line rather than passing through to
+/// the shim it invokes. portable-pty and `std::process` both append a
+/// no-whitespace metachar-bearing argument to a Windows command line unquoted,
+/// and an embedded `"` toggles cmd.exe out of any quoting that *was* added
+/// (BatBadBut / CVE-2024-24576's quote-toggle). Newline and carriage return
+/// terminate the command line outright. Any of these in a shim-form argument
+/// is therefore a command-injection primitive, not a literal argument value.
+#[cfg(windows)]
+const CMD_REPARSE_METACHARS: &[char] =
+    &['&', '|', '<', '>', '^', '(', ')', '%', '!', '"', '\n', '\r'];
+
+/// Whether `program` + `args` is the `cmd.exe /c <shim>` launcher form that
+/// [`resolve_program`] produces for a `.cmd`/`.bat` on Windows: the program's
+/// file stem is `cmd` and the first argument is `/c`. Matched structurally
+/// (case-insensitively) rather than by identity with a specific `COMSPEC`
+/// value, so a full-path or upper-cased `CMD.EXE` is recognised too.
+#[cfg(windows)]
+fn is_cmd_shim_launch(program: &str, args: &[String]) -> bool {
+    let program_is_cmd = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.eq_ignore_ascii_case("cmd"))
+        .unwrap_or(false);
+    program_is_cmd
+        && args
+            .first()
+            .map(|first| first.eq_ignore_ascii_case("/c"))
+            .unwrap_or(false)
+}
+
+/// FIX (command-injection defense): fail-closed guard for the one launch shape
+/// where a downstream argv element becomes cmd.exe *source text* rather than a
+/// literal argument. When [`resolve_program`] rewrites an npm-installed
+/// `claude.cmd` to `cmd.exe /c <shim>`, cmd.exe parses the whole appended
+/// command line before invoking the shim, so any argument after the shim path
+/// that carries a cmd.exe metacharacter is re-interpreted as a command. Repo-
+/// controlled strings (an injected system prompt, a passed-through flag) reach
+/// this argv, so an unguarded metacharacter there is arbitrary code execution
+/// on a victim who merely runs a supervised session in a hostile checkout.
+///
+/// This rejects such a launch outright rather than trying to quote around
+/// cmd.exe (which the embedded-quote toggle defeats). It is deliberately a
+/// pure decision function over the already-resolved `program`/`args`, called
+/// at every spawn seam (`supervise::spawn_tapped` for the headless
+/// `exec`/`loop` path; the `CommandBuilder` assembly in `wrap` and
+/// `dash::pane` for the pty path), so there is one metacharacter policy.
+///
+/// A no-op off Windows, and on Windows for any launch that is not the shim
+/// form: a direct `.exe`, an `sh <script>` fake agent, or a program with no
+/// launcher prefix is spawned exactly as before. zirv's own flags never carry
+/// these characters, so only injected content is ever rejected. The two shim-
+/// prefix tokens themselves (`/c` and the shim path) are zirv-controlled and
+/// skipped.
+pub fn guard_cmd_shim_reparse(program: &str, args: &[String]) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if is_cmd_shim_launch(program, args) {
+            for arg in args.iter().skip(2) {
+                if let Some(bad) = arg.chars().find(|c| CMD_REPARSE_METACHARS.contains(c)) {
+                    return Err(format!(
+                        "refusing to launch: argument '{arg}' contains the cmd.exe \
+                         metacharacter {bad:?}. zirv routes this agent through 'cmd.exe /c' on \
+                         Windows (an npm-installed '.cmd' shim), and cmd.exe would re-parse that \
+                         character as a command rather than pass it through. This is fail-closed \
+                         protection against repo-config command injection; zirv's own arguments \
+                         never contain these characters."
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (program, args);
+    }
+    Ok(())
+}
+
 /// `PATH` plus `PATHEXT`, the search the Windows shell performs and
 /// `std::process::Command` does not. A program that already carries a
 /// directory is looked for where it says, not on `PATH`; the flag reports
@@ -672,6 +751,73 @@ mod tests {
 
         assert!(err.contains("shim-agent.py"), "the error names it: {err}");
         assert!(err.contains("shim-agent"), "and what was asked for: {err}");
+    }
+
+    /// FIX 2a: a `cmd.exe /c <shim>` launch whose downstream arguments carry a
+    /// cmd.exe metacharacter is refused, because cmd.exe re-parses that
+    /// character as a command rather than passing it through to the shim. This
+    /// is the RCE-closing guard, tested as a pure decision function -- no
+    /// process is spawned.
+    #[cfg(windows)]
+    #[test]
+    fn a_shim_form_launch_with_a_metachar_arg_is_refused() {
+        let args = vec![
+            "/c".to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+            "-p".to_string(),
+            "foo&calc".to_string(),
+        ];
+        let err = guard_cmd_shim_reparse("cmd.exe", &args)
+            .expect_err("a metachar after the shim path is command injection");
+        assert!(
+            err.contains("foo&calc"),
+            "the error names the offending arg: {err}"
+        );
+
+        // A full-path, upper-cased COMSPEC is recognised structurally too.
+        assert!(
+            guard_cmd_shim_reparse(
+                "C:\\Windows\\System32\\CMD.EXE",
+                &[
+                    "/C".to_string(),
+                    "claude.cmd".to_string(),
+                    "\"; calc; \"".to_string(),
+                ],
+            )
+            .is_err(),
+            "an embedded quote (the BatBadBut toggle) is rejected regardless of cmd casing"
+        );
+    }
+
+    /// FIX 2a: the two shim-prefix tokens (`/c` and the shim path) are
+    /// zirv-controlled and never trip the guard, and a clean downstream arg --
+    /// including a real Bedrock model id with `:` `/` `.` -- passes. Runs on
+    /// every platform: off Windows it exercises the no-op path, on Windows the
+    /// real allow decision.
+    #[test]
+    fn a_shim_form_launch_with_only_clean_args_is_allowed() {
+        let args = vec![
+            "/c".to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+            "-p".to_string(),
+            "do the thing".to_string(),
+            "--model".to_string(),
+            "us.anthropic.claude-sonnet-4-v1:0".to_string(),
+        ];
+        assert!(guard_cmd_shim_reparse("cmd.exe", &args).is_ok());
+    }
+
+    /// FIX 2a: a direct `.exe` (no cmd.exe launcher prefix) is not the shim
+    /// form, so the guard is a no-op even for an argument that would be
+    /// dangerous through cmd.exe -- `CreateProcess` receives it as a literal.
+    /// This is also what keeps the test harness's own `sh <script>` fake agents
+    /// from being rejected.
+    #[test]
+    fn a_non_shim_launch_is_never_guarded() {
+        let args = vec!["-p".to_string(), "foo&calc".to_string()];
+        assert!(guard_cmd_shim_reparse("claude.exe", &args).is_ok());
+        assert!(guard_cmd_shim_reparse("/opt/homebrew/bin/claude", &args).is_ok());
+        assert!(guard_cmd_shim_reparse("sh", &["/tmp/fake-agent.sh".to_string()]).is_ok());
     }
 
     /// The trait default: an agent zirv has verified nothing about receives

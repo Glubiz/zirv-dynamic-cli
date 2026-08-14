@@ -420,6 +420,11 @@ impl Pane {
         let (program, rest) = argv
             .split_first()
             .ok_or("dashboard pane: empty argv, nothing to spawn")?;
+        // FIX 2a (command-injection defense): a pty pane assembles its own
+        // CommandBuilder, so it never passes through supervise::spawn_tapped's
+        // guard. Apply the same cmd.exe argv-reparse policy here. A no-op off
+        // Windows and for any program that is not the `cmd.exe /c <shim>` form.
+        super::super::adapters::guard_cmd_shim_reparse(program, rest)?;
         let mut command = CommandBuilder::new(program);
         for arg in rest {
             command.arg(arg);

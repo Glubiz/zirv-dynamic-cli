@@ -755,6 +755,20 @@ pub fn injection_args_for_session(
     {
         return vec![flag.to_string(), path.display().to_string()];
     }
+    // SECURITY (FIX 2b, deferred): on Windows the inline fallback below puts the
+    // composed prompt -- which includes repo-sourced text (repo `system-prompt.md`,
+    // repo CLAUDE.md via `--append-system-prompt`) -- directly on argv. When the
+    // launch program resolves to a `cmd.exe /c <shim>` (an npm-installed claude),
+    // that argv is re-parsed by cmd.exe. That vector is already closed
+    // fail-closed by `adapters::guard_cmd_shim_reparse` at every spawn seam
+    // (FIX 2a): a repo prompt bearing a cmd.exe metacharacter refuses the launch
+    // rather than executing. The remaining hardening is to prefer this file form
+    // more aggressively on Windows (e.g. write the file even when the `--help`
+    // probe merely timed out, rather than falling back to the injectable inline
+    // form), so a legitimate prompt containing an ampersand is delivered instead
+    // of refused. Not done here because a failed probe cannot distinguish "flag
+    // genuinely absent" (forcing the file form would fail the launch on an older
+    // binary) from "probe timed out"; see Known Issues.
     adapter.system_prompt_args(&composed.text)
 }
 

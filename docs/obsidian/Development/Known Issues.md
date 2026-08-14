@@ -14,11 +14,50 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-14 (feat/dashboard, security round): cmd.exe argv-reparse injection class recorded, with the two shipped defenses and the deferred file-preference hardening -->
 <!-- Updated 2026-08-14 (feat/agent-coordination, mail trust round): two latent traps recorded -- exec/loop's mail gate keys off prompt composition; wrap's status bar paints without raw mode -->
 <!-- Updated 2026-08-14 (feat/dashboard, review fixes): `Ord::clamp` panics on a zero-width rect -->
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Windows `cmd.exe` argv reparse: repo config can reach a shell command line
+
+On Windows, `adapters::resolve_program` rewrites an npm-installed `claude.cmd`
+(or `.bat`) to `cmd.exe /c <shim>`. cmd.exe then **re-parses the whole
+appended command line** before invoking the shim, so any downstream argv
+element bearing a cmd.exe metacharacter (`& | < > ^ ( ) % ! "` newline) is
+interpreted as a *command*, not passed through as a literal argument.
+portable-pty and `std::process` both append no-whitespace metachar args RAW,
+and an embedded `"` defeats any quoting they add (BatBadBut / CVE-2024-24576
+quote-toggle). Repo-controlled strings reach this argv — an injected system
+prompt (repo `system-prompt.md` / repo CLAUDE.md via `--append-system-prompt`),
+a passed-through flag, and formerly `chat.model` — so a hostile checkout could
+achieve arbitrary code execution on a victim who merely ran a supervised
+session in it. Two defenses ship:
+
+1. **`chat.model` charset validation** (`config::CtxConfig::load`): the one
+   repo-settable string on this path is constrained to `[A-Za-z0-9-._:/@]`, so
+   it cannot express a metacharacter (see [[Decision Log]] chat.model security
+   amendment).
+2. **`adapters::guard_cmd_shim_reparse`**: a fail-closed guard at every spawn
+   seam (`supervise::spawn_tapped` for the `exec`/`loop` std::process path; the
+   `CommandBuilder` assembly in `wrap` and `dash::pane` for the pty path) that
+   rejects a launch whose program is the `cmd.exe /c <shim>` form and whose
+   args (after the shim path) carry a cmd.exe metacharacter. A no-op off
+   Windows and for any non-shim program, so `sh <script>` fake agents and
+   direct `.exe` launches are untouched.
+
+**Deferred (FIX 2b, `// SECURITY:` in `prompt::injection_args_for_session`):**
+on Windows the guard *rejects* an otherwise-legitimate injected prompt that
+contains an ampersand rather than delivering it, because the metachar guard is
+fail-closed. The proper hardening is to prefer claude's
+`--append-system-prompt-file` form more aggressively on Windows (write the
+private prompt file even when the `--help` probe merely timed out, instead of
+falling back to the injectable inline `--append-system-prompt` argv). Not done
+because a failed probe cannot distinguish "flag genuinely absent on an older
+binary" (forcing the file form would fail that launch) from "probe timed out".
+The RCE itself is closed by defenses 1–2; this is a usability follow-up.
 
 ## `x.saturating_sub(n).clamp(1, x)` panics when `x` is 0
 

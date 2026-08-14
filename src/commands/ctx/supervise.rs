@@ -246,10 +246,30 @@ impl OutputTap {
     }
 }
 
+/// FIX 2a: refuse a launch that would let a downstream argv element be
+/// re-parsed by cmd.exe -- the `cmd.exe /c <shim>` form `resolve_program`
+/// produces on Windows for an npm-installed `.cmd`. Extracts the already-
+/// resolved program and arguments from the assembled `Command` and defers to
+/// the one metacharacter policy in `adapters::guard_cmd_shim_reparse`. A
+/// no-op off Windows and for any non-shim program.
+fn guard_cmd_shim_reparse(command: &Command) -> CtxResult<()> {
+    let program = command.get_program().to_string_lossy().to_string();
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    super::adapters::guard_cmd_shim_reparse(&program, &args).map_err(Into::into)
+}
+
 /// Like `spawn`, but the child's stdout and stderr are piped so they can be
 /// matched. Each stream is forwarded to this process's corresponding stream
 /// unchanged, line by line.
 pub fn spawn_tapped(mut command: Command) -> CtxResult<(Child, OutputTap)> {
+    // FIX 2a (command-injection defense): both std::process supervisors
+    // (`exec`, `loop`) reach every spawn -- first launch and every restart --
+    // through here, so this is their single chokepoint for the cmd.exe
+    // argv-reparse guard. A no-op off Windows and for any non-shim program.
+    guard_cmd_shim_reparse(&command)?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
