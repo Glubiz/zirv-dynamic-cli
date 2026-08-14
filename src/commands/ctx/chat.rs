@@ -451,7 +451,16 @@ pub(crate) fn dash_orchestrator_pane(
     // `wrap` fallback below deliberately does not: its relaunches expect the
     // harness to mint a fresh conversation each time. Empty for any adapter
     // with no verified pin flag (codex).
-    argv.extend(adapter.session_pin_args(session));
+    //
+    // D3: unless the operator already pinned it themselves. `zirv chat --
+    // --resume <id>` is an explicit instruction about which conversation this
+    // seat is, and appending a fresh `--session-id` on top of it hands the
+    // harness two contradictory ids and gets the launch refused. The
+    // operator's own flag wins; the roster then simply records the id they
+    // named, which is the one `--resume` can find anyway.
+    if !super::exec::pins_an_existing_conversation(&argv) {
+        argv.extend(adapter.session_pin_args(session));
+    }
 
     PaneSpec {
         agent_name: launch.agent_name,
@@ -815,6 +824,51 @@ mod tests {
             "the pinned id is the pane's own registry session id: {:?}",
             pane.argv
         );
+    }
+
+    /// D3: an operator who passed their own resume flag has already said which
+    /// conversation this seat is. Appending a fresh `--session-id` on top of it
+    /// hands the harness two contradictory ids and gets the launch refused
+    /// outright -- and inside a dashboard the pane then died on the spot and was
+    /// reaped, so the failure was invisible.
+    #[test]
+    fn an_operators_own_resume_flag_suppresses_the_session_pin() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let session = "11111111-2222-4333-8444-555555555555";
+        let existing = "99999999-8888-4777-8666-555555555555";
+        for extra in [
+            vec!["--resume".to_string(), existing.to_string()],
+            vec![format!("--resume={existing}")],
+            vec!["--session-id".to_string(), existing.to_string()],
+            vec![format!("--session-id={existing}")],
+            vec!["-c".to_string()],
+            vec!["--continue".to_string()],
+            vec!["--fork-session".to_string()],
+        ] {
+            let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+            let launch = build_launch(&adapter, None, &extra);
+            let pane =
+                dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false);
+
+            assert!(
+                !pane.argv.iter().any(|a| a == session),
+                "no fresh pin may be appended alongside {extra:?}: {:?}",
+                pane.argv
+            );
+            assert!(
+                pane.argv.iter().any(|a| a.contains(existing)
+                    || a == "-c"
+                    || a == "--continue"
+                    || a == "--fork-session"),
+                "and the operator's own flag still reaches the harness: {:?}",
+                pane.argv
+            );
+        }
     }
 
     // The `chat.model` disclosure. `chat.model` is repo-settable because the

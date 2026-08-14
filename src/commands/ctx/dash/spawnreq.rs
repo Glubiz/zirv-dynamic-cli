@@ -62,11 +62,23 @@ pub struct SpawnRequest {
 /// `ok: true` always carries `short` (the freshly spawned pane's own
 /// registry short id, the same address `zirv ctx nudge`/`zirv ctx send`
 /// would use to reach it).
+///
+/// O2: `retryable` splits the two very different things an `ok: false` can
+/// mean. A **policy** refusal (the agent gate, the argv guard, the pane cap)
+/// is this operator's configuration saying no, and running the same task
+/// headless instead would route straight around it -- so the requester must
+/// fail. A **channel-level** failure (the request named another repo, the pty
+/// spawn itself failed) says nothing about whether the task is allowed; the
+/// headless path would have handled it, and suppressing that fallback turned a
+/// recoverable mismatch into a dead delegation. Defaults to `false`, so an ack
+/// written by an older build is read as the refusal it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnAck {
     pub ok: bool,
     pub short: Option<String>,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 /// `<state>/dash/<dash_short>-<token>/requests`. `dash_short` is this
@@ -151,13 +163,22 @@ pub fn write_request(dir: &Path, req: &SpawnRequest) -> CtxResult<PathBuf> {
     write_atomic_private(dir, &format!("req-{}.json", uuid::Uuid::new_v4()), &body)
 }
 
-/// Every currently-queued request in `dir`: read, then deleted immediately
-/// -- a request is claimed at most once, whatever the dashboard goes on to
-/// do with it. A file that fails to parse (a torn write from a crash, or
-/// some other process's stray file) is skipped and removed rather than left
-/// to jam every later tick's listing forever; only `req-*.json` files are
-/// considered at all, so an `ack-*.json` this same directory also holds is
-/// never misread as a request.
+/// Every currently-queued request in `dir`, **claimed by rename**: each
+/// `req-<uuid>.json` is renamed to its own `claim-req-<uuid>` in the same
+/// operation that takes it off the queue, and only then read back. A file
+/// that fails to parse (a torn write from a crash, or some other process's
+/// stray file) is skipped and its claim removed rather than left to jam every
+/// later tick's listing forever; only `req-*.json` files are considered at
+/// all, so neither an `ack-*.json` nor a `claim-*` this same directory also
+/// holds is ever misread as a request.
+///
+/// O6: taking used to be a *delete*, with the claim written afterwards by
+/// `dash::mod::claim_batch`. Between those two writes the request existed
+/// nowhere on disk -- neither queued nor claimed -- so a requester whose ack
+/// timed out inside that window saw no claim, concluded nobody was listening,
+/// and ran the same task headless while the dashboard was already spawning it.
+/// One rename is both halves at once, so the window does not exist: the file
+/// is a request until it is a claim, with no instant in between.
 pub fn take_requests(dir: &Path) -> Vec<(PathBuf, SpawnRequest)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -174,12 +195,26 @@ pub fn take_requests(dir: &Path) -> Vec<(PathBuf, SpawnRequest)> {
         if !is_request {
             continue;
         }
-        let contents = std::fs::read_to_string(&path);
-        let _ = std::fs::remove_file(&path);
-        let Ok(contents) = contents else { continue };
-        let Ok(req) = serde_json::from_str::<SpawnRequest>(&contents) else {
+        let Some(stem) = request_stem(&path) else {
             continue;
         };
+        let claim = claim_path(dir, &stem);
+        // The claim *is* the take. A failed rename leaves the request queued
+        // for the next tick rather than consuming it into nothing.
+        if std::fs::rename(&path, &claim).is_err() {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&claim) else {
+            let _ = std::fs::remove_file(&claim);
+            continue;
+        };
+        let Ok(req) = serde_json::from_str::<SpawnRequest>(&contents) else {
+            let _ = std::fs::remove_file(&claim);
+            continue;
+        };
+        // The *request* path, not the claim path: every caller on both sides
+        // of the channel keys its ack off `request_stem` of the name the
+        // requester itself wrote.
         out.push((path, req));
     }
     out
@@ -205,21 +240,14 @@ pub fn write_ack(dir: &Path, request_stem: &str, ack: &SpawnAck) -> CtxResult<()
     Ok(())
 }
 
-/// `claim-<request_stem>`: written by the dashboard the moment
-/// [`take_requests`] hands it a request, before any fulfilment work starts.
-/// Deliberately extensionless so it can never be mistaken for a `req-*.json`
-/// or an `ack-*.json` by either side's own directory listing.
+/// `claim-<request_stem>`: the name [`take_requests`] renames a request to the
+/// moment it takes it, before any fulfilment work starts. Deliberately
+/// extensionless so it can never be mistaken for a `req-*.json` or an
+/// `ack-*.json` by either side's own directory listing. Its contents are the
+/// request's own JSON (that is what was renamed), but nothing ever parses them:
+/// the file's existence is the whole signal.
 fn claim_path(dir: &Path, request_stem: &str) -> PathBuf {
     dir.join(format!("claim-{request_stem}"))
-}
-
-/// Records that this dashboard has taken responsibility for the request whose
-/// file stem is `request_stem`. See [`is_claimed`] for what the requester does
-/// with it. Contents are advisory only -- the file's existence is the whole
-/// signal -- so nothing ever parses it.
-pub fn write_claim(dir: &Path, request_stem: &str) -> CtxResult<()> {
-    write_atomic_private(dir, &format!("claim-{request_stem}"), "claimed")?;
-    Ok(())
 }
 
 /// Withdraws a claim: called when fulfilment *failed* outright, so the claim
@@ -304,13 +332,17 @@ mod tests {
         let taken = take_requests(&dir);
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].1, req);
-        assert!(!path.exists(), "take_requests deletes the file it read");
+        assert!(
+            !path.exists(),
+            "take_requests takes the request off the queue"
+        );
 
         let stem = request_stem(&path).expect("stem");
         let ack = SpawnAck {
             ok: true,
             short: Some("bbbb2222".to_string()),
             reason: None,
+            retryable: false,
         };
         write_ack(&dir, &stem, &ack).expect("write_ack");
 
@@ -328,6 +360,49 @@ mod tests {
         let taken = take_requests(&dir);
         assert!(taken.is_empty(), "a malformed request yields nothing");
         assert!(!bad.exists(), "the malformed file is still removed");
+        assert!(
+            !is_claimed(&dir, "req-not-json"),
+            "and its claim is withdrawn rather than left standing for a request nobody can read"
+        );
+    }
+
+    /// O6: taking a request and claiming it are the same rename, so there is no
+    /// instant in which the request is neither queued nor claimed -- the window
+    /// a requester's ack timeout used to fall into and double-run the task.
+    #[test]
+    fn taking_a_request_claims_it_in_the_same_operation() {
+        let (_tmp, dir) = dir();
+        let path = write_request(&dir, &sample_request()).expect("write_request");
+        let stem = request_stem(&path).expect("stem");
+        assert!(
+            !is_claimed(&dir, &stem),
+            "nothing is claimed before the take"
+        );
+
+        let taken = take_requests(&dir);
+
+        assert_eq!(taken.len(), 1);
+        assert!(!path.exists(), "the request file is gone");
+        assert!(
+            is_claimed(&dir, &stem),
+            "and it is claimed already -- both are one rename"
+        );
+        assert!(
+            take_requests(&dir).is_empty(),
+            "a claimed request is never taken a second time"
+        );
+    }
+
+    /// The requester's own timeout cleanup runs against a path the dashboard
+    /// may already have renamed away: an absent file is not an error.
+    #[test]
+    fn removing_an_already_taken_request_is_not_an_error() {
+        let (_tmp, dir) = dir();
+        let path = write_request(&dir, &sample_request()).expect("write_request");
+        assert_eq!(take_requests(&dir).len(), 1);
+
+        let err = std::fs::remove_file(&path).expect_err("already renamed away");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -341,16 +416,22 @@ mod tests {
         assert!(take_requests(&absent).is_empty());
     }
 
-    /// F10: a claim is written before fulfilment and is neither a request nor
-    /// an ack, so neither side's own listing may pick it up.
+    /// Writes one request and takes it, so the directory holds exactly one
+    /// claim. Returns that claim's request stem.
+    fn claim_one(dir: &Path) -> String {
+        let path = write_request(dir, &sample_request()).expect("write_request");
+        assert_eq!(take_requests(dir).len(), 1);
+        request_stem(&path).expect("stem")
+    }
+
+    /// F10: a claim exists from the moment a request is taken and is neither a
+    /// request nor an ack, so neither side's own listing may pick it up.
     #[test]
     fn a_claim_is_visible_to_the_requester_and_invisible_to_take_requests() {
         let (_tmp, dir) = dir();
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        assert!(!is_claimed(&dir, "req-abc"), "nothing is claimed yet");
+        let stem = claim_one(&dir);
 
-        write_claim(&dir, "req-abc").expect("write_claim");
-        assert!(is_claimed(&dir, "req-abc"));
+        assert!(is_claimed(&dir, &stem));
         assert!(
             !is_claimed(&dir, "req-other"),
             "a claim only covers its own request"
@@ -360,7 +441,7 @@ mod tests {
             "a claim file must never be read back as a request"
         );
         assert!(
-            wait_for_ack(&dir, "req-abc", Duration::from_millis(50)).is_none(),
+            wait_for_ack(&dir, &stem, Duration::from_millis(50)).is_none(),
             "a claim is not an ack"
         );
     }
@@ -381,7 +462,6 @@ mod tests {
         let (_tmp, dir) = dir();
         let path = write_request(&dir, &sample_request()).expect("write_request");
         assert!(path.is_file());
-        write_claim(&dir, "req-x").expect("write_claim");
         write_ack(
             &dir,
             "req-x",
@@ -389,6 +469,7 @@ mod tests {
                 ok: true,
                 short: Some("bbbb2222".to_string()),
                 reason: None,
+                retryable: false,
             },
         )
         .expect("write_ack");
@@ -402,8 +483,9 @@ mod tests {
         assert!(lingering.is_empty(), "got {lingering:?}");
 
         // And the renamed files are all readable as themselves.
+        let stem = request_stem(&path).expect("stem");
         assert_eq!(take_requests(&dir).len(), 1);
-        assert!(is_claimed(&dir, "req-x"));
+        assert!(is_claimed(&dir, &stem));
         assert!(wait_for_ack(&dir, "req-x", Duration::from_millis(50)).is_some());
     }
 
@@ -435,12 +517,12 @@ mod tests {
     #[test]
     fn remove_claim_withdraws_a_claim() {
         let (_tmp, dir) = dir();
-        write_claim(&dir, "req-abc").expect("write_claim");
-        assert!(is_claimed(&dir, "req-abc"));
-        remove_claim(&dir, "req-abc");
-        assert!(!is_claimed(&dir, "req-abc"));
+        let stem = claim_one(&dir);
+        assert!(is_claimed(&dir, &stem));
+        remove_claim(&dir, &stem);
+        assert!(!is_claimed(&dir, &stem));
         // Idempotent: withdrawing twice is not an error.
-        remove_claim(&dir, "req-abc");
+        remove_claim(&dir, &stem);
     }
 
     #[test]

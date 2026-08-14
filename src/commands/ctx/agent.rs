@@ -92,6 +92,78 @@ pub fn exit_note(code: i32) -> Option<String> {
 /// directory has not yet been reaped) is not kept waiting for long.
 const DASH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How much longer a *claimed* request is waited out past [`DASH_ACK_TIMEOUT`]
+/// before the delegation is called a failure.
+///
+/// O3: a claim used to be reported as success on the spot -- exit 0, "the
+/// dashboard accepted this request" -- for a task that might never run at all
+/// (a dashboard that crashed between claiming and spawning leaves exactly that
+/// state behind). A claim is good evidence the answer is merely slow, so it
+/// buys real extra time; but when the extra time runs out too, the honest
+/// answer is a failure, not a success.
+const DASH_CLAIM_EXTENSION: Duration = Duration::from_secs(10);
+
+/// The requester's own reading of one [`spawnreq::SpawnAck`].
+///
+/// O2: `ok: false` is two different answers. A policy refusal ends the
+/// delegation -- falling back to headless would run a task this operator's own
+/// configuration just refused. A `retryable` refusal is the channel saying it
+/// could not carry the request, which the headless path was never subject to,
+/// so the caller falls through to it with the reason printed. `None` here is
+/// exactly that fall-through.
+fn answer_for_ack<W: Write>(ack: spawnreq::SpawnAck, w: &mut W) -> Option<CtxResult<i32>> {
+    if ack.ok {
+        let short = ack.short.unwrap_or_default();
+        return Some(
+            writeln!(w, "spawned in dashboard as {short}")
+                .map(|_| 0)
+                .map_err(|e| e.into()),
+        );
+    }
+    let reason = ack
+        .reason
+        .unwrap_or_else(|| "the dashboard refused this request".to_string());
+    if ack.retryable {
+        eprintln!("zirv ctx agent: {reason}; running headless");
+        return None;
+    }
+    Some(writeln!(w, "{reason}").map(|_| 1).map_err(|e| e.into()))
+}
+
+/// O3: a request that was claimed but not acked within [`DASH_ACK_TIMEOUT`]
+/// gets [`DASH_CLAIM_EXTENSION`] more, and then an honest answer either way.
+///
+/// Deliberately **no** headless fallback on the timeout, whatever the outcome:
+/// the dashboard holds the claim and may still be spawning the pane, so a
+/// second run of the same prompt is the one failure worse than a clear error.
+/// A retryable refusal that arrives inside the extension is the one exception,
+/// and the ack itself authorises it: the dashboard has answered, and its answer
+/// is that it spawned nothing. `None` is that fall-through.
+fn wait_out_a_claimed_request<W: Write>(
+    dir: &Path,
+    stem: &str,
+    extension: Duration,
+    w: &mut W,
+) -> Option<CtxResult<i32>> {
+    match spawnreq::wait_for_ack(dir, stem, extension) {
+        Some(ack) => answer_for_ack(ack, w),
+        None => Some(
+            writeln!(
+                w,
+                "dashboard claimed the request but never confirmed; check zirv ctx status / the \
+                 dashboard"
+            )
+            .map(|_| EXIT_DASH_UNCONFIRMED)
+            .map_err(|e| e.into()),
+        ),
+    }
+}
+
+/// The exit code a delegation that could not be confirmed reports. A plain
+/// `1`: the task may or may not be running, which for the caller is a failure
+/// like any other -- the message on stdout is what says which kind.
+const EXIT_DASH_UNCONFIRMED: i32 = 1;
+
 /// When this process is itself a dashboard pane's own child
 /// (`spawnreq::DASH_REQUESTS_ENV` set, and the directory it names still
 /// exists -- the dashboard deletes it on quit, see `dash::on_quit`), asks
@@ -102,18 +174,20 @@ const DASH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// `DASH_ACK_TIMEOUT` for the matching ack.
 ///
 /// `Some(result)` means the dashboard gave a definitive answer -- a pane was
-/// spawned, the request was refused outright, or the request was *claimed*
-/// and the answer is merely slow -- and the caller's own headless path must
-/// NOT run.
+/// spawned, the request was refused on policy grounds, or it was *claimed* and
+/// then never confirmed even after `DASH_CLAIM_EXTENSION` (O3) -- and the
+/// caller's own headless path must NOT run.
 ///
 /// `None` means the caller falls through to today's headless behavior
 /// unchanged, which covers: no dashboard to ask (env unset, or the directory
 /// is gone -- both silent, byte-for-byte the pre-Task-11 behavior); options a
 /// pane cannot honour (`--max-restarts`/`--timeout-secs`/`-- flags`, notice
 /// printed); a prompt that would be misread as a flag (notice printed); a
-/// request that could not even be written (notice printed); and an
-/// unclaimed ack timeout (notice printed, since that is a live channel that
-/// simply did not respond).
+/// request that could not even be written (notice printed); an unclaimed ack
+/// timeout (notice printed, since that is a live channel that simply did not
+/// respond); and a `retryable` refusal, where the dashboard has answered that
+/// it spawned nothing for a reason that says nothing about whether the task
+/// may run (O2).
 fn try_join_dashboard<W: Write>(
     args: &AgentArgs,
     prompt: &str,
@@ -121,6 +195,7 @@ fn try_join_dashboard<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
     ack_timeout: Duration,
+    claim_extension: Duration,
 ) -> Option<CtxResult<i32>> {
     let dir = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from)?;
     if !dir.is_dir() {
@@ -176,34 +251,16 @@ fn try_join_dashboard<W: Write>(
         return None;
     };
     match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
-        Some(ack) if ack.ok => {
-            let short = ack.short.unwrap_or_default();
-            Some(
-                writeln!(w, "spawned in dashboard as {short}")
-                    .map(|_| 0)
-                    .map_err(|e| e.into()),
-            )
-        }
-        Some(ack) => {
-            let reason = ack
-                .reason
-                .unwrap_or_else(|| "the dashboard refused this request".to_string());
-            Some(writeln!(w, "{reason}").map(|_| 1).map_err(|e| e.into()))
-        }
-        // F10: `take_requests` deletes the request the moment the dashboard
+        Some(ack) => answer_for_ack(ack, w),
+        // F10: `take_requests` takes the request the moment the dashboard
         // picks it up, so a timeout here is ambiguous -- nobody was
         // listening, or somebody took it and is still spawning. The claim
         // file is what distinguishes the two. Without this check both ends
         // ran the same task, and one `zirv ctx agent` became two live
         // sessions working the same prompt.
-        None if spawnreq::is_claimed(&dir, &stem) => Some(
-            writeln!(
-                w,
-                "the dashboard accepted this request (ack pending); not falling back to headless"
-            )
-            .map(|_| 0)
-            .map_err(|e| e.into()),
-        ),
+        None if spawnreq::is_claimed(&dir, &stem) => {
+            wait_out_a_claimed_request(&dir, &stem, claim_extension, w)
+        }
         None => {
             // R5: nothing claimed it, so nothing is going to. Take the request
             // file back before falling through: `take_requests` runs every
@@ -229,7 +286,15 @@ pub fn run_with<W: Write>(
     validate_flags(&args.flags)?;
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
 
-    if let Some(result) = try_join_dashboard(args, &prompt, w, repo, env, DASH_ACK_TIMEOUT) {
+    if let Some(result) = try_join_dashboard(
+        args,
+        &prompt,
+        w,
+        repo,
+        env,
+        DASH_ACK_TIMEOUT,
+        DASH_CLAIM_EXTENSION,
+    ) {
         return result;
     }
 
@@ -704,6 +769,7 @@ mod tests {
             tmp.path(),
             &|k| env.get(k).cloned(),
             Duration::from_millis(200),
+            Duration::from_millis(200),
         );
 
         assert!(
@@ -748,6 +814,7 @@ mod tests {
                 tmp.path(),
                 &|k| env.get(k).cloned(),
                 Duration::from_millis(200),
+                Duration::from_millis(200),
             );
             assert!(joined.is_none(), "must fall back to the headless path");
             assert!(
@@ -770,6 +837,7 @@ mod tests {
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
+            Duration::from_millis(200),
             Duration::from_millis(200),
         );
         assert!(joined.is_none(), "an unanswered request still falls back");
@@ -797,6 +865,7 @@ mod tests {
             tmp.path(),
             &|k| env.get(k).cloned(),
             Duration::from_millis(200),
+            Duration::from_millis(200),
         );
         assert!(joined.is_none(), "nobody answered, so this runs headless");
 
@@ -811,25 +880,88 @@ mod tests {
         );
     }
 
-    /// F10: the dashboard deletes a request the instant it takes it, so an
-    /// ack timeout alone cannot tell "nobody is listening" from "somebody is
-    /// still spawning it". Without the claim check both ends ran the same
-    /// prompt.
+    /// Claims the next request exactly the way the dashboard's own tick does
+    /// -- `take_requests`, which claims by renaming (O6) -- and then runs
+    /// `respond` with its stem. Returns the request's raw contents.
+    fn claim_next_request(dir: std::path::PathBuf, respond: impl Fn(&std::path::Path, &str)) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let taken = crate::commands::ctx::dash::spawnreq::take_requests(&dir);
+            if let Some((path, _)) = taken.first() {
+                let stem = crate::commands::ctx::dash::spawnreq::request_stem(path).expect("stem");
+                respond(&dir, &stem);
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("no spawn request appeared within the deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// O3: a claim buys the dashboard extra time, not a free pass. When the
+    /// extension runs out with no ack, the delegation fails honestly -- and
+    /// still does not double-run headless, because the dashboard holds the
+    /// claim and may yet spawn the pane.
     #[test]
-    fn a_claimed_request_never_double_runs_headless() {
+    fn a_claimed_but_unconfirmed_request_fails_instead_of_reporting_success() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let (requests_dir, env) = live_dashboard_dir(tmp.path());
 
-        // Claims the request the way `handle_spawn_requests` does -- before
-        // fulfilment -- and then deliberately never acks.
+        // Takes (and so claims) the request, then deliberately never acks.
         let claimer = std::thread::spawn({
             let dir = requests_dir.clone();
+            move || claim_next_request(dir, |_dir, _stem| {})
+        });
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        );
+        claimer.join().expect("claimer thread");
+
+        let code = joined
+            .expect("a claimed request must not fall back to headless")
+            .expect("writes its line");
+        assert_eq!(code, 1, "an unconfirmed spawn is a failure, not a success");
+        let printed = String::from_utf8_lossy(&out);
+        assert!(
+            printed.contains("claimed the request but never confirmed")
+                && printed.contains("zirv ctx status"),
+            "got {printed}"
+        );
+    }
+
+    /// O3, the other half: an ack that arrives late -- after the first
+    /// timeout, inside the extension the claim bought -- is a success.
+    #[test]
+    fn a_late_ack_inside_the_claim_extension_still_succeeds() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
             move || {
-                intercept_next_request(dir, |dir, stem| {
-                    crate::commands::ctx::dash::spawnreq::write_claim(dir, stem)
-                        .expect("write claim");
+                claim_next_request(dir, |dir, stem| {
+                    // Past the requester's own first timeout, well inside the
+                    // extension: a slow spawn, not a dead dashboard.
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    std::fs::write(
+                        dir.join(format!("ack-{stem}.json")),
+                        r#"{"ok":true,"short":"bbbb2222","reason":null}"#,
+                    )
+                    .expect("write ack");
                 })
             }
         });
@@ -842,18 +974,102 @@ mod tests {
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
-            Duration::from_millis(300),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
         );
-        claimer.join().expect("claimer thread");
+        responder.join().expect("responder thread");
 
         let code = joined
-            .expect("a claimed request must not fall back")
+            .expect("claimed, then acked")
             .expect("writes its line");
         assert_eq!(code, 0);
-        let printed = String::from_utf8_lossy(&out);
         assert!(
-            printed.contains("accepted") && printed.contains("not falling back"),
-            "got {printed}"
+            String::from_utf8_lossy(&out).contains("bbbb2222"),
+            "got {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// O2: a refusal the dashboard itself marks `retryable` -- a repo
+    /// mismatch, a pty that would not open -- says nothing about whether the
+    /// task may run, and the headless path was never subject to it. The join
+    /// declines rather than killing the delegation outright.
+    #[test]
+    fn a_retryable_refusal_falls_back_to_the_headless_path() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || {
+                respond_to_next_request(
+                    dir,
+                    r#"{"ok":false,"short":null,"reason":"this dashboard only spawns panes in its own repo","retryable":true}"#,
+                )
+            }
+        });
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        responder.join().expect("responder thread");
+
+        assert!(
+            joined.is_none(),
+            "a channel-level failure must not suppress the headless path"
+        );
+        assert!(out.is_empty(), "nothing is reported as spawned");
+    }
+
+    /// O2, the other class: a policy refusal ends the delegation. Falling back
+    /// to headless would run a task this operator's own configuration just
+    /// refused.
+    #[test]
+    fn a_policy_refusal_ends_the_delegation() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || {
+                respond_to_next_request(
+                    dir,
+                    r#"{"ok":false,"short":null,"reason":"claude is disabled by .zirv/.settings.toml","retryable":false}"#,
+                )
+            }
+        });
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        responder.join().expect("responder thread");
+
+        let code = joined.expect("a refusal is definitive").expect("writes");
+        assert_eq!(code, 1);
+        assert!(
+            String::from_utf8_lossy(&out).contains("disabled"),
+            "got {}",
+            String::from_utf8_lossy(&out)
         );
     }
 
@@ -874,6 +1090,7 @@ mod tests {
             &mut out,
             tmp.path(),
             &|k| env.get(k).cloned(),
+            Duration::from_millis(200),
             Duration::from_millis(200),
         );
         assert!(joined.is_none());

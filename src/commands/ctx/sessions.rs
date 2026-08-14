@@ -83,8 +83,10 @@ fn non_empty(value: Option<String>) -> Option<String> {
 }
 
 /// Why this process looks like it is already running *inside* an agent
-/// session, or `None` when nothing says so. Pure: it reads the caller's
-/// `EnvLookup` only, never the process environment or the filesystem.
+/// session, or `None` when nothing says so. Reads the caller's `EnvLookup`
+/// only, never the process environment -- and the filesystem only to ask
+/// whether the one directory-valued piece of evidence
+/// (`DASH_REQUESTS_ENV`) still exists (O5, below).
 ///
 /// Interactive supervision nested inside an existing session is not merely
 /// redundant, it is destructive. The nested `wrap` binds its own turn-signal
@@ -115,7 +117,18 @@ pub fn nested_session_evidence(env: super::config::EnvLookup<'_>) -> Option<Stri
     // child's own further children (e.g. a nested `zirv ctx agent`) must
     // still be able to reach the same spawn-request channel, which scrubbing
     // it there would break.
-    if non_empty(env(super::dash::spawnreq::DASH_REQUESTS_ENV)).is_some() {
+    //
+    // O5: the directory has to still exist, exactly as `agent::
+    // try_join_dashboard` requires before it will use the channel. The
+    // dashboard removes it on quit, so a shell that survived one -- a pane
+    // child still sitting at a prompt after the dashboard closed -- carries a
+    // stale value naming nothing. Treating that as evidence refused a session
+    // no dashboard owns any more, and the two readers of this variable
+    // disagreeing about what "set" means was the bug: one channel, one
+    // liveness test.
+    if non_empty(env(super::dash::spawnreq::DASH_REQUESTS_ENV))
+        .is_some_and(|dir| Path::new(&dir).is_dir())
+    {
         found.push(format!(
             "{} is set (a dashboard pane owns this terminal)",
             super::dash::spawnreq::DASH_REQUESTS_ENV
@@ -1497,9 +1510,17 @@ mod tests {
     /// dashboard's own launch.
     #[test]
     fn dash_requests_env_trips_the_nested_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp
+            .path()
+            .join("dash")
+            .join("aaaa1111-0123")
+            .join("requests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = dir.display().to_string();
         let env = env_map(&[(
             super::super::dash::spawnreq::DASH_REQUESTS_ENV,
-            "/tmp/dash/aaaa1111-0123456789abcdef/requests",
+            dir.as_str(),
         )]);
         let evidence =
             nested_session_evidence(&|k| env.get(k).cloned()).expect("a pane owns this terminal");
@@ -1508,6 +1529,29 @@ mod tests {
             "got {evidence}"
         );
         assert!(evidence.contains("dashboard pane"), "got {evidence}");
+    }
+
+    /// O5: the dashboard removes its request directory on quit, so a shell
+    /// that outlived one carries a value naming nothing. `agent::
+    /// try_join_dashboard` has always required the directory to exist before
+    /// it will use the channel; this guard must agree, or a survivor process
+    /// is refused an interactive session on the strength of a dashboard that
+    /// is gone.
+    #[test]
+    fn a_stale_dash_requests_path_is_not_evidence_of_a_live_dashboard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let gone = tmp
+            .path()
+            .join("dash")
+            .join("aaaa1111-0123")
+            .join("requests")
+            .display()
+            .to_string();
+        let env = env_map(&[(
+            super::super::dash::spawnreq::DASH_REQUESTS_ENV,
+            gone.as_str(),
+        )]);
+        assert_eq!(nested_session_evidence(&|k| env.get(k).cloned()), None);
     }
 
     #[test]

@@ -65,16 +65,24 @@ pub struct SpawnDraft {
 }
 
 /// Where a submitted nudge goes: an attached pane this dashboard owns
-/// (`AttachedPane`, indexing into the live `panes` vec -- idle-gated visible
-/// injection, or queued if the pane is still `Working`), or a session this
-/// dashboard did not spawn (`ViewOnlySession`, routed through
-/// `sessions::run_nudge_with`'s existing headless marker+mail semantics).
-/// `None` when nothing was selected at the moment `prefix,n` was pressed.
+/// (`AttachedPane` -- idle-gated visible injection, or queued if the pane is
+/// still `Working`), or a session this dashboard did not spawn
+/// (`ViewOnlySession`, routed through `sessions::run_nudge_with`'s existing
+/// headless marker+mail semantics). `None` when nothing was selected at the
+/// moment `prefix,n` was pressed.
+///
+/// D1: `AttachedPane` names the pane by its **registry short id**, exactly as
+/// `ViewOnlySession` does, not by its index in the live `panes` vector. The
+/// dialog stays open across as many ticks as the operator takes to type, and a
+/// pane reaped (or spawned) in the meantime shifts every index after it -- so
+/// a captured index quietly re-aimed the nudge at whichever pane had slid into
+/// that slot. A short id either still names a live pane at Enter time or names
+/// nothing at all, and "nothing" is a notice, never a misdelivery.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum NudgeTarget {
     #[default]
     None,
-    AttachedPane(usize),
+    AttachedPane(String),
     ViewOnlySession(String),
 }
 
@@ -514,7 +522,7 @@ fn render_restore_dialog(f: &mut Frame, area: Rect, view: &RestoreView) {
 
 fn render_nudge_dialog(f: &mut Frame, area: Rect, draft: &NudgeDraft) {
     let target = match &draft.target {
-        NudgeTarget::AttachedPane(i) => format!("pane #{}", i + 1),
+        NudgeTarget::AttachedPane(short) => format!("pane {short}"),
         NudgeTarget::ViewOnlySession(short) => format!("session {short} (headless)"),
         NudgeTarget::None => "(no target selected)".to_string(),
     };
@@ -745,17 +753,19 @@ mod tests {
         assert!(text.contains("build-cmd"), "got {text}");
     }
 
+    /// D1: the dialog names the pane by the same short id the nudge is
+    /// resolved against at Enter time, not by a position that can shift.
     #[test]
     fn nudge_dialog_names_an_attached_pane_target() {
         let draft = NudgeDraft {
-            target: NudgeTarget::AttachedPane(1),
+            target: NudgeTarget::AttachedPane("bbbb2222".to_string()),
             input: "hello".to_string(),
         };
         let overlay = Overlay::Nudge(draft);
         let area = Rect::new(0, 0, 60, 10);
         let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay));
         assert!(
-            text.contains("pane#2") || text.contains("pane #2"),
+            text.contains("panebbbb2222") || text.contains("pane bbbb2222"),
             "got {text}"
         );
     }
@@ -813,7 +823,7 @@ mod tests {
                 cursor: 0,
             }),
             Overlay::Nudge(NudgeDraft {
-                target: NudgeTarget::AttachedPane(0),
+                target: NudgeTarget::AttachedPane("aaaa1111".to_string()),
                 input: "hello".to_string(),
             }),
             Overlay::Mail(MailView {

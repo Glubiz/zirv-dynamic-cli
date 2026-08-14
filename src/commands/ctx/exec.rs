@@ -82,8 +82,28 @@ pub struct ExecArgs {
 /// would march the fresh child straight back into it and burn the whole
 /// restart budget re-entering rot. The first two carry a value; the rest are
 /// bare.
-const RESUME_FLAGS_WITH_VALUE: [&str; 2] = ["--session-id", "--resume"];
-const RESUME_FLAGS_BARE: [&str; 3] = ["-c", "--continue", "--fork-session"];
+pub(crate) const RESUME_FLAGS_WITH_VALUE: [&str; 2] = ["--session-id", "--resume"];
+pub(crate) const RESUME_FLAGS_BARE: [&str; 3] = ["-c", "--continue", "--fork-session"];
+
+/// Pure: whether `args` already pins this launch to a conversation that
+/// exists -- any of [`RESUME_FLAGS_WITH_VALUE`]/[`RESUME_FLAGS_BARE`], in
+/// either the two-token or the `--flag=value` spelling.
+///
+/// D3: a caller that adds a pin of its own (`chat::dash_orchestrator_pane`,
+/// via `AgentAdapter::session_pin_args`) has to ask this first. `zirv chat --
+/// --resume <id>` produced `--resume <id> --session-id <fresh-uuid>`, which
+/// the harness refuses outright: two contradictory conversation ids in one
+/// launch. Inside a dashboard the resulting pane died immediately and its
+/// corpse was reaped, so the operator saw the session vanish with no error at
+/// all.
+pub(crate) fn pins_an_existing_conversation(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        RESUME_FLAGS_WITH_VALUE.contains(&arg.as_str())
+            || RESUME_FLAGS_BARE.contains(&arg.as_str())
+            || is_joined_form(arg, &RESUME_FLAGS_WITH_VALUE)
+            || is_joined_form(arg, &RESUME_FLAGS_BARE)
+    })
+}
 
 /// True for `--resume=abc` when `--resume` is in `flags`: the CLIs accept both
 /// spellings, so stripping only the two-token form leaves the other behind.
@@ -1328,6 +1348,42 @@ mod tests {
             extra_launch_flags(&cmd, 1, Some("task")),
             vec!["--model".to_string(), "opus".to_string()]
         );
+    }
+
+    /// D3: the shared predicate `chat::dash_orchestrator_pane` asks before
+    /// appending a session pin of its own. Both spellings of every
+    /// value-carrying flag, and every bare one.
+    #[test]
+    fn pins_an_existing_conversation_recognises_every_resume_spelling() {
+        let yes = [
+            vec!["claude", "--resume", "abc"],
+            vec!["claude", "--resume=abc"],
+            vec!["claude", "--session-id", "abc"],
+            vec!["claude", "--session-id=abc"],
+            vec!["claude", "-c"],
+            vec!["claude", "--continue"],
+            vec!["claude", "--fork-session"],
+        ];
+        for argv in yes {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert!(
+                pins_an_existing_conversation(&owned),
+                "must be recognised as a pin: {argv:?}"
+            );
+        }
+
+        let no = [
+            vec!["claude", "--model", "opus"],
+            vec!["claude", "-p", "resume the migration"],
+            vec!["claude"],
+        ];
+        for argv in no {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert!(
+                !pins_an_existing_conversation(&owned),
+                "must not be mistaken for a pin: {argv:?}"
+            );
+        }
     }
 
     /// `--resume` with a flag after it took no value, so swallowing the next
