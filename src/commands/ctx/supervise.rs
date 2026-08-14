@@ -28,8 +28,12 @@ pub fn spawn(mut command: Command) -> CtxResult<Child> {
 }
 
 /// Polls the child, calling `on_tick` at every interval. Stops on child exit,
-/// on the deadline, or when a tick asks to stop; kills the child in the last two
-/// cases so no supervisor ever leaks a process.
+/// on the deadline, or when a tick asks to stop; in the last two cases it
+/// terminates the child. On Windows that means the whole process tree rooted
+/// at the child, not just the direct child: a shim launch (`cmd.exe /c
+/// claude.cmd`) runs the real agent as a `node` grandchild, and killing only
+/// cmd.exe would leave that grandchild alive to run alongside a freshly
+/// spawned replacement -- two live sessions on one repo. See `terminate`.
 pub fn supervise_child(
     child: &mut Child,
     deadline: Instant,
@@ -68,7 +72,16 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = child.kill();
+        // TerminateProcess (what `child.kill()` calls) kills only the direct
+        // child. On an npm-installed agent that child is `cmd.exe /c
+        // claude.cmd`, which runs `node`; killing cmd.exe leaves the node
+        // grandchild alive (there is no Job Object). `taskkill /T` terminates
+        // the whole tree rooted at the pid instead. Its arguments are fixed
+        // flags plus a decimal pid, so there is no cmd.exe-reparse exposure.
+        // Falls back to a direct kill if taskkill cannot be run.
+        if !taskkill_tree(child.id()) {
+            let _ = child.kill();
+        }
     }
 
     let deadline = Instant::now() + grace;
@@ -82,6 +95,36 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+/// The `taskkill` invocation that terminates the whole process tree rooted at
+/// `pid`: `/T` walks the tree, `/F` forces termination, `/PID <pid>` names the
+/// root. Every element is a fixed flag or a decimal pid, so nothing here can
+/// be reparsed by cmd.exe. Pure, so the wiring is testable without spawning.
+#[cfg(not(unix))]
+fn taskkill_args(pid: u32) -> Vec<String> {
+    vec![
+        "/T".to_string(),
+        "/F".to_string(),
+        "/PID".to_string(),
+        pid.to_string(),
+    ]
+}
+
+/// Runs `taskkill /T /F /PID <pid>` without a shell, waiting briefly for it to
+/// finish. Returns whether taskkill ran *and* reported success; `false` (it is
+/// not on PATH, or it failed) tells the caller to fall back to a direct
+/// `child.kill()`.
+#[cfg(not(unix))]
+fn taskkill_tree(pid: u32) -> bool {
+    Command::new("taskkill")
+        .args(taskkill_args(pid))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Bytes a transcript grew by since the previous poll.
@@ -450,6 +493,20 @@ mod tests {
             "child is gone"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// HIGH-1: the Windows terminate path kills the whole process tree by
+    /// pid, so a shim's `node` grandchild is not orphaned. The kill itself is
+    /// awkward to assert deterministically; the arg wiring it is built from is
+    /// pure, so pin that instead.
+    #[cfg(not(unix))]
+    #[test]
+    fn taskkill_args_terminate_the_whole_tree_by_pid() {
+        assert_eq!(
+            taskkill_args(4242),
+            ["/T", "/F", "/PID", "4242"].map(String::from),
+            "the tree flag, the force flag, then the numeric pid -- nothing a shell could reparse"
+        );
     }
 
     #[test]

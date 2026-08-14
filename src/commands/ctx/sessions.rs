@@ -96,6 +96,29 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// engine verdicts `Restart` and kills its own child: the session the user
 /// was actually talking to. `SUPERVISION_ENV` scrubbing closes the inherit
 /// half of that; this closes the "should we be here at all" half.
+/// Whether the dashboard that owns `requests_dir` is still alive, per its
+/// `owner.pid` file. The pidfile lives in the requests dir's PARENT (i.e.
+/// `<state>/dash/<short>-<token>/owner.pid`) and holds the dashboard's pid as
+/// decimal ASCII. A missing, unreadable, unparseable, or dead-pid pidfile all
+/// mean "no live dashboard" -- so an abnormally-exited dashboard's leftover
+/// requests directory never wedges a future interactive launch. Only a
+/// readable pidfile naming a live process counts.
+fn dashboard_owner_is_live(requests_dir: &Path) -> bool {
+    if !requests_dir.is_dir() {
+        return false;
+    }
+    let Some(parent) = requests_dir.parent() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(parent.join("owner.pid")) else {
+        return false;
+    };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return false;
+    };
+    is_alive(pid)
+}
+
 pub fn nested_session_evidence(env: super::config::EnvLookup<'_>) -> Option<String> {
     let mut found: Vec<String> = Vec::new();
     if let Some(id) = non_empty(env(super::adapters::SESSION_ENV)) {
@@ -126,8 +149,16 @@ pub fn nested_session_evidence(env: super::config::EnvLookup<'_>) -> Option<Stri
     // no dashboard owns any more, and the two readers of this variable
     // disagreeing about what "set" means was the bug: one channel, one
     // liveness test.
+    //
+    // A directory alone is not enough, though: an *abnormal* dashboard exit
+    // (crash, kill) leaves the directory behind, and a surviving pane shell
+    // still carrying this env would then wedge every future interactive
+    // launch forever. The dashboard writes its own pid into `owner.pid` (the
+    // requests dir's parent, `<state>/dash/<short>-<token>/owner.pid`), so
+    // only a pidfile naming a *live* process counts as a dashboard actually
+    // owning this terminal -- a stale or dead one is no evidence.
     if non_empty(env(super::dash::spawnreq::DASH_REQUESTS_ENV))
-        .is_some_and(|dir| Path::new(&dir).is_dir())
+        .is_some_and(|dir| dashboard_owner_is_live(Path::new(&dir)))
     {
         found.push(format!(
             "{} is set (a dashboard pane owns this terminal)",
@@ -441,6 +472,17 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
             found.push((record, Liveness::Stale));
         }
     }
+    // `read_dir` yields records in a filesystem-dependent order, so a caller
+    // that indexes the list positionally (the dashboard sidebar re-reads it
+    // every ~1s) would see rows reorder under the operator whenever an
+    // unrelated session registers or exits. Sort by a stable key -- the launch
+    // time, then the short id as a tiebreak -- so the ordering is deterministic
+    // across refreshes regardless of how the directory happened to enumerate.
+    found.sort_by(|a, b| {
+        a.0.started_at
+            .cmp(&b.0.started_at)
+            .then_with(|| a.0.short.cmp(&b.0.short))
+    });
     sweep_orphaned_markers(state, &found);
     found
 }
@@ -945,6 +987,43 @@ mod tests {
             "the malformed file is skipped, not fatal: {found:?}"
         );
         assert_eq!(found[0].0.session, good.session);
+    }
+
+    /// MED: `list` sorts by a stable key (`started_at`, then `short`) rather
+    /// than returning records in filesystem enumeration order, so a caller
+    /// that indexes positionally (the dashboard sidebar) sees a deterministic
+    /// ordering across refreshes. The `started_at` values here are chosen so
+    /// the correct order is neither the shorts' alphabetical order nor any
+    /// plausible directory order, pinning `started_at` as the primary key.
+    #[test]
+    fn list_returns_records_in_a_stable_sorted_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+
+        // (session, started_at): sorted by started_at gives ccc, bbb, aaa --
+        // the reverse of the shorts' own alphabetical order.
+        let seeds = [
+            ("cccccccc-2222-4333-8444-555555555555", 100u64),
+            ("aaaaaaaa-2222-4333-8444-555555555555", 300u64),
+            ("bbbbbbbb-2222-4333-8444-555555555555", 200u64),
+        ];
+        for (session, started_at) in seeds {
+            let mut record = record_for(session, &repo, Verb::Exec);
+            record.started_at = started_at;
+            write_record(&state, &record);
+        }
+
+        let order: Vec<String> = list(&state).into_iter().map(|(r, _)| r.short).collect();
+        assert_eq!(
+            order,
+            vec![
+                "cccccccc".to_string(),
+                "bbbbbbbb".to_string(),
+                "aaaaaaaa".to_string(),
+            ],
+            "records come back ordered by started_at, deterministically"
+        );
     }
 
     #[test]
@@ -1511,13 +1590,20 @@ mod tests {
     #[test]
     fn dash_requests_env_trips_the_nested_guard() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp
+        let requests = tmp
             .path()
             .join("dash")
             .join("aaaa1111-0123")
             .join("requests");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let dir = dir.display().to_string();
+        std::fs::create_dir_all(&requests).expect("mkdir");
+        // A live dashboard writes its own pid into `owner.pid`; this test
+        // process stands in for that live dashboard.
+        std::fs::write(
+            requests.parent().expect("parent").join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write owner.pid");
+        let dir = requests.display().to_string();
         let env = env_map(&[(
             super::super::dash::spawnreq::DASH_REQUESTS_ENV,
             dir.as_str(),
@@ -1552,6 +1638,62 @@ mod tests {
             gone.as_str(),
         )]);
         assert_eq!(nested_session_evidence(&|k| env.get(k).cloned()), None);
+    }
+
+    /// MED (read side of the leaked-spawn-request-dir wedge): a requests
+    /// directory that still exists is evidence a dashboard owns the terminal
+    /// only when its `owner.pid` names a live process. Missing, or naming a
+    /// dead pid, is no evidence -- an abnormally-exited dashboard must not
+    /// wedge every future interactive launch.
+    #[test]
+    fn only_a_live_dashboard_owner_pidfile_counts_as_a_dashboard_owner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let make = |name: &str| {
+            let requests = tmp.path().join("dash").join(name).join("requests");
+            std::fs::create_dir_all(&requests).expect("mkdir");
+            requests
+        };
+        let env_for = |requests: &Path| {
+            env_map(&[(
+                super::super::dash::spawnreq::DASH_REQUESTS_ENV,
+                requests.to_str().expect("utf8"),
+            )])
+        };
+
+        // Missing owner.pid: a directory alone is no evidence.
+        let missing = make("aaaa1111-0001");
+        let env = env_for(&missing);
+        assert_eq!(
+            nested_session_evidence(&|k| env.get(k).cloned()),
+            None,
+            "a requests dir with no owner.pid does not wedge the terminal"
+        );
+
+        // owner.pid naming a dead process: a crashed dashboard is no evidence.
+        let dead = make("bbbb2222-0002");
+        std::fs::write(
+            dead.parent().expect("parent").join("owner.pid"),
+            dead_pid().to_string(),
+        )
+        .expect("write owner.pid");
+        let env = env_for(&dead);
+        assert_eq!(
+            nested_session_evidence(&|k| env.get(k).cloned()),
+            None,
+            "a dead dashboard's leftover pidfile does not wedge the terminal"
+        );
+
+        // owner.pid naming a live process (this one): a real dashboard owns it.
+        let live = make("cccc3333-0003");
+        std::fs::write(
+            live.parent().expect("parent").join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write owner.pid");
+        let env = env_for(&live);
+        let evidence = nested_session_evidence(&|k| env.get(k).cloned())
+            .expect("a live dashboard owner is evidence");
+        assert!(evidence.contains("dashboard pane"), "got {evidence}");
     }
 
     #[test]

@@ -238,7 +238,15 @@ fn prune_to_cap(dir: &Path, keep: usize) {
         .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md"))
         .filter_map(|path| {
             let text = std::fs::read_to_string(&path).ok()?;
-            Some((parse_markdown(&text).written, path))
+            let written = parse_markdown(&text).written;
+            // A file that does not parse to a real `Written` timestamp reads
+            // as `written == 0`: an empty or partial read (a rewrite window),
+            // or a malformed file. Never select such a file for deletion --
+            // mirror `mail::list`, which skips parse failures rather than
+            // acting on them. Sorting a half-written entry to the front as the
+            // "oldest" and deleting it was silent data loss; a real entry
+            // always carries a non-zero `Written`.
+            (written > 0).then_some((written, path))
         })
         .collect();
     if items.len() <= keep {
@@ -282,6 +290,31 @@ pub fn remember(
 
     let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
     let path = claim_and_write(&dir, &base, &entry.to_markdown())?;
+
+    // LOW: `remember` is list -> remove-old -> write, so two concurrent
+    // `remember`s on one key can each miss the other's not-yet-written file,
+    // both write, and leave two entries under the key (the second lands on a
+    // `_NNN` suffix). Collapse them deterministically: keep only the entry
+    // with the greatest `(written, path)` -- a rule every racing writer
+    // computes identically from the same on-disk state, and which can never
+    // remove the globally-greatest file, so the bank converges to exactly one
+    // entry for the key rather than to zero. Best-effort, like every other
+    // removal here.
+    let dups: Vec<(PathBuf, Entry)> = list(state, slug)?
+        .into_iter()
+        .filter(|(_, existing)| existing.key == entry.key)
+        .collect();
+    if dups.len() > 1
+        && let Some((keep, _)) = dups
+            .iter()
+            .max_by(|a, b| a.1.written.cmp(&b.1.written).then_with(|| a.0.cmp(&b.0)))
+    {
+        for (other, _) in &dups {
+            if other != keep {
+                let _ = std::fs::remove_file(other);
+            }
+        }
+    }
 
     prune_to_cap(&dir, cfg.memory.max_entries);
     Ok(path)
@@ -952,6 +985,97 @@ This should not appear in the body.\n";
             vec!["key-2", "key-3", "key-4"],
             "the two oldest-Written entries are dropped, newest three remain"
         );
+    }
+
+    /// MED: `prune_to_cap` must never select a present-but-unparseable file
+    /// (an empty/partial read mid-rewrite, or a malformed file) for deletion.
+    /// Before the fix it read as `written == 0`, sorted first as the "oldest",
+    /// and was deleted -- silent data loss racing a concurrent write.
+    #[test]
+    fn prune_never_deletes_a_present_but_unparseable_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+
+        // An unparseable file: empty, so `parse_markdown` yields `written: 0`.
+        let junk = dir.join("0000000000-junk.md");
+        std::fs::write(&junk, "").expect("write empty");
+
+        // Plus several real entries, more than the cap.
+        for i in 0..5u64 {
+            let entry = sample(&format!("k{i}"), 1_700_000_000 + i);
+            std::fs::write(
+                dir.join(format!("{:010}-k{i}.md", 1_700_000_000 + i)),
+                entry.to_markdown(),
+            )
+            .expect("write entry");
+        }
+
+        prune_to_cap(dir, 2);
+
+        assert!(
+            junk.exists(),
+            "an unparseable file is never chosen for pruning"
+        );
+        let real: Vec<_> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "0000000000-junk.md")
+            .collect();
+        assert_eq!(
+            real.len(),
+            2,
+            "the real entries are still pruned down to the cap: {real:?}"
+        );
+    }
+
+    /// LOW: a key that ended up with two entries (as a racing pair of
+    /// `remember`s could leave) resolves the same way on every read, and a
+    /// fresh `remember` collapses the key back down to exactly one entry.
+    #[test]
+    fn duplicate_entries_for_one_key_resolve_deterministically_and_remember_converges_to_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        let dir = state.memory().join(slug);
+        super::super::state::create_private_dir_all(&dir).expect("mkdir");
+
+        // Two entries under one key: same base name, the second bumped to a
+        // `_NNN` suffix -- exactly the shape claim_and_write's collision path
+        // produces for a concurrent second writer.
+        let mut a = sample("build-cmd", 1_700_000_000);
+        a.body = "cargo build".to_string();
+        let mut b = sample("build-cmd", 1_700_000_000);
+        b.body = "cargo build --release".to_string();
+        std::fs::write(dir.join("1700000000-build-cmd.md"), a.to_markdown()).expect("write a");
+        std::fs::write(dir.join("1700000000-build-cmd_001.md"), b.to_markdown()).expect("write b");
+
+        // Deterministic read: `get` returns the same entry on every call.
+        let first = get(&state, slug, "build-cmd")
+            .expect("get")
+            .expect("present");
+        let again = get(&state, slug, "build-cmd")
+            .expect("get")
+            .expect("present");
+        assert_eq!(first, again, "a duplicated key resolves to a stable entry");
+
+        // A fresh `remember` collapses the key back to exactly one entry.
+        let mut c = sample("build-cmd", 1_700_000_100);
+        c.body = "cargo build --locked".to_string();
+        remember(&state, slug, &c, &cfg).expect("remember");
+
+        let for_key: Vec<_> = list(&state, slug)
+            .expect("list")
+            .into_iter()
+            .filter(|(_, e)| e.key == "build-cmd")
+            .collect();
+        assert_eq!(
+            for_key.len(),
+            1,
+            "remember converges the key to a single entry: {for_key:?}"
+        );
+        assert_eq!(for_key[0].1.body, "cargo build --locked");
     }
 
     #[test]

@@ -67,27 +67,72 @@ pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-#[cfg(unix)]
-pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `mode` applies only when the file is created, so writing over one that
-    // already exists would leave whatever permissions it had -- an operator
-    // who ran `touch report.md` first would get a world-readable report. Fail
-    // rather than write private content somewhere that cannot be made private.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents.as_bytes())
+/// A unique temp sibling of `target`, in the *same* directory so the `rename`
+/// in `write_private` is a same-filesystem atomic replace. The pid plus a
+/// process-local counter keeps two concurrent writers -- or two writes from
+/// one process -- from ever colliding on the same temp path.
+fn temp_sibling(target: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let name = match target.file_name().and_then(|n| n.to_str()) {
+        Some(base) => format!(".{base}.tmp-{pid}-{n}"),
+        None => format!(".tmp-{pid}-{n}"),
+    };
+    match target.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
 }
 
-#[cfg(not(unix))]
+/// Writes `contents` to `path` atomically: a temp sibling is written in full
+/// and then `rename`d over the target (atomic on the same filesystem, on both
+/// Windows and Unix), so a concurrent reader ever sees either the whole old
+/// file or the whole new one -- never the zero-length truncation window a
+/// plain create-truncate-write leaves. That window was a real hazard: a
+/// session refreshing its registry record while a dashboard `sessions::list`
+/// read it could have the record read as absent (and its pending nudge
+/// swept).
+///
+/// On Unix the file is 0600, forced on the fresh temp regardless of umask,
+/// so writing over an operator's pre-existing world-readable file still
+/// yields a private one.
 pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    use std::io::Write;
+
+    let tmp = temp_sibling(path);
+
+    // Write (and close) the temp file first; the handle must be dropped before
+    // the rename on Windows.
+    let write_tmp = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(contents.as_bytes())?;
+        file.flush()
+    };
+
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// How many files the per-session directories keep. High enough that no live
@@ -390,6 +435,49 @@ mod tests {
             "handoff",
             "a private file is still a normal file"
         );
+    }
+
+    /// MED-2: `write_private` is atomic (temp sibling + rename), so a reader
+    /// racing a rewrite never observes the zero-length truncation window a
+    /// plain `std::fs::write` leaves. Hammer a rewrite in one thread while
+    /// another reads and asserts the file, when present, is always one of the
+    /// two whole contents -- never empty or partial.
+    #[test]
+    fn concurrent_reads_of_a_rewritten_file_never_see_a_partial_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("record.json");
+        let a = "A".repeat(64 * 1024);
+        let b = "B".repeat(64 * 1024);
+        let (a_len, b_len) = (a.len(), b.len());
+        // Seed one so the reader always finds a file to read.
+        write_private(&path, &a).expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            while !reader_stop.load(Ordering::Relaxed) {
+                if let Ok(contents) = std::fs::read_to_string(&reader_path) {
+                    assert!(
+                        contents.len() == a_len || contents.len() == b_len,
+                        "a reader must never observe a partial/empty file: saw {} bytes",
+                        contents.len()
+                    );
+                }
+            }
+        });
+
+        for i in 0..1000 {
+            let contents = if i % 2 == 0 { &a } else { &b };
+            write_private(&path, contents).expect("write");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader
+            .join()
+            .expect("reader thread panicked on a partial read");
     }
 
     #[test]
