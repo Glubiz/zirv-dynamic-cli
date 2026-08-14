@@ -306,7 +306,7 @@ pub fn run_with<W: Write, E: Write>(
             repo,
             session.as_str(),
             args.simple,
-        );
+        )?;
         return dash::run_dashboard(&cfg, repo, &env, &state, pane);
     }
 
@@ -415,7 +415,7 @@ pub(crate) fn dash_orchestrator_pane(
     repo: &Path,
     session: &str,
     simple: bool,
-) -> PaneSpec {
+) -> CtxResult<PaneSpec> {
     let slug = super::state::repo_slug(repo);
     let memory_entries =
         super::memory::render_for_prompt(state, &slug, cfg, super::state::now_secs());
@@ -436,7 +436,7 @@ pub(crate) fn dash_orchestrator_pane(
         composed.as_ref(),
         state,
         session,
-    );
+    )?;
     super::prompt::log_injection(
         state,
         "chat",
@@ -473,14 +473,14 @@ pub(crate) fn dash_orchestrator_pane(
         argv.extend(adapter.session_pin_args(session));
     }
 
-    PaneSpec {
+    Ok(PaneSpec {
         agent_name: launch.agent_name,
         argv,
         role: launch.role,
         verb: launch.verb,
         session_id: session.to_string(),
         title: "orch".to_string(),
-    }
+    })
 }
 
 /// The extra arguments a chat launch is built with: the configured model's
@@ -682,10 +682,12 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let cfg = CtxConfig::default();
 
-        // A binary that does not exist: the file-flag capability probe fails,
-        // so `injection_args_for_session` falls back to the inline
-        // `system_prompt_args` form and the prompt text itself is visible in
-        // argv -- which is what makes this assertable without a real agent.
+        // A binary that does not exist and is not a cmd shim: the file-flag
+        // capability probe fails and the launch is not the reparsed `cmd.exe /c`
+        // form, so `injection_args_for_session` uses the inline
+        // `system_prompt_args` form and the prompt text is visible in argv --
+        // which is what makes this assertable without a real agent. (The shim
+        // form, which forces the file form, is covered in `prompt.rs`.)
         let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
         let launch = build_launch(&adapter, None, &[]);
         let pane = dash_orchestrator_pane(
@@ -696,7 +698,8 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             false,
-        );
+        )
+        .expect("pane");
 
         let argv = pane.argv.join(" ");
         assert!(
@@ -754,7 +757,8 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             false,
-        );
+        )
+        .expect("pane");
 
         let argv = pane.argv.join(" ");
         assert!(
@@ -793,7 +797,8 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             true,
-        );
+        )
+        .expect("pane");
         // R1: the session pin is launch plumbing, not injected instruction --
         // `--simple` promises the agent no zirv-authored text, and a pane that
         // cannot be resumed after a quit is not what it is asking for. Every
@@ -822,7 +827,8 @@ mod tests {
         let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
         let launch = build_launch(&adapter, None, &[]);
         let pane =
-            dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false);
+            dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false)
+                .expect("pane");
 
         let pin = pane
             .argv
@@ -864,7 +870,8 @@ mod tests {
             let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
             let launch = build_launch(&adapter, None, &extra);
             let pane =
-                dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false);
+                dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false)
+                    .expect("pane");
 
             assert!(
                 !pane.argv.iter().any(|a| a == session),
@@ -906,7 +913,8 @@ mod tests {
             &["--resume".to_string(), existing.to_string()],
         );
         let pane =
-            dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false);
+            dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false)
+                .expect("pane");
 
         assert_eq!(
             pane.session_id, session,

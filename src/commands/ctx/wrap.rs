@@ -939,7 +939,7 @@ pub fn run_with(
         composed.as_ref(),
         &state_dir,
         session.as_str(),
-    );
+    )?;
     super::prompt::log_injection(
         &state_dir,
         "wrap",

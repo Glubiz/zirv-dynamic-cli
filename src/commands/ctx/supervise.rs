@@ -264,17 +264,45 @@ fn guard_cmd_shim_reparse(command: &Command) -> CtxResult<()> {
 /// Like `spawn`, but the child's stdout and stderr are piped so they can be
 /// matched. Each stream is forwarded to this process's corresponding stream
 /// unchanged, line by line.
-pub fn spawn_tapped(mut command: Command) -> CtxResult<(Child, OutputTap)> {
+///
+/// `stdin_text` (FIX B) is the headless prompt when it must be delivered on
+/// **stdin** rather than as an argv token: on a Windows `cmd.exe /c <shim>`
+/// launch, an argv prompt would be reparsed by cmd.exe, so the prompt (and any
+/// folded mail) travels on stdin instead -- the same mechanism the distiller
+/// uses. `None` keeps stdin nulled, exactly as before, which is what every
+/// off-shim launch (and every `sh`-based fake-agent test) gets.
+pub fn spawn_tapped(
+    mut command: Command,
+    stdin_text: Option<String>,
+) -> CtxResult<(Child, OutputTap)> {
     // FIX 2a (command-injection defense): both std::process supervisors
     // (`exec`, `loop`) reach every spawn -- first launch and every restart --
     // through here, so this is their single chokepoint for the cmd.exe
     // argv-reparse guard. A no-op off Windows and for any non-shim program.
     guard_cmd_shim_reparse(&command)?;
+    let stdin_mode = if stdin_text.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(stdin_mode)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
+    // Write the prompt on its own thread, then drop the handle so the child
+    // sees EOF -- exactly `handoff::run_model`'s stdin discipline. A write
+    // failure (the child exited before draining) is not surfaced here: the
+    // supervisor already reports an early, unsuccessful exit through the
+    // child's own status, which is the more useful of the two reports.
+    if let Some(text) = stdin_text
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(text.as_bytes());
+        });
+    }
 
     let (tx, rx) = std::sync::mpsc::channel::<String>();
 
@@ -622,7 +650,7 @@ mod tests {
 
     #[test]
     fn a_tapped_child_still_reports_its_exit_code() {
-        let (mut child, _tap) = spawn_tapped(sh("printf hello\\n; exit 4")).expect("spawn");
+        let (mut child, _tap) = spawn_tapped(sh("printf hello\\n; exit 4"), None).expect("spawn");
         let outcome = supervise_child(
             &mut child,
             Instant::now() + Duration::from_secs(10),
@@ -635,7 +663,8 @@ mod tests {
 
     #[test]
     fn tapped_lines_reach_the_matcher() {
-        let (mut child, tap) = spawn_tapped(sh("printf 'one\\ntwo\\n'; exit 0")).expect("spawn");
+        let (mut child, tap) =
+            spawn_tapped(sh("printf 'one\\ntwo\\n'; exit 0"), None).expect("spawn");
         let mut seen: Vec<String> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
         while seen.len() < 2 && Instant::now() < deadline {
@@ -649,7 +678,8 @@ mod tests {
 
     #[test]
     fn stderr_is_tapped_too_because_notices_can_land_there() {
-        let (mut child, tap) = spawn_tapped(sh("printf 'oops\\n' >&2; exit 0")).expect("spawn");
+        let (mut child, tap) =
+            spawn_tapped(sh("printf 'oops\\n' >&2; exit 0"), None).expect("spawn");
         let mut seen: Vec<String> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
         while seen.is_empty() && Instant::now() < deadline {
@@ -662,10 +692,37 @@ mod tests {
 
     #[test]
     fn try_lines_is_empty_when_nothing_was_written() {
-        let (mut child, tap) = spawn_tapped(sh("exit 0")).expect("spawn");
+        let (mut child, tap) = spawn_tapped(sh("exit 0"), None).expect("spawn");
         let _ = child.wait();
         // Drain whatever arrived; a silent child must not block or panic.
         let _ = tap.try_lines();
         assert!(tap.try_lines().is_empty());
+    }
+
+    /// FIX B: a `Some(stdin_text)` is written to the child's stdin and then
+    /// EOF'd, exactly the shape a shim-form headless prompt takes. `cat`
+    /// echoes stdin to stdout, which the tap forwards -- proving the prompt
+    /// reaches the child off argv. The metacharacter is carried literally,
+    /// never reparsed, because it never touched a command line. Uses the same
+    /// `sh` the other tests in this module rely on.
+    #[test]
+    fn spawn_tapped_delivers_the_prompt_on_stdin() {
+        let (mut child, tap) =
+            spawn_tapped(sh("cat"), Some("refactor foo() & bar()\n".to_string())).expect("spawn");
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if child.try_wait().expect("wait").is_some() {
+                break;
+            }
+            seen.extend(tap.try_lines());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        seen.extend(tap.try_lines());
+        let _ = child.wait();
+        assert!(
+            seen.iter().any(|l| l.contains("refactor foo() & bar()")),
+            "the prompt reached the child verbatim on stdin: {seen:?}"
+        );
     }
 }

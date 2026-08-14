@@ -200,17 +200,14 @@ pub fn run_with<W: Write>(
         // M7: rebuilt per cycle because the private prompt file is named after
         // the session it belongs to, and every cycle is a new session. The
         // adapter builds this launch itself, so the probe gets an empty argv.
-        let extra: Vec<String> = user_extra
-            .iter()
-            .cloned()
-            .chain(super::prompt::injection_args_for_session(
-                adapter.as_ref(),
-                &[],
-                composed.as_ref(),
-                &state,
-                session.as_str(),
-            ))
-            .collect();
+        let prompt_args = super::prompt::injection_args_for_session(
+            adapter.as_ref(),
+            &[],
+            composed.as_ref(),
+            &state,
+            session.as_str(),
+        )?;
+        let extra: Vec<String> = user_extra.iter().cloned().chain(prompt_args).collect();
         // M2: README promises injection attribution "at every session start",
         // and every cycle is a new session, so the entry is written here under
         // that cycle's own id rather than once under a literal "loop".
@@ -230,7 +227,18 @@ pub fn run_with<W: Write>(
             cwd: repo.to_path_buf(),
         });
 
-        let mut command = adapter.headless_cmd(&prompt, &session, &extra);
+        // FIX B: on a Windows npm `.cmd` shim launch, cmd.exe reparses the
+        // downstream argv, so the prompt is delivered on stdin instead of as
+        // the `-p <prompt>` argv token. Off Windows and for a direct `.exe` it
+        // stays on argv, so `sh`-based fake-agent cycles are unchanged.
+        let (mut command, stdin_prompt) = if adapter.launches_through_cmd_shim() {
+            match adapter.headless_cmd_stdin(&session, &extra) {
+                Some(command) => (command, Some(prompt.clone())),
+                None => (adapter.headless_cmd(&prompt, &session, &extra), None),
+            }
+        } else {
+            (adapter.headless_cmd(&prompt, &session, &extra), None)
+        };
         command.current_dir(repo);
         // F3: `loop` binds no turn-signal socket of its own, so it has no
         // session identity to set here at all -- which is precisely why the
@@ -246,7 +254,7 @@ pub fn run_with<W: Write>(
         command.env(super::adapters::AGENT_ENV, adapter.name());
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
-        let (mut child, tap) = supervise::spawn_tapped(command)?;
+        let (mut child, tap) = supervise::spawn_tapped(command, stdin_prompt)?;
         // Item 3: consumed right after this cycle's own spawn has actually
         // succeeded, so the next cycle's fresh `mail::list` does not pick
         // the same message up again -- but a launch that never got this far

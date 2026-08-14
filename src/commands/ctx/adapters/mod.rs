@@ -96,6 +96,30 @@ pub trait AgentAdapter: std::fmt::Debug {
         false
     }
 
+    /// Whether a headless launch this adapter builds resolves to the Windows
+    /// `cmd.exe /c <shim>` form (an npm-installed `.cmd`), where cmd.exe
+    /// reparses the whole downstream command line. `false` (the default) off
+    /// Windows and for a directly executable program. When `true`, a caller
+    /// delivers the headless prompt -- and any folded mail -- on the child's
+    /// stdin via [`headless_cmd_stdin`](Self::headless_cmd_stdin) rather than
+    /// as an argv token, so that untrusted free text never reaches cmd.exe's
+    /// parser (`guard_cmd_shim_reparse` is only the fail-closed backstop).
+    fn launches_through_cmd_shim(&self) -> bool {
+        false
+    }
+
+    /// A headless launch that expects its prompt on **stdin** rather than as
+    /// the `-p <prompt>` argv token, for the
+    /// [`launches_through_cmd_shim`](Self::launches_through_cmd_shim) case.
+    /// `None` (the default) means this agent has no verified stdin form, so the
+    /// caller keeps argv delivery. When `Some`, the returned `Command` reads
+    /// its prompt from stdin to EOF -- the same mechanism the distiller uses --
+    /// and the caller must pipe the prompt in.
+    fn headless_cmd_stdin(&self, session: &SessionId, extra: &[String]) -> Option<Command> {
+        let _ = (session, extra);
+        None
+    }
+
     /// How many leading argv tokens are the program invocation itself rather
     /// than flags the operator passed. One for a bare binary; more when
     /// `agent_bin` carries arguments, since `"/usr/bin/env claude"` spends two
@@ -300,6 +324,40 @@ fn is_cmd_shim_launch(program: &str, args: &[String]) -> bool {
             .unwrap_or(false)
 }
 
+/// FIX D (defense-in-depth): the number of leading `args` tokens that are the
+/// zirv-controlled launcher prefix, when `program` + `args` is a Windows
+/// launcher form whose command line is reparsed before it reaches the real
+/// script -- either the `cmd.exe /c <shim>` form (a `.cmd`/`.bat`) or the
+/// `powershell -NoProfile -File <script>` form (a `.ps1`), both of which
+/// [`resolve_program`] produces. `None` when it is neither, so a direct
+/// `.exe` or an `sh <script>` fake agent is not keyed on at all. Keyed on the
+/// `/c` / `-File` structure rather than only the launcher basename, so the
+/// guard covers whichever launcher the resolver actually inserted.
+#[cfg(windows)]
+fn reparse_launcher_prefix(program: &str, args: &[String]) -> Option<usize> {
+    let stem = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())?
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "cmd" => args
+            .first()
+            .map(|first| first.eq_ignore_ascii_case("/c"))
+            .unwrap_or(false)
+            // `/c` and the shim path are both zirv-controlled.
+            .then_some(2),
+        "powershell" | "pwsh" => {
+            // Everything through the `-File <script>` pair is the launcher
+            // prefix; the script's own arguments follow it.
+            let file_at = args
+                .iter()
+                .position(|arg| arg.eq_ignore_ascii_case("-File"))?;
+            (file_at + 1 < args.len()).then_some(file_at + 2)
+        }
+        _ => None,
+    }
+}
+
 /// FIX (command-injection defense): fail-closed guard for the one launch shape
 /// where a downstream argv element becomes cmd.exe *source text* rather than a
 /// literal argument. When [`resolve_program`] rewrites an npm-installed
@@ -326,16 +384,18 @@ fn is_cmd_shim_launch(program: &str, args: &[String]) -> bool {
 pub fn guard_cmd_shim_reparse(program: &str, args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     {
-        if is_cmd_shim_launch(program, args) {
-            for arg in args.iter().skip(2) {
+        if let Some(prefix) = reparse_launcher_prefix(program, args) {
+            for arg in args.iter().skip(prefix) {
                 if let Some(bad) = arg.chars().find(|c| CMD_REPARSE_METACHARS.contains(c)) {
                     return Err(format!(
                         "refusing to launch: argument '{arg}' contains the cmd.exe \
-                         metacharacter {bad:?}. zirv routes this agent through 'cmd.exe /c' on \
-                         Windows (an npm-installed '.cmd' shim), and cmd.exe would re-parse that \
-                         character as a command rather than pass it through. This is fail-closed \
-                         protection against repo-config command injection; zirv's own arguments \
-                         never contain these characters."
+                         metacharacter {bad:?}. zirv routes this agent through a Windows \
+                         launcher ('cmd.exe /c' for an npm-installed '.cmd' shim, or \
+                         'powershell -File' for a '.ps1'), which would re-parse that character \
+                         as a command rather than pass it through. This is a fail-closed \
+                         backstop against command injection; zirv's own arguments never contain \
+                         these characters, and untrusted content (the composed system prompt, a \
+                         headless task prompt) is kept off this argv entirely."
                     ));
                 }
             }
@@ -346,6 +406,27 @@ pub fn guard_cmd_shim_reparse(program: &str, args: &[String]) -> Result<(), Stri
         let _ = (program, args);
     }
     Ok(())
+}
+
+/// Whether spawning `program` resolves to the Windows `cmd.exe /c <shim>`
+/// launcher form (an npm-installed `.cmd`), where cmd.exe reparses the whole
+/// downstream command line. The adapters use it to move a headless prompt --
+/// and any folded mail -- onto the child's stdin on exactly the launch shape
+/// where an argv token would otherwise be reparsed. Always `false` off
+/// Windows, and for a directly executable program.
+pub fn launches_through_cmd_shim(program: &str) -> bool {
+    #[cfg(windows)]
+    {
+        match resolve_program(program) {
+            Ok(resolved) => is_cmd_shim_launch(&resolved.program, &resolved.prefix),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = program;
+        false
+    }
 }
 
 /// `PATH` plus `PATHEXT`, the search the Windows shell performs and
@@ -805,6 +886,37 @@ mod tests {
             "us.anthropic.claude-sonnet-4-v1:0".to_string(),
         ];
         assert!(guard_cmd_shim_reparse("cmd.exe", &args).is_ok());
+    }
+
+    /// FIX D (defense-in-depth): the `powershell -NoProfile -File <script>`
+    /// launcher form is guarded the same way as the cmd shim -- everything
+    /// through the `-File <script>` pair is zirv-controlled prefix, and a
+    /// metacharacter in a token after it is refused. The two prefix tokens and
+    /// the script path never trip it.
+    #[cfg(windows)]
+    #[test]
+    fn a_powershell_file_launch_is_guarded_after_the_script_path() {
+        let bad = vec![
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            "C:\\tools\\agent.ps1".to_string(),
+            "foo&calc".to_string(),
+        ];
+        assert!(
+            guard_cmd_shim_reparse("powershell", &bad).is_err(),
+            "a metachar after the script path is refused"
+        );
+
+        let clean = vec![
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            "C:\\tools\\agent.ps1".to_string(),
+            "do the thing".to_string(),
+        ];
+        assert!(
+            guard_cmd_shim_reparse("pwsh", &clean).is_ok(),
+            "clean args on the powershell form pass, and the prefix never trips"
+        );
     }
 
     /// FIX 2a: a direct `.exe` (no cmd.exe launcher prefix) is not the shim

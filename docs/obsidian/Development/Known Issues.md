@@ -30,34 +30,54 @@ element bearing a cmd.exe metacharacter (`& | < > ^ ( ) % ! "` newline) is
 interpreted as a *command*, not passed through as a literal argument.
 portable-pty and `std::process` both append no-whitespace metachar args RAW,
 and an embedded `"` defeats any quoting they add (BatBadBut / CVE-2024-24576
-quote-toggle). Repo-controlled strings reach this argv — an injected system
-prompt (repo `system-prompt.md` / repo CLAUDE.md via `--append-system-prompt`),
-a passed-through flag, and formerly `chat.model` — so a hostile checkout could
-achieve arbitrary code execution on a victim who merely ran a supervised
-session in it. Two defenses ship:
+quote-toggle). The approach is **keep untrusted content off the reparsed
+argv** rather than try to quote around cmd.exe. Defenses that ship:
 
 1. **`chat.model` charset validation** (`config::CtxConfig::load`): the one
    repo-settable string on this path is constrained to `[A-Za-z0-9-._:/@]`, so
    it cannot express a metacharacter (see [[Decision Log]] chat.model security
    amendment).
-2. **`adapters::guard_cmd_shim_reparse`**: a fail-closed guard at every spawn
-   seam (`supervise::spawn_tapped` for the `exec`/`loop` std::process path; the
-   `CommandBuilder` assembly in `wrap` and `dash::pane` for the pty path) that
-   rejects a launch whose program is the `cmd.exe /c <shim>` form and whose
-   args (after the shim path) carry a cmd.exe metacharacter. A no-op off
-   Windows and for any non-shim program, so `sh <script>` fake agents and
-   direct `.exe` launches are untouched.
+2. **Composed prompt via file form on the cmd shim** (FIX A,
+   `prompt::injection_args_for_session`): the composed system prompt folds in
+   repo-sourced text (repo `system-prompt.md`, repo CLAUDE.md via the
+   command-line layer). When the launch resolves to the `cmd.exe /c <shim>`
+   form (`adapters::launches_through_cmd_shim`), the file form
+   (`--append-system-prompt-file <zirv-controlled-path>`) is *forced*
+   regardless of the `--help` probe, so that text never reaches the reparsed
+   argv at all; the inline `--append-system-prompt <text>` form is never used
+   for composed text there, and if the file cannot be written the launch fails
+   closed (an error) rather than degrading to inline. This closes the
+   repo-config RCE at every launch seam at once (`wrap`, `exec`, `loop`,
+   `resume`, `chat`, dash pane). A **non-shim** launch — a direct `.exe`, or an
+   `sh <script>` — is not reparsed by any shell (CreateProcess hands argv to the
+   target verbatim), so inline there is safe; the `--help` probe still gates the
+   file form purely as an `ps`-visibility hardening, identical on every
+   platform.
+3. **Headless prompt via stdin on the shim form** (FIX B, `exec`/`loop`
+   through `supervise::spawn_tapped`): on a `cmd.exe /c <shim>` launch the
+   headless `-p` prompt — operator task text, plus any mail folded into a
+   nudge/restart relaunch — is delivered on the child's **stdin** (the
+   distiller's own mechanism, `AgentAdapter::headless_cmd_stdin`) rather than
+   as an argv token, so a normal prompt containing `()`/`&` works instead of
+   being refused, and cmd.exe never parses it. Gated on
+   `AgentAdapter::launches_through_cmd_shim`, so off Windows and for a direct
+   `.exe` the prompt stays on argv and every `sh`-based fake-agent test is
+   byte-identical.
+4. **`adapters::guard_cmd_shim_reparse`**: the fail-closed *backstop* at every
+   spawn seam (`supervise::spawn_tapped` for `exec`/`loop`; the
+   `CommandBuilder` assembly in `wrap` and `dash::pane` for the pty path; and
+   `resume`'s own direct `command.status()` on Windows, added with FIX C). It
+   rejects a launch whose program is the `cmd.exe /c <shim>` — or
+   `powershell -File` (FIX D, defense-in-depth) — form and whose args carry a
+   cmd.exe metacharacter. After FIX A/B the only free text still on a reparsed
+   argv is an **interactive positional prompt** (a chat first message, a
+   `resume` handoff prompt, a dash worker task) — operator/zirv-generated and
+   rarely metachar-bearing. A no-op off Windows and for any non-shim program.
 
-**Deferred (FIX 2b, `// SECURITY:` in `prompt::injection_args_for_session`):**
-on Windows the guard *rejects* an otherwise-legitimate injected prompt that
-contains an ampersand rather than delivering it, because the metachar guard is
-fail-closed. The proper hardening is to prefer claude's
-`--append-system-prompt-file` form more aggressively on Windows (write the
-private prompt file even when the `--help` probe merely timed out, instead of
-falling back to the injectable inline `--append-system-prompt` argv). Not done
-because a failed probe cannot distinguish "flag genuinely absent on an older
-binary" (forcing the file form would fail that launch) from "probe timed out".
-The RCE itself is closed by defenses 1–2; this is a usability follow-up.
+**Residual (usability, not security):** an *interactive* initial prompt that
+contains a raw cmd.exe metacharacter is still refused by the backstop on a
+Windows npm `.cmd` install (rephrase it). Headless is the common automation
+path and is not subject to this (FIX B delivers it via stdin).
 
 ## `x.saturating_sub(n).clamp(1, x)` panics when `x` is 0
 

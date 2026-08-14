@@ -1046,7 +1046,8 @@ fn fulfill_spawn_request(
         composed.as_ref(),
         state,
         &session_id,
-    );
+    )
+    .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
     prompt::log_injection(
         state,
         "dash",

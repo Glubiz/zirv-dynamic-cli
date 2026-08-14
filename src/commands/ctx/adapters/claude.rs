@@ -538,6 +538,28 @@ impl AgentAdapter for ClaudeAdapter {
         probe_system_prompt_file_support(&program, &args)
     }
 
+    /// True on a Windows npm install, where `claude` is a `.cmd` shim that
+    /// [`super::resolve_program`] routes through `cmd.exe /c`. That is the one
+    /// launch shape where a headless prompt on argv would be reparsed by
+    /// cmd.exe, so on it the prompt is delivered via stdin instead
+    /// (`headless_cmd_stdin`).
+    fn launches_through_cmd_shim(&self) -> bool {
+        super::launches_through_cmd_shim(&self.program)
+    }
+
+    /// The `-p` headless launch with **no positional prompt**: claude then
+    /// reads the prompt from stdin (verified by the distiller, which does
+    /// exactly this). Everything else matches `headless_cmd`, so a stdin
+    /// launch and an argv launch differ only in where the prompt travels.
+    fn headless_cmd_stdin(&self, session: &SessionId, extra: &[String]) -> Option<Command> {
+        let mut cmd = self.base();
+        cmd.arg("-p")
+            .arg("--session-id")
+            .arg(session.as_str())
+            .args(extra);
+        Some(cmd)
+    }
+
     /// The distillation prompt is piped to stdin so a long transcript tail
     /// never hits argv length limits. This child embeds untrusted repo
     /// CLAUDE.md text in its prompt (the judgment call) and its only job is
@@ -1017,6 +1039,44 @@ mod tests {
                 "--model".to_string(),
                 "sonnet".to_string(),
             ]
+        );
+    }
+
+    /// FIX B: the stdin headless form keeps `-p` and the session pin but never
+    /// puts the prompt on argv -- claude reads it from stdin instead, so a
+    /// prompt bearing a cmd.exe metacharacter is never reparsed on the shim
+    /// form. The extra flags (the file-based system prompt, the operator's own)
+    /// still ride on argv, exactly as `headless_cmd` places them.
+    #[test]
+    fn headless_cmd_stdin_omits_the_prompt_and_reads_it_from_stdin() {
+        let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let cmd = adapter
+            .headless_cmd_stdin(
+                &SessionId::parse("abc"),
+                &[
+                    "--append-system-prompt-file".to_string(),
+                    "/s/p.md".to_string(),
+                ],
+            )
+            .expect("claude has a verified stdin form");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-p".to_string(),
+                "--session-id".to_string(),
+                "abc".to_string(),
+                "--append-system-prompt-file".to_string(),
+                "/s/p.md".to_string(),
+            ],
+            "no positional prompt token: the prompt travels on stdin"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("foo") || a.contains('&')),
+            "the prompt text is nowhere in argv: {args:?}"
         );
     }
 

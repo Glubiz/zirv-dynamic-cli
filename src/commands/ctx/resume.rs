@@ -140,7 +140,7 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         &state,
         session.as_str(),
-    );
+    )?;
     super::prompt::log_injection(
         &state,
         "resume",
@@ -174,6 +174,21 @@ pub fn run_with<W: Write>(
     }
     #[cfg(not(unix))]
     {
+        // FINDING-1 fix: `resume` is the one launch seam that spawns directly
+        // rather than through `supervise::spawn_tapped` or a pty
+        // `CommandBuilder`, so it never passed through the cmd.exe-reparse
+        // backstop. Apply it here too. FIX A already keeps the composed
+        // system prompt off this argv (file form on Windows), so the only free
+        // text still on it is the interactive positional handoff prompt, which
+        // this guards fail-closed exactly like every other interactive seam.
+        {
+            let program = command.get_program().to_string_lossy().to_string();
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect();
+            adapters::guard_cmd_shim_reparse(&program, &args)?;
+        }
         let status = command.status()?;
         Ok(status.code().unwrap_or(1))
     }

@@ -745,31 +745,77 @@ pub fn injection_args_for_session(
     composed: Option<&ComposedPrompt>,
     state: &StateDir,
     session: &str,
-) -> Vec<String> {
+) -> CtxResult<Vec<String>> {
     let Some(composed) = composed else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+
+    // SECURITY (FIX 2b, now closed): the composed prompt folds in repo-sourced
+    // text (repo `system-prompt.md`, repo CLAUDE.md via the command-line
+    // layer). When this launch reaches the agent through the Windows
+    // `cmd.exe /c <shim>` form (an npm-installed `claude.cmd`), cmd.exe
+    // *reparses* the whole downstream argv, so the inline `--append-system-
+    // prompt <text>` form would turn a repo `&`/`|`/quote into a command -- a
+    // repo-config RCE. The file form (`--append-system-prompt-file <path>`)
+    // keeps that text off argv entirely: the path is zirv-controlled and
+    // metachar-free. So on the shim form the file form is *forced* regardless
+    // of the `--help` probe, and if it cannot be written the launch fails
+    // closed rather than degrade to inline. A **non-shim** launch (a direct
+    // `.exe`, or an `sh <script>`) is not reparsed by any shell -- CreateProcess
+    // hands argv to the target verbatim -- so inline there is safe, and the
+    // probe still gates the file form purely as a `ps`-visibility hardening,
+    // identical on every platform. `guard_cmd_shim_reparse` remains the
+    // fail-closed backstop for the interactive positional prompt, the one
+    // free-text slot still on a reparsed argv.
+    let through_cmd_shim = if let Some(program) = launch.first() {
+        super::adapters::launches_through_cmd_shim(program)
+    } else {
+        // No passthrough argv: the adapter builds its own launch, so ask it.
+        adapter.launches_through_cmd_shim()
+    };
+
     if let Some(flag) = adapter.system_prompt_file_flag()
-        && adapter.supports_system_prompt_file(launch)
-        && let Ok(path) = write_prompt_file(state, session, &composed.text)
+        && (through_cmd_shim || adapter.supports_system_prompt_file(launch))
     {
-        return vec![flag.to_string(), path.display().to_string()];
+        match write_prompt_file(state, session, &composed.text) {
+            Ok(path) => return Ok(vec![flag.to_string(), path.display().to_string()]),
+            Err(err) => {
+                // On the cmd.exe shim there is no safe fallback: the inline
+                // form would put repo-sourced text on the reparsed argv. Fail
+                // closed rather than degrade to it. Off the shim (probe path) a
+                // write failure degrades to inline below, as before, since
+                // there is no reparse to protect against and losing the prompt
+                // would be the worse failure.
+                if through_cmd_shim {
+                    return Err(format!(
+                        "cannot safely inject a system prompt through the Windows 'cmd.exe /c' \
+                         shim: writing the private prompt file failed ({err}). Refusing to fall \
+                         back to the inline '--append-system-prompt' argv form, which cmd.exe \
+                         would reparse."
+                    )
+                    .into());
+                }
+            }
+        }
     }
-    // SECURITY (FIX 2b, deferred): on Windows the inline fallback below puts the
-    // composed prompt -- which includes repo-sourced text (repo `system-prompt.md`,
-    // repo CLAUDE.md via `--append-system-prompt`) -- directly on argv. When the
-    // launch program resolves to a `cmd.exe /c <shim>` (an npm-installed claude),
-    // that argv is re-parsed by cmd.exe. That vector is already closed
-    // fail-closed by `adapters::guard_cmd_shim_reparse` at every spawn seam
-    // (FIX 2a): a repo prompt bearing a cmd.exe metacharacter refuses the launch
-    // rather than executing. The remaining hardening is to prefer this file form
-    // more aggressively on Windows (e.g. write the file even when the `--help`
-    // probe merely timed out, rather than falling back to the injectable inline
-    // form), so a legitimate prompt containing an ampersand is delivered instead
-    // of refused. Not done here because a failed probe cannot distinguish "flag
-    // genuinely absent" (forcing the file form would fail the launch on an older
-    // binary) from "probe timed out"; see Known Issues.
-    adapter.system_prompt_args(&composed.text)
+
+    let inline = adapter.system_prompt_args(&composed.text);
+
+    // On the cmd.exe shim the inline form is only ever reached here when the
+    // adapter has no file-based flag at all. An adapter whose inline form is
+    // empty (no verified mechanism, e.g. codex) injects nothing, so there is
+    // nothing to protect and nothing to refuse; a non-empty inline form,
+    // however, would place composed text on the reparsed argv, so fail closed.
+    if through_cmd_shim && !inline.is_empty() {
+        return Err(
+            "cannot safely inject a system prompt through the Windows 'cmd.exe /c' shim \
+             without a file-based flag (e.g. '--append-system-prompt-file'): the adapter offers \
+             only the inline '--append-system-prompt' argv form, which cmd.exe would reparse."
+                .into(),
+        );
+    }
+
+    Ok(inline)
 }
 
 /// The prompt files this process has handed to an agent. A launch computes
@@ -923,6 +969,11 @@ mod tests {
         (tmp, state)
     }
 
+    /// A non-shim launch (here a nonexistent explicit binary, so `resolve_
+    /// program` never routes it through `cmd.exe /c`) whose `--help` probe does
+    /// not advertise the file flag delivers the composed prompt inline on argv.
+    /// Deterministic on every platform: inline is safe off the shim because
+    /// CreateProcess hands argv to the target verbatim, with no shell reparse.
     #[test]
     fn injection_args_come_from_the_adapter() {
         let (_tmp, home, repo) = tree();
@@ -936,16 +987,17 @@ mod tests {
             &[],
             0,
         );
-        let adapter = ClaudeAdapter::new(None).with_file_support_forced(false);
-        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-0");
+        let adapter =
+            ClaudeAdapter::new(Some("/nonexistent/fake-claude")).with_file_support_forced(false);
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-0")
+            .expect("args");
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], "--append-system-prompt");
         assert!(args[1].contains("zirv session conventions"));
     }
 
-    /// M7: when the installed binary's `--help` does not advertise the
-    /// file-based flag, delivery must fall back to today's argv behavior
-    /// unchanged.
+    /// M7: on a non-shim launch, when the installed binary's `--help` does not
+    /// advertise the file-based flag, delivery falls back to argv unchanged.
     #[test]
     fn injection_args_for_session_falls_back_to_argv_when_unsupported() {
         let (_tmp, home, repo) = tree();
@@ -960,11 +1012,68 @@ mod tests {
         );
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let adapter = ClaudeAdapter::new(None).with_file_support_forced(false);
+        let adapter =
+            ClaudeAdapter::new(Some("/nonexistent/fake-claude")).with_file_support_forced(false);
 
-        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-1");
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-1")
+            .expect("args");
         assert_eq!(args[0], "--append-system-prompt");
         assert!(args[1].contains("zirv session conventions"));
+    }
+
+    /// FIX A (the RCE-closing seam): when the launch resolves to the Windows
+    /// `cmd.exe /c <shim>` form (a real `.cmd` on disk), the file form is
+    /// *forced* even though the probe reports the flag unsupported. The inline
+    /// `--append-system-prompt <text>` form must never appear, because that
+    /// text folds in repo-sourced content and cmd.exe would reparse it. A repo
+    /// prompt bearing a raw `&` is delivered through a file, not refused and not
+    /// executed.
+    #[cfg(windows)]
+    #[test]
+    fn a_cmd_shim_launch_forces_the_file_form_and_never_inlines_composed_text() {
+        let (_tmp, home, repo) = tree();
+        std::fs::write(
+            repo.join(".zirv/system-prompt.md"),
+            "run this & do that | pipe",
+        )
+        .expect("write repo prompt");
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+            &[],
+            0,
+        );
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        // A real `.cmd` on disk: `resolve_program` routes it through
+        // `cmd.exe /c`, so `launches_through_cmd_shim` is true and the file
+        // form is forced regardless of the probe (forced to "unsupported").
+        let shim_dir = tempfile::tempdir().expect("tempdir");
+        let shim = shim_dir.path().join("claude.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+        let adapter =
+            ClaudeAdapter::new(Some(&shim.display().to_string())).with_file_support_forced(false);
+
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-w")
+            .expect("file form is written, not refused");
+        assert_eq!(args[0], "--append-system-prompt-file");
+        assert_ne!(args[0], "--append-system-prompt", "never the inline form");
+        let path = PathBuf::from(&args[1]);
+        let contents = std::fs::read_to_string(&path).expect("prompt file written");
+        assert!(
+            contents.contains('&'),
+            "the metachar text lives in the file"
+        );
+        // The only tokens on argv are the flag and a zirv-controlled path with
+        // no cmd.exe metacharacters.
+        assert!(
+            !args[1].chars().any(|c| "&|<>^()%!\"".contains(c)),
+            "the argv path carries no cmd.exe metacharacter: {}",
+            args[1]
+        );
     }
 
     /// M7: when the probe reports support, the composed prompt must be
@@ -986,7 +1095,8 @@ mod tests {
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
 
-        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-2");
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-2")
+            .expect("args");
         assert_eq!(args[0], "--append-system-prompt-file");
         let path = PathBuf::from(&args[1]);
         let contents = std::fs::read_to_string(&path).expect("prompt file written");
@@ -1014,7 +1124,8 @@ mod tests {
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
 
-        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-3");
+        let args = injection_args_for_session(&adapter, &[], composed.as_ref(), &state, "sess-3")
+            .expect("args");
         let path = PathBuf::from(&args[1]);
         let mode = std::fs::metadata(&path)
             .expect("metadata")
@@ -1030,7 +1141,11 @@ mod tests {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let adapter = ClaudeAdapter::new(None).with_file_support_forced(true);
-        assert!(injection_args_for_session(&adapter, &[], None, &state, "sess-4").is_empty());
+        assert!(
+            injection_args_for_session(&adapter, &[], None, &state, "sess-4")
+                .expect("args")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1054,6 +1169,7 @@ mod tests {
                 &state,
                 "sess-5"
             )
+            .expect("codex injects nothing rather than erroring")
             .is_empty(),
             "composition succeeding does not mean the agent can take it"
         );

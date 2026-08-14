@@ -426,7 +426,7 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         &state,
         session.as_str(),
-    );
+    )?;
     super::prompt::log_injection(
         &state,
         "exec",
@@ -533,11 +533,29 @@ pub fn run_with<W: Write>(
         }
     };
 
+    // FIX B: on a Windows npm `.cmd` shim launch, `cmd.exe /c <shim>` reparses
+    // the whole downstream argv, so a headless prompt on argv -- operator task
+    // text, plus any mail folded into a nudge/restart relaunch below -- would
+    // be reinterpreted by cmd.exe. Deliver it on the child's stdin instead (the
+    // same mechanism `handoff::run_model`'s distiller uses), and only on that
+    // launch shape: off Windows, and for a directly executable `.exe`, the
+    // prompt stays on argv exactly as before, so every `sh`-based fake-agent
+    // test is byte-identical. Returns the built command and the stdin payload
+    // (`Some` only when the prompt was kept off argv).
+    let prompt_via_stdin = adapter_builds_launch && adapter.launches_through_cmd_shim();
+    let build_headless =
+        |prompt_text: &str, session: &SessionId, extra: &[String]| -> (Command, Option<String>) {
+            if prompt_via_stdin && let Some(command) = adapter.headless_cmd_stdin(session, extra) {
+                return (command, Some(prompt_text.to_string()));
+            }
+            (adapter.headless_cmd(prompt_text, session, extra), None)
+        };
+
     // With no argv to pass through, the first launch is built exactly the way
     // every relaunch builds one. That symmetry is the point: a caller holding
     // the prompt as data never encodes it into argv for this function to
     // decode again, so it can never be misread as a flag.
-    let mut command = if adapter_builds_launch {
+    let (mut command, mut stdin_prompt) = if adapter_builds_launch {
         let prompt_text = prompt.as_deref().ok_or(
             "no command to supervise; pass the agent command after --, \
              or --prompt to have zirv build the launch itself",
@@ -547,15 +565,15 @@ pub fn run_with<W: Write>(
             .cloned()
             .chain(prompt_args.iter().cloned())
             .collect();
-        let mut command = adapter.headless_cmd(prompt_text, &session, &extra);
+        let (mut command, stdin_prompt) = build_headless(prompt_text, &session, &extra);
         command.current_dir(repo);
-        command
+        (command, stdin_prompt)
     } else {
         let mut command = build_command(&launch_command, repo)?;
         for arg in &prompt_args {
             command.arg(arg);
         }
-        command
+        (command, None)
     };
     apply_session_env(&mut command, &session);
     let mut restarts = 0;
@@ -598,7 +616,7 @@ pub fn run_with<W: Write>(
             Some(&announcer),
         );
 
-        let (mut child, tap) = supervise::spawn_tapped(command)?;
+        let (mut child, tap) = supervise::spawn_tapped(command, stdin_prompt.clone())?;
         // Item 3: the messages folded into the launch prompt are consumed
         // here, right after the spawn that actually carried them has
         // genuinely started -- not before pacing or the spawn itself, where
@@ -769,7 +787,7 @@ pub fn run_with<W: Write>(
                 composed.as_ref(),
                 &state,
                 session.as_str(),
-            );
+            )?;
             // Folded into the prompt above, but only actually marked read
             // once the relaunch that carries it genuinely spawns -- the same
             // Item 3 discipline every other delivery seam in this function
@@ -817,9 +835,11 @@ pub fn run_with<W: Write>(
                 .cloned()
                 .chain(prompt_args.iter().cloned())
                 .collect();
-            command = adapter.headless_cmd(&combined, &session, &extra);
-            command.current_dir(repo);
-            apply_session_env(&mut command, &session);
+            let (mut rebuilt, sp) = build_headless(&combined, &session, &extra);
+            rebuilt.current_dir(repo);
+            apply_session_env(&mut rebuilt, &session);
+            command = rebuilt;
+            stdin_prompt = sp;
             continue;
         }
 
@@ -886,9 +906,11 @@ pub fn run_with<W: Write>(
                 .cloned()
                 .chain(prompt_args.iter().cloned())
                 .collect();
-            command = adapter.headless_cmd(&prompt_text, &session, &extra);
-            command.current_dir(repo);
-            apply_session_env(&mut command, &session);
+            let (mut rebuilt, sp) = build_headless(&prompt_text, &session, &extra);
+            rebuilt.current_dir(repo);
+            apply_session_env(&mut rebuilt, &session);
+            command = rebuilt;
+            stdin_prompt = sp;
             continue;
         }
 
@@ -1028,9 +1050,11 @@ pub fn run_with<W: Write>(
             .cloned()
             .chain(prompt_args.iter().cloned())
             .collect();
-        command = adapter.headless_cmd(&combined, &session, &extra);
-        command.current_dir(repo);
-        apply_session_env(&mut command, &session);
+        let (mut rebuilt, sp) = build_headless(&combined, &session, &extra);
+        rebuilt.current_dir(repo);
+        apply_session_env(&mut rebuilt, &session);
+        command = rebuilt;
+        stdin_prompt = sp;
     }
 }
 
