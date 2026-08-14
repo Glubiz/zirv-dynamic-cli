@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-14 (feat/agent-coordination, mail trust round): two latent traps recorded -- exec/loop's mail gate keys off prompt composition; wrap's status bar paints without raw mode -->
 <!-- Updated 2026-08-14 (feat/dashboard, review fixes): `Ord::clamp` panics on a zero-width rect -->
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
@@ -41,6 +42,26 @@ quit sequence, quit/restore roster), it just never advises/compacts/restarts
 itself the way a plain `zirv ctx wrap` session does. Do not assume a pane
 attached in the dashboard is rot-monitored just because it looks identical to
 one running under `wrap` directly.
+
+## `exec`/`loop` gate mail on prompt composition, not on adapter capability
+
+Mail is consumed as part of *composing* a worker's system prompt, so the
+"was this message delivered?" decision is really "did we build a prompt?"
+rather than a check of `adapter.capabilities().system_prompt`. With the two
+adapters that ship today the two questions have the same answer, so nothing
+is lost. A third adapter whose `ready()` returns ok but which has no
+system-prompt support would turn this into a real message-eater: mail gets
+`mail::consume`d on launch and then has nowhere to go. Latent — fix the gate
+when a third adapter lands, not before.
+
+## `wrap`'s status bar paints whenever stdout is a tty
+
+Bar eligibility is decided on stdout being a terminal, but the bar reserves a
+screen row and repaints assuming it owns the display, which really requires
+raw mode on stdin. When stdout is a tty and stdin (or raw mode) is not, the
+bar still reserves and paints, leaving reserved-row artifacts in scrollback.
+Cosmetic only — nothing is lost and the session is unaffected — but it is why
+a `wrap` run with redirected stdin can litter the terminal.
 
 ## A markdown header block ends at the first blank line
 

@@ -741,7 +741,16 @@ pub fn run_nudge_with<W: Write>(
     // another checkout -- and storing its mail under the sender's slug filed
     // the message in a mailbox that session never reads. A nudge that
     // resolves a session must deliver into that session's own repo.
-    super::mail::store(&state, &record.repo_slug, &msg, &cfg)?;
+    // M2: `store_to` -- `record.repo_slug` may name another checkout, whose
+    // mailbox this session's `cfg.mail.keep`/`max_message_bytes` must not
+    // govern (see `mail::limits_for`).
+    super::mail::store_to(
+        &state,
+        &record.repo_slug,
+        &super::state::repo_slug(repo),
+        &msg,
+        &cfg,
+    )?;
     // Written after the mail: losing the marker (crash, or a write failure)
     // must never mean the message itself was lost, only that it is picked up
     // at the next natural poll or cycle instead of immediately.

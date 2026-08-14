@@ -1268,7 +1268,10 @@ fn apply_mail_effect(
             msg.from_session = from_session.to_string();
             msg.from_agent = from_agent.to_string();
             msg.sent = super::state::now_secs();
-            if let Err(e) = mail::store(state, &slug, &msg, cfg) {
+            // Same-repo store: the dashboard composes into its own repo's
+            // mailbox, so sender and destination slug are one and the same
+            // and the sender's own mail limits legitimately apply.
+            if let Err(e) = mail::store_to(state, &slug, &slug, &msg, cfg) {
                 push_error(errors, format!("mail send: {e}"));
             }
         }
