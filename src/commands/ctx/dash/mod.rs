@@ -548,9 +548,18 @@ fn reap_ended_panes(
 /// unanswered when the dashboard exited. `roster::take_roster` consumes on
 /// read, so without writing those candidates back this quit's fresh roster
 /// overwrote them and the sessions were lost for good, unoffered twice over.
+///
+/// G3: `deferred_restore` is the other pool of candidates a quit still owes
+/// the next launch -- every restore candidate the pane cap forced this
+/// session to skip when the operator confirmed the restore dialog
+/// (`partition_restore_selection`'s own `deferred` half), independent of
+/// whether that dialog is still open now. Merged in the same way and for the
+/// same reason as `unoffered`: both are offers this launch consumed without
+/// ever actually spawning them.
 fn on_quit(
     panes: &[Pane],
     unoffered: &[roster::RosterPane],
+    deferred_restore: &[roster::RosterPane],
     requests_dir: &Path,
     state: &StateDir,
     repo: &Path,
@@ -575,9 +584,11 @@ fn on_quit(
             title: pane.title().to_string(),
         })
         .collect();
+    let panes_for_roster = merge_unoffered(live, unoffered);
+    let panes_for_roster = merge_unoffered(panes_for_roster, deferred_restore);
     let roster = roster::Roster {
         written: super::state::now_secs(),
-        panes: merge_unoffered(live, unoffered),
+        panes: panes_for_roster,
     };
     let slug = super::state::repo_slug(repo);
     let _ = roster::write_roster(state, &slug, &roster);
@@ -952,7 +963,17 @@ fn compose_worker_prompt(
     let composed = prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
     // Last, and after the mail layer on purpose: this is zirv's own plumbing,
     // not something another session's message is allowed to sit on top of.
-    let composed = prompt::with_report_back_layer(composed, &req.requested_by);
+    //
+    // G2: gated on `cfg.mail.enabled`, same as the mail layer just above --
+    // telling a worker to `zirv ctx send` its outcome back when mail delivery
+    // is off would only ever produce a command that gets refused. An operator
+    // who has turned mail off has not asked for a task-completion channel that
+    // silently fails at the end of every worker's run.
+    let composed = if cfg.mail.enabled {
+        prompt::with_report_back_layer(composed, &req.requested_by)
+    } else {
+        composed
+    };
     (composed, mail_entries)
 }
 
@@ -1603,6 +1624,40 @@ fn restore_budget(live: usize, max_panes: usize, wanted: usize) -> (usize, usize
     (take, wanted - take)
 }
 
+/// Pure: splits a confirmed restore selection (`RestoreEffect::Confirm`'s own
+/// indices, into `restore_candidates`) into what this launch may actually
+/// spawn -- the first `take` of them, per `restore_budget` -- and the
+/// `RosterPane`s the pane cap forced it to skip.
+///
+/// G3: the skipped indices used to be dropped on the floor at the call site
+/// (`indices.into_iter().take(take)` simply never looked at the rest). The
+/// restore dialog closes on `Confirm` regardless of the cap, `restore_
+/// candidates` itself is never consulted again after this tick, and
+/// `roster::take_roster` already consumed the on-disk roster reading it --
+/// so those sessions were lost for good, not merely left unrestored this
+/// launch. Returned as owned `RosterPane`s, not indices, so the caller can
+/// carry them all the way to `on_quit` (as `deferred_restore`) without
+/// keeping `restore_candidates` borrowed for the rest of the session.
+fn partition_restore_selection(
+    indices: Vec<usize>,
+    restore_candidates: &[roster::RosterPane],
+    take: usize,
+) -> (Vec<roster::RosterPane>, Vec<roster::RosterPane>) {
+    let mut to_spawn = Vec::new();
+    let mut deferred = Vec::new();
+    for (position, idx) in indices.into_iter().enumerate() {
+        let Some(candidate) = restore_candidates.get(idx) else {
+            continue;
+        };
+        if position < take {
+            to_spawn.push(candidate.clone());
+        } else {
+            deferred.push(candidate.clone());
+        }
+    }
+    (to_spawn, deferred)
+}
+
 /// Spawns one roster candidate back as a fresh worker pane: resolves its
 /// adapter (re-checked against the live gate, same "data, never authority"
 /// discipline `fulfill_spawn_request` already holds a spawn request to --
@@ -1667,17 +1722,23 @@ fn spawn_restored_pane(
 // is only ever marked consumed after it was actually shown to the agent.
 
 /// Pure: whether a pane with `queued` nudges waiting should have the next one
-/// delivered right now -- idle, and there is something to deliver.
-pub fn deliverable_now(state: &PaneState, queued: usize) -> bool {
-    matches!(state, PaneState::Idle) && queued > 0
+/// delivered right now -- injectable, and there is something to deliver.
+///
+/// G1: takes `injectable` (`Pane::injectable`) rather than a `&PaneState`.
+/// `PaneState::Idle` alone is no longer sufficient: it deliberately excludes
+/// whether the operator has typed into the pane since its last turn boundary,
+/// so a bare `state == Idle` check here would happily type a nudge on top of
+/// a half-composed prompt.
+pub fn deliverable_now(injectable: bool, queued: usize) -> bool {
+    injectable && queued > 0
 }
 
 /// Pops the next queued nudge for one pane if `deliverable_now` allows it;
 /// otherwise leaves the queue untouched. Pure aside from the `VecDeque`
 /// mutation -- no pane, no I/O -- so the FIFO-drain-on-idle rule is testable
 /// without a real spawn.
-fn next_deliverable(queue: &mut VecDeque<String>, state: &PaneState) -> Option<String> {
-    if deliverable_now(state, queue.len()) {
+fn next_deliverable(queue: &mut VecDeque<String>, injectable: bool) -> Option<String> {
+    if deliverable_now(injectable, queue.len()) {
         queue.pop_front()
     } else {
         None
@@ -1714,15 +1775,19 @@ fn deliver_and_consume<I: Injector>(
     mail::consume(state, slug, path)
 }
 
-/// Pure: whether a pane in `verb`/`state` is a valid mail-sweep target --
-/// only an attached *worker* pane (`Verb::Dash`) that is currently `Idle`.
+/// Pure: whether a pane in `verb`, with `injectable` as `Pane::injectable`
+/// currently reports it, is a valid mail-sweep target -- only an attached
+/// *worker* pane (`Verb::Dash`) that may actually be injected into right now.
 /// The orchestrator pane (`Verb::Chat`) is deliberately excluded here, not
 /// just skipped by convention: it is never body-injected, only ever told a
 /// one-line unread-count advisory (the header's own mail segment) -- the
 /// same trust split every other mail delivery seam in this codebase already
 /// holds for an interactive Orchestrator session.
-fn is_delivery_eligible(verb: sessions::Verb, state: &PaneState) -> bool {
-    verb == sessions::Verb::Dash && matches!(state, PaneState::Idle)
+///
+/// G1: takes `injectable` rather than a `&PaneState` -- see `deliverable_now`'s
+/// own doc comment for why `state == Idle` alone is no longer the right gate.
+fn is_delivery_eligible(verb: sessions::Verb, injectable: bool) -> bool {
+    verb == sessions::Verb::Dash && injectable
 }
 
 /// Pure: the label a swept mail message is injected under. Carries the trust
@@ -1818,7 +1883,7 @@ fn mail_sweep(
     }
     let slug = super::state::repo_slug(repo);
     for pane in panes.iter_mut() {
-        if !is_delivery_eligible(pane.verb(), &pane.state()) {
+        if !is_delivery_eligible(pane.verb(), pane.injectable()) {
             continue;
         }
         let agent = pane.agent().to_string();
@@ -1848,7 +1913,7 @@ fn deliver_queued_nudges(
     errors: &mut Vec<String>,
 ) {
     for (pane, queue) in panes.iter_mut().zip(queues.iter_mut()) {
-        if let Some(text) = next_deliverable(queue, &pane.state())
+        if let Some(text) = next_deliverable(queue, pane.injectable())
             && let Err(e) = pane.inject_visible("nudge from operator", &text)
         {
             push_error(errors, format!("nudge delivery: {e}"));
@@ -2165,6 +2230,13 @@ pub fn run_dashboard(
     // F4: every reaped pane's exit code, in reap order -- the empty exit's own
     // status is a fold over this (`empty_exit_code`).
     let mut reaped_codes: Vec<i32> = Vec::new();
+    // G3: every restore candidate the pane cap has forced this session to
+    // skip so far, across however many restore confirmations happen during
+    // it (the spawn dialog is reachable any number of times, not just at
+    // startup) -- carried to every `on_quit` call below so none of them are
+    // lost just because the restore dialog that offered them has long since
+    // closed.
+    let mut deferred_restore: Vec<roster::RosterPane> = Vec::new();
 
     let exit_code: i32 = loop {
         for pane in panes.iter_mut() {
@@ -2200,6 +2272,7 @@ pub fn run_dashboard(
             on_quit(
                 &panes,
                 unoffered_candidates(&overlay, &restore_candidates),
+                &deferred_restore,
                 &requests_dir,
                 state,
                 repo,
@@ -2282,7 +2355,16 @@ pub fn run_dashboard(
                                     // `overlay` was taken above, so this is the
                                     // one quit path that cannot have a restore
                                     // dialog pending: it *is* the open overlay.
-                                    on_quit(&panes, &[], &requests_dir, state, repo);
+                                    // `deferred_restore` (G3) is independent of
+                                    // that and still owed regardless.
+                                    on_quit(
+                                        &panes,
+                                        &[],
+                                        &deferred_restore,
+                                        &requests_dir,
+                                        state,
+                                        repo,
+                                    );
                                     shutdown_all(&mut panes, cfg, &mut errors);
                                     break 0;
                                 }
@@ -2349,21 +2431,33 @@ pub fn run_dashboard(
                                         cfg.dash.max_panes,
                                         indices.len(),
                                     );
-                                    for idx in indices.into_iter().take(take) {
-                                        if let Some(candidate) = restore_candidates.get(idx) {
-                                            spawn_restored_pane(
-                                                candidate,
-                                                &mut panes,
-                                                &mut nudge_queues,
-                                                cfg,
-                                                state,
-                                                repo,
-                                                pane_size,
-                                                &requests_dir,
-                                                &mut errors,
-                                            );
-                                        }
+                                    // G3: the cap-skipped half is not just
+                                    // dropped -- it is carried in
+                                    // `deferred_restore` so `on_quit` can
+                                    // still offer those sessions to the next
+                                    // launch, even though this dialog closes
+                                    // (and `restore_candidates` stops being
+                                    // consulted) right after this effect is
+                                    // handled.
+                                    let (to_spawn, deferred) = partition_restore_selection(
+                                        indices,
+                                        &restore_candidates,
+                                        take,
+                                    );
+                                    for candidate in &to_spawn {
+                                        spawn_restored_pane(
+                                            candidate,
+                                            &mut panes,
+                                            &mut nudge_queues,
+                                            cfg,
+                                            state,
+                                            repo,
+                                            pane_size,
+                                            &requests_dir,
+                                            &mut errors,
+                                        );
                                     }
+                                    deferred_restore.extend(deferred);
                                     if skipped > 0 {
                                         push_error(
                                             &mut errors,
@@ -2507,8 +2601,17 @@ pub fn run_dashboard(
                                 if working.is_empty() {
                                     // Reached only with no overlay open (this
                                     // arm is the no-overlay branch), so there
-                                    // is nothing unoffered to hand back.
-                                    on_quit(&panes, &[], &requests_dir, state, repo);
+                                    // is nothing unoffered to hand back --
+                                    // `deferred_restore` (G3) aside, which is
+                                    // still owed regardless of overlay state.
+                                    on_quit(
+                                        &panes,
+                                        &[],
+                                        &deferred_restore,
+                                        &requests_dir,
+                                        state,
+                                        repo,
+                                    );
                                     shutdown_all(&mut panes, cfg, &mut errors);
                                     break 0;
                                 }
@@ -2608,6 +2711,7 @@ pub fn run_dashboard(
             on_quit(
                 &panes,
                 unoffered_candidates(&overlay, &restore_candidates),
+                &deferred_restore,
                 &requests_dir,
                 state,
                 repo,
@@ -3644,43 +3748,36 @@ mod tests {
 
     #[test]
     fn deliverable_now_truth_table() {
-        assert!(!deliverable_now(&PaneState::Working, 1));
-        assert!(!deliverable_now(&PaneState::Idle, 0));
-        assert!(deliverable_now(&PaneState::Idle, 1));
-        assert!(!deliverable_now(&PaneState::Ended(0), 1));
-        assert!(!deliverable_now(&PaneState::WaitingInput, 1));
+        assert!(!deliverable_now(false, 1), "not injectable, queued");
+        assert!(!deliverable_now(true, 0), "injectable, empty queue");
+        assert!(deliverable_now(true, 1));
+        assert!(!deliverable_now(false, 0));
     }
 
     #[test]
-    fn queue_drains_fifo_only_while_idle() {
+    fn queue_drains_fifo_only_while_injectable() {
         let mut queue: VecDeque<String> = VecDeque::new();
         queue.push_back("first".to_string());
         queue.push_back("second".to_string());
 
-        assert_eq!(next_deliverable(&mut queue, &PaneState::Working), None);
-        assert_eq!(queue.len(), 2, "nothing is popped while working");
+        assert_eq!(next_deliverable(&mut queue, false), None);
+        assert_eq!(queue.len(), 2, "nothing is popped while not injectable");
         assert_eq!(
-            next_deliverable(&mut queue, &PaneState::Idle),
+            next_deliverable(&mut queue, true),
             Some("first".to_string())
         );
         assert_eq!(
-            next_deliverable(&mut queue, &PaneState::Idle),
+            next_deliverable(&mut queue, true),
             Some("second".to_string())
         );
-        assert_eq!(next_deliverable(&mut queue, &PaneState::Idle), None);
+        assert_eq!(next_deliverable(&mut queue, true), None);
     }
 
     #[test]
     fn orchestrator_pane_is_excluded_from_mail_delivery() {
-        assert!(!is_delivery_eligible(
-            sessions::Verb::Chat,
-            &PaneState::Idle
-        ));
-        assert!(is_delivery_eligible(sessions::Verb::Dash, &PaneState::Idle));
-        assert!(!is_delivery_eligible(
-            sessions::Verb::Dash,
-            &PaneState::Working
-        ));
+        assert!(!is_delivery_eligible(sessions::Verb::Chat, true));
+        assert!(is_delivery_eligible(sessions::Verb::Dash, true));
+        assert!(!is_delivery_eligible(sessions::Verb::Dash, false));
     }
 
     struct FailingInjector;
@@ -3992,6 +4089,44 @@ mod tests {
         assert!(!composed.sources.contains(&prompt::PromptSource::ReportBack));
     }
 
+    /// G2: an operator who disabled mail delivery must not have a worker told
+    /// to `zirv ctx send` its outcome back anyway -- `zirv ctx send` itself
+    /// refuses outright when `cfg.mail.enabled` is false, so the instruction
+    /// would only ever produce a failed command at the end of every task.
+    #[test]
+    fn a_worker_panes_prompt_omits_the_report_back_line_when_mail_is_disabled() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.mail.enabled = false;
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+
+        let (composed, mail_entries) = compose_worker_prompt(
+            &spawn_request("do the work", repo),
+            "claude",
+            "cccc3333",
+            &cfg,
+            &state,
+            repo,
+            &slug,
+        );
+
+        let composed = composed.expect("a worker pane composes a prompt");
+        assert!(
+            !composed.text.contains("zirv ctx send --to-session"),
+            "mail disabled must suppress the report-back instruction:\n{}",
+            composed.text
+        );
+        assert!(!composed.sources.contains(&prompt::PromptSource::ReportBack));
+        assert!(
+            mail_entries.is_empty(),
+            "mail disabled also suppresses the mail-layer listing, unchanged from before"
+        );
+    }
+
     #[test]
     fn argv_unsafe_prompt_flags_anything_that_would_be_read_as_a_flag() {
         assert!(argv_unsafe_prompt("--dangerously-skip-permissions"));
@@ -4262,7 +4397,7 @@ mod tests {
         let requests_dir = state.dash().join("aaaa1111-token").join("requests");
         std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
 
-        on_quit(&panes, &[], &requests_dir, &state, &repo);
+        on_quit(&panes, &[], &[], &requests_dir, &state, &repo);
 
         assert!(
             !requests_dir
@@ -4756,6 +4891,7 @@ mod tests {
         on_quit(
             &[],
             unoffered_candidates(&pending, &candidates),
+            &[],
             &requests_dir,
             &state,
             &repo,
@@ -4909,22 +5045,122 @@ mod tests {
     }
 
     /// R3, at the seam the two same-tick injectors share: once a pane has
-    /// been injected into it is `Working`, so neither `mail_sweep`'s own
-    /// eligibility check nor `deliver_queued_nudges`' will act on it again
-    /// until its next turn signal.
+    /// been injected into it is no longer injectable, so neither
+    /// `mail_sweep`'s own eligibility check nor `deliver_queued_nudges`' will
+    /// act on it again until its next turn signal.
     #[test]
     fn a_pane_with_a_pending_injection_is_eligible_for_neither_injector() {
-        assert!(is_delivery_eligible(sessions::Verb::Dash, &PaneState::Idle));
-        assert!(deliverable_now(&PaneState::Idle, 1));
+        assert!(is_delivery_eligible(sessions::Verb::Dash, true));
+        assert!(deliverable_now(true, 1));
 
         assert!(
-            !is_delivery_eligible(sessions::Verb::Dash, &PaneState::Working),
-            "the mail sweep skips a pane that is already working"
+            !is_delivery_eligible(sessions::Verb::Dash, false),
+            "the mail sweep skips a pane that is not injectable"
         );
         assert!(
-            !deliverable_now(&PaneState::Working, 1),
+            !deliverable_now(false, 1),
             "and so does the nudge drain -- the queue simply waits a tick"
         );
+    }
+
+    /// G1, end to end on a real supervised child: an operator typing into a
+    /// pane -- with no turn signal following -- must not stop `mail_sweep` or
+    /// `deliver_queued_nudges` from seeing it as `Idle` (the sidebar glyph and
+    /// quit-confirm dialog stay honest), but both must still refuse to inject
+    /// into it, exactly as they already refuse a `Working` pane.
+    #[test]
+    fn mail_sweep_and_nudge_drain_skip_a_pane_the_operator_is_mid_typing_into() {
+        use super::pane::tests::{long_lived_argv, signal_until_idle};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let slug = super::super::state::repo_slug(&repo);
+        let cfg = CtxConfig::default();
+
+        let session_id = "66666666-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        assert!(
+            signal_until_idle(&mut panes[0], &state, session_id),
+            "the pane must report a turn boundary before this test can mean anything"
+        );
+
+        panes[0]
+            .write_operator_input(b"half a thought")
+            .expect("forwarding a keystroke must succeed while the child is alive");
+        assert!(
+            matches!(panes[0].state(), PaneState::Idle),
+            "the glyph stays Idle: typing alone must never render as Working"
+        );
+
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "aaaa1111".to_string(),
+                from_agent: "claude".to_string(),
+                to: "test-agent".to_string(),
+                to_session: None,
+                sent: super::super::state::now_secs(),
+                body: "the build is red".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::from(vec!["ping".to_string()])];
+        let mut errors = Vec::new();
+
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut errors);
+        assert_eq!(
+            mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
+                .expect("list")
+                .len(),
+            1,
+            "the sweep must not deliver into a pane the operator is mid-thought in"
+        );
+
+        deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
+        assert_eq!(
+            queues[0].len(),
+            1,
+            "the nudge drain must not deliver either, for the same reason"
+        );
+
+        // The next turn boundary clears the typing flag and delivery resumes
+        // -- one injector per tick, same as R3 (`mail_sweep` runs first and
+        // claims the tick; the nudge drain sees the pane busy again and waits
+        // one more turn, exactly as it would for any other injection).
+        assert!(signal_until_idle(&mut panes[0], &state, session_id));
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut errors);
+        assert!(
+            mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
+                .expect("list")
+                .is_empty(),
+            "mail delivery resumes once the turn boundary clears the typing flag"
+        );
+        deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
+        assert_eq!(
+            queues[0].len(),
+            1,
+            "the nudge still waits: the pane is mid-turn from the sweep's own injection"
+        );
+
+        assert!(signal_until_idle(&mut panes[0], &state, session_id));
+        deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
+        assert!(queues[0].is_empty(), "and delivers once that turn ends too");
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
     }
 
     /// R3, end to end through one tick's real sequence: `mail_sweep` runs
@@ -5103,6 +5339,100 @@ mod tests {
             restore_budget(0, 9, 3),
             (3, 0),
             "room for everything skips nothing"
+        );
+    }
+
+    fn restore_pane(short: &str, session_id: &str) -> roster::RosterPane {
+        roster::RosterPane {
+            agent: "claude".to_string(),
+            session_id: session_id.to_string(),
+            role: roster::ROLE_WORKER.to_string(),
+            short: short.to_string(),
+            title: format!("wrk {short}"),
+        }
+    }
+
+    /// G3: a confirmed selection under the pane cap is split into what gets
+    /// spawned (the first `take`, per `restore_budget`) and what the cap
+    /// forced this launch to defer -- and the deferred half must still be the
+    /// original `RosterPane`s, not merely dropped indices.
+    #[test]
+    fn partition_restore_selection_defers_what_the_cap_skips() {
+        let candidates = vec![
+            restore_pane("aaaa1111", "11111111-2222-4333-8444-555555555555"),
+            restore_pane("bbbb2222", "22222222-2222-4333-8444-555555555555"),
+            restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555"),
+        ];
+
+        // cap 2, roster 3, confirm all -> 2 to spawn, the third deferred.
+        let (take, _skipped) = restore_budget(0, 2, 3);
+        let (to_spawn, deferred) = partition_restore_selection(vec![0, 1, 2], &candidates, take);
+
+        assert_eq!(to_spawn, vec![candidates[0].clone(), candidates[1].clone()]);
+        assert_eq!(deferred, vec![candidates[2].clone()]);
+    }
+
+    #[test]
+    fn partition_restore_selection_defers_nothing_under_budget() {
+        let candidates = vec![restore_pane(
+            "aaaa1111",
+            "11111111-2222-4333-8444-555555555555",
+        )];
+        let (take, _skipped) = restore_budget(0, 9, 1);
+        let (to_spawn, deferred) = partition_restore_selection(vec![0], &candidates, take);
+
+        assert_eq!(to_spawn, candidates);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn partition_restore_selection_ignores_a_stale_index() {
+        let candidates = vec![restore_pane(
+            "aaaa1111",
+            "11111111-2222-4333-8444-555555555555",
+        )];
+        let (to_spawn, deferred) = partition_restore_selection(vec![5], &candidates, 1);
+
+        assert!(to_spawn.is_empty());
+        assert!(deferred.is_empty());
+    }
+
+    /// G3, end to end through `on_quit`: a restore candidate the pane cap
+    /// deferred this session must still be in the roster `on_quit` writes,
+    /// even though the restore dialog that offered it is long since closed
+    /// (`unoffered` here is empty -- exactly the state a closed dialog leaves
+    /// it in) and even though two *other* candidates from the same roster are
+    /// already live, spawned panes.
+    #[test]
+    fn on_quit_writes_back_restore_candidates_the_pane_cap_deferred() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let deferred = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+
+        // No live panes needed to prove the point: `deferred_restore` must
+        // round-trip through the roster on its own, the same as `unoffered`
+        // does in `an_unanswered_restore_dialog_round_trips_through_the_roster`.
+        on_quit(
+            &[],
+            &[],
+            std::slice::from_ref(&deferred),
+            &requests_dir,
+            &state,
+            &repo,
+        );
+
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is still written");
+        assert_eq!(
+            written.panes,
+            vec![deferred],
+            "the cap-deferred candidate is offered again next launch"
         );
     }
 

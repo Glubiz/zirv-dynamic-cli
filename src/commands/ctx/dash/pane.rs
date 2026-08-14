@@ -144,23 +144,23 @@ pub(crate) fn signal_still_stands(
 /// nudge drain -- which run back to back in one tick and both gate on `Idle`
 /// -- each saw the same idle pane and each typed into it.
 ///
-/// F1: `user_typed_since_turn` is the other precondition `wrap::may_inject`
-/// holds and this pane did not (`!state.user_typed_since_turn`,
-/// `wrap.rs:259`). An operator who has typed into this pane since its last
-/// turn boundary is mid-thought at a half-composed prompt, and an injected
-/// line submits itself -- taking whatever they had typed with it. Set by
-/// `write_operator_input` and cleared by the next turn signal, exactly like
-/// the injection flag beside it.
+/// G1: `user_typed_since_turn` used to be a third parameter here, folding the
+/// operator's own mid-thought typing into this **displayed** state -- so an
+/// operator who pressed a key with no turn signal following it left the pane
+/// rendered `Working` forever (`○`/`●` in the sidebar, and the quit-confirm
+/// dialog always named it as busy), even though nothing was actually running.
+/// The flag is real and still matters, but only for whether an *injection* may
+/// land, never for what glyph a pane renders -- see [`Pane::injectable`],
+/// which is where it moved to.
 fn state_from(
     signal_stands: bool,
     child_exit: Option<i32>,
     injected_awaiting_turn: bool,
-    user_typed_since_turn: bool,
 ) -> PaneState {
     if let Some(code) = child_exit {
         return PaneState::Ended(code);
     }
-    if injected_awaiting_turn || user_typed_since_turn {
+    if injected_awaiting_turn {
         return PaneState::Working;
     }
     if signal_stands {
@@ -168,6 +168,30 @@ fn state_from(
     } else {
         PaneState::Working
     }
+}
+
+/// Pure: whether a pane in `state`, with `injected_awaiting_turn` and
+/// `user_typed_since_turn` as they currently stand, may have a line injected
+/// into it right now. `state == Idle` already implies `!injected_awaiting_turn`
+/// ([`state_from`] reports `Working` while an injection is pending), so the
+/// explicit check here is belt-and-suspenders against that invariant changing
+/// out from under this function rather than load-bearing on its own.
+///
+/// G1: the operator-typing half of what `state_from` used to decide on its
+/// own. F1's precondition (`wrap::may_inject`'s own
+/// `!state.user_typed_since_turn`, `wrap.rs:259`) still holds -- an operator
+/// mid-thought at a half-composed prompt must not have an injected line
+/// submit it out from under them -- it is just no longer read off the
+/// **displayed** `PaneState`, so a pane an operator typed into and then left
+/// alone still renders `Idle`, is still named honestly in the quit-confirm
+/// dialog, and simply is not a valid injection target until its next turn
+/// signal clears the flag.
+fn injectable_from(
+    state: PaneState,
+    injected_awaiting_turn: bool,
+    user_typed_since_turn: bool,
+) -> bool {
+    matches!(state, PaneState::Idle) && !injected_awaiting_turn && !user_typed_since_turn
 }
 
 /// The bottom-most non-blank row of a vt100 screen, right-trimmed. Empty
@@ -339,8 +363,9 @@ pub struct Pane {
     injected_awaiting_turn: bool,
     /// Set by `write_operator_input` (every keystroke the dashboard forwards
     /// to this pane), cleared by the next turn signal: "the operator is
-    /// mid-thought in this pane." See `state_from`'s own doc comment -- the
-    /// same precondition `wrap::may_inject` holds before it types anything.
+    /// mid-thought in this pane." See [`Pane::injectable`]'s own doc comment
+    /// (G1) -- the same precondition `wrap::may_inject` holds before it types
+    /// anything, but gates injection only, not the pane's displayed state.
     user_typed_since_turn: bool,
     exit_code: Option<i32>,
     /// Idempotency guard for `shutdown` -- the release profile is
@@ -551,6 +576,18 @@ impl Pane {
             ),
             self.exit_code,
             self.injected_awaiting_turn,
+        )
+    }
+
+    /// Whether this pane may have a line injected into it right now -- the
+    /// mail sweep's and the nudge drain's own eligibility gate. See
+    /// [`injectable_from`] for the full reasoning (G1): `state()` alone is no
+    /// longer enough, because the operator's own mid-thought typing is
+    /// deliberately excluded from it.
+    pub fn injectable(&self) -> bool {
+        injectable_from(
+            self.state(),
+            self.injected_awaiting_turn,
             self.user_typed_since_turn,
         )
     }
@@ -677,20 +714,14 @@ pub(crate) mod tests {
 
     #[test]
     fn pane_state_maps_turn_signals_to_glyph_states() {
+        assert!(matches!(state_from(false, None, false), PaneState::Working));
+        assert!(matches!(state_from(true, None, false), PaneState::Idle));
         assert!(matches!(
-            state_from(false, None, false, false),
-            PaneState::Working
-        ));
-        assert!(matches!(
-            state_from(true, None, false, false),
-            PaneState::Idle
-        ));
-        assert!(matches!(
-            state_from(true, Some(0), false, false),
+            state_from(true, Some(0), false),
             PaneState::Ended(0)
         ));
         assert!(matches!(
-            state_from(false, Some(3), false, false),
+            state_from(false, Some(3), false),
             PaneState::Ended(3)
         ));
     }
@@ -814,42 +845,51 @@ pub(crate) mod tests {
         );
     }
 
-    /// F1: the operator typing into a pane is the same "do not inject" signal
-    /// `wrap::may_inject` already honours -- a half-composed prompt must not be
-    /// submitted by an injected line landing on top of it.
-    #[test]
-    fn operator_typing_keeps_a_pane_out_of_reach_until_the_next_turn_signal() {
-        assert!(matches!(
-            state_from(true, None, false, true),
-            PaneState::Working
-        ));
-        assert!(
-            matches!(state_from(true, None, false, false), PaneState::Idle),
-            "and the very next turn boundary, which clears the flag, makes it reachable again"
-        );
-        assert!(
-            matches!(state_from(true, Some(0), false, true), PaneState::Ended(0)),
-            "an exited pane is Ended regardless of what the operator was typing"
-        );
-    }
-
     /// R3: a pane that was just injected into is `Working` even though its
     /// last observed signal still says "idle" -- and an exit still wins over
     /// both.
     #[test]
     fn a_pending_injection_reports_working_until_the_next_turn_signal() {
-        assert!(matches!(
-            state_from(true, None, true, false),
-            PaneState::Working
-        ));
-        assert!(matches!(
-            state_from(false, None, true, false),
-            PaneState::Working
-        ));
+        assert!(matches!(state_from(true, None, true), PaneState::Working));
+        assert!(matches!(state_from(false, None, true), PaneState::Working));
         assert!(
-            matches!(state_from(true, Some(0), true, false), PaneState::Ended(0)),
+            matches!(state_from(true, Some(0), true), PaneState::Ended(0)),
             "an exited pane is Ended regardless of a pending injection"
         );
+    }
+
+    /// G1: operator typing is the same "do not inject" signal
+    /// `wrap::may_inject` already honours -- a half-composed prompt must not be
+    /// submitted by an injected line landing on top of it -- but, unlike
+    /// before, it no longer changes what `PaneState` the pane reports: a pane
+    /// the operator typed into and then left alone still renders `Idle`, it is
+    /// just not `injectable` until its next turn signal.
+    #[test]
+    fn operator_typing_keeps_a_pane_uninjectable_but_still_renders_idle() {
+        assert!(
+            !injectable_from(PaneState::Idle, false, true),
+            "typing makes the pane ineligible for injection"
+        );
+        assert!(
+            injectable_from(PaneState::Idle, false, false),
+            "and the very next turn boundary, which clears the flag, makes it eligible again"
+        );
+        assert!(
+            !injectable_from(PaneState::Working, false, true),
+            "a working pane is never injectable regardless of typing"
+        );
+        assert!(
+            !injectable_from(PaneState::Ended(0), false, true),
+            "an ended pane is never injectable regardless of typing"
+        );
+    }
+
+    /// G1: `injectable_from`'s explicit `injected_awaiting_turn` check is
+    /// belt-and-suspenders (state `Idle` already implies it is false), but it
+    /// must still hold on its own terms.
+    #[test]
+    fn a_pending_injection_is_never_injectable_even_if_state_somehow_says_idle() {
+        assert!(!injectable_from(PaneState::Idle, true, false));
     }
 
     #[test]
@@ -1138,12 +1178,14 @@ pub(crate) mod tests {
         pane.shutdown("").expect("shutdown");
     }
 
-    /// F1, end to end on a real supervised child: a keystroke the dashboard
+    /// F1/G1, end to end on a real supervised child: a keystroke the dashboard
     /// forwards to a pane takes it out of reach of both idle-gated injectors
-    /// until the pane reports its next turn boundary. Same rule `wrap` holds
-    /// with `user_typed_since_turn`, and the same clearing point.
+    /// until the pane reports its next turn boundary -- but, per G1, this must
+    /// no longer show up in the pane's own **displayed** state: the sidebar
+    /// glyph and the quit-confirm dialog (both driven by `state()`) must keep
+    /// reading the pane as `Idle`, only `injectable()` may say otherwise.
     #[test]
-    fn operator_typing_makes_a_pane_ineligible_until_its_next_turn_signal() {
+    fn operator_typing_makes_a_pane_ineligible_but_leaves_its_glyph_idle() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
@@ -1158,18 +1200,28 @@ pub(crate) mod tests {
             signal_until_idle(&mut pane, &state, session_id),
             "the pane must report a turn boundary before this test can mean anything"
         );
+        assert!(pane.injectable(), "idle with nothing typed is injectable");
 
         pane.write_operator_input(b"half a thought")
             .expect("forwarding a keystroke must succeed while the child is alive");
         assert!(
-            matches!(pane.state(), PaneState::Working),
-            "an operator mid-thought is not an injection target: {:?}",
+            matches!(pane.state(), PaneState::Idle),
+            "G1: typing with no turn signal following it must not change the \
+             displayed state -- the pane is not mid-turn, it is mid-thought: {:?}",
             pane.state()
+        );
+        assert!(
+            !pane.injectable(),
+            "an operator mid-thought is not an injection target"
         );
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
             "the next turn boundary clears the operator-typing flag"
+        );
+        assert!(
+            pane.injectable(),
+            "and the pane is reachable again once it does"
         );
 
         pane.shutdown("").expect("shutdown");
