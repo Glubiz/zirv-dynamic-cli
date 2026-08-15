@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, ScoreConfig, env_from_process};
-use super::event::input_hash;
+use super::event::{SessionId, SessionRef, input_hash};
 use super::rot::{self, RotState, Score};
 use super::state::StateDir;
 use super::supervise::Watcher;
@@ -221,10 +221,21 @@ pub fn score_transcript_cached(
     let Ok(state_dir) = StateDir::resolve(env) else {
         return full_score(adapter.as_ref(), transcript, &cfg.score);
     };
+    score_with_checkpoint(&state_dir, transcript, adapter.as_ref(), &cfg.score)
+}
 
-    let path = checkpoint_path(&state_dir, transcript);
-    let fingerprint = fingerprint(adapter.as_ref(), &cfg.score);
-    let mut scorer = match load_checkpoint(&path, transcript, fingerprint, &cfg.score) {
+/// The body of [`score_transcript_cached`], against a state dir the caller
+/// already has. Split out so the dashboard's [`cached_score`] reaches the same
+/// incremental fold without re-resolving the state dir from the environment.
+fn score_with_checkpoint(
+    state_dir: &StateDir,
+    transcript: &Path,
+    adapter: &dyn AgentAdapter,
+    cfg: &ScoreConfig,
+) -> CtxResult<Score> {
+    let path = checkpoint_path(state_dir, transcript);
+    let fingerprint = fingerprint(adapter, cfg);
+    let mut scorer = match load_checkpoint(&path, transcript, fingerprint, cfg) {
         Some(checkpoint) => IncrementalScorer::resuming(
             transcript.to_path_buf(),
             checkpoint.offset,
@@ -237,11 +248,165 @@ pub fn score_transcript_cached(
     // A poll that reports nothing new cannot be answered from a checkpoint
     // alone (an unreadable or empty transcript lands here too), so it falls
     // back rather than guessing.
-    let Ok(Some(score)) = scorer.poll(adapter.as_ref(), &cfg.score) else {
-        return full_score(adapter.as_ref(), transcript, &cfg.score);
+    let Ok(Some(score)) = scorer.poll(adapter, cfg) else {
+        return full_score(adapter, transcript, cfg);
     };
     save_checkpoint(&path, transcript, fingerprint, &scorer);
     Ok(score)
+}
+
+/// What a transcript looked like when its score was last computed. `mtime`
+/// alone can miss an in-place rewrite inside one filesystem clock tick and
+/// `len` alone misses an equal-length one, so the pair is the key -- both come
+/// out of the single `metadata` call the fast path is allowed to make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+fn stamp_of(transcript: &Path) -> Option<TranscriptStamp> {
+    let meta = std::fs::metadata(transcript).ok()?;
+    Some(TranscriptStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CachedScore {
+    /// Where this session's transcript was resolved to. Kept even when
+    /// nothing has been written there yet: resolving it is the expensive part
+    /// (`ClaudeAdapter::transcript_path` walks the agent's projects tree when
+    /// its slug rule misses), and a stat against a path that does not exist
+    /// costs nothing.
+    transcript: PathBuf,
+    /// The stamp that was actually scored, and its score. `None` until the
+    /// transcript first becomes readable.
+    scored: Option<(TranscriptStamp, u32)>,
+    /// Polls answered off this path since it was resolved, counted only while
+    /// the transcript is missing -- see [`RESOLVE_RETRY_POLLS`].
+    polls_since_resolve: u32,
+}
+
+/// How many polls a session whose transcript has not appeared yet reuses its
+/// resolved path before resolving again. Resolving every poll would put a
+/// directory walk per pane on a once-a-second render path; never resolving
+/// again would strand the rare session whose transcript lands somewhere the
+/// first resolution did not predict. At the dashboard's refresh rate this is
+/// about ten seconds.
+const RESOLVE_RETRY_POLLS: u32 = 10;
+
+/// Process-local, keyed by session id. `OnceLock` rather than a `lazy_static`
+/// dependency, and a poisoned lock is recovered with `into_inner` (the same
+/// thing `wrap` does with its stdout lock): a panic in another thread must not
+/// take the sidebar's scores down with it.
+fn score_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedScore>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, CachedScore>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// How many times [`cached_score`] has actually re-parsed a transcript, as
+/// opposed to answering from the cache. Only the tests read it, but it is
+/// counted unconditionally: an atomic increment on the recompute path costs
+/// nothing next to the parse it is counting, and a `cfg(test)`-only counter
+/// would measure a different code path than the one that ships.
+static SCORE_RECOMPUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// This session's current rot score, recomputed only when its transcript has
+/// changed since the last call. Built for the dashboard sidebar: up to nine
+/// panes polling about once a second, where a full parse per pane per second
+/// would be far too expensive.
+///
+/// The steady state is a single `metadata` call: the resolved transcript path
+/// is cached with the score, and an unchanged (mtime, len) answers straight
+/// from memory. A changed transcript falls into the same incremental fold the
+/// Stop hook uses ([`score_transcript_cached`]), which costs the appended
+/// bytes rather than the session. Nothing here spawns, waits, or touches the
+/// network.
+///
+/// `None` means *unknown*, never *healthy*: no transcript yet, a transcript
+/// that cannot be read, an unresolvable config or agent. A renderer must show
+/// that as `--`, since "healthy" and "unknown" are opposite things to tell an
+/// operator. A session whose agent has not written its first line yet still
+/// picks its score up once it does: the resolved path is stat-ed on every
+/// poll, and re-resolved every [`RESOLVE_RETRY_POLLS`] polls while nothing is
+/// there.
+///
+/// The dashboard sidebar that consumes this is a separate change in flight;
+/// until it lands nothing in the binary calls it.
+#[allow(dead_code)]
+pub fn cached_score(state: &StateDir, repo: &Path, session_id: &str) -> Option<u32> {
+    cached_score_with(state, repo, session_id, &env_from_process())
+}
+
+fn cached_score_with(
+    state: &StateDir,
+    repo: &Path,
+    session_id: &str,
+    env: EnvLookup<'_>,
+) -> Option<u32> {
+    let cached = {
+        let cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(session_id).cloned()
+    };
+
+    if let Some(entry) = &cached {
+        match stamp_of(&entry.transcript) {
+            // The whole fast path: one stat, no config load, no parse.
+            Some(stamp) => {
+                if let Some((scored, score)) = &entry.scored
+                    && *scored == stamp
+                {
+                    return Some(*score);
+                }
+            }
+            // Nothing written there (yet, or any more). Keep answering
+            // "unknown" off the path already resolved rather than resolving
+            // it again on every frame.
+            None => {
+                let polls = entry.polls_since_resolve.saturating_add(1);
+                if polls < RESOLVE_RETRY_POLLS {
+                    let mut cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(live) = cache.get_mut(session_id) {
+                        live.polls_since_resolve = polls;
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
+    let cfg = CtxConfig::load(repo, env).ok()?;
+    let adapter = adapters::select(cfg.agent.as_deref(), &[], &cfg).ok()?;
+    let transcript = adapter.transcript_path(&SessionRef {
+        id: SessionId::parse(session_id),
+        cwd: repo.to_path_buf(),
+    });
+    // Stamped before the parse, so a line appended while it runs invalidates
+    // this entry on the next poll instead of being missed forever.
+    let scored = match stamp_of(&transcript) {
+        Some(stamp) => score_with_checkpoint(state, &transcript, adapter.as_ref(), &cfg.score)
+            .ok()
+            .map(|score| {
+                SCORE_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (stamp, score.score)
+            }),
+        None => None,
+    };
+
+    let mut cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        session_id.to_string(),
+        CachedScore {
+            transcript,
+            scored: scored.clone(),
+            polls_since_resolve: 0,
+        },
+    );
+    scored.map(|(_, score)| score)
 }
 
 pub fn run_with<W: Write>(
@@ -637,6 +802,140 @@ mod tests {
         })
         .expect_err("must fail");
         assert!(err.to_string().contains("nope.jsonl"), "got {err}");
+    }
+
+    /// Where `ClaudeAdapter::transcript_path` computes this session's
+    /// transcript under a test `HOME`: `~/.claude/projects/<repo slug>/`,
+    /// which uses the same character rule as `state::repo_slug`.
+    fn claude_transcript(home: &Path, repo: &Path, session: &str) -> PathBuf {
+        let dir = home
+            .join(".claude")
+            .join("projects")
+            .join(super::super::state::repo_slug(repo));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir.join(format!("{session}.jsonl"))
+    }
+
+    fn recomputes() -> u64 {
+        SCORE_RECOMPUTES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The dashboard polls this about once a second per pane, for up to nine
+    /// panes. The contract is that an unchanged transcript costs no parse at
+    /// all, and a changed one is picked up on the very next poll.
+    #[test]
+    fn the_cached_score_recomputes_only_when_the_transcript_changes() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(home.path().join("state"));
+        let env: HashMap<String, String> = HashMap::new();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "5c0d0001-1111-4222-8333-444444444444";
+
+        assert_eq!(
+            cached_score_with(&state, repo.path(), session, &lookup),
+            None,
+            "no transcript yet is unknown, and a renderer must show '--' rather than 0"
+        );
+
+        let transcript = claude_transcript(home.path(), repo.path(), session);
+        let body = std::fs::read_to_string(write_transcript(repo.path(), 12, false, 170_000))
+            .expect("read");
+        std::fs::write(&transcript, &body).expect("write");
+
+        let before = recomputes();
+        let first = cached_score_with(&state, repo.path(), session, &lookup).expect("scores");
+        assert_eq!(recomputes() - before, 1, "the first call has to parse");
+        assert_eq!(
+            first,
+            score_transcript(&transcript, None, repo.path(), &lookup)
+                .expect("full")
+                .score,
+            "and it must agree with a full parse"
+        );
+
+        for poll in 0..5 {
+            assert_eq!(
+                cached_score_with(&state, repo.path(), session, &lookup),
+                Some(first),
+                "poll {poll} of an unchanged transcript"
+            );
+        }
+        assert_eq!(
+            recomputes() - before,
+            1,
+            "an unchanged transcript must never be re-parsed"
+        );
+
+        std::fs::write(
+            &transcript,
+            format!("{body}{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n"),
+        )
+        .expect("append a turn");
+
+        let after = cached_score_with(&state, repo.path(), session, &lookup).expect("scores");
+        assert_eq!(
+            recomputes() - before,
+            2,
+            "a changed transcript is picked up on the next poll"
+        );
+        assert_eq!(
+            after,
+            score_transcript(&transcript, None, repo.path(), &lookup)
+                .expect("full")
+                .score,
+            "and still agrees with a full parse of the new bytes"
+        );
+    }
+
+    /// A transcript that goes away is unknown again, not zero: the two mean
+    /// opposite things to an operator reading the sidebar.
+    #[test]
+    fn a_transcript_that_disappears_reads_as_unknown_not_healthy() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(home.path().join("state"));
+        let env: HashMap<String, String> = HashMap::new();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "5c0d0002-1111-4222-8333-444444444444";
+
+        let transcript = claude_transcript(home.path(), repo.path(), session);
+        std::fs::write(
+            &transcript,
+            std::fs::read_to_string(write_transcript(repo.path(), 4, true, 10_000)).expect("read"),
+        )
+        .expect("write");
+        assert!(cached_score_with(&state, repo.path(), session, &lookup).is_some());
+
+        std::fs::remove_file(&transcript).expect("remove");
+        let before = recomputes();
+        for poll in 0..RESOLVE_RETRY_POLLS - 1 {
+            assert_eq!(
+                cached_score_with(&state, repo.path(), session, &lookup),
+                None,
+                "poll {poll}: a stale score must not outlive the transcript it was read from"
+            );
+        }
+        assert_eq!(
+            recomputes() - before,
+            0,
+            "and a missing transcript must not put a directory walk on every frame"
+        );
+
+        // The transcript comes back (a session relaunched into the same id):
+        // the very next poll after the retry window picks it up.
+        std::fs::write(
+            &transcript,
+            std::fs::read_to_string(write_transcript(repo.path(), 12, false, 170_000))
+                .expect("read"),
+        )
+        .expect("rewrite");
+        assert!(
+            cached_score_with(&state, repo.path(), session, &lookup).is_some(),
+            "a transcript that reappears is scored again"
+        );
     }
 
     #[test]

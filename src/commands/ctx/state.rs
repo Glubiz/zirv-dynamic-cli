@@ -30,6 +30,32 @@ pub fn repo_slug(path: &Path) -> String {
         .collect()
 }
 
+/// Filesystem-safe form of an adapter's provider slug
+/// (`AgentAdapter::provider`), for the per-provider usage files. Lowercased
+/// first, then every character outside `[a-z0-9-]` replaced with `-`, the
+/// same shape as `repo_slug` above: a provider name is a `&'static str` an
+/// adapter chose, but the rule is what guarantees it can never carry a
+/// separator or a `..` out of the state directory. An empty result (a slug
+/// of nothing but punctuation) becomes `unknown` rather than an empty file
+/// name.
+pub fn provider_slug(provider: &str) -> String {
+    let slug: String = provider
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if slug.is_empty() {
+        return "unknown".to_string();
+    }
+    slug
+}
+
 /// The state dir holds transcript paths, prompts, distilled handoffs and a
 /// decision log: on a shared machine, none of that is anyone else's business.
 /// Directories are created 0700 and files 0600. Both are no-ops on Windows,
@@ -236,6 +262,17 @@ impl StateDir {
     /// statusline tee. One file, not per-session: the windows are per account.
     pub fn usage(&self) -> PathBuf {
         self.0.join("usage.json")
+    }
+
+    /// Per-provider usage-window state: `<state>/usage-<provider>.json`. The
+    /// windows are per *account*, and one machine can hold accounts with two
+    /// different vendors at once (an Anthropic subscription and an OpenAI
+    /// one), which the single `usage()` file above cannot represent. The
+    /// slug is sanitised by [`provider_slug`], so no provider name can name a
+    /// path outside this directory.
+    pub fn usage_for(&self, provider: &str) -> PathBuf {
+        self.0
+            .join(format!("usage-{}.json", provider_slug(provider)))
     }
 
     /// Per-transcript scoring checkpoints. The Stop hook is a fresh process on
@@ -485,6 +522,44 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.usage(), tmp.path().join("usage.json"));
+    }
+
+    #[test]
+    fn the_per_provider_usage_file_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(
+            state.usage_for("anthropic"),
+            tmp.path().join("usage-anthropic.json")
+        );
+        assert_eq!(
+            state.usage(),
+            tmp.path().join("usage.json"),
+            "the legacy global file is untouched"
+        );
+    }
+
+    /// A provider slug names a file, so it must never be able to name a
+    /// path: every separator and every `.` is folded to `-`, so the result
+    /// always stays a single component inside the state root.
+    #[test]
+    fn a_provider_slug_can_never_escape_the_state_directory() {
+        assert_eq!(provider_slug("anthropic"), "anthropic");
+        assert_eq!(provider_slug("OpenAI"), "openai");
+        assert_eq!(provider_slug("../../etc/passwd"), "------etc-passwd");
+        assert_eq!(provider_slug("a b\\c"), "a-b-c");
+        assert_eq!(provider_slug(""), "unknown");
+        assert_eq!(provider_slug("..."), "---");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let escaped = state.usage_for("../../../etc/passwd");
+        assert_eq!(
+            escaped.parent(),
+            Some(tmp.path()),
+            "still a direct child of the state root: {}",
+            escaped.display()
+        );
     }
 
     #[test]

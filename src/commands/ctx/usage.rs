@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
+use super::adapters::{self, AgentAdapter};
 use super::config::{CtxConfig, EnvLookup, PaceConfig, env_from_process};
 use super::pace::{self, PaceDecision};
 use super::state::{StateDir, now_secs};
@@ -62,8 +63,24 @@ pub fn run_tee<W: Write>(
     // Persisting is best-effort and happens first, so a broken statusline
     // script cannot cost us the reading.
     if let (Some(state), Some(fresh)) = (state, window::parse_statusline(stdin_text, now)) {
-        let merged = window::merge(window::load(state), fresh);
+        // The legacy global file, still written exactly as before: `zirv ctx
+        // usage`, `pace` and `wrap`'s status bar all read it, and an operator
+        // downgrading must not lose their readout.
+        let merged = window::merge(window::load(state), fresh.clone());
         let _ = window::store(state, &merged);
+
+        // The same reading, also filed under the account it belongs to. The
+        // provider is taken from the claude adapter rather than spelled out
+        // here: this tee IS Claude Code's statusline hook (`parse_statusline`
+        // reads Claude's documented `rate_limits` block and nothing else), so
+        // its account is whatever that adapter says its account is. It is not
+        // resolved through `adapters::select`, which would put a config load
+        // -- and its failure modes -- on a statusline hot path that has never
+        // had one.
+        let provider = adapters::claude::ClaudeAdapter::new(None).provider();
+        let per_provider =
+            window::merge(window::load_for(state, provider).unwrap_or_default(), fresh);
+        let _ = window::store_for(state, provider, &per_provider);
     }
 
     let chained = run_chained(stdin_text, command);
@@ -318,6 +335,35 @@ mod tests {
         assert_eq!(
             stored.seven_day.expect("seven_day").resets_at,
             1_785_400_000
+        );
+    }
+
+    /// The tee is Claude Code's statusline, so the same reading is also filed
+    /// under the account it belongs to. Both files are written: the legacy
+    /// one because `zirv ctx usage`, `pace` and `wrap`'s status bar read it,
+    /// the provider one so a per-account header can tell Anthropic's windows
+    /// apart from a vendor it has no source for.
+    #[test]
+    fn tee_files_the_reading_under_the_account_it_belongs_to() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let json =
+            std::fs::read_to_string(fixture("statusline-with-limits.json")).expect("fixture");
+
+        let mut out = Vec::new();
+        run_tee(&mut out, &json, &[], Some(&state), 1_784_999_000);
+
+        let stored = window::load_for(&state, "anthropic").expect("a provider file was written");
+        assert_eq!(stored.five_hour.expect("five_hour").used_percentage, 87.5);
+        assert_eq!(
+            stored,
+            window::load(&state),
+            "the legacy file keeps the same reading"
+        );
+        assert_eq!(
+            window::load_for(&state, "openai"),
+            None,
+            "a claude statusline says nothing about anyone else's account"
         );
     }
 

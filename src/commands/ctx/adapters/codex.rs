@@ -97,6 +97,13 @@ impl AgentAdapter for CodexAdapter {
         "codex"
     }
 
+    /// Codex spends an OpenAI account's limits. Nothing collects readings for
+    /// it yet, which is exactly why the provider is named: a usage readout
+    /// can then say "openai: no usage source" rather than imply zero.
+    fn provider(&self) -> &'static str {
+        "openai"
+    }
+
     fn ready(&self) -> CtxResult<()> {
         // Item 7: this is the surface a user actually sees (`--agent codex`,
         // or a config that names it), so it has to be honest in its own

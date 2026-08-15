@@ -1663,6 +1663,10 @@ mod tests {
             "sentinel"
         }
 
+        fn provider(&self) -> &'static str {
+            "sentinel"
+        }
+
         fn ready(&self) -> CtxResult<()> {
             Ok(())
         }

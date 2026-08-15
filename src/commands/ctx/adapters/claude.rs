@@ -481,6 +481,13 @@ impl AgentAdapter for ClaudeAdapter {
         "claude"
     }
 
+    /// Claude Code's subscription windows are Anthropic's, and the account is
+    /// what the limit belongs to: a different Anthropic-backed harness would
+    /// answer `"anthropic"` here too and share these readings.
+    fn provider(&self) -> &'static str {
+        "anthropic"
+    }
+
     /// The one thing that can make this adapter unusable before it is asked
     /// to do anything: a program that resolves to a file this OS has no way
     /// to execute. Reported here, by name, rather than left to surface as a

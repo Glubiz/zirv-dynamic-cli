@@ -34,6 +34,19 @@ pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 pub trait AgentAdapter: std::fmt::Debug {
     fn name(&self) -> &'static str;
 
+    /// The ACCOUNT/vendor whose rate limits this agent spends, as a stable
+    /// lowercase slug (`[a-z0-9-]`): `"anthropic"` for claude, `"openai"`
+    /// for codex.
+    ///
+    /// Deliberately *not* the binary or the adapter's own `name`. Usage
+    /// windows are a property of the account being billed, and two harnesses
+    /// can sit on one account -- a second Anthropic-backed harness would
+    /// report `"anthropic"` here and share claude's windows, which is the
+    /// truth about the limit even though it is a different program. It is
+    /// what `StateDir::usage_for` names a usage file after, so a change to an
+    /// existing adapter's slug orphans that adapter's stored readings.
+    fn provider(&self) -> &'static str;
+
     /// `Err` when the adapter exists but is not safe to use yet, so callers
     /// fail loudly instead of scoring garbage.
     fn ready(&self) -> CtxResult<()>;
@@ -538,6 +551,25 @@ pub const ADAPTERS: &[(&str, AdapterCtor)] = &[("claude", make_claude), ("codex"
 
 pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
     ADAPTERS.iter().map(|(_, ctor)| ctor(bin)).collect()
+}
+
+/// Every account/vendor the registry knows about, in registry order, with
+/// duplicates dropped (two adapters may share one account -- see
+/// [`AgentAdapter::provider`]). Walks `ADAPTERS` like every other function
+/// here, so a new adapter's provider appears without an edit.
+///
+/// This is what lets a usage readout list a provider it has no data for --
+/// "openai: no usage source" -- instead of quietly showing only the
+/// providers that happen to have written a file.
+pub fn providers() -> Vec<&'static str> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    for (_, ctor) in ADAPTERS {
+        let provider = ctor(None).provider();
+        if !seen.contains(&provider) {
+            seen.push(provider);
+        }
+    }
+    seen
 }
 
 /// The registry's names, each suffixed `(disabled)` when `gate` refuses it --
@@ -1142,6 +1174,35 @@ mod tests {
         for (instance, (name, _)) in instances.iter().zip(ADAPTERS.iter()) {
             assert_eq!(instance.name(), *name);
         }
+    }
+
+    /// A provider slug names a usage file, so it has to already *be* a slug:
+    /// lowercase `[a-z0-9-]`, non-empty, and unchanged by the sanitiser that
+    /// turns it into a file name. It is also the account, not the program --
+    /// claude's is `anthropic`, not `claude`.
+    #[test]
+    fn every_adapter_names_the_account_its_limits_belong_to() {
+        for adapter in all(None) {
+            let provider = adapter.provider();
+            assert!(!provider.is_empty(), "{} has no provider", adapter.name());
+            assert_eq!(
+                crate::commands::ctx::state::provider_slug(provider),
+                provider,
+                "{provider} is not already a filesystem-safe lowercase slug"
+            );
+        }
+
+        assert_eq!(
+            providers(),
+            vec!["anthropic", "openai"],
+            "registry order, deduplicated"
+        );
+        let claude = claude::ClaudeAdapter::new(None);
+        assert_ne!(
+            claude.provider(),
+            claude.name(),
+            "the provider is the account, not the binary: two harnesses can share one"
+        );
     }
 
     #[test]
