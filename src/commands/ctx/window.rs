@@ -118,74 +118,6 @@ pub fn load_for(state: &StateDir, provider: &str) -> Option<UsageWindows> {
     None
 }
 
-/// Every provider that has a usage file on disk, keyed by the slug in its
-/// file name. `BTreeMap` so the order is the slug order rather than whatever
-/// order the directory happened to be read in.
-///
-/// Includes [`LEGACY_USAGE_PROVIDER`]'s legacy-file reading when it has no
-/// provider file of its own, for the same upgrade reason as [`load_for`].
-/// Providers with no source at all are simply absent -- see
-/// [`provider_summary`] for the list that names them anyway.
-pub fn load_all(state: &StateDir) -> std::collections::BTreeMap<String, UsageWindows> {
-    let mut found = std::collections::BTreeMap::new();
-    if let Ok(entries) = std::fs::read_dir(state.root()) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Some(provider) = name
-                .strip_prefix("usage-")
-                .and_then(|rest| rest.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            if let Some(windows) = read_at(&entry.path()) {
-                found.insert(provider.to_string(), windows);
-            }
-        }
-    }
-    if !found.contains_key(LEGACY_USAGE_PROVIDER)
-        && let Some(legacy) = read_at(&state.usage())
-    {
-        found.insert(LEGACY_USAGE_PROVIDER.to_string(), legacy);
-    }
-    found
-}
-
-/// Every provider the adapter registry knows about, in registry order, each
-/// with its usage if any exists and `None` when there is no source for it at
-/// all. Any provider that has a file on disk but no adapter claiming it is
-/// appended after those, in slug order, so an upgrade that drops an adapter
-/// never silently hides readings that are still being collected.
-///
-/// This is the shape a header renders from: it can say "openai -- no usage
-/// source" without knowing which providers exist, and cannot mistake absence
-/// for zero. Deterministic, and a stat plus a small read per provider file --
-/// cheap enough for a once-a-second render path.
-///
-/// The dashboard header that consumes this is a separate change in flight;
-/// until it lands nothing in the binary calls it, and the tests below are the
-/// only caller.
-#[allow(dead_code)]
-pub fn provider_summary(state: &StateDir) -> Vec<(String, Option<UsageWindows>)> {
-    let mut on_disk = load_all(state);
-    let mut summary: Vec<(String, Option<UsageWindows>)> = super::adapters::providers()
-        .into_iter()
-        // Keyed by the same sanitised slug the file is named after, so a
-        // registry entry and its file can never fail to line up.
-        .map(super::state::provider_slug)
-        .map(|provider| {
-            let windows = on_disk.remove(&provider);
-            (provider, windows)
-        })
-        .collect();
-    // Whatever is left has a file but no adapter: still real data.
-    summary.extend(
-        on_disk
-            .into_iter()
-            .map(|(name, windows)| (name, Some(windows))),
-    );
-    summary
-}
-
 fn newer(existing: Option<Window>, fresh: Option<Window>) -> Option<Window> {
     match (existing, fresh) {
         (Some(existing), Some(fresh)) if fresh.observed_at >= existing.observed_at => Some(fresh),
@@ -634,7 +566,6 @@ mod tests {
             UsageWindows::default(),
             "a provider write must not touch the legacy global file"
         );
-        assert_eq!(load_all(&state), [("openai".to_string(), windows)].into());
     }
 
     /// The upgrade case, and the one that matters most: a user who has been
@@ -654,21 +585,8 @@ mod tests {
 
         assert_eq!(
             load_for(&state, "anthropic"),
-            Some(legacy.clone()),
-            "the legacy file backs anthropic until a provider file exists"
-        );
-        assert_eq!(
-            load_all(&state).get("anthropic"),
-            Some(&legacy),
-            "and load_all surfaces it under the same provider"
-        );
-        assert_eq!(
-            provider_summary(&state)
-                .into_iter()
-                .find(|(name, _)| name == "anthropic")
-                .and_then(|(_, windows)| windows),
             Some(legacy),
-            "so the header shows a percentage, not 'no source'"
+            "the legacy file backs anthropic until a provider file exists"
         );
         assert!(
             state.usage().exists(),
@@ -690,79 +608,6 @@ mod tests {
             .five_hour
             .expect("five");
         assert_eq!(five.used_percentage, 90.0);
-        assert_eq!(
-            load_all(&state)["anthropic"]
-                .five_hour
-                .expect("five")
-                .used_percentage,
-            90.0
-        );
-    }
-
-    /// The property the header is built on: every registry provider appears,
-    /// in registry order, and one with no source says so rather than
-    /// reporting zero.
-    #[test]
-    fn the_summary_names_every_known_provider_including_the_ones_with_no_source() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().to_path_buf());
-
-        let empty = provider_summary(&state);
-        assert_eq!(
-            empty,
-            vec![
-                ("anthropic".to_string(), None),
-                ("openai".to_string(), None)
-            ],
-            "registry order, and no data means None -- never a zero window"
-        );
-
-        let windows = windows_at(42.0, 10);
-        store_for(&state, "anthropic", &windows).expect("store");
-        let summary = provider_summary(&state);
-        assert_eq!(summary[0], ("anthropic".to_string(), Some(windows)));
-        assert_eq!(
-            summary[1],
-            ("openai".to_string(), None),
-            "codex still has no usage source, and must not read as 0%"
-        );
-    }
-
-    /// A file left by an adapter that is no longer registered is still data
-    /// someone collected: it is listed after the known providers rather than
-    /// dropped.
-    #[test]
-    fn a_provider_file_with_no_adapter_is_still_listed() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().to_path_buf());
-        let windows = windows_at(5.0, 1);
-        store_for(&state, "some-vendor", &windows).expect("store");
-
-        let summary = provider_summary(&state);
-        assert_eq!(summary.len(), 3);
-        assert_eq!(
-            summary.last(),
-            Some(&("some-vendor".to_string(), Some(windows)))
-        );
-    }
-
-    /// The enumeration keys on `usage-<provider>.json` exactly: neither the
-    /// legacy `usage.json` nor a temp file mid-write may appear as a provider.
-    #[test]
-    fn enumeration_ignores_the_legacy_file_and_anything_mid_write() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().to_path_buf());
-        std::fs::create_dir_all(state.root()).expect("mkdir");
-        store_for(&state, "anthropic", &windows_at(1.0, 1)).expect("store");
-        std::fs::write(state.root().join("usage-openai.tmp999"), "{}").expect("temp");
-        std::fs::write(state.root().join("usage-broken.json"), "{ nope").expect("corrupt");
-
-        let names: Vec<String> = load_all(&state).into_keys().collect();
-        assert_eq!(
-            names,
-            vec!["anthropic".to_string()],
-            "only whole, parseable usage-<provider>.json files count"
-        );
     }
 
     #[test]

@@ -21,54 +21,29 @@ use super::super::chrome::right_truncate;
 use super::super::mail::Message;
 use super::pane::PaneState;
 
-/// One account's two usage windows, already reduced to whole percents by the
-/// caller (`dash::mod`'s `usage_pct_u8`, the same rounding `chrome::status_bar`
-/// uses, so the two surfaces never disagree about one number).
-///
-/// A `None` field is *unknown*: a real usage source that reports nothing for
-/// that window. It is not zero, and it is not an error -- see [`AccountFacts`]
-/// for the genuinely-no-source case, which is a different thing to tell an
-/// operator.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AccountWindows {
-    pub five_hour: Option<u8>,
-    pub seven_day: Option<u8>,
-}
-
-/// One provider account in the header: a provider slug (`"anthropic"`,
-/// `"openai"`) plus its usage, when a usage source for it exists at all.
-///
-/// The outer `Option` is the whole point of `window::provider_summary`
-/// returning one: `None` means **no usage source exists for this provider**,
-/// which renders as words saying so and must never render as `0%` or as an
-/// empty bar. `Some(AccountWindows::default())` is a source that exists and
-/// reports neither window -- unknown, but real, and rendered as `--`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AccountFacts {
-    pub provider: String,
-    pub usage: Option<AccountWindows>,
-}
-
 /// The header's live facts. `mail_broadcast`/`mail_direct` render as
 /// "mail B+D" only when at least one is non-zero, mirroring `wrap.rs`'s own
 /// convention of omitting a segment entirely when mail is disabled rather
 /// than showing a hollow "mail 0+0".
 ///
-/// `harness`/`score`/`account` describe the **focused** pane specifically --
-/// the harness whose grid is on screen, its own rot score, and its own
-/// provider's usage. `accounts` is the whole-machine view: every provider the
-/// adapter registry knows about, whether or not any of them has ever written a
-/// reading. The two overlap deliberately: the operator needs the focused
-/// session's own limit without having to find it in a list.
+/// `harness`/`score` describe the **focused** pane specifically -- the harness
+/// whose grid is on screen and its own rot score. The remaining counts are
+/// whole-session facts.
+///
+/// Subscription usage is deliberately absent. It was shown here until the
+/// only reading that could be trusted required the operator to have wired
+/// `zirv ctx usage tee` into Claude's statusline, which almost nobody has, so
+/// the segment read "no usage source" for everyone else -- a line of chrome
+/// saying nothing, at the cost of a whole row of the pane grid. `zirv ctx
+/// usage`, `pace` and wrap's status bar still read the stored readings; the
+/// dashboard header simply no longer renders them.
 pub struct HeaderFacts {
     pub harness: String,
     pub score: Option<u32>,
-    pub account: AccountFacts,
     pub mail_broadcast: usize,
     pub mail_direct: usize,
     pub memory_count: usize,
     pub sessions: usize,
-    pub accounts: Vec<AccountFacts>,
 }
 
 /// One sidebar row: a dashboard pane (`attached: true`) or a view-only
@@ -235,27 +210,16 @@ pub enum Overlay {
 
 /// Pure: how many rows the header gets in an `area_height`-row frame.
 ///
-/// One row always -- the focused instance's own summary, which
-/// [`header_line`] guarantees fits any width. A second row, carrying the
-/// full multi-provider account list, only once the terminal is tall enough to
-/// spare it: the account list is a nice-to-have, and the pane grid is the
-/// thing the operator is actually working in.
+/// Exactly one -- the focused instance's own summary, which [`header_line`]
+/// guarantees fits any width. There used to be a conditional second row for
+/// the multi-provider account list; removing usage from the header gave that
+/// row back to the pane grid, which is what the operator is actually working
+/// in, at every terminal height rather than only below `MIN_DASH_ROWS`.
 ///
-/// The threshold is `chrome::MIN_DASH_ROWS`, the dashboard's own documented
-/// floor, rather than a number invented here. At or above the floor one row in
-/// twenty is affordable chrome; below it -- a terminal resized under the
-/// minimum mid-session, which the dashboard tolerates rather than refuses --
-/// the grid keeps every row it has and the account list is dropped outright
-/// rather than wrapped into a broken layout.
-///
-/// `min` throughout rather than arithmetic: `area.height` is genuinely `0` and
-/// `1` in real frames, and the release profile is `panic = "abort"`.
+/// `min` rather than arithmetic: `area.height` is genuinely `0` in real
+/// frames, and the release profile is `panic = "abort"`.
 pub(crate) fn header_rows(area_height: u16) -> u16 {
-    if area_height >= super::super::chrome::MIN_DASH_ROWS {
-        2.min(area_height)
-    } else {
-        1.min(area_height)
-    }
+    1.min(area_height)
 }
 
 /// Splits `area` into (header, sidebar, main): [`header_rows`] header rows, a
@@ -339,55 +303,17 @@ pub fn score_text(score: Option<u32>) -> String {
     }
 }
 
-/// Pure: one usage window's percentage, or `--` when that window is unknown.
-fn window_text(pct: Option<u8>) -> String {
-    match pct {
-        Some(pct) => format!("{pct}%"),
-        None => "--".to_string(),
-    }
-}
-
-/// Pure: one account's usage reading.
-///
-/// The `None` case is the load-bearing one: no usage source exists for this
-/// provider at all, which is said in words. Rendering it as `0%` would claim a
-/// fresh, empty quota; rendering it as `100%` would claim an exhausted one;
-/// both are inventions. A source that exists but reports neither window says
-/// `5h -- 7d --`, which is unknown-but-real -- a different fact, and not an
-/// error.
-pub fn usage_text(usage: Option<&AccountWindows>) -> String {
-    match usage {
-        None => "no usage source".to_string(),
-        Some(windows) => format!(
-            "5h {} 7d {}",
-            window_text(windows.five_hour),
-            window_text(windows.seven_day)
-        ),
-    }
-}
-
-/// Pure: one provider's account row, `"<provider> <usage>"`.
-pub fn account_text(account: &AccountFacts) -> String {
-    format!(
-        "{} {}",
-        account.provider,
-        usage_text(account.usage.as_ref())
-    )
-}
-
-/// Pure: the header's always-present first line, right-truncated to `cols`.
+/// Pure: the header's one line, right-truncated to `cols`.
 ///
 /// Ordered by how badly the operator needs it if the line has to be cut: the
 /// focused harness (which already carries any live notice or sticky error),
-/// then its rot score, then its own provider's usage, then the incidental
-/// counts. At `chrome::MIN_DASH_COLS` (80) everything through `sessions N`
-/// fits for a bare harness label; a long `chat.model` disclosure pushes the
-/// tail off the right, which is the same trade the line already made before
-/// the score and usage segments existed.
+/// then its rot score, then the incidental counts. At `chrome::MIN_DASH_COLS`
+/// (80) everything through `sessions N` fits for a bare harness label; a long
+/// `chat.model` disclosure pushes the tail off the right, which is the same
+/// trade the line already made before the score segment existed.
 pub fn header_line(facts: &HeaderFacts, cols: u16) -> String {
     let mut parts = vec![facts.harness.clone()];
     parts.push(format!("rot {}", score_text(facts.score)));
-    parts.push(account_text(&facts.account));
     if facts.mail_broadcast > 0 || facts.mail_direct > 0 {
         parts.push(format!(
             "mail {}+{}",
@@ -401,20 +327,6 @@ pub fn header_line(facts: &HeaderFacts, cols: u16) -> String {
     right_truncate(&parts.join("  "), cols as usize)
 }
 
-/// Pure: the header's second line -- every provider the adapter registry knows
-/// about, each with its own reading or an honest "no usage source".
-///
-/// Right-truncated rather than wrapped: a third provider would otherwise push
-/// this into two rows, and the header's height was decided (by
-/// [`header_rows`]) before this string existed.
-pub fn accounts_line(accounts: &[AccountFacts], cols: u16) -> String {
-    if accounts.is_empty() {
-        return String::new();
-    }
-    let listed: Vec<String> = accounts.iter().map(account_text).collect();
-    right_truncate(&format!("accounts  {}", listed.join("  ")), cols as usize)
-}
-
 pub fn render_header(f: &mut Frame, area: Rect, facts: &HeaderFacts) {
     if area.is_empty() {
         return;
@@ -424,20 +336,6 @@ pub fn render_header(f: &mut Frame, area: Rect, facts: &HeaderFacts) {
             .style(Style::default().add_modifier(Modifier::BOLD)),
         Rect { height: 1, ..area },
     );
-    // Only when `header_rows` actually gave us the row. Never squeezed into
-    // the first line, and never drawn outside `area`.
-    if area.height >= 2 {
-        f.render_widget(
-            Paragraph::new(accounts_line(&facts.accounts, area.width))
-                .style(Style::default().add_modifier(Modifier::DIM)),
-            Rect {
-                x: area.x,
-                y: area.y + 1,
-                width: area.width,
-                height: 1,
-            },
-        );
-    }
 }
 
 /// Pure: the first sidebar row drawn, given how many rows there are, how many
@@ -1093,10 +991,10 @@ mod tests {
     #[test]
     fn layout_reserves_the_header_rows_and_the_sidebar() {
         let (h, s, m) = layout(Rect::new(0, 0, 100, 30), 24);
-        assert_eq!(h.height, 2, "a tall terminal affords the accounts row");
+        assert_eq!(h.height, 1, "one header row at every height");
         assert_eq!(s.width, 24);
         assert_eq!(m.width, 76 - 1);
-        assert_eq!(m.height, 28);
+        assert_eq!(m.height, 29);
     }
 
     #[test]
@@ -1108,12 +1006,12 @@ mod tests {
         assert_eq!(m.height, 1);
     }
 
-    /// The accounts row is chrome; the pane grid is the work. A terminal below
-    /// the dashboard's own documented floor keeps every body row it has, and a
-    /// zero/one-row frame never underflows on the way there (the release
-    /// profile is `panic = "abort"`).
+    /// The header is one row at every height, including the tall terminals
+    /// that used to give up a second row to the account list -- that row is
+    /// the pane grid's again. A zero/one-row frame never underflows on the way
+    /// there (the release profile is `panic = "abort"`).
     #[test]
-    fn the_accounts_row_is_only_taken_from_a_terminal_tall_enough_to_spare_it() {
+    fn the_header_is_one_row_at_every_terminal_height() {
         assert_eq!(header_rows(0), 0);
         assert_eq!(header_rows(1), 1);
         assert_eq!(header_rows(2), 1);
@@ -1121,8 +1019,8 @@ mod tests {
             header_rows(super::super::super::chrome::MIN_DASH_ROWS - 1),
             1
         );
-        assert_eq!(header_rows(super::super::super::chrome::MIN_DASH_ROWS), 2);
-        assert_eq!(header_rows(200), 2);
+        assert_eq!(header_rows(super::super::super::chrome::MIN_DASH_ROWS), 1);
+        assert_eq!(header_rows(200), 1);
         // And the body never loses more rows than the header gained.
         for height in 0..=64u16 {
             let (h, _, m) = layout(Rect::new(0, 0, 80, height), 24);
@@ -1134,15 +1032,10 @@ mod tests {
         HeaderFacts {
             harness: "claude".to_string(),
             score: None,
-            account: AccountFacts {
-                provider: "anthropic".to_string(),
-                usage: None,
-            },
             mail_broadcast: 0,
             mail_direct: 0,
             memory_count: 0,
             sessions: 1,
-            accounts: Vec::new(),
         }
     }
 
@@ -1189,109 +1082,26 @@ mod tests {
         assert_eq!(score_text(Some(100)), "100");
     }
 
-    /// The three usage outcomes that must stay distinguishable: no source at
-    /// all, a source reporting nothing, and a source with readings. None of
-    /// them may render as a bare `0%`.
+    /// The header line has to fit `chrome::MIN_DASH_COLS` exactly, and never
+    /// wrap: the header's height was decided before this string existed, so an
+    /// over-long line steals a row it was not given.
     #[test]
-    fn usage_text_separates_no_source_from_an_unknown_reading() {
-        assert_eq!(usage_text(None), "no usage source");
-        assert_eq!(usage_text(Some(&AccountWindows::default())), "5h -- 7d --");
-        assert_eq!(
-            usage_text(Some(&AccountWindows {
-                five_hour: Some(42),
-                seven_day: None,
-            })),
-            "5h 42% 7d --"
-        );
-        assert_eq!(
-            usage_text(Some(&AccountWindows {
-                five_hour: Some(0),
-                seven_day: Some(13),
-            })),
-            "5h 0% 7d 13%",
-            "a genuine zero reading is still a reading, and says so"
-        );
-    }
-
-    #[test]
-    fn an_account_row_names_its_provider_alongside_its_reading() {
-        assert_eq!(
-            account_text(&AccountFacts {
-                provider: "openai".to_string(),
-                usage: None,
-            }),
-            "openai no usage source"
-        );
-        assert_eq!(
-            account_text(&AccountFacts {
-                provider: "anthropic".to_string(),
-                usage: Some(AccountWindows {
-                    five_hour: Some(42),
-                    seven_day: Some(13),
-                }),
-            }),
-            "anthropic 5h 42% 7d 13%"
-        );
-    }
-
-    fn two_accounts() -> Vec<AccountFacts> {
-        vec![
-            AccountFacts {
-                provider: "anthropic".to_string(),
-                usage: Some(AccountWindows {
-                    five_hour: Some(42),
-                    seven_day: Some(13),
-                }),
-            },
-            AccountFacts {
-                provider: "openai".to_string(),
-                usage: None,
-            },
-        ]
-    }
-
-    /// The header's whole reason for existing: every provider the registry
-    /// knows about is listed, including the one with nothing to show, which
-    /// says so in words rather than being silently dropped.
-    #[test]
-    fn the_accounts_line_names_every_provider_including_the_ones_with_no_source() {
-        let line = accounts_line(&two_accounts(), 200);
-        assert_eq!(
-            line,
-            "accounts  anthropic 5h 42% 7d 13%  openai no usage source"
-        );
-        assert_eq!(accounts_line(&[], 200), "");
-    }
-
-    /// Both header lines have to fit `chrome::MIN_DASH_COLS` exactly, and
-    /// never wrap: the header's height was decided before either string
-    /// existed, so an over-long line steals a row it was not given.
-    #[test]
-    fn both_header_lines_fit_at_eighty_columns() {
+    fn the_header_line_fits_at_eighty_columns() {
         let cols = super::super::super::chrome::MIN_DASH_COLS;
         let mut facts = base_facts();
         facts.score = Some(34);
-        facts.account = AccountFacts {
-            provider: "anthropic".to_string(),
-            usage: Some(AccountWindows {
-                five_hour: Some(42),
-                seven_day: Some(13),
-            }),
-        };
         facts.mail_broadcast = 2;
         facts.mail_direct = 1;
         facts.memory_count = 3;
         facts.sessions = 4;
-        facts.accounts = two_accounts();
 
         let line = header_line(&facts, cols);
         assert_eq!(
-            line, "claude  rot 34  anthropic 5h 42% 7d 13%  mail 2+1  mem 3  sessions 4",
+            line, "claude  rot 34  mail 2+1  mem 3  sessions 4",
             "nothing is cut at 80 columns for an ordinary header"
         );
         assert!(line.chars().count() <= cols as usize);
         assert!(!line.contains('\n'));
-        assert!(accounts_line(&facts.accounts, cols).chars().count() <= cols as usize);
 
         // And a header that genuinely does not fit is cut, not wrapped -- at a
         // character boundary, for every width down to zero.
@@ -1299,44 +1109,34 @@ mod tests {
             "claude (a-very-long-model-name-disclosure)  \u{26a0} something went wrong \
                          while spawning a pane"
                 .to_string();
-        facts.accounts = vec![
-            two_accounts()[0].clone(),
-            two_accounts()[1].clone(),
-            AccountFacts {
-                provider: "third-party-provider".to_string(),
-                usage: Some(AccountWindows::default()),
-            },
-        ];
         for w in 0..=cols {
             assert!(header_line(&facts, w).chars().count() <= w as usize);
-            assert!(accounts_line(&facts.accounts, w).chars().count() <= w as usize);
         }
     }
 
-    /// The accounts row is drawn only when `header_rows` gave the header two
-    /// rows, and never outside `area` -- a one-row header must not paint over
-    /// the sidebar's own top border.
+    /// The header draws its one line and nothing below it: a taller header
+    /// rect (which `layout` no longer produces, but a caller could still pass)
+    /// must not paint over the sidebar's own top border.
     #[test]
-    fn the_accounts_row_is_drawn_only_when_the_header_has_two_rows() {
+    fn the_header_draws_one_row_and_never_a_second() {
         let mut facts = base_facts();
-        facts.accounts = two_accounts();
+        facts.score = Some(34);
 
-        let one_row = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_header(f, area, &facts)
-        });
-        assert!(
-            !one_row.contains("accounts"),
-            "a one-row header has no account list: {one_row}"
-        );
-
-        let two_rows = render_and_capture_text(Rect::new(0, 0, 80, 2), |f, area| {
-            render_header(f, area, &facts)
-        });
-        assert!(two_rows.contains("accounts"), "got {two_rows}");
-        assert!(
-            two_rows.contains("openai no usage source"),
-            "the provider with no data is still named: {two_rows}"
-        );
+        for height in [1u16, 2, 3] {
+            let text = render_and_capture_text(Rect::new(0, 0, 80, height), |f, area| {
+                render_header(f, area, &facts)
+            });
+            assert!(text.contains("rot 34"), "got {text}");
+            assert!(
+                !text.contains("accounts"),
+                "usage left the header entirely: {text}"
+            );
+            let below: String = text.chars().skip(80).collect();
+            assert!(
+                below.trim().is_empty(),
+                "height {height} painted below its first row: {below:?}"
+            );
+        }
     }
 
     /// A very short terminal: the header renders its one line and nothing
@@ -1344,8 +1144,7 @@ mod tests {
     /// than a panic.
     #[test]
     fn the_header_never_panics_on_a_degenerate_area() {
-        let mut facts = base_facts();
-        facts.accounts = two_accounts();
+        let facts = base_facts();
         let backend = TestBackend::new(80, 4);
         let mut term = Terminal::new(backend).expect("terminal");
         for area in [

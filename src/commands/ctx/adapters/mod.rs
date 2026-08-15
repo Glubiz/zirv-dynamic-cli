@@ -553,25 +553,6 @@ pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
     ADAPTERS.iter().map(|(_, ctor)| ctor(bin)).collect()
 }
 
-/// Every account/vendor the registry knows about, in registry order, with
-/// duplicates dropped (two adapters may share one account -- see
-/// [`AgentAdapter::provider`]). Walks `ADAPTERS` like every other function
-/// here, so a new adapter's provider appears without an edit.
-///
-/// This is what lets a usage readout list a provider it has no data for --
-/// "openai: no usage source" -- instead of quietly showing only the
-/// providers that happen to have written a file.
-pub fn providers() -> Vec<&'static str> {
-    let mut seen: Vec<&'static str> = Vec::new();
-    for (_, ctor) in ADAPTERS {
-        let provider = ctor(None).provider();
-        if !seen.contains(&provider) {
-            seen.push(provider);
-        }
-    }
-    seen
-}
-
 /// The registry's names, each suffixed `(disabled)` when `gate` refuses it --
 /// used by the unknown-name error so a mistyped `--agent` also shows which
 /// known names are actually usable right now.
@@ -1192,11 +1173,6 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            providers(),
-            vec!["anthropic", "openai"],
-            "registry order, deduplicated"
-        );
         let claude = claude::ClaudeAdapter::new(None);
         assert_ne!(
             claude.provider(),

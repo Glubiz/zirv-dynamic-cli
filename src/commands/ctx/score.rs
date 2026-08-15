@@ -335,9 +335,8 @@ static SCORE_RECOMPUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// poll, and re-resolved every [`RESOLVE_RETRY_POLLS`] polls while nothing is
 /// there.
 ///
-/// The dashboard sidebar that consumes this is a separate change in flight;
-/// until it lands nothing in the binary calls it.
-#[allow(dead_code)]
+/// Consumed by the dashboard: the header renders the focused pane's score and
+/// every sidebar row carries its own, both polled on the facts throttle.
 pub fn cached_score(state: &StateDir, repo: &Path, session_id: &str) -> Option<u32> {
     cached_score_with(state, repo, session_id, &env_from_process())
 }

@@ -39,7 +39,7 @@ use super::config::{CtxConfig, EnvLookup};
 use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
 use super::term;
-use super::{mail, memory, prompt, score, sessions, window};
+use super::{mail, memory, prompt, score, sessions};
 
 pub(crate) use pane::{Pane, PaneSpec, PaneState, ScrollOutcome};
 
@@ -585,8 +585,8 @@ impl KeyLog {
 }
 
 // Task 7: sidebar row assembly (dashboard panes + view-only registry rows)
-// and the header's own live facts (mail, memory-bank size, usage, session
-// count), both refreshed at most once per second.
+// and the header's own live facts (rot scores, mail, memory-bank size,
+// session count), both refreshed at most once per second.
 
 /// One dashboard-owned pane's row inputs, decoupled from `Pane` itself so
 /// `assemble_sidebar` stays pure and testable without a real spawn.
@@ -748,15 +748,6 @@ const fn follow_focus(selected: usize, focused: usize, pane_count: usize) -> usi
     }
 }
 
-/// `window::max_used_percentage`'s `0.0..=100.0` reading, rounded to the
-/// nearest whole percent for the header's compact `usage NN%` display and
-/// clamped defensively to the documented range. Mirrors `chrome::status_bar`'s
-/// own `{:.0}%` rounding so the dashboard header and wrap's status bar never
-/// disagree about the same underlying number.
-fn usage_pct_u8(percent: Option<f64>) -> Option<u8> {
-    percent.map(|p| p.round().clamp(0.0, 100.0) as u8)
-}
-
 /// Pure: assembles `ui::HeaderFacts` from already-computed ingredients. Kept
 /// separate from `FactsCache::refresh_if_due` (the impure disk-reading half)
 /// so the header's own rendering rule -- a disabled/absent mail read renders
@@ -765,8 +756,6 @@ fn usage_pct_u8(percent: Option<f64>) -> Option<u8> {
 fn assemble_header_facts(
     harness: String,
     score: Option<u32>,
-    account: ui::AccountFacts,
-    accounts: Vec<ui::AccountFacts>,
     mail: Option<(usize, usize)>,
     memory_count: usize,
     sessions: usize,
@@ -775,80 +764,11 @@ fn assemble_header_facts(
     ui::HeaderFacts {
         harness,
         score,
-        account,
         mail_broadcast,
         mail_direct,
         memory_count,
         sessions,
-        accounts,
     }
-}
-
-/// The provider (account) an agent's own usage is billed against, from the
-/// adapter registry -- `"anthropic"` for claude, `"openai"` for codex. `None`
-/// for an agent name the registry does not carry, which a restored roster
-/// entry or a hand-written spawn request genuinely can produce.
-///
-/// Walks `adapters::ADAPTERS` rather than naming adapters here, so a new
-/// adapter's provider appears without an edit. Pure and allocation-cheap
-/// (each constructor only splits a program string), so unlike everything on
-/// `FactsCache` this is safe to call per frame.
-fn provider_for_agent(agent: &str) -> Option<&'static str> {
-    adapters::ADAPTERS
-        .iter()
-        .find(|(name, _)| *name == agent)
-        .map(|(_, ctor)| ctor(None).provider())
-}
-
-/// The focused pane's own account row: its provider, plus that provider's
-/// entry from the cached whole-machine summary.
-///
-/// Three distinct outcomes, all of which have to survive to the operator:
-/// an agent with no provider at all (`unknown`, no source), a provider the
-/// summary lists with no usage file (`no usage source`), and a provider with
-/// readings. None of them is ever rendered as `0%`.
-fn focused_account(agent: &str, accounts: &[ui::AccountFacts]) -> ui::AccountFacts {
-    let Some(provider) = provider_for_agent(agent) else {
-        return ui::AccountFacts {
-            provider: "unknown".to_string(),
-            usage: None,
-        };
-    };
-    let slug = super::state::provider_slug(provider);
-    accounts
-        .iter()
-        .find(|a| a.provider == slug)
-        .cloned()
-        .unwrap_or(ui::AccountFacts {
-            provider: slug,
-            usage: None,
-        })
-}
-
-/// One `window::UsageWindows` reduced to the whole percents the header
-/// renders. `None` in either field stays `None`: a window a real usage source
-/// does not report is unknown, not zero.
-fn account_windows(windows: &window::UsageWindows) -> ui::AccountWindows {
-    ui::AccountWindows {
-        five_hour: usage_pct_u8(windows.five_hour.as_ref().map(|w| w.used_percentage)),
-        seven_day: usage_pct_u8(windows.seven_day.as_ref().map(|w| w.used_percentage)),
-    }
-}
-
-/// Every provider the adapter registry knows about, each with its reading or
-/// with nothing -- `window::provider_summary`'s outer `Option` carried through
-/// unflattened, because "this provider has no usage source" and "this
-/// provider's source reports nothing" are different things to show.
-fn assemble_accounts(
-    summary: Vec<(String, Option<window::UsageWindows>)>,
-) -> Vec<ui::AccountFacts> {
-    summary
-        .into_iter()
-        .map(|(provider, windows)| ui::AccountFacts {
-            provider,
-            usage: windows.map(|w| account_windows(&w)),
-        })
-        .collect()
 }
 
 /// Pure: the header's harness segment.
@@ -857,8 +777,8 @@ fn assemble_accounts(
 /// `chat.model` disclosure, which is repo-settable on the strength of staying
 /// visible, so it never drops off. `focused_title` names the pane whose grid is
 /// actually on screen, appended only once focus has moved off the orchestrator:
-/// a single-pane dashboard would otherwise just repeat itself, and the score
-/// and usage beside it belong to whichever pane this names.
+/// a single-pane dashboard would otherwise just repeat itself, and the rot
+/// score beside it belongs to whichever pane this names.
 fn harness_segment(harness_label: &str, focused: usize, focused_title: Option<&str>) -> String {
     match focused_title {
         Some(title) if focused > 0 => format!("{harness_label} \u{25b8} {title}"),
@@ -872,8 +792,8 @@ fn harness_segment(harness_label: &str, focused: usize, focused_title: Option<&s
 /// `rot --`. Nothing here ever stores a placeholder zero.
 type ScoreMap = HashMap<String, u32>;
 
-/// How often the header's own disk-backed facts (mail, memory-bank size,
-/// usage) -- and the session registry the sidebar's view-only rows come
+/// How often the header's own disk-backed facts (rot scores, mail,
+/// memory-bank size) -- and the session registry the sidebar's view-only rows come
 /// from -- are re-read. Mirrors wrap's own `BAR_THROTTLE`/`BarRuntime::
 /// last_draw` pattern (`wrap.rs:1362`): the render loop polls every 50ms,
 /// but nothing here needs a disk hit that often.
@@ -896,10 +816,6 @@ fn due(last: Instant, now: Instant, interval: Duration) -> bool {
 /// actual read.
 #[derive(Default)]
 struct DiskFacts {
-    /// Every provider the adapter registry knows about, whether or not any of
-    /// them has a usage file. A directory scan (`window::load_all`), so it
-    /// belongs here and not on the render path.
-    accounts: Vec<ui::AccountFacts>,
     /// Rot scores for every row the sidebar can draw -- this dashboard's own
     /// panes and every live registry session. `score::cached_score` is cheap
     /// in the steady state but still costs one `metadata` call per session,
@@ -921,7 +837,7 @@ struct FactsOwner<'a> {
     session_short: &'a str,
 }
 
-/// Caches every disk read the header and sidebar need -- usage, mail,
+/// Caches every disk read the header and sidebar need -- rot scores, mail,
 /// memory-bank size, and the session registry itself -- refreshed at most
 /// once per `FACTS_THROTTLE` rather than on the render loop's own 50ms poll.
 struct FactsCache {
@@ -965,7 +881,6 @@ impl FactsCache {
             session_short,
         } = owner;
 
-        self.disk.accounts = assemble_accounts(window::provider_summary(state));
         self.disk.mail =
             mail::unread_counts(state, repo, agent_name, session_short, cfg.mail.enabled);
         let slug = super::state::repo_slug(repo);
@@ -3967,15 +3882,11 @@ pub fn run_dashboard(
         } else {
             label
         };
-        // The focused pane's own rot score and its own provider's usage, both
-        // read out of the throttled cache rather than off disk: this runs on
-        // every frame.
-        let focused_agent = focused_pane.map_or(agent_name.as_str(), |pane| pane.agent());
+        // The focused pane's own rot score, read out of the throttled cache
+        // rather than off disk: this runs on every frame.
         let facts = assemble_header_facts(
             harness,
             focused_pane.and_then(|pane| facts_cache.disk.scores.get(pane.short()).copied()),
-            focused_account(focused_agent, &facts_cache.disk.accounts),
-            facts_cache.disk.accounts.clone(),
             facts_cache.disk.mail,
             facts_cache.disk.memory_count,
             rows.len(),
@@ -4553,18 +4464,17 @@ mod tests {
     /// and with the sidebar drawn the pane's origin is genuinely not `(0, 0)`.
     #[test]
     fn a_forwarded_wheel_lands_in_the_childs_own_coordinate_space() {
-        // The real geometry: an 80x24 frame, two header rows (`ui::header_rows`
-        // affords the accounts line at this height), a 24-column sidebar and
-        // its separator -- so the pane starts at column 25, row 2.
+        // The real geometry: an 80x24 frame, one header row, a 24-column
+        // sidebar and its separator -- so the pane starts at column 25, row 1.
         let main = ui::layout(Rect::new(0, 0, 80, 24), 24).2;
-        assert_eq!((main.x, main.y), (25, 2), "sanity: the pane is inset");
+        assert_eq!((main.x, main.y), (25, 1), "sanity: the pane is inset");
 
         assert_eq!(
-            pane_local_mouse(main, 25, 2),
+            pane_local_mouse(main, 25, 1),
             (1, 1),
             "the pane's own top-left cell is its (1, 1), not the frame's"
         );
-        assert_eq!(pane_local_mouse(main, 31, 6), (7, 5));
+        assert_eq!(pane_local_mouse(main, 31, 5), (7, 5));
         // Bottom-right corner of the pane, and nothing past it.
         assert_eq!(
             pane_local_mouse(main, main.x + main.width - 1, main.y + main.height - 1),
@@ -4905,118 +4815,25 @@ mod tests {
         assert!(rows[1].selected);
     }
 
-    fn anthropic_account() -> ui::AccountFacts {
-        ui::AccountFacts {
-            provider: "anthropic".to_string(),
-            usage: Some(ui::AccountWindows {
-                five_hour: Some(42),
-                seven_day: Some(13),
-            }),
-        }
-    }
-
     #[test]
     fn assemble_header_facts_omits_mail_when_none() {
-        let facts = assemble_header_facts(
-            "claude".to_string(),
-            None,
-            anthropic_account(),
-            vec![anthropic_account()],
-            None,
-            3,
-            5,
-        );
+        let facts = assemble_header_facts("claude".to_string(), None, None, 3, 5);
         assert_eq!(facts.mail_broadcast, 0);
         assert_eq!(facts.mail_direct, 0);
-        assert_eq!(facts.account.usage.unwrap().five_hour, Some(42));
-        assert_eq!(facts.accounts.len(), 1);
         assert_eq!(facts.memory_count, 3);
         assert_eq!(facts.sessions, 5);
     }
 
     #[test]
     fn assemble_header_facts_carries_the_broadcast_direct_split_through() {
-        let facts = assemble_header_facts(
-            "claude".to_string(),
-            Some(12),
-            ui::AccountFacts::default(),
-            Vec::new(),
-            Some((2, 1)),
-            0,
-            1,
-        );
+        let facts = assemble_header_facts("claude".to_string(), Some(12), Some((2, 1)), 0, 1);
         assert_eq!(facts.mail_broadcast, 2);
         assert_eq!(facts.mail_direct, 1);
         assert_eq!(facts.score, Some(12));
     }
 
-    /// The registry's own provider slugs, not a list written out here: a new
-    /// adapter's account has to appear in the header without an edit.
-    #[test]
-    fn an_agents_provider_comes_from_the_adapter_registry() {
-        assert_eq!(provider_for_agent("claude"), Some("anthropic"));
-        assert_eq!(provider_for_agent("codex"), Some("openai"));
-        assert_eq!(provider_for_agent("not-an-agent"), None);
-        assert_eq!(provider_for_agent(""), None);
-    }
-
-    /// Three outcomes the operator has to be able to tell apart, none of which
-    /// may render as a fresh, empty `0%` quota.
-    #[test]
-    fn the_focused_account_is_honest_about_a_provider_it_has_no_source_for() {
-        let accounts = vec![
-            anthropic_account(),
-            ui::AccountFacts {
-                provider: "openai".to_string(),
-                usage: None,
-            },
-        ];
-
-        let claude = focused_account("claude", &accounts);
-        assert_eq!(claude.provider, "anthropic");
-        assert_eq!(ui::usage_text(claude.usage.as_ref()), "5h 42% 7d 13%");
-
-        let codex = focused_account("codex", &accounts);
-        assert_eq!(codex.provider, "openai");
-        assert_eq!(ui::usage_text(codex.usage.as_ref()), "no usage source");
-
-        // A provider the registry knows but the summary did not list, and an
-        // agent the registry does not know at all: both say "no source",
-        // never "0%".
-        let missing = focused_account("codex", &[anthropic_account()]);
-        assert_eq!(missing.provider, "openai");
-        assert!(missing.usage.is_none());
-        let stranger = focused_account("not-an-agent", &accounts);
-        assert_eq!(stranger.provider, "unknown");
-        assert!(stranger.usage.is_none());
-    }
-
-    /// `window::provider_summary`'s outer `Option` is the "no usage source"
-    /// signal and must not be flattened away; the inner ones are unknown
-    /// windows of a source that does exist.
-    #[test]
-    fn assemble_accounts_keeps_no_source_distinct_from_an_unknown_window() {
-        let accounts = assemble_accounts(vec![
-            (
-                "anthropic".to_string(),
-                Some(window::UsageWindows {
-                    five_hour: Some(window::Window {
-                        used_percentage: 41.6,
-                        resets_at: 0,
-                        observed_at: 0,
-                    }),
-                    seven_day: None,
-                }),
-            ),
-            ("openai".to_string(), None),
-        ]);
-        assert_eq!(accounts.len(), 2);
-        assert_eq!(ui::account_text(&accounts[0]), "anthropic 5h 42% 7d --");
-        assert_eq!(ui::account_text(&accounts[1]), "openai no usage source");
-    }
-
-    /// The harness segment names the pane the score and usage beside it belong
-    /// to, without ever dropping the repo-settable `chat.model` disclosure.
+    /// The harness segment names the pane the score beside it belongs to,
+    /// without ever dropping the repo-settable `chat.model` disclosure.
     #[test]
     fn the_harness_segment_names_the_focused_pane_once_focus_leaves_pane_zero() {
         assert_eq!(harness_segment("claude", 0, Some("orch")), "claude");
@@ -5026,15 +4843,6 @@ mod tests {
             harness_segment("claude (a-model)", 1, Some("wrk codex")),
             "claude (a-model) \u{25b8} wrk codex"
         );
-    }
-
-    #[test]
-    fn usage_pct_u8_rounds_and_clamps() {
-        assert_eq!(usage_pct_u8(None), None);
-        assert_eq!(usage_pct_u8(Some(63.4)), Some(63));
-        assert_eq!(usage_pct_u8(Some(63.5)), Some(64));
-        assert_eq!(usage_pct_u8(Some(150.0)), Some(100));
-        assert_eq!(usage_pct_u8(Some(-5.0)), Some(0));
     }
 
     #[test]
@@ -5087,14 +4895,13 @@ mod tests {
         );
     }
 
-    /// The provider summary and the rot scores are the two new disk-backed
-    /// reads, and both are rebuilt every ~20fps frame if they are not folded
-    /// into this cache. An earlier round of this dashboard shipped exactly
-    /// that regression, so the throttle is pinned here rather than assumed: a
-    /// usage file written *after* a refresh must stay invisible until the
-    /// window elapses.
+    /// The session registry and the rot scores are disk-backed, and both are
+    /// rebuilt every ~20fps frame if they are not folded into this cache. An
+    /// earlier round of this dashboard shipped exactly that regression, so the
+    /// throttle is pinned here rather than assumed: a record written *after* a
+    /// refresh must stay invisible until the window elapses.
     #[test]
-    fn the_provider_summary_and_scores_are_read_on_the_facts_throttle_only() {
+    fn the_registry_and_scores_are_read_on_the_facts_throttle_only() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
@@ -5103,52 +4910,31 @@ mod tests {
 
         let mut cache = FactsCache::new(now);
         cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
-        // Every registered provider is listed even with nothing on disk, and
-        // each says so rather than reporting a zeroed reading.
-        assert_eq!(
-            cache.disk.accounts.len(),
-            super::super::adapters::providers().len(),
-            "every registry provider is named: {:?}",
-            cache.disk.accounts
-        );
+        assert!(cache.registry.is_empty(), "nothing is registered yet");
         assert!(
-            cache.disk.accounts.iter().all(|a| a.usage.is_none()),
-            "an empty state dir has no usage source for anyone: {:?}",
-            cache.disk.accounts
+            cache.disk.scores.is_empty(),
+            "an unscored session is absent from the map, never a placeholder zero"
         );
-        assert!(cache.disk.scores.is_empty());
 
-        window::store(
-            &state,
-            &window::UsageWindows {
-                five_hour: Some(window::Window {
-                    used_percentage: 42.0,
-                    resets_at: 0,
-                    observed_at: 1,
-                }),
-                seven_day: None,
-            },
-        )
-        .expect("store usage");
+        let _guard =
+            sessions::SessionGuard::register(&state, registry_record("aaa11111", "claude"));
 
         cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
         assert!(
-            cache.disk.accounts.iter().all(|a| a.usage.is_none()),
-            "within the throttle window nothing re-reads the provider files"
+            cache.registry.is_empty(),
+            "within the throttle window nothing re-reads the registry"
         );
 
         let later = now + FACTS_THROTTLE;
         cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later);
-        let anthropic = cache
-            .disk
-            .accounts
-            .iter()
-            .find(|a| a.provider == "anthropic")
-            .expect("anthropic is a registered provider");
         assert_eq!(
-            ui::account_text(anthropic),
-            "anthropic 5h 42% 7d --",
-            "the legacy global usage file is anthropic's source until it has its own"
+            cache.registry.len(),
+            1,
+            "once the throttle elapses the registry refreshes"
+        );
+        assert!(
+            cache.disk.scores.is_empty(),
+            "a session with no readable transcript stays unscored: `rot --`, not `rot 0`"
         );
     }
 
@@ -7733,8 +7519,8 @@ mod tests {
         let mut term_rows = 24u16;
         let mut full = Rect::new(0, 0, 80, 24);
         let mut errors = Vec::new();
-        // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height = 40 - 2
-        // (a 40-row terminal affords `ui::header_rows`' accounts line).
+        // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height = 40 - 1
+        // (`ui::header_rows` takes one row at every height).
         apply_terminal_resize(
             100,
             40,
@@ -7751,7 +7537,7 @@ mod tests {
         // vt100 `size()` returns (rows, cols).
         assert_eq!(
             panes[0].screen().size(),
-            (38, 79),
+            (39, 79),
             "the pane's screen was resized to the new inner geometry"
         );
 
