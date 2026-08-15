@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-14
+last-verified: 2026-08-15
 ---
 
 # Decision Log
@@ -23,6 +23,34 @@ last-verified: 2026-08-14
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-15 — Forward the scroll wheel to a mouse-owning child instead of trying to emulate scrollback
+**Context:** A pty probe against the real harness (answering ConPTY's cursor-position query so output flowed) found two independent vt100 0.16.2 mechanisms that leave a full-screen pane with no scrollback at all: the alternate grid's scrollback is hardcoded to zero, and a child that also sets a DECSTBM scroll region defeats row retirement a second, independent way. The same startup stream shows the harness enabling its own mouse reporting (`?1000/1002/1003/1006h`, SGR) — it scrolls itself.
+**Decision:** Decide per pane at scroll time: a child with mouse reporting enabled gets the wheel event encoded the way it asked (SGR or X10) in pane-local 1-based coordinates via `write_input` (not `write_operator_input`, so scrolling never marks a pane typed-in and holds its idle-gated injectors off); a full-screen child without mouse reporting gets a transient "scrolling belongs to the app" notice; only a normal-screen child uses vt100 scrollback.
+**Rejected:** Patching or vendoring vt100 to add alternate-screen scrollback — fixes a symptom vt100 doesn't own, and real terminal multiplexers (tmux) make the same forward-the-wheel choice for the same reason.
+**Consequences:** `Ctrl+A PageUp/Home/End` are inert by design on a full-screen child — there is no synthesised wheel event to send; unprefixed `PageUp` still reaches the child directly. Any future pane-content feature must check `alternate_screen()` and mouse-reporting state, not vt100 scrollback size.
+**Spec / link:** [[Known Issues]] "A full-screen child... has NO vt100 scrollback"; `dash/pane.rs`'s `scroll_wheel`/`alt_scroll_bytes`.
+
+### 2026-08-15 — Dashboard mouse reporting is wheel+button only (`?1000h?1006h`), never motion tracking
+**Context:** `crossterm::EnableMouseCapture` enables `?1002`/`?1003` (motion tracking) alongside `?1000` (click), with no way to ask for wheel/button only. A probe on a real Windows Terminal session showed `?1003` emitting a `MouseEventKind::Moved` event per pixel of pointer movement — dozens from one sweep — competing with keystrokes in the bounded per-tick input drain, for a feature that only ever reads `ScrollUp`/`ScrollDown`.
+**Decision:** The dashboard writes `?1000h?1006h` itself as raw bytes (`term::dash_mouse_on_bytes`) instead of calling `EnableMouseCapture`, and resets all four modes on exit regardless of which were enabled. Gated by `[dash] mouse` (default on, `REPO_FORBIDDEN`, `ZIRV_CTX_DASH_MOUSE`), since enabling mouse reporting trades away the terminal's own native click-drag text selection (Shift bypasses it).
+**Rejected:** `EnableMouseCapture` plus client-side filtering of motion events — the flood already happened by the time zirv sees the events; filtering after the terminal emits them doesn't recover the drain budget already spent parsing them.
+**Consequences:** any future terminal-input feature must write mouse-mode bytes directly rather than reach for crossterm's capture helper.
+**Spec / link:** [[Known Issues]] "`crossterm::EnableMouseCapture` must never be used…"; `dash/mod.rs`, `term::dash_mouse_on_bytes`/`dash_mouse_off_bytes`.
+
+### 2026-08-15 — Usage dropped from the dashboard header; the rot score is the point of it now
+**Context:** The header's accounts row was added specifically to surface per-provider usage (`92d0d8b`), but in practice every figure rendered "no usage source": authoritative percentages need the operator to wire zirv into Claude's own statusline (`rate_limits`), and the estimator fallback defaults off because a plan's real token allowance is undocumented.
+**Decision:** Remove the accounts row and the usage segment from the header entirely — a row that always reads "no usage source" is worse than no row, and dropping it returns the header to one line at every terminal height, handing a body row back to the pane grid. The per-pane rot score (`score::cached_score`, shown for the focused pane in the header and for every row in the sidebar) is the header's main fact now; unknown renders `--`, never `0`.
+**Rejected:** Keeping the row but relabeling it "wire your statusline for this" — still spends a line of chrome for a feature most operators haven't configured, on data the dashboard cannot supply on its own (unlike the rot score, which it can).
+**Consequences:** the per-provider storage this row read from is not removed — see the next entry — only the dashboard's own rendering of it.
+**Spec / link:** [[Known Issues]]; commit `a3b81c3`; `dash/ui.rs`'s `header_line`/`header_rows`.
+
+### 2026-08-15 — Keep per-provider usage storage even though the dashboard header stopped reading it
+**Context:** After dropping usage from the header (above), the per-provider plumbing added alongside it (`AgentAdapter::provider()`, `state::usage_for`/`provider_slug`, `window::load_for`/`store_for`) had no remaining renderer in the binary.
+**Decision:** Keep the storage layer, and delete only what existed solely for the removed rendering (`window::provider_summary`, `window::load_all`, `adapters::providers()`) plus the now-false `#[allow(dead_code)]` on `score::cached_score`. `usage::run_tee` still files a reading under the account `AgentAdapter::provider()` names; `zirv ctx usage`, `pace`, and `wrap`'s status bar still read it unchanged.
+**Rejected:** Reverting the whole per-provider change — `provider()` (which account owns these rate limits) and the per-account file layout answer a real question (the old global `load`'s default-on-absent made "no source" and "0%" indistinguishable) that the header simply isn't the surface for yet; ripping it out would have to be rebuilt identically the next time zirv wires into a second provider's statusline.
+**Consequences:** a future dashboard usage surface, if one returns, reads data that already exists on disk today; wiring a statusline through zirv already lights up `usage`/`pace`/`wrap`, just not this header.
+**Spec / link:** `window.rs`'s `load_for`/`store_for`/`LEGACY_USAGE_PROVIDER`; [[Usage and Pacing]].
 
 ### 2026-08-14 — Dashboard `Shift+Enter` sends `ESC CR`, not the CSI-u form
 **Context:** The dashboard's key encoder needed a way to let an operator insert a newline in a pane without submitting the prompt (`Shift+Enter`). The "correct" modern encoding for a modified Enter is the kitty-protocol CSI-u form (`ESC [ 13 ; 2 u`), and claude's own `/terminal-setup` already binds something for this gesture.

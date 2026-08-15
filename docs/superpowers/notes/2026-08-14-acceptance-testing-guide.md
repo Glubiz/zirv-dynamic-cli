@@ -134,6 +134,8 @@ set the `REPO_FORBIDDEN` ones):
 | `ZIRV_CTX_DASH_MAX_PANES=N` | Pane cap (default 9) |
 | `ZIRV_CTX_DASH_SIDEBAR_COLS=N` | Sidebar width (default 24) |
 | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS=N` | Restore-roster freshness (default 604800 = 7d) |
+| `ZIRV_CTX_DASH_MOUSE=false` | Disable dashboard mouse reporting (default on) — trades pane wheel-scroll for the terminal's own native text selection |
+| `ZIRV_CTX_DASH_KEYLOG=<path>` | Opt-in, append-only diagnostic log of every dashboard input event, overlay/`filter_key` verdict, and scroll decision (not `REPO_FORBIDDEN`-gated; there is no `ctx.toml` key, env-only) |
 | `ZIRV_CTX_CHAT_MODEL=<m>` | Orchestrator model (overrides `[chat] model`) |
 | `ZIRV_CTX_QUIET=true` | Silence the `zirv ▸` announcement channel |
 | `ZIRV_ALLOW_NESTED=true` | Allow an interactive verb to start inside a session |
@@ -172,9 +174,11 @@ zirv
   - `session <uuid>`
   - `harnesses: claude, codex (disabled)`
   - `model: fable`
-  - Then a full-screen TUI: a **header** row (harness / usage% / mail / memory
-    count / session count), a **persistent left sidebar** listing sessions, and
-    a **main pane** rendering the claude orchestrator session.
+  - Then a full-screen TUI: a **header** row (harness [+ focused pane title] /
+    rot score / mail counts / memory count / session count — one row at every
+    terminal height; usage was removed from the header, see §5), a
+    **persistent left sidebar** listing sessions, and a **main pane** rendering
+    the claude orchestrator session.
 - **PASS:** dashboard opens with sidebar + header + one `orch` pane.
 - **FAIL:** a plain scrolling claude with no sidebar (that is the wrap
   fallback — check terminal size and `dash_eligible` axes), or exit code 2
@@ -236,7 +240,7 @@ each:
 |----------|----------------------|
 | `Ctrl+A` then `1`…`9` | Switch to (and focus) pane N. A digit **beyond the current pane count is a no-op** — nothing moves. |
 | `Ctrl+A` then `Tab` | Cycle to the next pane (focus + selection both move). |
-| `Ctrl+A` then `↑` / `↓` | Move the **sidebar selection** up/down — including onto view-only rows — **without** changing which pane your typing goes to (focus stays put). |
+| `Ctrl+A` then `↑` / `↓` | Move the sidebar selection up/down; landing on an **attached pane row** moves the keyboard there too (focus follows selection onto any pane row — fixed 2026-08-15, previously arrows only highlighted a row that could not actually be switched to). Landing on a **view-only** row (dimmed) moves the selection only — focus stays on the last pane, since a view-only row cannot take the keyboard. |
 | `Ctrl+A` then `s` | Spawn overlay opens (type `<agent> <prompt>`). |
 | `Ctrl+A` then `n` | Nudge overlay opens for the selected session. |
 | `Ctrl+A` then `m` | Mail overlay opens (read; compose with `c`). |
@@ -280,6 +284,25 @@ VS Code — confirm in each (matrix §4).
 - **PASS:** all four rows behave as described. **FAIL:** any of them types the
   literal character instead of sending the control byte, or `Ctrl`+arrow moves
   one character instead of by word.
+
+**Pane scrolling (fixed 2026-08-15 — verify, don't assume):** Claude Code
+spends the session on the alternate screen and enables its own mouse
+reporting, so the dashboard forwards the mouse wheel to it instead of trying
+to maintain its own scrollback for a full-screen child (vt100 structurally
+cannot keep scrollback on the alternate screen, in two independent ways).
+
+| Action | Expected observation |
+|---|---|
+| Mouse wheel over the focused (claude, full-screen) pane | The wheel scrolls **claude's own** history (forwarded to the child, SGR-encoded, pane-local coordinates) — not a zirv-drawn scrollback view. |
+| `Ctrl+A` then `PageUp`/`Home`/`End` on that same pane | **No-op by design**, with a transient notice that scrolling belongs to the app — there is no synthesised wheel event to send a full-screen child. This is expected, not a bug. |
+| Unprefixed `PageUp` | Reaches the child directly (claude's own binding, if it has one). |
+| Mouse wheel over a pane running a plain-screen program (not full-screen) | Scrolls zirv's own vt100 scrollback view; a `SCROLL -N` notice appears. |
+
+- **PASS:** wheel scrolling over the claude pane visibly scrolls claude's own
+  output, and `Ctrl+A PageUp` on it produces the "scrolling belongs to the
+  app" notice rather than doing nothing silently. **FAIL:** the wheel does
+  nothing over the claude pane, or scrolling desyncs/corrupts the pane's
+  display.
 
 **Cursor visibility (fixed 2026-08-14):** while typing into the focused pane, a
 visible terminal cursor tracks the pane's own insertion point (translated from
@@ -650,13 +673,16 @@ crash.
 These are drawn from `docs/obsidian/Development/Known Issues.md`. Do **not**
 file them as failures; confirm they behave as described.
 
-1. **A dashboard pane carries no rot score yet.** The header has a `score`
-   field but the real render loop always passes `None` — no rot-engine
-   transcript scoring is wired for a pane. A pane runs supervised (turn-signal
-   env, quit sequence, quit/restore roster) but does **not**
-   advise/compact/restart itself the way a plain `zirv ctx wrap` session does.
-   Do not expect a rot score in the pane header. (The header shows
-   harness/usage/mail/memory/session-count only.)
+1. **A dashboard pane still does not advise/compact/restart itself.** Fixed
+   2026-08-15: the header and every sidebar row now show a real rot score
+   (`score::cached_score`, `rot NN` or `rot --` for unknown/unscorable — never
+   `0`). What's still true: a pane runs fully supervised (turn-signal env,
+   quit sequence, quit/restore roster) but nothing acts on that score the way
+   `exec`/`wrap`/`run_loop` do for their own single session — this closes the
+   *display* gap only, not a supervision gap. Also note: usage is **no
+   longer** in the header at all (removed 2026-08-15 — every figure read "no
+   usage source" in practice); the header is harness/rot/mail/memory/session
+   only, one row at every terminal height.
 2. **Windows interactive positional prompt with a raw shell metacharacter is
    refused** on an npm `claude.cmd` install (the `cmd.exe` reparse backstop).
    Rephrase the prompt. Headless (`zirv ctx agent`, whose prompt goes via

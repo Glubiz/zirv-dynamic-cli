@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-14
+last-verified: 2026-08-15
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-15 (feat/dashboard, scrolling+overlay+header round): vt100's alternate-screen scrollback trap (two independent mechanisms) plus its Ctrl+A PageUp corollary; the invisible/transparent-overlay class closed (Clear + full-frame fallback); crossterm's EnableMouseCapture banned from the dashboard; removed the now-resolved "no rot score in a pane" entry -- score::cached_score is wired into both the header and the sidebar -->
 <!-- Updated 2026-08-14 (feat/dashboard, round-9 review): closed the help-probe RCE and the case-folded reserved-name bypass; Windows tree-kill, atomic state writes, and memory-prune parse safety; dashboard cursor/key-encoding/quit-latency fixes and the ⏸ glyph's removal -->
 <!-- Updated 2026-08-14 (feat/dashboard, security round): cmd.exe argv-reparse injection class recorded, with the two shipped defenses and the deferred file-preference hardening -->
 <!-- Updated 2026-08-14 (feat/agent-coordination, mail trust round): two latent traps recorded -- exec/loop's mail gate keys off prompt composition; wrap's status bar paints without raw mode -->
@@ -124,17 +125,68 @@ at startup). The release profile is `panic = "abort"`, so this is not a
 recoverable error anywhere near a TUI. Use `.max(1).min(x.max(1))` instead
 (`ui::dialog_width`), and guard whole renderers with `Rect::is_empty`.
 
-## A dashboard pane carries no rot score yet
+## A full-screen child on the alternate screen has NO vt100 scrollback -- raising `Parser::new`'s scrollback argument does not fix it
 
-`ui::HeaderFacts` has a `score: Option<u32>` field, and the header renders
-`score NN` when it's `Some`, but the dashboard's real render loop
-(`assemble_header_facts` in `run_dashboard`) always passes `None` -- no
-[[Rot Engine]] transcript scoring is wired up for a pane yet, unlike `wrap`'s
-own status bar. A pane still runs fully supervised otherwise (turn-signal env,
-quit sequence, quit/restore roster), it just never advises/compacts/restarts
-itself the way a plain `zirv ctx wrap` session does. Do not assume a pane
-attached in the dashboard is rot-monitored just because it looks identical to
-one running under `wrap` directly.
+An empirical probe (spawning the real harness in a pty, answering ConPTY's
+`ESC[6n` cursor-position query so output actually flowed, and parsing the
+stream through vt100) established that Claude Code spends the whole session on
+the alternate screen (`ESC[?1049h`) and enables its own mouse reporting
+(`?1000h ?1002h ?1003h ?1006h`, SGR). Two **independent** traps live in vt100
+0.16.2, not one:
+
+1. The alternate grid's scrollback is hardcoded to zero
+   (`vt100-0.16.2/src/screen.rs:76`) -- a pane hosting a full-screen harness
+   can never accumulate scrollback no matter how large `Parser::new`'s own
+   scrollback argument is. Raising it from 0 to 1000 (an earlier fix) was
+   necessary but not sufficient for exactly this reason.
+2. `grid.rs:566` only retires rows into scrollback when `scrollback_len > 0 &&
+   !scroll_region_active()`, so a child that also sets a DECSTBM scroll region
+   silently defeats scrollback a second, independent way.
+
+**Consequence:** `Ctrl+A PageUp`/`Home`/`End` do nothing but print an
+explanatory notice on a full-screen child -- there is no synthesised wheel
+event to send. Unprefixed `PageUp` still reaches the child directly. This is
+expected behavior, not a bug to chase: the real fix is not more vt100
+scrollback, it's the dashboard deciding per pane at scroll time whether to
+forward the wheel to a child that owns the mouse or fall back to vt100
+scrollback on a normal-screen child. See [[Decision Log]].
+
+## An overlay that draws nothing over part of its rect silently eats every keystroke, not just looks wrong
+
+`render_dialog` used to draw only a `Block` border and a `Paragraph`, so any
+cell inside the dialog's rect the text didn't reach kept whatever the pane
+grid had drawn there -- a "dialog" that read as pane content bleeding through
+a border. `render_overlay` separately returned early when the main rect was
+too small to host it, leaving nothing drawn at all while the overlay still
+owned input. Neither failure mode is cosmetic: while **any** overlay is open
+the event loop never calls `filter_key` at all -- `Ctrl+A` isn't even tested
+for prefix-ness -- and every reducer keeps itself open on an unmatched key, so
+only `Enter`/`Esc` close one. An invisible modal therefore presents as "the
+dashboard has stopped responding to `Ctrl+A` entirely," which is exactly how
+this was reported from a real session: the first `Ctrl+A s` opened the spawn
+dialog, and everything typed after it was silently swallowed by a dialog the
+operator could not see. Fixed: `render_dialog` renders `Clear` first (opaque),
+and `render_overlay` falls back to the full frame when the main rect can't
+host it. Any future overlay must render `Clear` and must never treat "too
+small to draw into" as a reason to skip drawing -- input is already committed
+to it either way.
+
+## `crossterm::EnableMouseCapture` must never be used in the dashboard
+
+It turns on `?1000h` (click) **and** `?1002h`/`?1003h` (motion tracking)
+together, with no way to enable only wheel/button reporting. A probe on a real
+Windows Terminal session showed `?1003` emitting a `MouseEventKind::Moved`
+event for every pixel of pointer movement -- dozens from one sweep across the
+window -- competing with keystrokes inside the bounded per-tick input drain,
+for a feature (`Ctrl+A`-scrolled panes) that only ever reads
+`ScrollUp`/`ScrollDown`. The dashboard writes `?1000h?1006h` itself as raw
+bytes instead (`term::dash_mouse_on_bytes` -- wheel + button reporting, SGR
+coordinates only) and resets all four modes on exit regardless of which were
+enabled. `[dash] mouse` (default true, `REPO_FORBIDDEN`, env override
+`ZIRV_CTX_DASH_MOUSE`) is a genuine trade, not a strict improvement: enabling
+mouse reporting takes over the terminal's own native click-drag text
+selection (hold Shift to bypass it -- the same trade every real terminal
+multiplexer makes).
 
 ## Dashboard special-key encoding must carry the xterm modifier parameter, and crossterm's own control-key pre-mapping must be undone explicitly
 

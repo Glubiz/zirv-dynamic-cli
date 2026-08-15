@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-15
 ---
 
 # Usage and Pacing
@@ -14,7 +14,8 @@ last-verified: 2026-08-12
 - **Gotchas:**
   - `usage tee` must **never** fail to print a line. If parsing the payload or the chained command fails, it still writes a fallback statusline and always exits `0` — see the `run_tee` and `dispatch`'s `ParseFailure::Statusline` notes below.
   - `five_hour_budget_tokens` and `seven_day_budget_tokens` default to `0`, which means "no budget configured," not "zero tokens." The estimator produces no percentage for a `0`-budget window (`estimate_windows` returns `None` for it) rather than inventing one from an undocumented plan allowance.
-  - `usage.json` under the state dir is a single, machine-wide file — not per-session, not per-repo. Every live Claude Code session's statusline tee writes to the same file, merged by newest-observation-per-window.
+  - `usage.json` under the state dir is a single, machine-wide file — not per-session, not per-repo. Every live Claude Code session's statusline tee writes to the same file, merged by newest-observation-per-window. A parallel per-provider file (`usage-<provider>.json`, see below) now exists alongside it; `usage.json` itself is untouched and still the file `load`/`store` (and thus `zirv ctx usage`, `pace`, and `wrap`'s status bar) read and write.
+  - `AgentAdapter::provider()` is the account (`"anthropic"`, `"openai"`), not the binary or the adapter's own `name()` — two harnesses can share one billed account. It has no default, so a new adapter must declare it explicitly rather than silently inheriting someone else's usage windows.
 
 ## Purpose
 
@@ -34,6 +35,10 @@ There are two independent sources of a `Window`:
 Persistence: `load`/`store` read and write `StateDir::usage()`, i.e. `usage.json` in the platform state directory — one file, shared by every session on the machine. `store` writes through a `tmp<pid>` file and renames it into place, so a reader never observes a half-written file even with several concurrent sessions' statuslines writing at once. A missing or corrupt file reads back as `UsageWindows::default()` rather than an error (a statusline hook must not break on a half-written state file). `merge` combines an existing and a freshly-parsed `UsageWindows` per sub-window, keeping whichever observation has the newer `observed_at`, and treating an absent window in the fresh reading as "no new information" rather than erasing what was already known.
 
 `window.rs` also contains `parse_iso8601_utc`, a small hand-rolled parser for the exact `2026-07-31T14:15:15.968Z` shape Claude writes into transcripts (using Howard Hinnant's `days_from_civil` so it needs no date crate), and a future-skew guard: an event timestamped more than 5 minutes in the future is skipped entirely rather than being clamped to age-zero and inflating the freshest bucket.
+
+**Per-provider storage (2026-08-15).** The single machine-wide `usage.json` above cannot say *which account* a reading belongs to, and the old `load`'s default-on-absent made "no source" and "sitting at 0%" indistinguishable. `StateDir::usage_for(provider)` names a second file per account, `usage-<provider>.json`, where `provider` is sanitized by `state::provider_slug` (lowercase `[a-z0-9-]`, non-empty, `"unknown"` if that would otherwise be empty — cannot escape the state directory). `window::store_for`/`load_for` are the per-provider counterparts of `store`/`load`; `load_for` returns `None` — never a zero-valued `UsageWindows` — when nothing has ever been recorded for that provider, and for `anthropic` specifically it falls back to reading the legacy global `usage.json` (never moving or deleting it), so an operator upgrading into this layout keeps the reading their statusline has already been collecting. `usage::run_tee` writes both the legacy file and the resolved adapter's own `usage_for(adapter.provider())` file on every statusline tick. This storage was originally paired with dashboard-header rendering (`window::provider_summary`, `window::load_all`, `adapters::providers()`), all since **deleted** (2026-08-15, `a3b81c3`) once the dashboard dropped usage from its header — see [[Ctx Supervisors]] and [[Decision Log]]. The storage itself was kept: `zirv ctx usage`, `pace`, and `wrap`'s status bar are unaffected, and a statusline wired through zirv still lights up a per-provider file today, even with nothing in the binary reading it back yet beyond those three.
+
+`score::cached_score(state, repo, session_id) -> Option<u32>` (in `score.rs`, covered in depth on [[Rot Engine]]) is unrelated to usage windows but was added the same round for the same "cheap per-pane facts on a ~1s render throttle" reason: a dashboard pane's rot score, backed by the same incremental fold the Stop hook uses, cached behind a single `metadata()` call in steady state. `None` means unknown, never a healthy `0`.
 
 ### `pace.rs` — the pacing gate
 

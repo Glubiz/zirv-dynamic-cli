@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-14
+last-verified: 2026-08-15
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-08-14
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-15: dashboard scrolling, opaque overlays, and a leaner header
+**What:** Five commits closing the dashboard's biggest usability gaps. A pty probe against the real harness explained why panes never scrolled (alternate screen plus two independent vt100 scrollback traps); the dashboard now forwards the wheel to a child that owns the mouse (SGR/X10, pane-local coordinates) and falls back to vt100 scrollback only on a normal screen. `Ctrl+A` arrows now move focus onto pane rows, not just the sidebar cursor, and the sidebar itself scrolls. Overlays (`render_dialog`/`render_overlay`) are opaque and fall back to the full frame instead of silently swallowing every keystroke behind invisible pane bleed-through. The header shrank back to one row: usage is gone (every figure read "no usage source" in practice) and the rot score (`score::cached_score`, per focused pane and per sidebar row) is the header's point now.
+**Key changes:** `dash/{mod,pane,ui}.rs`, `term.rs` (mouse-mode bytes), `score.rs` (`cached_score`), `adapters/{mod,claude,codex}.rs` + `state.rs`/`window.rs` (per-provider usage storage, kept even though the header stopped reading it), `config.rs` (`dash.mouse`).
+**Follow-up:** see [[Known Issues]] for the vt100/overlay/mouse gotchas and [[Decision Log]] for the four decisions; PR #21 is the single open PR into main and the branch is release-candidate.
 
 ### 2026-08-14: round-9 review — help-probe RCE, tree-kill, atomic state writes, dashboard cursor/keys
 **What:** Three commits closing findings from a further adversarial pass on `feat/dashboard`. Security: the `--help` capability probe itself was an unguarded `cmd.exe` spawn (live RCE via a distilled `--resume` summary), the forced system-prompt-file form was inert on `zirv chat`/bare `zirv`/the dash orchestrator (shim-detection false negative), and reserved-name interception was case-sensitive while script dispatch's own guard wasn't. Supervisors: Windows `terminate` now kills the whole process tree (`taskkill /T /F`), not just the launcher; state writes are atomic (temp+rename); `nested_session_evidence` now requires a live `owner.pid`. Dashboard: the cursor is finally drawn, input/mail/drain are all bounded per tick, special-key encoding carries the xterm modifier parameter, and the dead `WaitingInput`/`⏸` state is removed.

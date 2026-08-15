@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-14
+last-verified: 2026-08-15
 ---
 
 # Ctx Adapters
@@ -10,7 +10,7 @@ last-verified: 2026-08-14
 - **Used by:** [[Ctx Supervisors]] (`exec.rs`, `wrap.rs` build agent argv and relaunch through an adapter; `dash/mod.rs` and `dash/roster.rs` call `model_args`/`resume_args` for the dashboard's orchestrator pane and its quit/restore roster), [[Script Runner]] (`src/script_runner/agent_command.rs` calls `adapters::select`/`adapters::all` to run a wrapped agent command from a script), [[Ctx Subsystem]] (`handoff.rs` calls `distiller_cmd` to build the summarization child; `score.rs` calls `parse_events`/`structural_context`)
 - **Depends on:** [[Ctx Subsystem]] for `CtxResult`, `CtxConfig` and the `event` types (`SessionId`, `SessionRef`, `NormalizedEvent`, `StructuralContext`, `Capabilities`), [[Utilities]] for `home_dir()`, `src/settings.rs` (`AgentGate`, via `cfg.agents`) for the enable/disable gate `select` checks
 - **Tests:** inline `#[cfg(test)] mod tests` in all three files — `mod.rs` (adapter selection, Windows launcher rewriting, `program_invocation`), `claude.rs` (transcript parsing against a recorded fixture, command building, the distiller tool-restriction tests, the `--help` probe cache), `codex.rs` (command shapes verified against `codex --help`, the honest not-ready error)
-- **If changed:** [[Ctx Supervisors]], [[Ctx Subsystem]], [[Untrusted Configuration]], [[Known Issues]] (issue #11 tracks codex), [[Decision Log]] (the I6 distiller-restriction fix round)
+- **If changed:** [[Ctx Supervisors]], [[Ctx Subsystem]], [[Untrusted Configuration]], [[Usage and Pacing]] (`provider()`), [[Known Issues]] (issue #11 tracks codex), [[Decision Log]] (the I6 distiller-restriction fix round)
 - **Gotchas:** `distiller_cmd`'s tool restriction is a security control, not cosmetic — see below; it must stay a single `=`-bound `--disallowedTools=...` argv token, and `Bash` must stay in the deny list, or the restriction silently stops working. The `codex` adapter is **not implemented**: `ready()` always returns `Err` with a message pointing at issue #11, so `--agent codex` fails loudly rather than pretending to work.
 
 ## Purpose
@@ -22,6 +22,7 @@ This module is the seam between zirv's ctx subsystem and whatever coding-agent C
 Defined in `mod.rs`, with `Debug` as a supertrait (so `Box<dyn AgentAdapter>` can appear in test assertions). Required methods:
 
 - `name()` — the adapter's short identifier (`"claude"`, `"codex"`), used for `--agent` selection and error messages.
+- `provider()` (2026-08-15) — the **account**/vendor whose rate limits this adapter spends, a stable lowercase slug (`"anthropic"` for claude, `"openai"` for codex): deliberately not `name()`, since two harnesses can sit on one billed account and would then legitimately share one provider's usage windows. Required with no default, so a new adapter cannot silently inherit someone else's usage — see [[Usage and Pacing]] for `state::usage_for`/`window::load_for`, the per-provider storage this feeds.
 - `ready()` — returns `Err` when the adapter exists but isn't safe to use yet, so callers fail loudly instead of scoring garbage. This is where codex reports its own non-readiness (see below).
 - `detect(command)` — whether a wrapped argv looks like this adapter's binary, by filename.
 - `headless_cmd(prompt, session, extra)` — builds the one-shot, non-interactive command (`exec`'s launch shape).
