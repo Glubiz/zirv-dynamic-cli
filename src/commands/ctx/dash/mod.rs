@@ -327,6 +327,23 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
 /// file back, and nothing behaves differently because it is on.
 const KEYLOG_ENV: &str = "ZIRV_CTX_DASH_KEYLOG";
 
+/// The loop state the diagnostic watches for changes between ticks. Small and
+/// `Copy`-ish on purpose: it is compared every iteration, and only a change
+/// writes anything.
+///
+/// These four fields are exactly the ones the three live hypotheses turn on --
+/// `prefix_armed` for "the arming is lost between keystrokes", `overlay` for
+/// "something is swallowing keys before `filter_key` runs", and
+/// `panes`/`focused` for "the action fired but there was nothing to apply it
+/// to".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoopState {
+    prefix_armed: bool,
+    overlay: &'static str,
+    panes: usize,
+    focused: usize,
+}
+
 /// The append-only input log behind [`KEYLOG_ENV`].
 ///
 /// Every write is best-effort and its error discarded, on purpose: a
@@ -334,12 +351,41 @@ const KEYLOG_ENV: &str = "ZIRV_CTX_DASH_KEYLOG";
 /// dashboard's whole contract is that a failure degrades the feature rather
 /// than the session (`panic = "abort"` in the release profile means a panic
 /// here would take the operator's terminal with it).
+///
+/// The log is shaped to separate three specific hypotheses about `Ctrl+A`
+/// doing nothing, since a real terminal probe has already ruled out both the
+/// terminal and the matcher (`Ctrl+A` arrives as `Char('a')` + `CONTROL`,
+/// `kind: Press`, which [`is_prefix_key`] matches):
+///
+/// * **(a) an overlay is swallowing keys before [`filter_key`] is reached.**
+///   Every key line carries the overlay variant, `none` included, and a
+///   `TICK` line reports the overlay the moment it changes -- so an
+///   `Overlay::Restore` opened before the first keystroke is the very first
+///   `TICK` in the file.
+/// * **(b) arming is lost between keystrokes.** `EVENT` carries
+///   `armed_before`, `DISPATCH` carries the `armed_after` the loop actually
+///   stored, and `TICK` reports any change to it -- including one that
+///   happens with no event in between, which is precisely the signature of a
+///   state reset.
+/// * **(c) the action fires with no visible effect.** `DISPATCH` names every
+///   [`DashAction`] produced and `OVERLAY` records each take/assign of the
+///   overlay slot, so "set then immediately cleared" and "nothing at all
+///   happened downstream" read differently.
 struct KeyLog {
     file: std::fs::File,
     /// Monotonic, so the timestamps are readable deltas rather than wall
     /// clock -- what matters is the gap between two keystrokes, and whether a
     /// keystroke arrived at all.
     start: Instant,
+    /// Bumped once per event-loop iteration and stamped on every line, so an
+    /// event and the state around it can be placed on the same tick -- the
+    /// difference between "armed was cleared by the next keystroke" and
+    /// "armed was cleared by the loop with no keystroke at all".
+    tick: u64,
+    /// The last state a `TICK` line reported. The loop polls at 50ms, so an
+    /// unconditional line per iteration would be twenty a second of nothing;
+    /// only a change is worth a line.
+    last: Option<LoopState>,
 }
 
 impl KeyLog {
@@ -356,12 +402,15 @@ impl KeyLog {
         Some(KeyLog {
             file,
             start: Instant::now(),
+            tick: 0,
+            last: None,
         })
     }
 
     fn line(&mut self, body: &str) {
         let ms = self.start.elapsed().as_millis();
-        let _ = writeln!(self.file, "{ms:>9}ms {body}");
+        let tick = self.tick;
+        let _ = writeln!(self.file, "{ms:>9}ms t{tick:<7} {body}");
         // Flushed every line: the session this is diagnosing is one that may
         // well be killed from outside, and a buffered tail helps nobody.
         let _ = self.file.flush();
@@ -381,17 +430,56 @@ impl KeyLog {
         ));
     }
 
-    /// One line for one `event::read()`. A key press also carries the arming
-    /// state it was decided against and the decision itself -- either the
-    /// overlay that consumed it, or the `(new_armed, verdict)` pair
-    /// [`filter_key`] returns.
+    /// Called once at the top of every loop iteration: bumps the tick counter
+    /// and writes a `TICK` line **only when the watched state changed**.
+    ///
+    /// The silence is the point. At a 50ms poll an unconditional line would
+    /// bury the interesting ones, while a change-triggered line makes a
+    /// transition that happened *without* an event impossible to miss -- which
+    /// is exactly what hypothesis (b) would look like: an `EVENT` arming the
+    /// prefix, then a `TICK armed=false` on a later tick with no keystroke
+    /// logged in between.
+    fn tick(&mut self, state: LoopState) {
+        self.tick = self.tick.saturating_add(1);
+        if self.last == Some(state) {
+            return;
+        }
+        let previous = self.last;
+        self.last = Some(state);
+        match previous {
+            None => self.line(&format!(
+                "TICK armed={} overlay={} panes={} focused={} (first)",
+                state.prefix_armed, state.overlay, state.panes, state.focused
+            )),
+            Some(prev) => self.line(&format!(
+                "TICK armed={}->{} overlay={}->{} panes={}->{} focused={}->{}",
+                prev.prefix_armed,
+                state.prefix_armed,
+                prev.overlay,
+                state.overlay,
+                prev.panes,
+                state.panes,
+                prev.focused,
+                state.focused
+            )),
+        }
+    }
+
+    /// One line for one `event::read()`, whatever the event. A key press also
+    /// carries the arming state and the overlay it is about to be decided
+    /// against -- `overlay=none` included, so "no overlay was open" is a
+    /// recorded fact rather than an absence -- plus the decision itself:
+    /// either the overlay that will consume it, or the `(new_armed, verdict)`
+    /// pair [`filter_key`] returns.
     ///
     /// The verdict is re-derived here rather than observed from the dispatch
     /// below. That is sound precisely because `filter_key` is pure -- a total
     /// function of `(prefix_armed, key)` and nothing else, which is the
     /// property its own doc comment states and its own tests pin -- so calling
     /// it a second time cannot disagree with the call that actually runs, and
-    /// cannot have a side effect of its own.
+    /// cannot have a side effect of its own. [`KeyLog::dispatch`] then records
+    /// what the loop *actually did* with it, so the two disagreeing would
+    /// itself be the finding.
     fn observe<E: std::fmt::Display>(
         &mut self,
         read: &Result<Event, E>,
@@ -401,18 +489,55 @@ impl KeyLog {
         match read {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 let outcome = if matches!(overlay, ui::Overlay::None) {
-                    format!("filter_key -> {:?}", filter_key(prefix_armed, *key))
+                    format!(
+                        "predicted filter_key -> {:?}",
+                        filter_key(prefix_armed, *key)
+                    )
                 } else {
-                    format!("consumed by overlay={}", overlay_name(overlay))
+                    "will be consumed by the overlay".to_string()
                 };
                 self.line(&format!(
-                    "EVENT {:?} | armed_before={prefix_armed} | {outcome}",
-                    Event::Key(*key)
+                    "EVENT {:?} | armed_before={prefix_armed} | overlay={} | {outcome}",
+                    Event::Key(*key),
+                    overlay_name(overlay)
                 ));
             }
+            // Non-`Press` key events (Windows delivers a Release for every
+            // key, plus a stray one at startup left over from the shell that
+            // launched the process) land here too, deliberately: "the loop saw
+            // it and dropped it" is a different fact from "it never arrived".
             Ok(event) => self.line(&format!("EVENT {event:?}")),
             Err(e) => self.line(&format!("READ-ERR {e}")),
         }
+    }
+
+    /// What the loop actually did with a key press that reached
+    /// [`filter_key`]: the arming state it stored afterwards, and the verdict
+    /// -- every [`DashAction`] included, not just the interesting ones.
+    ///
+    /// Paired with `EVENT`'s `armed_before`, this is the whole of hypothesis
+    /// (b): if `armed_after=true` here and the next `EVENT` reports
+    /// `armed_before=false` with no `TICK` explaining the change, the arming
+    /// was lost between the two.
+    fn dispatch(&mut self, armed_before: bool, armed_after: bool, verdict: &InputVerdict) {
+        let rendered = match verdict {
+            // A `ToChild` payload is the operator's own typing; log its length
+            // rather than its bytes, which is enough to tell "forwarded" from
+            // "swallowed" without writing what they typed into a file.
+            InputVerdict::ToChild(bytes) => format!("ToChild({} bytes)", bytes.len()),
+            other => format!("{other:?}"),
+        };
+        self.line(&format!(
+            "DISPATCH armed {armed_before}->{armed_after} | verdict={rendered}"
+        ));
+    }
+
+    /// One take/assign of the overlay slot. `run_dashboard` `mem::take`s the
+    /// overlay before running a reducer and puts back whatever the reducer
+    /// returned, so "opened then immediately closed again" is a real shape
+    /// this makes visible -- and it is hypothesis (c)'s signature.
+    fn overlay_swap(&mut self, took: &'static str, now: &ui::Overlay) {
+        self.line(&format!("OVERLAY took={took} now={}", overlay_name(now)));
     }
 }
 
@@ -984,13 +1109,12 @@ fn teardown_terminal() {
     let mut stdout = io::stdout();
     let _ = stdout.write_all(term::dash_reset_bytes());
     let _ = stdout.flush();
-    // Belt and braces: crossterm's own sequences for the same two things, in
-    // case a future crossterm emits something extra alongside `\x1b[?1049l`
-    // or the mouse-mode resets. Both are no-ops when already undone -- and
-    // `DisableMouseCapture` is issued whether or not `dash.mouse` ever
-    // enabled it, since a terminal left reporting mouse events is unusable
-    // and "we think we never turned it on" is not worth betting a shell on.
-    let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+    // Belt and braces: crossterm's own sequence for the same thing, in case
+    // a future crossterm emits something extra alongside `\x1b[?1049l`.
+    // Leaving an alternate screen twice is a no-op. Mouse reporting needs no
+    // equivalent here -- `term::dash_reset_bytes` above already turns off all
+    // four modes, which is more than this dashboard ever turns on.
+    let _ = execute!(stdout, LeaveAlternateScreen);
 }
 
 /// The hook that was installed before the dashboard replaced it, shared
@@ -2646,16 +2770,36 @@ pub fn run_dashboard(
     // on every exit arm below.
     term::set_dash_active(true);
 
-    // Mouse capture, which is what makes the wheel scroll a pane's scrollback
-    // (`Event::Mouse` below). Best-effort: a terminal that will not report
-    // mouse events still has `Ctrl+A PageUp`/`Home`, so a failure here is a
-    // header notice, never a failed launch. Undone by `term::dash_reset_bytes`
-    // on every exit path -- the ordinary teardown, the panic hook and the
-    // external-kill handler alike -- so it cannot be left switched on.
-    if cfg.dash.mouse
-        && let Err(e) = execute!(io::stdout(), EnableMouseCapture)
-    {
-        push_error(&mut errors, format!("dashboard: mouse capture failed: {e}"));
+    // Mouse reporting, which is what makes the wheel scroll a pane's
+    // scrollback (`Event::Mouse` below).
+    //
+    // Written as raw bytes from `term::dash_mouse_on_bytes` rather than
+    // through crossterm's `EnableMouseCapture`, on purpose: that helper also
+    // turns on `?1002`/`?1003`, the motion-tracking modes, and a probe on a
+    // real Windows Terminal session showed `?1003` emitting a
+    // `MouseEventKind::Moved` event for every pointer movement -- dozens from
+    // one sweep across the window. Those land in the same bounded per-tick
+    // input drain the operator's keystrokes do (`MAX_INPUT_DRAIN_PER_TICK`),
+    // so motion tracking would have the pointer competing with the keyboard
+    // for a feature that only ever reads `ScrollUp`/`ScrollDown`. See
+    // `term::dash_mouse_on_bytes` for the full reasoning before changing this.
+    //
+    // Best-effort: a terminal that will not report mouse events still has
+    // `Ctrl+A PageUp`/`Home`, so a failure here is a header notice, never a
+    // failed launch. Undone by `term::dash_reset_bytes` on every exit path --
+    // the ordinary teardown, the panic hook and the external-kill handler
+    // alike -- so it cannot be left switched on.
+    if cfg.dash.mouse {
+        let mut stdout = io::stdout();
+        if let Err(e) = stdout
+            .write_all(term::dash_mouse_on_bytes())
+            .and_then(|()| stdout.flush())
+        {
+            push_error(
+                &mut errors,
+                format!("dashboard: mouse reporting could not be enabled: {e}"),
+            );
+        }
     }
 
     // Task 2: the opt-in input diagnostic. `None`, and entirely inert, unless
@@ -2753,6 +2897,18 @@ pub fn run_dashboard(
     let mut reaped_recent: HashSet<String> = HashSet::new();
 
     let exit_code: i32 = 'main: loop {
+        // Task 2: bumps the tick counter every iteration and writes a line
+        // only when the watched state changed -- so a `prefix_armed` (or
+        // `overlay`) that moves with no keystroke in between is visible as a
+        // `TICK` with no `EVENT` before it. Inert unless the keylog is on.
+        if let Some(log) = keylog.as_mut() {
+            log.tick(LoopState {
+                prefix_armed,
+                overlay: overlay_name(&overlay),
+                panes: panes.len(),
+                focused,
+            });
+        }
         for pane in panes.iter_mut() {
             pane.drain();
             pane.on_turn_signal();
@@ -2918,6 +3074,10 @@ pub fn run_dashboard(
                             input_errors = 0;
                             if !matches!(overlay, ui::Overlay::None) {
                                 let current = std::mem::take(&mut overlay);
+                                // Task 2: what the slot held on the way in, so
+                                // the `OVERLAY` line below can report the swap
+                                // rather than only the result.
+                                let took = overlay_name(&current);
                                 match current {
                                     ui::Overlay::None => {}
                                     ui::Overlay::QuitConfirm(working) => match key.code {
@@ -3129,9 +3289,28 @@ pub fn run_dashboard(
                                         _ => overlay = ui::Overlay::Nudge(draft),
                                     },
                                 }
+                                // Task 2: the take/assign pair. An overlay that
+                                // reopens itself (`took=X now=X`) is a key
+                                // swallowed with nothing to show for it; one
+                                // that closes (`now=none`) is the reducer
+                                // having acted.
+                                if let Some(log) = keylog.as_mut() {
+                                    log.overlay_swap(took, &overlay);
+                                }
                             } else {
                                 let (armed, verdict) = filter_key(prefix_armed, key);
+                                let armed_before = prefix_armed;
                                 prefix_armed = armed;
+                                // Task 2: what the loop ACTUALLY stored and
+                                // ACTUALLY decided -- every DashAction, not
+                                // only the interesting ones. Paired with
+                                // `EVENT`'s `armed_before` and the `TICK`
+                                // lines, this is what separates "arming was
+                                // never stored" from "arming was stored and
+                                // then lost before the next keystroke".
+                                if let Some(log) = keylog.as_mut() {
+                                    log.dispatch(armed_before, prefix_armed, &verdict);
+                                }
                                 match verdict {
                                     InputVerdict::Pending => {}
                                     // Typing always reaches the *focused* pane, never
@@ -3308,14 +3487,21 @@ pub fn run_dashboard(
                             );
                         }
                         // The wheel scrolls the FOCUSED pane, whatever the pointer
-                        // happens to be over. Not a shortcut: this dashboard shows
-                        // exactly one pane's grid at a time (`render_grid` is
-                        // called for `panes[focused]` alone) rather than tiling
-                        // them, so "the pane under the pointer" is either the
-                        // focused pane or the sidebar, which is a list of rows and
-                        // not a scrollable grid at all. Hit-testing the column/row
-                        // against the layout would therefore buy nothing beyond
-                        // "do nothing when the pointer is on the left".
+                        // happens to be over.
+                        //
+                        // Not a shortcut taken because the coordinates are
+                        // unreliable -- a probe on the operator's own terminal
+                        // confirmed `MouseEvent { kind: ScrollDown, column, row }`
+                        // arrives with real, usable coordinates. It is that there
+                        // is nothing to disambiguate: this dashboard shows exactly
+                        // one pane's grid at a time (`render_grid` is called for
+                        // `panes[focused]` alone) rather than tiling them, so the
+                        // only thing the pointer can be over other than the focused
+                        // pane's grid is the sidebar -- a list of rows, not a
+                        // scrollable grid. Hit-testing would therefore buy nothing
+                        // beyond "do nothing when the pointer is on the left",
+                        // which is a worse wheel, not a better one. Revisit only if
+                        // panes are ever tiled.
                         Ok(Event::Mouse(mouse)) => {
                             input_errors = 0;
                             let delta = match mouse.kind {
@@ -3852,8 +4038,118 @@ mod tests {
         );
         assert!(lines[2].contains("overlay=mail"), "{}", lines[2]);
         assert!(
+            lines.iter().all(|l| l.contains("overlay=")),
+            "the overlay is recorded on EVERY key line, `none` included: {text}"
+        );
+        assert!(
             lines.iter().all(|l| l.contains("ms ")),
             "every line is timestamped: {text}"
+        );
+    }
+
+    /// Hypothesis (b): a `prefix_armed` that is stored and then lost before the
+    /// next keystroke. The instrumentation has to make that shape readable --
+    /// `DISPATCH` records what the loop actually stored, and `TICK` reports a
+    /// later change to it *with no event in between*, which is the whole
+    /// signature.
+    #[test]
+    fn the_keylog_makes_a_lost_prefix_arming_visible_between_ticks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("keys.log");
+        let mut log = KeyLog {
+            file: std::fs::File::create(&path).expect("create"),
+            start: Instant::now(),
+            tick: 0,
+            last: None,
+        };
+
+        let live = |armed: bool| LoopState {
+            prefix_armed: armed,
+            overlay: "none",
+            panes: 1,
+            focused: 0,
+        };
+
+        // Tick 1: nothing armed. Tick 2: identical, so it writes nothing.
+        log.tick(live(false));
+        log.tick(live(false));
+        // The operator presses Ctrl+A and the loop stores the arming.
+        log.dispatch(false, true, &InputVerdict::Pending);
+        log.tick(live(true));
+        // ... and then it is gone, with no keystroke to explain it.
+        log.tick(live(false));
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            4,
+            "an unchanged tick writes nothing; at a 50ms poll silence is the point: {text}"
+        );
+        assert!(lines[0].contains("TICK armed=false"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("DISPATCH armed false->true"),
+            "the arming the loop actually stored: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("armed=false->true"),
+            "the tick that observed it: {}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains("armed=true->false"),
+            "and the tick that lost it again, with no EVENT between: {}",
+            lines[3]
+        );
+        // Tick numbers make "which iteration" answerable rather than inferred.
+        assert!(lines[3].contains("t4"), "{}", lines[3]);
+    }
+
+    /// Hypothesis (c): the action fires but nothing visible follows. Every
+    /// `DashAction` is logged, and each take/assign of the overlay slot is
+    /// recorded -- so an overlay opened and immediately closed again reads
+    /// differently from one that stayed open swallowing keys.
+    #[test]
+    fn the_keylog_records_every_action_and_overlay_swap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("keys.log");
+        let mut log = KeyLog {
+            file: std::fs::File::create(&path).expect("create"),
+            start: Instant::now(),
+            tick: 0,
+            last: None,
+        };
+
+        log.dispatch(true, false, &InputVerdict::Dash(DashAction::Mail));
+        log.overlay_swap("none", &ui::Overlay::Mail(ui::MailView::default()));
+        // The reducer closed it again on the very next key.
+        log.overlay_swap("mail", &ui::Overlay::None);
+        // A forwarded keystroke logs its length, never the operator's bytes.
+        log.dispatch(false, false, &InputVerdict::ToChild(b"secret".to_vec()));
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(lines[0].contains("verdict=Dash(Mail)"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("OVERLAY took=none now=mail"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("OVERLAY took=mail now=none"),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains("ToChild(6 bytes)"),
+            "a forwarded keystroke logs its length: {}",
+            lines[3]
+        );
+        assert!(
+            !text.contains("secret"),
+            "what the operator typed never lands in the log: {text}"
         );
     }
 

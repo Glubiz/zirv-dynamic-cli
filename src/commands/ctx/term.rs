@@ -972,8 +972,7 @@ mod tests {
     fn mouse_reporting_is_enabled_for_the_wheel_only_never_for_motion() {
         let on = dash_mouse_on_bytes();
         assert_eq!(
-            on,
-            b"\x1b[?1000h\x1b[?1006h",
+            on, b"\x1b[?1000h\x1b[?1006h",
             "button+wheel reporting with SGR coordinates, exactly"
         );
         for motion in [&b"\x1b[?1002h"[..], &b"\x1b[?1003h"[..]] {
