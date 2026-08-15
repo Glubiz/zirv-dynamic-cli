@@ -317,6 +317,19 @@ pub struct DashConfig {
     /// `Ctrl+A s` dialog -- so a pane child cannot fork-bomb its own
     /// dashboard into a machine full of harness processes.
     pub max_panes: usize,
+    /// Whether the dashboard captures the mouse, which is what makes the
+    /// wheel scroll a pane's scrollback.
+    ///
+    /// A toggle, and defaulted **on**, because it is a genuine trade rather
+    /// than a strict improvement: a terminal that is reporting mouse events to
+    /// the application no longer performs its own native click-drag text
+    /// selection, so an operator who wants to select and copy text has to hold
+    /// Shift to bypass the capture (the standard escape hatch every terminal
+    /// offers, and the same trade tmux's own `mouse on` makes). Some operators
+    /// live in the scrollback and some live in the selection; the wheel is the
+    /// more discoverable of the two, so it wins the default, and anyone who
+    /// disagrees sets `mouse = false` and still has `Ctrl+A PageUp`/`Home`.
+    pub mouse: bool,
 }
 
 impl Default for DashConfig {
@@ -326,6 +339,7 @@ impl Default for DashConfig {
             sidebar_cols: 24,
             roster_max_age_secs: 604_800,
             max_panes: 9,
+            mouse: true,
         }
     }
 }
@@ -578,6 +592,7 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["dash", "max_panes"],
         EnvKind::Int,
     ),
+    ("ZIRV_CTX_DASH_MOUSE", &["dash", "mouse"], EnvKind::Bool),
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
 ];
 
@@ -700,6 +715,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         "ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS",
     ),
     (&["dash", "max_panes"], "ZIRV_CTX_DASH_MAX_PANES"),
+    // Mouse capture takes over the terminal's own text selection, so which
+    // way that trade goes is the operator's call about their own terminal,
+    // not a checked-out repo's.
+    (&["dash", "mouse"], "ZIRV_CTX_DASH_MOUSE"),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -1517,6 +1536,10 @@ mod tests {
             cfg.dash.max_panes, 9,
             "the default cap matches Ctrl+A 1..9 addressing"
         );
+        assert!(
+            cfg.dash.mouse,
+            "the wheel scrolls a pane's scrollback out of the box"
+        );
     }
 
     #[test]
@@ -1526,6 +1549,7 @@ mod tests {
             ("sidebar_cols", "80"),
             ("roster_max_age_secs", "1"),
             ("max_panes", "999"),
+            ("mouse", "false"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -1566,12 +1590,17 @@ mod tests {
             ("ZIRV_CTX_DASH_SIDEBAR_COLS", "30"),
             ("ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS", "60"),
             ("ZIRV_CTX_DASH_MAX_PANES", "3"),
+            ("ZIRV_CTX_DASH_MOUSE", "false"),
         ]);
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.dash.enabled, "the environment is the operator");
         assert_eq!(cfg.dash.sidebar_cols, 30);
         assert_eq!(cfg.dash.roster_max_age_secs, 60);
         assert_eq!(cfg.dash.max_panes, 3);
+        assert!(
+            !cfg.dash.mouse,
+            "an operator who wants native text selection back turns capture off"
+        );
     }
 
     #[test]

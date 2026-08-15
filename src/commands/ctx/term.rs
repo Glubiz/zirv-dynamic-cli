@@ -54,8 +54,21 @@ const EMERGENCY_RESET: &[u8] = b"\x1b[r\x1b[?25h";
 
 /// What the dashboard owes the terminal on the way out, in the order a
 /// terminal wants it: show the cursor again (ratatui hides it on every frame
-/// it draws and `LeaveAlternateScreen` does **not** put it back), un-fence
-/// the scroll region, then leave the alternate screen.
+/// it draws and `LeaveAlternateScreen` does **not** put it back), turn off
+/// every mouse-reporting mode, un-fence the scroll region, then leave the
+/// alternate screen.
+///
+/// All four mouse modes -- `?1000` (button press/release), `?1002` (drag),
+/// `?1003` (any motion), `?1006` (SGR extended coordinates) -- are disabled
+/// unconditionally, and deliberately more than [`dash_mouse_on_bytes`] ever
+/// enables. Turning off a mode that was never on is a no-op, while *leaving*
+/// one on hands the operator a shell in which every click and every wheel
+/// notch spews escape sequences at the prompt. That is a badly broken
+/// terminal, and it is exactly the failure an external kill or a panic would
+/// otherwise produce, so it belongs in the shared constant rather than in the
+/// one clean exit path that could remember to undo it. Covering the two modes
+/// zirv does not turn on also means a future change to the enable set cannot
+/// silently outrun the cleanup.
 ///
 /// A fixed constant for the same reason `EMERGENCY_RESET` is one: this runs
 /// from a console-control/signal handler as well as from the ordinary
@@ -64,7 +77,7 @@ const EMERGENCY_RESET: &[u8] = b"\x1b[r\x1b[?25h";
 /// can never drift apart -- the pre-F4 hook wrote
 /// `emergency_reset_bytes(false)`, which is the *empty* slice, and no path at
 /// all ever showed the cursor again.
-const DASH_RESET: &[u8] = b"\x1b[?25h\x1b[r\x1b[?1049l";
+const DASH_RESET: &[u8] = b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\x1b[?1049l";
 
 /// Whether the chrome bar currently owns a reserved row, and therefore
 /// whether the handler owes the terminal a scroll-region reset. Set by `wrap`
@@ -86,11 +99,37 @@ pub fn dash_active() -> bool {
 }
 
 /// The bytes that put a terminal back after a dashboard session: cursor
-/// shown, scroll region reset, alternate screen left. Used by the dashboard's
-/// own teardown, its panic hook, and the external-kill handler alike.
+/// shown, mouse reporting off, scroll region reset, alternate screen left.
+/// Used by the dashboard's own teardown, its panic hook, and the
+/// external-kill handler alike.
 pub fn dash_reset_bytes() -> &'static [u8] {
     DASH_RESET
 }
+
+/// Mouse reporting, at exactly the level the dashboard's wheel-scrolling
+/// needs and no more: `?1000` (button press/release, which is what a wheel
+/// notch is reported as) plus `?1006` (SGR extended coordinates).
+///
+/// Deliberately **not** crossterm's `EnableMouseCapture`, and deliberately
+/// without `?1002`/`?1003`. Those are the motion-tracking modes, and a probe
+/// on a real Windows Terminal session confirmed what they cost: `?1003`
+/// reports *every* pointer movement, so simply sweeping the mouse across the
+/// window produced dozens of `MouseEventKind::Moved` events. Inside the
+/// dashboard's bounded per-tick input drain that flood competes directly with
+/// the operator's keystrokes, and it buys nothing -- the dashboard acts on
+/// `ScrollUp`/`ScrollDown` and discards every other mouse kind. Do not
+/// "simplify" this back to `EnableMouseCapture`.
+///
+/// `?1006` is not optional either: the default X10 encoding packs the column
+/// into a single byte and so cannot express a column past 223, and terminals
+/// are routinely wider than that.
+pub fn dash_mouse_on_bytes() -> &'static [u8] {
+    DASH_MOUSE_ON
+}
+
+/// See [`dash_mouse_on_bytes`]. A constant for the same allocation-free
+/// reason every other sequence in this module is one.
+const DASH_MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
 
 /// Installed exactly once, however many guards are entered.
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -894,6 +933,73 @@ mod tests {
             !reset.is_empty(),
             "the pre-F4 hook wrote an empty slice here"
         );
+    }
+
+    /// Mouse reporting (`dash.mouse`) is switched on with the dashboard, and a
+    /// terminal left reporting mouse events after the process is gone spews
+    /// escape sequences at the operator's shell prompt on every click and every
+    /// wheel notch. Disabling it therefore lives in the *shared* constant, so
+    /// the panic hook and the external-kill handler cover it without either
+    /// having to remember -- and so it is undone even on the paths that never
+    /// enabled it, where the disable is a harmless no-op.
+    ///
+    /// The reset deliberately covers more modes than the enable turns on, so a
+    /// later change to the enable set cannot outrun the cleanup.
+    #[test]
+    fn the_dash_reset_turns_every_mouse_reporting_mode_back_off() {
+        let reset = dash_reset_bytes();
+        for mode in [
+            &b"\x1b[?1000l"[..],
+            &b"\x1b[?1002l"[..],
+            &b"\x1b[?1003l"[..],
+            &b"\x1b[?1006l"[..],
+        ] {
+            assert!(
+                reset.windows(mode.len()).any(|w| w == mode),
+                "{} missing from the dash reset: {reset:?}",
+                String::from_utf8_lossy(mode)
+            );
+        }
+    }
+
+    /// The enable set is button+wheel reporting with SGR coordinates, and
+    /// nothing else. `?1002`/`?1003` are the motion-tracking modes: a probe on
+    /// a real Windows Terminal session showed `?1003` reporting every pointer
+    /// movement, which floods the dashboard's bounded per-tick input drain and
+    /// competes with the operator's own keystrokes for it. The dashboard only
+    /// ever acts on wheel events, so tracking motion buys nothing at all.
+    #[test]
+    fn mouse_reporting_is_enabled_for_the_wheel_only_never_for_motion() {
+        let on = dash_mouse_on_bytes();
+        assert_eq!(
+            on,
+            b"\x1b[?1000h\x1b[?1006h",
+            "button+wheel reporting with SGR coordinates, exactly"
+        );
+        for motion in [&b"\x1b[?1002h"[..], &b"\x1b[?1003h"[..]] {
+            assert!(
+                !on.windows(motion.len()).any(|w| w == motion),
+                "motion tracking must stay off: {}",
+                String::from_utf8_lossy(motion)
+            );
+        }
+        // SGR coordinates are not optional: the default X10 encoding cannot
+        // express a column past 223, and terminals are routinely wider.
+        assert!(on.windows(8).any(|w| w == b"\x1b[?1006h"));
+
+        // Every mode the enable turns on is turned back off by the shared
+        // reset -- the invariant that actually protects the operator's shell.
+        for (on_seq, off_seq) in [
+            (&b"\x1b[?1000h"[..], &b"\x1b[?1000l"[..]),
+            (&b"\x1b[?1006h"[..], &b"\x1b[?1006l"[..]),
+        ] {
+            assert!(on.windows(on_seq.len()).any(|w| w == on_seq));
+            assert!(
+                dash_reset_bytes()
+                    .windows(off_seq.len())
+                    .any(|w| w == off_seq)
+            );
+        }
     }
 
     #[test]

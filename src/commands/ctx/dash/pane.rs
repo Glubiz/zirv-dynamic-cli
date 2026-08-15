@@ -326,6 +326,41 @@ fn injection_bytes(label: &str, body: &str) -> Vec<u8> {
     bytes
 }
 
+/// How many rows of history one pane's `vt100::Parser` keeps once they scroll
+/// off the top of its screen -- what `Pane::scroll_by`/`scroll_page`/
+/// `scroll_to_top` move around in.
+///
+/// Was `0`, which is vt100's own "keep nothing" (`grid.rs` only pushes a
+/// retired row into the scrollback `if self.scrollback_len > 0`), so a pane's
+/// history was not merely unreachable, it was never recorded -- the reason
+/// `set_scrollback` alone would not have fixed anything.
+///
+/// 1000 is tmux's own order of magnitude (its `history-limit` default is
+/// 2000) and is bounded, deliberately: vt100 stores a row as a `Vec<Cell>` of
+/// 32-byte cells, so a full buffer costs `rows * cols * 32` -- about 6 MB per
+/// pane at 200 columns, and only after 1000 rows have actually scrolled off
+/// that pane. Nine of those (`dash.max_panes`) is the worst case, and the
+/// worst case is a dashboard that has been running long enough to have earned
+/// it.
+const SCROLLBACK_ROWS: usize = 1000;
+
+/// Pure: the scrollback offset `current` moves to under a scroll of `delta`
+/// rows -- positive back into history, negative toward the live view -- held
+/// inside `[0, max]`.
+///
+/// Both ends are real: `0` is the live bottom, past which "scroll down" is a
+/// no-op rather than an underflow (`current` is a `usize`), and `max` is
+/// however much history that pane has actually accumulated, past which
+/// "scroll up" stops instead of running off into blank rows. `isize`
+/// arithmetic throughout, so a wheel burst of many notches cannot wrap.
+pub(crate) fn scroll_offset(current: usize, delta: isize, max: usize) -> usize {
+    let want = (current as isize).saturating_add(delta);
+    if want <= 0 {
+        return 0;
+    }
+    (want as usize).min(max)
+}
+
 /// The most bytes one [`Pane::drain`] feeds the vt100 parser before it yields
 /// back to the event loop (M10). 256 KiB is many screens' worth of output --
 /// far more than a redraw ever shows -- so a normal burst still drains in one
@@ -526,7 +561,7 @@ impl Pane {
             agent_name,
             verb,
             session_id,
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
             master,
             child,
             writer,
@@ -568,9 +603,53 @@ impl Pane {
         more
     }
 
-    /// The current screen, for `dash::ui`'s renderers.
+    /// The current screen, for `dash::ui`'s renderers. Already reflects this
+    /// pane's scrollback offset: `vt100::Screen::cell` reads through
+    /// `Grid::visible_rows`, which splices in the scrolled-back rows, so
+    /// `ui::render_grid` draws the scrolled view with no change of its own.
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// How many rows back from the live view this pane is currently showing;
+    /// `0` is live. `ui::scroll_marker` turns it into the operator-facing
+    /// marker.
+    pub fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    /// Scrolls this pane by `delta` rows -- positive back into history,
+    /// negative toward the live view. Clamped at both ends: [`scroll_offset`]
+    /// holds the bottom at `0`, and `vt100::Screen::set_scrollback` clamps the
+    /// top to however much history this pane actually has (which is why `max`
+    /// is `usize::MAX` here -- vt100 owns that bound and is the only thing that
+    /// can see it).
+    pub fn scroll_by(&mut self, delta: isize) {
+        let want = scroll_offset(self.scrollback(), delta, usize::MAX);
+        self.parser.screen_mut().set_scrollback(want);
+    }
+
+    /// A half-screen of scrolling, the step `Ctrl+A PageUp`/`PageDown` moves.
+    /// Half rather than a full screen so the operator keeps a few lines of
+    /// overlap to read against, which is what `less`, tmux and every pager
+    /// converged on.
+    pub fn scroll_page(&mut self, up: bool) {
+        let (rows, _) = self.parser.screen().size();
+        let half = (rows as isize / 2).max(1);
+        self.scroll_by(if up { half } else { -half });
+    }
+
+    /// Jumps to the oldest row this pane still has (`Ctrl+A Home`).
+    /// `set_scrollback` clamps to the real length, so `usize::MAX` means "as
+    /// far back as there is".
+    pub fn scroll_to_top(&mut self) {
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+    }
+
+    /// Back to the live view (`Ctrl+A End`, and every keystroke the operator
+    /// sends the child -- see [`Pane::write_operator_input`]).
+    pub fn scroll_to_live(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
     }
 
     /// Forwards operator keystrokes into the child's pty and records that the
@@ -582,8 +661,18 @@ impl Pane {
     ///
     /// The flag is set before the write, not after: a write that failed part
     /// way through has still put bytes in front of the operator's cursor.
+    ///
+    /// Also snaps this pane back to the live view, the way tmux leaves copy
+    /// mode the moment you type: an operator typing into a pane whose viewport
+    /// is pinned 200 rows up would otherwise see nothing at all happen. This
+    /// is deliberately on the *operator input* seam rather than on
+    /// `write_input`, so an idle-gated `inject_visible` does not yank the view
+    /// out from under someone reading history -- and, for the same reason, new
+    /// output from the child does not either (vt100 keeps a non-zero offset
+    /// pinned to its row as rows retire past it).
     pub fn write_operator_input(&mut self, bytes: &[u8]) -> CtxResult<()> {
         self.user_typed_since_turn = true;
+        self.scroll_to_live();
         self.write_input(bytes)
     }
 
@@ -984,6 +1073,133 @@ pub(crate) mod tests {
     #[test]
     fn a_pending_injection_is_never_injectable_even_if_state_somehow_says_idle() {
         assert!(!injectable_from(PaneState::Idle, true, false));
+    }
+
+    /// The clamp/step arithmetic behind the wheel and `Ctrl+A PageUp`: neither
+    /// end may run away, and a `usize` offset must never underflow past the
+    /// live view.
+    #[test]
+    fn scroll_offset_clamps_at_the_live_view_and_at_the_end_of_history() {
+        assert_eq!(scroll_offset(0, 3, 100), 3, "a wheel notch scrolls back");
+        assert_eq!(scroll_offset(3, -3, 100), 0, "and back down again");
+        assert_eq!(
+            scroll_offset(0, -3, 100),
+            0,
+            "scrolling down at the live view is a no-op, not an underflow"
+        );
+        assert_eq!(
+            scroll_offset(98, 3, 100),
+            100,
+            "scrolling up stops at the end of the recorded history"
+        );
+        assert_eq!(
+            scroll_offset(100, 1, 100),
+            100,
+            "and stays there rather than running into blank rows"
+        );
+        assert_eq!(
+            scroll_offset(5, 0, 100),
+            5,
+            "a zero-row scroll changes nothing"
+        );
+        assert_eq!(
+            scroll_offset(0, 10, 0),
+            0,
+            "a pane with no history at all cannot be scrolled"
+        );
+    }
+
+    /// A burst of wheel notches (or a `usize::MAX` "jump to the top") must
+    /// saturate rather than wrap: the arithmetic runs in `isize`, and both
+    /// extremes are reachable from a real terminal.
+    #[test]
+    fn scroll_offset_saturates_instead_of_wrapping() {
+        assert_eq!(scroll_offset(0, isize::MAX, 100), 100);
+        assert_eq!(scroll_offset(100, isize::MIN, 100), 0);
+        assert_eq!(
+            scroll_offset(1000, isize::MAX, usize::MAX),
+            isize::MAX as usize,
+            "a jump to the top saturates; vt100's own clamp then cuts it to the real history"
+        );
+    }
+
+    /// End to end through the real parser, no child needed: rows that scroll
+    /// off the top are recorded, `scroll_by`/`scroll_to_top`/`scroll_to_live`
+    /// move the viewport over them, and the *rendered* screen follows -- which
+    /// is what lets `ui::render_grid` stay unchanged.
+    #[test]
+    fn a_parser_with_scrollback_shows_retired_rows_when_scrolled_back() {
+        let mut parser = vt100::Parser::new(3, 20, SCROLLBACK_ROWS);
+        for line in 0..10 {
+            parser.process(format!("line{line}\r\n").as_bytes());
+        }
+        assert_eq!(parser.screen().scrollback(), 0, "starts at the live view");
+
+        parser
+            .screen_mut()
+            .set_scrollback(scroll_offset(0, 3, 1000));
+        assert_eq!(parser.screen().scrollback(), 3);
+        assert_eq!(
+            last_line_of(parser.screen()),
+            "line7",
+            "three rows back, the bottom row is three lines earlier"
+        );
+
+        // Past the end of the recorded history: vt100 clamps rather than
+        // showing blanks, and reports the clamped value back.
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let top = parser.screen().scrollback();
+        assert!(
+            top > 0 && top < usize::MAX,
+            "clamped to real history: {top}"
+        );
+
+        parser.screen_mut().set_scrollback(0);
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert_eq!(last_line_of(parser.screen()), "line9", "back to live");
+    }
+
+    /// The regression that made scrollback unreachable in the first place: the
+    /// parser was built with a scrollback length of `0`, so vt100 discarded
+    /// every retired row instead of keeping it. With no recorded history there
+    /// is nothing for any amount of `set_scrollback` to show.
+    #[test]
+    fn a_parser_without_scrollback_records_no_history_at_all() {
+        let mut parser = vt100::Parser::new(3, 20, 0);
+        for line in 0..10 {
+            parser.process(format!("line{line}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(
+            parser.screen().scrollback(),
+            0,
+            "nothing was ever recorded, so the offset clamps straight back to live"
+        );
+    }
+
+    /// Return-to-live is the operator's own typing, and only that: output the
+    /// child produces while the operator is reading history must leave the
+    /// viewport where they put it (vt100 pins a non-zero offset to its row as
+    /// rows retire past it), and so must an idle-gated injection.
+    #[test]
+    fn new_output_does_not_yank_a_scrolled_back_view() {
+        let mut parser = vt100::Parser::new(3, 20, SCROLLBACK_ROWS);
+        for line in 0..10 {
+            parser.process(format!("line{line}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(3);
+        let pinned = last_line_of(parser.screen());
+
+        parser.process(b"fresh output\r\n");
+        assert_eq!(
+            last_line_of(parser.screen()),
+            pinned,
+            "the scrolled-back view stays on the same text as the child keeps printing"
+        );
+        assert!(
+            parser.screen().scrollback() > 3,
+            "the offset grew with the history so the view could stay put"
+        );
     }
 
     #[test]

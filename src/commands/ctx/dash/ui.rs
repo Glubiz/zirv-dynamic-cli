@@ -373,6 +373,53 @@ pub fn render_grid(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
     }
 }
 
+/// Pure: the marker a pane's title carries while its viewport is scrolled
+/// back, or `None` when it is live.
+///
+/// A scrolled-back pane looks exactly like a wedged one -- the child keeps
+/// producing output and the grid does not move -- so the operator needs to be
+/// told which of the two they are looking at. `-N` reads as "N rows behind
+/// live", the same sign convention tmux's own copy-mode indicator uses.
+pub fn scroll_marker(scrollback: usize) -> Option<String> {
+    if scrollback == 0 {
+        None
+    } else {
+        Some(format!("SCROLL -{scrollback}"))
+    }
+}
+
+/// Draws [`scroll_marker`] over the top-right corner of a pane's grid, in
+/// reverse video so it reads as chrome rather than as something the child
+/// printed. A no-op for a live pane.
+///
+/// Deliberately on the grid rather than in the header or the sidebar: `Ctrl+A
+/// z` hides both of those, and a zoomed pane is exactly the one an operator is
+/// most likely to be scrolling through. Clipped to `area`, so a grid too
+/// narrow to hold the marker simply does not get one.
+pub fn render_scroll_marker(f: &mut Frame, area: Rect, scrollback: usize) {
+    let Some(marker) = scroll_marker(scrollback) else {
+        return;
+    };
+    let width = marker.chars().count() as u16;
+    if area.is_empty() || area.width < width {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + area.width - width,
+        y: area.y,
+        width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(marker).style(
+            Style::default()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD),
+        ),
+        rect,
+    );
+}
+
 /// Pure: the absolute frame position of `screen`'s text cursor when it should
 /// be shown, given the `area` its grid was rendered into. `render_grid` draws
 /// cell `(row, col)` at `(area.x + col, area.y + row)` with no border of its
@@ -676,6 +723,62 @@ mod tests {
         // caret would land outside the drawn cells, so it is suppressed.
         visible.process(b"\r\n\r\n\r\nx");
         assert!(grid_cursor_position(Rect::new(0, 0, 40, 2), visible.screen()).is_none());
+    }
+
+    /// A live pane carries no marker at all; a scrolled-back one says how far
+    /// back it is, so "the grid is not updating" reads as a viewport the
+    /// operator moved rather than as a wedged child.
+    #[test]
+    fn the_scroll_marker_appears_only_while_a_pane_is_scrolled_back() {
+        assert_eq!(scroll_marker(0), None);
+        assert_eq!(scroll_marker(1).as_deref(), Some("SCROLL -1"));
+        assert_eq!(scroll_marker(42).as_deref(), Some("SCROLL -42"));
+        assert_eq!(scroll_marker(1000).as_deref(), Some("SCROLL -1000"));
+    }
+
+    #[test]
+    fn the_scroll_marker_renders_in_the_grids_top_right_corner() {
+        let area = Rect::new(0, 0, 40, 6);
+        let text = render_and_capture_text(area, |f, area| render_scroll_marker(f, area, 12));
+        assert!(
+            text.contains("SCROLL-12") || text.contains("SCROLL -12"),
+            "got {text}"
+        );
+        // Top row, flush right: the last cell of row 0 is the marker's last
+        // character, and nothing at all is drawn on any other row.
+        let backend = TestBackend::new(40, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_scroll_marker(f, area, 12)).unwrap();
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(39, 0)].symbol(), "2");
+        assert!(
+            (0..40).all(|x| buf[(x, 1)].symbol() == " "),
+            "the marker is one row tall"
+        );
+    }
+
+    /// Never draws outside its area, and never panics on the degenerate
+    /// geometries `layout` genuinely produces (a terminal narrowed to at most
+    /// the sidebar width leaves a zero-sized main rect).
+    #[test]
+    fn the_scroll_marker_is_skipped_when_there_is_no_room_for_it() {
+        let backend = TestBackend::new(20, 4);
+        let mut term = Terminal::new(backend).expect("terminal");
+        for area in [
+            Rect::new(0, 0, 0, 0),
+            Rect::new(0, 0, 20, 0),
+            Rect::new(0, 0, 0, 4),
+            Rect::new(0, 0, 5, 4),
+            Rect::new(0, 0, 1, 1),
+        ] {
+            term.draw(|f| render_scroll_marker(f, area, 12))
+                .expect("draw");
+        }
+        // A live pane draws nothing even with all the room in the world.
+        let text = render_and_capture_text(Rect::new(0, 0, 20, 2), |f, area| {
+            render_scroll_marker(f, area, 0)
+        });
+        assert!(text.trim().is_empty(), "got {text:?}");
     }
 
     #[test]
