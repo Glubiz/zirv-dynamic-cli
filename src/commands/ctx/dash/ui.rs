@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use super::super::mail::Message;
 use super::pane::PaneState;
@@ -479,6 +479,16 @@ fn render_dialog(f: &mut Frame, area: Rect, title: &str, lines: &[String]) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title.to_string());
+    // `Clear` first, or the dialog is transparent: a `Block` paints only its
+    // border and a `Paragraph` only the cells its text reaches, so every
+    // other cell inside `rect` keeps whatever the pane grid drew underneath.
+    // Over a live harness screen that renders as a bordered box with the
+    // child's output bleeding through it -- which is not merely ugly. An open
+    // overlay swallows every keystroke (`filter_key` is not even called while
+    // one is up), so a modal the operator cannot see is a dashboard that
+    // appears to have stopped responding to `Ctrl+A` entirely. That is
+    // exactly how this was reported from a real session.
+    f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines.join("\n")).block(block), rect);
 }
 
@@ -657,6 +667,47 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// A dialog must be opaque. `Block` paints only its border and
+    /// `Paragraph` only the cells its text reaches, so without a `Clear` the
+    /// pane grid underneath bleeds through every other cell -- and because an
+    /// open overlay swallows every keystroke before `filter_key` is reached, a
+    /// modal that reads as pane content is a dashboard that looks like it has
+    /// stopped responding to `Ctrl+A`. Reported from a real session; this
+    /// pins the fix by drawing a dialog over a screen full of `X`.
+    #[test]
+    fn a_dialog_is_opaque_and_never_lets_the_pane_bleed_through() {
+        let mut parser = vt100::Parser::new(8, 40, 0);
+        for _ in 0..8 {
+            parser.process(&[b'X'; 40]);
+        }
+        let backend = TestBackend::new(40, 8);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| {
+            let area = f.area();
+            render_grid(f, area, parser.screen());
+            render_dialog(f, area, "spawn", &["> prompt".to_string()]);
+        })
+        .expect("draw");
+
+        let buf = term.backend().buffer();
+        // The dialog is centred, so the row through its middle must contain
+        // its border and text but no surviving grid character.
+        let w = dialog_width(40);
+        let rect = centered(Rect::new(0, 0, 40, 8), w, 3);
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                assert_ne!(
+                    buf[(x, y)].symbol(),
+                    "X",
+                    "the pane grid bled through the dialog at ({x},{y})"
+                );
+            }
+        }
+        // Sanity: the grid is still painted outside the dialog, so the test
+        // would fail for the right reason rather than because nothing drew.
+        assert_eq!(buf[(0, 0)].symbol(), "X");
+    }
 
     #[test]
     fn grid_renders_vt100_cells_with_colours() {
