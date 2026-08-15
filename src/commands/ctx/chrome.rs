@@ -304,7 +304,11 @@ pub fn status_bar(state: &BarState, cols: u16, colour: bool) -> String {
 /// Keeps the leftmost `cols` characters (not bytes: a multi-byte placeholder
 /// character must not be split), dropping whatever would overflow on the
 /// right. Never produces more than `cols` characters.
-fn right_truncate(s: &str, cols: usize) -> String {
+///
+/// Shared with the dashboard's own renderers (`dash::ui`), which have exactly
+/// the same problem in a different frame: a header line and a sidebar row both
+/// have to degrade to whatever width they are given without splitting a glyph.
+pub(crate) fn right_truncate(s: &str, cols: usize) -> String {
     if s.chars().count() <= cols {
         return s.to_string();
     }

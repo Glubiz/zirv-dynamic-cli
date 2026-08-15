@@ -16,14 +16,14 @@ pub mod roster;
 pub mod spawnreq;
 pub mod ui;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -31,7 +31,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use super::CtxResult;
 use super::adapters;
@@ -39,9 +39,9 @@ use super::config::{CtxConfig, EnvLookup};
 use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
 use super::term;
-use super::{mail, memory, prompt, sessions, window};
+use super::{mail, memory, prompt, score, sessions, window};
 
-pub(crate) use pane::{Pane, PaneSpec, PaneState};
+pub(crate) use pane::{Pane, PaneSpec, PaneState, ScrollOutcome};
 
 /// The one dashboard prefix key, `Ctrl+A`. Not configurable in v1 (recorded
 /// as a deliberate spec deviation in the plan's self-review: YAGNI).
@@ -298,6 +298,12 @@ fn literal_prefix_bytes() -> Vec<u8> {
 
 /// How many rows one wheel notch scrolls a pane. Three is the near-universal
 /// terminal/pager default, and a wheel that moves a single row feels broken.
+///
+/// Applies to the dashboard's *own* scrollback only. When the event is
+/// forwarded to a child that asked for mouse reporting
+/// (`Pane::scroll_wheel`), one notch in is one notch out -- how many rows that
+/// moves is the child's decision to make, exactly as it would be in a real
+/// terminal.
 const WHEEL_STEP: isize = 3;
 
 /// Names an open overlay for the key diagnostic. Diagnostic-only: an overlay
@@ -336,12 +342,18 @@ const KEYLOG_ENV: &str = "ZIRV_CTX_DASH_KEYLOG";
 /// "something is swallowing keys before `filter_key` runs", and
 /// `panes`/`focused` for "the action fired but there was nothing to apply it
 /// to".
+///
+/// `focused_alt` was added for the scrolling report: a child that holds the
+/// alternate screen has no scrollback at all (see `pane::alt_scroll_bytes`),
+/// so "nothing scrolls" and "the harness entered full-screen mode" are the
+/// same fact and the log has to carry it without needing a scroll to happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LoopState {
     prefix_armed: bool,
     overlay: &'static str,
     panes: usize,
     focused: usize,
+    focused_alt: bool,
 }
 
 /// The append-only input log behind [`KEYLOG_ENV`].
@@ -448,11 +460,11 @@ impl KeyLog {
         self.last = Some(state);
         match previous {
             None => self.line(&format!(
-                "TICK armed={} overlay={} panes={} focused={} (first)",
-                state.prefix_armed, state.overlay, state.panes, state.focused
+                "TICK armed={} overlay={} panes={} focused={} alt_screen={} (first)",
+                state.prefix_armed, state.overlay, state.panes, state.focused, state.focused_alt
             )),
             Some(prev) => self.line(&format!(
-                "TICK armed={}->{} overlay={}->{} panes={}->{} focused={}->{}",
+                "TICK armed={}->{} overlay={}->{} panes={}->{} focused={}->{} alt_screen={}->{}",
                 prev.prefix_armed,
                 state.prefix_armed,
                 prev.overlay,
@@ -460,9 +472,40 @@ impl KeyLog {
                 prev.panes,
                 state.panes,
                 prev.focused,
-                state.focused
+                state.focused,
+                prev.focused_alt,
+                state.focused_alt
             )),
         }
+    }
+
+    /// One line per scroll request, whatever it did. The scrolling bug was
+    /// reported twice with nothing but "it does not scroll" to work from, so
+    /// this records every fact that separates the branches: whether the
+    /// focused pane was on the alternate screen (where vt100 keeps no
+    /// scrollback at all), whether its child had asked to be sent mouse events
+    /// (in which case the wheel is *its* event, not ours), the scrollback
+    /// offset either side of the request, and which branch was taken -- so a
+    /// capture showing `alt_screen=true mouse=true branch=forwarded-mouse`
+    /// settles it without another guess.
+    fn scroll(
+        &mut self,
+        action: &str,
+        alt_screen: bool,
+        wants_mouse: bool,
+        before: usize,
+        after: usize,
+        outcome: ScrollOutcome,
+    ) {
+        let branch = match outcome {
+            ScrollOutcome::ForwardedMouse => "forwarded-mouse",
+            ScrollOutcome::FullScreen => "none (alternate screen has no scrollback)",
+            _ => "scrollback",
+        };
+        self.line(&format!(
+            "SCROLL {action} alt_screen={alt_screen} mouse={wants_mouse} \
+             scrollback {before}->{after} branch={branch} outcome={outcome:?}"
+        ));
     }
 
     /// One line for one `event::read()`, whatever the event. A key press also
@@ -577,6 +620,7 @@ const VIEW_ONLY_GLYPH: char = '\u{00b7}';
 fn assemble_sidebar(
     panes: &[PaneRowMeta],
     registry: &[(sessions::Record, sessions::Liveness)],
+    scores: &ScoreMap,
     selected: usize,
     focused: usize,
 ) -> Vec<ui::SidebarRow> {
@@ -589,6 +633,7 @@ fn assemble_sidebar(
             title: p.title.clone(),
             short: p.short.clone(),
             preview: p.preview.clone(),
+            score: scores.get(&p.short).copied(),
             attached: true,
             selected: false,
             focused: false,
@@ -611,6 +656,7 @@ fn assemble_sidebar(
             title: format!("{} {}", record.verb.as_str(), record.agent),
             short: record.short.clone(),
             preview: String::new(),
+            score: scores.get(&record.short).copied(),
             attached: false,
             selected: false,
             focused: false,
@@ -629,10 +675,17 @@ fn assemble_sidebar(
 /// *combined* row list (panes plus view-only registry rows) and is what a
 /// nudge is aimed at; `focused` is the pane whose grid is drawn and whose
 /// child gets every un-prefixed keystroke, so it may only ever name a pane.
-/// `prefix,Up`/`prefix,Down` therefore move `selected` alone -- walking onto
-/// a view-only row leaves the focused pane exactly where it was, rather than
-/// blanking the grid and swallowing all input the way a single shared index
-/// did. `prefix,Tab` and `prefix,<digit>` address panes, so they move both.
+/// `prefix,Tab` and `prefix,<digit>` address panes, so they move both.
+///
+/// `prefix,Up`/`prefix,Down` move `selected` and then let `focused` **follow
+/// it onto any row that is a pane** (see [`follow_focus`]): arrow navigation
+/// that highlighted another session but could not switch to it was reported
+/// as a bug, and switching panes is what the arrows are for. Walking onto a
+/// view-only registry row still leaves the focused pane exactly where it was
+/// -- that session is not attached to this dashboard and cannot receive the
+/// keyboard -- rather than blanking the grid and swallowing all input the way
+/// a single shared index did. The sidebar dims those rows so the difference
+/// is visible (`ui::render_sidebar`).
 ///
 /// Every index stays clamped to something addressable: an empty dashboard
 /// (no panes at all) leaves both untouched.
@@ -664,15 +717,34 @@ fn apply_navigation(
                 (target, target)
             }
         }
-        DashAction::SelectUp => (selected.saturating_sub(1), focused),
+        DashAction::SelectUp => {
+            let next = selected.saturating_sub(1);
+            (next, follow_focus(next, focused, pane_count))
+        }
         DashAction::SelectDown => {
             if total_rows == 0 {
                 (selected, focused)
             } else {
-                ((selected + 1).min(total_rows - 1), focused)
+                let next = (selected + 1).min(total_rows - 1);
+                (next, follow_focus(next, focused, pane_count))
             }
         }
         _ => (selected, focused),
+    }
+}
+
+/// Pure: where `focused` ends up after the sidebar cursor moved to `selected`.
+///
+/// The combined sidebar puts this dashboard's own panes first and the
+/// view-only registry rows after them, so `selected < pane_count` is exactly
+/// "this row is an attached pane". A pane can take the keyboard, so focus
+/// follows the cursor onto it; a view-only row cannot, so focus stays put and
+/// the operator keeps typing into whatever pane they were already in.
+const fn follow_focus(selected: usize, focused: usize, pane_count: usize) -> usize {
+    if selected < pane_count {
+        selected
+    } else {
+        focused
     }
 }
 
@@ -693,7 +765,8 @@ fn usage_pct_u8(percent: Option<f64>) -> Option<u8> {
 fn assemble_header_facts(
     harness: String,
     score: Option<u32>,
-    usage_pct: Option<u8>,
+    account: ui::AccountFacts,
+    accounts: Vec<ui::AccountFacts>,
     mail: Option<(usize, usize)>,
     memory_count: usize,
     sessions: usize,
@@ -702,13 +775,102 @@ fn assemble_header_facts(
     ui::HeaderFacts {
         harness,
         score,
-        usage_pct,
+        account,
         mail_broadcast,
         mail_direct,
         memory_count,
         sessions,
+        accounts,
     }
 }
+
+/// The provider (account) an agent's own usage is billed against, from the
+/// adapter registry -- `"anthropic"` for claude, `"openai"` for codex. `None`
+/// for an agent name the registry does not carry, which a restored roster
+/// entry or a hand-written spawn request genuinely can produce.
+///
+/// Walks `adapters::ADAPTERS` rather than naming adapters here, so a new
+/// adapter's provider appears without an edit. Pure and allocation-cheap
+/// (each constructor only splits a program string), so unlike everything on
+/// `FactsCache` this is safe to call per frame.
+fn provider_for_agent(agent: &str) -> Option<&'static str> {
+    adapters::ADAPTERS
+        .iter()
+        .find(|(name, _)| *name == agent)
+        .map(|(_, ctor)| ctor(None).provider())
+}
+
+/// The focused pane's own account row: its provider, plus that provider's
+/// entry from the cached whole-machine summary.
+///
+/// Three distinct outcomes, all of which have to survive to the operator:
+/// an agent with no provider at all (`unknown`, no source), a provider the
+/// summary lists with no usage file (`no usage source`), and a provider with
+/// readings. None of them is ever rendered as `0%`.
+fn focused_account(agent: &str, accounts: &[ui::AccountFacts]) -> ui::AccountFacts {
+    let Some(provider) = provider_for_agent(agent) else {
+        return ui::AccountFacts {
+            provider: "unknown".to_string(),
+            usage: None,
+        };
+    };
+    let slug = super::state::provider_slug(provider);
+    accounts
+        .iter()
+        .find(|a| a.provider == slug)
+        .cloned()
+        .unwrap_or(ui::AccountFacts {
+            provider: slug,
+            usage: None,
+        })
+}
+
+/// One `window::UsageWindows` reduced to the whole percents the header
+/// renders. `None` in either field stays `None`: a window a real usage source
+/// does not report is unknown, not zero.
+fn account_windows(windows: &window::UsageWindows) -> ui::AccountWindows {
+    ui::AccountWindows {
+        five_hour: usage_pct_u8(windows.five_hour.as_ref().map(|w| w.used_percentage)),
+        seven_day: usage_pct_u8(windows.seven_day.as_ref().map(|w| w.used_percentage)),
+    }
+}
+
+/// Every provider the adapter registry knows about, each with its reading or
+/// with nothing -- `window::provider_summary`'s outer `Option` carried through
+/// unflattened, because "this provider has no usage source" and "this
+/// provider's source reports nothing" are different things to show.
+fn assemble_accounts(
+    summary: Vec<(String, Option<window::UsageWindows>)>,
+) -> Vec<ui::AccountFacts> {
+    summary
+        .into_iter()
+        .map(|(provider, windows)| ui::AccountFacts {
+            provider,
+            usage: windows.map(|w| account_windows(&w)),
+        })
+        .collect()
+}
+
+/// Pure: the header's harness segment.
+///
+/// `harness_label` is the dashboard's own launch identity -- the agent plus any
+/// `chat.model` disclosure, which is repo-settable on the strength of staying
+/// visible, so it never drops off. `focused_title` names the pane whose grid is
+/// actually on screen, appended only once focus has moved off the orchestrator:
+/// a single-pane dashboard would otherwise just repeat itself, and the score
+/// and usage beside it belong to whichever pane this names.
+fn harness_segment(harness_label: &str, focused: usize, focused_title: Option<&str>) -> String {
+    match focused_title {
+        Some(title) if focused > 0 => format!("{harness_label} \u{25b8} {title}"),
+        _ => harness_label.to_string(),
+    }
+}
+
+/// Cached rot scores, keyed by session short id. An **absent** key is the
+/// unknown case (`score::cached_score` returned `None`: no transcript yet, an
+/// unreadable one, an unresolvable agent), which the sidebar renders as
+/// `rot --`. Nothing here ever stores a placeholder zero.
+type ScoreMap = HashMap<String, u32>;
 
 /// How often the header's own disk-backed facts (mail, memory-bank size,
 /// usage) -- and the session registry the sidebar's view-only rows come
@@ -734,9 +896,29 @@ fn due(last: Instant, now: Instant, interval: Duration) -> bool {
 /// actual read.
 #[derive(Default)]
 struct DiskFacts {
-    usage_pct: Option<u8>,
+    /// Every provider the adapter registry knows about, whether or not any of
+    /// them has a usage file. A directory scan (`window::load_all`), so it
+    /// belongs here and not on the render path.
+    accounts: Vec<ui::AccountFacts>,
+    /// Rot scores for every row the sidebar can draw -- this dashboard's own
+    /// panes and every live registry session. `score::cached_score` is cheap
+    /// in the steady state but still costs one `metadata` call per session,
+    /// which is one per pane per frame if it is not cached here.
+    scores: ScoreMap,
     mail: Option<(usize, usize)>,
     memory_count: usize,
+}
+
+/// Who the dashboard is, for the reads that are scoped to it: the repo it
+/// runs in, its launch agent, and its own registry short id (D2 -- deliberately
+/// the dashboard's own identity, never `panes.first()`'s). Grouped rather than
+/// passed as three more parameters: all three are fixed for a session's whole
+/// life, and `refresh_if_due` already carries the ones that are not.
+#[derive(Clone, Copy)]
+struct FactsOwner<'a> {
+    repo: &'a Path,
+    agent_name: &'a str,
+    session_short: &'a str,
 }
 
 /// Caches every disk read the header and sidebar need -- usage, mail,
@@ -761,13 +943,15 @@ impl FactsCache {
         }
     }
 
+    /// Every disk read the header and sidebar need, at most once per
+    /// `FACTS_THROTTLE`. `panes` is only walked when a refresh is actually
+    /// due, so a throttled tick costs the `due` comparison and nothing else.
     fn refresh_if_due(
         &mut self,
         cfg: &CtxConfig,
         state: &StateDir,
-        repo: &Path,
-        agent_name: &str,
-        session_short: &str,
+        owner: FactsOwner<'_>,
+        panes: &[Pane],
         now: Instant,
     ) {
         if !due(self.last_refresh, now, FACTS_THROTTLE) {
@@ -775,13 +959,39 @@ impl FactsCache {
         }
         self.last_refresh = now;
 
-        let windows = window::load(state);
-        self.disk.usage_pct = usage_pct_u8(window::max_used_percentage(&windows));
+        let FactsOwner {
+            repo,
+            agent_name,
+            session_short,
+        } = owner;
+
+        self.disk.accounts = assemble_accounts(window::provider_summary(state));
         self.disk.mail =
             mail::unread_counts(state, repo, agent_name, session_short, cfg.mail.enabled);
         let slug = super::state::repo_slug(repo);
         self.disk.memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
         self.registry = sessions::list(state);
+
+        // Rebuilt rather than updated in place: a reaped pane or a released
+        // registry record must drop out of the map, not linger as a stale
+        // score attached to whatever short id lands there next. Every
+        // sidebar row is scored -- a view-only session's transcript is
+        // readable by short id and repo just like a pane's.
+        self.disk.scores.clear();
+        for pane in panes {
+            if let Some(score) = score::cached_score(state, repo, pane.session_id()) {
+                self.disk.scores.insert(pane.short().to_string(), score);
+            }
+        }
+        for (record, liveness) in &self.registry {
+            if *liveness != sessions::Liveness::Live || self.disk.scores.contains_key(&record.short)
+            {
+                continue;
+            }
+            if let Some(score) = score::cached_score(state, &record.repo, &record.session) {
+                self.disk.scores.insert(record.short.clone(), score);
+            }
+        }
     }
 }
 
@@ -1057,6 +1267,66 @@ fn push_notice(notices: &mut Vec<Notice>, now: Instant, text: String) {
         let drop = notices.len() - MAX_KEPT_ERRORS;
         notices.drain(0..drop);
     }
+}
+
+/// Pure: what the header says about a scroll that just happened.
+///
+/// Every scroll gets one, including the ones that moved nothing: total silence
+/// on a scroll that did not scroll is precisely how "the chat window is still
+/// not scrollable" was reported twice with nothing to go on. A notice expires
+/// on its own after [`NOTICE_TTL`], so this is the transient channel and never
+/// the sticky `⚠` error line -- a scroll that stops at the top of the history
+/// is not a failure.
+fn scroll_notice(outcome: ScrollOutcome) -> String {
+    match outcome {
+        ScrollOutcome::Scrolled(0) => "back to the live view".to_string(),
+        ScrollOutcome::Scrolled(rows) => format!("scrolled back {rows} line(s)"),
+        ScrollOutcome::AtOldest => "already at the oldest line".to_string(),
+        ScrollOutcome::AtLive => "already at the live view".to_string(),
+        ScrollOutcome::ForwardedMouse => {
+            "pane is in full-screen mode -- scrolling is forwarded to the app".to_string()
+        }
+        ScrollOutcome::FullScreen => {
+            "pane is in full-screen mode -- the app scrolls itself (wheel, or unprefixed PageUp)"
+                .to_string()
+        }
+    }
+}
+
+/// Pure: crossterm's button enum as the xterm protocol's own button number.
+/// Left/middle/right are 0/1/2 in every encoding, the same numbering the wheel
+/// extends with 64/65.
+const fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+/// Pure: a frame-relative mouse position translated into the pane-local,
+/// 1-based coordinates a child's own mouse reports are written in.
+///
+/// The child believes it owns a terminal whose top-left is its own, so a frame
+/// coordinate handed straight through would make it act on the wrong row --
+/// worse than not scrolling at all, and `area.x` is genuinely non-zero
+/// whenever the sidebar is drawn. Clamped into the pane as well as translated:
+/// the wheel scrolls the focused pane wherever the pointer happens to be
+/// (including over the sidebar), so a position outside the grid still has to
+/// encode to something inside it.
+fn pane_local_mouse(area: Rect, column: u16, row: u16) -> (u16, u16) {
+    if area.is_empty() {
+        return (1, 1);
+    }
+    let col = column
+        .saturating_sub(area.x)
+        .min(area.width.saturating_sub(1))
+        + 1;
+    let row = row
+        .saturating_sub(area.y)
+        .min(area.height.saturating_sub(1))
+        + 1;
+    (col, row)
 }
 
 /// Pure: the most recent notice still live as of `now`, if any. The header
@@ -2907,6 +3177,7 @@ pub fn run_dashboard(
                 overlay: overlay_name(&overlay),
                 panes: panes.len(),
                 focused,
+                focused_alt: panes.get(focused).is_some_and(Pane::alternate_screen),
             });
         }
         for pane in panes.iter_mut() {
@@ -3014,9 +3285,12 @@ pub fn run_dashboard(
         facts_cache.refresh_if_due(
             cfg,
             state,
-            repo,
-            &agent_name,
-            &dashboard_short,
+            FactsOwner {
+                repo,
+                agent_name: &agent_name,
+                session_short: &dashboard_short,
+            },
+            &panes,
             Instant::now(),
         );
         // L19: drop any recently-reaped short the registry snapshot no longer
@@ -3041,6 +3315,7 @@ pub fn run_dashboard(
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
             &visible_registry,
+            &facts_cache.disk.scores,
             selected,
             focused,
         );
@@ -3368,14 +3643,32 @@ pub fn run_dashboard(
                                         | DashAction::ScrollLive),
                                     ) => {
                                         if let Some(pane) = panes.get_mut(focused) {
-                                            match action {
-                                                DashAction::ScrollPageUp => pane.scroll_page(true),
-                                                DashAction::ScrollPageDown => {
-                                                    pane.scroll_page(false)
+                                            let alt = pane.alternate_screen();
+                                            let mouse = pane.wants_mouse();
+                                            let before = pane.scrollback();
+                                            let (name, outcome) = match action {
+                                                DashAction::ScrollPageUp => {
+                                                    ("page-up", pane.scroll_page(true))
                                                 }
-                                                DashAction::ScrollTop => pane.scroll_to_top(),
-                                                _ => pane.scroll_to_live(),
+                                                DashAction::ScrollPageDown => {
+                                                    ("page-down", pane.scroll_page(false))
+                                                }
+                                                DashAction::ScrollTop => {
+                                                    ("top", pane.scroll_to_top())
+                                                }
+                                                _ => ("live", pane.scroll_to_live()),
+                                            };
+                                            let after = pane.scrollback();
+                                            if let Some(log) = keylog.as_mut() {
+                                                log.scroll(
+                                                    name, alt, mouse, before, after, outcome,
+                                                );
                                             }
+                                            push_notice(
+                                                &mut notices,
+                                                Instant::now(),
+                                                scroll_notice(outcome),
+                                            );
                                         }
                                     }
                                     InputVerdict::Dash(DashAction::Zoom) => {
@@ -3512,7 +3805,60 @@ pub fn run_dashboard(
                             if delta != 0
                                 && let Some(pane) = panes.get_mut(focused)
                             {
-                                pane.scroll_by(delta);
+                                let alt = pane.alternate_screen();
+                                let wants_mouse = pane.wants_mouse();
+                                let before = pane.scrollback();
+                                // Pane-local and 1-based: the child believes
+                                // its own top-left is the terminal's, and the
+                                // sidebar means `main.x` is genuinely not 0.
+                                let main = effective_main(full, sidebar_cols, zoomed);
+                                let (col, row) = pane_local_mouse(main, mouse.column, mouse.row);
+                                match pane.scroll_wheel(delta, col, row) {
+                                    Ok(outcome) => {
+                                        let after = pane.scrollback();
+                                        if let Some(log) = keylog.as_mut() {
+                                            log.scroll(
+                                                "wheel",
+                                                alt,
+                                                wants_mouse,
+                                                before,
+                                                after,
+                                                outcome,
+                                            );
+                                        }
+                                        push_notice(
+                                            &mut notices,
+                                            Instant::now(),
+                                            scroll_notice(outcome),
+                                        );
+                                    }
+                                    Err(e) => push_error(&mut errors, format!("scroll: {e}")),
+                                }
+                            }
+                            // A click, for a child that asked for mouse
+                            // events -- unlike the wheel, only when the
+                            // pointer is genuinely over that child's grid:
+                            // a click on the sidebar is aimed at the sidebar,
+                            // and a button press is a position, not a
+                            // direction. Dropped entirely for a child that
+                            // never turned mouse reporting on.
+                            let button = match mouse.kind {
+                                MouseEventKind::Down(b) => Some((mouse_button_code(b), true)),
+                                MouseEventKind::Up(b) => Some((mouse_button_code(b), false)),
+                                _ => None,
+                            };
+                            if let Some((code, press)) = button {
+                                let main = effective_main(full, sidebar_cols, zoomed);
+                                if main.contains(Position::new(mouse.column, mouse.row))
+                                    && let Some(pane) = panes.get_mut(focused)
+                                {
+                                    let (col, row) =
+                                        pane_local_mouse(main, mouse.column, mouse.row);
+                                    if let Err(e) = pane.forward_mouse_button(code, press, col, row)
+                                    {
+                                        push_error(&mut errors, format!("mouse: {e}"));
+                                    }
+                                }
                             }
                         }
                         Ok(_) => input_errors = 0,
@@ -3599,6 +3945,7 @@ pub fn run_dashboard(
         let rows = assemble_sidebar(
             &build_pane_rows(&panes),
             &visible_registry,
+            &facts_cache.disk.scores,
             selected,
             focused,
         );
@@ -3607,17 +3954,28 @@ pub fn run_dashboard(
         // while fresh; once it expires the sticky error line (⚠) shows through
         // again. Only genuine failures reach `errors` now -- informational
         // confirmations go to `notices`.
+        let focused_pane = panes.get(focused);
+        let label = harness_segment(
+            &harness_label,
+            focused,
+            focused_pane.map(|pane| pane.title()),
+        );
         let harness = if let Some(note) = live_notice(&notices, Instant::now()) {
-            format!("{harness_label}  {note}")
+            format!("{label}  {note}")
         } else if let Some(last) = errors.last() {
-            format!("{harness_label}  \u{26a0} {last}")
+            format!("{label}  \u{26a0} {last}")
         } else {
-            harness_label.clone()
+            label
         };
+        // The focused pane's own rot score and its own provider's usage, both
+        // read out of the throttled cache rather than off disk: this runs on
+        // every frame.
+        let focused_agent = focused_pane.map_or(agent_name.as_str(), |pane| pane.agent());
         let facts = assemble_header_facts(
             harness,
-            None,
-            facts_cache.disk.usage_pct,
+            focused_pane.and_then(|pane| facts_cache.disk.scores.get(pane.short()).copied()),
+            focused_account(focused_agent, &facts_cache.disk.accounts),
+            facts_cache.disk.accounts.clone(),
             facts_cache.disk.mail,
             facts_cache.disk.memory_count,
             rows.len(),
@@ -4068,6 +4426,7 @@ mod tests {
             overlay: "none",
             panes: 1,
             focused: 0,
+            focused_alt: false,
         };
 
         // Tick 1: nothing armed. Tick 2: identical, so it writes nothing.
@@ -4153,6 +4512,140 @@ mod tests {
         );
     }
 
+    /// Every scroll says what it did. Silence on a scroll that moved nothing
+    /// is what left two rounds of "it does not scroll" with nothing to go on,
+    /// and the full-screen case has to name itself: it is the one where the
+    /// pane genuinely has no scrollback to move.
+    #[test]
+    fn every_scroll_outcome_has_something_to_say_for_itself() {
+        assert_eq!(
+            scroll_notice(ScrollOutcome::Scrolled(12)),
+            "scrolled back 12 line(s)"
+        );
+        assert_eq!(
+            scroll_notice(ScrollOutcome::Scrolled(0)),
+            "back to the live view"
+        );
+        assert_eq!(
+            scroll_notice(ScrollOutcome::AtOldest),
+            "already at the oldest line"
+        );
+        assert_eq!(
+            scroll_notice(ScrollOutcome::AtLive),
+            "already at the live view"
+        );
+        for full_screen in [ScrollOutcome::ForwardedMouse, ScrollOutcome::FullScreen] {
+            assert!(
+                scroll_notice(full_screen).contains("full-screen mode"),
+                "{full_screen:?} must name the mode it is in: {}",
+                scroll_notice(full_screen)
+            );
+        }
+        assert!(
+            scroll_notice(ScrollOutcome::ForwardedMouse).contains("forwarded to the app"),
+            "a forwarded scroll says where it went"
+        );
+    }
+
+    /// A forwarded wheel event has to arrive in the child's own coordinate
+    /// space: pane-local and 1-based. An untranslated frame coordinate makes
+    /// the child act on the wrong row, which is worse than not scrolling --
+    /// and with the sidebar drawn the pane's origin is genuinely not `(0, 0)`.
+    #[test]
+    fn a_forwarded_wheel_lands_in_the_childs_own_coordinate_space() {
+        // The real geometry: an 80x24 frame, two header rows (`ui::header_rows`
+        // affords the accounts line at this height), a 24-column sidebar and
+        // its separator -- so the pane starts at column 25, row 2.
+        let main = ui::layout(Rect::new(0, 0, 80, 24), 24).2;
+        assert_eq!((main.x, main.y), (25, 2), "sanity: the pane is inset");
+
+        assert_eq!(
+            pane_local_mouse(main, 25, 2),
+            (1, 1),
+            "the pane's own top-left cell is its (1, 1), not the frame's"
+        );
+        assert_eq!(pane_local_mouse(main, 31, 6), (7, 5));
+        // Bottom-right corner of the pane, and nothing past it.
+        assert_eq!(
+            pane_local_mouse(main, main.x + main.width - 1, main.y + main.height - 1),
+            (main.width, main.height)
+        );
+        assert_eq!(
+            pane_local_mouse(main, 500, 500),
+            (main.width, main.height),
+            "a position past the pane clamps into it rather than wrapping"
+        );
+        // The pointer over the sidebar still encodes to somewhere inside the
+        // pane: the wheel scrolls the focused pane wherever it is pointing.
+        assert_eq!(pane_local_mouse(main, 0, 0), (1, 1));
+        // Degenerate rects a narrowed terminal really produces.
+        assert_eq!(pane_local_mouse(Rect::new(24, 1, 0, 0), 30, 5), (1, 1));
+        assert_eq!(pane_local_mouse(Rect::new(0, 0, 1, 1), 9, 9), (1, 1));
+    }
+
+    /// The dashboard enables `?1000h`+`?1006h` and no motion mode
+    /// (`term::dash_mouse_on_bytes`), so the only button events that can reach
+    /// a child are presses and releases -- and they carry the protocol's own
+    /// button numbers, which the wheel's 64/65 extend.
+    #[test]
+    fn mouse_buttons_use_the_protocols_own_numbering() {
+        assert_eq!(mouse_button_code(MouseButton::Left), 0);
+        assert_eq!(mouse_button_code(MouseButton::Middle), 1);
+        assert_eq!(mouse_button_code(MouseButton::Right), 2);
+    }
+
+    /// One `ZIRV_CTX_DASH_KEYLOG` capture has to settle "why did nothing
+    /// scroll" without another guess: the alternate-screen flag, the offset
+    /// either side, and the branch taken.
+    #[test]
+    fn the_keylog_records_which_branch_each_scroll_took() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("keys.log");
+        let mut log = KeyLog {
+            file: std::fs::File::create(&path).expect("create"),
+            start: Instant::now(),
+            tick: 0,
+            last: None,
+        };
+
+        log.scroll("wheel", false, false, 0, 3, ScrollOutcome::Scrolled(3));
+        log.scroll("wheel", true, true, 0, 0, ScrollOutcome::ForwardedMouse);
+        log.scroll("top", true, false, 0, 0, ScrollOutcome::FullScreen);
+        // And the per-tick state line carries the flag even with no scroll.
+        log.tick(LoopState {
+            prefix_armed: false,
+            overlay: "none",
+            panes: 1,
+            focused: 0,
+            focused_alt: true,
+        });
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(
+            lines[0].contains(
+                "SCROLL wheel alt_screen=false mouse=false scrollback 0->3 branch=scrollback"
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("alt_screen=true")
+                && lines[1].contains("mouse=true")
+                && lines[1].contains("scrollback 0->0")
+                && lines[1].contains("branch=forwarded-mouse"),
+            "the whole diagnosis on one line: {}",
+            lines[1]
+        );
+        assert!(lines[2].contains("outcome=FullScreen"), "{}", lines[2]);
+        assert!(
+            lines[3].contains("alt_screen=true"),
+            "the tick line carries the focused pane's mode too: {}",
+            lines[3]
+        );
+    }
+
     #[test]
     fn effective_main_returns_the_full_area_when_zoomed() {
         let area = Rect::new(0, 0, 100, 30);
@@ -4210,6 +4703,44 @@ mod tests {
         assert_eq!(apply_navigation(DashAction::Switch(2), 0, 0, 3, 5), (2, 2));
     }
 
+    /// The reported bug: `Ctrl+A Up`/`Down` highlighted the other session but
+    /// could not switch to it, so `Ctrl+A Tab` was the only way to change
+    /// panes. An arrow that lands on a pane row now moves the keyboard there
+    /// too -- the F7 split stays, it just no longer strands the arrows.
+    #[test]
+    fn arrow_navigation_switches_panes_when_it_lands_on_one() {
+        // Three panes, five combined rows (two view-only sessions).
+        assert_eq!(
+            apply_navigation(DashAction::SelectDown, 0, 0, 3, 5),
+            (1, 1),
+            "down onto pane 1 moves the keyboard onto pane 1"
+        );
+        assert_eq!(apply_navigation(DashAction::SelectDown, 1, 1, 3, 5), (2, 2));
+        assert_eq!(
+            apply_navigation(DashAction::SelectUp, 2, 2, 3, 5),
+            (1, 1),
+            "and back up again"
+        );
+        // Onto the first view-only row: the cursor moves, the keyboard does
+        // not -- that session is not attached to this dashboard.
+        assert_eq!(
+            apply_navigation(DashAction::SelectDown, 2, 2, 3, 5),
+            (3, 2),
+            "a view-only row cannot take the keyboard"
+        );
+        assert_eq!(apply_navigation(DashAction::SelectDown, 3, 2, 3, 5), (4, 2));
+        // Walking back out of the view-only rows re-focuses the pane the
+        // cursor lands on, which is the whole point of the fix.
+        assert_eq!(apply_navigation(DashAction::SelectUp, 4, 2, 3, 5), (3, 2));
+        assert_eq!(
+            apply_navigation(DashAction::SelectUp, 3, 2, 3, 5),
+            (2, 2),
+            "back onto a pane row, so focus follows again"
+        );
+        // Focus follows even when it was somewhere else entirely.
+        assert_eq!(apply_navigation(DashAction::SelectUp, 1, 2, 3, 5), (0, 0));
+    }
+
     #[test]
     fn focus_stays_on_a_pane_when_selection_walks_into_view_only_rows() {
         // One pane, three combined rows: rows 1 and 2 are view-only
@@ -4245,7 +4776,7 @@ mod tests {
             sessions::Liveness::Live,
         )];
         // Selection has walked onto the view-only row; focus is still pane 1.
-        let rows = assemble_sidebar(&panes, &registry, 2, 1);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 2, 1);
         assert!(
             rows[2].selected,
             "the sidebar cursor is on the view-only row"
@@ -4278,6 +4809,20 @@ mod tests {
         }
     }
 
+    /// No session has been scored yet -- every row is unknown, which is what a
+    /// dashboard's very first frame genuinely looks like.
+    fn no_scores() -> ScoreMap {
+        ScoreMap::new()
+    }
+
+    fn owner(repo: &Path) -> FactsOwner<'_> {
+        FactsOwner {
+            repo,
+            agent_name: "claude",
+            session_short: "sess0000",
+        }
+    }
+
     fn registry_record(short: &str, agent: &str) -> sessions::Record {
         sessions::Record {
             session: format!("session-{short}"),
@@ -4298,7 +4843,7 @@ mod tests {
             pane_row("aaa11111", "orch"),
             pane_row("bbb22222", "wrk claude"),
         ];
-        let rows = assemble_sidebar(&panes, &[], 0, 0);
+        let rows = assemble_sidebar(&panes, &[], &no_scores(), 0, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short, "aaa11111");
         assert!(rows[0].attached);
@@ -4313,7 +4858,7 @@ mod tests {
             registry_record("ccc33333", "codex"),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 0, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].short, "ccc33333");
         assert!(!rows[1].attached, "a registry-only row is never attached");
@@ -4326,7 +4871,7 @@ mod tests {
             registry_record("aaa11111", "claude"),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 0, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0);
         assert_eq!(
             rows.len(),
             1,
@@ -4341,7 +4886,7 @@ mod tests {
             registry_record("ddd44444", "codex"),
             sessions::Liveness::Stale,
         )];
-        let rows = assemble_sidebar(&[], &registry, 0, 0);
+        let rows = assemble_sidebar(&[], &registry, &no_scores(), 0, 0);
         assert!(
             rows.is_empty(),
             "a dead session must not appear as a view-only row"
@@ -4355,27 +4900,132 @@ mod tests {
             registry_record("ccc33333", "codex"),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, 1, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 1, 0);
         assert!(!rows[0].selected);
         assert!(rows[1].selected);
     }
 
+    fn anthropic_account() -> ui::AccountFacts {
+        ui::AccountFacts {
+            provider: "anthropic".to_string(),
+            usage: Some(ui::AccountWindows {
+                five_hour: Some(42),
+                seven_day: Some(13),
+            }),
+        }
+    }
+
     #[test]
     fn assemble_header_facts_omits_mail_when_none() {
-        let facts = assemble_header_facts("claude".to_string(), None, Some(42), None, 3, 5);
+        let facts = assemble_header_facts(
+            "claude".to_string(),
+            None,
+            anthropic_account(),
+            vec![anthropic_account()],
+            None,
+            3,
+            5,
+        );
         assert_eq!(facts.mail_broadcast, 0);
         assert_eq!(facts.mail_direct, 0);
-        assert_eq!(facts.usage_pct, Some(42));
+        assert_eq!(facts.account.usage.unwrap().five_hour, Some(42));
+        assert_eq!(facts.accounts.len(), 1);
         assert_eq!(facts.memory_count, 3);
         assert_eq!(facts.sessions, 5);
     }
 
     #[test]
     fn assemble_header_facts_carries_the_broadcast_direct_split_through() {
-        let facts = assemble_header_facts("claude".to_string(), Some(12), None, Some((2, 1)), 0, 1);
+        let facts = assemble_header_facts(
+            "claude".to_string(),
+            Some(12),
+            ui::AccountFacts::default(),
+            Vec::new(),
+            Some((2, 1)),
+            0,
+            1,
+        );
         assert_eq!(facts.mail_broadcast, 2);
         assert_eq!(facts.mail_direct, 1);
         assert_eq!(facts.score, Some(12));
+    }
+
+    /// The registry's own provider slugs, not a list written out here: a new
+    /// adapter's account has to appear in the header without an edit.
+    #[test]
+    fn an_agents_provider_comes_from_the_adapter_registry() {
+        assert_eq!(provider_for_agent("claude"), Some("anthropic"));
+        assert_eq!(provider_for_agent("codex"), Some("openai"));
+        assert_eq!(provider_for_agent("not-an-agent"), None);
+        assert_eq!(provider_for_agent(""), None);
+    }
+
+    /// Three outcomes the operator has to be able to tell apart, none of which
+    /// may render as a fresh, empty `0%` quota.
+    #[test]
+    fn the_focused_account_is_honest_about_a_provider_it_has_no_source_for() {
+        let accounts = vec![
+            anthropic_account(),
+            ui::AccountFacts {
+                provider: "openai".to_string(),
+                usage: None,
+            },
+        ];
+
+        let claude = focused_account("claude", &accounts);
+        assert_eq!(claude.provider, "anthropic");
+        assert_eq!(ui::usage_text(claude.usage.as_ref()), "5h 42% 7d 13%");
+
+        let codex = focused_account("codex", &accounts);
+        assert_eq!(codex.provider, "openai");
+        assert_eq!(ui::usage_text(codex.usage.as_ref()), "no usage source");
+
+        // A provider the registry knows but the summary did not list, and an
+        // agent the registry does not know at all: both say "no source",
+        // never "0%".
+        let missing = focused_account("codex", &[anthropic_account()]);
+        assert_eq!(missing.provider, "openai");
+        assert!(missing.usage.is_none());
+        let stranger = focused_account("not-an-agent", &accounts);
+        assert_eq!(stranger.provider, "unknown");
+        assert!(stranger.usage.is_none());
+    }
+
+    /// `window::provider_summary`'s outer `Option` is the "no usage source"
+    /// signal and must not be flattened away; the inner ones are unknown
+    /// windows of a source that does exist.
+    #[test]
+    fn assemble_accounts_keeps_no_source_distinct_from_an_unknown_window() {
+        let accounts = assemble_accounts(vec![
+            (
+                "anthropic".to_string(),
+                Some(window::UsageWindows {
+                    five_hour: Some(window::Window {
+                        used_percentage: 41.6,
+                        resets_at: 0,
+                        observed_at: 0,
+                    }),
+                    seven_day: None,
+                }),
+            ),
+            ("openai".to_string(), None),
+        ]);
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(ui::account_text(&accounts[0]), "anthropic 5h 42% 7d --");
+        assert_eq!(ui::account_text(&accounts[1]), "openai no usage source");
+    }
+
+    /// The harness segment names the pane the score and usage beside it belong
+    /// to, without ever dropping the repo-settable `chat.model` disclosure.
+    #[test]
+    fn the_harness_segment_names_the_focused_pane_once_focus_leaves_pane_zero() {
+        assert_eq!(harness_segment("claude", 0, Some("orch")), "claude");
+        assert_eq!(harness_segment("claude", 0, None), "claude");
+        assert_eq!(harness_segment("claude", 2, None), "claude");
+        assert_eq!(
+            harness_segment("claude (a-model)", 1, Some("wrk codex")),
+            "claude (a-model) \u{25b8} wrk codex"
+        );
     }
 
     #[test]
@@ -4396,7 +5046,7 @@ mod tests {
         let now = Instant::now();
 
         let mut cache = FactsCache::new(now);
-        cache.refresh_if_due(&cfg, &state, &repo, "claude", "sess0000", now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
         assert_eq!(
             cache.disk.mail,
             Some((0, 0)),
@@ -4421,7 +5071,7 @@ mod tests {
         )
         .expect("store");
 
-        cache.refresh_if_due(&cfg, &state, &repo, "claude", "sess0000", now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
         assert_eq!(
             cache.disk.mail,
             Some((0, 0)),
@@ -4429,11 +5079,76 @@ mod tests {
         );
 
         let later = now + FACTS_THROTTLE;
-        cache.refresh_if_due(&cfg, &state, &repo, "claude", "sess0000", later);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later);
         assert_eq!(
             cache.disk.mail,
             Some((1, 0)),
             "once the throttle elapses, the disk-backed facts refresh"
+        );
+    }
+
+    /// The provider summary and the rot scores are the two new disk-backed
+    /// reads, and both are rebuilt every ~20fps frame if they are not folded
+    /// into this cache. An earlier round of this dashboard shipped exactly
+    /// that regression, so the throttle is pinned here rather than assumed: a
+    /// usage file written *after* a refresh must stay invisible until the
+    /// window elapses.
+    #[test]
+    fn the_provider_summary_and_scores_are_read_on_the_facts_throttle_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let now = Instant::now();
+
+        let mut cache = FactsCache::new(now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+        // Every registered provider is listed even with nothing on disk, and
+        // each says so rather than reporting a zeroed reading.
+        assert_eq!(
+            cache.disk.accounts.len(),
+            super::super::adapters::providers().len(),
+            "every registry provider is named: {:?}",
+            cache.disk.accounts
+        );
+        assert!(
+            cache.disk.accounts.iter().all(|a| a.usage.is_none()),
+            "an empty state dir has no usage source for anyone: {:?}",
+            cache.disk.accounts
+        );
+        assert!(cache.disk.scores.is_empty());
+
+        window::store(
+            &state,
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 42.0,
+                    resets_at: 0,
+                    observed_at: 1,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store usage");
+
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+        assert!(
+            cache.disk.accounts.iter().all(|a| a.usage.is_none()),
+            "within the throttle window nothing re-reads the provider files"
+        );
+
+        let later = now + FACTS_THROTTLE;
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later);
+        let anthropic = cache
+            .disk
+            .accounts
+            .iter()
+            .find(|a| a.provider == "anthropic")
+            .expect("anthropic is a registered provider");
+        assert_eq!(
+            ui::account_text(anthropic),
+            "anthropic 5h 42% 7d --",
+            "the legacy global usage file is anthropic's source until it has its own"
         );
     }
 
@@ -7018,7 +7733,8 @@ mod tests {
         let mut term_rows = 24u16;
         let mut full = Rect::new(0, 0, 80, 24);
         let mut errors = Vec::new();
-        // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height = 40 - 1.
+        // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height = 40 - 2
+        // (a 40-row terminal affords `ui::header_rows`' accounts line).
         apply_terminal_resize(
             100,
             40,
@@ -7035,7 +7751,7 @@ mod tests {
         // vt100 `size()` returns (rows, cols).
         assert_eq!(
             panes[0].screen().size(),
-            (39, 79),
+            (38, 79),
             "the pane's screen was resized to the new inner geometry"
         );
 

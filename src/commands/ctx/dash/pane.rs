@@ -361,6 +361,112 @@ pub(crate) fn scroll_offset(current: usize, delta: isize, max: usize) -> usize {
     (want as usize).min(max)
 }
 
+/// What one scroll request actually did to a pane, so the dashboard can say so
+/// instead of leaving the operator with a viewport that did not move and no
+/// explanation (the reported failure mode: "the chat window is still not
+/// scrollable").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollOutcome {
+    /// Branch (A): the vt100 scrollback offset moved, and is now this many
+    /// rows back from the live view.
+    Scrolled(usize),
+    /// Branch (A): asked to go further back, but this pane has no more
+    /// recorded history.
+    AtOldest,
+    /// Branch (A): asked to come forward, but the pane is already live.
+    AtLive,
+    /// Branch (B): the child turned mouse reporting on, so the wheel event was
+    /// encoded in the protocol it asked for and handed to it. The child scrolls
+    /// itself; the dashboard's own scrollback is not involved.
+    ForwardedMouse,
+    /// Branch (C): the child is on the alternate screen and did *not* ask for
+    /// mouse events. There is no history to show and nobody to hand the event
+    /// to, so the only honest thing to do is say so.
+    FullScreen,
+}
+
+/// Wheel-up's button number in the xterm mouse protocol; wheel-down is the
+/// next one. The wheel is reported as buttons 64/65 (the 0b0100_0000 bit is
+/// what marks a button number as a wheel event) in every encoding.
+const MOUSE_WHEEL_UP: u8 = 64;
+const MOUSE_WHEEL_DOWN: u8 = 65;
+
+/// The largest coordinate the default (X10) encoding can express: it packs
+/// `32 + coordinate` into one byte, so 223 is the end of the line. `?1006`
+/// (SGR) exists precisely because terminals are routinely wider than that,
+/// and it is what the dashboard asks its own terminal for
+/// (`term::dash_mouse_on_bytes`) -- but a *child* picks its own encoding, so
+/// the classic form still has to be encodable.
+const MOUSE_X10_MAX: u16 = 223;
+
+/// Pure: one mouse event encoded the way `encoding` says the child wants it.
+///
+/// `col`/`row` are **pane-local and 1-based** -- the child believes it owns a
+/// terminal that starts at its own top-left, so a frame coordinate handed
+/// straight through would make it act on the wrong row, which is worse than
+/// not scrolling at all. `dash::pane_local_mouse` does the translation.
+///
+/// `press` picks SGR's final byte (`M` for a press, `m` for a release); wheel
+/// events are always presses, in every encoding. The classic encodings cannot
+/// say *which* button was released, so a release there is the protocol's
+/// "some button came up" code (3) rather than the button's own number.
+pub(crate) fn mouse_report_bytes(
+    encoding: vt100::MouseProtocolEncoding,
+    button: u8,
+    col: u16,
+    row: u16,
+    press: bool,
+) -> Vec<u8> {
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            let final_byte = if press { 'M' } else { 'm' };
+            format!("\x1b[<{button};{col};{row}{final_byte}").into_bytes()
+        }
+        // The classic `ESC [ M` form, and its UTF-8 variant (`?1005`), which
+        // differ only in how a coordinate past 95 is written: one raw byte
+        // versus that code point encoded as UTF-8. Both offset by 32, and
+        // both clamp rather than wrapping a coordinate they cannot express.
+        encoding => {
+            let mut out = b"\x1b[M".to_vec();
+            let utf8 = matches!(encoding, vt100::MouseProtocolEncoding::Utf8);
+            let button = if press { button } else { 3 };
+            for value in [u16::from(button), col, row] {
+                let value = value.min(MOUSE_X10_MAX) + 32;
+                if utf8 {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(
+                        char::from_u32(u32::from(value))
+                            .unwrap_or(' ')
+                            .encode_utf8(&mut buf)
+                            .as_bytes(),
+                    );
+                } else {
+                    out.push(value as u8);
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Branch (A), against a parser rather than a whole pane: moves `parser`'s
+/// scrollback offset by `delta` rows and reports what happened. Split out so
+/// the clamped ends -- and the alternate screen's total absence of scrollback
+/// -- are testable without a pty child.
+fn scroll_parser(parser: &mut vt100::Parser, delta: isize) -> ScrollOutcome {
+    let before = parser.screen().scrollback();
+    let want = scroll_offset(before, delta, usize::MAX);
+    parser.screen_mut().set_scrollback(want);
+    let after = parser.screen().scrollback();
+    if after != before {
+        ScrollOutcome::Scrolled(after)
+    } else if delta > 0 {
+        ScrollOutcome::AtOldest
+    } else {
+        ScrollOutcome::AtLive
+    }
+}
+
 /// The most bytes one [`Pane::drain`] feeds the vt100 parser before it yields
 /// back to the event loop (M10). 256 KiB is many screens' worth of output --
 /// far more than a redraw ever shows -- so a normal burst still drains in one
@@ -618,38 +724,167 @@ impl Pane {
         self.parser.screen().scrollback()
     }
 
-    /// Scrolls this pane by `delta` rows -- positive back into history,
-    /// negative toward the live view. Clamped at both ends: [`scroll_offset`]
-    /// holds the bottom at `0`, and `vt100::Screen::set_scrollback` clamps the
-    /// top to however much history this pane actually has (which is why `max`
-    /// is `usize::MAX` here -- vt100 owns that bound and is the only thing that
-    /// can see it).
-    pub fn scroll_by(&mut self, delta: isize) {
-        let want = scroll_offset(self.scrollback(), delta, usize::MAX);
-        self.parser.screen_mut().set_scrollback(want);
+    /// Whether this pane's child currently holds the alternate screen
+    /// (`\x1b[?1049h`), and whether it has asked to be sent mouse events --
+    /// the two facts every scroll below branches on, stamped on each keylog
+    /// scroll line so one capture explains a scroll that appeared to do
+    /// nothing.
+    pub fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
+    /// Whether the child turned on any xterm mouse-reporting mode
+    /// (`vt100::Screen::mouse_protocol_mode`). A real harness does: a probe of
+    /// this machine's `claude.exe` startup, and the recorded
+    /// `tests/fixtures/claude-session.raw`, both show `?1000h ?1002h ?1003h
+    /// ?1006h` -- it is a full-screen TUI that scrolls itself and wants the
+    /// events to do it with.
+    pub fn wants_mouse(&self) -> bool {
+        !matches!(
+            self.parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        )
+    }
+
+    /// The wheel, on this pane. `delta` is positive for a scroll back into
+    /// history; `col`/`row` are pane-local 1-based coordinates
+    /// (`dash::pane_local_mouse`).
+    ///
+    /// Three branches, decided per pane at scroll time and in this order:
+    ///
+    /// * **(B) the child asked for mouse events.** It gets the wheel event,
+    ///   encoded in the protocol it selected, and scrolls itself. The
+    ///   dashboard's own scrollback is not touched -- it is structurally
+    ///   always empty for such a child anyway (see below), so consuming the
+    ///   wheel for it was the whole bug: the dashboard swallowed the event on
+    ///   behalf of a buffer that could never fill, instead of passing it to
+    ///   the child that had asked for it.
+    /// * **(C) no mouse reporting, but the child is on the alternate screen.**
+    ///   vt100 hard-codes the alternate grid's scrollback to zero
+    ///   (`vt100-0.16.2/src/screen.rs:76`, `Grid::new(size, 0)`) and
+    ///   `set_scrollback` clamps to `self.scrollback.len()` on whichever grid
+    ///   is drawing, so nothing can move there no matter how large
+    ///   [`SCROLLBACK_ROWS`] is. Nothing to show and nobody to hand the event
+    ///   to: say so rather than failing silently.
+    /// * **(A) the normal screen.** The vt100 scrollback offset moves, which
+    ///   is correct and genuinely useful for a child that is not a full-screen
+    ///   TUI. Clamped at both ends: [`scroll_offset`] holds the bottom at `0`,
+    ///   and `set_scrollback` clamps the top to however much history this pane
+    ///   actually has (which is why `max` is `usize::MAX` here -- vt100 owns
+    ///   that bound and is the only thing that can see it).
+    ///
+    /// Branch (B) writes through [`Pane::write_input`], deliberately **not**
+    /// `write_operator_input`: a forwarded wheel event is navigation, not
+    /// prompt composition, and `write_operator_input` would additionally mark
+    /// the pane as "the operator has typed since the last turn boundary" (F1),
+    /// keeping it out of reach of the idle-gated injectors for as long as
+    /// somebody keeps scrolling.
+    pub fn scroll_wheel(&mut self, delta: isize, col: u16, row: u16) -> CtxResult<ScrollOutcome> {
+        if self.wants_mouse() {
+            let button = if delta > 0 {
+                MOUSE_WHEEL_UP
+            } else {
+                MOUSE_WHEEL_DOWN
+            };
+            let bytes = mouse_report_bytes(
+                self.parser.screen().mouse_protocol_encoding(),
+                button,
+                col,
+                row,
+                true,
+            );
+            self.write_input(&bytes)?;
+            return Ok(ScrollOutcome::ForwardedMouse);
+        }
+        Ok(self.scroll_by(delta))
+    }
+
+    /// A mouse *button* press or release, on the same terms as the wheel: the
+    /// child gets it only if it asked for mouse reporting, in its own
+    /// encoding and its own coordinates. Returns whether it was forwarded, so
+    /// a click over a child that never asked is dropped rather than typed at
+    /// it.
+    ///
+    /// The dashboard enables `?1000h` + `?1006h` at its own terminal and
+    /// deliberately not the motion modes (`term::dash_mouse_on_bytes`), so
+    /// what can arrive here -- and therefore what a child can be sent -- is
+    /// the wheel and button presses/releases, never hover or drag.
+    pub fn forward_mouse_button(
+        &mut self,
+        button: u8,
+        press: bool,
+        col: u16,
+        row: u16,
+    ) -> CtxResult<bool> {
+        if !self.wants_mouse() {
+            return Ok(false);
+        }
+        let bytes = mouse_report_bytes(
+            self.parser.screen().mouse_protocol_encoding(),
+            button,
+            col,
+            row,
+            press,
+        );
+        self.write_input(&bytes)?;
+        Ok(true)
+    }
+
+    /// The keyboard scroll bindings' half of the same decision: the vt100
+    /// scrollback offset when there is one, and [`ScrollOutcome::FullScreen`]
+    /// when the child owns the screen. No mouse event is synthesised here --
+    /// `Ctrl+A PageUp` is not a wheel notch, and an *unprefixed* `PageUp`
+    /// already reaches the child as itself, which is how a full-screen TUI is
+    /// meant to be paged.
+    pub fn scroll_by(&mut self, delta: isize) -> ScrollOutcome {
+        if self.alternate_screen() {
+            return ScrollOutcome::FullScreen;
+        }
+        scroll_parser(&mut self.parser, delta)
     }
 
     /// A half-screen of scrolling, the step `Ctrl+A PageUp`/`PageDown` moves.
     /// Half rather than a full screen so the operator keeps a few lines of
     /// overlap to read against, which is what `less`, tmux and every pager
     /// converged on.
-    pub fn scroll_page(&mut self, up: bool) {
+    pub fn scroll_page(&mut self, up: bool) -> ScrollOutcome {
         let (rows, _) = self.parser.screen().size();
         let half = (rows as isize / 2).max(1);
-        self.scroll_by(if up { half } else { -half });
+        self.scroll_by(if up { half } else { -half })
     }
 
     /// Jumps to the oldest row this pane still has (`Ctrl+A Home`).
     /// `set_scrollback` clamps to the real length, so `usize::MAX` means "as
-    /// far back as there is".
-    pub fn scroll_to_top(&mut self) {
+    /// far back as there is". A full-screen child has no history to jump into,
+    /// so it reports [`ScrollOutcome::FullScreen`] rather than pretending to
+    /// have moved.
+    pub fn scroll_to_top(&mut self) -> ScrollOutcome {
+        if self.alternate_screen() {
+            return ScrollOutcome::FullScreen;
+        }
+        let before = self.scrollback();
         self.parser.screen_mut().set_scrollback(usize::MAX);
+        let after = self.scrollback();
+        if after != before {
+            ScrollOutcome::Scrolled(after)
+        } else {
+            ScrollOutcome::AtOldest
+        }
     }
 
     /// Back to the live view (`Ctrl+A End`, and every keystroke the operator
     /// sends the child -- see [`Pane::write_operator_input`]).
-    pub fn scroll_to_live(&mut self) {
+    pub fn scroll_to_live(&mut self) -> ScrollOutcome {
+        if self.alternate_screen() {
+            return ScrollOutcome::FullScreen;
+        }
+        let before = self.scrollback();
         self.parser.screen_mut().set_scrollback(0);
+        if before == 0 {
+            ScrollOutcome::AtLive
+        } else {
+            ScrollOutcome::Scrolled(0)
+        }
     }
 
     /// Forwards operator keystrokes into the child's pty and records that the
@@ -1174,6 +1409,267 @@ pub(crate) mod tests {
             parser.screen().scrollback(),
             0,
             "nothing was ever recorded, so the offset clamps straight back to live"
+        );
+    }
+
+    /// The root cause of the second scrolling report, pinned against the real
+    /// vt100: the alternate screen has **no scrollback at all**. vt100 builds
+    /// the alternate grid with `Grid::new(size, 0)` and `set_scrollback` acts
+    /// on whichever grid is drawing, so while a full-screen TUI child holds
+    /// `\x1b[?1049h` every scroll request clamps straight back to `0` -- no
+    /// value of `SCROLLBACK_ROWS` can change that, which is why branch (B)
+    /// forwards arrows instead of moving an offset that cannot move.
+    #[test]
+    fn the_alternate_screen_has_no_scrollback_for_any_offset_to_move_in() {
+        let mut parser = vt100::Parser::new(3, 20, SCROLLBACK_ROWS);
+        for line in 0..10 {
+            parser.process(format!("line{line}\r\n").as_bytes());
+        }
+        assert!(!parser.screen().alternate_screen());
+        assert!(
+            matches!(scroll_parser(&mut parser, 3), ScrollOutcome::Scrolled(3)),
+            "sanity: the normal screen scrolls"
+        );
+        parser.screen_mut().set_scrollback(0);
+
+        // The harness enters full-screen mode.
+        parser.process(b"\x1b[?1049h");
+        assert!(parser.screen().alternate_screen());
+        for line in 0..10 {
+            parser.process(format!("alt{line}\r\n").as_bytes());
+        }
+        assert_eq!(
+            scroll_parser(&mut parser, 3),
+            ScrollOutcome::AtOldest,
+            "nothing was recorded and nothing can move: this is the whole bug"
+        );
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    /// The same fact against a **real recorded claude session** rather than a
+    /// hand-written escape sequence, since two rounds of this bug have already
+    /// been fixed against the wrong mechanism.
+    /// `tests/fixtures/claude-session.raw` is a gitignored capture of a real
+    /// interactive session (present on the machine that recorded it, absent in
+    /// CI -- skipped there, like `ui`'s own fixture test): claude sends
+    /// `\x1b[?1049h` about six kilobytes in and never leaves for the remaining
+    /// ~550 KB, so for essentially the whole session the pane is on the
+    /// alternate screen, where vt100 records no history at all. That is why
+    /// the previous fix -- raising the parser's scrollback length -- changed
+    /// nothing the operator could see.
+    #[test]
+    fn a_real_claude_session_spends_itself_on_the_alternate_screen() {
+        let path = std::path::Path::new("tests/fixtures/claude-session.raw");
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!(
+                "skipping a_real_claude_session_spends_itself_on_the_alternate_screen: {} not present",
+                path.display()
+            );
+            return;
+        };
+
+        let mut parser = vt100::Parser::new(40, 120, SCROLLBACK_ROWS);
+        parser.process(&bytes);
+        assert!(
+            parser.screen().alternate_screen(),
+            "a real claude session ends on the alternate screen"
+        );
+        assert_eq!(
+            scroll_parser(&mut parser, 3),
+            ScrollOutcome::AtOldest,
+            "and there is no scrollback there for any offset to move in -- \
+             which is the whole of the reported bug"
+        );
+        // And it is not merely full-screen: it asked to be sent mouse events
+        // (`?1000h ?1002h ?1003h ?1006h` are all in the capture), in the SGR
+        // encoding. So the wheel is *its* event -- the dashboard consuming it
+        // for a buffer that can never fill is the bug, and branch (B) hands it
+        // over instead.
+        assert_ne!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "a real claude session turns mouse reporting on"
+        );
+        assert_eq!(
+            parser.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr,
+            "and selects SGR coordinates (?1006h)"
+        );
+    }
+
+    /// Branch (A)'s reported outcomes, both ends included -- "already at the
+    /// oldest line" and "already at the live view" are what the header says
+    /// instead of the silence that got this reported twice.
+    #[test]
+    fn scroll_parser_reports_movement_and_both_clamped_ends() {
+        let mut parser = vt100::Parser::new(3, 20, SCROLLBACK_ROWS);
+        assert_eq!(
+            scroll_parser(&mut parser, 3),
+            ScrollOutcome::AtOldest,
+            "a pane with no history yet cannot scroll back"
+        );
+        assert_eq!(scroll_parser(&mut parser, -3), ScrollOutcome::AtLive);
+
+        for line in 0..10 {
+            parser.process(format!("line{line}\r\n").as_bytes());
+        }
+        assert_eq!(scroll_parser(&mut parser, 3), ScrollOutcome::Scrolled(3));
+        assert_eq!(scroll_parser(&mut parser, -1), ScrollOutcome::Scrolled(2));
+        assert_eq!(scroll_parser(&mut parser, -5), ScrollOutcome::Scrolled(0));
+        assert_eq!(scroll_parser(&mut parser, -5), ScrollOutcome::AtLive);
+        // Past the oldest recorded row: vt100 clamps, and the second attempt
+        // has genuinely nowhere left to go.
+        assert!(matches!(
+            scroll_parser(&mut parser, 10_000),
+            ScrollOutcome::Scrolled(_)
+        ));
+        assert_eq!(scroll_parser(&mut parser, 10_000), ScrollOutcome::AtOldest);
+    }
+
+    /// Branch (B)'s bytes, in both encodings a child can select. Getting these
+    /// wrong makes the child act on the wrong row (or read them as typed
+    /// input), which is worse than not scrolling, so the exact sequences are
+    /// pinned.
+    #[test]
+    fn a_forwarded_wheel_encodes_the_way_the_child_asked_for() {
+        // SGR (`?1006h`), which is what a real claude session selects: wheel
+        // up is button 64, wheel down 65, and a wheel event is a press (`M`).
+        assert_eq!(
+            mouse_report_bytes(
+                vt100::MouseProtocolEncoding::Sgr,
+                MOUSE_WHEEL_UP,
+                7,
+                3,
+                true
+            ),
+            b"\x1b[<64;7;3M".to_vec()
+        );
+        assert_eq!(
+            mouse_report_bytes(
+                vt100::MouseProtocolEncoding::Sgr,
+                MOUSE_WHEEL_DOWN,
+                7,
+                3,
+                true
+            ),
+            b"\x1b[<65;7;3M".to_vec()
+        );
+        // A release only differs in the final byte -- SGR is the encoding that
+        // can still say *which* button came up.
+        assert_eq!(
+            mouse_report_bytes(vt100::MouseProtocolEncoding::Sgr, 0, 1, 1, false),
+            b"\x1b[<0;1;1m".to_vec()
+        );
+        assert_eq!(
+            mouse_report_bytes(vt100::MouseProtocolEncoding::Sgr, 2, 4, 9, true),
+            b"\x1b[<2;4;9M".to_vec()
+        );
+        // The classic form cannot, so a release there is the protocol's
+        // "some button came up" code (3), whichever button it was.
+        assert_eq!(
+            mouse_report_bytes(vt100::MouseProtocolEncoding::Default, 2, 1, 1, false),
+            vec![0x1b, b'[', b'M', 3 + 32, 33, 33]
+        );
+        // SGR is not limited to a byte, which is the whole reason it exists.
+        assert_eq!(
+            mouse_report_bytes(
+                vt100::MouseProtocolEncoding::Sgr,
+                MOUSE_WHEEL_UP,
+                400,
+                90,
+                true
+            ),
+            b"\x1b[<64;400;90M".to_vec()
+        );
+
+        // The classic X10 form: `ESC [ M` then three bytes, each offset by 32.
+        assert_eq!(
+            mouse_report_bytes(
+                vt100::MouseProtocolEncoding::Default,
+                MOUSE_WHEEL_UP,
+                7,
+                3,
+                true
+            ),
+            vec![0x1b, b'[', b'M', 64 + 32, 7 + 32, 3 + 32]
+        );
+        assert_eq!(
+            mouse_report_bytes(
+                vt100::MouseProtocolEncoding::Default,
+                MOUSE_WHEEL_DOWN,
+                1,
+                1,
+                true
+            ),
+            vec![0x1b, b'[', b'M', 65 + 32, 33, 33]
+        );
+        // A coordinate the single byte cannot express clamps instead of
+        // wrapping round to the top-left corner.
+        assert_eq!(
+            mouse_report_bytes(
+                vt100::MouseProtocolEncoding::Default,
+                MOUSE_WHEEL_UP,
+                400,
+                3,
+                true
+            ),
+            vec![0x1b, b'[', b'M', 96, (MOUSE_X10_MAX + 32) as u8, 35]
+        );
+        // The UTF-8 variant writes the same numbers as code points.
+        assert_eq!(
+            mouse_report_bytes(
+                vt100::MouseProtocolEncoding::Utf8,
+                MOUSE_WHEEL_UP,
+                200,
+                3,
+                true
+            ),
+            {
+                let mut want = b"\x1b[M".to_vec();
+                want.push(96);
+                want.extend_from_slice("\u{e8}".as_bytes());
+                want.push(35);
+                want
+            }
+        );
+    }
+
+    /// The encoding is the child's own, read off the parser rather than
+    /// assumed: `?1006h` selects SGR, `?1006l` puts it back, and a harness
+    /// that never asks for mouse reporting at all must not be sent events.
+    #[test]
+    fn the_mouse_protocol_is_read_from_the_child_not_assumed() {
+        let mut parser = vt100::Parser::new(3, 20, SCROLLBACK_ROWS);
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "a child that has asked for nothing gets nothing"
+        );
+        assert_eq!(
+            parser.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Default
+        );
+
+        // `?1000h` is VT200 press/release tracking in vt100's own mapping
+        // (`?9h` is the X10 press-only mode).
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::PressRelease
+        );
+        assert_eq!(
+            parser.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        );
+
+        parser.process(b"\x1b[?1006l\x1b[?1000l");
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        assert_eq!(
+            parser.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Default
         );
     }
 
