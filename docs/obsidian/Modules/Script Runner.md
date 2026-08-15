@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-15
 ---
 
 # Script Runner
@@ -55,7 +55,7 @@ The result is a flat `HashMap<String, String>` that every step's `${var}` substi
 
 `AgentCommand { agent, prompt, flags, description, options, capture }` runs a *supervised* AI-agent task in-process, through the exact same entry point `zirv ctx exec` uses — pacing against usage windows, rot detection, and restart-with-handoff. `capture` and `options.interactive` are declared only so misusing them produces a named error instead of being silently ignored; both are rejected by `validate()`, which also rejects an empty prompt, an unknown `agent` name, and any `flags` entry that doesn't start with `-` (a bare leading word would be read as the launched program). Validation runs at parse time (inside `CommandTypes::from_value`), not at execution time, so `--dry-run` rejects exactly what a real run would.
 
-`execute` substitutes the prompt, then calls `invoke`, which moves everything onto a blocking thread via `tokio::task::spawn_blocking` — `run_supervised` (and the exec supervisor it calls) spawns child processes and sleeps synchronously, so it must not run on the async executor. `run_supervised` loads `CtxConfig`, selects the adapter (surfacing an unready adapter's own error, e.g. codex, before any supervision starts), builds an `ExecArgs` with the prompt carried as *data* (not encoded into argv, so a prompt shaped like a flag can't be misread as one), and calls `ctx::exec::run_with` directly. A non-zero exit is decoded by `ctx::exec::describe_exit` (defined in `exec.rs` itself, not here, alongside `EXIT_ROT_EXHAUSTED`/`EXIT_TIMEOUT`; `zirv ctx agent` (`agent.rs`) shares the same function for the same reason): the supervisor's own two exit codes read as "the session kept rotting" / "hit its wall-clock timeout" rather than a generic agent failure.
+`execute` substitutes the prompt, then calls `invoke`, which moves everything onto a blocking thread via `tokio::task::spawn_blocking` — `run_supervised` (and the exec supervisor it calls) spawns child processes and sleeps synchronously, so it must not run on the async executor. `run_supervised` loads `CtxConfig`, selects the adapter (surfacing an unready or disabled adapter's own error before any supervision starts), builds an `ExecArgs` with the prompt carried as *data* (not encoded into argv, so a prompt shaped like a flag can't be misread as one), and calls `ctx::exec::run_with` directly. A non-zero exit is decoded by `ctx::exec::describe_exit` (defined in `exec.rs` itself, not here, alongside `EXIT_ROT_EXHAUSTED`/`EXIT_TIMEOUT`; `zirv ctx agent` (`agent.rs`) shares the same function for the same reason): the supervisor's own two exit codes read as "the session kept rotting" / "hit its wall-clock timeout" rather than a generic agent failure.
 
 ```mermaid
 flowchart LR

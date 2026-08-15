@@ -455,18 +455,77 @@ mod tests {
         assert!(msg.contains("disabled"), "got {msg}");
     }
 
+    /// Codex is a supported delegation target now that its own `ready()`
+    /// only checks that its program resolves (`CodexAdapter::ready`, mirrors
+    /// `ClaudeAdapter::ready`), so a disabled-by-settings codex is refused
+    /// for the gate reason, not "not implemented yet" -- the same shape as
+    /// `the_delegation_verb_refuses_an_agent_the_settings_file_disabled`
+    /// above, with the disabled name swapped.
     #[test]
-    fn the_delegation_verb_refuses_an_agent_that_is_not_ready_yet() {
+    fn the_delegation_verb_refuses_an_agent_the_settings_file_disabled_for_codex() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/.settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
 
         let env = base_env(&tmp.path().join("state"));
         let args = args_for("codex", "go");
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
-            .expect_err("codex is not implemented yet");
-        assert!(err.to_string().contains("not implemented yet"));
+            .expect_err("codex is disabled");
+        let msg = err.to_string();
+        assert!(msg.contains("codex"), "got {msg}");
+        assert!(msg.contains("disabled"), "got {msg}");
+    }
+
+    /// H4: distinct from the gate-disabled tests above -- an *enabled* named
+    /// agent whose own `ready()` fails must still have that error propagate
+    /// all the way out of `agent::run_with`. Not reachable with `ZIRV_CTX_
+    /// AGENT_BIN` (an explicit path is never a `ready()` failure -- only a
+    /// bare name resolved via `PATH` to an unlaunchable extension is, see
+    /// `adapters::mod::tests::an_unlaunchable_program_on_path_is_named_
+    /// rather_than_left_to_error_193`), so this deliberately omits `ZIRV_
+    /// CTX_AGENT_BIN` and rigs `PATH`/`PATHEXT` instead, the same seam
+    /// `readiness_note_and_the_fallback_skip_both_stay_covered_when_an_
+    /// adapter_is_genuinely_unready` uses.
+    #[cfg(windows)]
+    #[test]
+    fn the_delegation_verb_propagates_a_genuine_ready_failure() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("claude.py"), "print('x')\n").expect("write");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "PATH",
+                Some(format!("{};{}", dir.path().display(), path).as_str()),
+            ),
+            ("PATHEXT", Some(".EXE;.CMD;.PY")),
+        ]);
+
+        let env: HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+        let args = args_for("claude", "go");
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("claude's own ready() must fail under this rig");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "got {msg}");
+        assert!(
+            !msg.to_lowercase().contains("disabled"),
+            "a ready() failure is not a gate refusal, must not say 'disabled': {msg}"
+        );
     }
 
     #[test]

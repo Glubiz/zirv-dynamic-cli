@@ -344,6 +344,31 @@ impl AgentGate {
     pub fn states(&self) -> impl Iterator<Item = (&str, &AgentState)> {
         self.states.iter().map(|(k, v)| (k.as_str(), v))
     }
+
+    /// G: whether `name` is disabled, and disabled *only* by the repo layer
+    /// -- neither the operator's own home file nor the environment had
+    /// anything to say about it. `load`'s own fold already attributes
+    /// `disabled_by` to `Source::OperatorFile`/`Source::Env` whenever either
+    /// of those layers is the one that actually decided the disable (see the
+    /// `load` doc comment), so this is a cheap read of state already
+    /// computed, not a second pass over any settings file.
+    ///
+    /// This is the provenance `resolve_default`'s fallback (`adapters/
+    /// mod.rs`) uses to tell "the repo narrowed this option away" from "an
+    /// operator (or the environment) chose to disable it": only the former
+    /// is untrusted-input territory, where a repo checkout silently forcing
+    /// the fallback onto a *different* adapter -- a different vendor
+    /// account, different supervision capabilities -- would let a hostile
+    /// checkout select something rather than merely narrow what's on offer.
+    pub fn disabled_only_by_repo(&self, name: &str) -> bool {
+        matches!(
+            self.states.get(name),
+            Some(AgentState {
+                enabled: false,
+                disabled_by: Some(Source::RepoFile(_)),
+            })
+        )
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +429,56 @@ mod tests {
         let empty = env_map(&[]);
         let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert!(!gate.is_enabled("codex"));
+    }
+
+    /// G: `disabled_only_by_repo` is the provenance `resolve_default`'s
+    /// fallback reads to refuse silently landing on a different adapter --
+    /// true only when the repo layer is the one that actually decided the
+    /// disable, never merely "the repo file also happens to mention it."
+    #[test]
+    fn disabled_only_by_repo_is_true_when_only_the_repo_layer_disabled_it() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        write_settings(repo.path(), "[agents.codex]\nenabled = false\n");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(gate.disabled_only_by_repo("codex"));
+        assert!(
+            !gate.disabled_only_by_repo("claude"),
+            "an enabled agent is not disabled by anything"
+        );
+    }
+
+    /// G: an operator disable takes attribution priority over a repo one
+    /// (`load`'s own fold), so when both layers disable the same agent this
+    /// must read as operator-caused, not repo-only -- an operator's own
+    /// choice is not the untrusted-input case this predicate exists for.
+    #[test]
+    fn disabled_only_by_repo_is_false_when_the_operator_also_disabled_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[agents.codex]\nenabled = false\n");
+        let repo = tempfile::tempdir().expect("tempdir");
+        write_settings(repo.path(), "[agents.codex]\nenabled = false\n");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!gate.disabled_only_by_repo("codex"));
+    }
+
+    /// G: the environment is the operator too, and it can disable an agent
+    /// the repo never mentioned at all -- also not the repo-only case.
+    #[test]
+    fn disabled_only_by_repo_is_false_for_an_environment_disable() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let env = env_map(&[("ZIRV_AGENT_CODEX_ENABLED", "false")]);
+        let gate = AgentGate::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!gate.disabled_only_by_repo("codex"));
     }
 
     #[test]

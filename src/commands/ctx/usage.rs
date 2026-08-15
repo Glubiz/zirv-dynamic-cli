@@ -269,8 +269,43 @@ pub fn run_with<W: Write>(
         None => {
             let cfg = CtxConfig::load(repo, env)?;
             let state = StateDir::resolve(env)?;
+            // O: `select` can refuse for reasons that have nothing to do with
+            // reading a usage report -- a repo `.settings.toml` disabling the
+            // configured agent, or an unlaunchable claude -- and before this
+            // command was provider-scoped it never called `select` at all, so
+            // none of those ever stopped it from working. Only a provider
+            // *name* is actually needed here, not a working adapter.
+            //
+            // Low 5: derived from the *configured* agent name (`adapters::
+            // provider_for_agent_name`), not guessed as `LEGACY_USAGE_
+            // PROVIDER` on every refusal -- `agent = "codex"` with codex
+            // disabled must still show "openai: no usage source", not
+            // Anthropic percentages left over from a claude session that
+            // happened to write the legacy file.
+            //
+            // Final wave item 4: `provider_for_usage_readout` tries `resolve_
+            // default` first, so an *unset* `agent` with an operator-
+            // disabled claude still lands on codex's own provider (what
+            // `resolve_default`'s own fallback loop would actually select)
+            // instead of guessing the legacy default. Falling back to
+            // `provider_for_agent_name`, and from there to the legacy
+            // provider, is reserved for when `resolve_default` itself
+            // refuses (an explicitly configured, repo-disabled agent, or
+            // nothing enabled and ready at all).
+            let provider = adapters::provider_for_usage_readout(&cfg);
             let now = now_secs();
-            let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now);
+            // E: a provider with no *possible* usage source (codex/openai
+            // today) must not fall through to `report`'s own "no readings
+            // yet, wire the statusline tee" message -- that suggestion only
+            // ever helps claude, whose windows come from Claude Code's own
+            // statusline. `window::has_no_usage_source` is what keeps claude
+            // itself exempt even before its first tee, where "not yet" is
+            // still the true, actionable answer.
+            if window::has_no_usage_source(&state, provider) {
+                writeln!(w, "{provider}: no usage source")?;
+                return Ok(0);
+            }
+            let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
             report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
             Ok(0)
         }
@@ -700,5 +735,194 @@ mod tests {
         .expect("report runs with no state at all");
         assert_eq!(code, 0);
         assert!(String::from_utf8_lossy(&out).contains("not reported"));
+    }
+
+    /// E: codex/openai has no possible usage source, so `zirv ctx usage`
+    /// (no subcommand) must print the plain "<provider>: no usage source"
+    /// line README documents -- never `report`'s own "not reported ... wire
+    /// your statusline" text, which only ever helps claude.
+    #[test]
+    fn the_verb_names_a_provider_with_no_usage_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        // `agent` is `REPO_FORBIDDEN` (final wave item 1) -- configured via
+        // `ZIRV_CTX_AGENT` (the operator layer) instead of the repo's own
+        // `ctx.toml`.
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                tmp.path().join("state").display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "codex".to_string()),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_eq!(printed, "openai: no usage source\n");
+    }
+
+    /// O: before this command was provider-scoped it never called `adapters::
+    /// select` at all -- it read the one legacy global file directly -- so a
+    /// repo whose `.settings.toml` disables its own configured agent (or any
+    /// other `select` refusal) never stopped it from working. `select`'s
+    /// `?` regressed that: with claude configured (as the operator, since
+    /// `agent` is now `REPO_FORBIDDEN`) and this repo's `.settings.toml`
+    /// disabling it, `select` now refuses outright, and this must still
+    /// print the legacy reading rather than hard-error -- via `provider_
+    /// for_agent_name("claude")`, which happens to answer `"anthropic"` too
+    /// (claude *is* the legacy provider), not because this name is unknown
+    /// (see the codex-disabled test below for that case).
+    #[test]
+    fn the_verb_falls_back_to_the_legacy_reading_when_select_refuses() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let state_dir = tmp.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "claude".to_string()),
+        ]
+        .into();
+
+        let state = StateDir::from_root(state_dir);
+        window::store(
+            &state,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 42.0,
+                    resets_at: 1_785_509_000,
+                    observed_at: now_secs(),
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+
+        let mut out = Vec::new();
+        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("falls back rather than hard-erroring on the refusal");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("42"),
+            "the legacy reading still gets through: {printed}"
+        );
+        assert!(
+            !printed.contains("no usage source"),
+            "anthropic (the legacy provider) is exempt from that check: {printed}"
+        );
+    }
+
+    /// Low 5 (fix): unlike the claude case above, `agent = "codex"` with
+    /// codex disabled must show "openai: no usage source", never Anthropic
+    /// percentages left over from a claude session's legacy file. Guessing
+    /// `LEGACY_USAGE_PROVIDER` on every `select` refusal (the pre-fix
+    /// behavior) got this specific case wrong; deriving the provider from
+    /// the configured name directly gets it right regardless of whether
+    /// `select` itself would have refused.
+    #[test]
+    fn a_disabled_codex_shows_no_usage_source_not_anthropic_numbers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        // `agent` is `REPO_FORBIDDEN` (final wave item 1) -- configured via
+        // `ZIRV_CTX_AGENT` (the operator layer) instead of the repo's own
+        // `ctx.toml`.
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.join(".zirv/.settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let state_dir = tmp.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "codex".to_string()),
+        ]
+        .into();
+
+        // The legacy global file a claude session left behind: still on
+        // disk, but must not be misattributed to this codex-configured repo.
+        let state = StateDir::from_root(state_dir);
+        window::store(
+            &state,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 77.0,
+                    resets_at: 1_785_509_000,
+                    observed_at: now_secs(),
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+
+        let mut out = Vec::new();
+        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_eq!(printed, "openai: no usage source\n");
+    }
+
+    /// Final wave item 4: no `agent` configured anywhere, and claude
+    /// disabled by the *operator* (home `.settings.toml`, not the repo) --
+    /// `resolve_default`'s own fallback loop correctly skips it and lands
+    /// on codex, so this must show "openai: no usage source", not the
+    /// legacy Anthropic default `provider_for_agent_name(None)` alone would
+    /// have guessed for an unset `agent`.
+    #[test]
+    fn an_unset_agent_with_an_operator_disabled_claude_reports_codexs_own_provider() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_eq!(printed, "openai: no usage source\n");
     }
 }

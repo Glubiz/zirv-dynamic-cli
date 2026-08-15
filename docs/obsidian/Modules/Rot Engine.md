@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-15
 ---
 
 # Rot Engine
@@ -29,7 +29,7 @@ last-verified: 2026-08-12
 - `ToolResult { is_error }`.
 - `Compaction` — a marker for a context-compaction boundary in the transcript; carries no signal itself, but resets what "recent" tokens mean.
 
-Two other types travel alongside events but aren't scoring inputs: `Capabilities` (`marker_signal`, `token_usage`, `turn_signal`, `system_prompt`) tells the engine which signals a given adapter can actually feed — a capability that's off is treated the same as a signal that never fired, not as a zero — and `StructuralContext` carries raw material (user messages, assistant texts, files touched, tool errors) that handoffs need but the normalized stream deliberately drops.
+Two other types travel alongside events but aren't scoring inputs: `Capabilities` (`marker_signal`, `token_usage`, `turn_signal`, `system_prompt`, `events`) tells the engine which signals a given adapter can actually feed — a capability that's off is treated the same as a signal that never fired, not as a zero — and `StructuralContext` carries raw material (user messages, assistant texts, files touched, tool errors) that handoffs need but the normalized stream deliberately drops. `events` (added 2026-08-15) is different in kind from the other three: it is never read inside `rot.rs` at all (the purity invariant holds — `signals`/`score_events`/`score_from` don't consult it), only by `score.rs`'s own callers (`full_score`, `IncrementalScorer::poll`), which refuse to build a `Score` at all for an adapter with no verified event parsing (`events == false`, codex today) rather than fold its permanently-empty `parse_events` output into a fabricated `Healthy`/`0` — see the Score/caching section below.
 
 ### Signals and scoring (`rot.rs`)
 
@@ -88,6 +88,8 @@ This equivalence is the module's heaviest-tested property: `folding_events_in_ch
 ### The `score` verb driver (`score.rs`)
 
 `score.rs` is the one layer that actually touches the outside world, and it's intentionally thin around the pure core: `score_transcript` reads the JSONL transcript from disk, resolves the adapter and `ScoreConfig` from `CtxConfig::load`, calls `adapter.parse_events` to normalize it, and calls `rot::score_events` — the reference every incremental pass has to agree with. `score_transcript_cached` (used by the Stop hook, a fresh process every turn) adds `IncrementalScorer` + a checkpoint file per transcript (keyed by a hash of its path, written atomically via rename, invalidated on any doubt at all — corrupt JSON, wrong schema version, wrong transcript, wrong `ScoreConfig` fingerprint, or an offset past the current file length) so a long session is scored in the bytes appended since the last poll rather than from scratch. All of that machinery — file reads, `Watcher` diffing, checkpoint persistence — lives outside `rot.rs`; the engine itself only ever sees the `&[NormalizedEvent]` slice it's handed. The CLI plumbing for `zirv ctx score` (args, output format) is documented on [[Ctx Subsystem]].
+
+**No-event-parsing adapters report "no data," never `Healthy`/`0` (2026-08-15).** Both of `score.rs`'s own entry points into a real parse check `adapter.capabilities().events` first and refuse before computing anything: `full_score` returns `Err` (propagated by `score_transcript`/`score_transcript_cached`, degraded by the Stop hook's own `let Ok(score) = ... else { return Ok(0) }` into a silent no-op, exactly like a missing transcript), and `IncrementalScorer::poll` returns `Ok(None)` (its own existing spelling of "nothing to report," which is also what leaves `exec`/`loop`'s rot-restart gate — `verdict == Restart` — never true for such a session, now for an explicit, honest reason rather than as an accidental side effect of folding zero real events). `score::cached_score` (the dashboard's sidebar/header score, already documented as "`None` means unknown, never healthy," rendered as `--`) inherits this for free through `score_with_checkpoint`'s `.ok()`: no dashboard-side code changed at all. Codex is the current case (`capabilities().events == false`, since `parse_events`/`structural_context` are stubbed to empty/default — issue #11); claude's is `true`.
 
 ## Purity invariant
 

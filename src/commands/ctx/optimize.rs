@@ -786,6 +786,12 @@ pub fn evidence_from_transcripts(
             token_usage: true,
             turn_signal: true,
             system_prompt: false,
+            // Not read by `rot::score_events` (item D's fix lives in
+            // score.rs's own callers, not here), and `events` is already
+            // parsed through the real adapter above -- an adapter with no
+            // real parsing already scores an empty stream as healthy, which
+            // is the correct "not rotted" answer for this evidence count.
+            events: true,
         };
         if rot::score_events(&events, caps, cfg).verdict == Verdict::Restart {
             evidence.rot_sessions += 1;
@@ -1411,7 +1417,7 @@ pub fn run_with<W: Write>(
         match &adapter {
             Ok(adapter) => {
                 let model = if cfg.optimize.model.is_empty() {
-                    cfg.handoff.model.clone()
+                    handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref())
                 } else {
                     cfg.optimize.model.clone()
                 };
@@ -3287,30 +3293,45 @@ mod tests {
         );
     }
 
+    /// Item 9: `fake-optimizer.sh` reads only stdin (`prompt=$(cat)`), never
+    /// its own argv, so it stands in for either adapter's distiller call
+    /// unchanged -- `ZIRV_CTX_AGENT_BIN` is the one thing that differs. The
+    /// report-only guarantee this test exists to prove is named per-adapter
+    /// in CLAUDE.md now (`ClaudeAdapter::distiller_cmd`'s `--disallowedTools`
+    /// pin and `CodexAdapter::distiller_cmd`'s `--sandbox read-only` pin are
+    /// different flags backing the same promise), so both get the same
+    /// coverage here rather than only claude's.
     #[test]
     fn the_verb_never_modifies_an_analysed_file() {
-        let (tmp, home, repo) = fixture_tree();
-        let state = tmp.path().join("state");
-        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
-        let before_repo = tree_snapshot(&repo);
-        let before_home = tree_snapshot(&home);
+        for agent in ["claude", "codex"] {
+            let (tmp, home, repo) = fixture_tree();
+            let state = tmp.path().join("state");
+            let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+            let before_repo = tree_snapshot(&repo);
+            let before_home = tree_snapshot(&home);
 
-        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let args = OptimizeArgs {
-            agent: Some("claude".to_string()),
-            no_model: false,
-            sessions: Some(0),
-            out: None,
-        };
-        let mut out = Vec::new();
-        run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let args = OptimizeArgs {
+                agent: Some(agent.to_string()),
+                no_model: false,
+                sessions: Some(0),
+                out: None,
+            };
+            let mut out = Vec::new();
+            run_with(&args, &mut out, &repo, &|k| env.get(k).cloned())
+                .unwrap_or_else(|e| panic!("{agent}: runs: {e}"));
 
-        assert_eq!(before_repo, tree_snapshot(&repo), "optimize is report-only");
-        assert_eq!(
-            before_home,
-            tree_snapshot(&home),
-            "and that includes the global layer"
-        );
+            assert_eq!(
+                before_repo,
+                tree_snapshot(&repo),
+                "{agent}: optimize is report-only"
+            );
+            assert_eq!(
+                before_home,
+                tree_snapshot(&home),
+                "{agent}: and that includes the global layer"
+            );
+        }
     }
 
     #[test]

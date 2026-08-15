@@ -155,8 +155,9 @@ pub fn run_with<W: Write>(
         Err(e) => writeln!(w, "\nagents: (settings unreadable: {e})")?,
     }
 
-    match CtxConfig::load(repo, env) {
-        Ok(cfg) => writeln!(w, "\n{}", describe_chat(&cfg))?,
+    let cfg_result = CtxConfig::load(repo, env);
+    match &cfg_result {
+        Ok(cfg) => writeln!(w, "\n{}", describe_chat(cfg))?,
         Err(e) => writeln!(w, "\nchat: unavailable (configuration error: {e})")?,
     }
 
@@ -196,18 +197,53 @@ pub fn run_with<W: Write>(
         )?;
     }
 
-    let windows = crate::commands::ctx::window::load(&state);
-    let describe = |name: &str, window: Option<&crate::commands::ctx::window::Window>| match window
-    {
-        Some(found) => format!("{name} {:.0}%", found.used_percentage),
-        None => format!("{name} unknown"),
-    };
-    writeln!(
-        w,
-        "\nusage windows: {}, {} (see `zirv ctx usage` for detail)",
-        describe("five_hour", windows.five_hour.as_ref()),
-        describe("seven_day", windows.seven_day.as_ref())
-    )?;
+    // Third surface, same fix as `usage.rs`'s no-subcommand branch and
+    // `wrap.rs`'s status bar: the machine-wide `window::load` used to show
+    // whichever provider's numbers happened to be on disk regardless of
+    // which adapter this repo is actually configured for, so a codex-only
+    // repo could show a stale claude session's Anthropic percentages as if
+    // they were its own.
+    //
+    // Low 5: `provider` is derived from the *configured* agent, same as
+    // `usage.rs`, rather than from a successful `adapters::select` -- a
+    // repo-disabled or unready adapter used to make this whole line vanish
+    // silently (`select(...).ok()` collapsing straight to `None`), so
+    // `zirv ctx usage` and `zirv ctx status` could disagree about whether a
+    // usage line existed at all for the exact same repo. A config-load
+    // failure still omits the line: that failure already has its own
+    // `chat: unavailable (...)` line above, and there is no `cfg.agent` to
+    // read a name from at all in that case.
+    //
+    // Final wave item 4: `adapters::provider_for_usage_readout` (not the
+    // bare `provider_for_agent_name`) so an *unset* `agent` with an
+    // operator-disabled claude reports codex's own provider -- what
+    // `resolve_default`'s own fallback loop would actually select --
+    // rather than guessing the legacy default.
+    let provider = cfg_result
+        .as_ref()
+        .ok()
+        .map(adapters::provider_for_usage_readout);
+    match provider {
+        Some(provider) if crate::commands::ctx::window::has_no_usage_source(&state, provider) => {
+            writeln!(w, "\nusage windows: {provider}: no usage source")?;
+        }
+        Some(provider) => {
+            let windows =
+                crate::commands::ctx::window::load_for(&state, provider).unwrap_or_default();
+            let describe =
+                |name: &str, window: Option<&crate::commands::ctx::window::Window>| match window {
+                    Some(found) => format!("{name} {:.0}%", found.used_percentage),
+                    None => format!("{name} unknown"),
+                };
+            writeln!(
+                w,
+                "\nusage windows: {}, {} (see `zirv ctx usage` for detail)",
+                describe("five_hour", windows.five_hour.as_ref()),
+                describe("seven_day", windows.seven_day.as_ref())
+            )?;
+        }
+        None => {}
+    }
 
     writeln!(w, "\nlatest handoff for {}:", repo.display())?;
     match latest_for_repo(&state, repo)? {
@@ -446,13 +482,15 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
 
-        // Only claude is disabled: codex is still refused, but on its own
-        // `ready()` (never implemented), not the settings gate -- matching
-        // the design's own example wording.
+        // Both known adapters disabled: codex's own `ready()` now only
+        // checks that its program resolves (`CodexAdapter::ready`, mirrors
+        // claude), so disabling claude alone would leave codex as a usable
+        // fallback -- both have to be disabled by the gate to reach
+        // "nothing enabled and ready" at all.
         std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             tmp.path().join(".zirv/.settings.toml"),
-            "[agents.claude]\nenabled = false\n",
+            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n",
         )
         .expect("write");
 
@@ -466,9 +504,8 @@ mod tests {
         let chat_line = text.lines().find(|l| l.starts_with("chat:")).unwrap_or("");
         assert!(chat_line.contains("unavailable"), "got {chat_line}");
         assert!(chat_line.contains("claude"), "got {chat_line}");
-        assert!(chat_line.contains("disabled"), "got {chat_line}");
         assert!(chat_line.contains("codex"), "got {chat_line}");
-        assert!(chat_line.contains("not implemented yet"), "got {chat_line}");
+        assert!(chat_line.contains("disabled"), "got {chat_line}");
         assert!(
             !chat_line.contains('\u{2014}'),
             "no em dashes in user-facing copy: {chat_line}"
@@ -544,6 +581,93 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("usage"), "got {text}");
         assert!(text.contains("77"), "got {text}");
+    }
+
+    /// The third of the three usage surfaces this fixes (alongside `zirv ctx
+    /// usage`'s no-subcommand branch and `wrap`'s status bar): `window::load`
+    /// used to read the one machine-wide file regardless of which adapter
+    /// this repo is actually configured for, so a codex-only repo's `zirv
+    /// ctx status` could show a stale claude session's Anthropic percentages
+    /// as its own. Codex has no usage collector at all
+    /// (`window::has_no_usage_source`), so the honest line names that
+    /// instead of a number.
+    #[test]
+    fn status_shows_no_usage_source_for_a_codex_configured_repo_rather_than_anthropic_numbers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let mut env = env_for(state.root());
+        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+
+        // The legacy global file a claude session left behind: still on
+        // disk, but must not be misattributed to this operator-configured
+        // codex session (`ZIRV_CTX_AGENT`; a repo cannot set `agent`).
+        crate::commands::ctx::window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 77.0,
+                    resets_at: 1_785_509_000,
+                    observed_at: crate::commands::ctx::state::now_secs(),
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("openai: no usage source"), "got {text}");
+        assert!(
+            !text.contains("77"),
+            "the claude-only legacy file must not leak into a codex repo's usage line: {text}"
+        );
+    }
+
+    /// Low 5 (fix): the case above configures codex while it is still
+    /// enabled, so `adapters::select` never actually refuses there. Here
+    /// codex is *disabled* via the repo's own `.settings.toml` -- before
+    /// this fix, a `select` refusal made the `usage windows:` line vanish
+    /// entirely (`provider` collapsed to `None`), so `zirv ctx status` and
+    /// `zirv ctx usage` disagreed about whether a codex-configured repo had
+    /// a usage line at all. It must still say "openai: no usage source",
+    /// derived from the configured name directly.
+    ///
+    /// `agent` is configured via `ZIRV_CTX_AGENT` (the operator layer), not
+    /// the repo's own `ctx.toml`: `agent` is `REPO_FORBIDDEN` (final wave
+    /// item 1) precisely so a checkout cannot pick which vendor account
+    /// gets spent -- this test's own scenario if it tried.
+    #[test]
+    fn status_names_no_usage_source_for_a_disabled_codex_rather_than_hiding_the_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let mut env = env_for(state.root());
+        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/.settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("openai: no usage source"),
+            "the line must still name the configured agent's provider, not disappear: {text}"
+        );
     }
 
     // N7: the registry-backed `sessions:` block and the `memory:` line.

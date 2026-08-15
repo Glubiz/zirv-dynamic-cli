@@ -65,11 +65,22 @@ cargo clippy --all-targets -- -D warnings
 - `zirv ctx optimize` is report-only. It may read any configuration surface and
   write only to stdout, its own report copy under the state dir, and an explicit
   `--out` path. A test asserts the analysed tree is unchanged after a run. The
-  judgment/distiller model child's own tools are restricted too
-  (`ClaudeAdapter::distiller_cmd`), not just zirv's own code path: it embeds
-  untrusted repo CLAUDE.md text in its prompt, so the guarantee would
-  otherwise rest on model judgment alone. Verified against the real CLI; see
-  docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md.
+  judgment/distiller model child's own tools are restricted too, for both
+  adapters, not just zirv's own code path: each embeds untrusted repo prompt
+  text in its own prompt, so the guarantee would otherwise rest on model
+  judgment alone. `ClaudeAdapter::distiller_cmd` pins
+  `--disallowedTools=Write,Edit,Bash,NotebookEdit`; `CodexAdapter::distiller_cmd`
+  pins `--sandbox read-only`, verified against codex-cli 0.105.0
+  (`npm install -g @openai/codex`, the version most operators actually get).
+  The two restrictions are not identical guarantees: codex-cli 0.146.0 (a
+  brew-only capture, not what npm publishes) additionally documents
+  `--ignore-rules`/`--ignore-user-config`, which 0.105.0 does not have, so
+  codex's distiller still reads the repo's `.rules` execpolicy files and the
+  operator's own `~/.codex/config.toml` on top of AGENTS.md -- a known,
+  recorded residual (see Known Issues), not a gap in this guarantee's own
+  tests. Verified against the real CLI; see
+  docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md and
+  docs/superpowers/notes/2026-07-31-codex-cli-facts.md.
 - Repo-provided prompt text is untrusted input, like the repo `ctx.toml` layer:
   capped, labeled, and unable to enable itself.
 - Repo `.settings.toml` may only disable agents, never enable one: the same
@@ -91,20 +102,32 @@ cargo clippy --all-targets -- -D warnings
   agent workflow that pipes `zirv`'s stdout/stdin should not rely on the bare
   form: pipe into `zirv ctx chat` (or a specific verb) explicitly instead.
 - `REPO_FORBIDDEN` in `config.rs` also covers `mail.enabled`,
-  `mail.max_delivered_bytes`, and `chrome.events`, on top of the `agent_bin`/
-  `handoff.model`/`optimize.model`/`prompt.*` keys: a repo checkout must not
-  be able to raise its own delivered-mail cap, re-enable mail delivery an
-  operator disabled, or silence the `zirv ▸` announcement channel (including
-  its own degradation notices).
+  `mail.max_delivered_bytes`, `chrome.events`, and `agent`, on top of the
+  `agent_bin`/`handoff.model`/`optimize.model`/`prompt.*` keys: a repo
+  checkout must not be able to raise its own delivered-mail cap, re-enable
+  mail delivery an operator disabled, silence the `zirv ▸` announcement
+  channel (including its own degradation notices), or pick which vendor
+  account gets spent (`agent = "codex"` reaches `resolve_default`'s
+  *configured* arm, which never consults the repo-narrowing guard the
+  no-`agent`-configured fallback loop has). `~/.zirv/ctx.toml`, `ZIRV_CTX_*`
+  and flags may still set every one of these; only a repo checkout may not.
 - `zirv ctx send`/`zirv ctx inbox` deliver full message bodies only into a
-  headless **Worker** session's composed prompt (`exec`/`loop`, gated by
+  headless **Worker** session's prompt (`exec`/`loop`, gated by
   `cfg.mail.enabled`, consumed via `mail::consume` right after so a later
   launch/cycle does not see the same message again); an interactive
   **Orchestrator** session (`chat`/`wrap`) gets a one-line unread-count
   advisory instead, never the message bodies. Mail filenames
   (`mail::store`) get a collision-free `_NNN` suffix on a same-second
   collision, since `now_secs()` has one-second granularity and two real
-  sends that close together is common, not a rare edge case.
+  sends that close together is common, not a rare edge case. For an adapter
+  with real system-prompt injection (claude) that Worker delivery is into
+  the composed prompt, via `with_mail_layer`; for one without any injection
+  mechanism (codex today, `capabilities().system_prompt == false`) that path
+  delivers nothing at all (`injection_args_for_session` always returns an
+  empty argv for it), so `task_prompt_with_mail_fallback` instead appends the
+  same mail block onto the task prompt text itself — the one channel such an
+  adapter has (argv, or stdin on a Windows shim launch). Mail is consumed
+  only once it has actually reached one of these two channels.
 - `ctx/mod.rs`'s `CtxCli` `about` text calls `adapters::readiness_note()`,
   which calls `ready()` on every registered adapter; this is cached in a
   process-wide `OnceLock` (`ctx_about()`) since it otherwise re-runs on every

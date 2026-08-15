@@ -379,12 +379,14 @@ mod tests {
 
     /// Item 7: `zirv ctx --help` is the first thing a curious user reads, so
     /// it must say plainly which adapters are not ready yet, the same
-    /// honesty `CodexAdapter::ready` gives a user who tries `--agent codex`
-    /// directly. Pinned as a property over the registry (every adapter whose
-    /// own `ready()` fails must be named, with a not-ready indication)
-    /// rather than a literal sentence, so wiring up a real adapter -- or
-    /// adding a third one that also is not ready -- keeps this test honest
-    /// without an edit.
+    /// honesty an adapter's own `ready()` gives a user who tries `--agent
+    /// <name>` directly. Pinned as a property over the registry (every
+    /// adapter whose own `ready()` fails must be named, with a not-ready
+    /// indication, and -- the other direction -- nothing is named not-ready
+    /// when every adapter's own `ready()` succeeds, true today now that
+    /// `CodexAdapter::ready` mirrors claude's) rather than a literal
+    /// sentence, so wiring up a real adapter -- or adding a third one that is
+    /// not ready -- keeps this test honest without an edit.
     #[test]
     fn the_top_level_help_names_every_adapter_that_is_not_ready() {
         use clap::CommandFactory;
@@ -397,10 +399,6 @@ mod tests {
             .into_iter()
             .filter(|a| a.ready().is_err())
             .collect();
-        assert!(
-            !not_ready.is_empty(),
-            "this test expects at least one not-ready adapter today (codex)"
-        );
         for adapter in &not_ready {
             assert!(
                 about.contains(adapter.name()),
@@ -408,11 +406,62 @@ mod tests {
                 adapter.name()
             );
         }
-        assert!(
-            about.to_lowercase().contains("not implemented yet")
-                || about.to_lowercase().contains("not ready"),
-            "about must indicate not-ready status: {about}"
+        let claims_not_ready = about.to_lowercase().contains("not implemented yet")
+            || about.to_lowercase().contains("not ready");
+        assert_eq!(
+            claims_not_ready,
+            !not_ready.is_empty(),
+            "about's not-ready claim must match the registry's own ready() calls: {about}"
         );
+    }
+
+    /// Item 16: the property test above reads `about` off `ctx_about()`'s
+    /// process-wide `OnceLock` -- on any real machine both adapters are
+    /// `ready()`, so its `for adapter in &not_ready` loop body has never
+    /// once executed, and by the time this test runs the cache may already
+    /// be warmed by an *earlier* test's own `CtxCli::try_parse_from` call
+    /// (this module has several, and so do `optimize.rs`/`usage.rs`), which
+    /// a same-test PATH rig cannot retroactively change. Rigged directly
+    /// against `adapters::readiness_note()` instead -- the exact function
+    /// `ctx_about()` wraps and caches, so this is the same substance without
+    /// the caching hazard -- using the identical PATH/PATHEXT rig `adapters::
+    /// tests::readiness_note_and_the_fallback_skip_both_stay_covered_when_
+    /// an_adapter_is_genuinely_unready` already established for exactly this
+    /// "force claude genuinely unready" shape.
+    #[cfg(windows)]
+    #[test]
+    fn readiness_note_names_a_genuinely_unready_adapter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("claude.py"), "print('x')\n").expect("write");
+
+        let path = std::env::var("PATH").unwrap_or_default();
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "PATH",
+                Some(format!("{};{}", dir.path().display(), path).as_str()),
+            ),
+            ("PATHEXT", Some(".EXE;.CMD;.PY")),
+        ]);
+
+        let not_ready: Vec<_> = adapters::all(None)
+            .into_iter()
+            .filter(|a| a.ready().is_err())
+            .collect();
+        assert!(
+            !not_ready.is_empty(),
+            "the rig must genuinely make claude unready"
+        );
+
+        let note = adapters::readiness_note();
+        for adapter in &not_ready {
+            assert!(
+                note.contains(adapter.name()),
+                "readiness_note (what ctx_about's cached `about` is built from) must name \
+                 not-ready adapter '{}': {note}",
+                adapter.name()
+            );
+        }
+        assert!(note.to_lowercase().contains("not ready"), "got {note}");
     }
 
     #[test]

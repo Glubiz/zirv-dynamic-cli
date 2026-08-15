@@ -682,12 +682,35 @@ be invoked:
 quality drops: it advises, compacts early, or restarts the session with a
 distilled handoff. Scoring is deterministic, and every decision is logged.
 
-**Agent support.** Claude Code is the only agent `ctx` supports today. A
-`codex` adapter exists in the tree but is not implemented yet: `--agent codex`
-fails with a message saying so, because the event shapes it would have to
-parse were never verified against an authenticated CLI, and the `notify`
-mechanism the design assumed does not exist in current Codex versions.
-Progress is tracked in
+**Agent support.** Claude Code and Codex are both supported for supervised
+sessions, but not to the same depth. Claude Code gets the full feature set:
+event parsing, a rot score, turn signals and an injected system prompt. Codex
+launches and supervises fine -- `--agent codex` succeeds both when `codex`
+resolves to a real binary and when nothing named `codex` is installed at all
+(that case is left to fail at spawn time with the OS's own "not found"), the
+same contract `--agent claude` gives claude -- but with an honestly degraded
+surface, because the pieces below were never verified against an
+authenticated CLI:
+
+- No event parsing, so no rot score and no structural context for codex
+  sessions (`parse_events`/`structural_context` stay empty).
+- No usage source: a codex session's usage reads `openai: no usage source`
+  rather than a real reading.
+- No turn signal: current Codex versions have no `notify` mechanism to hook.
+- No injected system prompt: there is no verified per-run mechanism to carry
+  one.
+
+A declared consequence of the last point: an interactive orchestrator session
+on codex (`zirv chat --agent codex`, or bare `zirv` resolving to it) runs with
+no role, memory, or repo-context layer injected at all -- the composed prompt
+zirv would otherwise carry never has anywhere on that launch to go, so the
+session starts exactly as a bare `codex` invocation would. (`zirv agent` is a
+different path -- a one-shot headless **Worker** delegation, not an
+orchestrator session -- and is unaffected: it delivers mail and its own
+task text through the codex CLI's argv/stdin directly, never through this
+injection mechanism.)
+
+Full event support is tracked in
 [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
 
 **Platform support.** Supervision is unix only. `wrap` and `exec` need unix
@@ -805,15 +828,16 @@ subscription-window waiting.
 
 A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
-`agent_bin`, `supervise.on_failure`, `handoff.model`, `optimize.model`,
-`prompt.enabled`, `prompt.repo_layer`, `prompt.max_repo_bytes`,
-`mail.enabled`, `mail.max_delivered_bytes`, `chrome.events`, or any `memory.*`
-key; doing so is an error that names the key. Set those in
-`~/.zirv/ctx.toml`, or with the matching `ZIRV_CTX_*` variable below, which
-comes from the operator rather than the checkout:
+`agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
+`optimize.model`, `prompt.enabled`, `prompt.repo_layer`,
+`prompt.max_repo_bytes`, `mail.enabled`, `mail.max_delivered_bytes`,
+`chrome.events`, or any `memory.*` key; doing so is an error that names the
+key. Set those in `~/.zirv/ctx.toml`, or with the matching `ZIRV_CTX_*`
+variable below, which comes from the operator rather than the checkout:
 
 | Forbidden repo key | Set instead via |
 |---|---|
+| `agent` | `ZIRV_CTX_AGENT` |
 | `agent_bin` | `ZIRV_CTX_AGENT_BIN` |
 | `supervise.on_failure` | `ZIRV_CTX_ON_FAILURE` |
 | `handoff.model` | `ZIRV_CTX_MODEL` |
@@ -838,8 +862,12 @@ silencing the announcement channel would hide its own degradation notices
 from anyone running zirv there. `memory.*` closes the same hole again for the
 memory bank: a repo checkout must not be able to seed the bank, raise its own
 caps, or switch automatic harvesting on for anyone who runs zirv there.
-Everything else, including `agent` (which chooses between built-in adapters
-rather than naming an executable), `chrome.banner`/`chrome.bar`,
+`agent` closes a narrower hole discovered once codex shipped out of the box:
+an explicit `agent = "codex"` reaches `resolve_default`'s *configured* arm,
+which never consults the repo-narrowing guard the no-`agent`-configured
+fallback loop has (see [.settings.toml](#settingstoml) below) -- without this,
+a repo checkout could pick which vendor account gets spent with that guard
+never in the way. Everything else, including `chrome.banner`/`chrome.bar`,
 `supervise.max_nudges`, and every threshold, is still repo-configurable.
 
 #### Environment variables worth knowing
@@ -890,13 +918,24 @@ disabled, and `=false` disables one nothing else touched. A repository can
 only narrow what it inherited -- `enabled = true` in a repo's own
 `.settings.toml` is a silent no-op, since there is nothing there for a repo to
 refuse. Disabling an agent is checked before that adapter's own readiness, so
-`--agent codex` with codex disabled reports the disable, not "not implemented
-yet". `zirv ctx status` lists every known adapter, whether it is enabled, and
-(when not) which file or variable disabled it. A malformed *repo*
-`.settings.toml` never falls back to a fully permissive gate: `zirv ctx
+`--agent codex` with codex disabled reports the disable, not codex's own
+`ready()` outcome. `zirv ctx status` lists every known adapter, whether it is
+enabled, and (when not) which file or variable disabled it. A malformed
+*repo* `.settings.toml` never falls back to a fully permissive gate: `zirv ctx
 optimize` and the Stop hook both fall back to the operator's own layers only
 (home file, then environment) if the full config cannot be loaded, so a broken
 repo file can narrow what an operator already disabled but can never revive it.
+A repo disable can also never *pick* an agent on the operator's behalf: if a
+repo-only `.settings.toml` disables the agent that would otherwise have been
+the default (no `--agent`, no `agent =` configured, and that adapter is the
+first enabled-and-ready one in registry order), zirv refuses rather than
+silently falling back to a different, still-enabled adapter -- naming both
+the disabled agent and the one it would have picked, and how to choose
+explicitly (`--agent`, `agent =` in your own `~/.zirv/ctx.toml`, or the
+`ZIRV_CTX_AGENT` environment variable — the repo's `.zirv/ctx.toml` cannot set
+`agent`; it is a forbidden repo key).
+Narrowing which agent is *possible* is a repo's call; narrowing which one you
+actually get is not.
 
 ### Hook registration (Claude Code)
 

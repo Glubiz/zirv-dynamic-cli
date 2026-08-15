@@ -1236,9 +1236,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_is_a_valid_launch_target_even_though_it_is_not_ready() {
+    fn codex_is_a_valid_launch_target_regardless_of_readiness() {
         // Sanity: build_launch itself does not care about readiness, only
-        // resolve_adapter (exercised above) does.
+        // resolve_adapter (exercised above) does -- true whether or not
+        // codex's own ready() happens to succeed on the machine running this.
         let adapter = CodexAdapter::new(None);
         let launch = build_launch(&adapter, None, &[]);
         assert_eq!(launch.agent_name, "codex");

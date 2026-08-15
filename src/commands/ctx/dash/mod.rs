@@ -35,6 +35,7 @@ use ratatui::layout::{Position, Rect};
 
 use super::CtxResult;
 use super::adapters;
+use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup};
 use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
@@ -1632,6 +1633,41 @@ impl SpawnRefusal {
     }
 }
 
+/// Whether the task-prompt fallback (`worker_task_prompt`, below) has
+/// anywhere safe to put its text this launch. Both fallback blocks contain
+/// characters `guard_cmd_shim_reparse` refuses on a reparsed argv (embedded
+/// newlines from the mail/report-back labels, and `<`/`>` from `report_back_
+/// command`'s literal `<summary>`), so on a Windows launcher form that
+/// reparses its downstream argv -- `cmd.exe /c <shim>` (an npm-installed
+/// `.cmd`, e.g. `codex.cmd`) or `powershell -NoProfile -File <script>` (a
+/// `.ps1`) -- appending either would make `Pane::spawn`'s own guard
+/// (`pane.rs`) refuse the launch outright.
+///
+/// Medium 1, 2026-08-15: this used to key on `adapter.launches_through_cmd_
+/// shim()`, which only recognises the `cmd.exe` form -- a `.ps1` `agent_bin`
+/// would report "safe" here while `guard_cmd_shim_reparse` (which also
+/// covers `powershell -File`, via `reparse_launcher_prefix`) still refused
+/// the spawn, reproducing the exact cmd-shim regression this module already
+/// closed once, just on the other launcher shape. `launch_reparses_through_
+/// shim` is the same broader predicate `prompt.rs`'s `injection_args_for_
+/// session` uses, so both defences now agree. It takes an argv, not a bare
+/// adapter, so the probe below builds exactly the launcher prefix this
+/// pane's real spawn will use (`interactive_cmd(None, &[])` -- no prompt
+/// token yet, since deciding whether one is safe to append is the whole
+/// point) and asks the same question `Pane::spawn` will.
+///
+/// I, 2026-08-15: every dashboard-spawned codex worker failed to start
+/// whenever mail was pending or the requester was addressable, until this
+/// was caught. `false` here means both blocks are held back entirely rather
+/// than risking that refusal; a capable adapter never needs to ask (its own
+/// delivery channel -- composed + `injection_args_for_session`'s forced
+/// file-form on a shim launch, FIX A -- is a solved problem this module does
+/// not own).
+fn task_prompt_fallback_is_safe(adapter: &dyn AgentAdapter) -> bool {
+    let probe = flatten_command(adapter.interactive_cmd(None, &[]));
+    !adapters::launch_reparses_through_shim(&probe)
+}
+
 /// The composed prompt one freshly requested worker pane launches with, and
 /// the mail entries that went into it (returned so the caller can consume them
 /// only once the pane has actually spawned -- `exec::run_with`'s own
@@ -1643,21 +1679,54 @@ impl SpawnRefusal {
 /// dashboard's alone: `prompt::with_report_back_layer`, which tells the worker
 /// how to mail its outcome back to the session that requested it (F3).
 ///
+/// Both of those two layers are folded into `composed` only when `adapter`
+/// has a real system-prompt injection mechanism (`capabilities().system_
+/// prompt`): for one that doesn't (codex today), `injection_args_for_session`
+/// always turns `composed` into an empty argv, so folding mail or the
+/// report-back instruction in here only would silently destroy both -- the
+/// requesting session would then wait forever for a report-back that was
+/// never sent, and mail would vanish with no trace. `fulfill_spawn_request`
+/// instead reaches for `worker_task_prompt` to fold the same two blocks onto
+/// the task prompt text itself for such an adapter -- the one channel it
+/// has, since this is a **Worker** pane (`PaneSpec::role` is always
+/// `PromptRole::Worker` for a dashboard-spawned worker, never
+/// `Orchestrator`; see CLAUDE.md's Worker/Orchestrator mail asymmetry) and
+/// therefore gets full message bodies, not an advisory -- *unless* even
+/// that channel is unsafe on this launch (`task_prompt_fallback_is_safe`),
+/// in which case `fulfill_spawn_request` degrades further still.
+///
+/// Mail is listed here whenever `cfg.mail.enabled`, for *either* adapter
+/// shape that has a delivery channel at all: `composed.is_some()` for a
+/// capable adapter (its only channel), or unconditionally for an incapable
+/// one, whose channel -- the task prompt text -- does not depend on the
+/// other composed layers existing at all. `--simple`/a disabled prompt must
+/// not also withhold mail from codex. `fulfill_spawn_request` is what then
+/// decides, per this specific launch, whether that listed mail can actually
+/// be delivered (`task_prompt_fallback_is_safe`) or must be left unconsumed.
+///
 /// Split out of `fulfill_spawn_request` so what a worker pane is actually told
 /// is testable without spawning a pty -- the rest of that function is the
 /// spawn itself.
+/// Item 13: the third element is `mail_entries`' own bodies, already
+/// derived here for `with_mail_layer`'s sake -- returned alongside it so
+/// `fulfill_spawn_request` (which needs that same `Vec<mail::Message>` for
+/// `worker_task_prompt`) does not clone every pending message body a second
+/// time to rebuild an identical list.
+type ComposedWorkerPrompt = (
+    Option<prompt::ComposedPrompt>,
+    Vec<(PathBuf, mail::Message)>,
+    Vec<mail::Message>,
+);
+
 fn compose_worker_prompt(
     req: &spawnreq::SpawnRequest,
-    adapter_name: &str,
+    adapter: &dyn AgentAdapter,
     registry_short: &str,
     cfg: &CtxConfig,
     state: &StateDir,
     repo: &Path,
     slug: &str,
-) -> (
-    Option<prompt::ComposedPrompt>,
-    Vec<(PathBuf, mail::Message)>,
-) {
+) -> ComposedWorkerPrompt {
     let memory_entries = memory::render_for_prompt(state, slug, cfg, super::state::now_secs());
     let composed = prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
@@ -1668,11 +1737,13 @@ fn compose_worker_prompt(
         &memory_entries,
         cfg.memory.max_injected_bytes,
     );
-    let mail_entries: Vec<(PathBuf, mail::Message)> = if composed.is_some() && cfg.mail.enabled {
+    let system_prompt_supported = adapter.capabilities().system_prompt;
+    let should_list_mail = cfg.mail.enabled && (composed.is_some() || !system_prompt_supported);
+    let mail_entries: Vec<(PathBuf, mail::Message)> = if should_list_mail {
         mail::list(
             state,
             slug,
-            Some(adapter_name),
+            Some(adapter.name()),
             sessions::delivery_filter(None, registry_short),
         )
         .unwrap_or_default()
@@ -1680,7 +1751,11 @@ fn compose_worker_prompt(
         Vec::new()
     };
     let mail_messages: Vec<mail::Message> = mail_entries.iter().map(|(_, m)| m.clone()).collect();
-    let composed = prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes);
+    let composed = if system_prompt_supported {
+        prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes)
+    } else {
+        composed
+    };
     // Last, and after the mail layer on purpose: this is zirv's own plumbing,
     // not something another session's message is allowed to sit on top of.
     //
@@ -1689,12 +1764,78 @@ fn compose_worker_prompt(
     // is off would only ever produce a command that gets refused. An operator
     // who has turned mail off has not asked for a task-completion channel that
     // silently fails at the end of every worker's run.
-    let composed = if cfg.mail.enabled {
+    let composed = if cfg.mail.enabled && system_prompt_supported {
         prompt::with_report_back_layer(composed, &req.requested_by)
     } else {
         composed
     };
-    (composed, mail_entries)
+    (composed, mail_entries, mail_messages)
+}
+
+/// Low 7: both `render_mail_block` and `render_report_back_block` open with
+/// a `"\n\n---\n\n"` separator meant to set their labeled content apart from
+/// the real task prompt text *above* it. When `req_prompt` is empty or
+/// whitespace-only there is no text above it to separate from, so the
+/// resulting argv token's own first non-whitespace characters are literally
+/// `---` -- flag-like to anything doing a simple leading-dash check, and
+/// just confusing to read regardless. Strips exactly that leading separator
+/// (never anything else in the string) so an empty-prompt worker's argv
+/// token starts with the fallback's own labeled content instead.
+fn strip_leading_separator_for_an_empty_prompt(req_prompt: &str, text: String) -> String {
+    if !req_prompt.trim().is_empty() {
+        return text;
+    }
+    match text.trim_start().strip_prefix("---\n\n") {
+        Some(rest) => rest.to_string(),
+        None => text,
+    }
+}
+
+/// The text passed positionally to `interactive_cmd` for a freshly spawned
+/// worker pane: `req.prompt` as written for an adapter with real
+/// system-prompt injection (its mail and report-back instruction already
+/// rode `compose_worker_prompt`'s `composed` above), or -- for one without --
+/// the same two blocks appended onto the task prompt text instead, unless
+/// even that channel is unsafe on this launch (`task_prompt_fallback_is_
+/// safe`, I), in which case the bare requester prompt is returned unchanged
+/// and the caller (`fulfill_spawn_request`) is responsible for not treating
+/// `mail_messages` as delivered. Split out of `fulfill_spawn_request` for
+/// the same testability reason `compose_worker_prompt` was.
+///
+/// Low 12: `fallback_is_safe` is `task_prompt_fallback_is_safe(adapter)`'s
+/// own answer, computed once by the caller and passed in rather than
+/// recomputed here -- it walks `PATH` to resolve the launcher shape
+/// (`interactive_cmd` -> `resolve_program`), and `fulfill_spawn_request`
+/// already needs the same answer for its own narration decision just below
+/// this call. Evaluating it twice per spawn request cost a second PATH walk
+/// for a fact that cannot have changed between the two call sites.
+fn worker_task_prompt(
+    req: &spawnreq::SpawnRequest,
+    adapter: &dyn AgentAdapter,
+    mail_messages: &[mail::Message],
+    cfg: &CtxConfig,
+    fallback_is_safe: bool,
+) -> String {
+    let system_prompt_supported = adapter.capabilities().system_prompt;
+    if !system_prompt_supported && !fallback_is_safe {
+        return req.prompt.clone();
+    }
+    let with_mail = prompt::task_prompt_with_mail_fallback(
+        &req.prompt,
+        system_prompt_supported,
+        mail_messages,
+        cfg.mail.max_delivered_bytes,
+    );
+    let text = if cfg.mail.enabled {
+        prompt::task_prompt_with_report_back_fallback(
+            &with_mail,
+            system_prompt_supported,
+            &req.requested_by,
+        )
+    } else {
+        with_mail
+    };
+    strip_leading_separator_for_an_empty_prompt(&req.prompt, text)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1750,9 +1891,9 @@ fn fulfill_spawn_request(
     let session_id = SessionId::new_v4().to_string();
     let registry_short = sessions::short_id(&session_id);
     let slug = super::state::repo_slug(repo);
-    let (composed, mut mail_entries) = compose_worker_prompt(
+    let (composed, mut mail_entries, mut mail_messages) = compose_worker_prompt(
         req,
-        adapter.name(),
+        adapter.as_ref(),
         &registry_short,
         cfg,
         state,
@@ -1776,8 +1917,70 @@ fn fulfill_spawn_request(
         adapter.capabilities().system_prompt,
     );
 
+    // I: on a Windows `cmd.exe /c <shim>` launch, neither fallback block has
+    // anywhere safe to go (see `task_prompt_fallback_is_safe`'s own doc
+    // comment) -- `worker_task_prompt` already degrades to the bare
+    // requester prompt for this case, but `mail_entries` still has to be
+    // cleared here too, or the consume loop below would mark mail read that
+    // was never actually delivered anywhere. One narration line names what
+    // was held back, but only when something actually was: an addressable
+    // requester with no pending mail on an unaffected (claude, or non-shim
+    // codex) launch must not print noise on every spawn.
+    //
+    // Low 12: computed once here, reused by `worker_task_prompt` below
+    // rather than each re-walking `PATH` to answer the same question.
+    //
+    // Final wave item 5: short-circuited on `capabilities().system_prompt`
+    // -- a capable adapter (claude) never actually consults `fallback_is_
+    // safe` (both this `if` and `worker_task_prompt`'s own check start with
+    // `!system_prompt_supported`), so `task_prompt_fallback_is_safe`'s PATH
+    // walk is skipped for it entirely rather than paid on every spawn
+    // request for an answer nothing reads. `true` is a safe placeholder for
+    // the unused case, matching what `||` short-circuiting already gives.
+    let system_prompt_supported = adapter.capabilities().system_prompt;
+    let fallback_is_safe =
+        system_prompt_supported || task_prompt_fallback_is_safe(adapter.as_ref());
+    if !system_prompt_supported && !fallback_is_safe {
+        let withheld_mail = !mail_entries.is_empty();
+        let withheld_report_back =
+            cfg.mail.enabled && prompt::is_addressable_short(&req.requested_by);
+        if withheld_mail || withheld_report_back {
+            let what = match (withheld_mail, withheld_report_back) {
+                (true, true) => "mail and the report-back instruction",
+                (true, false) => "mail",
+                (false, true) => "the report-back instruction",
+                (false, false) => unreachable!("guarded by the outer if"),
+            };
+            push_error(
+                errors,
+                format!(
+                    "{} pane for {}: {what} cannot reach argv on this Windows shim launch, so \
+                     {} held back (mail stays unread)",
+                    req.agent,
+                    req.requested_by,
+                    if withheld_mail && withheld_report_back {
+                        "both are"
+                    } else {
+                        "it is"
+                    }
+                ),
+            );
+        }
+        mail_entries.clear();
+        // Item 13: kept in lockstep with `mail_entries` -- `mail_messages`
+        // is `compose_worker_prompt`'s own already-derived list, reused here
+        // rather than re-cloned from `mail_entries`, so clearing one without
+        // the other would let a withheld message's body still reach
+        // `worker_task_prompt` below even though it was just declared
+        // undeliverable above.
+        mail_messages.clear();
+    }
+
+    let effective_prompt =
+        worker_task_prompt(req, adapter.as_ref(), &mail_messages, cfg, fallback_is_safe);
+
     let extra = pane_launch_extra(adapter.as_ref(), prompt_args, &session_id);
-    let argv = flatten_command(adapter.interactive_cmd(Some(&req.prompt), &extra));
+    let argv = flatten_command(adapter.interactive_cmd(Some(&effective_prompt), &extra));
     let spec = PaneSpec {
         agent_name: req.agent.clone(),
         argv,
@@ -5687,6 +5890,117 @@ mod tests {
         }
     }
 
+    fn a_mail_message() -> mail::Message {
+        mail::Message {
+            from_session: "other-session".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 1,
+            body: "heads up: the webhook route moved".to_string(),
+        }
+    }
+
+    /// A capable adapter (claude) is a no-op here: its mail and report-back
+    /// instruction already rode `compose_worker_prompt`'s own `composed`
+    /// output, so appending them a second time onto the task prompt text
+    /// would duplicate them.
+    #[test]
+    fn worker_task_prompt_is_unchanged_for_an_adapter_with_real_injection() {
+        let req = spawn_request("do the work", Path::new("/repo"));
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
+        let prompt =
+            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+        assert_eq!(prompt, "do the work");
+    }
+
+    /// The bug this exists to close: codex has no system-prompt injection
+    /// mechanism at all, so `compose_worker_prompt`'s `composed` never
+    /// reaches the launched process (`injection_args_for_session` always
+    /// returns an empty argv for it). Without this fallback, a codex worker
+    /// pane never received its mail and was never told to report back --
+    /// the requesting session would then wait forever for a reply that was
+    /// never sent.
+    #[test]
+    fn worker_task_prompt_appends_mail_and_report_back_for_an_uninjectable_adapter() {
+        let req = spawn_request("do the work", Path::new("/repo"));
+        // An explicit, non-PATH-resolvable path: on a machine where `codex`
+        // really is installed as an npm `.cmd` shim, `CodexAdapter::new(None)`
+        // would resolve through PATH to that shim and `launches_through_cmd_shim()`
+        // would report `true`, tripping the shim-unsafe degradation this test
+        // is not exercising. This test is about the non-shim fallback path.
+        let adapter = super::super::adapters::codex::CodexAdapter::new(Some("/tmp/fake-codex"));
+        let cfg = CtxConfig::default();
+        let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
+        let prompt =
+            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+
+        assert!(prompt.starts_with("do the work"), "got {prompt}");
+        assert!(
+            prompt.contains("heads up: the webhook route moved"),
+            "the mail body must reach the task prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("another agent session"),
+            "still labeled as mail, not as an operator instruction: {prompt}"
+        );
+        assert!(
+            prompt.contains("zirv ctx send --to-session aaaa1111 --message '<summary>'"),
+            "the worker must still be told how to report back: {prompt}"
+        );
+        let mail_at = prompt.find("heads up").expect("checked above");
+        let report_back_at = prompt.find("zirv ctx send").expect("checked above");
+        assert!(
+            mail_at < report_back_at,
+            "mail, then the report-back instruction, matching compose_worker_prompt's own \
+             layer order: {prompt}"
+        );
+    }
+
+    /// Low 7 (fix): an empty/whitespace `req.prompt` has no task text above
+    /// the fallback's own `"\n\n---\n\n"` separator to set apart from, so
+    /// the resulting argv token used to start with `---` -- flag-like, and
+    /// confusing regardless. The stripped result must start with the
+    /// fallback's own labeled content instead.
+    #[test]
+    fn worker_task_prompt_strips_the_leading_separator_for_an_empty_prompt() {
+        let req = spawn_request("   ", Path::new("/repo"));
+        let adapter = super::super::adapters::codex::CodexAdapter::new(Some("/tmp/fake-codex"));
+        let cfg = CtxConfig::default();
+        let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
+        let prompt =
+            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+
+        assert!(
+            !prompt.trim_start().starts_with("---"),
+            "must not start with the bare separator: {prompt:?}"
+        );
+        assert!(
+            prompt.starts_with("The following section was written by another agent session"),
+            "must start with the fallback's own labeled content instead: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("heads up: the webhook route moved"),
+            "the mail body must still reach the task prompt: {prompt}"
+        );
+    }
+
+    /// G2 extended to the fallback path: an operator who disabled mail
+    /// delivery must not have a worker told to `zirv ctx send` its outcome
+    /// back either, on this path any more than on the composed-prompt one.
+    #[test]
+    fn worker_task_prompt_omits_report_back_when_mail_is_disabled() {
+        let req = spawn_request("do the work", Path::new("/repo"));
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let mut cfg = CtxConfig::default();
+        cfg.mail.enabled = false;
+        let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
+        let prompt = worker_task_prompt(&req, &adapter, &[], &cfg, fallback_is_safe);
+        assert_eq!(prompt, "do the work");
+    }
+
     /// Runs `fulfill_spawn_request` against an empty pane list. Every
     /// assertion below is on a refusal that happens *before* adapter
     /// resolution or any spawn, so no agent -- real or fake -- is ever
@@ -5726,9 +6040,9 @@ mod tests {
         let repo = tmp.path();
         let slug = super::super::state::repo_slug(repo);
 
-        let (composed, mail_entries) = compose_worker_prompt(
+        let (composed, mail_entries, _) = compose_worker_prompt(
             &spawn_request("do the work", repo),
-            "claude",
+            &super::super::adapters::claude::ClaudeAdapter::new(None),
             "cccc3333",
             &cfg,
             &state,
@@ -5768,8 +6082,15 @@ mod tests {
 
         let mut req = spawn_request("do the work", repo);
         req.requested_by = "unknown".to_string();
-        let (composed, _) =
-            compose_worker_prompt(&req, "claude", "cccc3333", &cfg, &state, repo, &slug);
+        let (composed, _, _) = compose_worker_prompt(
+            &req,
+            &super::super::adapters::claude::ClaudeAdapter::new(None),
+            "cccc3333",
+            &cfg,
+            &state,
+            repo,
+            &slug,
+        );
 
         let composed = composed.expect("a worker pane composes a prompt");
         assert!(
@@ -5795,9 +6116,9 @@ mod tests {
         let repo = tmp.path();
         let slug = super::super::state::repo_slug(repo);
 
-        let (composed, mail_entries) = compose_worker_prompt(
+        let (composed, mail_entries, _) = compose_worker_prompt(
             &spawn_request("do the work", repo),
-            "claude",
+            &super::super::adapters::claude::ClaudeAdapter::new(None),
             "cccc3333",
             &cfg,
             &state,
@@ -5815,6 +6136,53 @@ mod tests {
         assert!(
             mail_entries.is_empty(),
             "mail disabled also suppresses the mail-layer listing, unchanged from before"
+        );
+    }
+
+    /// Codex has no system-prompt injection mechanism at all, so `compose_
+    /// worker_prompt` must not fold mail or the report-back instruction into
+    /// `composed` for it -- `injection_args_for_session` would turn that into
+    /// an empty argv and silently destroy both. `worker_task_prompt`'s own
+    /// tests cover where they land instead (the task prompt text).
+    #[test]
+    fn compose_worker_prompt_leaves_mail_and_report_back_out_of_composed_for_codex() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+
+        mail::store(&state, &slug, &a_mail_message(), &cfg).expect("store mail");
+
+        let (composed, mail_entries, _) = compose_worker_prompt(
+            &spawn_request("do the work", repo),
+            &super::super::adapters::codex::CodexAdapter::new(None),
+            "cccc3333",
+            &cfg,
+            &state,
+            repo,
+            &slug,
+        );
+
+        let composed = composed.expect("codex still gets the agent-neutral layers");
+        assert!(
+            !composed.text.contains("heads up: the webhook route moved"),
+            "mail must not be folded into a composed prompt codex never receives:\n{}",
+            composed.text
+        );
+        assert!(!composed.sources.contains(&prompt::PromptSource::Mail));
+        assert!(
+            !composed.text.contains("zirv ctx send --to-session"),
+            "nor the report-back instruction:\n{}",
+            composed.text
+        );
+        assert!(!composed.sources.contains(&prompt::PromptSource::ReportBack));
+        assert_eq!(
+            mail_entries.len(),
+            1,
+            "the mail is still listed, so the caller can fold it into the task prompt instead"
         );
     }
 
@@ -5871,6 +6239,156 @@ mod tests {
         let reason = refusal_for(&spawn_request("do the work", &repo), &cfg, &repo);
         assert!(reason.contains("pane limit reached"), "got {reason}");
         assert!(reason.contains("dash.max_panes"), "got {reason}");
+    }
+
+    /// I, the High-severity regression this round closes: before
+    /// `task_prompt_fallback_is_safe` existed, every dashboard-spawned codex
+    /// worker on a real Windows npm install (a `.cmd` shim) failed outright
+    /// whenever mail was pending, because the mail-fallback block's embedded
+    /// newlines tripped `guard_cmd_shim_reparse` in `pane.rs` on the
+    /// `cmd.exe /c <shim>` launch. `fulfill_spawn_request` must now spawn
+    /// successfully on exactly that launch shape, holding the mail back
+    /// (unread, so a later, safer launch still gets a chance to deliver it)
+    /// rather than failing the whole pane.
+    #[cfg(windows)]
+    #[test]
+    fn fulfill_spawn_request_spawns_a_shim_shape_codex_pane_and_leaves_mail_unread() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let slug = super::super::state::repo_slug(&repo);
+
+        // A real `.cmd` file on disk: `resolve_program` only routes a name
+        // through `cmd.exe /c` when it actually resolves to a `.cmd`/`.bat`,
+        // so a bare in-memory path is not enough to reproduce the shim shape.
+        let shim = tmp.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let cfg = CtxConfig {
+            agent_bin: Some(shim.display().to_string()),
+            ..CtxConfig::default()
+        };
+        mail::store(&state, &slug, &a_mail_message(), &cfg).expect("store mail");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "codex".to_string();
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
+            &req,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a shim-shape codex launch must spawn, not be refused by the argv guard: {result:?}"
+        );
+        assert_eq!(panes.len(), 1, "the pane was actually created");
+
+        let remaining = mail::list(&state, &slug, Some("codex"), None).expect("list");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "mail that could not reach argv on this launch must stay unread, not be silently \
+             consumed"
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "one narration line explains what was withheld and why: {errors:?}"
+        );
+        assert!(
+            errors[0].contains("cannot reach argv"),
+            "got {:?}",
+            errors[0]
+        );
+
+        // Let the trivial `@echo off` child exit on its own rather than
+        // leaving a lingering handle for the test process to outlive.
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// Medium 1: the other Windows launcher form `guard_cmd_shim_reparse`
+    /// covers (`powershell -NoProfile -File <script>`, for a `.ps1` `agent_
+    /// bin`) must degrade exactly the way the `.cmd` shim does above --
+    /// `task_prompt_fallback_is_safe` used to key on `launches_through_cmd_
+    /// shim` (cmd-only), which reported this launch "safe" while `pane.rs`'s
+    /// own guard still refused it on the reparsed argv.
+    #[cfg(windows)]
+    #[test]
+    fn fulfill_spawn_request_spawns_a_powershell_shim_codex_pane_and_leaves_mail_unread() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let slug = super::super::state::repo_slug(&repo);
+
+        // A real `.ps1` file on disk: `resolve_program` only routes a name
+        // through `powershell -File` when it actually resolves to a `.ps1`.
+        let shim = tmp.path().join("codex.ps1");
+        std::fs::write(&shim, "exit 0\r\n").expect("write shim");
+
+        let cfg = CtxConfig {
+            agent_bin: Some(shim.display().to_string()),
+            ..CtxConfig::default()
+        };
+        mail::store(&state, &slug, &a_mail_message(), &cfg).expect("store mail");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "codex".to_string();
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
+            &req,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a .ps1 shim-shape codex launch must spawn, not be refused by the argv guard: \
+             {result:?}"
+        );
+        assert_eq!(panes.len(), 1, "the pane was actually created");
+
+        let remaining = mail::list(&state, &slug, Some("codex"), None).expect("list");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "mail that could not reach argv on this launch must stay unread, not be silently \
+             consumed"
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "one narration line explains what was withheld and why: {errors:?}"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
     // F11: the spawn dialog's own reducer.

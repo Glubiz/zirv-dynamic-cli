@@ -1190,6 +1190,7 @@ pub fn run_with(
     let mut bar = BarRuntime::new(
         chrome,
         adapter.name().to_string(),
+        adapter.provider().to_string(),
         super::sessions::short_id(session.as_str()),
         cfg.mail.enabled,
         stdout_lock.clone(),
@@ -1259,7 +1260,7 @@ pub fn run_with(
         inject_timeout,
         repo,
         cfg.handoff.tail_items,
-        &cfg.handoff.model,
+        &handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref()),
         Duration::from_secs(cfg.handoff.timeout_secs),
         &cfg,
         &memory_slug,
@@ -1321,6 +1322,12 @@ struct BarRuntime {
     last_text: Option<String>,
     last_draw: Instant,
     harness: String,
+    /// The resolved adapter's own `AgentAdapter::provider()` (`"anthropic"`
+    /// for claude, `"openai"` for codex), so `redraw_bar_if_due` reads the
+    /// usage window for *this* session's account rather than the legacy
+    /// unscoped file every session used to share. See `window::has_no_usage_
+    /// source`/`load_for` and [[Usage and Pacing]].
+    provider: String,
     /// This session's own short id (`sessions::short_id`'s vocabulary), used
     /// to scope the mail count `unread_mail_count` reads to messages this
     /// session may actually see, not every session's mail in the repo.
@@ -1335,6 +1342,7 @@ impl BarRuntime {
     fn new(
         chrome: super::chrome::Chrome,
         harness: String,
+        provider: String,
         session_short: String,
         mail_enabled: bool,
         stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
@@ -1355,6 +1363,7 @@ impl BarRuntime {
                 .checked_sub(BAR_THROTTLE)
                 .unwrap_or_else(Instant::now),
             harness,
+            provider,
             session_short,
             mail_enabled,
             stdout_lock,
@@ -1460,7 +1469,17 @@ fn redraw_bar_if_due(
     }
     bar.last_draw = now;
 
-    let windows = super::window::load(state_dir);
+    // Per-provider since this fix: `window::load` is the legacy machine-wide
+    // file every session used to share, so a wrapped codex session's bar
+    // used to render whatever Anthropic numbers a claude session happened to
+    // leave there. `load_for` falls back to that same legacy file for
+    // claude's own provider (`anthropic`), so this is a no-op for the common
+    // case; for a provider with no usage source at all (codex/openai today)
+    // it now reads as `UsageWindows::default()`, which `max_used_percentage`
+    // already turns into `None` -- and `status_bar` already renders `None`
+    // as the placeholder dash, never a misleading `0%`. No renderer change
+    // needed at all, only which windows are read.
+    let windows = super::window::load_for(state_dir, &bar.provider).unwrap_or_default();
     let usage_percent = super::window::max_used_percentage(&windows);
     let unread_mail = unread_mail_counts(
         state_dir,
@@ -1950,11 +1969,72 @@ mod tests {
                 colour: false,
             },
             "claude".to_string(),
+            "anthropic".to_string(),
             "sess0000".to_string(),
             true,
             std::sync::Arc::new(std::sync::Mutex::new(())),
             size,
         )
+    }
+
+    /// Item 2 (Usage and Pacing follow-up): the status bar used to read the
+    /// single legacy `usage.json` regardless of which adapter it was
+    /// wrapping, so a codex (`openai`) session's bar rendered whatever
+    /// Anthropic numbers a claude session happened to leave there. It now
+    /// reads `window::load_for(state_dir, &bar.provider)`, so a codex
+    /// session's usage segment must show the placeholder dash (no usage
+    /// source) even while a real claude reading sits in the legacy file --
+    /// and a claude session must still see it, via the same legacy-file
+    /// fallback `load_for` already gives `anthropic`.
+    #[test]
+    fn a_codex_sessions_bar_does_not_inherit_claudes_own_legacy_usage_reading() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        super::super::window::store(
+            &state,
+            &super::super::window::UsageWindows {
+                five_hour: Some(super::super::window::Window {
+                    used_percentage: 42.0,
+                    resets_at: 0,
+                    observed_at: 1,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store the legacy (claude) reading");
+
+        let mut codex_bar = test_bar((80, 1));
+        codex_bar.provider = "openai".to_string();
+        redraw_bar_if_due(
+            &mut codex_bar,
+            &InjectionState::new(),
+            &state,
+            tmp.path(),
+            Instant::now(),
+        );
+        let codex_text = codex_bar.last_text.expect("the bar drew something");
+        assert!(
+            !codex_text.contains("42%"),
+            "codex must not inherit claude's own legacy reading: {codex_text}"
+        );
+        assert!(
+            codex_text.contains("usage \u{2013}"),
+            "and must show the placeholder, not a fabricated zero: {codex_text}"
+        );
+
+        let mut claude_bar = test_bar((80, 1));
+        redraw_bar_if_due(
+            &mut claude_bar,
+            &InjectionState::new(),
+            &state,
+            tmp.path(),
+            Instant::now(),
+        );
+        let claude_text = claude_bar.last_text.expect("the bar drew something");
+        assert!(
+            claude_text.contains("42%"),
+            "claude keeps reading the legacy file via its own provider fallback: {claude_text}"
+        );
     }
 
     /// Item 2 (regression): a shrink that disables the bar must move

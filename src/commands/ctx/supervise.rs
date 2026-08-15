@@ -295,7 +295,13 @@ impl OutputTap {
 /// resolved program and arguments from the assembled `Command` and defers to
 /// the one metacharacter policy in `adapters::guard_cmd_shim_reparse`. A
 /// no-op off Windows and for any non-shim program.
-fn guard_cmd_shim_reparse(command: &Command) -> CtxResult<()> {
+///
+/// L: `pub(crate)` (not just this module's own `spawn_tapped` chokepoint) so
+/// `handoff::run_model` -- the judgment/distiller child, spawned directly
+/// rather than through `spawn_tapped` -- can reach the same guard at its own
+/// spawn seam, matching every other place a `Command` an adapter built is
+/// actually spawned.
+pub(crate) fn guard_cmd_shim_reparse(command: &Command) -> CtxResult<()> {
     let program = command.get_program().to_string_lossy().to_string();
     let args: Vec<String> = command
         .get_args()

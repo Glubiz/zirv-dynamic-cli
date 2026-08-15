@@ -608,6 +608,15 @@ impl AgentAdapter for ClaudeAdapter {
         cmd
     }
 
+    /// A real, verified cheap-model name for claude's own lineup -- the
+    /// value `handoff.model`/`optimize.model` defaulted to before it became
+    /// per-adapter (see `resolve_distiller_model` in `handoff.rs`). Specific
+    /// to claude by construction: a hardcoded model name from one agent's
+    /// lineup has no business leaking into another adapter's default.
+    fn default_distiller_model(&self) -> Option<&'static str> {
+        Some("haiku")
+    }
+
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
         let projects = self.home_dir().join(".claude").join("projects");
         let computed = projects
@@ -653,6 +662,7 @@ impl AgentAdapter for ClaudeAdapter {
             token_usage: true,
             turn_signal: true,
             system_prompt: true,
+            events: true,
         }
     }
 
@@ -1020,18 +1030,12 @@ mod tests {
     use crate::commands::ctx::adapters::{AgentAdapter, SESSION_ENV, SOCKET_ENV};
     use crate::commands::ctx::event::{SessionId, SessionRef};
 
-    /// The flags an adapter-built command carries, with any launcher prefix
-    /// dropped. On a Windows machine where `claude` is an npm `.cmd` shim
-    /// every command this adapter builds starts `cmd.exe /c <shim>`, and
-    /// those tokens are not what a test about agent flags is asserting on.
+    /// I: `super::super::built_args` (`adapters/mod.rs`) takes the program
+    /// string rather than the whole adapter, since `program` is private to
+    /// this module -- this thin wrapper is what lets every call site below
+    /// keep passing `&adapter` unchanged.
     fn built_args(adapter: &ClaudeAdapter, cmd: &Command) -> Vec<String> {
-        let launcher = super::super::resolve_program(&adapter.program)
-            .map(|resolved| resolved.prefix.len())
-            .unwrap_or(0);
-        cmd.get_args()
-            .skip(launcher)
-            .map(|a| a.to_string_lossy().to_string())
-            .collect()
+        super::super::built_args(&adapter.program, cmd)
     }
 
     #[test]
@@ -1374,6 +1378,16 @@ mod tests {
         assert_eq!(
             adapter.model_args("opus"),
             vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    /// C: claude keeps a real default so `resolve_distiller_model` never has
+    /// to fall back to an empty model for it, unlike codex.
+    #[test]
+    fn claude_defaults_the_distiller_model_to_haiku() {
+        assert_eq!(
+            ClaudeAdapter::new(None).default_distiller_model(),
+            Some("haiku")
         );
     }
 

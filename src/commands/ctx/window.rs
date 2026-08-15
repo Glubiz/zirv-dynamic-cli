@@ -118,6 +118,24 @@ pub fn load_for(state: &StateDir, provider: &str) -> Option<UsageWindows> {
     None
 }
 
+/// E: whether `provider` has **no possible** usage source, as distinct from
+/// "nothing recorded yet." Only claude (`LEGACY_USAGE_PROVIDER`) has a real
+/// collector mechanism today (`usage::run_tee`, Claude Code's own statusline
+/// hook) -- a fresh machine that has never tee'd a statusline has no reading
+/// for it either, but "wire your statusline through `zirv ctx usage tee`" is
+/// still the true, actionable answer there, so claude is exempt from this
+/// check regardless of whether [`load_for`] currently finds a file.
+///
+/// Any other provider (codex/openai today) has no write path at all by
+/// design, so [`load_for`] returning `None` for it *is* the honest, durable
+/// answer: pacing (`pace::wait_for_window`) and `zirv ctx usage`'s own report
+/// both key off this, rather than `load_for(..).is_none()` alone, which
+/// cannot tell "structurally impossible" from "claude, not tee'd yet."
+pub fn has_no_usage_source(state: &StateDir, provider: &str) -> bool {
+    super::state::provider_slug(provider) != LEGACY_USAGE_PROVIDER
+        && load_for(state, provider).is_none()
+}
+
 fn newer(existing: Option<Window>, fresh: Option<Window>) -> Option<Window> {
     match (existing, fresh) {
         (Some(existing), Some(fresh)) if fresh.observed_at >= existing.observed_at => Some(fresh),
@@ -565,6 +583,37 @@ mod tests {
             load(&state),
             UsageWindows::default(),
             "a provider write must not touch the legacy global file"
+        );
+    }
+
+    /// E: codex/openai has no possible source (no tee writes for it, ever,
+    /// today), so a fresh state dir with nothing written must read that way
+    /// -- even after storing data for a *different* provider, which must
+    /// never leak into this one's answer.
+    #[test]
+    fn has_no_usage_source_is_true_for_a_provider_with_no_collector() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(has_no_usage_source(&state, "openai"));
+
+        store_for(&state, "anthropic", &windows_at(50.0, 10)).expect("store");
+        assert!(
+            has_no_usage_source(&state, "openai"),
+            "another provider's own data must not count as this one's source"
+        );
+    }
+
+    /// E: claude is exempt even before its first statusline tee -- "not yet"
+    /// is still the true, actionable answer for the one provider with a real
+    /// collector mechanism, so `has_no_usage_source` must stay `false` for it
+    /// regardless of whether a file happens to exist yet.
+    #[test]
+    fn has_no_usage_source_is_false_for_claude_even_before_the_first_tee() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(
+            !has_no_usage_source(&state, "anthropic"),
+            "claude has a real collector mechanism, just nothing recorded yet"
         );
     }
 

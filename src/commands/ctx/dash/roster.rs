@@ -307,7 +307,14 @@ mod tests {
 
     #[test]
     fn restore_argv_falls_back_to_a_prompt_carrying_launch_when_unverified() {
-        let adapter = CodexAdapter::new(None);
+        // An explicit path rather than the bare default: on a machine with a
+        // real npm-installed `codex.cmd` on `PATH` (this one, among others),
+        // `CodexAdapter::base` now legitimately resolves the bare "codex"
+        // through `cmd.exe /c <shim>` (mirroring claude's own shim
+        // handling), so `argv[0]` would be `cmd.exe`, not `codex`. This test
+        // is about the resume-fallback text, not the launcher rewrite, so it
+        // pins a program that never resolves to anything on `PATH`.
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex"));
         let pane = RosterPane {
             agent: "codex".to_string(),
             session_id: "22222222-2222-4333-8444-555555555555".to_string(),
@@ -316,7 +323,7 @@ mod tests {
             title: "wrk codex".to_string(),
         };
         let argv = restore_argv(&adapter, &pane);
-        assert_eq!(argv[0], "codex");
+        assert_eq!(argv[0], "/tmp/fake-codex");
         assert!(
             argv.iter()
                 .any(|a| a.contains("resuming after a dashboard restart")),

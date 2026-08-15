@@ -171,6 +171,31 @@ not invent progress that is not evidenced below.\n\n\
 
 const DISTILL_POLL: Duration = Duration::from_millis(25);
 
+/// Turns the operator's own model config into the `model: &str`
+/// `distiller_cmd`/`run_model`/`distill`/`distill_or_structural` all take:
+/// `explicit` (the operator's `handoff.model`/`optimize.model`) if set, else
+/// the resolved adapter's own [`AgentAdapter::default_distiller_model`].
+///
+/// `handoff.model` used to default to the literal `"haiku"` unconditionally,
+/// which reached `codex exec --model haiku` for a codex session and failed
+/// outright, falling back to codex's empty `structural_context` for a
+/// silently near-empty handoff. Every model-taking caller in this module,
+/// `exec.rs`, `wrap.rs`, and `optimize.rs` goes through this rather than
+/// reading `cfg.handoff.model`/`cfg.optimize.model` directly, so a third
+/// adapter with its own default (or none) is handled without an edit at any
+/// of those call sites.
+///
+/// Empty (never `None` -- every current caller's `distiller_cmd` reads an
+/// empty model as "omit the flag", not "error") when neither the operator
+/// nor the adapter named one, which is codex's own case today.
+pub fn resolve_distiller_model(explicit: Option<&str>, adapter: &dyn AgentAdapter) -> String {
+    explicit
+        .filter(|m| !m.is_empty())
+        .or_else(|| adapter.default_distiller_model())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Runs one fresh model call and returns its stdout. The child is bounded on
 /// every axis that can hang a supervisor: stdin and stdout are each serviced
 /// on their own thread, started before either side has exchanged a byte, so
@@ -201,6 +226,14 @@ pub fn run_model(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
+    // L: the same FIX 2a chokepoint `supervise::spawn_tapped` applies to
+    // every headless `exec`/`loop` spawn. This distiller child is spawned
+    // directly rather than through that function, so it had no guard of its
+    // own against a Windows `cmd.exe /c <shim>` launch reparsing a
+    // metacharacter out of its argv -- a pre-existing gap, not something
+    // this round introduced, but the same class the rest of this codebase
+    // closes at every other spawn seam.
+    super::supervise::guard_cmd_shim_reparse(&command)?;
     let mut child = command.spawn()?;
 
     let mut stdout = child.stdout.take().ok_or("model stdout unavailable")?;
@@ -249,12 +282,29 @@ pub fn run_model(
 /// Bounded by `timeout`, because `wrap` calls this from its pump: a model call
 /// that never answers would otherwise freeze the user's own terminal with no
 /// way out but killing the wrapper.
+///
+/// D, symmetric with `score::full_score`'s own guard: an adapter with no
+/// verified event parsing (`capabilities().events == false`, codex today)
+/// has `structural_context` stubbed to always return `StructuralContext::
+/// default()` -- there is never anything real in `ctx` to distill. Spawning
+/// the judgment-model child anyway would ask it to summarize nothing, and a
+/// plausible-looking answer would then be reported as `"distilled"`, exactly
+/// the fabricated-verdict class `full_score`'s own guard exists to prevent.
+/// Refusing here, before the child is ever spawned, is what `distill_or_
+/// structural` below relies on to report the honest `"no data"` instead.
 pub fn distill(
     adapter: &dyn AgentAdapter,
     model: &str,
     ctx: &StructuralContext,
     timeout: Duration,
 ) -> CtxResult<Handoff> {
+    if !adapter.capabilities().events {
+        return Err(format!(
+            "{} has no verified event parsing; nothing to distill",
+            adapter.name()
+        )
+        .into());
+    }
     let answer = run_model(adapter, model, &distill_prompt(ctx), timeout)?;
     let handoff = parse_markdown(&answer);
     if !handoff.is_usable() {
@@ -264,12 +314,22 @@ pub fn distill(
 }
 
 /// Never fails: a restart always has something to stand on.
+///
+/// D: the eventless case is checked here too, not just inside `distill`
+/// (which would otherwise be reached and its `Err` mapped to the ordinary
+/// `"structural"` label) -- `structural(ctx)` over an always-empty `ctx` is
+/// not a real mechanical extraction the way it is for an adapter whose
+/// transcript actually populated `ctx`, so it gets its own label, `"no
+/// data"`, rather than borrowing one that implies real (if crude) content.
 pub fn distill_or_structural(
     adapter: &dyn AgentAdapter,
     model: &str,
     ctx: &StructuralContext,
     timeout: Duration,
 ) -> (Handoff, &'static str) {
+    if !adapter.capabilities().events {
+        return (structural(ctx), "no data");
+    }
     match distill(adapter, model, ctx, timeout) {
         Ok(handoff) => (handoff, "distilled"),
         Err(_) => (structural(ctx), "structural"),
@@ -346,12 +406,23 @@ pub fn run_with<W: Write>(
         .map_err(|e| format!("{}: {e}", args.transcript.display()))?;
     let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
 
-    let (handoff, source) = if args.no_model {
+    // Low 6: the eventless check wins regardless of `--no-model`. For an
+    // adapter with no verified event parsing (`capabilities().events ==
+    // false`, codex today), `ctx` above is always `StructuralContext::
+    // default()` (`structural_context` is stubbed empty), so labelling it
+    // `"structural"` here -- as `--no-model` used to do unconditionally --
+    // implies a real mechanical extraction that never happened, the same
+    // dishonesty `distill_or_structural`'s own `"no data"` label (below)
+    // already closed for the non-`--no-model` path. `structural` is now
+    // reserved for an adapter whose `ctx` came from a real transcript.
+    let (handoff, source) = if !adapter.capabilities().events {
+        (structural(&ctx), "no data")
+    } else if args.no_model {
         (structural(&ctx), "structural")
     } else {
         distill_or_structural(
             adapter.as_ref(),
-            &cfg.handoff.model,
+            &resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref()),
             &ctx,
             Duration::from_secs(cfg.handoff.timeout_secs),
         )
@@ -420,6 +491,43 @@ mod tests {
             files_touched: vec!["src/routes/webhook.rs".to_string()],
             tool_errors: vec!["401 from the provider".to_string()],
         }
+    }
+
+    /// C: the operator's own explicit choice always wins, regardless of the
+    /// adapter's own default.
+    #[test]
+    fn resolve_distiller_model_prefers_the_operators_explicit_choice() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(resolve_distiller_model(Some("sonnet"), &adapter), "sonnet");
+    }
+
+    /// C: with nothing explicit, claude's own real default ("haiku") is what
+    /// used to be `HandoffConfig::default().model` unconditionally.
+    #[test]
+    fn resolve_distiller_model_falls_back_to_claudes_own_default() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(resolve_distiller_model(None, &adapter), "haiku");
+    }
+
+    /// C: codex has no verified cheap-model default of its own
+    /// (`CodexAdapter::default_distiller_model` is `None`), so with nothing
+    /// explicit this resolves to empty -- which `CodexAdapter::distiller_
+    /// cmd` reads as "omit --model entirely" rather than guess a name.
+    #[test]
+    fn resolve_distiller_model_is_empty_for_codex_with_nothing_explicit() {
+        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        assert_eq!(resolve_distiller_model(None, &adapter), "");
+    }
+
+    /// C: an explicit empty string (an operator setting `handoff.model =
+    /// ""`, or `optimize.model`'s own "empty means defer" convention) is
+    /// treated the same as "nothing explicit" -- it still falls back to the
+    /// adapter's own default, rather than being passed straight through as
+    /// a literal empty model name.
+    #[test]
+    fn resolve_distiller_model_treats_an_explicit_empty_string_as_unset() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(resolve_distiller_model(Some(""), &adapter), "haiku");
     }
 
     #[test]
@@ -525,6 +633,45 @@ mod tests {
         assert!(handoff.is_usable());
     }
 
+    /// D, symmetric with `score::full_score_refuses_an_adapter_with_no_
+    /// event_parsing`: codex's `structural_context` is stubbed to always
+    /// return `StructuralContext::default()`, so both `distill` and `distill_
+    /// or_structural` must refuse before ever spawning the judgment-model
+    /// child, and the latter must report `"no data"`, not `"structural"` --
+    /// that label is reserved for an adapter whose `ctx` came from a real
+    /// transcript. A garbage `model` name proves the point: if either
+    /// function tried to spawn it, this would fail some other way (a spawn
+    /// error, or a timeout), not return cleanly.
+    #[test]
+    fn an_eventless_adapter_never_spawns_the_distiller_and_reports_no_data() {
+        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        assert!(!adapter.capabilities().events);
+
+        let err = distill(
+            &adapter,
+            "definitely-not-a-real-model-binary",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+        )
+        .expect_err("no event parsing means nothing to distill");
+        assert!(
+            err.to_string().contains("no verified event parsing"),
+            "got {err}"
+        );
+
+        let (handoff, source) = distill_or_structural(
+            &adapter,
+            "definitely-not-a-real-model-binary",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+        );
+        assert_eq!(
+            source, "no data",
+            "not \"structural\": ctx here is never real"
+        );
+        assert!(handoff.is_usable(), "still something to stand on");
+    }
+
     /// `wrap` calls this from its pump, so an unbounded wait is a frozen
     /// terminal for the user with no way out but killing the wrapper.
     #[test]
@@ -593,6 +740,33 @@ mod tests {
         }
         let err = result.expect_err("non-zero exit surfaces");
         assert!(err.to_string().contains('4'), "report the exit code: {err}");
+    }
+
+    /// L: `run_model` is spawned directly, not through `supervise::
+    /// spawn_tapped`, so it had no guard of its own against a Windows
+    /// `cmd.exe /c <shim>` launch reparsing a metacharacter out of its argv
+    /// -- `model` is repo-forbidden (`REPO_FORBIDDEN`), so this is defense
+    /// in depth rather than a live path today, but the guard has to actually
+    /// run at this seam for that to be true. Proven the same way claude.rs's
+    /// own shim tests are: a `.cmd` shim that writes a sentinel if it ever
+    /// runs, and a metacharacter-bearing argv token that must never reach it.
+    #[cfg(windows)]
+    #[test]
+    fn run_model_refuses_a_cmd_shim_launch_with_a_metachar_in_argv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("fake-model.cmd");
+        std::fs::write(
+            &shim,
+            "@echo off\r\necho ran> \"%~dp0ran.marker\"\r\necho ## Task\r\n",
+        )
+        .expect("write shim");
+        let sentinel = dir.path().join("ran.marker");
+
+        let adapter = ClaudeAdapter::new(Some(&shim.display().to_string()));
+        let err = run_model(&adapter, "foo&calc", "prompt", Duration::from_secs(5))
+            .expect_err("a metachar in argv must be refused before spawn");
+        assert!(err.to_string().contains("foo&calc"), "got {err}");
+        assert!(!sentinel.exists(), "the shim must never have been spawned");
     }
 
     /// Before this, `run_model` wrote the whole prompt to the child's stdin
@@ -926,6 +1100,43 @@ mod tests {
         assert!(
             text.contains("/work/src/lib.rs"),
             "files from tool calls: {text}"
+        );
+    }
+
+    /// Low 6 (fix): for an eventless adapter, `--no-model` used to still
+    /// label the result `"structural"`, the same label the non-`--no-model`
+    /// path reserves for an adapter whose `ctx` came from a real
+    /// transcript. Codex's `ctx` here is always `StructuralContext::
+    /// default()` regardless of the transcript on disk (`structural_
+    /// context` is stubbed empty), so the honest label is `"no data"`,
+    /// matching `distill_or_structural`'s own vocabulary, and it must win
+    /// even though `--no-model` never reaches that function at all.
+    #[test]
+    fn no_model_on_an_eventless_adapter_still_reports_no_data_not_structural() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_with(tmp.path(), "ship the webhook");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+
+        let args = HandoffArgs {
+            transcript,
+            agent: Some("codex".to_string()),
+            session_id: None,
+            stdout: false,
+            no_model: true,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+
+        let log =
+            std::fs::read_to_string(tmp.path().join("state/logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"no data\""), "got {log}");
+        assert!(
+            !log.contains("\"action\":\"structural\""),
+            "structural implies a real mechanical extraction codex never had: {log}"
         );
     }
 }

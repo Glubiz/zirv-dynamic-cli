@@ -47,20 +47,38 @@ pub enum Event {
     /// transcript confirmed it actually happened.
     Compact { verified: bool },
     /// A rotted session was restarted, naming the handoff style
-    /// (`"distilled"` or `"structural"`, `handoff::distill_or_structural`'s
-    /// own vocabulary) and where the handoff was stored.
+    /// (`"distilled"`, `"structural"`, or `"no data"` for an adapter with no
+    /// verified event parsing at all, `handoff::distill_or_structural`'s own
+    /// vocabulary) and where the handoff was stored.
     Restart { style: String, stored: String },
     /// Unread mail is waiting in the mailbox (the T8 advisory `wrap`'s pump
     /// used to build by hand).
     MailWaiting { count: usize },
     /// Mail was folded into a composed prompt at session start.
     MailDelivered { count: usize },
+    /// Low 8: mail was pending but this launch has no channel to carry it
+    /// at all -- `exec.rs`'s own `mail_deliverable == false` case (an
+    /// explicit `--` command for an adapter with no system-prompt
+    /// mechanism, which has neither `composed` nor task-prompt text to
+    /// append to), the headless-side counterpart of the narration
+    /// `dash/mod.rs`'s worker-pane spawn already gives (`push_error`) when
+    /// its own, narrower "unsafe on this launch" case holds mail back.
+    /// Left unread, same as there -- still visible to `zirv ctx inbox` and
+    /// to any other session that can actually deliver it.
+    MailWithheld { count: usize },
     /// The pacing gate is waiting on a usage window, naming which one and
     /// when it is expected to reset.
     PacingWait {
         window: String,
         reset_at: Option<u64>,
     },
+    /// E: the pacing gate never ran a single decision for this session,
+    /// because the resolved adapter's provider has no usage source at all
+    /// (`window::load_for` returned `None` and it is not the legacy
+    /// anthropic file) -- naming the provider so an operator watching a
+    /// codex session does not wonder why no pacing lines ever appear, and
+    /// does not mistake the silence for "usage is healthy".
+    PacingSkipped { provider: String },
     /// Supervision degraded to permanent passthrough, naming what caused it.
     Degraded { cause: String },
     /// Context health is slipping (the rot advisory `wrap`'s pump used to
@@ -178,10 +196,20 @@ impl Event {
                 let plural = if *count == 1 { "" } else { "s" };
                 format!("delivered {count} mail message{plural} into the session prompt")
             }
+            Event::MailWithheld { count } => {
+                let plural = if *count == 1 { "" } else { "s" };
+                format!(
+                    "{count} mail message{plural} cannot reach this launch (no delivery channel \
+                     for this adapter/command shape); left unread"
+                )
+            }
             Event::PacingWait { window, reset_at } => match reset_at {
                 Some(at) => format!("pacing: waiting on the {window} window, resets at unix {at}"),
                 None => format!("pacing: waiting on the {window} window, reset time unknown"),
             },
+            Event::PacingSkipped { provider } => {
+                format!("pacing off: {provider} has no usage source")
+            }
             Event::Degraded { cause } => format!("supervision degraded: {cause}"),
             Event::RotAdvisory { score, tokens } => format!(
                 "context health is slipping (score {score}, {tokens} tokens in context); a \
@@ -442,6 +470,18 @@ mod tests {
         assert!(unknown.line().contains("unknown"), "got {}", unknown.line());
     }
 
+    /// E: names the provider so an operator watching a codex session does
+    /// not mistake pacing's silence for "usage is healthy".
+    #[test]
+    fn a_pacing_skipped_announcement_names_the_provider() {
+        let event = Event::PacingSkipped {
+            provider: "openai".to_string(),
+        };
+        let line = event.line();
+        assert!(line.contains("openai"), "got {line}");
+        assert!(line.contains("no usage source"), "got {line}");
+    }
+
     #[test]
     fn a_mail_delivery_announcement_counts_the_notes_it_added() {
         let one = Event::MailDelivered { count: 1 };
@@ -449,6 +489,27 @@ mod tests {
         let many = Event::MailDelivered { count: 3 };
         assert!(
             many.line().contains("3 mail messages "),
+            "got {}",
+            many.line()
+        );
+    }
+
+    /// Low 8: `exec.rs`'s own visibility gap -- when `mail_deliverable` is
+    /// false (an explicit `--` command for an adapter with no system-prompt
+    /// mechanism), mail is left unread with no announcement at all, so an
+    /// operator watching the `zirv ▸` channel could not tell "nothing
+    /// pending" from "something pending but silently withheld".
+    #[test]
+    fn a_mail_withheld_announcement_counts_and_explains_itself() {
+        let one = Event::MailWithheld { count: 1 };
+        let line = one.line();
+        assert!(line.contains("1 mail message "), "got {line}");
+        assert!(line.contains("cannot reach"), "got {line}");
+        assert!(line.contains("unread"), "got {line}");
+
+        let many = Event::MailWithheld { count: 2 };
+        assert!(
+            many.line().contains("2 mail messages "),
             "got {}",
             many.line()
         );
@@ -575,9 +636,13 @@ mod tests {
             },
             Event::MailWaiting { count: 2 },
             Event::MailDelivered { count: 2 },
+            Event::MailWithheld { count: 2 },
             Event::PacingWait {
                 window: "five_hour".to_string(),
                 reset_at: None,
+            },
+            Event::PacingSkipped {
+                provider: "openai".to_string(),
             },
             Event::Degraded {
                 cause: "x".to_string(),

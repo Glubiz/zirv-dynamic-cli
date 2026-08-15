@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-15
+last-verified: 2026-08-16
 ---
 
 # Known Issues
@@ -14,6 +14,11 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-16 (feat/dashboard, codex review-fix final wave): agent joined REPO_FORBIDDEN (a repo ctx.toml could otherwise pick which vendor account gets spent, since resolve_default's configured arm never consulted the repo-narrowing guard); exec.rs's prompt_via_stdin/.ps1 shim-routing dropped its adapter_builds_launch conjunct so a relaunch of an explicit-command run correctly uses stdin on a shim-resolved agent instead of tripping guard_cmd_shim_reparse; the repo_narrowed pre-check and the usage/status provider fallback both got narrower false-premise fixes (agent_bin cross-adapter skip; resolve_default tried before name-derivation) -- a new entry records the limit-park loop's structural lack of throttling for a provider with no usage collector, not fixed -->
+<!-- Updated 2026-08-15 (feat/dashboard, codex review-fix round 3): closed the dash/mod.rs shim-guard trip (a Windows npm codex.cmd launch now degrades to the bare task prompt instead of being refused whenever mail was pending); status.rs became the third per-provider usage surface; the nudge arm, an eventless adapter's handoff distillation, resolve_default's repo-narrowed refusal and the usage.rs no-subcommand fallback all got the same mail_deliverable/capabilities().events/ready() honesty fixes as their siblings; a new agent_bin cross-adapter collision guard was added -- codex's distiller sandbox residual (still reads .rules/config.toml on the npm-published 0.105.0) is recorded below as a new entry, not fixed -->
+<!-- Updated 2026-08-15 (feat/dashboard, codex review-fix round 2): closed the two remaining mail-destruction copies (dash/mod.rs's worker-pane spawn, now also folding the F3 report-back instruction the same way; exec.rs's explicit-command shape, which has no task-prompt text to append to so it now leaves undeliverable mail untouched instead of destroying it) and the wrap.rs status-bar residual (now per-provider, same window::load_for/has_no_usage_source fix pace.rs/usage.rs got) -- the "wrap's status bar" Known Issues entry from round 1 is removed as resolved -->
+<!-- Updated 2026-08-15 (feat/dashboard, codex review-fix round): mail now reaches an injection-less adapter's task prompt instead of being silently destroyed; codex's distiller pinned to --sandbox read-only and no longer defaults to claude's "haiku"; a no-events adapter reports unknown/no-data instead of a fabricated Healthy/0; pacing and `zirv ctx usage` became per-provider (wrap's status bar is the one residual unscoped reader, see below); a repo-only disable of the default agent now refuses rather than silently switching provider; two new entries recorded rather than fixed -- wrap's status bar gap, and the per-adapter (not secure-by-default) shim defense -->
+<!-- Updated 2026-08-15 (feat/dashboard, codex support round): closed the codex adapter's cmd.exe shim gap (resolve_program + launches_through_cmd_shim + stdin prompt delivery) and codex::ready() no longer hard-errors -- codex is now a selectable, launchable adapter with an honestly degraded surface; what remains open is event parsing (issue #11) -->
 <!-- Updated 2026-08-15 (feat/dashboard, scrolling+overlay+header round): vt100's alternate-screen scrollback trap (two independent mechanisms) plus its Ctrl+A PageUp corollary; the invisible/transparent-overlay class closed (Clear + full-frame fallback); crossterm's EnableMouseCapture banned from the dashboard; removed the now-resolved "no rot score in a pane" entry -- score::cached_score is wired into both the header and the sidebar -->
 <!-- Updated 2026-08-14 (feat/dashboard, round-9 review): closed the help-probe RCE and the case-folded reserved-name bypass; Windows tree-kill, atomic state writes, and memory-prune parse safety; dashboard cursor/key-encoding/quit-latency fixes and the ⏸ glyph's removal -->
 <!-- Updated 2026-08-14 (feat/dashboard, security round): cmd.exe argv-reparse injection class recorded, with the two shipped defenses and the deferred file-preference hardening -->
@@ -104,15 +109,85 @@ contains a raw cmd.exe metacharacter is still refused by the backstop on a
 Windows npm `.cmd` install (rephrase it). Headless is the common automation
 path and is not subject to this (FIX B delivers it via stdin).
 
-**The codex adapter has the same shim gap claude had before the round-9
-fix, but it's inert.** `CodexAdapter::base()` does not route through
-`resolve_program` and overrides neither `launches_through_cmd_shim` nor
-`system_prompt_file_flag` — harmless today only because `codex::ready()`
-always errors, so no codex launch ever reaches a spawn. When codex becomes a
-completed adapter it **must** mirror claude (`resolve_program` + shim
-detection + forced system-prompt-file delivery), or completing it
-reintroduces this exact Windows `.cmd` reparse RCE class. See [[Ctx
+**The codex adapter's shim gap is closed.** `CodexAdapter::base()` now
+routes `self.program` through `resolve_program`, exactly like claude, so an
+npm-installed `codex.cmd` launches through `cmd.exe /c <shim>` on Windows
+instead of failing outright. `launches_through_cmd_shim` is overridden the
+same way claude's is (`super::launches_through_cmd_shim(&self.program)`), so
+`exec`/`run_loop`'s FIX B branch recognises a codex shim launch and delivers
+the headless prompt via `headless_cmd_stdin` (codex's own verified stdin
+fallback: `codex exec` with `[PROMPT]` omitted reads from stdin) instead of
+as an argv token cmd.exe would reparse. `codex::ready()` no longer hard-errors
+either -- it mirrors `ClaudeAdapter::ready` (`resolve_program(&self.program)?`)
+-- so codex is a selectable, launchable adapter, just with no event parsing
+wired up yet (`parse_events`/`structural_context` stay empty; no rot score, no
+usage source, no turn signal, no injected system prompt). There is no
+`system_prompt_file_flag` override because there is still no verified
+per-run system-prompt mechanism at all for codex, so nothing is ever put on
+argv for that flag to move off of. Full event support is tracked in
+[issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11). See [[Ctx
 Adapters]].
+
+## The Windows `cmd.exe`-shim defense is opt-in per adapter, not secure by default
+
+`AgentAdapter`'s trait defaults for `launches_through_cmd_shim` (`false`) and
+`headless_cmd_stdin` (`None`) are the *insecure* answers -- "this adapter is
+never a shim launch" and "no stdin form, keep the prompt on argv." Both of
+today's adapters override them correctly (`claude.rs`, `codex.rs`, see [[Ctx
+Adapters]]), so the reparse-argv RCE class documented earlier in this file is
+closed for both. But nothing enforces the override: a third adapter that
+implements `AgentAdapter` and simply doesn't override these two methods
+compiles cleanly and passes every existing test, and silently ships with a
+headless prompt (operator task text, plus any mail folded in via `task_
+prompt_with_mail_fallback`) sitting on argv even on a Windows npm `.cmd`
+install -- `guard_cmd_shim_reparse` still catches an actual metacharacter at
+spawn time (the fail-closed backstop holds), but a clean prompt sails through
+unprotected where claude's and codex's own prompts would have moved to
+stdin. Recorded here deliberately as a note, not a fix: making the trait
+default secure (`launches_through_cmd_shim` defaulting to "ask `resolve_
+program`" rather than `false`, or restructuring so an adapter cannot omit
+the override at all) is a real refactor with its own blast radius, out of
+scope for the round that found this gap.
+
+## Codex's distiller sandbox still reads the repo's `.rules` and the operator's `~/.codex/config.toml`
+
+`CodexAdapter::distiller_cmd` pins `--sandbox read-only`, codex's analogue of
+claude's `--disallowedTools` pin backing `zirv ctx optimize`'s report-only
+guarantee -- but unlike claude's `--disallowedTools`, which is the *whole*
+restriction claude needs, codex-cli genuinely ships two more flags that would
+close a gap `--sandbox` does not touch: `--ignore-rules` (skip project/user
+execpolicy `.rules` files) and `--ignore-user-config` (skip
+`$CODEX_HOME/config.toml`). They are documented on `codex exec --help` for
+codex-cli 0.146.0 (the brew-installed capture in
+`docs/superpowers/notes/2026-07-31-codex-cli-facts.md`), but **not** on
+0.105.0, the version `npm install -g @openai/codex` actually publishes
+(verified on a real Windows machine) and the one `distiller_cmd`'s own doc
+comment is written against. Passing either flag on 0.105.0 would very likely
+error as an unrecognized argument, breaking the distiller for the common
+install path. So today, a repo's own `.rules` execpolicy files and the
+operator's own `~/.codex/config.toml` still shape what this "report-only"
+judgment child does, on top of AGENTS.md already being embedded in its
+prompt (the one residual claude's distiller has too, and cannot close either
+-- `--disallowedTools` restricts tools, not what text the model reads). Add
+`--ignore-rules --ignore-user-config` to `distiller_cmd` once the
+npm-published codex-cli ships them, verified against that installed CLI the
+same way `-s, --sandbox` was.
+
+## A limit-park is guaranteed unthrottled for a provider with no usage collector
+
+`pace::wait_for_window`'s own early return for `window::has_no_usage_source`
+(codex/openai today: no collector mechanism exists at all) skips the wait
+entirely and reports `Source::None` -- so a `limit-park` restart after
+codex reports a usage limit relaunches immediately, with no backoff, and can
+re-hit the same limit and park again right away. This is not a new failure
+mode: claude gets the identical *observable* behavior before its first
+statusline tee ever runs (`nothing_known_is_unknown_not_zero` -- an unknown
+reading also proceeds without waiting), so a fresh claude session parks and
+relaunches just as fast until a real reading exists. For codex the gap is
+structural rather than transient, though: there is no tee to eventually
+populate a reading, so it never self-resolves. Recorded, not fixed -- a real
+fix needs either a fallback delay specifically for the no-source case or a
+codex-side usage collector to exist at all (there is none today).
 
 ## `x.saturating_sub(n).clamp(1, x)` panics when `x` is 0
 
@@ -215,16 +290,33 @@ it. Real glyphs are `●` working, `○` idle, `·` view-only, `✕` ended. A tr
 "waiting on input" indicator would need a new turn-signal kind end-to-end,
 not just a state variant — do not re-add the enum case without one.
 
-## `exec`/`loop` gate mail on prompt composition, not on adapter capability
+## The mail-vs-`composed` delivery decision is open-coded at ~11 call sites, not one seam
 
-Mail is consumed as part of *composing* a worker's system prompt, so the
-"was this message delivered?" decision is really "did we build a prompt?"
-rather than a check of `adapter.capabilities().system_prompt`. With the two
-adapters that ship today the two questions have the same answer, so nothing
-is lost. A third adapter whose `ready()` returns ok but which has no
-system-prompt support would turn this into a real message-eater: mail gets
-`mail::consume`d on launch and then has nowhere to go. Latent — fix the gate
-when a third adapter lands, not before.
+The original version of this entry described a real bug: `exec`/`loop` used
+to gate "was this mail delivered?" on "did we build a `composed` prompt?"
+rather than on `adapter.capabilities().system_prompt`, which for an
+injection-less adapter (codex) under `--simple`, or on a Windows `cmd.exe`
+shim launch, silently destroyed mail or refused a spawn outright depending on
+which copy of the bug a given call site had. That class is now closed —
+`exec.rs` (the launch, park, rot-restart and nudge arms), `run_loop.rs`,
+`dash/mod.rs`'s `compose_worker_prompt`/`fulfill_spawn_request`, and
+`wrap.rs`'s own restart arm each now compute their own
+`mail_deliverable`/`should_list_mail`/shim-safety condition from
+`adapter.capabilities().system_prompt` (and, where relevant,
+`launches_through_cmd_shim()`) rather than from `composed.is_some()` alone.
+
+What is left, deliberately not fixed in the same round that closed the bug
+itself: that condition is hand-written independently at roughly eleven call
+sites rather than behind one shared delivery-seam function. Nothing is wrong
+today — every site was verified and tested individually — but a future
+adapter whose capability shape does not match claude's or codex's (or a
+future call site added without reading this note) can drift from the others
+without either compiler or test catching it, since there is no single
+function whose signature would force the new site to ask the same question
+the same way. Extracting one seam (something like `fn mail_channel_for
+(adapter, launch_shape) -> MailChannel`) is a real refactor with its own
+blast radius across every one of those files — out of scope for the round
+that closed the underlying bug.
 
 ## `wrap`'s status bar paints whenever stdout is a tty
 

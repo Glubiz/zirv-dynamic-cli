@@ -704,10 +704,14 @@ mod tests {
         assert_eq!(corrections_in(&transcript, &cfg), 5);
     }
 
-    /// An unready adapter (codex today) must degrade to zero corrections
-    /// rather than panic: the recommendation is advisory, never load-bearing.
+    /// An adapter with no event parsing wired up (codex today -- out of
+    /// scope, see issue #11) must degrade to zero corrections rather than
+    /// panic: the recommendation is advisory, never load-bearing. Codex is
+    /// selectable now (`CodexAdapter::ready` mirrors claude's), so this
+    /// exercises `structural_context`'s all-empty stub rather than a
+    /// selection failure, but the degrade-to-zero guarantee is the same one.
     #[test]
-    fn corrections_are_zero_when_the_configured_adapter_is_not_ready() {
+    fn corrections_are_zero_for_an_adapter_with_no_event_parsing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = correction_heavy_transcript(dir.path());
         let cfg = CtxConfig {
@@ -717,7 +721,7 @@ mod tests {
         assert_eq!(
             corrections_in(&transcript, &cfg),
             0,
-            "an unready adapter degrades to zero corrections, not a panic"
+            "an adapter with no parsing degrades to zero corrections, not a panic"
         );
     }
 
@@ -792,10 +796,17 @@ mod tests {
         );
     }
 
-    /// Task A6: `select`'s new gate check degrades the same way an unready
-    /// adapter already does -- `corrections_in`'s `Ok(adapter)` else-branch
-    /// already covers both causes, so a disabled agent must leave the Stop
-    /// hook a silent no-op exactly like the unready-codex case above.
+    /// Task A6: `select`'s gate check degrades the same way an adapter with
+    /// no event parsing already does -- `corrections_in`'s `Ok(adapter)`
+    /// else-branch covers a refused `select`. G (2026-08-15): disabling
+    /// claude via a repo-only `.settings.toml` used to fall through to codex
+    /// (enabled, and its own `ready()` succeeds) here, exercising `count_
+    /// corrections`'s `structural_context` path instead. `resolve_default`
+    /// now refuses that silent provider switch outright
+    /// (`AgentGate::disabled_only_by_repo`), so this test exercises the
+    /// refused-`select` path once more -- the assertion is unchanged (both
+    /// paths degrade to zero, not a panic), but for a different reason than
+    /// when this test was written.
     #[test]
     fn a_disabled_agent_leaves_the_stop_hook_a_silent_no_op() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -815,7 +826,7 @@ mod tests {
         assert_eq!(
             corrections_in(&transcript, &cfg),
             0,
-            "a disabled adapter degrades to zero corrections, not a panic"
+            "a refused fallback (repo may narrow, not select) still degrades to zero, not a panic"
         );
     }
 

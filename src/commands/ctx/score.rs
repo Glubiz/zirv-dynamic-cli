@@ -23,11 +23,27 @@ pub struct ScoreArgs {
 
 /// Read a whole transcript, parse it with the selected adapter, score it. The
 /// reference every incremental pass has to agree with.
+///
+/// D: `Err` when the adapter cannot produce events at all
+/// (`capabilities().events == false`, codex today): scoring an always-empty
+/// parse would compute `Score { score: 0, verdict: Healthy, .. }`, which
+/// reads to every caller as a genuine "this session is healthy" rather than
+/// the honest "there is no data to score this session with" -- exactly the
+/// distinction `score::cached_score`'s own doc comment already draws for a
+/// missing transcript. `rot.rs` stays pure and is never told about this; the
+/// refusal happens here, before a fabricated `Score` is ever built.
 fn full_score(
     adapter: &dyn AgentAdapter,
     transcript: &Path,
     cfg: &ScoreConfig,
 ) -> CtxResult<Score> {
+    if !adapter.capabilities().events {
+        return Err(format!(
+            "{} has no verified event parsing; nothing to score",
+            adapter.name()
+        )
+        .into());
+    }
     let jsonl = std::fs::read_to_string(transcript)
         .map_err(|e| format!("{}: {e}", transcript.display()))?;
     Ok(rot::score_events(
@@ -88,12 +104,23 @@ impl IncrementalScorer {
     }
 
     /// `None` when the transcript has not changed since the last poll, which
-    /// leaves the caller's previous verdict standing.
+    /// leaves the caller's previous verdict standing. Also `None` -- rather
+    /// than a `Score` folded from an always-empty parse -- for an adapter
+    /// with no verified event parsing at all (`capabilities().events ==
+    /// false`, codex today): the alternative, feeding zero real events
+    /// through the fold every poll, reads to every caller (in particular
+    /// `exec`/`loop`'s own rot-restart gate, which checks `verdict ==
+    /// Restart`) as a genuine `Healthy`/`0`, not the honest "no data" it
+    /// actually is. See `full_score`'s matching guard, which this mirrors
+    /// for the bounded-state fold path that never calls it.
     pub fn poll(
         &mut self,
         adapter: &dyn AgentAdapter,
         cfg: &ScoreConfig,
     ) -> CtxResult<Option<Score>> {
+        if !adapter.capabilities().events {
+            return Ok(None);
+        }
         let Some(appended) = self.watcher.read_appended()? else {
             return Ok(None);
         };
@@ -287,6 +314,19 @@ struct CachedScore {
     /// Polls answered off this path since it was resolved, counted only while
     /// the transcript is missing -- see [`RESOLVE_RETRY_POLLS`].
     polls_since_resolve: u32,
+    /// Item 12: set once this session's adapter is known to have no verified
+    /// event parsing at all (`capabilities().events == false`, codex
+    /// today), the same fact `full_score` itself refuses on. Terminal, not
+    /// retried like `polls_since_resolve`: an adapter's capabilities do not
+    /// change between polls, so no future poll -- no matter how many times
+    /// the transcript's own stamp changes -- will ever produce a score for
+    /// it. Without this, a codex pane's `scored` stayed permanently `None`
+    /// (`full_score`'s own `Err` collapses to `None` here), which never
+    /// matches any `stamp_of` reading, so every single poll fell all the way
+    /// through to `CtxConfig::load` + `adapters::select` +
+    /// `transcript_path` again -- at the dashboard's refresh rate, forever,
+    /// for a fact already known for good on the very first poll.
+    eventless: bool,
 }
 
 /// How many polls a session whose transcript has not appeared yet reuses its
@@ -314,6 +354,14 @@ fn score_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
 /// nothing next to the parse it is counting, and a `cfg(test)`-only counter
 /// would measure a different code path than the one that ships.
 static SCORE_RECOMPUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times [`cached_score`] has fallen all the way through the fast
+/// path to `CtxConfig::load` + `adapters::select` (+, for a scorable
+/// adapter, `transcript_path`) -- the expensive resolution `RESOLVE_RETRY_
+/// POLLS` and the eventless-adapter cache (item 12) both exist to bound.
+/// Same test-only purpose and unconditional-counting rationale as
+/// `SCORE_RECOMPUTES`.
+static RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// This session's current rot score, recomputed only when its transcript has
 /// changed since the last call. Built for the dashboard sidebar: up to nine
@@ -353,6 +401,11 @@ fn cached_score_with(
     };
 
     if let Some(entry) = &cached {
+        if entry.eventless {
+            // Item 12: terminal. Not even a `stamp_of` stat is worth paying
+            // for a session that can never be scored.
+            return None;
+        }
         match stamp_of(&entry.transcript) {
             // The whole fast path: one stat, no config load, no parse.
             Some(stamp) => {
@@ -378,8 +431,29 @@ fn cached_score_with(
         }
     }
 
+    RESOLVE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cfg = CtxConfig::load(repo, env).ok()?;
     let adapter = adapters::select(cfg.agent.as_deref(), &[], &cfg).ok()?;
+
+    // Item 12: an eventless adapter (`capabilities().events == false`,
+    // codex today) never produces a score, on this transcript or any other
+    // -- `transcript_path` is not even worth resolving for it. Cached as
+    // terminal so every later poll returns off this cheap check above
+    // rather than reaching this same conclusion, the expensive way, again.
+    if !adapter.capabilities().events {
+        let mut cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
+            session_id.to_string(),
+            CachedScore {
+                transcript: PathBuf::new(),
+                scored: None,
+                polls_since_resolve: 0,
+                eventless: true,
+            },
+        );
+        return None;
+    }
+
     let transcript = adapter.transcript_path(&SessionRef {
         id: SessionId::parse(session_id),
         cwd: repo.to_path_buf(),
@@ -401,6 +475,7 @@ fn cached_score_with(
         session_id.to_string(),
         CachedScore {
             transcript,
+            eventless: false,
             scored: scored.clone(),
             polls_since_resolve: 0,
         },
@@ -465,6 +540,60 @@ mod tests {
             dir.join("state").display().to_string(),
         )]
         .into()
+    }
+
+    /// D: an adapter with no verified event parsing (`capabilities().events
+    /// == false`, codex today) must refuse rather than compute a `Score`
+    /// from an always-empty parse -- that would read to every caller as a
+    /// genuine `Healthy`/`0`, not the honest "no data" it actually is. A
+    /// transcript with real, healthy-looking content is used deliberately:
+    /// the point is that `full_score` refuses *before* it ever gets to
+    /// parsing, on the adapter alone, not because this particular file
+    /// happened to be empty or unreadable.
+    #[test]
+    fn full_score_refuses_an_adapter_with_no_event_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = write_transcript(dir.path(), 12, true, 20_000);
+        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let err = full_score(&adapter, &transcript, &ScoreConfig::default())
+            .expect_err("codex has no verified event parsing");
+        assert!(err.to_string().contains("codex"), "got {err}");
+    }
+
+    /// D: the incremental fold's bounded-state path never calls `full_score`
+    /// at all, so it needs its own guard -- otherwise `state.feed_all(&[])`
+    /// every poll would still fold to a real `Score { Healthy, 0 }` for an
+    /// adapter whose `parse_events` is permanently empty.
+    #[test]
+    fn incremental_poll_reports_nothing_for_an_adapter_with_no_event_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = write_transcript(dir.path(), 12, true, 20_000);
+        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let mut scorer = IncrementalScorer::new(transcript);
+        assert_eq!(
+            scorer
+                .poll(&adapter, &ScoreConfig::default())
+                .expect("no error"),
+            None,
+            "no data, not a fabricated healthy score"
+        );
+    }
+
+    /// D end to end: `score_transcript_cached` -- the Stop hook's own entry
+    /// point, and what `score::cached_score` (the dashboard's sidebar/header
+    /// score) falls back to via `score_with_checkpoint` -- must refuse for
+    /// codex the same way `full_score` does directly, even though a real
+    /// transcript file exists and is readable.
+    #[test]
+    fn score_transcript_cached_refuses_an_adapter_with_no_event_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = write_transcript(dir.path(), 12, true, 20_000);
+        let env = state_env(dir.path());
+        let err = score_transcript_cached(&transcript, Some("codex"), dir.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect_err("codex has no verified event parsing");
+        assert!(err.to_string().contains("codex"), "got {err}");
     }
 
     /// Grows `transcript` towards `body` in `chunks` appends cut at line
@@ -885,6 +1014,40 @@ mod tests {
                 .expect("full")
                 .score,
             "and still agrees with a full parse of the new bytes"
+        );
+    }
+
+    /// Item 12: a codex pane's `scored` stayed permanently `None` (`full_
+    /// score`'s own refusal collapses to `None` through `.ok()`), which
+    /// never matched any `stamp_of` reading, so every poll fell through to
+    /// `CtxConfig::load` + `adapters::select` + `transcript_path` again --
+    /// at the dashboard's refresh rate, forever. The eventless cache entry
+    /// must bound that to exactly one resolution for the whole session,
+    /// same as `RESOLVE_RETRY_POLLS` already bounds the missing-transcript
+    /// case.
+    #[test]
+    fn a_codex_session_resolves_its_eventless_fact_once_then_never_again() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(home.path().join("state"));
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "5c0d0099-1111-4222-8333-444444444444";
+
+        let before = RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+        for poll in 0..12 {
+            assert_eq!(
+                cached_score_with(&state, repo.path(), session, &lookup),
+                None,
+                "poll {poll}: codex has no event parsing, never a fabricated score"
+            );
+        }
+        assert_eq!(
+            RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) - before,
+            1,
+            "one resolution for the whole session, not one per poll"
         );
     }
 

@@ -19,7 +19,7 @@ last-verified: 2026-08-15
 
 ## Purpose
 
-`zirv ctx` is the AI-agent-context-management side of the CLI: a supervisor and toolkit for keeping a long-running coding-agent session (Claude Code today; codex is scaffolded but not implemented, tracked in issue #11) from rotting as its context window fills. This page is the hub for the whole area — the verb tree, config layering, on-disk state, and the decision log. Deeper mechanics live on the sibling pages linked above.
+`zirv ctx` is the AI-agent-context-management side of the CLI: a supervisor and toolkit for keeping a long-running coding-agent session from rotting as its context window fills. Claude Code and Codex are both supported adapters (see [[Ctx Adapters]]), but Claude Code has the full feature set; Codex launches and supervises with an honestly degraded surface (no event parsing, rot score, usage source, turn signal or injected system prompt) until its event shapes are wired up, tracked in issue #11. This page is the hub for the whole area — the verb tree, config layering, on-disk state, and the decision log. Deeper mechanics live on the sibling pages linked above.
 
 ## The Verb Tree
 

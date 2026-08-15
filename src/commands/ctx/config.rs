@@ -106,7 +106,16 @@ impl Default for SuperviseConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HandoffConfig {
-    pub model: String,
+    /// The operator's own choice of distiller/judgment model, when set.
+    /// `None` -- the default -- means "let the adapter decide":
+    /// `resolve_distiller_model` (`handoff.rs`) falls back to the resolved
+    /// adapter's own `AgentAdapter::default_distiller_model`, which is a
+    /// real value for claude ("haiku") but `None` for codex, since a
+    /// hardcoded model name is specific to one agent's lineup and zirv has
+    /// no verified cheap-model default for codex's. This used to default to
+    /// the literal `"haiku"` unconditionally, which reached `codex exec
+    /// --model haiku` for a codex session and failed outright.
+    pub model: Option<String>,
     /// How many trailing items of each kind the handoff context keeps: user
     /// messages, assistant texts and tool errors. One knob, because
     /// `structural_context` applies one limit to all three.
@@ -120,7 +129,7 @@ pub struct HandoffConfig {
 impl Default for HandoffConfig {
     fn default() -> Self {
         Self {
-            model: "haiku".to_string(),
+            model: None,
             tail_items: 5,
             timeout_secs: 30,
         }
@@ -179,7 +188,12 @@ pub struct OptimizeConfig {
     pub enabled: bool,
     pub sessions_sampled: usize,
     pub max_surface_bytes: usize,
-    /// Empty reuses `handoff.model`: one cheap-model choice for the whole tool.
+    /// Empty reuses `handoff.model`'s own resolution (`resolve_distiller_
+    /// model` in `handoff.rs`, which already falls back to the resolved
+    /// adapter's own default when `handoff.model` itself is unset): one
+    /// cheap-model choice for the whole tool, kept as a plain `String`
+    /// rather than `Option<String>` since "empty" already means "defer" here
+    /// and always has.
     pub model: String,
     pub recommend_tool_failure_rate: f64,
     pub recommend_corrections: usize,
@@ -657,6 +671,19 @@ fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
 /// those come from the operator, not from the checkout.
 const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["agent_bin"], "ZIRV_CTX_AGENT_BIN"),
+    // Final wave item 1: a repo `ctx.toml` setting `agent` reaches `resolve_
+    // default`'s *configured* arm (`cfg.agent.as_deref()` is `Some`), which
+    // never consults `AgentGate::disabled_only_by_repo` at all -- that check
+    // only runs in the no-`cfg.agent` fallback loop. A repo could therefore
+    // pick which vendor account gets spent (`agent = "codex"`, say) with no
+    // narrowing guard in the way, the exact outcome
+    // `the_fallback_refuses_to_silently_switch_provider_when_the_repo_
+    // disabled_the_default` exists to block for the *unconfigured* path.
+    // This was inert while codex's own `ready()` still hard-errored; codex
+    // shipping out of the box activates it. `~/.zirv/ctx.toml`, `ZIRV_CTX_
+    // AGENT` and `--agent` all still choose the agent same as before -- only
+    // a repo checkout may not.
+    (&["agent"], "ZIRV_CTX_AGENT"),
     (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),
     (&["handoff", "model"], "ZIRV_CTX_MODEL"),
     (&["optimize", "model"], "ZIRV_CTX_OPTIMIZE_MODEL"),
@@ -889,7 +916,11 @@ mod tests {
         assert_eq!(WrapConfig::default().debounce_ms, 3000);
         assert_eq!(SuperviseConfig::default().max_restarts, 2);
         assert_eq!(SuperviseConfig::default().max_nudges, 3);
-        assert_eq!(HandoffConfig::default().model, "haiku");
+        assert_eq!(
+            HandoffConfig::default().model,
+            None,
+            "per-adapter resolution now lives in resolve_distiller_model, not a hardcoded default"
+        );
         assert_eq!(HandoffConfig::default().tail_items, 5);
         assert_eq!(HandoffConfig::default().timeout_secs, 30);
     }
@@ -950,6 +981,11 @@ mod tests {
                 "supervise.on_failure",
             ),
             ("[handoff]\nmodel = \"opus\"\n", "handoff.model"),
+            // Final wave item 1: `agent` reaches `resolve_default`'s
+            // *configured* arm, which never consults `disabled_only_by_
+            // repo` -- a repo checkout must not be able to pick which
+            // vendor account gets spent.
+            ("agent = \"codex\"\n", "agent"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -974,30 +1010,37 @@ mod tests {
             ("ZIRV_CTX_AGENT_BIN", "/opt/homebrew/bin/claude"),
             ("ZIRV_CTX_ON_FAILURE", "say done"),
             ("ZIRV_CTX_MODEL", "sonnet"),
+            ("ZIRV_CTX_AGENT", "codex"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.agent_bin.as_deref(), Some("/opt/homebrew/bin/claude"));
         assert_eq!(cfg.supervise.on_failure.as_deref(), Some("say done"));
-        assert_eq!(cfg.handoff.model, "sonnet");
+        assert_eq!(cfg.handoff.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.agent.as_deref(), Some("codex"));
     }
 
-    /// `agent` picks between two vetted adapters rather than naming an
-    /// executable, so a repository is still allowed to choose it.
+    /// Ordinary thresholds like `tail_items` shape *how* a run behaves, not
+    /// *what* runs or whose account it spends, so they stay repo-settable.
+    /// (`agent` used to sit in this bucket too; it moved to `REPO_FORBIDDEN`
+    /// once codex became selectable, because picking the adapter picks the
+    /// vendor account -- see `a_repository_config_cannot_name_what_the_tool_runs`.)
     #[test]
-    fn a_repository_may_still_choose_the_adapter_and_the_thresholds() {
+    fn a_repository_may_still_choose_the_thresholds() {
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
-            "agent = \"claude\"\n\n[handoff]\ntail_items = 9\n",
+            "[handoff]\ntail_items = 9\n",
         )
         .expect("write");
 
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
-        assert_eq!(cfg.agent.as_deref(), Some("claude"));
         assert_eq!(cfg.handoff.tail_items, 9);
-        assert_eq!(cfg.handoff.model, "haiku", "still the default");
+        assert_eq!(
+            cfg.handoff.model, None,
+            "still the default: per-adapter resolution now lives in resolve_distiller_model"
+        );
     }
 
     #[test]

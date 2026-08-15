@@ -3,6 +3,31 @@
 codex version: verified: `codex-cli 0.146.0` (`codex --version`)
 Install method: verified: `brew install codex` (Homebrew cask; not published under `@openai/codex` on npm as the plan guessed -- brew succeeded on the first try, so npm was never attempted). Binary: `/opt/homebrew/bin/codex`, package `/opt/homebrew/Caskroom/codex/0.146.0`.
 
+**Addendum (2026-08-15):** the "not published on npm" line above is stale --
+`@openai/codex` is on npm after all. Verified on a second machine (Windows):
+`npm install -g @openai/codex` installs `codex-cli 0.105.0` as
+`%APPDATA%\npm\codex.cmd` (a `#!/bin/sh` shim invoking `node
+node_modules/@openai/codex/bin/codex.js`), exactly the argv-reparse-prone
+shape `CodexAdapter::base()`'s Windows shim handling (`resolve_program`) now
+routes through `cmd.exe /c`. Left as an addendum rather than an edit to the
+original line: the original capture (brew, 2026-07-31) is still accurate for
+what it actually tested, npm was just never attempted there, not
+unavailable.
+
+**Addendum (2026-08-15, round 3):** this file now deliberately cites two
+different codex-cli versions' `codex exec --help` output side by side, not
+by accident -- the original `--sandbox`/`-m` capture above is 0.146.0
+(brew), while `--ignore-rules`/`--ignore-user-config` (quoted verbatim
+further down, in that same 0.146.0 capture) do **not** exist on 0.105.0, the
+version actually verified installed on the Windows machine above via `npm
+install -g @openai/codex`. `CodexAdapter::distiller_cmd`'s own doc comment
+in `codex.rs` is written against 0.105.0 specifically (the version most
+operators get), so it does not add those two flags even though this file
+documents them for 0.146.0 -- see that doc comment and Known Issues for the
+residual this leaves (the distiller still reads the repo's `.rules` and the
+operator's own config). If the two versions' flag sets ever converge, this
+split stops being a real discrepancy to track.
+
 ## Headless invocation
 
 verified: `codex exec [OPTIONS] [PROMPT]` -- matches the spec's guess. If `[PROMPT]` is omitted (or is `-`), instructions are read from stdin.

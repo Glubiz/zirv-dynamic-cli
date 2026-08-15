@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-13
+last-verified: 2026-08-15
 ---
 
 # _system-context
@@ -8,7 +8,7 @@ last-verified: 2026-08-13
 
 ## System Purpose
 
-`zirv` is a single Rust binary that executes developer-defined scripts (YAML/JSON/TOML) living in `.zirv/` directories, substituting `${var}` parameters and secrets and running shell/agent/concurrent steps in order. Its second half, `zirv ctx`, is an AI-agent-context-management subsystem: it supervises long-running Claude Code (and eventually Codex) sessions, scoring their transcripts with a deterministic rot engine and acting — advise, compact, or restart-with-handoff — before context-window degradation ruins the session. The two halves share one binary and one dispatch table but are otherwise decoupled: script steps can *invoke* a supervised agent run, but the ctx CLI surface is intercepted before script resolution ever runs. See [[Architecture Overview]] and [[Context Management]].
+`zirv` is a single Rust binary that executes developer-defined scripts (YAML/JSON/TOML) living in `.zirv/` directories, substituting `${var}` parameters and secrets and running shell/agent/concurrent steps in order. Its second half, `zirv ctx`, is an AI-agent-context-management subsystem: it supervises long-running Claude Code or Codex sessions, scoring their transcripts with a deterministic rot engine and acting — advise, compact, or restart-with-handoff — before context-window degradation ruins the session. Codex is launch-supported but honestly degraded (no rot score, no turn signal) until its event shapes are wired up — see [[Ctx Adapters]]. The two halves share one binary and one dispatch table but are otherwise decoupled: script steps can *invoke* a supervised agent run, but the ctx CLI surface is intercepted before script resolution ever runs. See [[Architecture Overview]] and [[Context Management]].
 
 ## Architecture at a Glance
 
@@ -39,7 +39,7 @@ Dispatch order matters: `ctx` and top-level `--help` are matched on **raw argv**
 | Ctx hub / verb tree | `src/commands/ctx/{mod,config,state,log}.rs` | [[Ctx Subsystem]] | `CtxCli`/`CtxVerb`, dispatch + parse-failure classification, layered `CtxConfig`, `StateDir`, decision log |
 | Ctx verb modules | `src/commands/ctx/{score,handoff,resume,hook,status,chat,agent,mail,sessions,memory}.rs` | [[Ctx Subsystem]] | One module per verb: read-transcript/decide/maybe-write-state, the meta-harness verbs (chat/agent/mail), the session registry + nudge, and the memory bank |
 | Ctx supervisors | `src/commands/ctx/{run_loop,exec,wrap}.rs` + `{signal,supervise,term}.rs` + `dash/{mod,pane,ui,spawnreq,roster}.rs` | [[Ctx Supervisors]] | The three process supervisors, turn-signal sockets, shared process/terminal primitives, and the `dash` session multiplexer `zirv chat` opens on a capable terminal |
-| Ctx adapters | `src/commands/ctx/adapters/{mod,claude,codex}.rs` | [[Ctx Adapters]] | `AgentAdapter` trait; claude (implemented) and codex (not implemented, issue #11) |
+| Ctx adapters | `src/commands/ctx/adapters/{mod,claude,codex}.rs` | [[Ctx Adapters]] | `AgentAdapter` trait; claude (full capabilities) and codex (launch-supported, event parsing/rot score/turn signal pending issue #11) |
 | Rot engine | `src/commands/ctx/{event,rot}.rs` | [[Rot Engine]] | Pure normalized-event scoring → `Verdict` |
 | Usage & pacing | `src/commands/ctx/{window,usage,pace}.rs` | [[Usage and Pacing]] | Rolling rate-limit windows, the pacing gate, `usage` verb + statusline tee |
 | Config analysis & prompt | `src/commands/ctx/{optimize,prompt}.rs` | [[Utilities]] | Report-only config analysis; the layered injected session prompt |
@@ -110,7 +110,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 - **Fixtures are data, not tests**: `tests/fixtures/` holds recorded sessions and fake shell scripts only; all unit tests stay inline in `#[cfg(test)] mod tests` next to the code. Re-record the claude fixture with `scripts/record-claude-fixture.py`; never hand-edit it. See [[Testing Guide]].
 - **Untagged-enum footgun avoided on purpose**: `CommandTypes` is deserialized by hand (dispatching on which key a step's mapping has) rather than serde's `untagged`, because untagged silently picks the first variant that fits and reports only "data did not match any variant." See [[Script Runner]].
 - **`REPO_FORBIDDEN` is a real security boundary, not style**: a repo-committed `.zirv/ctx.toml` cannot set `agent_bin`, `supervise.on_failure`, `handoff.model`, `optimize.model`, or any `prompt.*` cap/enable key — `CtxConfig::load` hard-errors naming the key and its operator-only escape hatch (an env var or `~/.zirv/ctx.toml`). See [[Ctx Subsystem]], [[Untrusted Configuration]].
-- **codex is scaffolded, not usable**: `CodexAdapter::ready()` unconditionally returns `Err` pointing at issue #11, so `--agent codex` always fails loudly at selection time before any process spawns. Don't assume adapter parity between claude and codex when reading `adapters/codex.rs`. See [[Ctx Adapters]], [[Known Issues]].
+- **codex is launch-supported, not feature-parity**: `CodexAdapter::ready()` mirrors claude's (only an unresolvable binary fails it), so `--agent codex` selects and launches, but `capabilities()` stays all-false — no event parsing, rot score, usage source, turn signal, or injected system prompt. Don't assume adapter parity between claude and codex when reading `adapters/codex.rs`; full event support is issue #11. See [[Ctx Adapters]], [[Known Issues]].
 
 ## Build & Verify
 

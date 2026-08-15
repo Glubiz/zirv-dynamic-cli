@@ -24,6 +24,13 @@ last-verified: 2026-08-15
 
 ## Decisions
 
+### 2026-08-15 — Codex ships supported-but-degraded, not "unsupported"; drop `key_probe` in favor of `alt_screen_probe`
+**Context:** PR #21 review left two loose ends: whether codex should ship as a documented gap ("declare unsupported" in release notes) now that its Windows shim gap was already closed as a security fix, and whether the diagnostic example `examples/key_probe.rs` still earned its keep next to `alt_screen_probe.rs`.
+**Decision:** Codex ships supported out of the box — `ready()` resolves the binary like claude's, and `base()`/`launches_through_cmd_shim`/`headless_cmd_stdin` mirror claude's shim handling exactly — but scope stays deliberately narrow: launch-level support only, `capabilities()` stays all-false, event parsing/rot score/turn signal/injected system prompt remain issue #11. `examples/key_probe.rs` is deleted; its conclusion is already encoded in `dash::is_prefix_key`, and `alt_screen_probe.rs` stays as the one reusable harness-behaviour diagnostic.
+**Rejected:** Declaring codex unsupported in release notes — the shim gap that made refusal safe was already closed, so continuing to hard-error `ready()` would just withhold a working code path. Keeping `key_probe.rs` "for reference" — its finding is already load-bearing code, not a living diagnostic.
+**Consequences:** `--agent codex` is a real, documented launch target now, not a stub; full event parity is a separate, still-open piece of work and must not be implied by "supported."
+**Spec / link:** [[Ctx Adapters]], [[Known Issues]] "The codex adapter's shim gap is closed."
+
 ### 2026-08-15 — Forward the scroll wheel to a mouse-owning child instead of trying to emulate scrollback
 **Context:** A pty probe against the real harness (answering ConPTY's cursor-position query so output flowed) found two independent vt100 0.16.2 mechanisms that leave a full-screen pane with no scrollback at all: the alternate grid's scrollback is hardcoded to zero, and a child that also sets a DECSTBM scroll region defeats row retirement a second, independent way. The same startup stream shows the harness enabling its own mouse reporting (`?1000/1002/1003/1006h`, SGR) — it scrolls itself.
 **Decision:** Decide per pane at scroll time: a child with mouse reporting enabled gets the wheel event encoded the way it asked (SGR or X10) in pane-local 1-based coordinates via `write_input` (not `write_operator_input`, so scrolling never marks a pane typed-in and holds its idle-gated injectors off); a full-screen child without mouse reporting gets a transient "scrolling belongs to the app" notice; only a normal-screen child uses vt100 scrollback.
