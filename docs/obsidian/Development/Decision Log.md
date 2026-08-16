@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-15
+last-verified: 2026-08-16
 ---
 
 # Decision Log
@@ -23,6 +23,20 @@ last-verified: 2026-08-15
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-16 — The harness roster is derived and advisory; the review policy is zirv-owned with a convergence bound
+**Context:** The orchestrator prompt named `zirv ctx status` as the way to learn which harnesses were available, with nothing in the prompt itself; separately, claude's `ORCHESTRATOR_PROMPT` and `.zirv/claude.yaml` each carried their own final-review mandate, independently wordable and already drifting from each other.
+**Decision:** `adapters::harness_prompt_lines` derives one line per adapter (enabled+ready with the exact `zirv agent` invocation, installed-but-not-ready, or disabled-and-where) from the live registry/gate/`ready()` state — never hand-authored — and `prompt::compose` folds it in as `PromptSource::Harnesses`, Orchestrator-only, gated on `cfg.prompt.harnesses`. The cross-harness review mandate moved into `HARNESS_PROMPT` as the one owner: native full-diff review plus one review worker per other enabled harness, triage, fix, re-review only what fixes touched, stop on no new confirmed findings, hard stop after 2 fix rounds. Claude's `ORCHESTRATOR_PROMPT` and `.zirv/claude.yaml` stay self-contained for both roles (run this seat's own `/code-review` pass before reporting done, since that layer is injected for a Worker too) and additionally layer `HARNESS_PROMPT`'s cross-harness round on top whenever that Orchestrator-only layer is also present, rather than each restating the same policy.
+**Rejected:** Hand-maintaining the roster text in `HARNESS_PROMPT` — drifts from the actual gate/registry the moment an adapter is added or disabled. An unbounded "review until clean" loop — no stated stop condition risks a session looping on residual disagreement between harnesses forever.
+**Consequences:** A worker session still never sees the roster (recursion guard unchanged). Adding a third adapter changes the roster with no prompt edit. A future adapter-specific review mandate must stay self-contained for its own native pass and layer `HARNESS_PROMPT`'s policy on top rather than restate the cross-harness round itself, or the two will drift again.
+**Spec / link:** [[Ctx Adapters]] (`harness_prompt_lines`), [[Ctx Subsystem]] (`prompt.harnesses`), [[Context Management]].
+
+### 2026-08-16 — Dashboard sidebar view-only rows are scoped to sessions this dashboard spawned, reversing `ac40418`
+**Context:** `ac40418` (2026-08-13) deliberately made the sidebar merge every live registry session, machine-wide, so an operator could see everything running. In practice a second, concurrently running dashboard's own sessions then rendered indistinguishably in the first dashboard's panel and could be nudged from it — not what "every registered session" was meant to imply.
+**Decision:** `sessions::Record` gained `owner_pid: Option<u32>` (`#[serde(default)]`); `SessionGuard::register` itself stamps it with the *registering* process's own pid unless a caller already set one, so every registration path (a dashboard pane, its in-process headless fallback, or a standalone `wrap`/`exec`/`loop` session) is attributed uniformly with no per-caller stamping to remember. `assemble_sidebar` takes the running dashboard's own pid and excludes any record whose `owner_pid` doesn't match, including `None` (pre-upgrade records).
+**Rejected:** Filtering by repo slug instead of pid — two dashboards can legitimately run against the same repo, and repo scoping would not have separated them. Keeping the everything-view but marking foreign rows read-only — still lets one dashboard nudge a session it does not own once misread as its own.
+**Consequences:** `zirv ctx status` remains the only true everything-view. A standalone `wrap`/`exec`/`loop`/`chat` session, and any record from a build predating this field, never appears in any dashboard's sidebar — expected, not a bug. Ownership is still a raw pid, not a process-independent identity: a dashboard pane's own child falling back to an in-process headless worker in a genuinely separate OS process is correctly *not* attributed to the dashboard either — see [[Known Issues]] for that residual and the unrelated roster-restore liveness gap found during the same investigation, both left open.
+**Spec / link:** [[Ctx Supervisors]] ("View-only rows are scoped..."), commit `183d45f`.
 
 ### 2026-08-15 — Codex ships supported-but-degraded, not "unsupported"; drop `key_probe` in favor of `alt_screen_probe`
 **Context:** PR #21 review left two loose ends: whether codex should ship as a documented gap ("declare unsupported" in release notes) now that its Windows shim gap was already closed as a security fix, and whether the diagnostic example `examples/key_probe.rs` still earned its keep next to `alt_screen_probe.rs`.
