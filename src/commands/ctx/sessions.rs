@@ -266,6 +266,16 @@ pub struct Record {
     /// reachable session.
     #[serde(default = "reachable_default")]
     pub reachable: bool,
+    /// The dashboard process that spawned this session, if any. `None` for
+    /// every registration outside a dashboard pane (`wrap`/`exec`/`loop`
+    /// resume, `chat`) and for any record written before this field
+    /// existed. The dashboard sidebar merge (`dash::assemble_sidebar`) keeps
+    /// only records whose `owner_pid` matches its own pid, so a second,
+    /// concurrently running dashboard's panes never bleed into this one's
+    /// panel. `#[serde(default)]` so an on-disk record from an older build
+    /// deserializes as `None` rather than failing to parse.
+    #[serde(default)]
+    pub owner_pid: Option<u32>,
 }
 
 fn reachable_default() -> bool {
@@ -291,6 +301,11 @@ impl Record {
             // `wrap` (which can run `--no-supervise`, or fail to bind) has
             // any reason to call `unreachable()` below.
             reachable: true,
+            // Unowned unless a dashboard pane stamps itself in afterward
+            // (`dash/pane.rs`): every other registration path -- `wrap`,
+            // `exec`, `loop`, `resume`, `chat` outside the dash -- has no
+            // dashboard to attribute the session to.
+            owner_pid: None,
         }
     }
 
@@ -872,6 +887,27 @@ mod tests {
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    #[test]
+    fn a_record_without_owner_pid_deserializes_as_unowned() {
+        // A record written by a build that predates `owner_pid` has no such
+        // key in its JSON at all -- not `null`, simply absent -- which is
+        // what `#[serde(default)]` (rather than a required field) exists to
+        // survive.
+        let json = r#"{
+            "session": "11111111-2222-4333-8444-555555555555",
+            "short": "11111111",
+            "agent": "claude",
+            "repo": "/repo",
+            "repo_slug": "-repo",
+            "verb": "exec",
+            "pid": 1,
+            "started_at": 0,
+            "reachable": true
+        }"#;
+        let record: Record = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(record.owner_pid, None);
     }
 
     #[test]

@@ -607,23 +607,32 @@ struct PaneRowMeta {
 const VIEW_ONLY_GLYPH: char = '\u{00b7}';
 
 /// Combines this dashboard's own panes (attached, in pane order) with every
-/// OTHER live session in the registry (view-only, `attached: false`), so the
-/// sidebar shows every registered session, not only the ones this process
-/// spawned. Deduped by short id -- a pane's own registry record is never
-/// listed a second time as a view-only row. Dead/stale registry entries
+/// OTHER live session in the registry that THIS SAME dashboard process
+/// itself spawned (view-only, `attached: false`) -- so the sidebar shows
+/// every session this dashboard is responsible for, not only the ones
+/// currently attached as panes. A registry record whose `owner_pid` does not
+/// match `dashboard_pid` (another, concurrently running dashboard's session)
+/// or is `None` (a pre-ownership record, or a session registered outside any
+/// dashboard -- `wrap`/`exec`/`loop`/`chat`) is excluded outright: this
+/// dashboard has no more business showing it than it does attaching to it.
+/// Deduped by short id -- a pane's own registry record is never listed a
+/// second time as a view-only row. Dead/stale registry entries
 /// (`Liveness::Stale`) are excluded outright: `sessions::list` already swept
 /// them from disk, and a dashboard has nothing useful to attach to or nudge
 /// there. `selected` indexes into the combined list this returns; `focused`
 /// indexes into `panes` alone (see `ui::SidebarRow`'s own doc comment for
 /// why the two are separate), and is simply not marked when it is out of
 /// range -- an empty dashboard has nothing to focus. Pure: no I/O of its own
-/// -- `registry` is whatever the caller already read via `sessions::list`.
+/// -- `registry` is whatever the caller already read via `sessions::list`,
+/// and `dashboard_pid` is passed in rather than read via
+/// `std::process::id()` here so tests can exercise foreign vs. own owners.
 fn assemble_sidebar(
     panes: &[PaneRowMeta],
     registry: &[(sessions::Record, sessions::Liveness)],
     scores: &ScoreMap,
     selected: usize,
     focused: usize,
+    dashboard_pid: u32,
 ) -> Vec<ui::SidebarRow> {
     let own_shorts: HashSet<&str> = panes.iter().map(|p| p.short.as_str()).collect();
 
@@ -647,6 +656,9 @@ fn assemble_sidebar(
 
     for (record, liveness) in registry {
         if *liveness != sessions::Liveness::Live {
+            continue;
+        }
+        if record.owner_pid != Some(dashboard_pid) {
             continue;
         }
         if own_shorts.contains(record.short.as_str()) {
@@ -3437,6 +3449,7 @@ pub fn run_dashboard(
             &facts_cache.disk.scores,
             selected,
             focused,
+            std::process::id(),
         );
         let total_rows = rows.len();
         selected = selected.min(total_rows.saturating_sub(1));
@@ -4067,6 +4080,7 @@ pub fn run_dashboard(
             &facts_cache.disk.scores,
             selected,
             focused,
+            std::process::id(),
         );
 
         // L13: a live notice (info) shows as plain text and takes precedence
@@ -4886,11 +4900,11 @@ mod tests {
     fn assemble_sidebar_marks_the_focused_pane_separately_from_the_selection() {
         let panes = vec![pane_row("aaa11111", "orch"), pane_row("bbb22222", "wrk")];
         let registry = vec![(
-            registry_record("ccc33333", "codex"),
+            registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
         // Selection has walked onto the view-only row; focus is still pane 1.
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 2, 1);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 2, 1, DASHBOARD_PID);
         assert!(
             rows[2].selected,
             "the sidebar cursor is on the view-only row"
@@ -4937,7 +4951,13 @@ mod tests {
         }
     }
 
-    fn registry_record(short: &str, agent: &str) -> sessions::Record {
+    /// This test module's stand-in for "the running dashboard's own pid" --
+    /// arbitrary, since these tests never spawn a real process, but shared
+    /// across every fixture/call so "owned by this dashboard" and "owned by
+    /// a different one" are unambiguous.
+    const DASHBOARD_PID: u32 = 424242;
+
+    fn registry_record(short: &str, agent: &str, owner_pid: Option<u32>) -> sessions::Record {
         sessions::Record {
             session: format!("session-{short}"),
             short: short.to_string(),
@@ -4948,6 +4968,7 @@ mod tests {
             pid: 1,
             started_at: 0,
             reachable: true,
+            owner_pid,
         }
     }
 
@@ -4957,7 +4978,7 @@ mod tests {
             pane_row("aaa11111", "orch"),
             pane_row("bbb22222", "wrk claude"),
         ];
-        let rows = assemble_sidebar(&panes, &[], &no_scores(), 0, 0);
+        let rows = assemble_sidebar(&panes, &[], &no_scores(), 0, 0, DASHBOARD_PID);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short, "aaa11111");
         assert!(rows[0].attached);
@@ -4966,26 +4987,57 @@ mod tests {
     }
 
     #[test]
-    fn assemble_sidebar_appends_view_only_registry_rows_not_owned_by_this_dashboard() {
+    fn assemble_sidebar_appends_view_only_registry_rows_owned_by_this_dashboard() {
         let panes = vec![pane_row("aaa11111", "orch")];
         let registry = vec![(
-            registry_record("ccc33333", "codex"),
+            registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].short, "ccc33333");
         assert!(!rows[1].attached, "a registry-only row is never attached");
     }
 
     #[test]
+    fn assemble_sidebar_excludes_a_registry_record_owned_by_a_different_dashboard() {
+        let panes = vec![pane_row("aaa11111", "orch")];
+        let registry = vec![(
+            registry_record("ccc33333", "codex", Some(DASHBOARD_PID + 1)),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a session another dashboard spawned must not appear in this one's sidebar"
+        );
+    }
+
+    #[test]
+    fn assemble_sidebar_excludes_a_registry_record_with_no_owner() {
+        let panes = vec![pane_row("aaa11111", "orch")];
+        let registry = vec![(
+            registry_record("ccc33333", "codex", None),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a record with no owner_pid (pre-ownership build, or a session \
+             registered outside any dashboard) must not appear"
+        );
+    }
+
+    #[test]
     fn assemble_sidebar_dedupes_a_panes_own_registry_record() {
         let panes = vec![pane_row("aaa11111", "orch")];
         let registry = vec![(
-            registry_record("aaa11111", "claude"),
+            registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
         assert_eq!(
             rows.len(),
             1,
@@ -4997,10 +5049,10 @@ mod tests {
     #[test]
     fn assemble_sidebar_excludes_stale_registry_entries() {
         let registry = vec![(
-            registry_record("ddd44444", "codex"),
+            registry_record("ddd44444", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Stale,
         )];
-        let rows = assemble_sidebar(&[], &registry, &no_scores(), 0, 0);
+        let rows = assemble_sidebar(&[], &registry, &no_scores(), 0, 0, DASHBOARD_PID);
         assert!(
             rows.is_empty(),
             "a dead session must not appear as a view-only row"
@@ -5011,10 +5063,10 @@ mod tests {
     fn assemble_sidebar_marks_the_selected_index_in_the_combined_list() {
         let panes = vec![pane_row("aaa11111", "orch")];
         let registry = vec![(
-            registry_record("ccc33333", "codex"),
+            registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 1, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 1, 0, DASHBOARD_PID);
         assert!(!rows[0].selected);
         assert!(rows[1].selected);
     }
@@ -5120,8 +5172,10 @@ mod tests {
             "an unscored session is absent from the map, never a placeholder zero"
         );
 
-        let _guard =
-            sessions::SessionGuard::register(&state, registry_record("aaa11111", "claude"));
+        let _guard = sessions::SessionGuard::register(
+            &state,
+            registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
+        );
 
         cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
         assert!(
