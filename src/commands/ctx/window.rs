@@ -454,7 +454,10 @@ pub fn windows_from_rate_limits(
             .and_then(|m| m.as_u64())
             .unwrap_or(0);
         let resets_at = w.get("resets_at").and_then(|r| r.as_u64()).unwrap_or(0);
-        let Some(five_hour) = window_slot(minutes * 60) else {
+        // Saturating: `window_minutes` comes straight from untrusted JSON, and
+        // a value near u64::MAX would otherwise panic in debug builds instead
+        // of falling through to the slot rejection below.
+        let Some(five_hour) = window_slot(minutes.saturating_mul(60)) else {
             continue;
         };
         let win = Window {
@@ -1170,5 +1173,12 @@ mod tests {
         assert!(parse_rollout_line("{broken").is_none());
         // a 1-minute window maps to neither slot -> dropped -> no windows -> None
         assert!(parse_rollout_line(lines[3]).is_none());
+        // an absurd window_minutes must reject, never overflow-panic (review
+        // finding on 4a44eb2: `minutes * 60` panicked in debug builds)
+        let huge = format!(
+            "{{\"timestamp\":\"2026-02-26T18:52:21.222Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"rate_limits\":{{\"primary\":{{\"used_percent\":1.0,\"window_minutes\":{},\"resets_at\":1}}}}}}}}",
+            u64::MAX
+        );
+        assert!(parse_rollout_line(&huge).is_none());
     }
 }
