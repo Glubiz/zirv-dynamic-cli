@@ -57,3 +57,31 @@ jobs:
 
       - name: Run Clippy Lint (Windows target)
         run: cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+
+  # Every merge to main triggers CD, which re-publishes whatever version main
+  # carries and fails on a duplicate — so every PR must raise Cargo.toml's
+  # version above its base branch before it can merge.
+  version-bump:
+    name: Version Bump Check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Require a version above the base branch
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          extract() { grep '^version' "$1" | head -1 | sed -E 's/version *= *"([^"]+)".*/\1/'; }
+          git show "origin/${{ github.base_ref }}:Cargo.toml" > /tmp/base-Cargo.toml
+          BASE=$(extract /tmp/base-Cargo.toml)
+          HEAD=$(extract Cargo.toml)
+          echo "base branch version: $BASE — PR version: $HEAD"
+          if [ "$BASE" = "$HEAD" ]; then
+            echo "::error file=Cargo.toml::Version ($HEAD) is unchanged from ${{ github.base_ref }}. Bump it — every merge to main publishes a release."
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$BASE" "$HEAD" | sort -V | tail -1)" != "$HEAD" ]; then
+            echo "::error file=Cargo.toml::Version ($HEAD) is lower than ${{ github.base_ref }}'s ($BASE)."
+            exit 1
+          fi
