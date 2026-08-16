@@ -1388,16 +1388,16 @@ mod tests {
         let day = sessions_dir.join("2026").join("02").join("26");
         std::fs::create_dir_all(&day).unwrap();
 
-        // Use a now value that matches the test
-        let now = 1_000_000u64;
+        // A rollout line just before `now`, so a scan of it is genuinely
+        // newer than the "stale" stored reading below and the merge must
+        // prefer it -- the review of c3c7fe9 caught this test asserting
+        // nothing when the line's timestamp predated the stale reading.
+        let test_json = r#"{"timestamp":"2026-02-26T18:52:21Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.0,"window_minutes":300,"resets_at":1772135737}}}}"#;
+        let line_ts = parse_rfc3339_utc("2026-02-26T18:52:21Z").expect("test timestamp parses");
+        let now = line_ts + 60;
         let max_age = 900u64;
-
-        // Create a simple test line with fixed timestamp we can control
-        let test_json = r#"{"timestamp":"1970-01-01T00:01:40Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.0,"window_minutes":300,"resets_at":1772135737}}}}"#;
         std::fs::write(day.join("rollout.jsonl"), format!("{}\n", test_json)).unwrap();
 
-        // The test line has timestamp 1970-01-01T00:01:40Z = 100 seconds
-        // now = 1_000_000, so skew check: 100 <= 1_000_000 + 300? Yes, passes
         let scanned = scan_codex_rollouts(sessions_dir.as_path(), ROLLOUT_SCAN_FILES, now);
         assert!(
             scanned.is_some(),
@@ -1443,15 +1443,15 @@ mod tests {
         refresh_codex_usage(&state, Some(sessions_dir.as_path()), now, max_age);
         let after_stale_refresh = load_for(&state, CODEX_USAGE_PROVIDER);
 
-        // The scanned 12% (observed_at=100) should be merged with the stale 20% (observed_at=now-10_000=990_000)
-        // Since 990_000 > 100, the stale one is newer, so it should keep 20%
-        // But that's counter to what we want. Let me fix the test data.
+        // The scanned 12% (observed_at = now - 60) is newer than the stale
+        // 20% (observed_at = now - 10_000), so the merge must replace it.
         let merged = after_stale_refresh.expect("merged present");
-        // For now, just verify the merge happens (doesn't matter which wins yet)
-        assert!(
-            merged.five_hour.is_some(),
-            "merge should have a five_hour window"
+        let five = merged.five_hour.expect("five_hour after refresh");
+        assert_eq!(
+            five.used_percentage, 12.0,
+            "a stale stored reading is replaced by the fresher scan"
         );
+        assert_eq!(five.resets_at, 1772135737);
     }
 
     #[test]
