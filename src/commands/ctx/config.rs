@@ -161,6 +161,19 @@ pub struct PaceConfig {
     /// wait-until-reset semantics require: a global cap would resume early and
     /// spend tokens against a window that is still exhausted.
     pub max_wait_secs: Option<u64>,
+    /// Start of the soft-throttle band. At or above this (and below
+    /// `max_percent`) cycles are delayed so the remaining budget spreads
+    /// linearly over the time left in the window. `>= max_percent` means no
+    /// throttle band -- hard pause only.
+    pub soft_percent: f64,
+    /// Active API-poll fallback: only consulted when the passive collector
+    /// reading is stale at a gating point.
+    pub poll_enabled: bool,
+    /// Per-provider floor between poll attempts, shared across processes.
+    pub poll_min_interval_secs: u64,
+    /// Operator declaration that a harness's vendor plan covers overage from
+    /// credits: gating (throttle and pause) is skipped for that harness.
+    pub use_credits: UseCreditsConfig,
 }
 
 impl Default for PaceConfig {
@@ -177,6 +190,38 @@ impl Default for PaceConfig {
             fallback_delay_secs: 900,
             wait_slack_secs: 3600,
             max_wait_secs: None,
+            soft_percent: 80.0,
+            poll_enabled: true,
+            poll_min_interval_secs: 60,
+            use_credits: UseCreditsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UseCreditsConfig {
+    pub claude: bool,
+    pub codex: bool,
+}
+
+impl UseCreditsConfig {
+    /// Keyed by agent in config (what the operator thinks in), resolved by
+    /// provider at the gate (what pacing knows). Unknown providers gate.
+    ///
+    /// No in-tree caller yet outside this module's own tests: a later task
+    /// wires the pacing gate (`pace::decide` and its callers) to call
+    /// `cfg.pace.use_credits.for_provider(adapter.provider())` and skip
+    /// throttle/pause for that harness. `#[allow(dead_code)]` covers it until
+    /// that wiring lands, the same reasoning `dash::pane`'s module-level
+    /// allow documents: a real API with no in-tree caller yet is not the same
+    /// thing as code that should be deleted.
+    #[allow(dead_code)]
+    pub fn for_provider(&self, provider: &str) -> bool {
+        match provider {
+            "anthropic" => self.claude,
+            "openai" => self.codex,
+            _ => false,
         }
     }
 }
@@ -531,6 +576,31 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["pace", "seven_day_budget_tokens"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_PACE_SOFT_PERCENT",
+        &["pace", "soft_percent"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_PACE_POLL",
+        &["pace", "poll_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
+        &["pace", "poll_min_interval_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
+        &["pace", "use_credits", "claude"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PACE_USE_CREDITS_CODEX",
+        &["pace", "use_credits", "codex"],
+        EnvKind::Bool,
+    ),
     ("ZIRV_CTX_OPTIMIZE", &["optimize", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_OPTIMIZE_SESSIONS",
@@ -766,6 +836,19 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // way that trade goes is the operator's call about their own terminal,
     // not a checked-out repo's.
     (&["dash", "mouse"], "ZIRV_CTX_DASH_MOUSE"),
+    // A repo checkout must not be able to flip a spend decision (skipping
+    // throttle/pause gating on the operator's own vendor plan), re-enable
+    // the active API-poll fallback an operator turned off, or change its
+    // cadence -- credential reads and network calls are the operator's
+    // budget to spend, not the checkout's. `value_at` matches a table node
+    // the same way it matches a leaf, so this one entry also catches a repo
+    // setting only `[pace.use_credits]\ncodex = true` without `claude`.
+    (&["pace", "use_credits"], "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE"),
+    (&["pace", "poll_enabled"], "ZIRV_CTX_PACE_POLL"),
+    (
+        &["pace", "poll_min_interval_secs"],
+        "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
+    ),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -1147,6 +1230,94 @@ mod tests {
         let env = env_map(&[("ZIRV_CTX_PACE", "yes-please")]);
         let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad bool");
         assert!(err.to_string().contains("ZIRV_CTX_PACE"));
+    }
+
+    #[test]
+    fn pace_gains_soft_and_poll_and_use_credits_defaults() {
+        let cfg = PaceConfig::default();
+        assert_eq!(cfg.soft_percent, 80.0);
+        assert!(cfg.poll_enabled);
+        assert_eq!(cfg.poll_min_interval_secs, 60);
+        assert!(!cfg.use_credits.claude);
+        assert!(!cfg.use_credits.codex);
+    }
+
+    #[test]
+    fn use_credits_maps_providers_to_agent_flags() {
+        let uc = UseCreditsConfig {
+            claude: true,
+            codex: false,
+        };
+        assert!(uc.for_provider("anthropic"));
+        assert!(!uc.for_provider("openai"));
+        assert!(
+            !uc.for_provider("something-else"),
+            "unknown provider: gate stays on"
+        );
+    }
+
+    #[test]
+    fn a_repo_layer_may_not_touch_use_credits_or_poll_keys() {
+        for (toml, key, variable) in [
+            (
+                "[pace.use_credits]\nclaude = true\n",
+                "pace.use_credits",
+                "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
+            ),
+            (
+                "[pace]\npoll_enabled = false\n",
+                "pace.poll_enabled",
+                "ZIRV_CTX_PACE_POLL",
+            ),
+            (
+                "[pace]\npoll_min_interval_secs = 1\n",
+                "pace.poll_min_interval_secs",
+                "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(key), "name the offending key: {err}");
+            assert!(
+                err.contains(variable),
+                "names the operator escape hatch: {err}"
+            );
+        }
+
+        // The rejection is real, not decorative: a clean repo layer still
+        // loads and keeps the new keys at their defaults.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.pace.soft_percent, 80.0);
+        assert!(cfg.pace.poll_enabled);
+        assert_eq!(cfg.pace.poll_min_interval_secs, 60);
+        assert!(!cfg.pace.use_credits.claude);
+    }
+
+    #[test]
+    fn env_overrides_use_credits_and_poll() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE_USE_CREDITS_CLAUDE", "true"),
+            ("ZIRV_CTX_PACE_POLL", "false"),
+            ("ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS", "120"),
+            ("ZIRV_CTX_PACE_SOFT_PERCENT", "70"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.pace.use_credits.claude);
+        assert!(!cfg.pace.use_credits.codex);
+        assert!(!cfg.pace.poll_enabled);
+        assert_eq!(cfg.pace.poll_min_interval_secs, 120);
+        assert_eq!(cfg.pace.soft_percent, 70.0);
     }
 
     #[test]
