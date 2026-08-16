@@ -1,12 +1,12 @@
 ---
-last-verified: 2026-08-16
+last-verified: 2026-08-17
 ---
 
 # Technology Stack
 
 ## Quick Reference
 
-- Crate `zirv`, version 2.8.0, Rust edition 2024.
+- Crate `zirv`, version 2.9.0, Rust edition 2024.
 - Async runtime is `tokio` (multi-thread), used for process spawning throughout `script_runner/` and the `ctx` supervisors.
 - Release profile is tuned for a small, fast-starting CLI binary and sets `panic = "abort"` — see the Gotcha below.
 - **If changed:** update this page whenever a dependency is added, removed, or re-pinned in `Cargo.toml`. If the release profile changes (especially `panic`), also check [[Ctx Supervisors]] and [[Architecture Overview]] for correctness of any assumption built on it.
@@ -17,7 +17,7 @@ last-verified: 2026-08-16
 | Field | Value |
 |---|---|
 | name | `zirv` |
-| version | `2.8.0` |
+| version | `2.9.0` |
 | edition | `2024` |
 | license | MIT |
 | repository | https://github.com/Glubiz/zirv |
@@ -44,6 +44,7 @@ last-verified: 2026-08-16
 | `crossterm` | 0.29 | Terminal event/key input and raw-mode primitives for the dashboard's own event loop (`dash/mod.rs`) |
 | `ratatui` | 0.30 | Immediate-mode TUI rendering for the dashboard's header, sidebar, pane grid, and overlays (`dash/ui.rs`) |
 | `vt100` | 0.16 | Embedded terminal-screen emulation, one `vt100::Screen` per dashboard pane, so a pane's own child renders correctly without owning the real terminal |
+| `ureq` | 3 | Blocking HTTP client for `ctx::poll::HttpPoller` — this crate's **first** HTTP dependency (2026-08-16). Deliberately narrow in scope: it backs only the active usage-poll *fallback*, consulted solely when the passive collector reading (statusline tee or codex rollout scan) has already gone stale at a pacing decision point — never on a path that must stay network-free (`wrap`'s status-bar redraw never constructs a poller). Chosen over `reqwest` for a synchronous, blocking call with no async runtime coupling needed for one occasional GET; pulls in `rustls` (and transitively `ring`/`cc`) rather than a system TLS dependency, keeping the binary's TLS story self-contained the way the rest of the dependency tree already is |
 
 ### Platform-specific
 

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-16
+last-verified: 2026-08-17
 ---
 
 # Decision Log
@@ -23,6 +23,27 @@ last-verified: 2026-08-16
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-16 — Hybrid usage source: passive collector primary, active HTTP poll fallback-only; `ureq` is this crate's first HTTP dependency
+**Context:** The passive collector (statusline tee for claude, rollout-file scan for codex) can go stale between observations — nothing refreshes it if a session is idle, or if the statusline was never wired up at all. A real vendor usage API exists for both providers, but calling it proactively on every gate check would spend a network round-trip (and the operator's own OAuth token) on every supervised cycle, including the overwhelming majority where the passive reading is already fresh.
+**Decision:** `poll.rs`'s `HttpPoller` (behind the new `UsagePoller` trait, so every test stubs it) is consulted only through `maybe_poll`, which is a no-op whenever the stored reading is already fresher than `collector_max_age_secs`, and otherwise floored to at most one attempt per `poll_min_interval_secs` (default 60s) via a per-provider marker file, written on both success and failure. `ureq = "3"` was chosen for the one blocking GET this needs — no async runtime coupling for an occasional call — pulling in `rustls`/`ring` rather than a system TLS dependency.
+**Rejected:** Polling on every gate check regardless of collector freshness — spends tokens and vendor API quota for no benefit over the passive reading in the common case. An async client (`reqwest`) — this crate's supervisors are already synchronous outside `tokio`'s process-spawn usage; adding an async HTTP stack for one occasional call was a bigger dependency footprint than the problem justified.
+**Consequences:** The codex endpoint (`https://chatgpt.com/backend-api/codex/usage`) ships **unverified** — no readable token existed on the reference machine to exercise it live — so it is code-reviewed but not observed against a real response; see [[Known Issues]]. The Anthropic endpoint is unofficial (undocumented, may drift) and its parser degrades to `None` rather than erroring if the shape changes.
+**Spec / link:** [[Usage and Pacing]] (`poll.rs`), [[Technology Stack]] (`ureq`); `docs/superpowers/specs/2026-08-16-usage-credits-throttle-design.md`.
+
+### 2026-08-16 — `use_credits` skips proactive pacing only; a vendor-reported limit hit still parks
+**Context:** Some operators run a harness on a vendor plan where overage draws from purchased credits rather than hard-stopping — for them, zirv's own proactive throttle (`Slow`) and hard pause (`WaitUntil`) are friction with no protective purpose. But the pacing gate is not the only thing that can stop a session: `scan_for_limit`/`is_limit_hit` watches live output for the vendor's own "hit your session/weekly/opus limit" message, a fact reported by the vendor itself, not a zirv guess.
+**Decision:** `PaceGate.use_credits` (resolved per call from `cfg.pace.use_credits.for_provider(adapter.provider())`, a new `REPO_FORBIDDEN` config table) short-circuits `wait_for_window` before any source refresh or decision at all — no throttle, no pause, logged once per run. It does **not** touch the separate limit-park code path: both `exec.rs`/`run_loop.rs` call sites that react to a scanned limit message deliberately pass `use_credits: false` into whatever pacing follows a park, so a vendor-reported hit is never silenced by this flag.
+**Rejected:** Making `use_credits` also suppress the limit-park reaction — conflates "I don't need proactive pacing" with "ignore the vendor telling me it already stopped serving requests," which is a materially different and riskier claim than the operator is making.
+**Consequences:** An operator who mis-declares `use_credits` for a plan that does *not* actually cover overage loses zirv's own proactive protection but is still caught by the limit-park path the moment the vendor says so — a bounded, not unbounded, risk.
+**Spec / link:** [[Usage and Pacing]] (`pace.rs`'s `PaceGate`); `docs/superpowers/specs/2026-08-16-usage-credits-throttle-design.md`.
+
+### 2026-08-16 — Session conventions v2 delivered to codex workers via task-prompt fallback, ahead of mail
+**Context:** `DEFAULT_PROMPT` (v1) taught a session zirv's own conventions, but only ever reached an adapter with real system-prompt injection (claude). Task 9 added two new conventions bullets (verify once then trust the result; keep scope to what was asked) and, separately, an adapter with `capabilities().system_prompt == false` (codex today) had no channel at all for this layer — `compose` still built it, but `injection_args_for_session` turned it into an empty argv, a silent no-op.
+**Decision:** `task_prompt_with_conventions_fallback` mirrors the existing `task_prompt_with_mail_fallback` pattern: for an injection-less adapter, it appends `DEFAULT_PROMPT` verbatim onto the task-prompt text itself (the one channel such an adapter has — an argv token, or stdin on a Windows shim launch), a no-op for a capable adapter. Applied first among the task-prompt fallbacks, so the final order is task text -> conventions -> mail -> report-back. Unlike the mail fallback, it respects `--simple` (callers only apply it when a composed prompt exists for the run, mirroring `compose`'s own gate) — a deliberate asymmetry from mail, which is pinned by its own dedicated test.
+**Rejected:** Giving codex its own separate conventions text — would drift from claude's wording over time with no shared source of truth; the whole point of `DEFAULT_PROMPT` is one canonical statement of zirv's conventions regardless of which channel delivers it.
+**Consequences:** A `--simple` codex worker still gets no conventions layer at all, same as before — that is the existing `--simple` contract (zirv injects nothing), not a gap introduced here.
+**Spec / link:** [[Ctx Adapters]] (prompt layering), `docs/superpowers/plans/2026-08-16-usage-credits-throttle.md` (Task 9); `prompt.rs`'s `task_prompt_with_conventions_fallback`.
 
 ### 2026-08-16 — Usage returns to the dashboard header, reversing `a3b81c3`, once passive scanning made it non-empty
 **Context:** `a3b81c3` (2026-08-15) removed usage from the dashboard header because every figure rendered "no usage source" — authoritative percentages needed a statusline tee almost nobody had wired up, and a row that always says nothing is worse than no row (see the two 2026-08-15 entries below). Since then, Tasks 4-6 gave codex a passive rollout scan and an HTTP poll fallback at every `PaceGate` call site, so a stored per-provider reading is now usually fresh without any statusline at all.
