@@ -261,6 +261,16 @@ pub fn run_model(
             break status;
         }
         if Instant::now() >= deadline {
+            // P1: the distiller is launched through the same adapter machinery
+            // as any other child, so on Windows it can be a `cmd.exe /c
+            // <shim>` whose real model process is a `node` grandchild --
+            // `child.kill()` alone is a `TerminateProcess` against the shim and
+            // leaves that grandchild running with nothing watching it. `wrap`
+            // calls this from its pump, so the orphan would outlive the very
+            // restart it was blocking. Tree-kill first, narrow kill behind it,
+            // and `wait` unchanged as the only evidence of death.
+            #[cfg(not(unix))]
+            super::supervise::kill_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!("model did not answer within {}s", timeout.as_secs()).into());

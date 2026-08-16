@@ -1075,6 +1075,54 @@ mod tests {
         );
     }
 
+    /// P5, the restart window: the pid a `wrap` record names must never be a
+    /// *dead* one, not even briefly.
+    ///
+    /// `list` sweeps any record whose pid is gone, and it runs on other
+    /// processes' schedules -- `zirv ctx status`, `nudge`, `send
+    /// --to-session`, a dashboard's ~1s registry refresh. So during a rot
+    /// restart, where the old child is killed long before a replacement
+    /// exists, `pump`'s restart arm parks the record on zirv's own pid first
+    /// and adopts the fresh child's only once there is one. This pins that
+    /// three-step sequence, which is all `pump` does to the guard: there is
+    /// no seam to drive the pump's own restart arm from a unit test, and the
+    /// two calls it makes are exactly these.
+    #[test]
+    fn a_restart_never_leaves_the_record_naming_a_dead_pid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = record_for("44444444-2222-4333-8444-555555555555", &repo, Verb::Wrap);
+        let path = record_path(&state, &record.short);
+        let mut guard = SessionGuard::register(&state, record);
+
+        let on_disk = || -> Record {
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse")
+        };
+
+        // 1. First spawn: the record names the agent child.
+        guard.adopt_child_pid(4242);
+        assert_eq!(on_disk().pid, 4242);
+
+        // 2. Restart begins -- the child is about to be killed, so the record
+        //    is parked on this process, which is alive by construction.
+        guard.adopt_child_pid(std::process::id());
+        assert_eq!(on_disk().pid, std::process::id());
+        assert!(
+            is_alive(on_disk().pid),
+            "a concurrent `list` mid-restart must not sweep this record"
+        );
+
+        // 3. Respawn: back onto the fresh child.
+        guard.adopt_child_pid(5353);
+        assert_eq!(on_disk().pid, 5353);
+        assert_eq!(
+            on_disk().short,
+            guard.short(),
+            "and the delivery address never moved through any of it"
+        );
+    }
+
     /// Idempotent and inert after release, like every other guard write here:
     /// a relaunch calls it once per fresh child, and a released guard must not
     /// resurrect the record file it just removed.

@@ -200,6 +200,14 @@ pub(crate) fn deregister_child_pid(pid: u32) {
 /// contended mutex hangs the window instead of killing anything. Losing the
 /// snapshot degrades to today's behaviour (orphans), which is bad; hanging
 /// the close is worse. A poisoned lock takes the same route.
+///
+/// `allow(dead_code)` off Windows rather than `cfg(windows)`: the only
+/// non-test caller is `kill_registered_trees`, which *is* Windows-only, so
+/// on Linux this reads as dead in the bin target and `-D warnings` fails the
+/// ubuntu CI job. Gating the function itself would take the registry tests
+/// with it, and running those on CI is the whole reason the registry is not
+/// `cfg`'d in the first place (see this section's own header comment).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn supervised_pid_snapshot() -> Vec<u32> {
     supervised_pids()
         .try_lock()

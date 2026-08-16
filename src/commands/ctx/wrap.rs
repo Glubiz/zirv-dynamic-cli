@@ -1770,6 +1770,20 @@ fn pump(
             Action::Restart => {
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
 
+                // P5: park the record on zirv's own (unquestionably alive) pid
+                // for the duration of the restart. Everything from here to the
+                // respawn below -- the distiller call, `quit_child`'s grace
+                // ladder, the fresh pty -- happens while the *old* child is
+                // being killed, and `sessions::list` sweeps any record whose
+                // pid is dead. That listing runs on other processes' schedules
+                // (`zirv ctx status`, `nudge`, `send --to-session`, a
+                // dashboard's own ~1s registry refresh), so leaving the record
+                // pointing at the child being killed meant a concurrent reader
+                // could delete this very much live session's record mid-restart
+                // and strand every message addressed to it. The real child pid
+                // is adopted again the moment there is one.
+                session_guard.adopt_child_pid(std::process::id());
+
                 let jsonl = transcript
                     .path()
                     .map(|path| std::fs::read_to_string(path).unwrap_or_default())
