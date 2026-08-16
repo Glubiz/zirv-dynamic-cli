@@ -173,6 +173,7 @@ pub fn run_with<W: Write>(
             super::prompt::PromptRole::Worker,
             &memory_entries,
             cfg.memory.max_injected_bytes,
+            &[],
         );
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles. Minted here, ahead of

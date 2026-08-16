@@ -123,6 +123,7 @@ pub fn run_with<W: Write>(
         super::prompt::PromptRole::Worker,
         &memory_entries,
         cfg.memory.max_injected_bytes,
+        &[],
     );
     let (user_extra, composed) =
         super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);

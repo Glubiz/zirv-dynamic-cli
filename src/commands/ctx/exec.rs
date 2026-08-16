@@ -316,6 +316,9 @@ pub fn run_with<W: Write>(
         super::prompt::PromptRole::Worker,
         &memory_entries,
         cfg.memory.max_injected_bytes,
+        // A Worker session never hears about other harnesses; see
+        // `prompt::PromptSource::Harnesses`.
+        &[],
     );
     // Known before argv is touched, because it decides how argv is read: the
     // token holding this exact text is the prompt, whatever it looks like.
@@ -865,6 +868,7 @@ pub fn run_with<W: Write>(
                 super::prompt::PromptRole::Worker,
                 &memory_entries,
                 cfg.memory.max_injected_bytes,
+                &[],
             );
             // C7: `registry_short`, not `short_id(session)` -- `session`
             // has just been rotated above, and the nudge's own payload was

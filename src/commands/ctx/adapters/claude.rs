@@ -54,10 +54,9 @@ project's format, lint and test commands before reporting back.
 - Verify in batches: one independent reviewer gate per batch of related changes, not one per \
 micro-task. You own the final integration, so resolve conflicts between agent outputs and report \
 outcomes, including failures, plainly.
-- Finish every development task with a full-diff review by a dedicated subagent running the \
-/code-review skill, with model and effort scaled to the blast radius of the diff, scaling up when \
-in doubt. Run it only once the other quality gates pass, then triage its findings, fix what is \
-real, and rerun until it is clean before reporting the work done.";
+- The final-review policy for a development task comes from the zirv meta-harness layer (a bounded \
+cross-harness review round); this seat's native full-diff pass within that round is the \
+/code-review skill.";
 
 fn text_of(message: &Value) -> String {
     message

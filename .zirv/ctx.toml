@@ -5,3 +5,12 @@
 # Model for the interactive orchestrator session (displayed in the banner/header).
 # User decision 2026-08-13: the orchestrator runs Fable (claude-fable-5).
 model = "fable"
+
+# The orchestrator's harness roster (which other harnesses this session can
+# initiate with `zirv agent <name> "<prompt>"`) is derived by zirv at launch
+# from the adapter registry, each adapter's own readiness, and this repo's
+# `.zirv/.settings.toml` gate, then injected into the session prompt. It is
+# not configured here: `prompt.harnesses` is operator-only (REPO_FORBIDDEN),
+# so a repo checkout cannot force it back on. An operator who wants it off
+# sets `prompt.harnesses = false` in `~/.zirv/ctx.toml` or
+# `ZIRV_CTX_PROMPT_HARNESSES=false`.

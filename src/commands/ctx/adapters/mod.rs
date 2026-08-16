@@ -729,6 +729,60 @@ pub fn available_adapter_names(cfg: &CtxConfig) -> Vec<&'static str> {
         .collect()
 }
 
+/// One line per registered adapter, describing whether an Orchestrator
+/// session may delegate to it right now via `zirv agent <name> "<prompt>"`.
+/// Rendered by a caller that already has `cfg` in hand (`wrap`, `chat`'s
+/// dashboard orchestrator pane path), never by a Worker call site: the result
+/// is folded into the composed prompt as the harness roster
+/// (`prompt::PromptSource::Harnesses`), and a worker must not learn what it
+/// could delegate to.
+///
+/// Walks `ADAPTERS` in registry order, same as `readiness_note`, but reports
+/// per-adapter gate state too (`readiness_note` only ever speaks about
+/// installed-but-not-ready or degraded adapters, never a disabled one): a
+/// disabled adapter gets its own line naming where the disable came from
+/// (`AgentState::location`) rather than silently vanishing from the roster,
+/// so an operator reading the prompt can tell "not offered because disabled
+/// in .zirv/.settings.toml" from "not offered because not installed".
+pub fn harness_prompt_lines(cfg: &CtxConfig) -> Vec<String> {
+    let bin = cfg.agent_bin.as_deref();
+    ADAPTERS
+        .iter()
+        .map(|(name, ctor)| {
+            let name: &str = name;
+            let (enabled, location) = cfg
+                .agents
+                .states()
+                .find(|(n, _)| *n == name)
+                .map(|(_, s)| (s.enabled, s.location()))
+                .unwrap_or((true, "default".to_string()));
+            if !enabled {
+                return format!("- {name}: disabled ({location})");
+            }
+
+            let adapter = ctor(bin);
+            match adapter.ready() {
+                Ok(()) => {
+                    let missing = missing_capability_labels(adapter.capabilities());
+                    let degraded = if missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (degraded: no {})", join_with_or(&missing))
+                    };
+                    format!(
+                        "- {name}: enabled, ready -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
+                    )
+                }
+                Err(err) => {
+                    let reason = err.to_string();
+                    let short = reason.lines().next().unwrap_or(&reason);
+                    format!("- {name}: installed? not ready ({short})")
+                }
+            }
+        })
+        .collect()
+}
+
 /// A `Capabilities` predicate paired with its user-facing label -- factored
 /// out purely to keep `CAPABILITY_LABELS`'s type simple enough for clippy's
 /// `type_complexity` lint.
@@ -1110,6 +1164,53 @@ mod tests {
         assert!(
             !note.contains("claude (launch-level"),
             "claude is fully capable and must not appear in the degraded clause: {note}"
+        );
+    }
+
+    #[test]
+    fn harness_prompt_lines_returns_one_line_per_registered_adapter() {
+        let lines = harness_prompt_lines(&permissive_cfg());
+        assert_eq!(lines.len(), ADAPTERS.len());
+        for (name, _) in ADAPTERS {
+            assert!(
+                lines.iter().any(|l| l.starts_with(&format!("- {name}:"))),
+                "missing a line for '{name}': {lines:?}"
+            );
+        }
+    }
+
+    /// The one call site (`prompt::compose` for an Orchestrator session) must
+    /// never learn about a disabled adapter as if it were offered for
+    /// delegation: a disabled line names where the disable came from and
+    /// never the `zirv agent <name>` invitation.
+    #[test]
+    fn harness_prompt_lines_names_the_disabled_adapter_and_its_location() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env: std::collections::HashMap<String, String> =
+            [("ZIRV_AGENT_CODEX_ENABLED".to_string(), "false".to_string())]
+                .into_iter()
+                .collect();
+        let cfg = CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| env.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        };
+
+        let lines = harness_prompt_lines(&cfg);
+        let codex_line = lines
+            .iter()
+            .find(|l| l.starts_with("- codex:"))
+            .expect("codex line present");
+        assert!(codex_line.contains("disabled"), "got {codex_line}");
+        assert!(
+            codex_line.contains("ZIRV_AGENT_CODEX_ENABLED"),
+            "names the environment source: {codex_line}"
+        );
+        assert!(
+            !codex_line.contains("zirv agent codex"),
+            "a disabled adapter is never offered for delegation: {codex_line}"
         );
     }
 

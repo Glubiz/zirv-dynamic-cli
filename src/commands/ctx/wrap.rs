@@ -919,6 +919,13 @@ pub fn run_with(
     let memory_slug = super::state::repo_slug(repo);
     let memory_entries =
         super::memory::render_for_prompt(&state_dir, &memory_slug, &cfg, super::state::now_secs());
+    // Only an Orchestrator session hears about other harnesses at all: see
+    // `prompt::PromptSource::Harnesses`.
+    let harness_lines = if role == PromptRole::Orchestrator {
+        adapters::harness_prompt_lines(&cfg)
+    } else {
+        Vec::new()
+    };
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
@@ -927,6 +934,7 @@ pub fn run_with(
         role,
         &memory_entries,
         cfg.memory.max_injected_bytes,
+        &harness_lines,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below

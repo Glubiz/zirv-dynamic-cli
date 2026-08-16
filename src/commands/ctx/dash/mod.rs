@@ -1736,6 +1736,7 @@ fn compose_worker_prompt(
         prompt::PromptRole::Worker,
         &memory_entries,
         cfg.memory.max_injected_bytes,
+        &[],
     );
     let system_prompt_supported = adapter.capabilities().system_prompt;
     let should_list_mail = cfg.mail.enabled && (composed.is_some() || !system_prompt_supported);
