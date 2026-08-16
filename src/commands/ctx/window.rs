@@ -550,7 +550,7 @@ pub fn scan_codex_rollouts(
 }
 
 #[allow(dead_code)]
-fn newest_observation(windows: &UsageWindows) -> u64 {
+pub(crate) fn newest_observation(windows: &UsageWindows) -> u64 {
     windows
         .five_hour
         .iter()

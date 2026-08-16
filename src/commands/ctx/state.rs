@@ -275,6 +275,18 @@ impl StateDir {
             .join(format!("usage-{}.json", provider_slug(provider)))
     }
 
+    /// Poll-marker file: `<state>/poll-<provider>.json`, one `{"last_attempt":
+    /// u64}` per provider. `poll::maybe_poll` uses this to throttle real
+    /// network polls to `poll_min_interval_secs`, independent of how stale the
+    /// stored usage reading looks -- a failed attempt still writes the marker,
+    /// so a provider with no working token does not retry every call. The slug
+    /// is sanitised by [`provider_slug`], mirroring [`Self::usage_for`].
+    #[allow(dead_code)]
+    pub fn poll_marker_for(&self, provider: &str) -> PathBuf {
+        self.0
+            .join(format!("poll-{}.json", provider_slug(provider)))
+    }
+
     /// Per-transcript scoring checkpoints. The Stop hook is a fresh process on
     /// every turn, so the only place it can leave its parse position is a file.
     pub fn scoring(&self) -> PathBuf {
