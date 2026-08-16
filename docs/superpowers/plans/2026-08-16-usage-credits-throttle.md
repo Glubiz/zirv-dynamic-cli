@@ -1086,6 +1086,48 @@ gh pr create --title "feat(ctx): vendor usage monitoring, use_credits gating, pa
 
 ---
 
+### Task 9: Session-conventions v2 — check-once-then-trust and anti-scope-creep (user scope expansion, 2026-08-16)
+
+**Goal:** Every zirv-started session tells the model to (a) verify a fact once and then rely on the result instead of re-checking, and (b) keep scope to what was asked, expanding only when strictly needed for correctness, bug avoidance, clean code, or flexibility, preferring simple solutions. Approved design: both harnesses — claude via the injected `DEFAULT_PROMPT` layer, codex workers via a new task-prompt fallback mirroring the mail fallback.
+
+**Files:** `src/commands/ctx/prompt.rs` (constant + new fallback + tests), call sites in `src/commands/ctx/exec.rs`, `src/commands/ctx/run_loop.rs`, `src/commands/ctx/dash/mod.rs`.
+
+**Step 1 — `DEFAULT_PROMPT` v2.** In `prompt.rs`, change the first line `zirv session conventions (v1)` to `(v2)` and append two bullets after the existing three (keep the existing wrap style with trailing `\` continuations):
+
+```text
+- Verify once, then trust the result: when you have already read a file, run a check, or \
+established a fact in this session, rely on that result instead of re-checking it. Re-verify \
+only when something has changed it since.
+- Keep the scope to what was asked. Expand it only when an addition is strictly needed to \
+implement the request with best practices: avoiding bugs, keeping the code clean, or keeping \
+it flexible. Prefer the simplest solution that meets the requirement, and mention further \
+ideas instead of building them.
+```
+
+Update the doc comment above the constant ("Deliberately three rules" → five). Do **not** bump `DEFAULT_PROMPT_VERSION` (stays `v5`): per the module doc, rewording a layer's own text moves the layer's first-line version only, not the composed-shape marker. Fix any test pinned to the old text (grep tests for `(v1)`, "three rules", or asserting on `DEFAULT_PROMPT` content).
+
+**Step 2 — codex worker fallback.** Add to `prompt.rs`, mirroring `task_prompt_with_mail_fallback` exactly (same doc-comment style, same no-op contract):
+
+```rust
+pub fn task_prompt_with_conventions_fallback(
+    prompt_text: &str,
+    system_prompt_supported: bool,
+) -> String
+```
+
+- Returns `prompt_text` unchanged when `system_prompt_supported` is true (capable adapters get the conventions through the normal composed-prompt route; their launch stays byte-for-byte unaffected).
+- Otherwise appends a labeled block: `"\n\n---\n\nThe following section is from zirv, the harness that started this session.\n\n"` followed by `DEFAULT_PROMPT` verbatim.
+
+**Step 3 — call sites.** At every point a headless task prompt is finalized for launch — `exec.rs` (the `task_prompt_with_mail_fallback` call sites at ~685, ~1024, ~1115, ~1262), `run_loop.rs` (~294), `dash/mod.rs` (~1843) — apply the conventions fallback **first**, so the final order on the codex channel is: task text → conventions → mail → report-back. Gate identically to composition: only when a composed prompt exists for this run (the call sites hold `composed`/equivalent; where only flags are in scope, gate on the same `simple`/`cfg.prompt.enabled` pair `compose` checks). A `--simple` run or disabled prompt appends nothing.
+
+**Step 4 — tests (TDD).** In `prompt.rs` tests: (1) composed prompt contains both new bullets and the `(v2)` marker; (2) `task_prompt_with_conventions_fallback` with `system_prompt_supported == false` appends the conventions block, `== true` returns input unchanged, and ordering with the mail fallback puts conventions before mail; (3) existing tests still pass. Run `cargo test --quiet -- --test-threads=1 prompt` plus the exec/run_loop tests that assert on task-prompt text (grep for tests naming `task_prompt_with_mail_fallback`; if any pin exact prompt text, update them).
+
+**Step 5 — commit** `feat(ctx): session conventions v2 — verify-once and scope discipline, delivered to codex workers too`.
+
+**Doc note for Task 8:** the Task 8 doc pass must also record conventions v2 + the codex conventions fallback in `Modules/Ctx Adapters.md` (or the page owning prompt layering) per the CLAUDE.md doc table.
+
+---
+
 ## Post-plan review round (orchestrator, after Task 8)
 
 Per session conventions, not a plan task for implementers: run `/code-review` over the full branch diff, plus one `zirv agent codex` review worker with a self-contained brief; triage, fix confirmed findings, re-review touched areas; hard-stop after 2 fix rounds.
