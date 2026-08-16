@@ -373,16 +373,12 @@ pub fn current_windows(
 /// text it always has, so nothing that already asserts on it breaks.
 ///
 /// `provider` is the resolved adapter's own `AgentAdapter::provider()`
-/// (`"anthropic"` for claude, `"openai"` for codex). E: when `provider` has
-/// **no possible** usage source (`window::has_no_usage_source` -- any
-/// provider but claude, since only claude has a real collector mechanism at
-/// all today), the gate is skipped outright with one announcement rather
-/// than silently entering the loop below and reading "nothing known" as if
-/// it were a fresh, empty collector reading for *this* provider: there is no
-/// collector for this provider at all, which is a materially different fact
-/// than "the collector says 0%". Claude itself is exempt from this check
-/// even before its first statusline tee: "not yet" is still true and
-/// actionable there.
+/// (`"anthropic"` for claude, `"openai"` for codex). When nothing has been
+/// recorded for `provider` (`window::has_no_usage_source`), the gate is
+/// skipped outright with one announcement rather than silently entering the
+/// loop below and reading "nothing known" as if it were a fresh, empty
+/// collector reading. (Tasks 6/7 wire `refresh_codex_usage` and the poller
+/// ahead of this check, so callers refresh sources first.)
 ///
 /// `announced_no_source` is owned by the caller and threaded through every
 /// call across one run (`exec`'s own supervise loop calls this once per

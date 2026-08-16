@@ -294,13 +294,9 @@ pub fn run_with<W: Write>(
             // nothing enabled and ready at all).
             let provider = adapters::provider_for_usage_readout(&cfg);
             let now = now_secs();
-            // E: a provider with no *possible* usage source (codex/openai
-            // today) must not fall through to `report`'s own "no readings
-            // yet, wire the statusline tee" message -- that suggestion only
-            // ever helps claude, whose windows come from Claude Code's own
-            // statusline. `window::has_no_usage_source` is what keeps claude
-            // itself exempt even before its first tee, where "not yet" is
-            // still the true, actionable answer.
+            // Check whether anything has been recorded for this provider.
+            // (Tasks 6/7 wire `refresh_codex_usage` and the poller ahead of
+            // this check, so callers refresh sources first.)
             if window::has_no_usage_source(&state, provider) {
                 writeln!(w, "{provider}: no usage source")?;
                 return Ok(0);
