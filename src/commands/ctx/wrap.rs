@@ -922,7 +922,7 @@ pub fn run_with(
     // Only an Orchestrator session hears about other harnesses at all: see
     // `prompt::PromptSource::Harnesses`.
     let harness_lines = if role == PromptRole::Orchestrator {
-        adapters::harness_prompt_lines(&cfg)
+        adapters::harness_prompt_lines(&cfg, adapter.name())
     } else {
         Vec::new()
     };

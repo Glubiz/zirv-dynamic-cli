@@ -655,12 +655,11 @@ impl Pane {
         if let Some(child_pid) = child.process_id() {
             record.pid = child_pid;
         }
-        // Stamped so the dashboard's own sidebar merge can tell its own
-        // spawned sessions apart from another, concurrently running
-        // dashboard's -- see `sessions::Record::owner_pid` and
-        // `dash::assemble_sidebar`. Every pane this dashboard spawns, both
-        // the orchestrator and every worker, goes through this constructor.
-        record.owner_pid = Some(std::process::id());
+        // `owner_pid` is left unset here: `SessionGuard::register` below
+        // stamps it with this process's own pid -- the dashboard's -- for
+        // every pane, orchestrator and worker alike, the same seam every
+        // other registration path shares (`sessions::Record::owner_pid`,
+        // `dash::assemble_sidebar`).
         let record = if server.is_some() {
             record
         } else {

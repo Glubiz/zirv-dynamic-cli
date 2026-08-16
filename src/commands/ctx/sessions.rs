@@ -266,13 +266,28 @@ pub struct Record {
     /// reachable session.
     #[serde(default = "reachable_default")]
     pub reachable: bool,
-    /// The dashboard process that spawned this session, if any. `None` for
-    /// every registration outside a dashboard pane (`wrap`/`exec`/`loop`
-    /// resume, `chat`) and for any record written before this field
-    /// existed. The dashboard sidebar merge (`dash::assemble_sidebar`) keeps
-    /// only records whose `owner_pid` matches its own pid, so a second,
-    /// concurrently running dashboard's panes never bleed into this one's
-    /// panel. `#[serde(default)]` so an on-disk record from an older build
+    /// The process that registered this session, stamped by
+    /// [`SessionGuard::register`] itself (unless a caller already set it) --
+    /// so it is always `Some(pid)` for a record written by this build, and
+    /// `None` only for one written by an older build before this field
+    /// existed. A dashboard pane carries the *dashboard's* pid because
+    /// `Pane::new` registers from inside the dashboard process itself; any
+    /// other session simply carries the pid of whichever process actually
+    /// called `register`. That is not always the dashboard even for a
+    /// session a dashboard pane is morally responsible for: `zirv ctx
+    /// agent`'s dashboard-refused-but-retryable fallback (`agent.rs`'s
+    /// headless path, `agent.rs:126` onward into `exec::run_with`) runs in
+    /// the *requester's* process -- a pane's own child shell, or a plain
+    /// terminal -- never inside the dashboard's, so that fallback session
+    /// registers the requester's pid and is not shown in that dashboard's
+    /// sidebar. Accepted residual: pid-based ownership has no way to express
+    /// "spawned on this dashboard's behalf, but from outside its process," so
+    /// that session is only visible via mail (its own report-back) and `zirv
+    /// ctx status`, same as any other unowned-by-this-dashboard record. The
+    /// dashboard sidebar merge (`dash::assemble_sidebar`) keeps only records
+    /// whose `owner_pid` matches its own pid, so a second, concurrently
+    /// running dashboard's panes never bleed into this one's panel.
+    /// `#[serde(default)]` so an on-disk record from an older build
     /// deserializes as `None` rather than failing to parse.
     #[serde(default)]
     pub owner_pid: Option<u32>,
@@ -301,10 +316,9 @@ impl Record {
             // `wrap` (which can run `--no-supervise`, or fail to bind) has
             // any reason to call `unreachable()` below.
             reachable: true,
-            // Unowned unless a dashboard pane stamps itself in afterward
-            // (`dash/pane.rs`): every other registration path -- `wrap`,
-            // `exec`, `loop`, `resume`, `chat` outside the dash -- has no
-            // dashboard to attribute the session to.
+            // Left unset here: `SessionGuard::register` stamps this
+            // process's own pid on the way to disk, unless a caller has
+            // already set one (see its own doc comment).
             owner_pid: None,
         }
     }
@@ -348,7 +362,22 @@ pub struct SessionGuard {
 }
 
 impl SessionGuard {
-    pub fn register(state: &StateDir, record: Record) -> Self {
+    /// Stamps `owner_pid` with this process's own pid before writing the
+    /// record, unless the caller already set one -- see the field's own doc
+    /// comment. Every registration path goes through this one function, so
+    /// this is the single seam: a dashboard pane and a standalone `wrap`/
+    /// `exec`/`loop` session both end up attributed to whichever process
+    /// actually called this, without each caller having to remember to stamp
+    /// itself. That is the dashboard's own pid for a pane (registered from
+    /// inside the dashboard process) and the calling process's own pid for
+    /// everything else -- including `zirv ctx agent`'s headless fallback,
+    /// which runs in the *requester's* process rather than the dashboard's
+    /// even when the request named one (see the field's own doc comment for
+    /// that residual).
+    pub fn register(state: &StateDir, mut record: Record) -> Self {
+        if record.owner_pid.is_none() {
+            record.owner_pid = Some(std::process::id());
+        }
         let path = write_record(state, &record);
         Self {
             state: state.clone(),
@@ -925,6 +954,42 @@ mod tests {
         assert!(
             !path.exists(),
             "the record file is gone once the supervisor exits"
+        );
+    }
+
+    /// Finding 3: `owner_pid` used to be stamped only by `dash/pane.rs`, so
+    /// every *other* registration path -- a standalone `wrap`/`exec`/`loop`
+    /// session in particular -- was written with `owner_pid: None`, an owner
+    /// no dashboard could ever match, even though the registering process
+    /// itself is a perfectly good owner to record. Moving the stamp into
+    /// `register` itself fixes that uniformly: every registration is now
+    /// attributed to whichever process actually called it. (This does not
+    /// reach `zirv ctx agent`'s dashboard-refused-but-retryable fallback,
+    /// which runs in the *requester's* process rather than the dashboard's
+    /// even when it was dispatched on that dashboard's behalf -- a separate,
+    /// accepted residual; see `owner_pid`'s own doc comment.)
+    #[test]
+    fn register_stamps_owner_pid_with_the_current_process_unless_already_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+
+        let record = record_for("11111111-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        assert_eq!(record.owner_pid, None, "unstamped before registration");
+        let guard = SessionGuard::register(&state, record);
+        assert_eq!(
+            guard.record().owner_pid,
+            Some(std::process::id()),
+            "register stamps the current process's own pid"
+        );
+
+        let mut explicit = record_for("22222222-3333-4444-8555-666666666666", &repo, Verb::Exec);
+        explicit.owner_pid = Some(999);
+        let guard = SessionGuard::register(&state, explicit);
+        assert_eq!(
+            guard.record().owner_pid,
+            Some(999),
+            "an owner the caller already set is left alone"
         );
     }
 

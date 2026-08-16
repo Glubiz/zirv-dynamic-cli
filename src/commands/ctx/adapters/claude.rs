@@ -54,9 +54,9 @@ project's format, lint and test commands before reporting back.
 - Verify in batches: one independent reviewer gate per batch of related changes, not one per \
 micro-task. You own the final integration, so resolve conflicts between agent outputs and report \
 outcomes, including failures, plainly.
-- The final-review policy for a development task comes from the zirv meta-harness layer (a bounded \
-cross-harness review round); this seat's native full-diff pass within that round is the \
-/code-review skill.";
+- Before reporting development work done, run this harness's own /code-review pass over the full \
+diff; a session that also carries the zirv meta-harness layer follows that layer's cross-harness \
+review round on top.";
 
 fn text_of(message: &Value) -> String {
     message
@@ -478,6 +478,10 @@ pub fn project_slug(cwd: &Path) -> String {
 impl AgentAdapter for ClaudeAdapter {
     fn name(&self) -> &'static str {
         "claude"
+    }
+
+    fn program(&self) -> &str {
+        &self.program
     }
 
     /// Claude Code's subscription windows are Anthropic's, and the account is

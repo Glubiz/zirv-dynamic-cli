@@ -1669,6 +1669,10 @@ mod tests {
             "sentinel"
         }
 
+        fn program(&self) -> &str {
+            "sentinel"
+        }
+
         fn provider(&self) -> &'static str {
             "sentinel"
         }

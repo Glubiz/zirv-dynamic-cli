@@ -830,9 +830,11 @@ fn due(last: Instant, now: Instant, interval: Duration) -> bool {
 #[derive(Default)]
 struct DiskFacts {
     /// Rot scores for every row the sidebar can draw -- this dashboard's own
-    /// panes and every live registry session. `score::cached_score` is cheap
-    /// in the steady state but still costs one `metadata` call per session,
-    /// which is one per pane per frame if it is not cached here.
+    /// panes and every live registry session it owns (see `assemble_sidebar`'s
+    /// own `owner_pid` filter; a foreign or unowned record is never displayed,
+    /// so scoring it here would be wasted work). `score::cached_score` is
+    /// cheap in the steady state but still costs one `metadata` call per
+    /// session, which is one per pane per frame if it is not cached here.
     scores: ScoreMap,
     mail: Option<(usize, usize)>,
     memory_count: usize,
@@ -912,7 +914,12 @@ impl FactsCache {
             }
         }
         for (record, liveness) in &self.registry {
-            if *liveness != sessions::Liveness::Live || self.disk.scores.contains_key(&record.short)
+            if *liveness != sessions::Liveness::Live
+                || self.disk.scores.contains_key(&record.short)
+                // Undisplayable: `assemble_sidebar` will drop this row for
+                // the same reason (a foreign dashboard's session, or an
+                // unowned pre-upgrade record), so scoring it is wasted work.
+                || record.owner_pid != Some(std::process::id())
             {
                 continue;
             }
@@ -5193,6 +5200,60 @@ mod tests {
         assert!(
             cache.disk.scores.is_empty(),
             "a session with no readable transcript stays unscored: `rot --`, not `rot 0`"
+        );
+    }
+
+    /// Finding 5: `refresh_if_due` used to score every live registry record
+    /// regardless of ownership, even though `assemble_sidebar` was about to
+    /// discard any record this dashboard process does not own. A record with
+    /// a real, scorable transcript must still never reach `score::
+    /// cached_score` at all when a foreign pid owns it.
+    #[test]
+    fn refresh_if_due_scores_only_registry_records_this_dashboard_owns() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path();
+        let cfg = CtxConfig::default();
+
+        let owned_session = "5c0d0002-2222-4222-8333-555555555555";
+        let foreign_session = "5c0d0003-3333-4222-8333-555555555555";
+
+        let transcript_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(super::super::state::repo_slug(repo));
+        std::fs::create_dir_all(&transcript_dir).expect("mkdir");
+        let body = "{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[zirv] done\"}],\"usage\":{\"input_tokens\":170000}}}\n";
+        for session in [owned_session, foreign_session] {
+            std::fs::write(transcript_dir.join(format!("{session}.jsonl")), body).expect("write");
+        }
+
+        let owned = sessions::Record::new(owned_session, "claude", repo, sessions::Verb::Wrap);
+        let owned_short = owned.short.clone();
+        let _owned_guard = sessions::SessionGuard::register(&state, owned);
+
+        let mut foreign =
+            sessions::Record::new(foreign_session, "claude", repo, sessions::Verb::Wrap);
+        let foreign_short = foreign.short.clone();
+        foreign.owner_pid = Some(std::process::id().wrapping_add(1));
+        let _foreign_guard = sessions::SessionGuard::register(&state, foreign);
+
+        let mut cache = FactsCache::new(Instant::now());
+        cache.refresh_if_due(&cfg, &state, owner(repo), &[], Instant::now());
+
+        assert_eq!(cache.registry.len(), 2, "both records are on disk");
+        assert!(
+            cache.disk.scores.contains_key(&owned_short),
+            "an owned record with a real transcript is scored: {:?}",
+            cache.disk.scores
+        );
+        assert!(
+            !cache.disk.scores.contains_key(&foreign_short),
+            "a foreign-owned record must never be scored, undisplayable as it is: {:?}",
+            cache.disk.scores
         );
     }
 
