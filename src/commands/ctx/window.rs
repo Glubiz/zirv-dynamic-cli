@@ -377,6 +377,116 @@ pub fn estimate_windows(
     }
 }
 
+/// Parses an RFC 3339 timestamp ("2026-08-16T20:49:59.785342+00:00", trailing
+/// "Z" or "+/-HH:MM", fraction ignored) to unix seconds. None on anything
+/// malformed or pre-epoch. Used by the codex collector and the rollout parser.
+#[allow(dead_code)]
+pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
+    let (date, rest) = s.split_once('T')?;
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let mo: u64 = dp.next()?.parse().ok()?;
+    let d: u64 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Split the time from the offset: "Z", or the last '+'/'-' in the string.
+    let (time, offset_secs) = if let Some(t) = rest.strip_suffix('Z') {
+        (t, 0i64)
+    } else if let Some(idx) = rest.rfind(['+', '-']) {
+        let (t, off) = rest.split_at(idx);
+        let sign = if off.starts_with('-') { -1i64 } else { 1i64 };
+        let (oh, om) = off[1..].split_once(':')?;
+        let oh: i64 = oh.parse().ok()?;
+        let om: i64 = om.parse().ok()?;
+        (t, sign * (oh * 3600 + om * 60))
+    } else {
+        return None;
+    };
+    let time = time.split_once('.').map_or(time, |(t, _frac)| t);
+    let mut tp = time.split(':');
+    let h: i64 = tp.next()?.parse().ok()?;
+    let mi: i64 = tp.next()?.parse().ok()?;
+    let sec: i64 = tp.next()?.parse().ok()?;
+    if tp.next().is_some()
+        || !(0..24).contains(&h)
+        || !(0..60).contains(&mi)
+        || !(0..61).contains(&sec)
+    {
+        return None;
+    }
+    let total =
+        days_from_civil(y, mo as i64, d as i64) * 86_400 + h * 3600 + mi * 60 + sec - offset_secs;
+    u64::try_from(total).ok()
+}
+
+/// Which UsageWindows slot a window of this length belongs to: the nearest of
+/// 5h/7d, accepted only within a factor of two — anything else is a window
+/// shape we do not understand and must drop, never guess.
+fn window_slot(window_secs: u64) -> Option<bool /* true = five_hour */> {
+    if (FIVE_HOUR_SECS / 2..=FIVE_HOUR_SECS * 2).contains(&window_secs) {
+        Some(true)
+    } else if (SEVEN_DAY_SECS / 2..=SEVEN_DAY_SECS * 2).contains(&window_secs) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Maps a codex `rate_limits` object (primary/secondary with used_percent,
+/// window_minutes, resets_at in unix seconds) onto UsageWindows. Shared by the
+/// rollout collector and the codex poller.
+#[allow(dead_code)]
+pub fn windows_from_rate_limits(
+    limits: &serde_json::Value,
+    observed_at: u64,
+) -> Option<UsageWindows> {
+    let mut out = UsageWindows::default();
+    for key in ["primary", "secondary"] {
+        let Some(w) = limits.get(key).filter(|w| w.is_object()) else {
+            continue;
+        };
+        let Some(used) = w.get("used_percent").and_then(|p| p.as_f64()) else {
+            continue;
+        };
+        let minutes = w
+            .get("window_minutes")
+            .and_then(|m| m.as_u64())
+            .unwrap_or(0);
+        let resets_at = w.get("resets_at").and_then(|r| r.as_u64()).unwrap_or(0);
+        let Some(five_hour) = window_slot(minutes * 60) else {
+            continue;
+        };
+        let win = Window {
+            used_percentage: used,
+            resets_at,
+            observed_at,
+        };
+        if five_hour {
+            out.five_hour = Some(win);
+        } else {
+            out.seven_day = Some(win);
+        }
+    }
+    (out.five_hour.is_some() || out.seven_day.is_some()).then_some(out)
+}
+
+/// One codex session-rollout JSONL line -> usage windows, if it is a
+/// token_count event carrying rate limits.
+#[allow(dead_code)]
+pub fn parse_rollout_line(line: &str) -> Option<UsageWindows> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type")?.as_str()? != "event_msg" {
+        return None;
+    }
+    let payload = v.get("payload")?;
+    if payload.get("type")?.as_str()? != "token_count" {
+        return None;
+    }
+    let observed_at = parse_rfc3339_utc(v.get("timestamp")?.as_str()?)?;
+    windows_from_rate_limits(payload.get("rate_limits")?, observed_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1129,46 @@ mod tests {
         let five = windows.five_hour.expect("five");
         assert_eq!(five.used_percentage, 0.0);
         assert_eq!(five.resets_at, now, "nothing to wait for");
+    }
+
+    #[test]
+    fn rfc3339_utc_parses_fraction_and_offset() {
+        // 2026-02-26T18:52:21.222Z -> known epoch; verify against a precomputed value.
+        let z = parse_rfc3339_utc("2026-02-26T18:52:21.222Z").unwrap();
+        let plus = parse_rfc3339_utc("2026-02-26T18:52:21.222+00:00").unwrap();
+        assert_eq!(z, plus);
+        // +01:00 is one hour EARLIER in UTC
+        let cet = parse_rfc3339_utc("2026-02-26T19:52:21+01:00").unwrap();
+        assert_eq!(z, cet);
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_utc("not a time"), None);
+        assert_eq!(parse_rfc3339_utc("2026-13-40T99:00:00Z"), None);
+    }
+
+    #[test]
+    fn rollout_snapshot_maps_primary_and_secondary_by_window_length() {
+        let lines: Vec<&str> =
+            include_str!("../../../tests/fixtures/codex-rollout-rate-limits.jsonl")
+                .lines()
+                .collect();
+        let w = parse_rollout_line(lines[0]).unwrap();
+        let fh = w.five_hour.unwrap();
+        assert_eq!(fh.used_percentage, 10.0);
+        assert_eq!(fh.resets_at, 1772135737);
+        let sd = w.seven_day.unwrap();
+        assert_eq!(sd.used_percentage, 3.0);
+        assert_eq!(sd.resets_at, 1772722537);
+        // observed_at comes from the line's own timestamp, not scan time
+        assert_eq!(
+            fh.observed_at,
+            parse_rfc3339_utc("2026-02-26T18:52:21.222Z").unwrap()
+        );
+        // populated-info shape parses identically
+        assert!(parse_rollout_line(lines[1]).is_some());
+        // non-token_count lines and garbage yield None
+        assert!(parse_rollout_line(lines[2]).is_none());
+        assert!(parse_rollout_line("{broken").is_none());
+        // a 1-minute window maps to neither slot -> dropped -> no windows -> None
+        assert!(parse_rollout_line(lines[3]).is_none());
     }
 }
