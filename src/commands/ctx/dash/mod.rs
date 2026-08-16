@@ -1870,8 +1870,18 @@ fn worker_task_prompt(
     if !system_prompt_supported && !fallback_is_safe {
         return req.prompt.clone();
     }
+    // Session conventions first, ahead of mail and report-back: task text ->
+    // conventions -> mail -> report-back. Gated identically to composition --
+    // `compose_worker_prompt` always calls `prompt::compose` with `simple:
+    // false`, so "a composed prompt exists for this run" reduces to `cfg.
+    // prompt.enabled` alone.
+    let with_conventions = if cfg.prompt.enabled {
+        prompt::task_prompt_with_conventions_fallback(&req.prompt, system_prompt_supported)
+    } else {
+        req.prompt.clone()
+    };
     let with_mail = prompt::task_prompt_with_mail_fallback(
-        &req.prompt,
+        &with_conventions,
         system_prompt_supported,
         mail_messages,
         cfg.mail.max_delivered_bytes,
@@ -6229,7 +6239,7 @@ mod tests {
             "must not start with the bare separator: {prompt:?}"
         );
         assert!(
-            prompt.starts_with("The following section was written by another agent session"),
+            prompt.starts_with("The following section is from zirv, the harness that started"),
             "must start with the fallback's own labeled content instead: {prompt:?}"
         );
         assert!(

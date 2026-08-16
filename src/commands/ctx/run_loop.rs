@@ -295,6 +295,16 @@ pub fn run_with<W: Write>(
             cwd: repo.to_path_buf(),
         });
 
+        // The session conventions (`DEFAULT_PROMPT`) are the first task-
+        // prompt-text fallback applied, ahead of mail: gated identically to
+        // composition (`composed.is_some()`), unlike mail's own gate just
+        // below, which deliberately does not depend on `composed` for an
+        // uninjectable adapter (see the `mail_entries` gate above).
+        let prompt = if composed.is_some() {
+            super::prompt::task_prompt_with_conventions_fallback(&prompt, system_prompt_supported)
+        } else {
+            prompt.clone()
+        };
         // Mail is the one composed layer that still has somewhere to go for
         // an adapter with no system-prompt mechanism: the task prompt text
         // itself. A capable adapter (claude) gets the unchanged `prompt`

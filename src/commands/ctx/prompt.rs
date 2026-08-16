@@ -23,17 +23,17 @@ use super::config::PromptConfig;
 ///
 /// Rewording a layer's own text is *not* a shape change and does not move this
 /// marker: each layer carries its own version in its first line
-/// (`DEFAULT_PROMPT`'s "(v1)", `HARNESS_PROMPT`'s "(v4)"), which is where a
+/// (`DEFAULT_PROMPT`'s "(v2)", `HARNESS_PROMPT`'s "(v4)"), which is where a
 /// changed sentence is recorded. See `the_composed_prompt_version_changed_
 /// with_its_shape`.
 pub const DEFAULT_PROMPT_VERSION: &str = "v5";
 pub const PROMPT_FILE: &str = "system-prompt.md";
 
-/// The floor every zirv-started session gets. Deliberately three rules: enough
+/// The floor every zirv-started session gets. Deliberately five rules: enough
 /// to make sessions behave the same way twice, short enough that it never
 /// competes with the repository's own instructions.
 pub const DEFAULT_PROMPT: &str = "\
-zirv session conventions (v1)
+zirv session conventions (v2)
 
 - Follow the conventions already in this repository: match the surrounding code's style, test \
 layout, and commit message format rather than importing habits from elsewhere. When a repository \
@@ -42,7 +42,14 @@ instruction file applies, it wins over these defaults.
 you were given rather than a paraphrase of it, and check a command's result instead of assuming \
 it worked.
 - Report failures honestly. If a command failed, a test did not pass, or a step was skipped, say \
-so plainly and show the output. Never describe unverified work as done or verified.";
+so plainly and show the output. Never describe unverified work as done or verified.
+- Verify once, then trust the result: when you have already read a file, run a check, or \
+established a fact in this session, rely on that result instead of re-checking it. Re-verify \
+only when something has changed it since.
+- Keep the scope to what was asked. Expand it only when an addition is strictly needed to \
+implement the request with best practices: avoiding bugs, keeping the code clean, or keeping \
+it flexible. Prefer the simplest solution that meets the requirement, and mention further \
+ideas instead of building them.";
 
 /// Deterministic, agent-agnostic teaching about the zirv meta-harness itself:
 /// context, usage and cross-harness communication. Included only for an
@@ -483,6 +490,49 @@ pub fn with_mail_layer(
     composed.text.push_str(&block);
     composed.sources.push(PromptSource::Mail);
     Some(composed)
+}
+
+/// The agent-agnostic-layer fallback for zirv's own session conventions
+/// (`DEFAULT_PROMPT`), mirroring [`task_prompt_with_mail_fallback`] exactly:
+/// for an adapter with no system-prompt injection mechanism (`AgentAdapter::
+/// capabilities().system_prompt == false`, e.g. codex today), `compose`
+/// folding `DEFAULT_PROMPT` into a `ComposedPrompt` that `injection_args_for_
+/// session` then turns into an empty argv is a silent no-op: such a worker
+/// never hears "verify once, then trust the result" or "keep scope to what
+/// was asked" at all, even though `compose` itself unconditionally starts
+/// every composed text with this layer.
+///
+/// The task prompt text itself is the one channel such an adapter has (an
+/// argv token, or -- on a Windows `cmd.exe` shim launch -- stdin), the same
+/// reasoning `task_prompt_with_mail_fallback`'s own doc comment gives.
+/// Applied first among the task-prompt fallbacks, ahead of mail and
+/// report-back, so the final order on that channel is: task text ->
+/// conventions -> mail -> report-back (see the call sites in `exec.rs`,
+/// `run_loop.rs`, `dash/mod.rs`).
+///
+/// A no-op (returns `prompt_text` unchanged) whenever `system_prompt_
+/// supported` is true, so a capable adapter's launch is byte-for-byte
+/// unaffected -- that path still gets `DEFAULT_PROMPT` through the normal
+/// `compose` -> `injection_args_for_session` route.
+///
+/// Unlike `task_prompt_with_mail_fallback` and `task_prompt_with_report_
+/// back_fallback`, this has no "empty input" case to skip: `DEFAULT_PROMPT`
+/// is a fixed, always-non-empty constant, so the only gate is `system_
+/// prompt_supported`. Callers still apply it only when a composed prompt
+/// exists for this run (mirroring `compose`'s own `simple`/`cfg.enabled`
+/// gate), so a `--simple` run or a disabled prompt appends nothing here
+/// either, exactly as it composes nothing for a capable adapter.
+pub fn task_prompt_with_conventions_fallback(
+    prompt_text: &str,
+    system_prompt_supported: bool,
+) -> String {
+    if system_prompt_supported {
+        return prompt_text.to_string();
+    }
+    format!(
+        "{prompt_text}\n\n---\n\nThe following section is from zirv, the harness that started \
+         this session.\n\n{DEFAULT_PROMPT}"
+    )
 }
 
 /// The agent-agnostic-layer fallback for an adapter with no system-prompt
@@ -3645,6 +3695,114 @@ mod tests {
             task_prompt_with_mail_fallback("do the work", false, &[], 4096),
             "do the work",
             "no mail means nothing to append, even for an uninjectable adapter"
+        );
+    }
+
+    // Session conventions v2: the two new bullets, and the codex worker
+    // fallback that mirrors the mail fallback.
+
+    #[test]
+    fn the_default_prompt_carries_the_v2_marker_and_both_new_bullets() {
+        assert!(
+            DEFAULT_PROMPT.contains("zirv session conventions (v2)"),
+            "got {DEFAULT_PROMPT}"
+        );
+        assert!(
+            DEFAULT_PROMPT.contains("Verify once, then trust the result"),
+            "the check-once-then-trust bullet is present: {DEFAULT_PROMPT}"
+        );
+        assert!(
+            DEFAULT_PROMPT.contains("Keep the scope to what was asked"),
+            "the anti-scope-creep bullet is present: {DEFAULT_PROMPT}"
+        );
+    }
+
+    #[test]
+    fn a_composed_prompt_carries_the_v2_marker_and_both_new_bullets() {
+        let (_tmp, home, repo) = tree();
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+            &[],
+            0,
+            &[],
+        )
+        .expect("composed");
+
+        assert!(
+            composed.text.contains("zirv session conventions (v2)"),
+            "got {}",
+            composed.text
+        );
+        assert!(
+            composed.text.contains("Verify once, then trust the result"),
+            "got {}",
+            composed.text
+        );
+        assert!(
+            composed.text.contains("Keep the scope to what was asked"),
+            "got {}",
+            composed.text
+        );
+        assert_eq!(
+            composed.version, DEFAULT_PROMPT_VERSION,
+            "rewording a layer's own text does not move the composed-shape marker"
+        );
+    }
+
+    /// A capable adapter (claude) gets no fallback: the task prompt text is
+    /// untouched, since it already gets `DEFAULT_PROMPT` through the normal
+    /// `compose` -> `injection_args_for_session` route. This is what keeps
+    /// claude's launch byte-for-byte unaffected by the codex-only fallback.
+    #[test]
+    fn task_prompt_with_conventions_fallback_is_a_noop_when_the_adapter_can_be_injected() {
+        assert_eq!(
+            task_prompt_with_conventions_fallback("do the work", true),
+            "do the work",
+            "a capable adapter must not get conventions appended to its task prompt"
+        );
+    }
+
+    /// An adapter with no system-prompt mechanism (codex) still has to
+    /// receive the session conventions somehow, or a worker on that harness
+    /// never hears them: this is what makes the task prompt text itself the
+    /// delivery channel.
+    #[test]
+    fn task_prompt_with_conventions_fallback_appends_default_prompt_for_an_uninjectable_adapter() {
+        let out = task_prompt_with_conventions_fallback("do the work", false);
+        assert!(out.starts_with("do the work"), "got {out}");
+        assert!(
+            out.contains(DEFAULT_PROMPT),
+            "DEFAULT_PROMPT is appended verbatim: {out}"
+        );
+        assert!(
+            out.contains("zirv, the harness that started this session"),
+            "labeled as zirv's own plumbing: {out}"
+        );
+    }
+
+    /// Ordering on the codex task-prompt channel: task text -> conventions
+    /// -> mail -> report-back. Applying the conventions fallback first, then
+    /// the mail fallback, must put the conventions block before the mail
+    /// block.
+    #[test]
+    fn conventions_fallback_precedes_mail_fallback_on_the_task_prompt_channel() {
+        let messages = vec![mail_msg("claude", "heads up: schema changed")];
+        let with_conventions = task_prompt_with_conventions_fallback("do the work", false);
+        let out = task_prompt_with_mail_fallback(&with_conventions, false, &messages, 4096);
+
+        let conventions_at = out
+            .find("zirv, the harness that started this session")
+            .expect("conventions block present");
+        let mail_at = out
+            .find("heads up: schema changed")
+            .expect("mail block present");
+        assert!(
+            conventions_at < mail_at,
+            "conventions must precede mail on the codex channel:\n{out}"
         );
     }
 }

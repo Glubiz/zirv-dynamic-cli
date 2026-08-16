@@ -682,8 +682,16 @@ pub fn run_with<W: Write>(
             "no command to supervise; pass the agent command after --, \
              or --prompt to have zirv build the launch itself",
         )?;
+        let prompt_text = if composed.is_some() {
+            super::prompt::task_prompt_with_conventions_fallback(
+                prompt_text,
+                system_prompt_supported,
+            )
+        } else {
+            prompt_text.to_string()
+        };
         let prompt_text = super::prompt::task_prompt_with_mail_fallback(
-            prompt_text,
+            &prompt_text,
             system_prompt_supported,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
@@ -1026,6 +1034,14 @@ pub fn run_with<W: Write>(
             )?;
 
             let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+            let combined = if composed.is_some() {
+                super::prompt::task_prompt_with_conventions_fallback(
+                    &combined,
+                    system_prompt_supported,
+                )
+            } else {
+                combined
+            };
             // A nudge relaunch re-lists mail fresh (`nudge_mail_msgs` above),
             // so the fallback for an uninjectable adapter has to use that
             // same fresh listing, not the launch-time `mail_messages`.
@@ -1124,6 +1140,14 @@ pub fn run_with<W: Write>(
                 .cloned()
                 .chain(prompt_args.iter().cloned())
                 .collect();
+            let prompt_text = if composed.is_some() {
+                super::prompt::task_prompt_with_conventions_fallback(
+                    &prompt_text,
+                    system_prompt_supported,
+                )
+            } else {
+                prompt_text
+            };
             // A park does not itself re-list mail (matching every other
             // value it reuses here), so the fallback for an uninjectable
             // adapter reuses whatever `mail_messages` currently holds --
@@ -1274,6 +1298,11 @@ pub fn run_with<W: Write>(
             adapter.capabilities().system_prompt,
         ));
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+        let combined = if composed.is_some() {
+            super::prompt::task_prompt_with_conventions_fallback(&combined, system_prompt_supported)
+        } else {
+            combined
+        };
         // A rot/timeout restart, like a park, does not itself re-list mail,
         // so the fallback for an uninjectable adapter reuses whatever
         // `mail_messages` currently holds -- the launch-time listing, or a
