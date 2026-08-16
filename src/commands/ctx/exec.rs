@@ -752,7 +752,13 @@ pub fn run_with<W: Write>(
             &mut pace_no_source_announced,
         );
 
-        let (mut child, tap) = supervise::spawn_tapped(command, stdin_prompt.clone())?;
+        // P2/P3: `_child_guard` holds this cycle's child in the console-close
+        // pid registry and in a kill-on-close job for as long as it is in
+        // scope -- which is this loop iteration, i.e. exactly the child's own
+        // life. Dropped (and so released) at the end of the iteration, after
+        // the child has been reaped, and again by every arm that returns.
+        let (mut child, tap, _child_guard) =
+            supervise::spawn_tapped(command, stdin_prompt.clone())?;
         // Item 3: the messages folded into the launch prompt are consumed
         // here, right after the spawn that actually carried them has
         // genuinely started -- not before pacing or the spawn itself, where

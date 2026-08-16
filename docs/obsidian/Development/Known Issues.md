@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-16 (fix/process-lifecycle, c843891+222b24f): resolved the roster liveness gap (dash::roster::partition_live + sessions::short_is_live) but recorded three residuals -- the age window still applies to a genuinely-dead candidate, a live session's roster entry is re-seeded every launch and so never ages out while it stays alive, and a held-back candidate is lost if the dashboard never reaches on_quit (abort_setup's terminal-setup failure arms); narrowed the portable-pty do_kill and supervise::terminate entries to note every teardown path now tree-kills first; added three new gotchas -- a dropped ChildGuard kills its child on Windows, Job-Object assignment races a shim's own grandchild, and the distiller's kill_tree escalation ships without a dedicated test on either platform -->
 <!-- Updated 2026-08-16 (feat/harness-roster-prompt, review round): owner_pid stamping moved from dash/pane.rs into SessionGuard::register itself, uniformly attributing every registration path -- a new entry records the residual it does not close: a raw pid cannot express "owned by dashboard X" from a genuinely separate process, so a dashboard pane's own child falling back to zirv ctx agent's in-process headless worker is correctly, but unhelpfully, invisible to that dashboard's own sidebar -->
 <!-- Updated 2026-08-16 (feat/harness-roster-prompt): dashboard sidebar scoped to sessions owned by this dashboard (owner_pid), reversing ac40418's "show every registered session" -- a new entry records the roster-restore liveness gap found while investigating this, not fixed -->
 <!-- Updated 2026-08-16 (feat/dashboard, codex review-fix final wave): agent joined REPO_FORBIDDEN (a repo ctx.toml could otherwise pick which vendor account gets spent, since resolve_default's configured arm never consulted the repo-narrowing guard); exec.rs's prompt_via_stdin/.ps1 shim-routing dropped its adapter_builds_launch conjunct so a relaunch of an explicit-command run correctly uses stdin on a shim-resolved agent instead of tripping guard_cmd_shim_reparse; the repo_narrowed pre-check and the usage/status provider fallback both got narrower false-premise fixes (agent_bin cross-adapter skip; resolve_default tried before name-derivation) -- a new entry records the limit-park loop's structural lack of throttling for a provider with no usage collector, not fixed -->
@@ -36,11 +37,17 @@ Each entry gets a changelog comment at the top of the file, newest first:
 
 Recorded, not fixed: closing this needs process-independent ownership — e.g. stamping the *dashboard's own registry short id* rather than a pid, threaded down through the spawn-request/fallback path — which is a deliberate non-goal of the round that added `owner_pid` scoping (see [[Decision Log]], [[Ctx Supervisors]] "View-only rows are scoped...").
 
-## The dashboard's quit/restore roster has no process-liveness check on its candidates
+## The dashboard's quit/restore roster now checks liveness, but three residuals remain
 
-`dash::roster::take_roster` gates a restore offer on age (`cfg.dash.roster_max_age_secs`, default 7 days) and role, but not on whether the pane it describes is actually gone. Relaunching a dashboard can therefore resurrect a worker whose previous incarnation is still running — verified on a real machine: a dashboard quit, its roster offered and restored the next day, and every "restored" worker turned out to still be the original process, alive roughly 23 hours later, still burning quota against the same repo.
+**Resolved 2026-08-16 (`fix/process-lifecycle`, P4):** `dash::roster::take_roster` used to gate a restore offer on age (`cfg.dash.roster_max_age_secs`, default 7 days) and role only, never on whether the pane it describes is actually gone — relaunching a dashboard could resurrect a worker whose previous incarnation was still running (verified on a real machine: a dashboard quit, its roster offered and restored the next day, and every "restored" worker turned out to still be the original process, alive roughly 23 hours later, still burning quota against the same repo). `run_dashboard` now partitions `take_roster`'s candidates through `roster::partition_live` (in production, `sessions::short_is_live` — a direct read of the candidate's own registry record, not `sessions::list`'s sweeping read) before ever offering the restore dialog; a candidate whose recorded pid is still alive is held back and announced (`"not restoring … : that session is still running (kept for next launch)"`) rather than offered.
 
-The new per-dashboard sidebar ownership scoping (`owner_pid`, see [[Ctx Supervisors]] and [[Decision Log]]) hides the resulting duplicate from the *new* dashboard's own panel — it is stamped with the new dashboard's pid, not the old one's — but the old process itself is untouched by that fix and keeps running, invisible to any sidebar, discoverable only via `zirv ctx status`. Recorded, not fixed: a real fix needs `take_roster`'s candidates to be checked against the live registry (or an OS-level pid probe) before being offered, not just aged out.
+**Residual 1 — the age window still exists, now for a different reason too.** A candidate whose process really has exited is still subject to `roster_max_age_secs` exactly as before; the liveness check only ever *adds* a reason to withhold an offer, never removes the age gate.
+
+**Residual 2 — a live session's roster entry is effectively immortal for as long as it stays alive.** A held-back candidate is written straight back into the fresh roster (`deferred_restore`, merged by `on_quit`/`merge_unoffered`), and `on_quit` stamps the *whole roster* with one fresh `written: now_secs()` timestamp on every write — there is no per-pane age field. So a session that is still running gets its roster entry's age reset to zero on every dashboard launch-then-quit cycle for as long as it stays alive, and `roster_max_age_secs` never gets a chance to apply to it at all; only a session that actually exits ever starts aging out. This is the corollary of the fix, not a bug in it: the alternative (letting a live candidate's entry age out) is exactly the false-negative this round closed.
+
+**Residual 3 — a held-back candidate can still be lost if the dashboard never reaches `on_quit`.** `deferred_restore` (and `unoffered` generally) is only ever written to disk by `on_quit`. The three terminal-setup failure arms in `run_dashboard` (`enable_raw_mode`, `EnterAlternateScreen`, `Terminal::new` failing) call `abort_setup` and return `Err` directly, never reaching `on_quit` — so a candidate this same launch just held back for being live is lost the moment setup fails, sharing the pre-existing hole every deferred/unoffered candidate has always had (a pane-cap-deferred candidate loses the same way). Not new to P4, but P4 is the first thing that can put a *live, still-running* session's roster entry through this path and lose it.
+
+See [[Ctx Supervisors]] ("Quit and restore roster") and [[Decision Log]].
 
 ## Windows `cmd.exe` argv reparse: repo config can reach a shell command line
 
@@ -406,6 +413,20 @@ invisible to each other. Fixed 2026-08-14: the Windows arm now runs
 `taskkill /T /F /PID <pid>` (a numeric pid, no shell, no new dependency)
 first and falls back to `child.kill()` only if that fails.
 
+**This fixed only `supervise::terminate` (`exec`/`loop`'s own escalation
+ladder) — the pty seams (`wrap`, the dashboard's panes) had no tree-kill at
+all until 2026-08-16.** `wrap::quit_child` and `dash::pane::Pane::finish_
+shutdown` had only ever called portable-pty's own `Child::kill()`, so a
+quit or a rot-restart on either could leave the very same npm-shim
+grandchild running that this entry describes for `exec`/`loop`. The
+underlying primitive is now shared: `taskkill_tree` was renamed `kill_tree`
+and promoted `pub(crate)` so both pty seams (plus the distiller's own
+timeout escalation in `handoff.rs`) call the identical function `exec`/`loop`
+always have, rather than reimplementing it. See [[Ctx Supervisors]] and the
+2026-08-16 [[Decision Log]] entry for the fuller Windows lifecycle picture
+(the console-close pid registry and the Job-Object backstop this same round
+added on top).
+
 ## `state::write_private` used to leave a zero-length window a concurrent reader could observe
 
 Writing was create-truncate-then-write. A read landing in that window (e.g.
@@ -444,6 +465,33 @@ Do **not** vendor or patch portable-pty for this. Treat `kill()` as
 best-effort and never build logic on its return value — `try_wait()` /
 `wait_for_exit` are the only trustworthy evidence a child is actually gone,
 and `quit_child` already keys on those.
+
+**The guidance stands; the blast radius shrank (2026-08-16).** Every pty
+seam (`wrap::quit_child`, `dash::pane::Pane::finish_shutdown`) now runs
+`supervise::kill_tree` (`taskkill /T /F /PID`, by pid only) *ahead of* the
+narrow `child.kill()` this entry describes, the same escalation `exec`/`loop`
+have always had. `kill_tree`'s own return value is still not evidence of
+anything — it is a best-effort escalation, not a replacement for
+`try_wait`/`wait` — so this entry's core guidance (never trust a kill's
+return value; only wait/try_wait proves death) is unchanged. What changed is
+what a failed narrow kill now leaves behind: with `kill_tree` run first, the
+*direct* child (and, on Windows, whatever a kill-on-close Job Object still
+holds — see below) is very likely already gone by the time `child.kill()`'s
+untrustworthy result is even consulted, so the inverted-check bug's practical
+consequence — "zirv thinks the tree died when it didn't" — is a narrower
+window than before this round.
+
+## Dropping a `ChildGuard` on Windows kills the child it guards
+
+`supervise::ChildGuard` (2026-08-16) owns a supervised child's membership in the console-close pid registry (P2) and its kill-on-close Job Object (P3). `ChildGuard::release()`/`Drop` close the job handle — and closing the *last* handle to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job is precisely what makes the kernel terminate every process still in it. That is the intended backstop when the child is already confirmed dead (closing an empty job kills nothing), but it means **the guard must never go out of scope while its child might still be alive** — an early return, a `?` on an unrelated error, or any other unplanned scope exit between adopting a guard and confirming the child's exit (`try_wait`/`wait`) will kill a live agent as a side effect of ordinary Rust cleanup, not a bug in the job-object mechanism itself. Every current call site (`spawn_tapped`'s returned guard held for the whole `exec`/`loop` cycle, `wrap`'s `child_guard` released explicitly after `pump` returns, `dash::pane::Pane`'s `lifecycle` field released in `shutdown`/`finish_shutdown`) is written to hold the guard for exactly the child's lifetime; a future call site that stores a `ChildGuard` in something with a shorter lifetime than its child will silently kill that child the moment the guard drops.
+
+## Job-Object assignment is a race against a shim's own grandchild, not a guarantee
+
+`JobGuard::adopt` calls `AssignProcessToJobObject` immediately after spawn, but `AssignProcessToJobObject` only pulls in descendants a process creates **after** it is assigned — anything the process already spawned before assignment landed is not retroactively added. On an npm-installed shim launch (`cmd.exe /c claude.cmd` → `node`), the assignment happens on the very next statement after `spawn()`, so in practice it lands well before `cmd.exe` has started `node` — but this is a timing race, not a structural guarantee, and portable-pty offers no `CREATE_SUSPENDED` (or equivalent) seam to close it outright. This is why the Job Object is a backstop layered *underneath* `kill_tree`'s `taskkill /T`, never a replacement for it: `taskkill /T` walks whatever tree exists **at kill time**, so it still catches a grandchild the job assignment raced and missed. Losing this race requires an unusually slow assignment or an unusually fast shim; no reproduction is recorded, but the mitigation (the other two lifecycle layers) is unconditional regardless. See [[Decision Log]].
+
+## The distiller's `kill_tree` timeout escalation ships without a dedicated test on either platform
+
+`handoff::run_model`'s timeout arm now calls `supervise::kill_tree(child.id())` on Windows before its existing `child.kill()`/`wait()` (2026-08-16, P1), the same escalation `wrap`/`exec`/`loop` gained. The existing coverage (`run_model_gives_up_at_the_timeout`) exercises the timeout path itself (a hung fake model, asserting `run_model` returns `Err` inside the deadline) but asserts nothing about tree-kill behavior specifically. On Linux CI the call is `#[cfg(not(unix))]` and never compiled at all; on a real Windows machine it compiles and runs as part of that same test, but nothing in the suite spawns a shim-shaped grandchild and asserts it died. Verification for this call site today is the same manual recipe as the rest of the Windows lifecycle work (`term.rs`'s doc comment), not an automated one — consistent with the existing Windows-environmental-gap pattern this project already has for other Windows-only paths.
 
 ## Never write a control byte into a pty master
 

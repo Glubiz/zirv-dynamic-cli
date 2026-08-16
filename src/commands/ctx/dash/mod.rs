@@ -3250,7 +3250,7 @@ pub fn run_dashboard(
     // nothing. There is nothing to draw before the loop starts anyway: the
     // dialog is rendered from inside it.
     let repo_slug = super::state::repo_slug(repo);
-    let restore_candidates: Vec<roster::RosterPane> = roster::take_roster(
+    let taken_candidates: Vec<roster::RosterPane> = roster::take_roster(
         state,
         &repo_slug,
         super::state::now_secs(),
@@ -3258,6 +3258,16 @@ pub fn run_dashboard(
     )
     .map(restorable_candidates)
     .unwrap_or_default();
+    // P4: a roster says what the *previous* dashboard owned, not what is dead.
+    // A dashboard that was killed rather than quit left both a roster and, on
+    // Windows before the job-object backstop, genuinely live pane agents --
+    // and restoring one of those spawns a second agent onto a conversation the
+    // first is still holding. Any candidate whose registry record still names
+    // a live process is skipped, and the skip is announced rather than
+    // silently swallowed: "my pane did not come back" needs a reason attached.
+    let (restore_candidates, still_live) = roster::partition_live(taken_candidates, &|short| {
+        super::sessions::short_is_live(state, short)
+    });
 
     // Two indices, not one (F7): `selected` walks the combined sidebar
     // (panes plus view-only registry rows) and is what a nudge is aimed at;
@@ -3277,6 +3287,21 @@ pub fn run_dashboard(
     // sticky `errors` channel (⚠) so a confirmation like "spawned … as …"
     // shows briefly and then clears instead of pinning behind a warning glyph.
     let mut notices: Vec<Notice> = Vec::new();
+    // P4: one line per candidate the liveness check just held back. Pushed
+    // here rather than at the partition above only because `notices` does not
+    // exist yet up there. It says "kept for next launch" because that is now
+    // literally true (see `deferred_restore` below) -- the notice is no longer
+    // the only trace of a candidate this launch decided not to offer.
+    for pane in &still_live {
+        push_notice(
+            &mut notices,
+            Instant::now(),
+            format!(
+                "not restoring {} ({}): that session is still running (kept for next launch)",
+                pane.title, pane.short
+            ),
+        );
+    }
     // H3: the mail sweep is disk-backed (`mail::list` = read_dir + read per
     // .md) and used to run every 50ms tick; throttled to the same ~1s cadence
     // as the header facts. Seeded a full interval in the past so the first
@@ -3298,7 +3323,17 @@ pub fn run_dashboard(
     // startup) -- carried to every `on_quit` call below so none of them are
     // lost just because the restore dialog that offered them has long since
     // closed.
-    let mut deferred_restore: Vec<roster::RosterPane> = Vec::new();
+    //
+    // P4: seeded with the candidates the liveness gate held back, for exactly
+    // the same reason F5 writes `unoffered` back. `take_roster` claims by
+    // rename *before* reading, so a candidate this launch declines to offer is
+    // already consumed -- and a liveness verdict is a probe of a pid, which a
+    // roster up to `roster.max_age_secs` old can genuinely get wrong (the OS
+    // recycles pids). Dropping the candidate on that verdict would destroy the
+    // pane permanently, with a four-second notice as its only trace. Merged
+    // back into the fresh roster instead, so the worst a false "still live"
+    // costs is one launch's restore rather than the session.
+    let mut deferred_restore: Vec<roster::RosterPane> = still_live;
     // L19: shorts of panes reaped since the last registry refresh, excluded
     // from the view-only sidebar rows so a just-released session does not
     // re-list (and become nudge-targetable) off the up-to-1s-stale snapshot.
@@ -4175,11 +4210,24 @@ pub fn run_dashboard(
 
 /// The cleanup a failed terminal setup owes the panes that were already
 /// spawned: the orchestrator pane's child exists by the time raw mode is
-/// enabled, and `Pane` has no `Drop` (the release profile is `panic = abort`,
-/// so `Drop` is not a safety net anyway) -- dropping a `portable-pty` child
-/// does not kill it. R4: all three setup-failure arms used to return `Err`
-/// straight past it, orphaning a live harness process with a registry record
-/// still claiming it was reachable.
+/// enabled. R4: all three setup-failure arms used to return `Err` straight
+/// past it, orphaning a live harness process with a registry record still
+/// claiming it was reachable.
+///
+/// P3 changed what a *dropped* `Pane` costs, and the change is worth stating
+/// precisely, because the old comment here is now wrong. A `Pane` holds a
+/// `supervise::ChildGuard`, whose `Drop` closes the child's kill-on-close job
+/// object -- so on Windows, dropping a `Pane` now does reap the child's whole
+/// tree rather than orphaning it. Dropping is no longer a leak.
+///
+/// This call is still very much wanted, for four reasons that `Drop` does not
+/// cover: it walks the adapter's own quit-sequence-then-grace ladder so the
+/// harness gets a chance to exit cleanly and flush its transcript instead of
+/// being shot; it releases the registry record and unpublishes the socket
+/// (`Pane::finish_shutdown`), which `ChildGuard` knows nothing about; the job
+/// object is Windows-only, so unix has nothing but this; and the release
+/// profile is `panic = "abort"`, under which `Drop` does not run at all. The
+/// guard is the backstop, not the plan.
 ///
 /// Exactly the quit path's own `shutdown_all`, with the error strings
 /// discarded: there is no header left to show them in and the caller is about
@@ -7855,6 +7903,51 @@ mod tests {
             written.panes,
             vec![deferred],
             "the cap-deferred candidate is offered again next launch"
+        );
+    }
+
+    /// P4, end to end: a candidate the liveness gate holds back must survive
+    /// the launch that declined to offer it.
+    ///
+    /// `take_roster` claims the roster by rename *before* it reads, so by the
+    /// time `partition_live` runs the candidate has already been consumed off
+    /// disk. Simply dropping it would make a *wrong* liveness verdict --
+    /// entirely possible, since the probe is a pid lookup and a roster may be
+    /// days old while the OS recycles pids -- permanently destroy the pane.
+    /// So the skipped half is seeded straight into `deferred_restore` (the
+    /// same pool G3 and H3 already use) and merged back by `on_quit`.
+    ///
+    /// This pins the wiring `run_dashboard` performs inline: partition, then
+    /// hand the skipped half to `on_quit` as deferred.
+    #[test]
+    fn a_candidate_held_back_because_its_session_is_live_is_written_back_to_the_roster() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let live_one = restore_pane("dddd4444", "44444444-2222-4333-8444-555555555555");
+        let dead_one = restore_pane("eeee5555", "55555555-2222-4333-8444-555555555555");
+
+        // Exactly what `run_dashboard` does with `take_roster`'s output.
+        let (offerable, still_live) =
+            roster::partition_live(vec![live_one.clone(), dead_one.clone()], &|short| {
+                short == "dddd4444"
+            });
+        assert_eq!(offerable, vec![dead_one], "only the dead one is offered");
+        let deferred_restore = still_live;
+
+        on_quit(&[], &[], &deferred_restore, &requests_dir, &state, &repo);
+
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is still written");
+        assert_eq!(
+            written.panes,
+            vec![live_one],
+            "a held-back candidate is offered again next launch, not destroyed"
         );
     }
 

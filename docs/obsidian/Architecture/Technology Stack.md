@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-13
+last-verified: 2026-08-16
 ---
 
 # Technology Stack
@@ -50,7 +50,7 @@ last-verified: 2026-08-13
 | Crate | Version | Scope | Purpose |
 |---|---|---|---|
 | `libc` | 0.2.183 | `cfg(unix)` | Unix system calls needed by `ctx` process/terminal primitives |
-| `windows-sys` (Win32_Foundation, Win32_Security, Win32_Storage_FileSystem, Win32_System_Console, Win32_System_IO, Win32_System_Pipes, Win32_System_Threading) | 0.61.2 | `cfg(windows)` | Console-mode and named-pipe APIs for `ctx wrap` on Windows. Named explicitly rather than relying on the transitive copy pulled in by `console`/`dirs-sys`/`mio`/`tempfile`, to avoid a second win32 binding crate |
+| `windows-sys` (Win32_Foundation, Win32_Security, Win32_Storage_FileSystem, Win32_System_Console, Win32_System_IO, Win32_System_JobObjects, Win32_System_Pipes, Win32_System_Threading) | 0.61.2 | `cfg(windows)` | Console-mode and named-pipe APIs for `ctx wrap` on Windows. `Win32_System_JobObjects` (added 2026-08-16) is `ctx::supervise::JobGuard`'s kill-on-close job object, the kernel-enforced backstop that reaps a supervised agent's whole process tree when zirv itself dies with no user code running (`taskkill /F`, a crash, `panic = "abort"`) — see [[Ctx Supervisors]]. Named explicitly rather than relying on the transitive copy pulled in by `console`/`dirs-sys`/`mio`/`tempfile`, to avoid a second win32 binding crate |
 
 ### Dev-dependencies
 

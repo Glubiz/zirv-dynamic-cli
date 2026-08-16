@@ -595,6 +595,21 @@ fn wait_for_exit(
 /// and `kill` swallows the result, so a failed kill is invisible here -- see
 /// Known Issues; that is a reason to be conservative about what else we try,
 /// not a reason to reach for a console-wide broadcast.
+///
+/// P1: on Windows the escalation rung is now a **tree**-kill by pid
+/// (`supervise::kill_tree`, the same `taskkill /T /F /PID <n>` `exec`/`loop`
+/// have always used) run *before* the narrow `child.kill()`. `TerminateProcess`
+/// against the direct child is not enough for an npm-installed agent, where
+/// that direct child is `cmd.exe /c claude.cmd` and the agent itself is a
+/// `node` grandchild: quitting a session -- or restarting one on a rot verdict
+/// -- left that grandchild alive, and a freshly spawned replacement then ran
+/// alongside it on the same repo. The tree-kill is by **pid only**, with fixed
+/// flags and a decimal pid, so it is neither a shell invocation nor a console
+/// broadcast; it is not a substitute for the narrow kill (taskkill may not be
+/// on `PATH`) and its result is not evidence of anything. `wait_for_exit`/
+/// `wait` stay the only proof of death. Unix is untouched: portable-pty does
+/// `setsid` + `TIOCSCTTY` there, so the child is a session leader and dies
+/// with its pty.
 pub fn quit_child(
     sink: &mut dyn Write,
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -610,6 +625,10 @@ pub fn quit_child(
         return Ok(());
     }
 
+    #[cfg(not(unix))]
+    if let Some(pid) = child.process_id() {
+        super::supervise::kill_tree(pid);
+    }
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
@@ -1122,6 +1141,18 @@ pub fn run_with(
     let writer = std::sync::Arc::new(std::sync::Mutex::new(first_writer));
 
     let mut child = pair.slave.spawn_command(command)?;
+    // P2/P3: adopted the instant the child exists -- registered for the
+    // console-close sweep and put in a kill-on-close job, so neither closing
+    // the window nor killing zirv outright can orphan the agent.
+    let mut child_guard = super::supervise::ChildGuard::adopt(child.process_id());
+    // P5: the registry record was filed above with `std::process::id()` --
+    // zirv's own pid, which stays alive exactly as long as the wrapper rather
+    // than as long as the agent. Point it at the child, the same override
+    // `dash::pane::Pane::spawn` makes. `pump` re-points it after every
+    // relaunch.
+    if let Some(child_pid) = child.process_id() {
+        session_guard.adopt_child_pid(child_pid);
+    }
 
     let reader = pair.master.try_clone_reader()?;
     let (tx, rx) = mpsc::channel::<PumpEvent>();
@@ -1255,6 +1286,8 @@ pub fn run_with(
 
     let exit = pump(
         &mut child,
+        &mut child_guard,
+        &mut session_guard,
         &rx,
         &mut pair,
         &mut supervision,
@@ -1281,6 +1314,12 @@ pub fn run_with(
         &announcer,
         &mut bar,
     );
+    // P2/P3: `pump` only ever returns once the child has exited (every arm
+    // waits on it), so the pid leaves the console-close registry and the job
+    // handle closes here, explicitly -- `panic = "abort"` means `Drop` is no
+    // safety net. Before `session_guard.release()` purely for symmetry with
+    // the order they were taken in.
+    child_guard.release();
     session_guard.release();
     // Paired with `publish_socket_path` above, at the same single point every
     // other per-session artifact is released: a dead supervisor's file must
@@ -1529,6 +1568,11 @@ fn redraw_bar_if_due(
 #[allow(clippy::too_many_arguments)]
 fn pump(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    // P2/P3/P5: both are swapped over to the fresh child on every relaunch,
+    // so the replaced child's tree can never outlive the supervisor that
+    // replaced it and the registry record never points at a dead pid.
+    child_guard: &mut super::supervise::ChildGuard,
+    session_guard: &mut super::sessions::SessionGuard,
     rx: &mpsc::Receiver<PumpEvent>,
     pair: &mut portable_pty::PtyPair,
     supervision: &mut InjectionState,
@@ -1726,6 +1770,20 @@ fn pump(
             Action::Restart => {
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
 
+                // P5: park the record on zirv's own (unquestionably alive) pid
+                // for the duration of the restart. Everything from here to the
+                // respawn below -- the distiller call, `quit_child`'s grace
+                // ladder, the fresh pty -- happens while the *old* child is
+                // being killed, and `sessions::list` sweeps any record whose
+                // pid is dead. That listing runs on other processes' schedules
+                // (`zirv ctx status`, `nudge`, `send --to-session`, a
+                // dashboard's own ~1s registry refresh), so leaving the record
+                // pointing at the child being killed meant a concurrent reader
+                // could delete this very much live session's record mid-restart
+                // and strand every message addressed to it. The real child pid
+                // is adopted again the moment there is one.
+                session_guard.adopt_child_pid(std::process::id());
+
                 let jsonl = transcript
                     .path()
                     .map(|path| std::fs::read_to_string(path).unwrap_or_default())
@@ -1819,6 +1877,26 @@ fn pump(
                                 }
                                 *pair = fresh_pair;
                                 *child = fresh_child;
+                                // P1/P2/P3: the old child was tree-killed by
+                                // `quit_child` above, so releasing its guard
+                                // now only takes it out of the console-close
+                                // registry and closes a job with nothing left
+                                // in it. Released *before* the new adoption
+                                // so a pid the OS has already recycled cannot
+                                // be deregistered out from under the fresh
+                                // child.
+                                child_guard.release();
+                                *child_guard =
+                                    super::supervise::ChildGuard::adopt(child.process_id());
+                                // P5: and the registry record follows the
+                                // child it names. Left pointing at the
+                                // replaced child's dead pid, `sessions::list`
+                                // would sweep the record and this very much
+                                // live session would disappear from `zirv ctx
+                                // status`.
+                                if let Some(child_pid) = child.process_id() {
+                                    session_guard.adopt_child_pid(child_pid);
+                                }
                                 true
                             }
                             Err(e) => {
@@ -3743,9 +3821,13 @@ mod tests {
 
         // Resolved from the registry rather than passed as an empty prefix:
         // there is exactly one live session, the wrap subprocess `spawn_wrap`
-        // just started under its own (real) pid, and F6 makes `zirv ctx
-        // nudge` refuse any prefix shorter than four characters -- an empty
-        // one most of all.
+        // just started, and F6 makes `zirv ctx nudge` refuse any prefix
+        // shorter than four characters -- an empty one most of all.
+        //
+        // P5: the record's `pid` is the *agent child's* now, not the wrap
+        // subprocess's own -- which is still exactly as live here (the
+        // stub TUI is up and waiting), so the `Liveness::Live` filter picks
+        // it out the same way.
         let repo = std::env::current_dir().expect("cwd");
         let state = super::super::state::StateDir::from_root(state_root.clone());
         let short = super::super::sessions::list(&state)
