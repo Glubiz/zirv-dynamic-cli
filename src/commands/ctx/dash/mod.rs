@@ -40,6 +40,7 @@ use super::config::{CtxConfig, EnvLookup};
 use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
 use super::term;
+use super::window;
 use super::{mail, memory, prompt, score, sessions};
 
 pub(crate) use pane::{Pane, PaneSpec, PaneState, ScrollOutcome};
@@ -772,6 +773,7 @@ fn assemble_header_facts(
     mail: Option<(usize, usize)>,
     memory_count: usize,
     sessions: usize,
+    usage: Vec<(&'static str, Option<f64>, bool)>,
 ) -> ui::HeaderFacts {
     let (mail_broadcast, mail_direct) = mail.unwrap_or((0, 0));
     ui::HeaderFacts {
@@ -781,6 +783,7 @@ fn assemble_header_facts(
         mail_direct,
         memory_count,
         sessions,
+        usage,
     }
 }
 
@@ -838,6 +841,16 @@ struct DiskFacts {
     scores: ScoreMap,
     mail: Option<(usize, usize)>,
     memory_count: usize,
+    /// Per-harness usage snapshot for the header row, one entry per enabled
+    /// harness (`cfg.agents`) in registry order: `(harness name, percent,
+    /// credits-mode)`. Filled from whatever `window::load_for` already has on
+    /// disk -- a file read only, never a rollout scan or a poll. Those live in
+    /// the sessions that actually gate on pacing (Tasks 4-6's `PaceGate`
+    /// call sites) and, for a wrapped codex session with no statusline tee,
+    /// in wrap's own throttled passive scan (`wrap::redraw_bar_if_due`); this
+    /// dashboard's event loop must never do either itself, or a redraw could
+    /// stall on a stale rollout file or the network.
+    usage: Vec<(&'static str, Option<f64>, bool)>,
 }
 
 /// Who the dashboard is, for the reads that are scoped to it: the repo it
@@ -901,6 +914,23 @@ impl FactsCache {
         let slug = super::state::repo_slug(repo);
         self.disk.memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
         self.registry = sessions::list(state);
+
+        // Task 7: one usage entry per enabled harness, read straight off
+        // disk. `window::load_for` is a file read, never a scan/poll -- see
+        // `DiskFacts::usage`'s own doc comment for why this loop must stay
+        // that way.
+        self.disk.usage = adapters::ADAPTERS
+            .iter()
+            .filter(|(name, _)| cfg.agents.is_enabled(name))
+            .map(|(name, _)| {
+                let provider = adapters::provider_for_agent_name(Some(name));
+                let percent = window::load_for(state, provider)
+                    .as_ref()
+                    .and_then(window::max_used_percentage);
+                let credits = cfg.pace.use_credits.for_provider(provider);
+                (*name, percent, credits)
+            })
+            .collect();
 
         // Rebuilt rather than updated in place: a reaped pane or a released
         // registry record must drop out of the map, not linger as a stale
@@ -4150,6 +4180,7 @@ pub fn run_dashboard(
             facts_cache.disk.mail,
             facts_cache.disk.memory_count,
             rows.len(),
+            facts_cache.disk.usage.clone(),
         );
 
         let draw = terminal.draw(|f| {
@@ -5128,7 +5159,7 @@ mod tests {
 
     #[test]
     fn assemble_header_facts_omits_mail_when_none() {
-        let facts = assemble_header_facts("claude".to_string(), None, None, 3, 5);
+        let facts = assemble_header_facts("claude".to_string(), None, None, 3, 5, Vec::new());
         assert_eq!(facts.mail_broadcast, 0);
         assert_eq!(facts.mail_direct, 0);
         assert_eq!(facts.memory_count, 3);
@@ -5137,10 +5168,66 @@ mod tests {
 
     #[test]
     fn assemble_header_facts_carries_the_broadcast_direct_split_through() {
-        let facts = assemble_header_facts("claude".to_string(), Some(12), Some((2, 1)), 0, 1);
+        let facts = assemble_header_facts(
+            "claude".to_string(),
+            Some(12),
+            Some((2, 1)),
+            0,
+            1,
+            Vec::new(),
+        );
         assert_eq!(facts.mail_broadcast, 2);
         assert_eq!(facts.mail_direct, 1);
         assert_eq!(facts.score, Some(12));
+    }
+
+    /// Task 7: `refresh_if_due` fills `disk.usage` with one entry per enabled
+    /// harness, read straight off `window::load_for` -- a file already
+    /// stored, never a rollout scan or a poll.
+    #[test]
+    fn refresh_if_due_reads_per_harness_usage_off_disk_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let now = Instant::now();
+
+        super::super::window::store_for(
+            &state,
+            "anthropic",
+            &super::super::window::UsageWindows {
+                five_hour: Some(super::super::window::Window {
+                    used_percentage: 55.0,
+                    resets_at: 0,
+                    observed_at: 1,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store claude's reading");
+
+        let mut cache = FactsCache::new(now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+
+        let claude = cache
+            .disk
+            .usage
+            .iter()
+            .find(|(name, _, _)| *name == "claude")
+            .expect("claude is enabled by default");
+        assert_eq!(claude.1, Some(55.0));
+        assert!(!claude.2, "use_credits is off by default");
+
+        let codex = cache
+            .disk
+            .usage
+            .iter()
+            .find(|(name, _, _)| *name == "codex")
+            .expect("codex is enabled by default");
+        assert_eq!(
+            codex.1, None,
+            "nothing was ever stored for codex's own provider"
+        );
     }
 
     /// The harness segment names the pane the score beside it belongs to,

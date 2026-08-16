@@ -1234,6 +1234,7 @@ pub fn run_with(
         cfg.mail.enabled,
         stdout_lock.clone(),
         (cols, rows),
+        cfg.pace.collector_max_age_secs,
     );
     // C5: `raw.is_some()` as well as `bar.chrome.bar`. `RawGuard::enter` is
     // what stashes the console modes and installs the emergency restore
@@ -1383,9 +1384,21 @@ struct BarRuntime {
     stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
     rows: u16,
     cols: u16,
+    /// Unix-seconds timestamp of the last passive codex rollout scan this
+    /// bar ran (`0` means never), throttled to `CODEX_BAR_SCAN_SECS` --
+    /// wrap's own version of the freshness a wrapped codex session would
+    /// otherwise only get from an inner session's own pacing gate or a
+    /// statusline tee it does not have.
+    last_codex_scan: u64,
+    /// Copied from `cfg.pace.collector_max_age_secs` at construction: how
+    /// stale a stored codex reading has to be before `refresh_codex_usage`
+    /// bothers scanning at all (its own internal staleness gate, separate
+    /// from `CODEX_BAR_SCAN_SECS`'s call-rate floor).
+    collector_max_age_secs: u64,
 }
 
 impl BarRuntime {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         chrome: super::chrome::Chrome,
         harness: String,
@@ -1394,6 +1407,7 @@ impl BarRuntime {
         mail_enabled: bool,
         stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
         size: (u16, u16),
+        collector_max_age_secs: u64,
     ) -> Self {
         Self {
             disabled: !chrome.bar,
@@ -1416,6 +1430,11 @@ impl BarRuntime {
             stdout_lock,
             cols: size.0,
             rows: size.1,
+            // Never scanned yet, so the very first redraw due is eligible
+            // immediately (`now.saturating_sub(0) >= CODEX_BAR_SCAN_SECS` is
+            // true for any real `now`).
+            last_codex_scan: 0,
+            collector_max_age_secs,
         }
     }
 
@@ -1427,6 +1446,13 @@ impl BarRuntime {
 /// The 1s redraw throttle: usage and mail are read from disk only when this
 /// has elapsed, never on the byte-pump path.
 const BAR_THROTTLE: Duration = Duration::from_secs(1);
+
+/// Floor between a wrapped codex session's own passive rollout scans
+/// (`BarRuntime::last_codex_scan`), independent of `BAR_THROTTLE`'s 1s
+/// redraw cadence: a rollout scan is a real filesystem walk, not a single
+/// stat call, so it must not run on every redraw tick just because the bar
+/// text happened to change. Never HTTP -- see `redraw_bar_if_due`.
+const CODEX_BAR_SCAN_SECS: u64 = 60;
 
 /// Item 2 (regression fix): applies a `ResizeDecision::disables_bar` outcome
 /// to `bar`'s own bookkeeping. The dims move to the *current* size *before*
@@ -1515,6 +1541,33 @@ fn redraw_bar_if_due(
         return;
     }
     bar.last_draw = now;
+
+    // Passive refresh only: a wrapped codex session has no statusline tee, so
+    // the bar would otherwise stay a permanent placeholder for its entire
+    // life. Scans are floored to once per `CODEX_BAR_SCAN_SECS`; HTTP stays
+    // off this path entirely -- `wrap` must never make a session worse, and
+    // a network call on the redraw path could stall it.
+    if bar.provider == super::window::CODEX_USAGE_PROVIDER {
+        let now_secs = super::state::now_secs();
+        if now_secs.saturating_sub(bar.last_codex_scan) >= CODEX_BAR_SCAN_SECS {
+            bar.last_codex_scan = now_secs;
+            // Resolved via `crate::utils::home_dir()`, the same as `pace::
+            // refresh_sources` and `usage.rs`'s own refresh -- not left to
+            // `refresh_codex_usage`'s internal `dirs::home_dir()` fallback,
+            // which calls `SHGetKnownFolderPath` directly on Windows and so
+            // ignores `HOME`/`USERPROFILE`, the one thing a test's
+            // `HomeGuard` can actually override.
+            let sessions_dir = crate::utils::home_dir()
+                .ok()
+                .map(|h| h.join(".codex").join("sessions"));
+            super::window::refresh_codex_usage(
+                state_dir,
+                sessions_dir.as_deref(),
+                now_secs,
+                bar.collector_max_age_secs,
+            );
+        }
+    }
 
     // Per-provider since this fix: `window::load` is the legacy machine-wide
     // file every session used to share, so a wrapped codex session's bar
@@ -2060,6 +2113,7 @@ mod tests {
             true,
             std::sync::Arc::new(std::sync::Mutex::new(())),
             size,
+            900,
         )
     }
 
@@ -2075,6 +2129,14 @@ mod tests {
     #[test]
     fn a_codex_sessions_bar_does_not_inherit_claudes_own_legacy_usage_reading() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // The codex bar below is due for its own passive rollout scan (never
+        // scanned yet), which resolves `~/.codex/sessions` via `HOME`/
+        // `USERPROFILE` -- must not be left pointed at this machine's real
+        // home directory. An empty one yields no rollouts, so the assertions
+        // below still hold: the passive scan itself is exercised (it runs,
+        // finds nothing, leaves the stored state untouched), not bypassed.
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let state = StateDir::from_root(tmp.path().join("state"));
         super::super::window::store(
             &state,

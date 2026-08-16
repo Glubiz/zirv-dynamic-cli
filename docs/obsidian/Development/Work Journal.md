@@ -20,6 +20,11 @@ last-verified: 2026-08-16
 
 ## Entries
 
+### 2026-08-16: usage returns to the dashboard header; a wrapped codex bar gets its own passive scan
+**What:** Task 7 of the usage-credits-throttle plan. `ui::HeaderFacts` gained `usage: Vec<(&'static str, Option<f64>, bool)>`, one entry per harness enabled in `cfg.agents`, assembled in `FactsCache::refresh_if_due` from `window::load_for`/`max_used_percentage` (file reads only — the dashboard's event loop never scans or polls). `header_line` renders a percent, the shared `chrome::PLACEHOLDER` en dash for unknown, or `<harness> credits` when `cfg.pace.use_credits` is on for that provider. Separately, `wrap::redraw_bar_if_due` now runs its own throttled (`CODEX_BAR_SCAN_SECS`, 60s) passive `refresh_codex_usage` scan for a wrapped codex session, since it has no statusline tee to keep its bar fresh otherwise — file-only, never HTTP, per `wrap`'s own invariant.
+**Key changes:** `chrome.rs` (`PLACEHOLDER` → `pub(crate)`), `dash/ui.rs` (`HeaderFacts`, `header_line`), `dash/mod.rs` (`DiskFacts::usage`, `refresh_if_due`, `assemble_header_facts`), `wrap.rs` (`BarRuntime::{last_codex_scan,collector_max_age_secs}`, `CODEX_BAR_SCAN_SECS`, `redraw_bar_if_due`).
+**Follow-up:** see [[Decision Log]] (reverses the 2026-08-15 header removal) and [[Usage and Pacing]]/[[Ctx Supervisors]] for the mechanism.
+
 ### 2026-08-16: reap child process trees on every teardown path (Windows lifecycle)
 **What:** Two commits on `fix/process-lifecycle` (stacked on `feat/harness-roster-prompt`) closing every Windows teardown path that could leave an agent's process tree running unsupervised. Three layers: (P1) `supervise::kill_tree` (renamed/`pub(crate)`'d from `taskkill_tree`) now runs at `wrap::quit_child`, `dash::pane::Pane::finish_shutdown`, and the distiller's timeout escalation, not just `exec`/`loop`. (P2) a cross-platform supervised-pid registry swept by the Windows console-close handler on terminal events only (Ctrl-C exempt). (P3) kill-on-close Job Objects (`ChildGuard`/`JobGuard`, new `windows-sys` feature) as the kernel backstop for crash/`taskkill /F`/`panic=abort`. Review round (`222b24f`) added the roster liveness fail-safe (`partition_live`/`short_is_live`, deferred-not-dropped) and parked `wrap`'s registry record on zirv's own pid during the kill→respawn window so a concurrent `sessions::list` can't sweep a live record.
 **Key changes:** `supervise.rs` (`kill_tree`, `ChildGuard`, `JobGuard`, pid registry), `term.rs` (console-close sweep, `is_terminal_console_event`), `wrap.rs` (`quit_child`, restart pid parking), `dash/{mod,pane,roster}.rs` (P4 fail-safe), `sessions.rs` (`adopt_child_pid`, `short_is_live`), `handoff.rs` (distiller escalation), `exec.rs`/`run_loop.rs` (`spawn_tapped`'s 3-tuple), `Cargo.toml` (`Win32_System_JobObjects`).
@@ -65,9 +70,4 @@ last-verified: 2026-08-16
 **Key changes:** src/main.rs (`top_level_ctx_alias`, `rewrite_ctx_alias_args`, `bare_invocation_target`, `zirv_dir_present`), src/utils.rs (`RESERVED_COMMANDS` +chat/+agent), src/commands/help.rs, src/commands/ctx/status.rs (`describe_chat`), README, CLAUDE.md, vault pages. Landed alongside (not touched by this wave): `chat.rs`/`agent.rs`/`mail.rs` verbs, `chrome.rs`/`announce.rs` terminal chrome.
 **Follow-up:** none for this wave; `announce.rs`'s event channel was still a placeholder at the time these docs were written — see its own module doc.
 
-### 2026-08-12: Agent enable/disable gate (.zirv/.settings.toml)
-**What:** New zirv-wide settings file toggling the claude/codex harnesses, enforced in `adapters::select` before `ready()`. Repo layer can only narrow; env is operator authority. Malformed repo file falls back to an operator-only/deny-all gate.
-**Key changes:** src/settings.rs (new), adapters/mod.rs + 10 call sites, utils/help/input reserved-name guards, ctx status, README, vault pages. PR #18.
-**Follow-up:** harness roadmap (session registry, mailbox, codex completion) awaits prioritization — see [[Decision Log]] and PR #18 description.
-
-Older entries: see [[journal-archive/2026-Q3|2026 Q3 archive]] (2026-08-12: Obsidian vault created).
+Older entries: see [[journal-archive/2026-Q3|2026 Q3 archive]] (2026-08-12: Agent enable/disable gate, Obsidian vault created).
