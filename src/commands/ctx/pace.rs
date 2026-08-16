@@ -575,8 +575,9 @@ pub fn wait_for_window<W: Write>(
         // The safety valve, scaled to the window that tripped: a seven-day trip
         // may legitimately wait days, a five-hour trip may not.
         let cap = match &decision {
-            PaceDecision::WaitUntil { window, .. } => wait_cap(window, cfg),
-            PaceDecision::Slow { window, .. } => wait_cap(window, cfg),
+            PaceDecision::WaitUntil { window, .. } | PaceDecision::Slow { window, .. } => {
+                wait_cap(window, cfg)
+            }
             _ => 0,
         };
         if now.saturating_sub(started) >= cap {
