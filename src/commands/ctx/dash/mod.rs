@@ -3250,7 +3250,7 @@ pub fn run_dashboard(
     // nothing. There is nothing to draw before the loop starts anyway: the
     // dialog is rendered from inside it.
     let repo_slug = super::state::repo_slug(repo);
-    let restore_candidates: Vec<roster::RosterPane> = roster::take_roster(
+    let taken_candidates: Vec<roster::RosterPane> = roster::take_roster(
         state,
         &repo_slug,
         super::state::now_secs(),
@@ -3258,6 +3258,16 @@ pub fn run_dashboard(
     )
     .map(restorable_candidates)
     .unwrap_or_default();
+    // P4: a roster says what the *previous* dashboard owned, not what is dead.
+    // A dashboard that was killed rather than quit left both a roster and, on
+    // Windows before the job-object backstop, genuinely live pane agents --
+    // and restoring one of those spawns a second agent onto a conversation the
+    // first is still holding. Any candidate whose registry record still names
+    // a live process is skipped, and the skip is announced rather than
+    // silently swallowed: "my pane did not come back" needs a reason attached.
+    let (restore_candidates, still_live) = roster::partition_live(taken_candidates, &|short| {
+        super::sessions::short_is_live(state, short)
+    });
 
     // Two indices, not one (F7): `selected` walks the combined sidebar
     // (panes plus view-only registry rows) and is what a nudge is aimed at;
@@ -3277,6 +3287,19 @@ pub fn run_dashboard(
     // sticky `errors` channel (⚠) so a confirmation like "spawned … as …"
     // shows briefly and then clears instead of pinning behind a warning glyph.
     let mut notices: Vec<Notice> = Vec::new();
+    // P4: one line per candidate the liveness check just held back. Pushed
+    // here rather than at the partition above only because `notices` does not
+    // exist yet up there.
+    for pane in &still_live {
+        push_notice(
+            &mut notices,
+            Instant::now(),
+            format!(
+                "not restoring {} ({}): that session is still running",
+                pane.title, pane.short
+            ),
+        );
+    }
     // H3: the mail sweep is disk-backed (`mail::list` = read_dir + read per
     // .md) and used to run every 50ms tick; throttled to the same ~1s cadence
     // as the header facts. Seeded a full interval in the past so the first

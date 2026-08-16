@@ -108,6 +108,39 @@ pub fn take_roster(state: &StateDir, repo_slug: &str, now: u64, max_age: u64) ->
     Some(roster)
 }
 
+/// Splits restore candidates into the ones worth offering and the ones whose
+/// session is *still running*, per `is_live` (in production
+/// `sessions::short_is_live`, keyed on the candidate's own `short`).
+///
+/// P4: `take_roster` has never checked liveness, and the case that matters is
+/// exactly the one a roster exists for. A dashboard that was *killed* rather
+/// than quit -- window closed, `taskkill`, a crash -- left its roster behind
+/// and, on Windows before the job-object backstop, left its panes' agents
+/// genuinely running: they lived on their own ConPTYs and never saw the
+/// console-close event. Offering those back spawned a second agent onto a
+/// conversation the first one still held, two live sessions writing one
+/// repo. A candidate whose recorded process is gone is the normal case and
+/// still offered.
+///
+/// Pure (the liveness probe is the caller's), so the filtering is testable
+/// without a registry or a live process. Returns `(offerable, skipped)`;
+/// order is preserved in both, so the caller can name what it skipped.
+pub fn partition_live(
+    candidates: Vec<RosterPane>,
+    is_live: &dyn Fn(&str) -> bool,
+) -> (Vec<RosterPane>, Vec<RosterPane>) {
+    let mut offerable = Vec::new();
+    let mut skipped = Vec::new();
+    for pane in candidates {
+        if is_live(&pane.short) {
+            skipped.push(pane);
+        } else {
+            offerable.push(pane);
+        }
+    }
+    (offerable, skipped)
+}
+
 /// A one-line note used as the resumed session's initial prompt when the
 /// agent has no verified resume mechanism (`AgentAdapter::resume_args`
 /// returns `None`). Deliberately not `resume::resume_prompt`'s own
@@ -259,6 +292,41 @@ mod tests {
         // The second caller loses the race: the rename fails, and it reads
         // nothing at all rather than the copy the winner is already restoring.
         assert!(take_roster(&state, "-repo", 1_500, 1_000).is_none());
+    }
+
+    /// P4: the whole point -- a candidate whose session is still running is
+    /// held back, everything else is still offered, and both lists keep their
+    /// roster order so the skip can be named.
+    #[test]
+    fn partition_live_holds_back_only_the_candidates_still_running() {
+        let candidates = sample_roster().panes;
+        let (offerable, skipped) = partition_live(candidates, &|short| short == "bbbb2222");
+
+        assert_eq!(offerable.len(), 1);
+        assert_eq!(offerable[0].short, "aaaa1111");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0].short, "bbbb2222",
+            "restoring this would put a second agent on a conversation the first still holds"
+        );
+    }
+
+    #[test]
+    fn partition_live_offers_everything_when_nothing_is_still_running() {
+        let candidates = sample_roster().panes;
+        let (offerable, skipped) = partition_live(candidates.clone(), &|_| false);
+        assert_eq!(offerable, candidates, "the normal case is unchanged");
+        assert!(skipped.is_empty());
+    }
+
+    /// The killed-dashboard case: every pane's agent survived, so there is
+    /// nothing left to offer at all -- and the restore dialog must simply not
+    /// open, rather than open empty or spawn duplicates.
+    #[test]
+    fn partition_live_can_hold_back_every_candidate() {
+        let (offerable, skipped) = partition_live(sample_roster().panes, &|_| true);
+        assert!(offerable.is_empty());
+        assert_eq!(skipped.len(), 2);
     }
 
     #[test]

@@ -38,6 +38,45 @@ use super::CtxResult;
 //   3. In the detached console, type: echo hello
 //      Before F4 the characters do not echo and the bottom row is fenced off.
 //      After F4 the console echoes normally and scrolls to the last row.
+//
+// P2/P3 (Windows only) extend the same handler to *killing supervised
+// children*, and those two paths are no more automatable than the console
+// restore is -- both need a real console window and a real external killer.
+// The recipe, run from a detached console as above:
+//
+//   A. Console close (P2), the X-button case:
+//        1. cmd /c start zirv chat        (wait for a pane's agent to appear)
+//        2. In another shell, note the agent's own pid:
+//             tasklist /FI "IMAGENAME eq node.exe"
+//           -- or, more precisely, walk zirv's tree (`wmic` is gone on
+//           Windows 11, so use CIM):
+//             powershell -c "Get-CimInstance Win32_Process |
+//               ? ParentProcessId -eq <zirv pid> | ft ProcessId,Name"
+//        3. Click the console window's X button.
+//        4. Re-run the tasklist. Before P2 the agent (and its `cmd.exe`
+//           shim) was still there, orphaned and invisible, holding the repo.
+//           After P2 the whole tree is gone within a second or two.
+//        Repeat with a logoff for CTRL_LOGOFF_EVENT; Ctrl-C in the same
+//        window must NOT kill anything (it is the operator talking to the
+//        agent -- see `is_terminal_console_event`).
+//
+//   B. Kernel backstop (P3), the no-user-code case:
+//        1. cmd /c start zirv chat        (wait for the agent to appear)
+//        2. From another shell: taskkill /F /PID <zirv pid>
+//           `/F` is `TerminateProcess`: no handler of ours runs at all, so
+//           P2 cannot fire and only the job object can.
+//        3. Re-run the tasklist. Before P3 the agent survived its supervisor
+//           indefinitely. After P3 the kernel reaps the whole tree the moment
+//           zirv's last job handle closes.
+//        Same check after an induced crash (release builds are
+//        `panic = "abort"`), which is the same "no user code runs" shape.
+//
+//   C. Tree kill on the pty seam (P1), the shim case:
+//        Only observable against an *npm-installed* agent, where the pty
+//        child is `cmd.exe /c claude.cmd` and the agent is a `node`
+//        grandchild. Quit a pane whose agent ignores the harness quit
+//        sequence (or let a rot verdict restart a `wrap` session) and watch
+//        the grandchild: before P1 `Child::kill()` reaped only the shim.
 // ---------------------------------------------------------------------------
 
 /// Written to the real stdout from the handler when the chrome bar was up:
@@ -415,12 +454,48 @@ fn restore_stashed_console_modes() {
     }
 }
 
+/// Whether a console control event means this process is about to be torn
+/// down for good -- window closed, user logged off, machine shutting down --
+/// as opposed to an interrupt the wrapped session may well survive
+/// (`CTRL_C_EVENT`, `CTRL_BREAK_EVENT`).
+///
+/// Only the terminal three take supervised children with them (P2): a Ctrl-C
+/// at a `wrap` prompt is the operator talking to the agent, and tree-killing
+/// every child on it would be catastrophic. Pure, so the classification is
+/// testable even though invoking the handler is not.
+#[cfg(windows)]
+pub fn is_terminal_console_event(ctrl_type: u32) -> bool {
+    use windows_sys::Win32::System::Console::{
+        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    matches!(
+        ctrl_type,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    )
+}
+
 /// Returns FALSE so the next handler in the chain -- ultimately the default
 /// one, which terminates the process -- still runs. This exists to put the
 /// console back on the way out, not to swallow the event.
+///
+/// P2: on a *terminal* event it also tree-kills every supervised child pid
+/// before returning. A pane's (or `wrap`'s) child lives on a ConPTY of its
+/// own and is not attached to this console, so it never receives
+/// `CTRL_CLOSE_EVENT` itself -- closing the window used to leave every agent
+/// running, invisible, holding the repo. Unlike a POSIX signal handler, a
+/// Windows console control handler runs on an ordinary thread, so spawning
+/// `taskkill` here is legal; the sweep is bounded (see `CLOSE_KILL_BUDGET`)
+/// because the OS will not wait past about five seconds. The console is
+/// restored *first*: whatever else happens, the operator gets their terminal
+/// back. The unix signal handler deliberately gains none of this -- none of
+/// it is async-signal-safe, and unix does not need it (portable-pty's
+/// `setsid` + `TIOCSCTTY` means closing the master SIGHUPs the child).
 #[cfg(windows)]
-unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> windows_sys::core::BOOL {
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows_sys::core::BOOL {
     restore_console_from_handler();
+    if is_terminal_console_event(ctrl_type) {
+        super::supervise::kill_registered_trees();
+    }
     0
 }
 
@@ -1002,6 +1077,34 @@ mod tests {
                     .any(|w| w == off_seq)
             );
         }
+    }
+
+    /// P2: which console control events take the supervised children with
+    /// them. Only the three that mean "this process is going away for good".
+    ///
+    /// `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` deliberately do not: a Ctrl-C at
+    /// a `wrap` prompt is the operator talking to the agent, and tree-killing
+    /// every supervised child on it would end the session the operator was
+    /// only trying to interrupt. The handler still restores the console for
+    /// all of them, as it always has.
+    #[cfg(windows)]
+    #[test]
+    fn only_a_terminal_console_event_takes_the_children_with_it() {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+
+        assert!(is_terminal_console_event(CTRL_CLOSE_EVENT), "the X button");
+        assert!(is_terminal_console_event(CTRL_LOGOFF_EVENT));
+        assert!(is_terminal_console_event(CTRL_SHUTDOWN_EVENT));
+
+        assert!(
+            !is_terminal_console_event(CTRL_C_EVENT),
+            "Ctrl-C is the operator talking to the agent, not a teardown"
+        );
+        assert!(!is_terminal_console_event(CTRL_BREAK_EVENT));
+        assert!(!is_terminal_console_event(99), "and nothing unrecognised");
     }
 
     #[test]
