@@ -2158,6 +2158,17 @@ mod tests {
             cmd.arg(arg);
         }
         cmd.env("TERM", "xterm");
+        // `zirv ctx wrap`'s own `run()` derives its "repo" from
+        // `std::env::current_dir()` of the wrap process itself -- the same
+        // call the test-side helpers (`store_mail_for_cwd`, `repo_slug`
+        // lookups) make from *this* process to compute the slug they file
+        // and expect mail under. Without pinning it here, portable-pty's
+        // `CommandBuilder` (see the HOME comment just below) falls back to
+        // `chdir`-ing into HOME instead, so the two processes silently
+        // disagree on "repo": the spawned `wrap` never finds mail the test
+        // stored, and a test waiting on the mail advisory hangs rather than
+        // failing loudly, since nothing further ever arrives on the pty.
+        cmd.cwd(std::env::current_dir().expect("cwd"));
         // C9: a throwaway state dir and HOME by default. These tests spawn a
         // real `zirv ctx wrap`, which resolves its state dir from the
         // environment -- so without this they registered sessions, published
@@ -2171,8 +2182,21 @@ mod tests {
             crate::commands::ctx::state::STATE_ENV,
             sandbox.path().join("state").display().to_string(),
         );
+        // The directory has to actually exist, not just be a plausible
+        // path. Historically this was load-bearing for the spawn itself:
+        // with no `.cwd()` set, portable-pty's CommandBuilder falls back to
+        // `chdir`-ing into `HOME` before exec (see `as_command` in its
+        // `cmdbuilder.rs`), and a HOME that only existed on paper made that
+        // chdir fail with ENOENT -- surfaced by `spawn_command` as "No such
+        // file or directory", indistinguishable at a glance from the
+        // wrapped binary itself being missing. The `.cwd()` pin above now
+        // takes precedence over that fallback, but the spawned `zirv` still
+        // resolves real paths under HOME (`~/.zirv`, state fallbacks), so
+        // the sandbox home stays a directory that exists, not a fiction.
+        let home_dir = sandbox.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("create sandbox home");
         for home in ["HOME", "USERPROFILE"] {
-            cmd.env(home, sandbox.path().join("home").display().to_string());
+            cmd.env(home, home_dir.display().to_string());
         }
         // Hermetic against the developer's own environment (F2): this spawns
         // the real `zirv` binary, which reads the process environment, so a
@@ -4392,7 +4416,17 @@ mod tests {
             log.contains("\"action\":\"degrade\""),
             "note_failure logged: {log}"
         );
-        assert!(log.contains("relaunch failed"), "reason recorded: {log}");
+        // "Item 6 audit" (see the comment at `relaunch_error`'s
+        // declaration) made `note_failure` name the *real* spawn error
+        // instead of the old generic "relaunch failed" placeholder, which
+        // that fallback string is now dead code for -- `relaunch_error` is
+        // always `Some` by the time this arm runs. The nonexistent
+        // `ZIRV_CTX_AGENT_BIN` path is what's actually stable across
+        // portable-pty's own wording for "the binary is missing".
+        assert!(
+            log.contains("zirv-ctx-test-agent-binary"),
+            "reason recorded: {log}"
+        );
         assert!(
             log.contains("\"action\":\"restart-failed\""),
             "restart outcome logged: {log}"

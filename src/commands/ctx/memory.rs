@@ -1784,9 +1784,14 @@ This should not appear in the body.\n";
         let mut cfg = CtxConfig::default();
         cfg.memory.harvest = true;
 
+        // N4 (see `write_harvested`, and `a_harvested_fact_never_overwrites_
+        // an_explicit_entry` below): a harvest only ever refreshes an
+        // earlier *harvested* entry, never a deliberate `explicit` one --
+        // seeding with `explicit` here would make the refresh this test
+        // checks for illegal, not merely untested.
         let mut existing = sample("build-cmd", 1_700_000_000);
         existing.body = "cargo build".to_string();
-        existing.source = "explicit".to_string();
+        existing.source = "handoff".to_string();
         remember(&state, "-work-repo", &existing, &cfg).expect("seed");
 
         let adapter = fake_model_adapter();

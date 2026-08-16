@@ -4164,13 +4164,19 @@ mod tests {
         );
 
         // The second nudge's own mail must still be sitting there, unread.
-        let second_short = sessions
-            .get(1)
-            .map(|raw| crate::commands::ctx::sessions::short_id(raw))
-            .expect("the second session started");
+        // It is addressed to this run's *registry* short id -- the address
+        // `SessionGuard::refresh_session` deliberately leaves untouched
+        // across a restart (C7) and the one `nudge_live_session` itself
+        // resolves and sends to -- not to `short_id` of the second
+        // session's own rotated id, which is a different value entirely.
+        assert!(
+            sessions.len() >= 2,
+            "the second session started: {sessions:?}"
+        );
+        let registry_short = crate::commands::ctx::sessions::short_id(session);
         let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
         let slug = crate::commands::ctx::state::repo_slug(tmp.path());
-        let unread = crate::commands::ctx::mail::list(&state, &slug, None, Some(&second_short))
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None, Some(&registry_short))
             .expect("list");
         assert_eq!(
             unread.len(),
