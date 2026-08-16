@@ -118,22 +118,11 @@ pub fn load_for(state: &StateDir, provider: &str) -> Option<UsageWindows> {
     None
 }
 
-/// E: whether `provider` has **no possible** usage source, as distinct from
-/// "nothing recorded yet." Only claude (`LEGACY_USAGE_PROVIDER`) has a real
-/// collector mechanism today (`usage::run_tee`, Claude Code's own statusline
-/// hook) -- a fresh machine that has never tee'd a statusline has no reading
-/// for it either, but "wire your statusline through `zirv ctx usage tee`" is
-/// still the true, actionable answer there, so claude is exempt from this
-/// check regardless of whether [`load_for`] currently finds a file.
-///
-/// Any other provider (codex/openai today) has no write path at all by
-/// design, so [`load_for`] returning `None` for it *is* the honest, durable
-/// answer: pacing (`pace::wait_for_window`) and `zirv ctx usage`'s own report
-/// both key off this, rather than `load_for(..).is_none()` alone, which
-/// cannot tell "structurally impossible" from "claude, not tee'd yet."
+/// True when nothing has ever been recorded for this provider. Since the
+/// codex collector and the poller exist, no provider is structurally exempt
+/// any more — callers refresh sources first, then ask.
 pub fn has_no_usage_source(state: &StateDir, provider: &str) -> bool {
-    super::state::provider_slug(provider) != LEGACY_USAGE_PROVIDER
-        && load_for(state, provider).is_none()
+    load_for(state, provider).is_none()
 }
 
 fn newer(existing: Option<Window>, fresh: Option<Window>) -> Option<Window> {
@@ -490,6 +479,105 @@ pub fn parse_rollout_line(line: &str) -> Option<UsageWindows> {
     windows_from_rate_limits(payload.get("rate_limits")?, observed_at)
 }
 
+/// The account the codex provider's usage is attributed to.
+#[allow(dead_code)]
+pub const CODEX_USAGE_PROVIDER: &str = "openai";
+
+/// Rollout files grow large; only the tail can hold the newest snapshot.
+#[allow(dead_code)]
+const ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;
+#[allow(dead_code)]
+const ROLLOUT_SCAN_FILES: usize = 3;
+
+#[allow(dead_code)]
+fn collect_jsonl(
+    dir: &Path,
+    depth: u8,
+    out: &mut Vec<(std::time::SystemTime, std::path::PathBuf)>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl(&path, depth + 1, out);
+        } else if path.extension().is_some_and(|e| e == "jsonl")
+            && let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+        {
+            out.push((modified, path));
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn last_snapshot_in(path: &Path) -> Option<UsageWindows> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(ROLLOUT_TAIL_BYTES)))
+        .ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    // The tail may start mid-line/mid-char; lossy decode + rev line scan copes.
+    let text = String::from_utf8_lossy(&buf);
+    text.lines().rev().find_map(parse_rollout_line)
+}
+
+/// Newest rate-limit snapshot across the most recently modified rollout files.
+#[allow(dead_code)]
+pub fn scan_codex_rollouts(sessions_dir: &Path, max_files: usize) -> Option<UsageWindows> {
+    let mut files = Vec::new();
+    collect_jsonl(sessions_dir, 0, &mut files);
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    files
+        .into_iter()
+        .take(max_files)
+        .find_map(|(_, p)| last_snapshot_in(&p))
+}
+
+#[allow(dead_code)]
+fn newest_observation(windows: &UsageWindows) -> u64 {
+    windows
+        .five_hour
+        .iter()
+        .chain(windows.seven_day.iter())
+        .map(|w| w.observed_at)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Opportunistic passive refresh for codex: scan its session rollouts only
+/// when the stored reading is stale. Best-effort by design — every failure
+/// leaves the stored state exactly as it was.
+#[allow(dead_code)]
+pub fn refresh_codex_usage(
+    state: &StateDir,
+    sessions_dir: Option<&Path>,
+    now: u64,
+    max_age_secs: u64,
+) {
+    let existing = load_for(state, CODEX_USAGE_PROVIDER);
+    if let Some(w) = &existing
+        && now.saturating_sub(newest_observation(w)) <= max_age_secs
+    {
+        return;
+    }
+    let default_dir = dirs::home_dir().map(|h| h.join(".codex").join("sessions"));
+    let Some(dir) = sessions_dir.or(default_dir.as_deref()) else {
+        return;
+    };
+    let Some(fresh) = scan_codex_rollouts(dir, ROLLOUT_SCAN_FILES) else {
+        return;
+    };
+    let merged = merge(existing.unwrap_or_default(), fresh);
+    let _ = store_for(state, CODEX_USAGE_PROVIDER, &merged);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,17 +804,16 @@ mod tests {
         );
     }
 
-    /// E: claude is exempt even before its first statusline tee -- "not yet"
-    /// is still the true, actionable answer for the one provider with a real
-    /// collector mechanism, so `has_no_usage_source` must stay `false` for it
-    /// regardless of whether a file happens to exist yet.
+    /// E: the codex collector and poller now exist, so no provider is
+    /// structurally exempt any more. Callers refresh sources first, then ask
+    /// whether one is available.
     #[test]
-    fn has_no_usage_source_is_false_for_claude_even_before_the_first_tee() {
+    fn has_no_usage_source_is_true_for_any_provider_when_nothing_recorded() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert!(
-            !has_no_usage_source(&state, "anthropic"),
-            "claude has a real collector mechanism, just nothing recorded yet"
+            has_no_usage_source(&state, "anthropic"),
+            "no provider is exempt: all are 'nothing recorded' when no file exists"
         );
     }
 
@@ -1180,5 +1267,141 @@ mod tests {
             u64::MAX
         );
         assert!(parse_rollout_line(&huge).is_none());
+    }
+
+    #[test]
+    fn scan_finds_last_snapshot_in_newest_rollout_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let fixture = include_str!("../../../tests/fixtures/codex-rollout-rate-limits.jsonl");
+        let lines: Vec<&str> = fixture.lines().collect();
+        // older file: 10% snapshot; newer file: 12% snapshot after a non-snapshot line
+        std::fs::write(day.join("rollout-a.jsonl"), format!("{}\n", lines[0])).unwrap();
+        std::fs::write(
+            day.join("rollout-b.jsonl"),
+            format!("{}\n{}\n", lines[2], lines[1]),
+        )
+        .unwrap();
+        // make b's mtime strictly newer
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = std::fs::File::options()
+            .append(true)
+            .open(day.join("rollout-b.jsonl"))
+            .unwrap();
+        f.set_modified(newer).unwrap();
+        let w = scan_codex_rollouts(dir.path(), 3).unwrap();
+        assert_eq!(w.five_hour.unwrap().used_percentage, 12.0);
+    }
+
+    #[test]
+    fn scan_of_missing_or_empty_dir_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(scan_codex_rollouts(&dir.path().join("nope"), 3).is_none());
+        assert!(scan_codex_rollouts(dir.path(), 3).is_none());
+    }
+
+    #[test]
+    fn refresh_skips_when_stored_reading_is_fresh_and_stores_when_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        // Create a codex sessions dir with the 12% fixture file
+        let sessions_dir = tmp.path().join("codex_sessions");
+        let day = sessions_dir.join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let fixture = include_str!("../../../tests/fixtures/codex-rollout-rate-limits.jsonl");
+        let lines: Vec<&str> = fixture.lines().collect();
+        std::fs::write(day.join("rollout.jsonl"), format!("{}\n", lines[1])).unwrap();
+
+        let now = 1_000_000u64;
+        let max_age = 900u64;
+
+        // Pre-store a fresh openai reading (observed_at close to now)
+        let fresh = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 50.0,
+                resets_at: 1000,
+                observed_at: now - 100, // well within max_age
+            }),
+            seven_day: None,
+        };
+        store_for(&state, CODEX_USAGE_PROVIDER, &fresh).expect("store fresh");
+
+        refresh_codex_usage(&state, Some(sessions_dir.as_path()), now, max_age);
+        let after_fresh_refresh = load_for(&state, CODEX_USAGE_PROVIDER);
+        assert_eq!(
+            after_fresh_refresh,
+            Some(fresh),
+            "fresh reading should not be updated"
+        );
+
+        // Now pre-store a stale reading (observed_at = now - 10_000)
+        let stale = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 20.0,
+                resets_at: 500,
+                observed_at: now - 10_000, // well beyond max_age
+            }),
+            seven_day: None,
+        };
+        store_for(&state, CODEX_USAGE_PROVIDER, &stale).expect("store stale");
+
+        refresh_codex_usage(&state, Some(sessions_dir.as_path()), now, max_age);
+        let after_stale_refresh = load_for(&state, CODEX_USAGE_PROVIDER);
+
+        // The scanned 12% should be merged with the stale 20%
+        let merged = after_stale_refresh.expect("merged present");
+        assert_eq!(
+            merged.five_hour.unwrap().used_percentage,
+            12.0,
+            "fresh scan should update stale reading"
+        );
+    }
+
+    #[test]
+    fn no_usage_source_is_now_a_plain_no_data_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        // openai has nothing stored -> true
+        assert!(has_no_usage_source(&state, CODEX_USAGE_PROVIDER));
+
+        // Store something for openai -> false
+        store_for(
+            &state,
+            CODEX_USAGE_PROVIDER,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 50.0,
+                    resets_at: 1000,
+                    observed_at: 10,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+        assert!(!has_no_usage_source(&state, CODEX_USAGE_PROVIDER));
+
+        // anthropic with nothing stored -> true (previously hardcoded false)
+        let tmp2 = tempfile::tempdir().unwrap();
+        let state2 = StateDir::from_root(tmp2.path().to_path_buf());
+        assert!(has_no_usage_source(&state2, "anthropic"));
+
+        // Store something for anthropic -> false
+        store_for(
+            &state2,
+            "anthropic",
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 75.0,
+                    resets_at: 2000,
+                    observed_at: 20,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+        assert!(!has_no_usage_source(&state2, "anthropic"));
     }
 }
