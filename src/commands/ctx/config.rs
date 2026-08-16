@@ -77,6 +77,15 @@ pub struct SuperviseConfig {
     pub max_failures: u32,
     pub backoff_base_secs: u64,
     pub on_failure: Option<String>,
+    /// Consecutive `zirv ctx nudge`-driven restarts a single supervised run
+    /// (`exec`) will honor before it starts ignoring further nudges: a
+    /// separate cap from `max_restarts`, since a nudge-restart never spends
+    /// that budget (it is not rot). Past the cap the nudge's mail is left
+    /// unread rather than acted on, so it is still visible via `zirv ctx
+    /// inbox`. Not repo-forbidden: unlike `agent_bin` or `handoff.model`,
+    /// this names no binary, shell command, or model choice, only how many
+    /// times a session tolerates being interrupted.
+    pub max_nudges: u32,
 }
 
 impl Default for SuperviseConfig {
@@ -89,6 +98,7 @@ impl Default for SuperviseConfig {
             max_failures: 5,
             backoff_base_secs: 60,
             on_failure: None,
+            max_nudges: 3,
         }
     }
 }
@@ -96,7 +106,16 @@ impl Default for SuperviseConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HandoffConfig {
-    pub model: String,
+    /// The operator's own choice of distiller/judgment model, when set.
+    /// `None` -- the default -- means "let the adapter decide":
+    /// `resolve_distiller_model` (`handoff.rs`) falls back to the resolved
+    /// adapter's own `AgentAdapter::default_distiller_model`, which is a
+    /// real value for claude ("haiku") but `None` for codex, since a
+    /// hardcoded model name is specific to one agent's lineup and zirv has
+    /// no verified cheap-model default for codex's. This used to default to
+    /// the literal `"haiku"` unconditionally, which reached `codex exec
+    /// --model haiku` for a codex session and failed outright.
+    pub model: Option<String>,
     /// How many trailing items of each kind the handoff context keeps: user
     /// messages, assistant texts and tool errors. One knob, because
     /// `structural_context` applies one limit to all three.
@@ -110,7 +129,7 @@ pub struct HandoffConfig {
 impl Default for HandoffConfig {
     fn default() -> Self {
         Self {
-            model: "haiku".to_string(),
+            model: None,
             tail_items: 5,
             timeout_secs: 30,
         }
@@ -169,7 +188,12 @@ pub struct OptimizeConfig {
     pub enabled: bool,
     pub sessions_sampled: usize,
     pub max_surface_bytes: usize,
-    /// Empty reuses `handoff.model`: one cheap-model choice for the whole tool.
+    /// Empty reuses `handoff.model`'s own resolution (`resolve_distiller_
+    /// model` in `handoff.rs`, which already falls back to the resolved
+    /// adapter's own default when `handoff.model` itself is unset): one
+    /// cheap-model choice for the whole tool, kept as a plain `String`
+    /// rather than `Option<String>` since "empty" already means "defer" here
+    /// and always has.
     pub model: String,
     pub recommend_tool_failure_rate: f64,
     pub recommend_corrections: usize,
@@ -210,6 +234,156 @@ impl Default for PromptConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MailConfig {
+    pub enabled: bool,
+    /// Cap on a stored message's body. Enforced by `mail::store`, which
+    /// truncates rather than fails an oversize message.
+    pub max_message_bytes: usize,
+    /// Cap on how much mail is surfaced to a session at once (delivery is a
+    /// later piece; the cap lives here so it is configured alongside the
+    /// rest of the mailbox from the start).
+    pub max_delivered_bytes: usize,
+    /// How many unread messages a repo's mailbox keeps before the oldest are
+    /// pruned. Read messages, already moved into `read/`, are never touched
+    /// by this limit.
+    pub keep: usize,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_message_bytes: 4096,
+            max_delivered_bytes: 4096,
+            keep: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    /// Whether facts may be harvested automatically from distilled handoffs.
+    /// Off by default: an entry worth keeping across sessions is, for now, a
+    /// deliberate act, not an inferred one.
+    pub harvest: bool,
+    /// How many entries a repository's bank keeps before the oldest
+    /// (by `Written`) are pruned. Mirrors `mail.keep`.
+    pub max_entries: usize,
+    /// Cap on a single entry's body. Enforced by `memory::remember`, which
+    /// truncates rather than fails an oversize entry.
+    pub max_entry_bytes: usize,
+    /// Cap on how much of the bank is surfaced to a session at once.
+    pub max_injected_bytes: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            harvest: false,
+            max_entries: 50,
+            max_entry_bytes: 512,
+            max_injected_bytes: 2048,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChromeConfig {
+    /// The launch banner naming the resolved harness, the rule that chose it,
+    /// and the session id.
+    pub banner: bool,
+    /// The reserved bottom status bar (T12b).
+    pub bar: bool,
+    /// The `zirv ▸` announcement channel on stderr.
+    pub events: bool,
+}
+
+impl Default for ChromeConfig {
+    fn default() -> Self {
+        Self {
+            banner: true,
+            bar: true,
+            events: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DashConfig {
+    pub enabled: bool,
+    /// Width, in columns, of the persistent sidebar listing every session.
+    pub sidebar_cols: u16,
+    /// How long a quit-time roster stays offered for restore before a fresh
+    /// launch treats it as stale and ignores it.
+    pub roster_max_age_secs: u64,
+    /// The most panes one dashboard will ever hold at once, counting the
+    /// orchestrator. Defaults to 9, matching `DashAction::Switch`'s own
+    /// `Ctrl+A 1..9` addressing: a pane nothing can select is a pane nobody
+    /// asked for. Enforced wherever a pane is created from something other
+    /// than the operator's own launch -- the spawn-request channel and the
+    /// `Ctrl+A s` dialog -- so a pane child cannot fork-bomb its own
+    /// dashboard into a machine full of harness processes.
+    pub max_panes: usize,
+    /// Whether the dashboard captures the mouse, which is what makes the
+    /// wheel scroll a pane's scrollback.
+    ///
+    /// A toggle, and defaulted **on**, because it is a genuine trade rather
+    /// than a strict improvement: a terminal that is reporting mouse events to
+    /// the application no longer performs its own native click-drag text
+    /// selection, so an operator who wants to select and copy text has to hold
+    /// Shift to bypass the capture (the standard escape hatch every terminal
+    /// offers, and the same trade tmux's own `mouse on` makes). Some operators
+    /// live in the scrollback and some live in the selection; the wheel is the
+    /// more discoverable of the two, so it wins the default, and anyone who
+    /// disagrees sets `mouse = false` and still has `Ctrl+A PageUp`/`Home`.
+    pub mouse: bool,
+}
+
+impl Default for DashConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sidebar_cols: 24,
+            roster_max_age_secs: 604_800,
+            max_panes: 9,
+            mouse: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChatConfig {
+    /// Model for the interactive orchestrator session, passed through
+    /// `AgentAdapter::model_args`. `None` leaves the agent's own default in
+    /// place. Deliberately **not** in `REPO_FORBIDDEN` -- see the comment
+    /// there and the spec's "Orchestrator model" section
+    /// (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
+    /// `handoff.model`/`optimize.model`, this only shapes a session the
+    /// operator deliberately launched interactively, and the choice is
+    /// disclosed on screen at launch rather than spent silently in the
+    /// background.
+    ///
+    /// That disclosure is `chat.rs::announce_model_choice`, on the `zirv
+    /// \u{25b8}` announcement channel, **not** the launch banner. The banner
+    /// alone was not enough to carry the exemption: `chrome.banner` is not
+    /// `REPO_FORBIDDEN`, so the same repo layer that set this key could set
+    /// `[chrome] banner = false` beside it and choose the model with nothing
+    /// shown anywhere (the `wrap` fallback has no other model surface at
+    /// all). `chrome.events` **is** `REPO_FORBIDDEN`, so the announcement is
+    /// one a repo cannot silence -- only the operator can, with
+    /// `--quiet`/`ZIRV_CTX_QUIET`. The banner and the dashboard header still
+    /// show it too, as the standing on-screen copy.
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -222,6 +396,18 @@ pub struct CtxConfig {
     pub pace: PaceConfig,
     pub optimize: OptimizeConfig,
     pub prompt: PromptConfig,
+    pub mail: MailConfig,
+    pub memory: MemoryConfig,
+    pub chrome: ChromeConfig,
+    pub dash: DashConfig,
+    pub chat: ChatConfig,
+    /// Per-agent enable/disable state from `.settings.toml`, a file this type
+    /// deliberately never deserializes (see `crate::settings`): loaded
+    /// separately at the end of `load`, and rejected outright if it appears
+    /// as an `[agents]` table inside `ctx.toml` itself, so the two files stay
+    /// distinct.
+    #[serde(skip)]
+    pub agents: crate::settings::AgentGate,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,6 +415,11 @@ enum EnvKind {
     Int,
     Float,
     Bool,
+    /// Same parsing as `Bool`, but the parsed value is inverted before being
+    /// inserted. `ZIRV_CTX_QUIET=true` needs to become `chrome.events =
+    /// false`, and this is the one variable in `ENV_MAP` whose meaning is the
+    /// negation of the config key it feeds.
+    NegatedBool,
     Str,
 }
 
@@ -283,6 +474,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_ON_FAILURE",
         &["supervise", "on_failure"],
         EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_MAX_NUDGES",
+        &["supervise", "max_nudges"],
+        EnvKind::Int,
     ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
@@ -348,6 +544,70 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["prompt", "max_repo_bytes"],
         EnvKind::Int,
     ),
+    ("ZIRV_CTX_MAIL", &["mail", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_MAIL_MAX_MESSAGE_BYTES",
+        &["mail", "max_message_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES",
+        &["mail", "max_delivered_bytes"],
+        EnvKind::Int,
+    ),
+    ("ZIRV_CTX_MAIL_KEEP", &["mail", "keep"], EnvKind::Int),
+    ("ZIRV_CTX_MEMORY", &["memory", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_MEMORY_HARVEST",
+        &["memory", "harvest"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_MAX_ENTRIES",
+        &["memory", "max_entries"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES",
+        &["memory", "max_entry_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
+        &["memory", "max_injected_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_CHROME_BANNER",
+        &["chrome", "banner"],
+        EnvKind::Bool,
+    ),
+    ("ZIRV_CTX_CHROME_BAR", &["chrome", "bar"], EnvKind::Bool),
+    // Not `["chrome", "events"], EnvKind::Bool`: quiet is the inverse of
+    // events, so this is the one entry that needs `NegatedBool`.
+    (
+        "ZIRV_CTX_QUIET",
+        &["chrome", "events"],
+        EnvKind::NegatedBool,
+    ),
+    ("ZIRV_CTX_DASH", &["dash", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_DASH_SIDEBAR_COLS",
+        &["dash", "sidebar_cols"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS",
+        &["dash", "roster_max_age_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_DASH_MAX_PANES",
+        &["dash", "max_panes"],
+        EnvKind::Int,
+    ),
+    ("ZIRV_CTX_DASH_MOUSE", &["dash", "mouse"], EnvKind::Bool),
+    ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -397,6 +657,10 @@ fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
             .parse::<bool>()
             .map(toml::Value::Boolean)
             .map_err(|_| format!("expected true or false, got '{raw}'").into()),
+        EnvKind::NegatedBool => raw
+            .parse::<bool>()
+            .map(|b| toml::Value::Boolean(!b))
+            .map_err(|_| format!("expected true or false, got '{raw}'").into()),
     }
 }
 
@@ -407,6 +671,19 @@ fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
 /// those come from the operator, not from the checkout.
 const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["agent_bin"], "ZIRV_CTX_AGENT_BIN"),
+    // Final wave item 1: a repo `ctx.toml` setting `agent` reaches `resolve_
+    // default`'s *configured* arm (`cfg.agent.as_deref()` is `Some`), which
+    // never consults `AgentGate::disabled_only_by_repo` at all -- that check
+    // only runs in the no-`cfg.agent` fallback loop. A repo could therefore
+    // pick which vendor account gets spent (`agent = "codex"`, say) with no
+    // narrowing guard in the way, the exact outcome
+    // `the_fallback_refuses_to_silently_switch_provider_when_the_repo_
+    // disabled_the_default` exists to block for the *unconfigured* path.
+    // This was inert while codex's own `ready()` still hard-errored; codex
+    // shipping out of the box activates it. `~/.zirv/ctx.toml`, `ZIRV_CTX_
+    // AGENT` and `--agent` all still choose the agent same as before -- only
+    // a repo checkout may not.
+    (&["agent"], "ZIRV_CTX_AGENT"),
     (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),
     (&["handoff", "model"], "ZIRV_CTX_MODEL"),
     (&["optimize", "model"], "ZIRV_CTX_OPTIMIZE_MODEL"),
@@ -418,6 +695,77 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["prompt", "max_repo_bytes"],
         "ZIRV_CTX_PROMPT_MAX_REPO_BYTES",
     ),
+    // Same rationale as prompt.max_repo_bytes above: mail is folded into the
+    // composed prompt as its own layer (`with_mail_layer`), and without this
+    // a repo could simply raise its own delivered-mail cap, making it
+    // decorative.
+    (
+        &["mail", "max_delivered_bytes"],
+        "ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES",
+    ),
+    // A repo could otherwise turn mail delivery back on after an operator
+    // disabled it -- the same "the checkout is not the operator" boundary
+    // every other entry here enforces, applied to a boolean instead of a
+    // number.
+    (&["mail", "enabled"], "ZIRV_CTX_MAIL"),
+    // Without this a repo could silence the `zirv \u{25b8}` announcement
+    // channel -- including the degradation notices it exists to surface --
+    // for anyone running zirv there, with no operator-visible sign that it
+    // happened.
+    (&["chrome", "events"], "ZIRV_CTX_QUIET"),
+    // A repo checkout must not be able to seed the memory bank, grow its
+    // cap, or turn on automatic harvesting -- the same class of decision
+    // `prompt.max_repo_bytes` guards: something the checkout must not
+    // choose for itself, only the operator (`~/.zirv/ctx.toml`, `ZIRV_CTX_*`
+    // or flags) may.
+    (&["memory", "enabled"], "ZIRV_CTX_MEMORY"),
+    (&["memory", "harvest"], "ZIRV_CTX_MEMORY_HARVEST"),
+    (&["memory", "max_entries"], "ZIRV_CTX_MEMORY_MAX_ENTRIES"),
+    (
+        &["memory", "max_entry_bytes"],
+        "ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES",
+    ),
+    (
+        &["memory", "max_injected_bytes"],
+        "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
+    ),
+    // A repo checkout must not be able to switch its own dashboard on or off,
+    // resize the sidebar, change how long a quit-time roster is offered for
+    // restore, or raise its own pane cap -- the operator's terminal, the
+    // operator's machine, the operator's call. `max_panes` in particular is
+    // the same trust asymmetry as `mail.max_delivered_bytes`: a checked-out
+    // repo raising its own limit is exactly the case the limit exists for.
+    (&["dash", "enabled"], "ZIRV_CTX_DASH"),
+    (&["dash", "sidebar_cols"], "ZIRV_CTX_DASH_SIDEBAR_COLS"),
+    (
+        &["dash", "roster_max_age_secs"],
+        "ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS",
+    ),
+    (&["dash", "max_panes"], "ZIRV_CTX_DASH_MAX_PANES"),
+    // Mouse capture takes over the terminal's own text selection, so which
+    // way that trade goes is the operator's call about their own terminal,
+    // not a checked-out repo's.
+    (&["dash", "mouse"], "ZIRV_CTX_DASH_MOUSE"),
+    // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
+    // own doc comment and the spec's "Orchestrator model" section
+    // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
+    // every model key above, it only shapes an interactive session the
+    // operator deliberately launched, and the choice is disclosed on the
+    // `zirv \u{25b8}` announcement channel (`chat::announce_model_choice`) --
+    // which `chrome.events`, right above, keeps repo-unsilenceable -- rather
+    // than spent silently in the background. A repo checkout may set it -- do
+    // not "fix" this by adding it here, and do not remove `chrome.events`
+    // from this list, which is what the exemption rests on.
+    //
+    // The exemption is safe against the cmd.exe argv-reparse injection class
+    // because the value is *charset-validated* at the end of `CtxConfig::load`
+    // (only `[A-Za-z0-9-._:/@]`, max 128 bytes): a validated model string can
+    // express no shell/cmd metacharacter, so it can never carry a payload even
+    // though it reaches an argv that `resolve_program` may route through
+    // `cmd.exe /c` on Windows. The disclosed operator-in-repo model-choice
+    // purpose survives (real model ids only ever use that charset); the RCE
+    // does not. This is a narrower, correctness-preserving guard than banning
+    // the key outright, which is why it stays out of `REPO_FORBIDDEN`.
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -492,9 +840,47 @@ impl CtxConfig {
             }
         }
 
-        toml::Value::Table(merged)
+        let mut cfg: Self = toml::Value::Table(merged)
             .try_into()
-            .map_err(|e| format!("invalid ctx config: {e}").into())
+            .map_err(|e| format!("invalid ctx config: {e}"))?;
+
+        // SECURITY (command-injection defense): `chat.model` is one of the few
+        // keys a repo `ctx.toml` may set (see `REPO_FORBIDDEN`'s `chat.model`
+        // note), and it is appended to an interactive launch's argv via
+        // `AgentAdapter::model_args`. On Windows an npm-installed agent resolves
+        // to a `.cmd` shim that zirv routes through `cmd.exe /c`, which
+        // re-parses that argv -- so an unconstrained model string is a repo-
+        // controlled path into a shell command line. Constrain it to a charset
+        // that cannot express any shell/cmd metacharacter (space, quote,
+        // `& | ^ < > ( ) % ! ` backtick, newline are all excluded), so the
+        // repo-settable exemption cannot carry a payload. `:` `/` `@` are kept
+        // so Bedrock/Vertex ids (`us.anthropic.claude-...-v1:0`,
+        // `claude-...@20250101`) stay valid. The `ZIRV_CTX_CHAT_MODEL` env path
+        // merged above is validated identically, since it merges before here,
+        // and every downstream surface (banner, dashboard header, `model_args`)
+        // reads the value only after this point.
+        if let Some(model) = cfg.chat.model.as_deref()
+            && (model.is_empty()
+                || model.len() > 128
+                // A leading `-` would let the value pose as its own flag on the
+                // launch argv (`--model --dangerously-skip-permissions`), so it
+                // is rejected even though `-` is otherwise a legal model-id
+                // character. Anchored here rather than dropped from the charset,
+                // since a hyphen mid-id (`claude-opus-5`) is legitimate.
+                || model.starts_with('-')
+                || !model.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/' | '@')
+                }))
+        {
+            return Err(format!(
+                "invalid ctx config: `chat.model` may contain only ASCII letters, digits and \
+                 `-._:/@` and may not begin with `-`, got '{model}'"
+            )
+            .into());
+        }
+
+        cfg.agents = crate::settings::AgentGate::load(repo, env)?;
+        Ok(cfg)
     }
 }
 
@@ -529,7 +915,12 @@ mod tests {
         );
         assert_eq!(WrapConfig::default().debounce_ms, 3000);
         assert_eq!(SuperviseConfig::default().max_restarts, 2);
-        assert_eq!(HandoffConfig::default().model, "haiku");
+        assert_eq!(SuperviseConfig::default().max_nudges, 3);
+        assert_eq!(
+            HandoffConfig::default().model,
+            None,
+            "per-adapter resolution now lives in resolve_distiller_model, not a hardcoded default"
+        );
         assert_eq!(HandoffConfig::default().tail_items, 5);
         assert_eq!(HandoffConfig::default().timeout_secs, 30);
     }
@@ -590,6 +981,11 @@ mod tests {
                 "supervise.on_failure",
             ),
             ("[handoff]\nmodel = \"opus\"\n", "handoff.model"),
+            // Final wave item 1: `agent` reaches `resolve_default`'s
+            // *configured* arm, which never consults `disabled_only_by_
+            // repo` -- a repo checkout must not be able to pick which
+            // vendor account gets spent.
+            ("agent = \"codex\"\n", "agent"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -614,30 +1010,37 @@ mod tests {
             ("ZIRV_CTX_AGENT_BIN", "/opt/homebrew/bin/claude"),
             ("ZIRV_CTX_ON_FAILURE", "say done"),
             ("ZIRV_CTX_MODEL", "sonnet"),
+            ("ZIRV_CTX_AGENT", "codex"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.agent_bin.as_deref(), Some("/opt/homebrew/bin/claude"));
         assert_eq!(cfg.supervise.on_failure.as_deref(), Some("say done"));
-        assert_eq!(cfg.handoff.model, "sonnet");
+        assert_eq!(cfg.handoff.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.agent.as_deref(), Some("codex"));
     }
 
-    /// `agent` picks between two vetted adapters rather than naming an
-    /// executable, so a repository is still allowed to choose it.
+    /// Ordinary thresholds like `tail_items` shape *how* a run behaves, not
+    /// *what* runs or whose account it spends, so they stay repo-settable.
+    /// (`agent` used to sit in this bucket too; it moved to `REPO_FORBIDDEN`
+    /// once codex became selectable, because picking the adapter picks the
+    /// vendor account -- see `a_repository_config_cannot_name_what_the_tool_runs`.)
     #[test]
-    fn a_repository_may_still_choose_the_adapter_and_the_thresholds() {
+    fn a_repository_may_still_choose_the_thresholds() {
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
-            "agent = \"claude\"\n\n[handoff]\ntail_items = 9\n",
+            "[handoff]\ntail_items = 9\n",
         )
         .expect("write");
 
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
-        assert_eq!(cfg.agent.as_deref(), Some("claude"));
         assert_eq!(cfg.handoff.tail_items, 9);
-        assert_eq!(cfg.handoff.model, "haiku", "still the default");
+        assert_eq!(
+            cfg.handoff.model, None,
+            "still the default: per-adapter resolution now lives in resolve_distiller_model"
+        );
     }
 
     #[test]
@@ -839,5 +1242,562 @@ mod tests {
             msg.contains("ZIRV_CTX_OPTIMIZE_MODEL"),
             "name the alternative: {msg}"
         );
+    }
+
+    #[test]
+    fn mail_defaults_are_enabled_with_sane_caps() {
+        let mail = MailConfig::default();
+        assert!(mail.enabled, "the mailbox is on by default");
+        assert_eq!(mail.max_message_bytes, 4096);
+        assert_eq!(mail.max_delivered_bytes, 4096);
+        assert_eq!(mail.keep, 50);
+    }
+
+    #[test]
+    fn mail_reads_config_and_env() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[mail]\nkeep = 10\nmax_message_bytes = 2048\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.mail.keep, 10);
+        assert_eq!(cfg.mail.max_message_bytes, 2048);
+        assert_eq!(
+            cfg.mail.max_delivered_bytes, 4096,
+            "untouched keys keep defaults"
+        );
+
+        let env = env_map(&[
+            ("ZIRV_CTX_MAIL", "false"),
+            ("ZIRV_CTX_MAIL_MAX_MESSAGE_BYTES", "512"),
+            ("ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES", "256"),
+            ("ZIRV_CTX_MAIL_KEEP", "5"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.mail.enabled);
+        assert_eq!(cfg.mail.max_message_bytes, 512);
+        assert_eq!(cfg.mail.max_delivered_bytes, 256);
+        assert_eq!(cfg.mail.keep, 5);
+    }
+
+    /// `.settings.toml` and `ctx.toml` are deliberately distinct files:
+    /// `agents` is `#[serde(skip)]` on `CtxConfig`, so an `[agents]` table
+    /// inside `ctx.toml` is unrecognized rather than silently accepted.
+    #[test]
+    fn agents_in_ctx_toml_is_rejected_so_the_two_files_stay_distinct() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("[agents] belongs in .settings.toml, not ctx.toml");
+        assert!(err.to_string().contains("agents"), "got {err}");
+    }
+
+    #[test]
+    fn chrome_defaults_are_all_on() {
+        let chrome = ChromeConfig::default();
+        assert!(chrome.banner, "the launch banner is on by default");
+        assert!(chrome.bar, "the status bar is on by default");
+        assert!(chrome.events, "the announcement channel is on by default");
+    }
+
+    #[test]
+    fn chrome_reads_config_and_env() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chrome]\nbanner = false\nbar = false\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.chrome.banner);
+        assert!(!cfg.chrome.bar);
+        assert!(cfg.chrome.events, "untouched keys keep defaults");
+
+        let env = env_map(&[
+            ("ZIRV_CTX_CHROME_BANNER", "false"),
+            ("ZIRV_CTX_CHROME_BAR", "false"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.chrome.banner);
+        assert!(!cfg.chrome.bar);
+    }
+
+    /// `ZIRV_CTX_QUIET=true` must turn the announcement channel off, not on:
+    /// it is the negation of `chrome.events`, the one entry in `ENV_MAP`
+    /// whose meaning is inverted from the key it feeds.
+    #[test]
+    fn zirv_ctx_quiet_inverts_into_chrome_events() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_QUIET", "true")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.chrome.events,
+            "quiet=true must silence the announcement channel"
+        );
+
+        let env = env_map(&[("ZIRV_CTX_QUIET", "false")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            cfg.chrome.events,
+            "quiet=false must leave the announcement channel on"
+        );
+    }
+
+    #[test]
+    fn a_non_boolean_quiet_value_is_rejected() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_QUIET", "loud")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad bool");
+        assert!(err.to_string().contains("ZIRV_CTX_QUIET"), "got {err}");
+    }
+
+    /// `chrome.bar`/`chrome.banner` are not in `REPO_FORBIDDEN`: unlike
+    /// `agent_bin` or `handoff.model`, neither names what zirv runs or
+    /// spends tokens on, so a repository may configure its own defaults for
+    /// them. `chrome.events` is different -- see
+    /// `a_repo_may_not_silence_the_announcement_channel` below.
+    #[test]
+    fn a_repository_may_configure_chrome() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chrome]\nbar = false\n",
+        )
+        .expect("write");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.chrome.bar);
+    }
+
+    /// S1: mail is folded into the composed prompt as its own layer
+    /// (`with_mail_layer`), the same reasoning that puts `prompt.max_repo_
+    /// bytes` in `REPO_FORBIDDEN` -- a repo raising its own delivered-mail
+    /// cap would make the cap decorative, and a repo re-enabling delivery
+    /// after an operator disabled it would defeat the point of disabling it.
+    #[test]
+    fn a_repo_may_not_raise_the_mail_delivered_cap_or_toggle_delivery() {
+        for (key, value) in [("max_delivered_bytes", "1000000"), ("enabled", "true")] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[mail]\n{key} = {value}\n"),
+            )
+            .expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(&format!("mail.{key}")), "got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_MAIL"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+    }
+
+    /// S1: a repo could otherwise silence the `zirv \u{25b8}` announcement
+    /// channel -- including its own degradation notices -- for anyone
+    /// running zirv there, with no operator-visible sign that it happened.
+    #[test]
+    fn a_repo_may_not_silence_the_announcement_channel() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chrome]\nevents = false\n",
+        )
+        .expect("write");
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not silence the announcement channel")
+            .to_string();
+        assert!(err.contains("chrome.events"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_QUIET"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    #[test]
+    fn the_operator_may_still_toggle_mail_delivery_and_the_announcement_channel() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_only.path());
+        let env = env_map(&[
+            ("ZIRV_CTX_MAIL", "false"),
+            ("ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES", "9000"),
+            ("ZIRV_CTX_QUIET", "true"),
+        ]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.mail.enabled, "the environment is the operator");
+        assert_eq!(cfg.mail.max_delivered_bytes, 9000);
+        assert!(!cfg.chrome.events);
+    }
+
+    #[test]
+    fn memory_defaults_are_enabled_off_harvest_with_sane_caps() {
+        let memory = MemoryConfig::default();
+        assert!(memory.enabled, "the memory bank is on by default");
+        assert!(
+            !memory.harvest,
+            "automatic harvesting is off by default: remembering is a deliberate act"
+        );
+        assert_eq!(memory.max_entries, 50);
+        assert_eq!(memory.max_entry_bytes, 512);
+        assert_eq!(memory.max_injected_bytes, 2048);
+    }
+
+    #[test]
+    fn memory_env_overrides_every_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_MEMORY", "false"),
+            ("ZIRV_CTX_MEMORY_HARVEST", "true"),
+            ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "9"),
+            ("ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES", "128"),
+            ("ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES", "999"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.memory.enabled);
+        assert!(cfg.memory.harvest);
+        assert_eq!(cfg.memory.max_entries, 9);
+        assert_eq!(cfg.memory.max_entry_bytes, 128);
+        assert_eq!(cfg.memory.max_injected_bytes, 999);
+    }
+
+    /// N4: `supervise.max_nudges` reads from its own env var like every
+    /// other `supervise.*` key.
+    #[test]
+    fn max_nudges_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_MAX_NUDGES", "7")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.max_nudges, 7);
+    }
+
+    /// Unlike `supervise.on_failure` (a shell command) or `agent_bin` (a
+    /// binary), `max_nudges` names no binary, shell command, or model
+    /// choice -- only how many times a session tolerates being interrupted
+    /// -- so a repository checkout may set it, the same trust level a repo's
+    /// `score.*` tuning already has.
+    #[test]
+    fn a_repository_config_may_set_max_nudges() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nmax_nudges = 5\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.max_nudges, 5);
+    }
+
+    /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and
+    /// `mail.max_delivered_bytes`: a repo checkout must not be able to seed
+    /// the bank, grow its own cap, or switch automatic harvesting on for
+    /// anyone who runs zirv there.
+    #[test]
+    fn a_repository_config_may_not_raise_a_memory_cap_or_enable_harvesting() {
+        for (key, value) in [
+            ("enabled", "true"),
+            ("harvest", "true"),
+            ("max_entries", "100000"),
+            ("max_entry_bytes", "100000"),
+            ("max_injected_bytes", "100000"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[memory]\n{key} = {value}\n"),
+            )
+            .expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(&format!("memory.{key}")), "got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_MEMORY"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operator_may_still_set_memory_keys() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_only.path());
+        let env = env_map(&[
+            ("ZIRV_CTX_MEMORY", "false"),
+            ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "5"),
+        ]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.memory.enabled, "the environment is the operator");
+        assert_eq!(cfg.memory.max_entries, 5);
+    }
+
+    #[test]
+    fn dash_defaults_are_on_with_a_24_col_sidebar() {
+        let cfg = CtxConfig::default();
+        assert!(cfg.dash.enabled);
+        assert_eq!(cfg.dash.sidebar_cols, 24);
+        assert_eq!(cfg.dash.roster_max_age_secs, 604_800);
+        assert_eq!(
+            cfg.dash.max_panes, 9,
+            "the default cap matches Ctrl+A 1..9 addressing"
+        );
+        assert!(
+            cfg.dash.mouse,
+            "the wheel scrolls a pane's scrollback out of the box"
+        );
+    }
+
+    #[test]
+    fn repo_layer_cannot_touch_dash_keys() {
+        for (key, value) in [
+            ("enabled", "false"),
+            ("sidebar_cols", "80"),
+            ("roster_max_age_secs", "1"),
+            ("max_panes", "999"),
+            ("mouse", "false"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[dash]\n{key} = {value}\n"),
+            )
+            .expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(&format!("dash.{key}")), "got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_DASH"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_can_disable_the_dashboard() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_DASH", "false")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.dash.enabled);
+    }
+
+    #[test]
+    fn the_operator_may_still_set_dash_keys() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_only.path());
+        let env = env_map(&[
+            ("ZIRV_CTX_DASH", "false"),
+            ("ZIRV_CTX_DASH_SIDEBAR_COLS", "30"),
+            ("ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS", "60"),
+            ("ZIRV_CTX_DASH_MAX_PANES", "3"),
+            ("ZIRV_CTX_DASH_MOUSE", "false"),
+        ]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.dash.enabled, "the environment is the operator");
+        assert_eq!(cfg.dash.sidebar_cols, 30);
+        assert_eq!(cfg.dash.roster_max_age_secs, 60);
+        assert_eq!(cfg.dash.max_panes, 3);
+        assert!(
+            !cfg.dash.mouse,
+            "an operator who wants native text selection back turns capture off"
+        );
+    }
+
+    #[test]
+    fn chat_model_defaults_to_none() {
+        assert_eq!(ChatConfig::default().model, None);
+    }
+
+    /// Unlike `handoff.model`/`optimize.model`, `chat.model` shapes an
+    /// interactive session the operator deliberately launched and the choice
+    /// is displayed on screen -- see `ChatConfig`'s own doc comment and the
+    /// spec's "Orchestrator model" section
+    /// (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md). A repo
+    /// checkout is therefore allowed to set it, unlike every other model key
+    /// in `REPO_FORBIDDEN`.
+    #[test]
+    fn a_repository_config_may_set_the_chat_model() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chat]\nmodel = \"opus\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.chat.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn env_overrides_the_chat_model() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", "sonnet")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.chat.model.as_deref(), Some("sonnet"));
+    }
+
+    /// SECURITY (FIX 1): `chat.model` is repo-settable and reaches an argv that
+    /// `resolve_program` may route through `cmd.exe /c` on Windows, so a repo
+    /// value bearing a shell/cmd metacharacter must fail the load rather than
+    /// carry a command-injection payload into the launch.
+    #[test]
+    fn a_repo_chat_model_with_a_shell_metacharacter_is_rejected() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chat]\nmodel = \"sonnet&calc\"\n",
+        )
+        .expect("write");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a metacharacter model must fail the load");
+        assert!(
+            err.to_string().contains("chat.model"),
+            "the refusal names the key: {err}"
+        );
+    }
+
+    /// FIX 1: real model ids -- a Bedrock id with `:` `/` `.`, a Vertex id with
+    /// `@`, a hyphenated alias, a bare name -- use only the allowed charset and
+    /// load cleanly, so the exemption's disclosed operator-in-repo purpose
+    /// survives the guard.
+    #[test]
+    fn real_model_ids_are_accepted() {
+        for model in [
+            "us.anthropic.claude-sonnet-4-v1:0",
+            "claude-fable-5",
+            "fable",
+            "claude-sonnet-4@20250101",
+        ] {
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[chat]\nmodel = \"{model}\"\n"),
+            )
+            .expect("write");
+            let empty = env_map(&[]);
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .unwrap_or_else(|e| panic!("'{model}' should load: {e}"));
+            assert_eq!(cfg.chat.model.as_deref(), Some(model));
+        }
+    }
+
+    /// SECURITY: a leading-dash model value would reach the launch argv as its
+    /// own flag (`--model --dangerously-skip-permissions`), so it is rejected at
+    /// load, while an ordinary hyphenated id (`claude-opus-5`) that only uses a
+    /// hyphen mid-token still loads cleanly.
+    #[test]
+    fn a_leading_dash_chat_model_is_rejected() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", "--dangerously-skip-permissions")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a leading-dash model must fail the load");
+        assert!(err.to_string().contains("chat.model"), "got {err}");
+
+        for good in ["fable", "claude-opus-5"] {
+            let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", good)]);
+            let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+                .unwrap_or_else(|e| panic!("'{good}' should load: {e}"));
+            assert_eq!(cfg.chat.model.as_deref(), Some(good));
+        }
+    }
+
+    /// FIX 1: the `ZIRV_CTX_CHAT_MODEL` env path merges before the same
+    /// validation, so an operator-set metacharacter is rejected identically --
+    /// the check is on the merged value, not on which layer set it.
+    #[test]
+    fn the_env_chat_model_path_is_validated_identically() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", "sonnet | calc")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("an env metacharacter model must fail too");
+        assert!(err.to_string().contains("chat.model"), "got {err}");
+    }
+
+    /// FIX 1: an over-long model string is rejected before it can reach any
+    /// argv, bounding the value regardless of its charset.
+    #[test]
+    fn an_overlong_chat_model_is_rejected() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let long = "a".repeat(129);
+        let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", long.as_str())]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a 129-char model must fail");
+        assert!(err.to_string().contains("chat.model"), "got {err}");
+    }
+
+    #[test]
+    fn the_agent_gate_is_loaded_alongside_the_ctx_config() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.agents.is_enabled("codex"));
+        assert!(cfg.agents.is_enabled("claude"));
     }
 }

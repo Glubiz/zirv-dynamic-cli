@@ -54,26 +54,86 @@ pub fn parse_statusline(json: &str, observed_at: u64) -> Option<UsageWindows> {
     Some(windows)
 }
 
+/// `None` means there is no source at all for these windows -- no file, or one
+/// that says nothing readable. Distinct from `Some(UsageWindows::default())`,
+/// which is a real file that happens to report neither window: "unknown" and
+/// "nothing used" are opposite things to say to an operator.
+fn read_at(path: &Path) -> Option<UsageWindows> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 /// Never fails: an absent or corrupt file reads as "nothing known", because a
 /// statusline hook must not break on a half-written state file.
 pub fn load(state: &StateDir) -> UsageWindows {
-    std::fs::read_to_string(state.usage())
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    read_at(&state.usage()).unwrap_or_default()
 }
 
 /// Atomic: every live session's statusline writes this file, so a reader must
 /// never observe a truncated one.
-pub fn store(state: &StateDir, windows: &UsageWindows) -> CtxResult<()> {
-    let target = state.usage();
-    if let Some(parent) = target.parent() {
+fn store_at(path: &Path, windows: &UsageWindows) -> CtxResult<()> {
+    if let Some(parent) = path.parent() {
         super::state::create_private_dir_all(parent)?;
     }
-    let temp = target.with_extension(format!("tmp{}", std::process::id()));
+    let temp = path.with_extension(format!("tmp{}", std::process::id()));
     super::state::write_private(&temp, &serde_json::to_string(windows)?)?;
-    std::fs::rename(&temp, &target)?;
+    std::fs::rename(&temp, path)?;
     Ok(())
+}
+
+pub fn store(state: &StateDir, windows: &UsageWindows) -> CtxResult<()> {
+    store_at(&state.usage(), windows)
+}
+
+/// The account the legacy global `usage.json` holds readings for. Its only
+/// writer is `usage::run_tee`, which is Claude Code's own statusline hook, so
+/// whatever is in that file is Anthropic subscription data stored before
+/// there was anywhere provider-specific to put it. Stated here as a fact
+/// about a file already on disk rather than read off the adapter registry --
+/// the file outlives any particular registry -- and pinned against
+/// `ClaudeAdapter::provider` by a test so the two cannot drift.
+pub const LEGACY_USAGE_PROVIDER: &str = "anthropic";
+
+/// Per-provider counterpart of [`store`], written to
+/// `StateDir::usage_for(provider)` with the same temp-plus-rename atomicity.
+pub fn store_for(state: &StateDir, provider: &str, windows: &UsageWindows) -> CtxResult<()> {
+    store_at(&state.usage_for(provider), windows)
+}
+
+/// This provider's usage windows, or `None` when nothing has ever recorded
+/// any for it -- which is the honest answer for a provider with no collector
+/// (codex/openai today), and must render as "no source", never as 0%.
+///
+/// [`LEGACY_USAGE_PROVIDER`] falls back to the legacy global file when it has
+/// no provider file of its own yet, so an operator upgrading into this layout
+/// keeps the reading their statusline has been collecting all along. The
+/// legacy file is only read here, never moved or deleted: `load`, `zirv ctx
+/// usage` and `wrap`'s status bar still read it directly.
+pub fn load_for(state: &StateDir, provider: &str) -> Option<UsageWindows> {
+    if let Some(windows) = read_at(&state.usage_for(provider)) {
+        return Some(windows);
+    }
+    if super::state::provider_slug(provider) == LEGACY_USAGE_PROVIDER {
+        return read_at(&state.usage());
+    }
+    None
+}
+
+/// E: whether `provider` has **no possible** usage source, as distinct from
+/// "nothing recorded yet." Only claude (`LEGACY_USAGE_PROVIDER`) has a real
+/// collector mechanism today (`usage::run_tee`, Claude Code's own statusline
+/// hook) -- a fresh machine that has never tee'd a statusline has no reading
+/// for it either, but "wire your statusline through `zirv ctx usage tee`" is
+/// still the true, actionable answer there, so claude is exempt from this
+/// check regardless of whether [`load_for`] currently finds a file.
+///
+/// Any other provider (codex/openai today) has no write path at all by
+/// design, so [`load_for`] returning `None` for it *is* the honest, durable
+/// answer: pacing (`pace::wait_for_window`) and `zirv ctx usage`'s own report
+/// both key off this, rather than `load_for(..).is_none()` alone, which
+/// cannot tell "structurally impossible" from "claude, not tee'd yet."
+pub fn has_no_usage_source(state: &StateDir, provider: &str) -> bool {
+    super::state::provider_slug(provider) != LEGACY_USAGE_PROVIDER
+        && load_for(state, provider).is_none()
 }
 
 fn newer(existing: Option<Window>, fresh: Option<Window>) -> Option<Window> {
@@ -96,6 +156,22 @@ pub fn merge(existing: UsageWindows, fresh: UsageWindows) -> UsageWindows {
 
 pub fn age_secs(window: &Window, now: u64) -> u64 {
     now.saturating_sub(window.observed_at)
+}
+
+/// The worse (higher) of the two subscription windows' `used_percentage`,
+/// or `None` when neither is known. Shared by wrap's status bar
+/// (`wrap.rs`'s `redraw_bar_if_due`) and the dashboard's header
+/// (`dash::mod::refresh_if_due`) so the two never compute this figure
+/// differently.
+pub fn max_used_percentage(windows: &UsageWindows) -> Option<f64> {
+    windows
+        .five_hour
+        .iter()
+        .chain(windows.seven_day.iter())
+        .map(|w| w.used_percentage)
+        .fold(None, |acc: Option<f64>, p| {
+            Some(acc.map_or(p, |a| a.max(p)))
+        })
 }
 
 pub const FIVE_HOUR_SECS: u64 = 5 * 3600;
@@ -365,6 +441,49 @@ mod tests {
         );
     }
 
+    fn window_at_pct(pct: f64) -> Window {
+        Window {
+            used_percentage: pct,
+            resets_at: 0,
+            observed_at: 0,
+        }
+    }
+
+    #[test]
+    fn max_used_percentage_is_none_when_neither_window_is_known() {
+        assert_eq!(max_used_percentage(&UsageWindows::default()), None);
+    }
+
+    #[test]
+    fn max_used_percentage_picks_the_worse_of_the_two_windows() {
+        let windows = UsageWindows {
+            five_hour: Some(window_at_pct(20.0)),
+            seven_day: Some(window_at_pct(75.0)),
+        };
+        assert_eq!(max_used_percentage(&windows), Some(75.0));
+
+        let flipped = UsageWindows {
+            five_hour: Some(window_at_pct(90.0)),
+            seven_day: Some(window_at_pct(10.0)),
+        };
+        assert_eq!(max_used_percentage(&flipped), Some(90.0));
+    }
+
+    #[test]
+    fn max_used_percentage_falls_back_to_whichever_window_is_present() {
+        let five_only = UsageWindows {
+            five_hour: Some(window_at_pct(42.0)),
+            seven_day: None,
+        };
+        assert_eq!(max_used_percentage(&five_only), Some(42.0));
+
+        let seven_only = UsageWindows {
+            five_hour: None,
+            seven_day: Some(window_at_pct(13.0)),
+        };
+        assert_eq!(max_used_percentage(&seven_only), Some(13.0));
+    }
+
     #[test]
     fn garbage_input_parses_to_nothing_rather_than_erroring() {
         assert_eq!(parse_statusline("not json at all", 1), None);
@@ -416,6 +535,140 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| name != "usage.json")
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "temp file was not cleaned up: {strays:?}"
+        );
+    }
+
+    fn windows_at(pct: f64, observed_at: u64) -> UsageWindows {
+        UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: pct,
+                resets_at: 1000,
+                observed_at,
+            }),
+            seven_day: None,
+        }
+    }
+
+    /// The slug the legacy file's data is attributed to has to be the same
+    /// slug the claude adapter reports, or an upgrading user's readings would
+    /// be filed under a provider nothing ever asks about.
+    #[test]
+    fn the_legacy_file_is_attributed_to_the_claude_adapters_own_provider() {
+        use crate::commands::ctx::adapters::AgentAdapter;
+        assert_eq!(
+            crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None).provider(),
+            LEGACY_USAGE_PROVIDER
+        );
+    }
+
+    #[test]
+    fn per_provider_state_round_trips_through_its_own_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        assert_eq!(
+            load_for(&state, "openai"),
+            None,
+            "a provider with no collector has no source, which is not zero"
+        );
+
+        let windows = windows_at(50.0, 10);
+        store_for(&state, "openai", &windows).expect("store");
+        assert_eq!(load_for(&state, "openai"), Some(windows.clone()));
+        assert_eq!(
+            load(&state),
+            UsageWindows::default(),
+            "a provider write must not touch the legacy global file"
+        );
+    }
+
+    /// E: codex/openai has no possible source (no tee writes for it, ever,
+    /// today), so a fresh state dir with nothing written must read that way
+    /// -- even after storing data for a *different* provider, which must
+    /// never leak into this one's answer.
+    #[test]
+    fn has_no_usage_source_is_true_for_a_provider_with_no_collector() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(has_no_usage_source(&state, "openai"));
+
+        store_for(&state, "anthropic", &windows_at(50.0, 10)).expect("store");
+        assert!(
+            has_no_usage_source(&state, "openai"),
+            "another provider's own data must not count as this one's source"
+        );
+    }
+
+    /// E: claude is exempt even before its first statusline tee -- "not yet"
+    /// is still the true, actionable answer for the one provider with a real
+    /// collector mechanism, so `has_no_usage_source` must stay `false` for it
+    /// regardless of whether a file happens to exist yet.
+    #[test]
+    fn has_no_usage_source_is_false_for_claude_even_before_the_first_tee() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(
+            !has_no_usage_source(&state, "anthropic"),
+            "claude has a real collector mechanism, just nothing recorded yet"
+        );
+    }
+
+    /// The upgrade case, and the one that matters most: a user who has been
+    /// collecting into the legacy global file since before per-provider files
+    /// existed must not see their readout go blank. The legacy file is read,
+    /// never moved or deleted.
+    #[test]
+    fn an_upgrading_users_legacy_reading_still_shows_under_anthropic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let legacy = windows_at(87.5, 10);
+        store(&state, &legacy).expect("store the legacy file, as an older zirv did");
+        assert!(
+            !state.usage_for("anthropic").exists(),
+            "no provider file exists yet: this is exactly the upgrade moment"
+        );
+
+        assert_eq!(
+            load_for(&state, "anthropic"),
+            Some(legacy),
+            "the legacy file backs anthropic until a provider file exists"
+        );
+        assert!(
+            state.usage().exists(),
+            "the legacy file is read, never moved: other readers still use it"
+        );
+    }
+
+    /// Once a provider file exists it is the answer; the legacy file is only
+    /// ever the fallback, so a fresh reading is never shadowed by an old one.
+    #[test]
+    fn a_provider_file_wins_over_the_legacy_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        store(&state, &windows_at(10.0, 10)).expect("legacy");
+        store_for(&state, "anthropic", &windows_at(90.0, 99)).expect("provider");
+
+        let five = load_for(&state, "anthropic")
+            .expect("present")
+            .five_hour
+            .expect("five");
+        assert_eq!(five.used_percentage, 90.0);
+    }
+
+    #[test]
+    fn a_provider_store_leaves_no_partial_file_behind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        store_for(&state, "anthropic", &UsageWindows::default()).expect("store");
+        let strays: Vec<_> = std::fs::read_dir(state.root())
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "usage-anthropic.json")
             .collect();
         assert!(
             strays.is_empty(),

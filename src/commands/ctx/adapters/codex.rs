@@ -5,16 +5,27 @@ use super::super::CtxResult;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext,
 };
-use super::{AgentAdapter, TurnSignalSetup};
+use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
 /// Verified facts backing this adapter live in
 /// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`. `parse_events` and
-/// `structural_context` stay empty and `ready()` stays `Err` because that
+/// `structural_context` stay empty on purpose (out of scope; tracked in
+/// [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11)): that
 /// file records the assistant/tool-call/token-usage event shapes and the
-/// notify contract as unverified: codex requires authentication this branch
-/// was not permitted to set up, and the notify mechanism this codex version
-/// exposes (a `hooks` feature flag) does not match the plan's assumed
-/// `notify = [...]` config array at all.
+/// notify contract as unverified, since codex requires authentication and
+/// exposes a notify mechanism (a `hooks` feature flag) that does not match
+/// the plan's originally assumed `notify = [...]` config array at all.
+///
+/// `ready()` no longer hard-errors, though: codex is a supported adapter with
+/// an honestly degraded capability set (`capabilities()` below is all-false,
+/// so no rot score, no turn signal, no injected system prompt, and `provider()`
+/// reports "openai: no usage source" until a usage collector exists for it).
+/// It is selectable and launchable in the common case (`codex` resolves to a
+/// real binary) and also when nothing named `codex` is installed at all --
+/// `resolve_program` fails open for that case, so `--agent codex` on a
+/// machine without it fails at spawn time with the OS's own "not found",
+/// not here. The one launch `ready()` actually refuses is a bare `codex`
+/// that resolves via `PATH` to a file this OS cannot execute at all.
 #[derive(Debug, Clone)]
 pub struct CodexAdapter {
     program: String,
@@ -45,8 +56,22 @@ impl CodexAdapter {
 
     /// Every command starts here so the program and its leading arguments are
     /// applied uniformly to headless, interactive and distiller invocations.
+    ///
+    /// SECURITY (FINDING 6, closed): this now mirrors `ClaudeAdapter::base`
+    /// exactly -- the program is routed through `super::resolve_program` so an
+    /// npm-installed `codex.cmd` shim launches at all on Windows, and
+    /// `launches_through_cmd_shim` below reports the same shim shape so a
+    /// caller moves the headless prompt onto stdin
+    /// (`headless_cmd_stdin`) rather than argv on exactly that launch shape.
+    /// There is no `system_prompt_file_flag` override because there is no
+    /// verified per-run system-prompt mechanism at all for codex (see
+    /// `system_prompt_args` below) -- nothing to force off argv, since
+    /// nothing is ever put on it in the first place.
     fn base(&self) -> Command {
-        let mut cmd = Command::new(&self.program);
+        let resolved = super::resolve_program(&self.program)
+            .unwrap_or_else(|_| ResolvedProgram::direct(&self.program));
+        let mut cmd = Command::new(&resolved.program);
+        cmd.args(&resolved.prefix);
         cmd.args(&self.bin_args);
         cmd
     }
@@ -83,16 +108,25 @@ impl AgentAdapter for CodexAdapter {
         "codex"
     }
 
+    /// Codex spends an OpenAI account's limits. Nothing collects readings for
+    /// it yet, which is exactly why the provider is named: a usage readout
+    /// can then say "openai: no usage source" rather than imply zero.
+    fn provider(&self) -> &'static str {
+        "openai"
+    }
+
+    /// Mirrors `ClaudeAdapter::ready` exactly: the one thing that can make
+    /// this adapter unusable before it is asked to do anything is a bare
+    /// name that *does* resolve (via `PATH`) to a file this OS has no way to
+    /// execute. `resolve_program` fails open for the opposite case -- a name
+    /// that resolves to nothing at all -- so `--agent codex` succeeds even
+    /// when `codex` is not installed anywhere; that case is left to surface
+    /// as the OS's own "not found" at spawn time, not caught here. Codex
+    /// support is otherwise honestly degraded (see the module doc comment)
+    /// but not refused.
     fn ready(&self) -> CtxResult<()> {
-        // Item 7: this is the surface a user actually sees (`--agent codex`,
-        // or a config that names it), so it has to be honest in its own
-        // words rather than pointing at an internal plan task number.
-        Err(
-            "codex support is not implemented yet; ctx currently supports Claude Code only. \
-             Pass --agent claude, or track progress at \
-             https://github.com/Glubiz/zirv-dynamic-cli/issues/11."
-                .into(),
-        )
+        super::resolve_program(&self.program)?;
+        Ok(())
     }
 
     fn detect(&self, command: &[String]) -> bool {
@@ -109,6 +143,30 @@ impl AgentAdapter for CodexAdapter {
         let mut cmd = self.base();
         cmd.arg("exec").arg(prompt).args(extra);
         cmd
+    }
+
+    /// True on a Windows npm install, where `codex` is a `.cmd` shim that
+    /// [`super::resolve_program`] routes through `cmd.exe /c`. Exactly
+    /// `ClaudeAdapter::launches_through_cmd_shim`'s own body: that is the one
+    /// launch shape where a headless prompt on argv would be reparsed by
+    /// cmd.exe, so on it the prompt is delivered via stdin instead
+    /// (`headless_cmd_stdin`).
+    fn launches_through_cmd_shim(&self) -> bool {
+        super::launches_through_cmd_shim(&self.program)
+    }
+
+    /// `codex exec [PROMPT]` reads its prompt from stdin when the positional
+    /// argument is omitted (verified:
+    /// docs/superpowers/notes/2026-07-31-codex-cli-facts.md, line 8 -- "If
+    /// `[PROMPT]` is omitted (or is `-`), instructions are read from stdin"),
+    /// so the same `exec` invocation `headless_cmd` builds works here with
+    /// just the positional prompt token dropped. This is what lets
+    /// `launches_through_cmd_shim` above move a headless prompt off argv on a
+    /// Windows `.cmd` shim launch, exactly like claude's own stdin form.
+    fn headless_cmd_stdin(&self, _session: &SessionId, extra: &[String]) -> Option<Command> {
+        let mut cmd = self.base();
+        cmd.arg("exec").args(extra);
+        Some(cmd)
     }
 
     /// With no subcommand, `codex [PROMPT]` forwards straight to the
@@ -140,10 +198,62 @@ impl AgentAdapter for CodexAdapter {
     /// Verified via `codex exec --help` (quoted verbatim in the notes file):
     /// `-m, --model <MODEL>` is a real flag, and the prompt is read from
     /// stdin when none is given as an argument, so the distillation prompt
-    /// never hits an argv length limit.
+    /// never hits an argv length limit. `model` is empty when neither the
+    /// operator's own config nor `default_distiller_model` (`None` for
+    /// codex, since zirv has no verified cheap model name for this lineup)
+    /// named one -- omitting `--model` entirely rather than passing an empty
+    /// value lets codex's own `~/.codex/config.toml` default apply instead
+    /// of zirv guessing a model name that may not exist on the operator's
+    /// account.
+    ///
+    /// `--sandbox read-only` is codex's own analogue of claude's
+    /// `--disallowedTools=Write,Edit,Bash,NotebookEdit` pin: it is what backs
+    /// `zirv ctx optimize`'s report-only guarantee for a codex judgment
+    /// child. Verified against the real installed CLI (`codex exec --help`,
+    /// codex-cli 0.105.0): `-s, --sandbox <SANDBOX_MODE>`, possible values
+    /// `read-only`/`workspace-write`/`danger-full-access`. It blocks the
+    /// class of risk claude's own restriction was verified to close (this
+    /// child writing a file, running a shell command, or otherwise mutating
+    /// the checkout via a tool) -- but it is not the identical guarantee:
+    /// `--sandbox` restricts what codex-*executed shell commands* may touch,
+    /// not which of codex's own tools may run at all, and codex's own
+    /// AGENTS.md (this repo's equivalent of CLAUDE.md, read into context the
+    /// same way) is still embedded in this child's prompt just like claude's
+    /// distiller embeds CLAUDE.md -- read-only scopes what the sandbox lets
+    /// an executed command do, it does not stop the model from reading that
+    /// text or from answering based on it.
+    ///
+    /// KNOWN RESIDUAL (checked 2026-08-15, see docs/superpowers/notes/
+    /// 2026-07-31-codex-cli-facts.md's addendum and its `--ignore-rules`/
+    /// `--ignore-user-config` capture): codex-cli 0.146.0's `codex exec
+    /// --help` (the brew-installed capture that note quotes verbatim) *does*
+    /// document `--ignore-rules` (skip project/user execpolicy `.rules`
+    /// files) and `--ignore-user-config` (skip `$CODEX_HOME/config.toml`),
+    /// which would close this distiller's remaining "still reads repo/
+    /// operator config" gap the same way `guard_cmd_shim_reparse`-style
+    /// fixes close others. They are deliberately **not** added here: the
+    /// version most operators actually get (`npm install -g @openai/codex`,
+    /// verified as `codex-cli 0.105.0` on a real Windows machine, the exact
+    /// version this whole function is verified against) has neither flag on
+    /// its own `codex exec --help` -- passing either would very likely be an
+    /// unrecognized-argument error on 0.105.0, breaking every distiller call
+    /// for the common install rather than sandboxing it further. So: a
+    /// repo's own `.rules` execpolicy files and the operator's own
+    /// `~/.codex/config.toml` still shape this judgment child's behavior
+    /// (unlike claude's distiller, whose CLAUDE.md-reading is the one thing
+    /// `--disallowedTools` cannot touch either, so the two residuals are not
+    /// symmetric: claude's is "still reads the file", codex's is "still
+    /// reads the file *and* still honors config it did not ask for"). Add
+    /// `--ignore-rules --ignore-user-config` once 0.105.0 (or whatever the
+    /// npm-published version is by then) ships them too, verified the same
+    /// way `-s, --sandbox` was.
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
-        cmd.arg("exec").arg("--model").arg(model);
+        cmd.arg("exec");
+        if !model.is_empty() {
+            cmd.arg("--model").arg(model);
+        }
+        cmd.arg("--sandbox").arg("read-only");
         cmd
     }
 
@@ -180,7 +290,21 @@ impl AgentAdapter for CodexAdapter {
             token_usage: false,
             turn_signal: false,
             system_prompt: false,
+            // D: parse_events/structural_context are stubbed to empty/default
+            // (out of scope, issue #11) -- an honest `false` here is what
+            // keeps score.rs from reading that emptiness as a real
+            // `Healthy`/`0` verdict. See the doc comment on `Capabilities::
+            // events`.
+            events: false,
         }
+    }
+
+    /// Verified (docs/superpowers/notes/2026-07-31-codex-cli-facts.md, line
+    /// 139): `-m, --model <MODEL>` is present on top-level `codex --help`
+    /// with the same description as on `codex exec --help`, so the
+    /// interactive launch this feeds (`interactive_cmd`) accepts it too.
+    fn model_args(&self, model: &str) -> Vec<String> {
+        vec!["--model".to_string(), model.to_string()]
     }
 
     fn register_turn_signal(&self, _session: &SessionRef, _socket: &Path) -> TurnSignalSetup {
@@ -189,12 +313,33 @@ impl AgentAdapter for CodexAdapter {
             instructions: String::new(),
         }
     }
+
+    // No `resume_args` override: codex's own resume story (a `--last`/
+    // session-id flag for the interactive launch) is unverified against the
+    // real CLI, unlike `model_args` above. The trait default (`None`) is
+    // correct here -- `dash::roster::restore_argv` falls back to a plain
+    // prompt-carrying relaunch for this adapter rather than a guessed flag.
+    //
+    // No `session_pin_args` override either, for the same reason and one
+    // stronger: `headless_cmd` above already records the verified fact that
+    // codex has no `--session-id` flag at all and always mints its own id, so
+    // there is nothing to pin an interactive dashboard pane with. The trait
+    // default (empty) is what "no verified mechanism" has to ship as.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::ctx::adapters::{AgentAdapter, select};
+    use crate::commands::ctx::config::CtxConfig;
+
+    /// I: `super::super::built_args` (`adapters/mod.rs`) takes the program
+    /// string rather than the whole adapter, since `program` is private to
+    /// this module -- this thin wrapper is what lets every call site below
+    /// keep passing `&adapter` unchanged. Mirrors `claude.rs`'s own wrapper.
+    fn built_args(adapter: &CodexAdapter, cmd: &Command) -> Vec<String> {
+        super::super::built_args(&adapter.program, cmd)
+    }
 
     #[test]
     fn codex_detects_its_own_binary() {
@@ -224,40 +369,33 @@ mod tests {
         );
     }
 
+    /// Codex is now supported out of the box: `--agent codex` selects it
+    /// directly wherever the `codex` program resolves, the same contract
+    /// `ClaudeAdapter::ready` already gives claude.
     #[test]
-    fn selecting_codex_before_it_is_verified_fails_loudly() {
-        // Replaced by a success assertion in Task A10 once the parser exists.
-        let err = select(Some("codex"), &[], None).expect_err("unverified adapter");
-        assert!(err.to_string().contains("codex"), "got {err}");
+    fn selecting_codex_succeeds_once_the_binary_resolves() {
+        let adapter =
+            select(Some("codex"), &[], &CtxConfig::default()).expect("codex resolves and is ready");
+        assert_eq!(adapter.name(), "codex");
     }
 
-    /// Item 7: the error a user actually sees from `--agent codex` must be
-    /// plain about codex not working yet, name Claude Code as what does work
-    /// today, and point at the issue tracking it, rather than an internal
-    /// plan task number nobody outside the repo can look up.
+    /// Mirrors `ClaudeAdapter::ready`'s own contract exactly:
+    /// `resolve_program` is the only thing that can fail it, and a bare
+    /// `"codex"` that never resolves to anything at all is not an error here
+    /// (the OS raises its own "not found" at spawn time instead).
     #[test]
-    fn ready_error_is_honest_about_codex_support_and_points_at_the_tracking_issue() {
-        let err = CodexAdapter::new(None).ready().expect_err("not ready yet");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not implemented yet"),
-            "must plainly say codex is not implemented yet: {msg}"
-        );
-        assert!(
-            msg.contains("Claude Code only"),
-            "must say ctx currently supports Claude Code only: {msg}"
-        );
-        assert!(
-            msg.contains("issues/11"),
-            "must reference the tracking issue: {msg}"
-        );
+    fn ready_succeeds_for_the_default_program_name() {
+        assert!(CodexAdapter::new(None).ready().is_ok());
     }
 
+    /// argv auto-detection now selects codex directly instead of refusing:
+    /// once `ready()` no longer hard-errors, `select`'s detection arm has
+    /// nothing left to refuse on for a plain `codex ...` command.
     #[test]
-    fn detecting_codex_argv_does_not_silently_fall_back_to_claude() {
+    fn detecting_codex_argv_selects_codex() {
         let cmd = vec!["codex".to_string(), "exec".to_string(), "do it".to_string()];
-        let err = select(None, &cmd, None).expect_err("must not misroute to claude");
-        assert!(err.to_string().contains("codex"), "got {err}");
+        let adapter = select(None, &cmd, &CtxConfig::default()).expect("codex is ready");
+        assert_eq!(adapter.name(), "codex");
     }
 
     /// Verified via `codex exec --help`: there is no `--session-id` flag, so
@@ -293,19 +431,10 @@ mod tests {
     fn interactive_cmd_passes_the_initial_prompt_positionally_with_no_subcommand() {
         let adapter = CodexAdapter::new(None);
         let with = adapter.interactive_cmd(Some("resume this"), &[]);
-        assert_eq!(with.get_program().to_string_lossy(), "codex");
-        let args: Vec<String> = with
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(args, vec!["resume this".to_string()]);
+        assert_eq!(built_args(&adapter, &with), vec!["resume this".to_string()]);
 
         let without = adapter.interactive_cmd(None, &["--last".to_string()]);
-        let args: Vec<String> = without
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(args, vec!["--last".to_string()]);
+        assert_eq!(built_args(&adapter, &without), vec!["--last".to_string()]);
     }
 
     /// Verified via `codex exec --help` (quoted verbatim in the notes file):
@@ -315,17 +444,63 @@ mod tests {
     fn distiller_cmd_uses_exec_with_a_cheap_model_and_reads_stdin() {
         let adapter = CodexAdapter::new(None);
         let cmd = adapter.distiller_cmd("gpt-5.6-luna");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
         assert_eq!(
-            args,
+            built_args(&adapter, &cmd),
             vec![
                 "exec".to_string(),
                 "--model".to_string(),
                 "gpt-5.6-luna".to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
             ]
+        );
+    }
+
+    /// C: an empty `model` (no operator config, and `default_distiller_
+    /// model` is `None` for codex) must omit `--model` entirely rather than
+    /// pass an empty value -- codex's own `~/.codex/config.toml` default
+    /// then applies instead of zirv guessing a model name.
+    #[test]
+    fn distiller_cmd_omits_the_model_flag_when_none_is_given() {
+        let adapter = CodexAdapter::new(None);
+        let cmd = adapter.distiller_cmd("");
+        let args = built_args(&adapter, &cmd);
+        assert!(
+            !args.iter().any(|a| a == "--model"),
+            "no model resolved means no --model flag at all: {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string()
+            ]
+        );
+    }
+
+    /// C: codex has no verified cheap-model default of its own -- a
+    /// hardcoded model name is specific to claude's lineup.
+    #[test]
+    fn codex_has_no_default_distiller_model() {
+        assert_eq!(CodexAdapter::new(None).default_distiller_model(), None);
+    }
+
+    /// B: `--sandbox read-only` (verified against `codex exec --help` on
+    /// codex-cli 0.105.0: `-s, --sandbox <SANDBOX_MODE>`, possible values
+    /// `read-only`/`workspace-write`/`danger-full-access`) is the pin behind
+    /// `zirv ctx optimize`'s report-only guarantee for a codex judgment
+    /// child, the same role claude's `--disallowedTools=...` plays. Pinned
+    /// as its own test so a future edit to `distiller_cmd` cannot drop the
+    /// flag without a test failing here specifically.
+    #[test]
+    fn the_distiller_is_pinned_to_the_read_only_sandbox() {
+        let adapter = CodexAdapter::new(None);
+        let cmd = adapter.distiller_cmd("gpt-5.6-luna");
+        let args = built_args(&adapter, &cmd);
+        assert!(
+            args.windows(2).any(|w| w == ["--sandbox", "read-only"]),
+            "the distiller must be pinned to codex's own read-only sandbox: {args:?}"
         );
     }
 
@@ -379,5 +554,104 @@ mod tests {
             cwd: std::path::PathBuf::from("/work/repo"),
         };
         assert_eq!(adapter.transcript_path(&session), expected);
+    }
+
+    /// `-m, --model <MODEL>` is verified on top-level `codex --help` too (see
+    /// the `model_args` doc comment), so the dashboard's orchestrator pane
+    /// can select a model on codex exactly as it does on claude.
+    #[test]
+    fn model_args_uses_the_verified_flag() {
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(
+            adapter.model_args("gpt-5.6-sol"),
+            vec!["--model".to_string(), "gpt-5.6-sol".to_string()]
+        );
+    }
+
+    /// SECURITY (FINDING 6, closed): an npm-installed `codex` on Windows is a
+    /// `.cmd` shim, exactly the shape `ClaudeAdapter`'s own equivalent test
+    /// (`a_cmd_shim_is_launched_through_cmd_exe_with_its_arguments_intact`)
+    /// covers. `base()` must route it through `cmd.exe /c`, and
+    /// `launches_through_cmd_shim` must report that shape so a caller moves
+    /// the headless prompt onto stdin instead of leaving it on the reparsed
+    /// argv.
+    #[cfg(windows)]
+    #[test]
+    fn a_cmd_shim_codex_is_launched_through_cmd_exe_and_reports_the_shim_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let adapter = CodexAdapter::new(Some(&shim.display().to_string()));
+        assert!(
+            adapter.launches_through_cmd_shim(),
+            "a .cmd resolution must be reported as the shim shape"
+        );
+
+        let cmd = adapter.interactive_cmd(Some("resume this"), &["--last".to_string()]);
+        assert!(
+            cmd.get_program()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("cmd"),
+            "got {:?}",
+            cmd.get_program()
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "/c".to_string(),
+                shim.display().to_string(),
+                "resume this".to_string(),
+                "--last".to_string(),
+            ]
+        );
+    }
+
+    /// FIX B, extended to codex: on the shim launch shape the headless prompt
+    /// must never be the `exec <prompt>` argv token cmd.exe would reparse.
+    /// `headless_cmd_stdin` omits the positional prompt entirely, relying on
+    /// codex's own verified stdin fallback (`codex exec` with `[PROMPT]`
+    /// omitted reads from stdin).
+    #[test]
+    fn headless_cmd_stdin_omits_the_prompt_and_reads_it_from_stdin() {
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex"));
+        let cmd = adapter
+            .headless_cmd_stdin(
+                &SessionId::parse("abc"),
+                &["--model".to_string(), "gpt-5.6-luna".to_string()],
+            )
+            .expect("codex has a verified stdin form");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--model".to_string(),
+                "gpt-5.6-luna".to_string(),
+            ],
+            "no positional prompt token: the prompt travels on stdin"
+        );
+    }
+
+    /// A directly executable program (no `.cmd` extension, and not one that
+    /// resolves to anything on `PATH` at all) is never the shim shape, off
+    /// Windows or on it -- mirrors claude's own
+    /// `a_program_is_spawned_exactly_as_written_off_windows` /
+    /// `launches_through_cmd_shim` contract. Deliberately not the bare
+    /// `"codex"` default: on a machine with a real npm-installed `codex.cmd`
+    /// on `PATH`, that bare name legitimately *does* resolve to the shim
+    /// shape, which is the behavior under test elsewhere in this file.
+    #[test]
+    fn a_direct_program_never_reports_the_shim_shape() {
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex"));
+        assert!(!adapter.launches_through_cmd_shim());
     }
 }

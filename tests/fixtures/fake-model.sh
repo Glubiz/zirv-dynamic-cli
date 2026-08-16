@@ -11,6 +11,8 @@
 #   flood   writes past a pipe buffer's worth of output *before* reading any
 #           of stdin, the way a model that starts answering before the
 #           caller has finished sending the prompt looks from the outside
+#   harvest a well-formed set of `key: body` durable-fact lines, for
+#           memory::harvest_from_handoff tests
 set -eu
 
 case "${FAKE_MODEL_MODE:-good}" in
@@ -32,6 +34,10 @@ case "${FAKE_MODEL_MODE:-good}" in
   fail) exit 4 ;;
   hang) while true; do sleep 1; done ;;
   garbage) printf 'I had a look and things seem mostly fine.\n' ;;
+  harvest)
+    printf 'build-cmd: cargo build --release\n'
+    printf 'staging-db-creds: staging DB creds live in 1Password under staging-db\n'
+    ;;
   partial)
     printf '## Task\nShip the webhook\n\n## Done\n- wrote the route\n'
     ;;

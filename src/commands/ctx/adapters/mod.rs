@@ -5,6 +5,7 @@ pub mod claude;
 pub mod codex;
 
 use super::CtxResult;
+use super::config::CtxConfig;
 use super::event::{Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext};
 
 /// How an adapter arranges for turn-boundary events to reach a supervisor's
@@ -18,12 +19,33 @@ pub struct TurnSignalSetup {
 
 pub const SOCKET_ENV: &str = "ZIRV_CTX_SOCKET";
 pub const SESSION_ENV: &str = "ZIRV_CTX_SESSION";
+/// Tells a spawned session which agent it is running as. Deliberately the
+/// same name as `ctx.toml`'s own `agent` config key (`ZIRV_CTX_AGENT` in
+/// `config::ENV_MAP`): it states the same fact from the other direction, so a
+/// nested `zirv ctx ...` invocation inside a worker's own child processes
+/// defaults to that worker's own harness rather than re-resolving from
+/// scratch. Read by `mail::run_send`/`mail::run_inbox` to identify the
+/// calling session without requiring an explicit `--to`/`--agent` flag.
+pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 
 /// `Debug` is a supertrait so `Box<dyn AgentAdapter>` can appear in
 /// `Result::expect_err` (the registry tests assert on the unknown-adapter
 /// error path); every adapter already derives it.
 pub trait AgentAdapter: std::fmt::Debug {
     fn name(&self) -> &'static str;
+
+    /// The ACCOUNT/vendor whose rate limits this agent spends, as a stable
+    /// lowercase slug (`[a-z0-9-]`): `"anthropic"` for claude, `"openai"`
+    /// for codex.
+    ///
+    /// Deliberately *not* the binary or the adapter's own `name`. Usage
+    /// windows are a property of the account being billed, and two harnesses
+    /// can sit on one account -- a second Anthropic-backed harness would
+    /// report `"anthropic"` here and share claude's windows, which is the
+    /// truth about the limit even though it is a different program. It is
+    /// what `StateDir::usage_for` names a usage file after, so a change to an
+    /// existing adapter's slug orphans that adapter's stored readings.
+    fn provider(&self) -> &'static str;
 
     /// `Err` when the adapter exists but is not safe to use yet, so callers
     /// fail loudly instead of scoring garbage.
@@ -33,7 +55,31 @@ pub trait AgentAdapter: std::fmt::Debug {
 
     fn headless_cmd(&self, prompt: &str, session: &SessionId, extra: &[String]) -> Command;
     fn interactive_cmd(&self, initial_prompt: Option<&str>, extra: &[String]) -> Command;
+    /// Builds the judgment/distiller model child's command. `model` is empty
+    /// when neither the operator's own config (`handoff.model`/`optimize.
+    /// model`) nor this adapter's own [`default_distiller_model`](Self::
+    /// default_distiller_model) named one, which an adapter with no sane
+    /// default of its own (codex) must read as "omit the model flag
+    /// entirely" rather than pass an empty value to its own CLI -- see
+    /// `resolve_distiller_model` in `handoff.rs`, which is what every caller
+    /// uses to turn `Option<&str>` config into this parameter.
     fn distiller_cmd(&self, model: &str) -> Command;
+
+    /// The model name to use for the judgment/distiller child when the
+    /// operator has not named one explicitly (`handoff.model`/`optimize.
+    /// model` both empty/unset). `None` -- the default, and codex's own
+    /// answer -- means this adapter has no verified cheap-model default of
+    /// its own to guess, so `resolve_distiller_model` passes an empty model
+    /// through, and this adapter's own `distiller_cmd` must read that as
+    /// "omit the model flag" so the agent's own configuration (e.g. codex's
+    /// `~/.codex/config.toml`) picks a model instead of zirv guessing a name
+    /// that may not exist on the operator's account. Claude's own default is
+    /// a real, verified value ("haiku") rather than the trait default,
+    /// because a hardcoded model name is specific to one agent's lineup and
+    /// must never leak into another adapter's guess.
+    fn default_distiller_model(&self) -> Option<&'static str> {
+        None
+    }
 
     /// Arguments that add `prompt` to this agent's system prompt for one run.
     /// Empty when the agent has no verified mechanism, which is how an
@@ -87,6 +133,30 @@ pub trait AgentAdapter: std::fmt::Debug {
         false
     }
 
+    /// Whether a headless launch this adapter builds resolves to the Windows
+    /// `cmd.exe /c <shim>` form (an npm-installed `.cmd`), where cmd.exe
+    /// reparses the whole downstream command line. `false` (the default) off
+    /// Windows and for a directly executable program. When `true`, a caller
+    /// delivers the headless prompt -- and any folded mail -- on the child's
+    /// stdin via [`headless_cmd_stdin`](Self::headless_cmd_stdin) rather than
+    /// as an argv token, so that untrusted free text never reaches cmd.exe's
+    /// parser (`guard_cmd_shim_reparse` is only the fail-closed backstop).
+    fn launches_through_cmd_shim(&self) -> bool {
+        false
+    }
+
+    /// A headless launch that expects its prompt on **stdin** rather than as
+    /// the `-p <prompt>` argv token, for the
+    /// [`launches_through_cmd_shim`](Self::launches_through_cmd_shim) case.
+    /// `None` (the default) means this agent has no verified stdin form, so the
+    /// caller keeps argv delivery. When `Some`, the returned `Command` reads
+    /// its prompt from stdin to EOF -- the same mechanism the distiller uses --
+    /// and the caller must pipe the prompt in.
+    fn headless_cmd_stdin(&self, session: &SessionId, extra: &[String]) -> Option<Command> {
+        let _ = (session, extra);
+        None
+    }
+
     /// How many leading argv tokens are the program invocation itself rather
     /// than flags the operator passed. One for a bare binary; more when
     /// `agent_bin` carries arguments, since `"/usr/bin/env claude"` spends two
@@ -111,6 +181,58 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup;
+
+    /// Argv tokens that select `model` for one interactive launch (the
+    /// dashboard's orchestrator pane, via `chat.model`/`ZIRV_CTX_CHAT_MODEL`).
+    /// Appended after the launch prefix, alongside any other `extra` argv
+    /// `interactive_cmd` receives. The default is empty, matching every other
+    /// "no verified mechanism" trait default on this trait
+    /// (`system_prompt_args`, `base_system_prompt`): an adapter with no
+    /// verified flag ships with no model selection rather than a guess.
+    ///
+    /// Both current adapters override this, so nothing calls the default body
+    /// through `dyn AgentAdapter` yet -- wired into the orchestrator pane's
+    /// argv when `chat.rs` builds it (dashboard Task 6).
+    #[allow(dead_code)]
+    fn model_args(&self, model: &str) -> Vec<String> {
+        let _ = model;
+        Vec::new()
+    }
+
+    /// Argv tokens that resume `session_id`'s own conversation, for the
+    /// dashboard's quit/restore roster (`dash::roster::restore_argv`, called
+    /// through `dyn AgentAdapter` -- unlike `model_args` above, both
+    /// adapters reach this default body today, since codex does not
+    /// override it). `None` -- the default, and every "no verified
+    /// mechanism" trait default's own answer -- means this agent's resume
+    /// story is unverified: a restore falls back to a fresh launch carrying
+    /// a plain one-line "resuming after a dashboard restart" prompt instead
+    /// of trying to guess a flag.
+    fn resume_args(&self, session_id: &str) -> Option<Vec<String>> {
+        let _ = session_id;
+        None
+    }
+
+    /// Argv tokens that make this agent adopt zirv's own `session` uuid as the
+    /// id of the conversation it is about to start, so a later
+    /// [`resume_args`](Self::resume_args) against that same uuid finds
+    /// something. Empty -- the default -- means the agent mints its own
+    /// conversation id and zirv's uuid is only ever a zirv-side handle.
+    ///
+    /// Appended **only** to a dashboard pane's launch (`chat.rs::
+    /// dash_orchestrator_pane` and `dash::fulfill_spawn_request`, both of
+    /// which own a freshly minted uuid), never inside `interactive_cmd`
+    /// itself: `wrap`'s relaunch path deliberately lets the harness mint a
+    /// fresh conversation on every restart, and a restored pane already
+    /// carries `resume_args`, which would conflict with a pin.
+    ///
+    /// Without this, the dashboard's restore roster stored a uuid the agent
+    /// had never heard of: `claude --resume <zirv-uuid>` answered "no
+    /// conversation found" and the restored pane died immediately.
+    fn session_pin_args(&self, session: &str) -> Vec<String> {
+        let _ = session;
+        Vec::new()
+    }
 }
 
 /// The program invocation at the head of an argv: the binary plus the leading
@@ -208,6 +330,214 @@ pub fn resolve_program(program: &str) -> Result<ResolvedProgram, String> {
     Ok(ResolvedProgram::direct(program))
 }
 
+/// I: the flags an adapter-built command carries, with any launcher prefix
+/// dropped. On a Windows machine where the adapter's own program resolves to
+/// a real npm `.cmd` shim, every command an adapter builds starts `cmd.exe /c
+/// <shim>`, and those tokens are not what a test about agent flags is
+/// asserting on. `program` is the adapter's own `program` field (each
+/// adapter's `base()` resolves exactly this string) -- a shared helper takes
+/// it as a plain `&str` rather than `&dyn AgentAdapter` because nothing else
+/// about the adapter is needed, and because `program` is private to each
+/// adapter's own module, so only that module's own tests can pass it in
+/// anyway. Was duplicated byte-for-byte in `claude.rs` and `codex.rs`'s own
+/// test modules before this; both now call this one copy.
+#[cfg(test)]
+pub(crate) fn built_args(program: &str, cmd: &std::process::Command) -> Vec<String> {
+    let launcher = resolve_program(program)
+        .map(|resolved| resolved.prefix.len())
+        .unwrap_or(0);
+    cmd.get_args()
+        .skip(launcher)
+        .map(|a| a.to_string_lossy().to_string())
+        .collect()
+}
+
+/// The cmd.exe metacharacters that, appearing RAW in an argument, cmd.exe
+/// re-parses out of its own `/c` command line rather than passing through to
+/// the shim it invokes. portable-pty and `std::process` both append a
+/// no-whitespace metachar-bearing argument to a Windows command line unquoted,
+/// and an embedded `"` toggles cmd.exe out of any quoting that *was* added
+/// (BatBadBut / CVE-2024-24576's quote-toggle). Newline and carriage return
+/// terminate the command line outright. Any of these in a shim-form argument
+/// is therefore a command-injection primitive, not a literal argument value.
+#[cfg(windows)]
+const CMD_REPARSE_METACHARS: &[char] =
+    &['&', '|', '<', '>', '^', '(', ')', '%', '!', '"', '\n', '\r'];
+
+/// Whether `program` + `args` is the `cmd.exe /c <shim>` launcher form that
+/// [`resolve_program`] produces for a `.cmd`/`.bat` on Windows: the program's
+/// file stem is `cmd` and the first argument is `/c`. Matched structurally
+/// (case-insensitively) rather than by identity with a specific `COMSPEC`
+/// value, so a full-path or upper-cased `CMD.EXE` is recognised too.
+#[cfg(windows)]
+fn is_cmd_shim_launch(program: &str, args: &[String]) -> bool {
+    let program_is_cmd = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.eq_ignore_ascii_case("cmd"))
+        .unwrap_or(false);
+    program_is_cmd
+        && args
+            .first()
+            .map(|first| first.eq_ignore_ascii_case("/c"))
+            .unwrap_or(false)
+}
+
+/// FIX D (defense-in-depth): the number of leading `args` tokens that are the
+/// zirv-controlled launcher prefix, when `program` + `args` is a Windows
+/// launcher form whose command line is reparsed before it reaches the real
+/// script -- either the `cmd.exe /c <shim>` form (a `.cmd`/`.bat`) or the
+/// `powershell -NoProfile -File <script>` form (a `.ps1`), both of which
+/// [`resolve_program`] produces. `None` when it is neither, so a direct
+/// `.exe` or an `sh <script>` fake agent is not keyed on at all. Keyed on the
+/// `/c` / `-File` structure rather than only the launcher basename, so the
+/// guard covers whichever launcher the resolver actually inserted.
+#[cfg(windows)]
+fn reparse_launcher_prefix(program: &str, args: &[String]) -> Option<usize> {
+    let stem = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())?
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "cmd" => args
+            .first()
+            .map(|first| first.eq_ignore_ascii_case("/c"))
+            .unwrap_or(false)
+            // `/c` and the shim path are both zirv-controlled.
+            .then_some(2),
+        "powershell" | "pwsh" => {
+            // Everything through the `-File <script>` pair is the launcher
+            // prefix; the script's own arguments follow it.
+            let file_at = args
+                .iter()
+                .position(|arg| arg.eq_ignore_ascii_case("-File"))?;
+            (file_at + 1 < args.len()).then_some(file_at + 2)
+        }
+        _ => None,
+    }
+}
+
+/// FIX (command-injection defense): fail-closed guard for the one launch shape
+/// where a downstream argv element becomes cmd.exe *source text* rather than a
+/// literal argument. When [`resolve_program`] rewrites an npm-installed
+/// `claude.cmd` to `cmd.exe /c <shim>`, cmd.exe parses the whole appended
+/// command line before invoking the shim, so any argument after the shim path
+/// that carries a cmd.exe metacharacter is re-interpreted as a command. Repo-
+/// controlled strings (an injected system prompt, a passed-through flag) reach
+/// this argv, so an unguarded metacharacter there is arbitrary code execution
+/// on a victim who merely runs a supervised session in a hostile checkout.
+///
+/// This rejects such a launch outright rather than trying to quote around
+/// cmd.exe (which the embedded-quote toggle defeats). It is deliberately a
+/// pure decision function over the already-resolved `program`/`args`, called
+/// at every spawn seam (`supervise::spawn_tapped` for the headless
+/// `exec`/`loop` path; the `CommandBuilder` assembly in `wrap` and
+/// `dash::pane` for the pty path), so there is one metacharacter policy.
+///
+/// A no-op off Windows, and on Windows for any launch that is not the shim
+/// form: a direct `.exe`, an `sh <script>` fake agent, or a program with no
+/// launcher prefix is spawned exactly as before. zirv's own flags never carry
+/// these characters, so only injected content is ever rejected. The two shim-
+/// prefix tokens themselves (`/c` and the shim path) are zirv-controlled and
+/// skipped.
+pub fn guard_cmd_shim_reparse(program: &str, args: &[String]) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if let Some(prefix) = reparse_launcher_prefix(program, args) {
+            for arg in args.iter().skip(prefix) {
+                if let Some(bad) = arg.chars().find(|c| CMD_REPARSE_METACHARS.contains(c)) {
+                    return Err(format!(
+                        "refusing to launch: argument '{arg}' contains the cmd.exe \
+                         metacharacter {bad:?}. zirv routes this agent through a Windows \
+                         launcher ('cmd.exe /c' for an npm-installed '.cmd' shim, or \
+                         'powershell -File' for a '.ps1'), which would re-parse that character \
+                         as a command rather than pass it through. This is a fail-closed \
+                         backstop against command injection; zirv's own arguments never contain \
+                         these characters, and untrusted content (the composed system prompt, a \
+                         headless task prompt) is kept off this argv entirely."
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (program, args);
+    }
+    Ok(())
+}
+
+/// Whether spawning `program` resolves to the Windows `cmd.exe /c <shim>`
+/// launcher form (an npm-installed `.cmd`), where cmd.exe reparses the whole
+/// downstream command line. The adapters use it to move a headless prompt --
+/// and any folded mail -- onto the child's stdin on exactly the launch shape
+/// where an argv token would otherwise be reparsed. Always `false` off
+/// Windows, and for a directly executable program.
+pub fn launches_through_cmd_shim(program: &str) -> bool {
+    #[cfg(windows)]
+    {
+        match resolve_program(program) {
+            Ok(resolved) => is_cmd_shim_launch(&resolved.program, &resolved.prefix),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = program;
+        false
+    }
+}
+
+/// Whether spawning the argv `launch` puts its downstream tokens through a
+/// Windows launcher that reparses them -- either the `cmd.exe /c <shim>` form
+/// (an npm-installed `.cmd`) or the `powershell -File <script>` form (a
+/// `.ps1`). Unlike [`launches_through_cmd_shim`], which is given only a bare
+/// program name to re-resolve, this handles an argv that is **already
+/// resolved** to a launcher: `chat::build_launch`/`ClaudeAdapter::base` hand
+/// `wrap`/`dash_orchestrator_pane` an argv whose head is literally `cmd.exe`
+/// (or `powershell`), so re-resolving that head finds a plain `.exe` and would
+/// wrongly report "not a shim", leaving the forced-file-form defence inert on
+/// the interactive path. Recognising the resolved launcher structure directly
+/// (via [`reparse_launcher_prefix`]) is what keeps that defence engaged.
+///
+/// Falls back to resolving the head program for an argv that has *not* been
+/// resolved yet (a raw `wrap` command such as `["claude", "--resume"]`), so
+/// both call shapes reach the same verdict. Always `false` off Windows.
+pub fn launch_reparses_through_shim(launch: &[String]) -> bool {
+    #[cfg(windows)]
+    {
+        let Some((program, rest)) = launch.split_first() else {
+            return false;
+        };
+        // An already-resolved `cmd.exe /c <shim>` or `powershell -File <script>`
+        // argv: the launcher reparses everything past its own prefix.
+        if reparse_launcher_prefix(program, rest).is_some() {
+            return true;
+        }
+        // Otherwise the head is an ordinary program name that `resolve_program`
+        // may still route through a launcher.
+        launches_through_cmd_shim(program)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = launch;
+        false
+    }
+}
+
+/// `std::process::Command` -> the flat `program, arg, arg, ...` form
+/// [`launch_reparses_through_shim`] wants. Shared here rather than
+/// duplicated per call site (`exec.rs`, `run_loop.rs`; `dash/mod.rs` keeps
+/// its own private copy, established first and not worth churning): a probe
+/// command built purely to answer "what launcher shape would this be" (no
+/// real prompt text on it yet) is flattened the same way regardless of
+/// which module is asking.
+pub fn flatten_command(command: std::process::Command) -> Vec<String> {
+    let mut argv = vec![command.get_program().to_string_lossy().to_string()];
+    argv.extend(command.get_args().map(|a| a.to_string_lossy().to_string()));
+    argv
+}
+
 /// `PATH` plus `PATHEXT`, the search the Windows shell performs and
 /// `std::process::Command` does not. A program that already carries a
 /// directory is looked for where it says, not on `PATH`; the flag reports
@@ -258,19 +588,387 @@ fn resolve_on_path(program: &str) -> Option<(PathBuf, bool)> {
     None
 }
 
-pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
-    vec![
-        Box::new(claude::ClaudeAdapter::new(bin)),
-        Box::new(codex::CodexAdapter::new(bin)),
-    ]
+/// An adapter constructor: the same shape `ClaudeAdapter::new` and
+/// `CodexAdapter::new` already share, named so `ADAPTERS` reads as a table
+/// rather than a wall of type punctuation.
+pub type AdapterCtor = fn(Option<&str>) -> Box<dyn AgentAdapter>;
+
+fn make_claude(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(claude::ClaudeAdapter::new(bin))
 }
 
-/// Explicit `--agent` name, else detection from the wrapped argv, else claude.
+fn make_codex(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(codex::CodexAdapter::new(bin))
+}
+
+/// The single source of truth for which adapters exist: a name paired with a
+/// constructor. Adding an adapter is one entry here (plus its own module) --
+/// `all`, `select`'s fallback, `describe_known_adapters`, `resolve_default`
+/// and `readiness_note` all walk this table rather than naming adapters by
+/// hand, so none of them can drift from it.
+pub const ADAPTERS: &[(&str, AdapterCtor)] = &[("claude", make_claude), ("codex", make_codex)];
+
+pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
+    ADAPTERS.iter().map(|(_, ctor)| ctor(bin)).collect()
+}
+
+/// Low 5: the account a usage readout should report for `name`, without
+/// needing that adapter to be enabled or ready -- adapter name -> provider
+/// is a static fact through the registry (`ctor(None).provider()` never
+/// touches the filesystem, a gate, or `ready()`), so it stays answerable
+/// even when `adapters::select(name, ...)` itself would refuse. `zirv ctx
+/// usage`'s no-subcommand branch and `zirv ctx status`'s usage-windows line
+/// used to fall back to `window::LEGACY_USAGE_PROVIDER` on *any* `select`
+/// refusal, which silently showed Anthropic percentages for a repo
+/// configured for a disabled codex rather than "openai: no usage source" --
+/// a guess dressed up as a fact. Falls back to `LEGACY_USAGE_PROVIDER` only
+/// when `name` is `None` or matches no registered adapter at all (an unknown
+/// or absent configuration, where there truly is nothing more specific to
+/// say than the legacy default).
+pub fn provider_for_agent_name(name: Option<&str>) -> &'static str {
+    name.and_then(|n| ADAPTERS.iter().find(|(adapter_name, _)| *adapter_name == n))
+        .map(|(_, ctor)| ctor(None).provider())
+        .unwrap_or(super::window::LEGACY_USAGE_PROVIDER)
+}
+
+/// Final wave item 4: `provider_for_agent_name(cfg.agent)` alone gets an
+/// *unset* `agent` wrong whenever `resolve_default` would not have landed on
+/// the legacy provider -- an operator-disabled claude (home `.settings.toml`
+/// or `ZIRV_AGENT_CLAUDE_ENABLED=false`, not a repo one) with codex enabled
+/// and ready falls back straight to `LEGACY_USAGE_PROVIDER` ("anthropic")
+/// with no `agent` name to derive anything more specific from, even though
+/// `resolve_default`'s own fallback loop would correctly skip claude and
+/// land on codex. Tried first here for exactly that reason: `resolve_
+/// default` is the actual selection logic (gates, `ready()`, the repo-
+/// narrowing guard), so when it succeeds its answer is authoritative.
+/// `provider_for_agent_name` is the fallback for when it does not -- an
+/// explicitly configured, repo-disabled agent (`resolve_default`'s
+/// configured arm hard-refuses there) still needs a provider, and only
+/// `provider_for_agent_name` can name one without requiring readiness.
+pub fn provider_for_usage_readout(cfg: &CtxConfig) -> &'static str {
+    resolve_default(cfg)
+        .map(|(adapter, _origin)| adapter.provider())
+        .unwrap_or_else(|_| provider_for_agent_name(cfg.agent.as_deref()))
+}
+
+/// `cfg.agent_bin` is one global override applied to *whichever* adapter is
+/// selected (every `ctor(bin)` call in this module reuses the same value
+/// regardless of the adapter name) -- there is no per-adapter binary
+/// override. That is fine for a stub path, a wrapper script (`sh
+/// /path/fake-codex-agent.sh`), or a differently located install of the
+/// *same* agent, but a value whose own program basename names a *different*
+/// registered adapter (`agent_bin = "/usr/local/bin/claude"` while `codex`
+/// is what gets selected, most plausibly stale config left over from
+/// switching agents) would launch that other agent's real binary dressed up
+/// in the selected adapter's own argv shape -- codex's `exec <prompt>`
+/// positional form handed to the real claude CLI, wrong account, wrong
+/// safety model, and no error anywhere naming what happened. Checked by
+/// basename only (extension stripped, case-insensitive), not full-path
+/// identity: an operator who genuinely renamed a binary to something that
+/// happens to collide with another adapter's own name gets the same
+/// refusal, which is the conservative, name-the-problem-and-stop failure
+/// mode this guard exists for.
+///
+/// Returns the *other* adapter's name when `bin`'s basename collides with
+/// one that is not `selected`; `None` when `bin` is unset, names no
+/// registered adapter at all (a stub/wrapper path, the common test and
+/// wrapper-script shape), or names `selected` itself.
+fn agent_bin_names_a_different_adapter(bin: Option<&str>, selected: &str) -> Option<&'static str> {
+    let bin = bin?;
+    let program = bin.split_whitespace().next()?;
+    let stem = Path::new(program).file_stem()?.to_str()?;
+    ADAPTERS.iter().find_map(|(name, _)| {
+        (!name.eq_ignore_ascii_case(selected) && stem.eq_ignore_ascii_case(name)).then_some(*name)
+    })
+}
+
+/// The clear, name-both-adapters refusal `agent_bin_names_a_different_
+/// adapter` backs, shared by every `select`/`resolve_default` arm that is
+/// about to return `selected` as the resolved adapter.
+fn refuse_if_agent_bin_names_another_adapter(bin: Option<&str>, selected: &str) -> CtxResult<()> {
+    if let Some(other) = agent_bin_names_a_different_adapter(bin, selected) {
+        return Err(format!(
+            "agent_bin '{}' names '{other}', not the selected agent '{selected}' -- refusing to \
+             launch '{other}'s binary as if it were '{selected}'. Point agent_bin at a '{selected}' \
+             install, or select '{other}' instead.",
+            bin.unwrap_or_default()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The registry's names, each suffixed `(disabled)` when `gate` refuses it --
+/// used by the unknown-name error so a mistyped `--agent` also shows which
+/// known names are actually usable right now.
+fn describe_known_adapters(gate: &crate::settings::AgentGate) -> String {
+    ADAPTERS
+        .iter()
+        .map(|(name, _)| {
+            if gate.is_enabled(name) {
+                name.to_string()
+            } else {
+                format!("{name} (disabled)")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The adapters that are both gate-enabled and `ready()` right now, in
+/// registry order. Used to spell out actual options in an error instead of a
+/// single hardcoded name -- `wrap`'s undetected-command refusal in
+/// particular, which used to say "pass --agent claude" no matter how many
+/// adapters the registry actually held.
+pub fn available_adapter_names(cfg: &CtxConfig) -> Vec<&'static str> {
+    let bin = cfg.agent_bin.as_deref();
+    ADAPTERS
+        .iter()
+        .filter(|(name, ctor)| cfg.agents.is_enabled(name) && ctor(bin).ready().is_ok())
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// A `Capabilities` predicate paired with its user-facing label -- factored
+/// out purely to keep `CAPABILITY_LABELS`'s type simple enough for clippy's
+/// `type_complexity` lint.
+type CapabilityLabel = (fn(Capabilities) -> bool, &'static str);
+
+/// The user-facing label for each `Capabilities` flag this disclosure cares
+/// about, in a fixed reporting order. `marker_signal` is deliberately not
+/// included: it is a sub-feature of `events` (no event parsing means no
+/// marker detection either), so listing both would say the same thing twice.
+const CAPABILITY_LABELS: &[CapabilityLabel] = &[
+    (|c| c.events, "rot score"),
+    (|c| c.token_usage, "usage"),
+    (|c| c.turn_signal, "turn signal"),
+    (|c| c.system_prompt, "injected prompt"),
+];
+
+/// Which of [`CAPABILITY_LABELS`] this adapter's `capabilities()` reports as
+/// missing, in the same fixed order.
+fn missing_capability_labels(caps: Capabilities) -> Vec<&'static str> {
+    CAPABILITY_LABELS
+        .iter()
+        .filter(|(has, _)| !has(caps))
+        .map(|(_, label)| *label)
+        .collect()
+}
+
+/// `["a", "b", "c"]` -> `"a, b, or c"`; `["a", "b"]` -> `"a or b"`; `["a"]` ->
+/// `"a"`. Plain English list join for a short, human-readable sentence.
+fn join_with_or(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [first, second] => format!("{first} or {second}"),
+        _ => {
+            let (last, rest) = items.split_last().expect("non-empty, matched above");
+            format!("{}, or {last}", rest.join(", "))
+        }
+    }
+}
+
+/// A short clause naming every adapter that is not ready yet, plus one
+/// naming every *ready* adapter whose own `capabilities()` still leaves its
+/// launches degraded (no rot score, usage, turn signal, or injected
+/// system prompt) -- for `zirv ctx --help`'s `about` text. Both halves are
+/// generated from each adapter's own `ready()`/`capabilities()` rather than
+/// hardcoded, so a newly wired-up adapter (or one that later closes a
+/// capability gap) falls in or out of the sentence on its own. Empty only
+/// once every adapter is both ready and fully capable.
+///
+/// Codex is the adapter this currently discloses: `ready()` no longer
+/// hard-errors (its shim gap and `resolve_program` routing are closed, see
+/// [[Known Issues]] via CLAUDE.md), but its `capabilities()` is still
+/// honestly all-`false` -- `--agent codex` works, silently missing the four
+/// things claude gets for free, which a user reading `--help` deserves to
+/// see stated plainly rather than only discovering by surprise.
+pub fn readiness_note() -> String {
+    let mut clauses: Vec<String> = Vec::new();
+
+    // Item 11: each adapter is constructed and `ready()`-checked exactly
+    // once here, in one pass -- the two-pass version used to build a fresh
+    // adapter and re-call `ready()` a second time for every adapter, once
+    // per clause. `ctx_about()`'s `OnceLock` already caps this to once per
+    // process, but the hook/statusline path still goes through it on every
+    // invocation before that cache is warm.
+    let mut not_ready: Vec<&str> = Vec::new();
+    let mut degraded: Vec<String> = Vec::new();
+    for (name, ctor) in ADAPTERS {
+        let adapter = ctor(None);
+        if adapter.ready().is_err() {
+            not_ready.push(name);
+            continue;
+        }
+        let missing = missing_capability_labels(adapter.capabilities());
+        if !missing.is_empty() {
+            degraded.push(format!(
+                "{name} (launch-level: no {})",
+                join_with_or(&missing)
+            ));
+        }
+    }
+
+    if !not_ready.is_empty() {
+        clauses.push(format!(
+            "Not ready yet: {} (see issue #11).",
+            not_ready.join(", ")
+        ));
+    }
+    if !degraded.is_empty() {
+        clauses.push(format!(
+            "Degraded surface: {} (see issue #11).",
+            degraded.join("; ")
+        ));
+    }
+
+    clauses.join(" ")
+}
+
+/// Which rule picked the default adapter, for callers (`zirv ctx status`,
+/// diagnostics) that want to explain the choice rather than just use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultOrigin {
+    /// `cfg.agent` named it explicitly.
+    Configured,
+    /// No configured agent; this was the first adapter in registry order
+    /// that was both gate-enabled and `ready()`.
+    FirstEnabledReady,
+}
+
+/// Resolves the adapter `select` falls back to when neither an explicit
+/// `--agent` nor detection named one: `cfg.agent` if set, else the first
+/// registry entry that is both gate-enabled and `ready()`. Every call site
+/// of `select` already folds `cfg.agent` into the `name` it passes in, so by
+/// the time `select`'s fallback arm calls this, `cfg.agent` is always `None`
+/// there -- but this function stands on its own (and is tested that way),
+/// since a `None` name is not the only way to reach "use the configured or
+/// default agent".
+///
+/// When nothing qualifies, the error aggregates one line per adapter naming
+/// why it was skipped, reusing the gate's own refusal text and each
+/// adapter's own `ready()` text rather than inventing new wording.
+///
+/// G: a repo checkout's own `.settings.toml` may narrow this fallback (take
+/// an adapter off the table) but must never *select* a different one for the
+/// operator as a side effect of that narrowing -- a repo-only disable
+/// (`AgentGate::disabled_only_by_repo`) that would otherwise leave the
+/// fallback silently landing on a different, still-enabled adapter refuses
+/// instead, naming both adapters and the fix. Skipping past a repo-disabled
+/// adapter when *nothing else* qualifies either is unaffected: no different
+/// provider was ever silently chosen, so the ordinary aggregate error still
+/// applies and still names every candidate.
+///
+/// G2 (fix): `repo_narrowed` is only recorded when the repo-disabled adapter
+/// would *also* have passed `ready()` -- otherwise it was never a candidate
+/// this fallback could have landed on in the first place (an unlaunchable
+/// bare name, say), and the refusal's own claim that it "would otherwise
+/// have been the default agent" would be false. Without this, disabling an
+/// already-unlaunchable adapter via `.settings.toml` could still block a
+/// perfectly good fallback to the next one, over a hypothetical that was
+/// never true.
+pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, DefaultOrigin)> {
+    let bin = cfg.agent_bin.as_deref();
+
+    if let Some(name) = cfg.agent.as_deref() {
+        let adapter = ADAPTERS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ctor)| ctor(bin))
+            .ok_or_else(|| {
+                format!(
+                    "unknown agent '{name}'; known adapters: {}",
+                    describe_known_adapters(&cfg.agents)
+                )
+            })?;
+        if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
+            return Err(refusal.into());
+        }
+        adapter.ready()?;
+        refuse_if_agent_bin_names_another_adapter(bin, adapter.name())?;
+        return Ok((adapter, DefaultOrigin::Configured));
+    }
+
+    let mut reasons = Vec::new();
+    let mut repo_narrowed: Option<&str> = None;
+    for (name, ctor) in ADAPTERS {
+        let adapter = ctor(bin);
+        if let Some(refusal) = cfg.agents.refusal(name) {
+            // Final wave item 3: the same cross-adapter skip Medium 2 gave
+            // the enabled-and-ready arm below, applied here too. Without
+            // it, `ctor(bin)` on this line always builds the candidate
+            // with the *global* `agent_bin`, even when `agent_bin` names a
+            // different adapter entirely -- so `adapter.ready()` could
+            // report "ready" for, say, a claude adapter whose `program` is
+            // actually pointed at a real codex binary. That is not a
+            // candidate this fallback could ever have genuinely landed on
+            // (the cross-adapter guard would refuse it exactly the way
+            // Medium 2 does below), so recording `repo_narrowed` from it
+            // would refuse on a false premise: "claude would otherwise
+            // have been the default agent" when `agent_bin` never actually
+            // named claude's own binary at all.
+            if repo_narrowed.is_none()
+                && cfg.agents.disabled_only_by_repo(name)
+                && agent_bin_names_a_different_adapter(bin, name).is_none()
+                && adapter.ready().is_ok()
+            {
+                repo_narrowed = Some(name);
+            }
+            reasons.push(format!("{name}: {refusal}"));
+            continue;
+        }
+        match adapter.ready() {
+            Ok(()) => {
+                if let Some(narrowed) = repo_narrowed {
+                    return Err(format!(
+                        "the repository checkout disabled '{narrowed}' via .settings.toml, \
+                         which would otherwise have been the default agent; a repo may narrow \
+                         this fallback but not choose '{name}' for you instead. Pass --agent \
+                         explicitly, or set `agent` in your own operator config or environment, \
+                         to pick one."
+                    )
+                    .into());
+                }
+                // Medium 2: recorded and skipped, not `?`-aborted. `bin`
+                // is one value tried against *every* candidate in this
+                // loop in registry order -- if it names a different
+                // adapter than this one (`name`), the right answer is to
+                // keep walking to the adapter it actually does name, not
+                // to abort the whole fallback here. An operator with no
+                // `agent =` configured, only `agent_bin` pointing at a
+                // real codex install, used to get a hard error at claude
+                // (first in registry order) instead of landing on codex.
+                // The explicit-`--agent` arm above still hard-refuses:
+                // there the operator named the mismatch directly, so
+                // there is nothing left to fall back to.
+                if let Some(other) = agent_bin_names_a_different_adapter(bin, name) {
+                    reasons.push(format!("{name}: agent_bin names '{other}', not '{name}'"));
+                    continue;
+                }
+                return Ok((adapter, DefaultOrigin::FirstEnabledReady));
+            }
+            Err(e) => reasons.push(format!("{name}: {e}")),
+        }
+    }
+    Err(format!(
+        "no agent is both enabled and ready:\n{}",
+        reasons.join("\n")
+    )
+    .into())
+}
+
+/// Explicit `--agent` name, else detection from the wrapped argv, else
+/// `resolve_default`. The `.settings.toml` gate (`cfg.agents`) is checked
+/// before `ready()` in every arm: `ready()` reports implementation state,
+/// the gate reports operator policy, and a disabled agent must report the
+/// disable rather than (for codex) "not implemented yet".
 pub fn select(
     name: Option<&str>,
     command: &[String],
-    bin: Option<&str>,
+    cfg: &CtxConfig,
 ) -> CtxResult<Box<dyn AgentAdapter>> {
+    let bin = cfg.agent_bin.as_deref();
     let adapters = all(bin);
 
     if let Some(name) = name {
@@ -278,25 +976,27 @@ pub fn select(
         let adapter = found.ok_or_else(|| {
             format!(
                 "unknown agent '{name}'; known adapters: {}",
-                all(None)
-                    .iter()
-                    .map(|a| a.name())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                describe_known_adapters(&cfg.agents)
             )
         })?;
+        if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
+            return Err(refusal.into());
+        }
         adapter.ready()?;
+        refuse_if_agent_bin_names_another_adapter(bin, adapter.name())?;
         return Ok(adapter);
     }
 
     if let Some(adapter) = adapters.into_iter().find(|a| a.detect(command)) {
+        if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
+            return Err(refusal.into());
+        }
         adapter.ready()?;
+        refuse_if_agent_bin_names_another_adapter(bin, adapter.name())?;
         return Ok(adapter);
     }
 
-    let adapter: Box<dyn AgentAdapter> = Box::new(claude::ClaudeAdapter::new(bin));
-    adapter.ready()?;
-    Ok(adapter)
+    resolve_default(cfg).map(|(adapter, _origin)| adapter)
 }
 
 /// True when the wrapped command can be trusted to actually be this adapter's
@@ -318,6 +1018,100 @@ pub fn command_matches_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A permissive `CtxConfig` (every agent enabled, no `agent_bin`
+    /// override) for tests that only care about selection, not gating.
+    /// `CtxConfig::default()` never touches the filesystem or `HOME` (its
+    /// `AgentGate` is `AgentGate::default()`, not a `load`), so this one
+    /// needs no `HomeGuard`, unlike `cfg_disabling` below.
+    fn permissive_cfg() -> CtxConfig {
+        CtxConfig::default()
+    }
+
+    /// A `CtxConfig` whose gate disables exactly one named agent, as if an
+    /// operator or repo `.settings.toml` had set `[agents.<name>] enabled =
+    /// false`, but without touching any file: `AgentGate`'s fields are
+    /// crate-private, so the state is built by loading a real settings file
+    /// from an isolated repo dir instead. `AgentGate::load` also reads the
+    /// operator (home) layer, so this isolates `HOME`/`USERPROFILE` too --
+    /// otherwise a developer machine's real `~/.zirv/.settings.toml` (if any)
+    /// would leak into the loaded gate.
+    fn cfg_disabling(name: &str) -> CtxConfig {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            format!("[agents.{name}]\nenabled = false\n"),
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        }
+    }
+
+    #[test]
+    fn join_with_or_reads_like_plain_english() {
+        assert_eq!(join_with_or(&[]), "");
+        assert_eq!(join_with_or(&["a"]), "a");
+        assert_eq!(join_with_or(&["a", "b"]), "a or b");
+        assert_eq!(join_with_or(&["a", "b", "c"]), "a, b, or c");
+    }
+
+    #[test]
+    fn missing_capability_labels_names_only_the_false_flags() {
+        let all_false = Capabilities::default();
+        assert_eq!(
+            missing_capability_labels(all_false),
+            vec!["rot score", "usage", "turn signal", "injected prompt"]
+        );
+
+        let all_true = Capabilities {
+            marker_signal: true,
+            token_usage: true,
+            turn_signal: true,
+            system_prompt: true,
+            events: true,
+        };
+        assert!(missing_capability_labels(all_true).is_empty());
+
+        let mixed = Capabilities {
+            events: true,
+            ..Capabilities::default()
+        };
+        assert_eq!(
+            missing_capability_labels(mixed),
+            vec!["usage", "turn signal", "injected prompt"],
+            "an adapter with real events but nothing else"
+        );
+    }
+
+    /// F: codex is ready (its own `ready()` no longer hard-errors) but still
+    /// honestly all-`false` in `capabilities()`, so `--help`'s about text
+    /// must keep disclosing the degraded surface even though codex no longer
+    /// shows up in the "not ready yet" clause at all.
+    #[test]
+    fn the_readiness_note_discloses_codexs_degraded_surface_now_that_it_is_ready() {
+        let note = readiness_note();
+        assert!(
+            !note.to_lowercase().contains("not ready"),
+            "codex is ready now, not unready: {note}"
+        );
+        assert!(note.contains("codex"), "got {note}");
+        assert!(note.contains("rot score"), "got {note}");
+        assert!(note.contains("usage"), "got {note}");
+        assert!(note.contains("turn signal"), "got {note}");
+        assert!(note.contains("injected prompt"), "got {note}");
+        assert!(note.contains("issue #11"), "got {note}");
+        assert!(
+            !note.contains("claude (launch-level"),
+            "claude is fully capable and must not appear in the degraded clause: {note}"
+        );
+    }
 
     /// M7 probed the adapter's own program while `wrap` spawned the user's
     /// argv, so the file flag could be handed to a binary that never
@@ -424,20 +1218,209 @@ mod tests {
 
         // Temporarily put the directory on PATH so the bare name resolves the
         // way the shell would, with `.PY` advertised on PATHEXT.
+        //
+        // NEW-1: a guard, not a manual restore. The restore used to sit after
+        // an `expect_err`, so a failing resolution left this process with a
+        // mangled `PATH` and a `PATHEXT` of `.EXE;.CMD;.PY` -- the highest
+        // blast radius of any leak in the suite, since every later test that
+        // spawns anything resolves its program through both.
         let path = std::env::var("PATH").unwrap_or_default();
-        let pathext = std::env::var("PATHEXT").unwrap_or_default();
-        unsafe {
-            std::env::set_var("PATH", format!("{};{}", dir.path().display(), path));
-            std::env::set_var("PATHEXT", ".EXE;.CMD;.PY");
-        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "PATH",
+                Some(format!("{};{}", dir.path().display(), path).as_str()),
+            ),
+            ("PATHEXT", Some(".EXE;.CMD;.PY")),
+        ]);
         let err = resolve_program("shim-agent").expect_err("no launcher for .py");
-        unsafe {
-            std::env::set_var("PATH", path);
-            std::env::set_var("PATHEXT", pathext);
-        }
 
         assert!(err.contains("shim-agent.py"), "the error names it: {err}");
         assert!(err.contains("shim-agent"), "and what was asked for: {err}");
+    }
+
+    /// H1/H2: both `readiness_note`'s "not ready yet" clause and `resolve_
+    /// default`'s `Err(e) => continue` unready-skip branch lost their only
+    /// coverage once codex's own `ready()` stopped hard-erroring -- nothing
+    /// in the real registry is ever actually unready anymore, so a test that
+    /// only reads the real `ADAPTERS` table can no longer exercise either
+    /// branch at all. This forces claude's own bare `"claude"` name to
+    /// resolve to an unlaunchable `.py` (the same PATH/PATHEXT rig `an_
+    /// unlaunchable_program_on_path_is_named_rather_than_left_to_error_193`
+    /// uses), which is the one real way `ready()` fails on this codebase,
+    /// leaving codex genuinely unaffected (codex.cmd, wherever it resolves
+    /// or fails to, is never a `ready()` error case) to prove the skip-and-
+    /// continue path lands on it.
+    #[cfg(windows)]
+    #[test]
+    fn readiness_note_and_the_fallback_skip_both_stay_covered_when_an_adapter_is_genuinely_unready()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("claude.py"), "print('x')\n").expect("write");
+
+        let path = std::env::var("PATH").unwrap_or_default();
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "PATH",
+                Some(format!("{};{}", dir.path().display(), path).as_str()),
+            ),
+            ("PATHEXT", Some(".EXE;.CMD;.PY")),
+        ]);
+
+        // H1: the "not ready yet" clause is genuinely exercised again.
+        let note = readiness_note();
+        assert!(
+            note.to_lowercase().contains("not ready"),
+            "claude must be reported not ready under this rig: {note}"
+        );
+        assert!(note.contains("claude"), "got {note}");
+
+        // H2: `resolve_default`'s fallback must skip claude's `Err` and land
+        // on codex, exercising the `Err(e) => reasons.push(...); continue`
+        // arm rather than the `Ok(())` one.
+        let (adapter, origin) = resolve_default(&permissive_cfg()).expect("codex still qualifies");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// FIX 2a: a `cmd.exe /c <shim>` launch whose downstream arguments carry a
+    /// cmd.exe metacharacter is refused, because cmd.exe re-parses that
+    /// character as a command rather than passing it through to the shim. This
+    /// is the RCE-closing guard, tested as a pure decision function -- no
+    /// process is spawned.
+    #[cfg(windows)]
+    #[test]
+    fn a_shim_form_launch_with_a_metachar_arg_is_refused() {
+        let args = vec![
+            "/c".to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+            "-p".to_string(),
+            "foo&calc".to_string(),
+        ];
+        let err = guard_cmd_shim_reparse("cmd.exe", &args)
+            .expect_err("a metachar after the shim path is command injection");
+        assert!(
+            err.contains("foo&calc"),
+            "the error names the offending arg: {err}"
+        );
+
+        // A full-path, upper-cased COMSPEC is recognised structurally too.
+        assert!(
+            guard_cmd_shim_reparse(
+                "C:\\Windows\\System32\\CMD.EXE",
+                &[
+                    "/C".to_string(),
+                    "claude.cmd".to_string(),
+                    "\"; calc; \"".to_string(),
+                ],
+            )
+            .is_err(),
+            "an embedded quote (the BatBadBut toggle) is rejected regardless of cmd casing"
+        );
+    }
+
+    /// FIX 2a: the two shim-prefix tokens (`/c` and the shim path) are
+    /// zirv-controlled and never trip the guard, and a clean downstream arg --
+    /// including a real Bedrock model id with `:` `/` `.` -- passes. Runs on
+    /// every platform: off Windows it exercises the no-op path, on Windows the
+    /// real allow decision.
+    #[test]
+    fn a_shim_form_launch_with_only_clean_args_is_allowed() {
+        let args = vec![
+            "/c".to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+            "-p".to_string(),
+            "do the thing".to_string(),
+            "--model".to_string(),
+            "us.anthropic.claude-sonnet-4-v1:0".to_string(),
+        ];
+        assert!(guard_cmd_shim_reparse("cmd.exe", &args).is_ok());
+    }
+
+    /// FIX D (defense-in-depth): the `powershell -NoProfile -File <script>`
+    /// launcher form is guarded the same way as the cmd shim -- everything
+    /// through the `-File <script>` pair is zirv-controlled prefix, and a
+    /// metacharacter in a token after it is refused. The two prefix tokens and
+    /// the script path never trip it.
+    #[cfg(windows)]
+    #[test]
+    fn a_powershell_file_launch_is_guarded_after_the_script_path() {
+        let bad = vec![
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            "C:\\tools\\agent.ps1".to_string(),
+            "foo&calc".to_string(),
+        ];
+        assert!(
+            guard_cmd_shim_reparse("powershell", &bad).is_err(),
+            "a metachar after the script path is refused"
+        );
+
+        let clean = vec![
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            "C:\\tools\\agent.ps1".to_string(),
+            "do the thing".to_string(),
+        ];
+        assert!(
+            guard_cmd_shim_reparse("pwsh", &clean).is_ok(),
+            "clean args on the powershell form pass, and the prefix never trips"
+        );
+    }
+
+    /// FIX 2a: a direct `.exe` (no cmd.exe launcher prefix) is not the shim
+    /// form, so the guard is a no-op even for an argument that would be
+    /// dangerous through cmd.exe -- `CreateProcess` receives it as a literal.
+    /// This is also what keeps the test harness's own `sh <script>` fake agents
+    /// from being rejected.
+    #[test]
+    fn a_non_shim_launch_is_never_guarded() {
+        let args = vec!["-p".to_string(), "foo&calc".to_string()];
+        assert!(guard_cmd_shim_reparse("claude.exe", &args).is_ok());
+        assert!(guard_cmd_shim_reparse("/opt/homebrew/bin/claude", &args).is_ok());
+        assert!(guard_cmd_shim_reparse("sh", &["/tmp/fake-agent.sh".to_string()]).is_ok());
+    }
+
+    /// FINDING 3: an argv that is *already resolved* to the `cmd.exe /c <shim>`
+    /// launcher form (what the interactive path hands `injection_args_for_
+    /// session`) is recognised as reparsing, where re-resolving the literal
+    /// head `cmd.exe` would have found a plain `.exe` and missed it. A direct
+    /// `.exe` argv is not a launcher form and is not flagged.
+    #[cfg(windows)]
+    #[test]
+    fn an_already_resolved_launcher_argv_is_recognised_as_reparsing() {
+        let resolved_cmd = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "C:\\tools\\claude.cmd".to_string(),
+            "the prompt".to_string(),
+        ];
+        assert!(launch_reparses_through_shim(&resolved_cmd));
+
+        let resolved_ps = vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-File".to_string(),
+            "C:\\tools\\agent.ps1".to_string(),
+            "arg".to_string(),
+        ];
+        assert!(launch_reparses_through_shim(&resolved_ps));
+
+        let direct = vec!["C:\\tools\\claude.exe".to_string(), "--resume".to_string()];
+        assert!(!launch_reparses_through_shim(&direct));
+    }
+
+    /// Off Windows there is no launcher reparse, so the detection is always
+    /// `false` -- including for an argv that structurally looks like one.
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_reparse_detection_is_a_noop_off_windows() {
+        let looks_like_cmd = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "claude.cmd".to_string(),
+        ];
+        assert!(!launch_reparses_through_shim(&looks_like_cmd));
+        assert!(!launch_reparses_through_shim(&[]));
     }
 
     /// The trait default: an agent zirv has verified nothing about receives
@@ -455,8 +1438,99 @@ mod tests {
 
     #[test]
     fn explicit_name_wins() {
-        let adapter = select(Some("claude"), &[], None).expect("claude selects");
+        let adapter = select(Some("claude"), &[], &permissive_cfg()).expect("claude selects");
         assert_eq!(adapter.name(), "claude");
+    }
+
+    /// `agent_bin` is one global override applied to whichever adapter gets
+    /// selected. Naming codex explicitly while `agent_bin` points at a real
+    /// `claude` install (stale config left over from switching agents is the
+    /// plausible way this happens) would otherwise launch claude's binary
+    /// dressed up in codex's own `exec <prompt>` argv shape -- wrong account,
+    /// wrong safety model, no error naming what happened. Both names appear
+    /// in the refusal, and it is basename-only: the full path is never a
+    /// factor.
+    #[test]
+    fn agent_bin_naming_a_different_adapter_than_selected_is_refused() {
+        let mut cfg = permissive_cfg();
+        cfg.agent_bin = Some("/opt/homebrew/bin/claude".to_string());
+        let err = select(Some("codex"), &[], &cfg).expect_err("cross-adapter agent_bin refuses");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claude"),
+            "names the binary's own agent: {msg}"
+        );
+        assert!(
+            msg.contains("codex"),
+            "names the one that was selected: {msg}"
+        );
+    }
+
+    /// The same collision reached through `resolve_default`'s own
+    /// *configured* arm (`cfg.agent` set explicitly, just not on the CLI) --
+    /// still a hard refusal, unlike the fallback loop below.
+    #[test]
+    fn agent_bin_naming_a_different_adapter_is_refused_through_the_default_fallback_too() {
+        let mut cfg = permissive_cfg();
+        cfg.agent = Some("codex".to_string());
+        cfg.agent_bin = Some("claude.exe".to_string());
+        let err = resolve_default(&cfg).expect_err("cross-adapter agent_bin refuses");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "got {msg}");
+        assert!(msg.contains("codex"), "got {msg}");
+    }
+
+    /// Medium 2 (fix): with *no* `cfg.agent` configured, `resolve_default`'s
+    /// own fallback loop tries `ADAPTERS` in registry order (`claude` first)
+    /// -- before this fix, `agent_bin` naming a real codex install still hit
+    /// claude first, and the cross-adapter guard's `?` aborted the whole
+    /// fallback right there instead of continuing on to codex, the adapter
+    /// that binary actually is. It must resolve to codex, not error.
+    #[test]
+    fn agent_bin_naming_codex_with_no_agent_configured_falls_through_to_codex() {
+        let cfg = CtxConfig {
+            agent_bin: Some("/definitely/not/a/real/path/codex".to_string()),
+            ..permissive_cfg()
+        };
+        let (adapter, origin) =
+            resolve_default(&cfg).expect("falls through past claude to codex, not an error");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// The other half of the same fix: a basename that names *no* registered
+    /// adapter at all -- a stub path, or the `sh <fixture>.sh` wrapper shape
+    /// this codebase's own tests use throughout -- is never a collision, no
+    /// matter how unrelated it looks, and a value that happens to name the
+    /// *same* adapter as the one selected (a differently located install) is
+    /// explicitly fine too.
+    #[test]
+    fn agent_bin_naming_no_adapter_or_the_same_one_stays_allowed() {
+        let cfg = permissive_cfg();
+        assert_eq!(
+            agent_bin_names_a_different_adapter(Some("/tmp/fake-codex"), "codex"),
+            None,
+            "a stub path matches nothing"
+        );
+        assert_eq!(
+            agent_bin_names_a_different_adapter(
+                Some("sh /repo/tests/fixtures/fake-codex-agent.sh"),
+                "codex"
+            ),
+            None,
+            "the wrapper shape's own basename is \"sh\", not an adapter name"
+        );
+        assert_eq!(
+            agent_bin_names_a_different_adapter(Some("/opt/codex-beta/codex"), "codex"),
+            None,
+            "naming the selected adapter itself is not a collision"
+        );
+
+        let mut cfg = cfg;
+        cfg.agent_bin = Some("/opt/codex-beta/codex".to_string());
+        let adapter =
+            select(Some("codex"), &[], &cfg).expect("same-adapter agent_bin is never refused");
+        assert_eq!(adapter.name(), "codex");
     }
 
     #[test]
@@ -465,19 +1539,32 @@ mod tests {
             "/opt/homebrew/bin/claude".to_string(),
             "--resume".to_string(),
         ];
-        let adapter = select(None, &cmd, None).expect("detect claude");
+        let adapter = select(None, &cmd, &permissive_cfg()).expect("detect claude");
         assert_eq!(adapter.name(), "claude");
     }
 
+    /// The property the fallback actually promises: whatever it picks is
+    /// enabled and ready. Now that codex's own `ready()` succeeds too (see
+    /// `CodexAdapter::ready`), both adapters qualify, so this also pins
+    /// `ADAPTERS`' registry order (`("claude", ...)` first) as what actually
+    /// decides the winner -- both are asserted, the property for its own
+    /// sake and the concrete name because losing it silently would be a
+    /// regression worth catching too.
     #[test]
     fn empty_command_defaults_to_claude() {
-        let adapter = select(None, &[], None).expect("default");
+        let cfg = permissive_cfg();
+        let adapter = select(None, &[], &cfg).expect("default");
+        assert!(
+            cfg.agents.is_enabled(adapter.name()),
+            "must be gate-enabled"
+        );
+        assert!(adapter.ready().is_ok(), "must be ready");
         assert_eq!(adapter.name(), "claude");
     }
 
     #[test]
     fn unknown_name_is_an_error_that_lists_the_options() {
-        let err = select(Some("gemini"), &[], None).expect_err("unknown agent");
+        let err = select(Some("gemini"), &[], &permissive_cfg()).expect_err("unknown agent");
         let msg = err.to_string();
         assert!(msg.contains("gemini"), "got {msg}");
         assert!(
@@ -486,10 +1573,305 @@ mod tests {
         );
     }
 
+    /// Task A3: an agent named explicitly is refused, and the message names
+    /// the layer that disabled it (mirrors the settings-layer wording tests
+    /// in `settings.rs`; here the point is that `select` actually surfaces
+    /// it, not the exact wording).
+    #[test]
+    fn a_disabled_agent_named_explicitly_is_refused_with_the_layer_that_disabled_it() {
+        let cfg = cfg_disabling("codex");
+        let err = select(Some("codex"), &[], &cfg).expect_err("codex is disabled");
+        let msg = err.to_string();
+        assert!(msg.contains("codex"), "got {msg}");
+        assert!(msg.contains("disabled"), "got {msg}");
+        assert!(
+            msg.contains(".settings.toml"),
+            "names the file that disabled it: {msg}"
+        );
+    }
+
+    /// The detection arm must refuse, not silently fall back to claude, the
+    /// same invariant `detecting_codex_argv_does_not_silently_fall_back_to_claude`
+    /// pins for the unready case.
+    #[test]
+    fn a_disabled_agent_detected_on_the_argv_does_not_fall_back_to_the_default() {
+        let cfg = cfg_disabling("codex");
+        let cmd = vec!["codex".to_string(), "exec".to_string(), "go".to_string()];
+        let err = select(None, &cmd, &cfg).expect_err("must not misroute to claude");
+        assert!(err.to_string().contains("codex"), "got {err}");
+    }
+
+    /// G: `select`'s empty-command default no longer silently lands on a
+    /// different provider just because the repo checkout narrowed claude
+    /// off the table -- codex's own `ready()` succeeding too used to make
+    /// the fallback pick it automatically, which handed a repo checkout the
+    /// power to select which vendor account gets spent. It must refuse
+    /// instead, naming both adapters and the fix, exercised here through the
+    /// public `select` entry point rather than `resolve_default` directly.
+    #[test]
+    fn the_default_fallback_refuses_rather_than_silently_switching_provider() {
+        let cfg = cfg_disabling("claude");
+        let err = select(None, &[], &cfg).expect_err("a repo may narrow, not select");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "got {msg}");
+        assert!(msg.contains("codex"), "got {msg}");
+        assert!(msg.contains("--agent"), "must say how to fix it: {msg}");
+    }
+
+    /// The gate is checked before `ready()`: a disabled-and-unready agent
+    /// (codex, always) must report the disable, not "not implemented yet".
+    #[test]
+    fn the_disable_is_reported_before_an_adapters_own_readiness() {
+        let cfg = cfg_disabling("codex");
+        let err = select(Some("codex"), &[], &cfg).expect_err("codex is disabled");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("not implemented yet"),
+            "the gate must win over ready(): {msg}"
+        );
+        assert!(msg.contains("disabled"), "got {msg}");
+    }
+
     #[test]
     fn registry_exposes_both_v1_adapters() {
-        let names: Vec<&str> = all(None).iter().map(|a| a.name()).collect();
+        let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, vec!["claude", "codex"]);
+    }
+
+    /// The registry table is the one place a new adapter is wired in: `all`
+    /// must produce exactly one instance per table entry, in table order,
+    /// with matching names -- otherwise `all` and `ADAPTERS` could drift.
+    #[test]
+    fn adding_an_adapter_is_one_entry_in_the_constructor_table() {
+        let instances = all(None);
+        assert_eq!(instances.len(), ADAPTERS.len());
+        for (instance, (name, _)) in instances.iter().zip(ADAPTERS.iter()) {
+            assert_eq!(instance.name(), *name);
+        }
+    }
+
+    /// A provider slug names a usage file, so it has to already *be* a slug:
+    /// lowercase `[a-z0-9-]`, non-empty, and unchanged by the sanitiser that
+    /// turns it into a file name. It is also the account, not the program --
+    /// claude's is `anthropic`, not `claude`.
+    #[test]
+    fn every_adapter_names_the_account_its_limits_belong_to() {
+        for adapter in all(None) {
+            let provider = adapter.provider();
+            assert!(!provider.is_empty(), "{} has no provider", adapter.name());
+            assert_eq!(
+                crate::commands::ctx::state::provider_slug(provider),
+                provider,
+                "{provider} is not already a filesystem-safe lowercase slug"
+            );
+        }
+
+        let claude = claude::ClaudeAdapter::new(None);
+        assert_ne!(
+            claude.provider(),
+            claude.name(),
+            "the provider is the account, not the binary: two harnesses can share one"
+        );
+    }
+
+    #[test]
+    fn the_registry_names_are_unique_and_non_empty() {
+        let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
+        for name in &names {
+            assert!(!name.is_empty(), "no adapter may have an empty name");
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "duplicate adapter name in {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_command_falls_back_to_the_first_enabled_and_ready_adapter() {
+        let (adapter, origin) = resolve_default(&permissive_cfg()).expect("a default exists");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// G: now that codex's own `ready()` only checks that its program
+    /// resolves (exactly like claude's, see `CodexAdapter::ready`),
+    /// disabling claude via a repo-only `.settings.toml` does not leave the
+    /// fallback with nothing enabled-and-ready -- codex, next in registry
+    /// order, would qualify. `resolve_default` must refuse rather than
+    /// silently landing on it: the repo checkout narrowed claude off the
+    /// table, but selecting codex *instead* is not the repo's call to make
+    /// (`AgentGate::disabled_only_by_repo`).
+    #[test]
+    fn the_fallback_refuses_to_silently_switch_provider_when_the_repo_disabled_the_default() {
+        let cfg = cfg_disabling("claude");
+        let err = resolve_default(&cfg).expect_err("a repo may narrow, not select");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "names the narrowed adapter: {msg}");
+        assert!(
+            msg.contains("codex"),
+            "names what it would have silently picked: {msg}"
+        );
+        assert!(msg.contains("--agent"), "says how to fix it: {msg}");
+    }
+
+    /// G2 (fix): the "would otherwise have been the default agent" refusal
+    /// must not fire when the repo-disabled adapter was never actually a
+    /// candidate -- here claude is *both* repo-disabled *and* genuinely
+    /// unready (the same PATH/PATHEXT rig `readiness_note_and_the_fallback_
+    /// skip_both_stay_covered_when_an_adapter_is_genuinely_unready` uses), so
+    /// disabling it changed nothing: codex was always going to be the
+    /// fallback either way, and the refusal's own premise would be false.
+    #[cfg(windows)]
+    #[test]
+    fn the_narrowed_refusal_does_not_fire_for_an_adapter_that_was_never_ready_anyway() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("claude.py"), "print('x')\n").expect("write");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "PATH",
+                Some(format!("{};{}", dir.path().display(), path).as_str()),
+            ),
+            ("PATHEXT", Some(".EXE;.CMD;.PY")),
+        ]);
+
+        let cfg = cfg_disabling("claude");
+        let (adapter, origin) =
+            resolve_default(&cfg).expect("codex qualifies; claude was never a real candidate");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// Final wave item 3: the same false-premise class as the test above,
+    /// but reached through `agent_bin` instead of an unresolvable `PATH`.
+    /// Claude is repo-disabled, and `agent_bin`'s own basename names codex,
+    /// not claude -- so the pre-check used to build `ClaudeAdapter::new(bin)`
+    /// (a claude adapter whose `program` actually points at a codex binary)
+    /// and ask *that* whether it is `ready()`, which can genuinely answer
+    /// yes without claude's own real binary ever being consulted at all.
+    /// Recording `repo_narrowed` from that would refuse with a false claim
+    /// ("claude would otherwise have been the default agent") over a
+    /// candidate `agent_bin_names_a_different_adapter` was always going to
+    /// refuse anyway (Medium 2). It must instead land on codex.
+    #[test]
+    fn the_narrowed_refusal_does_not_fire_when_agent_bin_names_a_different_adapter() {
+        let cfg = CtxConfig {
+            agent_bin: Some("/definitely/not/a/real/path/codex".to_string()),
+            ..cfg_disabling("claude")
+        };
+        let (adapter, origin) = resolve_default(&cfg)
+            .expect("codex qualifies; agent_bin never actually named claude's own binary");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// G: the refusal is specific to a *repo-only* disable. An operator who
+    /// disabled claude themselves (home file or environment) has already
+    /// made the choice the fallback would otherwise be accused of making for
+    /// them, so codex is picked normally, exactly as before this fix.
+    #[test]
+    fn an_operator_disable_still_falls_through_normally() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let cfg = CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        };
+
+        let (adapter, origin) = resolve_default(&cfg).expect("the operator's own choice");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// Disabling both known adapters leaves nothing to fall back to; the
+    /// error must aggregate one line per adapter naming its own reason,
+    /// reusing the gate's refusal text and each adapter's own `ready()` text
+    /// rather than inventing new wording.
+    #[test]
+    fn when_no_adapter_is_both_enabled_and_ready_the_error_names_each_one_and_why() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let cfg = CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        };
+
+        let err = resolve_default(&cfg).expect_err("both disabled");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "must name claude: {msg}");
+        assert!(msg.contains("codex"), "must name codex: {msg}");
+        assert!(
+            msg.contains("disabled"),
+            "must say why claude lost out: {msg}"
+        );
+        assert!(
+            msg.contains("not implemented yet") || msg.contains("disabled"),
+            "must say why codex lost out: {msg}"
+        );
+    }
+
+    /// The fallback is only reached when neither an explicit `--agent` nor
+    /// detection named an adapter; either one must bypass it entirely.
+    #[test]
+    fn an_explicit_or_detected_agent_still_bypasses_the_fallback_entirely() {
+        let cfg = cfg_disabling("claude");
+
+        // H3: `resolve_default`'s own fallback would *refuse* under this
+        // exact cfg (G: claude is disabled only by the repo layer, and
+        // codex would otherwise be silently picked instead) -- proving that
+        // if `select(Some("codex"), ...)` below were ever accidentally
+        // routed through the fallback instead of truly bypassing it, this
+        // test would see that refusal, not a quiet "codex" answer. The two
+        // assertions below are provably distinguishable outcomes, not the
+        // same value reached two different ways.
+        resolve_default(&cfg).expect_err("the fallback itself must refuse here");
+
+        // Explicit name: codex is still enabled by this gate and now
+        // resolves successfully, so it is selected directly without ever
+        // consulting the fallback.
+        let adapter = select(Some("codex"), &[], &cfg).expect("codex is enabled and ready");
+        assert_eq!(adapter.name(), "codex");
+
+        // Detection: an argv that names claude explicitly is refused for
+        // being disabled, not silently redirected into the fallback.
+        let cmd = vec!["/usr/bin/claude".to_string()];
+        let err = select(None, &cmd, &cfg).expect_err("claude is disabled");
+        assert!(err.to_string().contains("disabled"), "got {err}");
+    }
+
+    #[test]
+    fn resolve_default_reports_which_rule_chose_the_adapter() {
+        let mut cfg = permissive_cfg();
+        cfg.agent = Some("claude".to_string());
+        let (adapter, origin) = resolve_default(&cfg).expect("claude is configured");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::Configured);
+
+        let (adapter, origin) = resolve_default(&permissive_cfg()).expect("fallback picks one");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
     }
 
     /// The gate wrap and exec use before injecting: a command that matches no

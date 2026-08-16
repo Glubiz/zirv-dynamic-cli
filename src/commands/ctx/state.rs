@@ -30,6 +30,32 @@ pub fn repo_slug(path: &Path) -> String {
         .collect()
 }
 
+/// Filesystem-safe form of an adapter's provider slug
+/// (`AgentAdapter::provider`), for the per-provider usage files. Lowercased
+/// first, then every character outside `[a-z0-9-]` replaced with `-`, the
+/// same shape as `repo_slug` above: a provider name is a `&'static str` an
+/// adapter chose, but the rule is what guarantees it can never carry a
+/// separator or a `..` out of the state directory. An empty result (a slug
+/// of nothing but punctuation) becomes `unknown` rather than an empty file
+/// name.
+pub fn provider_slug(provider: &str) -> String {
+    let slug: String = provider
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if slug.is_empty() {
+        return "unknown".to_string();
+    }
+    slug
+}
+
 /// The state dir holds transcript paths, prompts, distilled handoffs and a
 /// decision log: on a shared machine, none of that is anyone else's business.
 /// Directories are created 0700 and files 0600. Both are no-ops on Windows,
@@ -67,27 +93,72 @@ pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-#[cfg(unix)]
-pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `mode` applies only when the file is created, so writing over one that
-    // already exists would leave whatever permissions it had -- an operator
-    // who ran `touch report.md` first would get a world-readable report. Fail
-    // rather than write private content somewhere that cannot be made private.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents.as_bytes())
+/// A unique temp sibling of `target`, in the *same* directory so the `rename`
+/// in `write_private` is a same-filesystem atomic replace. The pid plus a
+/// process-local counter keeps two concurrent writers -- or two writes from
+/// one process -- from ever colliding on the same temp path.
+fn temp_sibling(target: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let name = match target.file_name().and_then(|n| n.to_str()) {
+        Some(base) => format!(".{base}.tmp-{pid}-{n}"),
+        None => format!(".tmp-{pid}-{n}"),
+    };
+    match target.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
 }
 
-#[cfg(not(unix))]
+/// Writes `contents` to `path` atomically: a temp sibling is written in full
+/// and then `rename`d over the target (atomic on the same filesystem, on both
+/// Windows and Unix), so a concurrent reader ever sees either the whole old
+/// file or the whole new one -- never the zero-length truncation window a
+/// plain create-truncate-write leaves. That window was a real hazard: a
+/// session refreshing its registry record while a dashboard `sessions::list`
+/// read it could have the record read as absent (and its pending nudge
+/// swept).
+///
+/// On Unix the file is 0600, forced on the fresh temp regardless of umask,
+/// so writing over an operator's pre-existing world-readable file still
+/// yields a private one.
 pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    use std::io::Write;
+
+    let tmp = temp_sibling(path);
+
+    // Write (and close) the temp file first; the handle must be dropped before
+    // the rename on Windows.
+    let write_tmp = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(contents.as_bytes())?;
+        file.flush()
+    };
+
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// How many files the per-session directories keep. High enough that no live
@@ -158,6 +229,26 @@ impl StateDir {
         self.0.join("optimize")
     }
 
+    /// Inter-agent mailbox: `<state>/mail/<repo_slug>/...`. See
+    /// `super::mail` for the storage layout and message format.
+    pub fn mail(&self) -> PathBuf {
+        self.0.join("mail")
+    }
+
+    /// Cross-session memory bank: `<state>/memory/<repo_slug>/...`. See
+    /// `super::memory` for the storage layout and entry format.
+    pub fn memory(&self) -> PathBuf {
+        self.0.join("memory")
+    }
+
+    /// The dashboard's own state: today, only the spawn-request capability-
+    /// token directories `super::dash::spawnreq::request_dir_for` names
+    /// under `<state>/dash/<dash_short>-<token>/requests`. A future roster
+    /// file (`super::dash::roster`) hangs off this same root.
+    pub fn dash(&self) -> PathBuf {
+        self.0.join("dash")
+    }
+
     /// Short on purpose: unix socket paths are capped near 104 bytes on macOS.
     pub fn sockets(&self) -> PathBuf {
         self.0.join("s")
@@ -173,10 +264,28 @@ impl StateDir {
         self.0.join("usage.json")
     }
 
+    /// Per-provider usage-window state: `<state>/usage-<provider>.json`. The
+    /// windows are per *account*, and one machine can hold accounts with two
+    /// different vendors at once (an Anthropic subscription and an OpenAI
+    /// one), which the single `usage()` file above cannot represent. The
+    /// slug is sanitised by [`provider_slug`], so no provider name can name a
+    /// path outside this directory.
+    pub fn usage_for(&self, provider: &str) -> PathBuf {
+        self.0
+            .join(format!("usage-{}.json", provider_slug(provider)))
+    }
+
     /// Per-transcript scoring checkpoints. The Stop hook is a fresh process on
     /// every turn, so the only place it can leave its parse position is a file.
     pub fn scoring(&self) -> PathBuf {
         self.0.join("scoring")
+    }
+
+    /// Session registry: `<state>/sessions/<short8>.json`, one file per live
+    /// supervisor. See `super::sessions` for the record format and the short
+    /// id derivation, which matches `socket_for`'s own exactly.
+    pub fn sessions(&self) -> PathBuf {
+        self.0.join("sessions")
     }
 
     /// First 8 hex characters of the session id keep the socket path short.
@@ -365,10 +474,98 @@ mod tests {
         );
     }
 
+    /// MED-2: `write_private` is atomic (temp sibling + rename), so a reader
+    /// racing a rewrite never observes the zero-length truncation window a
+    /// plain `std::fs::write` leaves. Hammer a rewrite in one thread while
+    /// another reads and asserts the file, when present, is always one of the
+    /// two whole contents -- never empty or partial.
+    #[test]
+    fn concurrent_reads_of_a_rewritten_file_never_see_a_partial_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("record.json");
+        let a = "A".repeat(64 * 1024);
+        let b = "B".repeat(64 * 1024);
+        let (a_len, b_len) = (a.len(), b.len());
+        // Seed one so the reader always finds a file to read.
+        write_private(&path, &a).expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            while !reader_stop.load(Ordering::Relaxed) {
+                if let Ok(contents) = std::fs::read_to_string(&reader_path) {
+                    assert!(
+                        contents.len() == a_len || contents.len() == b_len,
+                        "a reader must never observe a partial/empty file: saw {} bytes",
+                        contents.len()
+                    );
+                }
+            }
+        });
+
+        for i in 0..1000 {
+            let contents = if i % 2 == 0 { &a } else { &b };
+            write_private(&path, contents).expect("write");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader
+            .join()
+            .expect("reader thread panicked on a partial read");
+    }
+
     #[test]
     fn the_usage_file_hangs_off_the_state_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.usage(), tmp.path().join("usage.json"));
+    }
+
+    #[test]
+    fn the_per_provider_usage_file_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(
+            state.usage_for("anthropic"),
+            tmp.path().join("usage-anthropic.json")
+        );
+        assert_eq!(
+            state.usage(),
+            tmp.path().join("usage.json"),
+            "the legacy global file is untouched"
+        );
+    }
+
+    /// A provider slug names a file, so it must never be able to name a
+    /// path: every separator and every `.` is folded to `-`, so the result
+    /// always stays a single component inside the state root.
+    #[test]
+    fn a_provider_slug_can_never_escape_the_state_directory() {
+        assert_eq!(provider_slug("anthropic"), "anthropic");
+        assert_eq!(provider_slug("OpenAI"), "openai");
+        assert_eq!(provider_slug("../../etc/passwd"), "------etc-passwd");
+        assert_eq!(provider_slug("a b\\c"), "a-b-c");
+        assert_eq!(provider_slug(""), "unknown");
+        assert_eq!(provider_slug("..."), "---");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let escaped = state.usage_for("../../../etc/passwd");
+        assert_eq!(
+            escaped.parent(),
+            Some(tmp.path()),
+            "still a direct child of the state root: {}",
+            escaped.display()
+        );
+    }
+
+    #[test]
+    fn the_dash_dir_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.dash(), tmp.path().join("dash"));
     }
 }

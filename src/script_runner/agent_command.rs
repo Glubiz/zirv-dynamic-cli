@@ -142,22 +142,7 @@ impl AgentCommand {
         if code == 0 {
             return Ok(());
         }
-        Err(describe_exit(code))
-    }
-}
-
-/// The supervisor reports its own outcomes through the same `i32` the agent's
-/// exit code arrives on, so "exited with code 75" read as something the agent
-/// did rather than as zirv giving up.
-fn describe_exit(code: i32) -> String {
-    match code {
-        crate::commands::ctx::exec::EXIT_ROT_EXHAUSTED => {
-            "the session kept rotting and the restart budget ran out".to_string()
-        }
-        crate::commands::ctx::exec::EXIT_TIMEOUT => {
-            "the supervised run hit its wall-clock timeout".to_string()
-        }
-        other => format!("exited with code {other}"),
+        Err(crate::commands::ctx::exec::describe_exit(code))
     }
 }
 
@@ -184,7 +169,7 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
     // is what surfaces an adapter's own "not ready" error (e.g. codex) before any
     // supervision starts, and lets the first spawn's argv be built from the exact
     // same `headless_cmd` restarts use.
-    adapters::select(Some(agent), &[], cfg.agent_bin.as_deref()).map_err(|e| e.to_string())?;
+    adapters::select(Some(agent), &[], &cfg).map_err(|e| e.to_string())?;
 
     let session = SessionId::new_v4();
     // No argv: the prompt travels as data and `run_with` builds the launch
@@ -339,19 +324,38 @@ mod tests {
         assert!(err.contains("codex"), "got {err}");
     }
 
-    /// The supervisor reports its own outcomes on the same `i32` the agent's
-    /// exit code arrives on, so "exited with code 75" read as something the
-    /// agent did rather than as zirv giving up.
-    #[test]
-    fn the_supervisors_own_exit_codes_read_as_outcomes_not_agent_failures() {
+    /// Task A6: `validate()` stays registry-only (it only checks the agent
+    /// name against `adapters::all`, never loads `.settings.toml`), so a step
+    /// naming a disabled agent must still pass validation and only fail once
+    /// `execute()` actually tries to run it, through the same `select` gate
+    /// `run_supervised` calls.
+    #[tokio::test]
+    async fn a_step_naming_a_disabled_agent_fails_at_execution_not_at_load() {
+        let mut cmd = agent_step("go");
+        cmd.agent = "claude".to_string();
         assert!(
-            describe_exit(crate::commands::ctx::exec::EXIT_ROT_EXHAUSTED)
-                .contains("restart budget")
+            cmd.validate().is_ok(),
+            "validate is registry-only and must not need .settings.toml"
         );
-        assert!(
-            describe_exit(crate::commands::ctx::exec::EXIT_TIMEOUT).contains("wall-clock timeout")
-        );
-        assert_eq!(describe_exit(1), "exited with code 1");
+
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let mut context = HashMap::new();
+        context.insert("cwd".to_string(), tmp.path().display().to_string());
+        let err = cmd
+            .execute(&mut context)
+            .await
+            .expect_err("a disabled agent must fail at execution");
+        assert!(err.contains("claude"), "got {err}");
+        assert!(err.contains("disabled"), "got {err}");
     }
 
     #[tokio::test]

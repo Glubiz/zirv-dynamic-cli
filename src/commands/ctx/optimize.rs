@@ -786,6 +786,12 @@ pub fn evidence_from_transcripts(
             token_usage: true,
             turn_signal: true,
             system_prompt: false,
+            // Not read by `rot::score_events` (item D's fix lives in
+            // score.rs's own callers, not here), and `events` is already
+            // parsed through the real adapter above -- an adapter with no
+            // real parsing already scores an empty stream as healthy, which
+            // is the correct "not rotted" answer for this evidence count.
+            events: true,
         };
         if rot::score_events(&events, caps, cfg).verdict == Verdict::Restart {
             evidence.rot_sessions += 1;
@@ -944,6 +950,83 @@ pub fn friction_findings(evidence: &Evidence, cfg: &OptimizeConfig) -> Vec<Findi
     }
 
     findings
+}
+
+// N7: a read-only summary of this repo's memory bank for the report's own
+// "Memory bank" section. Deliberately NOT folded into `collect_surfaces` or
+// `judgment_prompt`: a memory entry's key or body must never reach the
+// judgment model's prompt, so this is read straight from `memory::list` and
+// rendered to counts-and-ages text right here, kept entirely separate from
+// every surface/evidence path the model call above actually sees.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemorySummary {
+    pub count: usize,
+    pub total_bytes: usize,
+    /// Age in days of the oldest/newest entry by its `Written` stamp. `None`
+    /// when the bank is empty.
+    pub oldest_written_days: Option<u64>,
+    pub newest_written_days: Option<u64>,
+    /// Entries whose `Verified` stamp is more than 30 days old.
+    pub stale_count: usize,
+    /// How many entries share a key with an earlier one in the listing.
+    /// `remember` already de-duplicates on write, so this is normally zero;
+    /// it stays a defensive check rather than an assumption.
+    pub duplicate_keys: usize,
+}
+
+const MEMORY_STALE_SECS: u64 = 30 * 86_400;
+
+/// Read-only: only ever calls `memory::list`, never `memory::remember` or
+/// any other write path, matching the report-only guarantee the rest of
+/// this module already holds itself to.
+pub fn memory_bank_summary(state: &StateDir, slug: &str, now: u64) -> MemorySummary {
+    let entries = super::memory::list(state, slug).unwrap_or_default();
+    let mut summary = MemorySummary {
+        count: entries.len(),
+        ..MemorySummary::default()
+    };
+    let mut seen_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (_, entry) in &entries {
+        summary.total_bytes += entry.body.len();
+        if !seen_keys.insert(entry.key.as_str()) {
+            summary.duplicate_keys += 1;
+        }
+        let written_days = now.saturating_sub(entry.written) / 86_400;
+        summary.oldest_written_days = Some(
+            summary
+                .oldest_written_days
+                .map_or(written_days, |d| d.max(written_days)),
+        );
+        summary.newest_written_days = Some(
+            summary
+                .newest_written_days
+                .map_or(written_days, |d| d.min(written_days)),
+        );
+        if now.saturating_sub(entry.verified) > MEMORY_STALE_SECS {
+            summary.stale_count += 1;
+        }
+    }
+    summary
+}
+
+/// Renders the "Memory bank" section: counts and ages only, never a key or a
+/// body. Appended to the report text separately from `render_report`
+/// (never folded into its findings), so the never-quoted guarantee holds
+/// regardless of what `render_report` does with its own inputs.
+pub fn render_memory_section(summary: &MemorySummary) -> String {
+    if summary.count == 0 {
+        return "## Memory bank\n\nEmpty.\n\n".to_string();
+    }
+    format!(
+        "## Memory bank\n\n{count} entries, {bytes} bytes total, oldest {oldest}d, newest \
+         {newest}d, {stale} stale (verified over 30d ago), {dupes} duplicate keys.\n\n",
+        count = summary.count,
+        bytes = summary.total_bytes,
+        oldest = summary.oldest_written_days.unwrap_or(0),
+        newest = summary.newest_written_days.unwrap_or(0),
+        stale = summary.stale_count,
+        dupes = summary.duplicate_keys,
+    )
 }
 
 pub const OPTIMIZE_PROMPT_VERSION: &str = "v1";
@@ -1266,7 +1349,12 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     // A findings run must never fail on a bad config: a malformed ctx.toml or
     // a forbidden key degrades to defaults instead, same spirit as the model
-    // call below.
+    // call below. The gate is the one exception: it does not fall back to
+    // `CtxConfig::default()`'s permissive `AgentGate`, because that would let
+    // a malformed *repo* `.settings.toml` silently void an *operator*
+    // disable and launch the agent the operator turned off. Falling back to
+    // `AgentGate::load_operator_only` keeps the operator's policy in force
+    // even when the rest of the config could not be read.
     let cfg = match CtxConfig::load(repo, env) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -1274,7 +1362,10 @@ pub fn run_with<W: Write>(
                 w,
                 "zirv ctx optimize: config load failed, using defaults ({e})"
             )?;
-            CtxConfig::default()
+            CtxConfig {
+                agents: crate::settings::AgentGate::load_operator_only(env),
+                ..CtxConfig::default()
+            }
         }
     };
     let home = crate::utils::home_dir().ok();
@@ -1284,11 +1375,7 @@ pub fn run_with<W: Write>(
     // call below, the same adapter `score`/`exec`/`wrap` would use to parse
     // this agent's transcripts: a future codex parser needs no separate
     // wiring in this verb.
-    let adapter = adapters::select(
-        args.agent.as_deref().or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    );
+    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg);
 
     let sample = args.sessions.unwrap_or(cfg.optimize.sessions_sampled);
     let transcripts = window::projects_root()
@@ -1330,7 +1417,7 @@ pub fn run_with<W: Write>(
         match &adapter {
             Ok(adapter) => {
                 let model = if cfg.optimize.model.is_empty() {
-                    cfg.handoff.model.clone()
+                    handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref())
                 } else {
                     cfg.optimize.model.clone()
                 };
@@ -1351,7 +1438,16 @@ pub fn run_with<W: Write>(
         }
     }
 
-    let report = render_report(&findings, &evidence, model_used);
+    let mut report = render_report(&findings, &evidence, model_used);
+    // N7: appended, not folded into `render_report`'s own findings -- see
+    // `MemorySummary`'s doc comment for why its content stays out of every
+    // surface/evidence path the judgment model call above actually sees.
+    let memory_slug = repo_slug(repo);
+    let memory_summary = state_for_evidence
+        .as_ref()
+        .map(|state| memory_bank_summary(state, &memory_slug, now_secs()))
+        .unwrap_or_default();
+    report.push_str(&render_memory_section(&memory_summary));
     write!(w, "{report}")?;
 
     let stored = store_report(env, repo, &report);
@@ -1570,6 +1666,10 @@ mod tests {
 
     impl AgentAdapter for SentinelAdapter {
         fn name(&self) -> &'static str {
+            "sentinel"
+        }
+
+        fn provider(&self) -> &'static str {
             "sentinel"
         }
 
@@ -3193,30 +3293,45 @@ mod tests {
         );
     }
 
+    /// Item 9: `fake-optimizer.sh` reads only stdin (`prompt=$(cat)`), never
+    /// its own argv, so it stands in for either adapter's distiller call
+    /// unchanged -- `ZIRV_CTX_AGENT_BIN` is the one thing that differs. The
+    /// report-only guarantee this test exists to prove is named per-adapter
+    /// in CLAUDE.md now (`ClaudeAdapter::distiller_cmd`'s `--disallowedTools`
+    /// pin and `CodexAdapter::distiller_cmd`'s `--sandbox read-only` pin are
+    /// different flags backing the same promise), so both get the same
+    /// coverage here rather than only claude's.
     #[test]
     fn the_verb_never_modifies_an_analysed_file() {
-        let (tmp, home, repo) = fixture_tree();
-        let state = tmp.path().join("state");
-        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
-        let before_repo = tree_snapshot(&repo);
-        let before_home = tree_snapshot(&home);
+        for agent in ["claude", "codex"] {
+            let (tmp, home, repo) = fixture_tree();
+            let state = tmp.path().join("state");
+            let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+            let before_repo = tree_snapshot(&repo);
+            let before_home = tree_snapshot(&home);
 
-        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let args = OptimizeArgs {
-            agent: Some("claude".to_string()),
-            no_model: false,
-            sessions: Some(0),
-            out: None,
-        };
-        let mut out = Vec::new();
-        run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let args = OptimizeArgs {
+                agent: Some(agent.to_string()),
+                no_model: false,
+                sessions: Some(0),
+                out: None,
+            };
+            let mut out = Vec::new();
+            run_with(&args, &mut out, &repo, &|k| env.get(k).cloned())
+                .unwrap_or_else(|e| panic!("{agent}: runs: {e}"));
 
-        assert_eq!(before_repo, tree_snapshot(&repo), "optimize is report-only");
-        assert_eq!(
-            before_home,
-            tree_snapshot(&home),
-            "and that includes the global layer"
-        );
+            assert_eq!(
+                before_repo,
+                tree_snapshot(&repo),
+                "{agent}: optimize is report-only"
+            );
+            assert_eq!(
+                before_home,
+                tree_snapshot(&home),
+                "{agent}: and that includes the global layer"
+            );
+        }
     }
 
     #[test]
@@ -3226,10 +3341,10 @@ mod tests {
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        // SAFETY: CI runs tests single-threaded.
-        unsafe {
-            std::env::set_var("FAKE_OPTIMIZER_MODE", "fail");
-        }
+        // NEW-1: a guard, so a failing assertion below cannot leave
+        // `FAKE_OPTIMIZER_MODE=fail` set for every later test.
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_OPTIMIZER_MODE", Some("fail"))]);
         let args = OptimizeArgs {
             agent: Some("claude".to_string()),
             no_model: false,
@@ -3238,9 +3353,6 @@ mod tests {
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
-        unsafe {
-            std::env::remove_var("FAKE_OPTIMIZER_MODE");
-        }
 
         assert_eq!(code, 0, "a dead model is not a failed analysis");
         let printed = String::from_utf8(out).expect("utf8");
@@ -3262,10 +3374,11 @@ mod tests {
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        // SAFETY: CI runs tests single-threaded.
-        unsafe {
-            std::env::set_var("FAKE_OPTIMIZER_PROMPT_LOG", &log);
-        }
+        // NEW-1: a guard; the old restore (if any) sat behind assertions.
+        let _prompt_log = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_OPTIMIZER_PROMPT_LOG",
+            log.to_str(),
+        )]);
         let args = OptimizeArgs {
             agent: Some("claude".to_string()),
             no_model: true,
@@ -3274,9 +3387,6 @@ mod tests {
         };
         let mut out = Vec::new();
         run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
-        unsafe {
-            std::env::remove_var("FAKE_OPTIMIZER_PROMPT_LOG");
-        }
 
         assert!(!log.exists(), "--no-model must not spawn the model at all");
     }
@@ -3391,6 +3501,56 @@ mod tests {
         assert!(
             printed.to_lowercase().contains("config load failed"),
             "the report admits the config could not be read: {printed}"
+        );
+    }
+
+    /// Review finding 1: a malformed *repo* `.settings.toml` makes
+    /// `CtxConfig::load` fail, and the fallback used to be
+    /// `CtxConfig::default()` -- whose gate is permissive. That let one bad
+    /// byte in the repo's own settings file silently void an *operator*
+    /// disable and launch (or, here, parse transcripts through) the agent
+    /// the operator turned off. The fallback gate must come from
+    /// `AgentGate::load_operator_only` instead, so the operator's disable
+    /// still holds even though the repo layer could not be read.
+    #[test]
+    fn a_malformed_repo_settings_file_does_not_void_an_operator_disable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(
+            home.join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n",
+        )
+        .expect("write");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir zirv");
+        std::fs::write(repo.join(".zirv/.settings.toml"), "not [ valid toml").expect("write");
+
+        let state = tmp.path().join("state");
+        let env = verb_env(&state, &fixture("fake-optimizer.sh"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: true,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+
+        assert_eq!(
+            code, 0,
+            "a malformed settings file must not fail the command"
+        );
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("no adapter available"),
+            "claude must not have been selected: {printed}"
+        );
+        assert!(
+            printed.contains("claude") && printed.to_lowercase().contains("disabled"),
+            "the operator's disable must still be reported: {printed}"
         );
     }
 
@@ -3692,6 +3852,119 @@ mod tests {
                 1_800_000_000
             )
             .is_none()
+        );
+    }
+
+    // N7: the report's own memory-bank summary block.
+
+    fn seed_memory_entry(
+        state: &StateDir,
+        slug: &str,
+        key: &str,
+        written: u64,
+        verified: u64,
+        body: &str,
+    ) {
+        let cfg = CtxConfig::default();
+        let entry = crate::commands::ctx::memory::Entry {
+            key: key.to_string(),
+            written_by: "claude".to_string(),
+            written,
+            verified,
+            source: "explicit".to_string(),
+            body: body.to_string(),
+        };
+        crate::commands::ctx::memory::remember(state, slug, &entry, &cfg).expect("seed memory");
+    }
+
+    #[test]
+    fn an_empty_bank_summarises_as_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let summary = memory_bank_summary(&state, "-work-repo", 1_800_000_000);
+        assert_eq!(summary, MemorySummary::default());
+        assert_eq!(
+            render_memory_section(&summary),
+            "## Memory bank\n\nEmpty.\n\n"
+        );
+    }
+
+    #[test]
+    fn the_bank_summary_reports_counts_ages_staleness_and_duplicates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let now = 1_800_000_000u64;
+
+        seed_memory_entry(
+            &state,
+            "-work-repo",
+            "fresh-fact",
+            now - 2 * 86_400,
+            now - 2 * 86_400,
+            "a short fact",
+        );
+        seed_memory_entry(
+            &state,
+            "-work-repo",
+            "stale-fact",
+            now - 40 * 86_400,
+            now - 40 * 86_400,
+            "an older fact",
+        );
+
+        let summary = memory_bank_summary(&state, "-work-repo", now);
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.stale_count, 1, "only the one verified >30d ago");
+        assert_eq!(summary.newest_written_days, Some(2));
+        assert_eq!(summary.oldest_written_days, Some(40));
+        assert_eq!(summary.duplicate_keys, 0, "remember never duplicates a key");
+        assert!(summary.total_bytes > 0);
+
+        let text = render_memory_section(&summary);
+        assert!(text.contains("2 entries"), "got {text}");
+        assert!(text.contains("1 stale"), "got {text}");
+    }
+
+    /// The report must say how big the bank is without ever quoting what is
+    /// in it: a memory entry's body is repository-scoped, cross-session
+    /// content that has nothing to do with what this report is reviewing.
+    #[test]
+    fn the_optimize_report_summarises_the_bank_without_quoting_it() {
+        let (tmp, home, repo) = fixture_tree();
+        let state_root = tmp.path().join("state");
+        let state = StateDir::from_root(state_root.clone());
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let distinctive_body = "the staging DB creds live in a very particular vault path";
+        seed_memory_entry(
+            &state,
+            &slug,
+            "staging-db-creds",
+            1_700_000_000,
+            1_700_000_000,
+            distinctive_body,
+        );
+
+        let env = verb_env(&state_root, &fixture("fake-optimizer.sh"));
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let args = OptimizeArgs {
+            agent: Some("claude".to_string()),
+            no_model: true,
+            sessions: Some(0),
+            out: None,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, &repo, &|k| env.get(k).cloned()).expect("runs");
+        let printed = String::from_utf8(out).expect("utf8");
+
+        assert!(printed.contains("Memory bank"), "got {printed}");
+        assert!(printed.contains("1 entries"), "got {printed}");
+        assert!(
+            !printed.contains(distinctive_body),
+            "the body must never be quoted in the report: {printed}"
+        );
+        assert!(
+            !printed.contains("staging-db-creds"),
+            "the key must never be quoted either: {printed}"
         );
     }
 }

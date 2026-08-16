@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, ScoreConfig, env_from_process};
-use super::event::input_hash;
+use super::event::{SessionId, SessionRef, input_hash};
 use super::rot::{self, RotState, Score};
 use super::state::StateDir;
 use super::supervise::Watcher;
@@ -23,11 +23,27 @@ pub struct ScoreArgs {
 
 /// Read a whole transcript, parse it with the selected adapter, score it. The
 /// reference every incremental pass has to agree with.
+///
+/// D: `Err` when the adapter cannot produce events at all
+/// (`capabilities().events == false`, codex today): scoring an always-empty
+/// parse would compute `Score { score: 0, verdict: Healthy, .. }`, which
+/// reads to every caller as a genuine "this session is healthy" rather than
+/// the honest "there is no data to score this session with" -- exactly the
+/// distinction `score::cached_score`'s own doc comment already draws for a
+/// missing transcript. `rot.rs` stays pure and is never told about this; the
+/// refusal happens here, before a fabricated `Score` is ever built.
 fn full_score(
     adapter: &dyn AgentAdapter,
     transcript: &Path,
     cfg: &ScoreConfig,
 ) -> CtxResult<Score> {
+    if !adapter.capabilities().events {
+        return Err(format!(
+            "{} has no verified event parsing; nothing to score",
+            adapter.name()
+        )
+        .into());
+    }
     let jsonl = std::fs::read_to_string(transcript)
         .map_err(|e| format!("{}: {e}", transcript.display()))?;
     Ok(rot::score_events(
@@ -46,11 +62,7 @@ pub fn score_transcript(
     env: EnvLookup<'_>,
 ) -> CtxResult<Score> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(
-        agent.or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    )?;
+    let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     full_score(adapter.as_ref(), transcript, &cfg.score)
 }
 
@@ -92,12 +104,23 @@ impl IncrementalScorer {
     }
 
     /// `None` when the transcript has not changed since the last poll, which
-    /// leaves the caller's previous verdict standing.
+    /// leaves the caller's previous verdict standing. Also `None` -- rather
+    /// than a `Score` folded from an always-empty parse -- for an adapter
+    /// with no verified event parsing at all (`capabilities().events ==
+    /// false`, codex today): the alternative, feeding zero real events
+    /// through the fold every poll, reads to every caller (in particular
+    /// `exec`/`loop`'s own rot-restart gate, which checks `verdict ==
+    /// Restart`) as a genuine `Healthy`/`0`, not the honest "no data" it
+    /// actually is. See `full_score`'s matching guard, which this mirrors
+    /// for the bounded-state fold path that never calls it.
     pub fn poll(
         &mut self,
         adapter: &dyn AgentAdapter,
         cfg: &ScoreConfig,
     ) -> CtxResult<Option<Score>> {
+        if !adapter.capabilities().events {
+            return Ok(None);
+        }
         let Some(appended) = self.watcher.read_appended()? else {
             return Ok(None);
         };
@@ -221,18 +244,25 @@ pub fn score_transcript_cached(
     env: EnvLookup<'_>,
 ) -> CtxResult<Score> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(
-        agent.or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    )?;
+    let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     let Ok(state_dir) = StateDir::resolve(env) else {
         return full_score(adapter.as_ref(), transcript, &cfg.score);
     };
+    score_with_checkpoint(&state_dir, transcript, adapter.as_ref(), &cfg.score)
+}
 
-    let path = checkpoint_path(&state_dir, transcript);
-    let fingerprint = fingerprint(adapter.as_ref(), &cfg.score);
-    let mut scorer = match load_checkpoint(&path, transcript, fingerprint, &cfg.score) {
+/// The body of [`score_transcript_cached`], against a state dir the caller
+/// already has. Split out so the dashboard's [`cached_score`] reaches the same
+/// incremental fold without re-resolving the state dir from the environment.
+fn score_with_checkpoint(
+    state_dir: &StateDir,
+    transcript: &Path,
+    adapter: &dyn AgentAdapter,
+    cfg: &ScoreConfig,
+) -> CtxResult<Score> {
+    let path = checkpoint_path(state_dir, transcript);
+    let fingerprint = fingerprint(adapter, cfg);
+    let mut scorer = match load_checkpoint(&path, transcript, fingerprint, cfg) {
         Some(checkpoint) => IncrementalScorer::resuming(
             transcript.to_path_buf(),
             checkpoint.offset,
@@ -245,11 +275,212 @@ pub fn score_transcript_cached(
     // A poll that reports nothing new cannot be answered from a checkpoint
     // alone (an unreadable or empty transcript lands here too), so it falls
     // back rather than guessing.
-    let Ok(Some(score)) = scorer.poll(adapter.as_ref(), &cfg.score) else {
-        return full_score(adapter.as_ref(), transcript, &cfg.score);
+    let Ok(Some(score)) = scorer.poll(adapter, cfg) else {
+        return full_score(adapter, transcript, cfg);
     };
     save_checkpoint(&path, transcript, fingerprint, &scorer);
     Ok(score)
+}
+
+/// What a transcript looked like when its score was last computed. `mtime`
+/// alone can miss an in-place rewrite inside one filesystem clock tick and
+/// `len` alone misses an equal-length one, so the pair is the key -- both come
+/// out of the single `metadata` call the fast path is allowed to make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+fn stamp_of(transcript: &Path) -> Option<TranscriptStamp> {
+    let meta = std::fs::metadata(transcript).ok()?;
+    Some(TranscriptStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CachedScore {
+    /// Where this session's transcript was resolved to. Kept even when
+    /// nothing has been written there yet: resolving it is the expensive part
+    /// (`ClaudeAdapter::transcript_path` walks the agent's projects tree when
+    /// its slug rule misses), and a stat against a path that does not exist
+    /// costs nothing.
+    transcript: PathBuf,
+    /// The stamp that was actually scored, and its score. `None` until the
+    /// transcript first becomes readable.
+    scored: Option<(TranscriptStamp, u32)>,
+    /// Polls answered off this path since it was resolved, counted only while
+    /// the transcript is missing -- see [`RESOLVE_RETRY_POLLS`].
+    polls_since_resolve: u32,
+    /// Item 12: set once this session's adapter is known to have no verified
+    /// event parsing at all (`capabilities().events == false`, codex
+    /// today), the same fact `full_score` itself refuses on. Terminal, not
+    /// retried like `polls_since_resolve`: an adapter's capabilities do not
+    /// change between polls, so no future poll -- no matter how many times
+    /// the transcript's own stamp changes -- will ever produce a score for
+    /// it. Without this, a codex pane's `scored` stayed permanently `None`
+    /// (`full_score`'s own `Err` collapses to `None` here), which never
+    /// matches any `stamp_of` reading, so every single poll fell all the way
+    /// through to `CtxConfig::load` + `adapters::select` +
+    /// `transcript_path` again -- at the dashboard's refresh rate, forever,
+    /// for a fact already known for good on the very first poll.
+    eventless: bool,
+}
+
+/// How many polls a session whose transcript has not appeared yet reuses its
+/// resolved path before resolving again. Resolving every poll would put a
+/// directory walk per pane on a once-a-second render path; never resolving
+/// again would strand the rare session whose transcript lands somewhere the
+/// first resolution did not predict. At the dashboard's refresh rate this is
+/// about ten seconds.
+const RESOLVE_RETRY_POLLS: u32 = 10;
+
+/// Process-local, keyed by session id. `OnceLock` rather than a `lazy_static`
+/// dependency, and a poisoned lock is recovered with `into_inner` (the same
+/// thing `wrap` does with its stdout lock): a panic in another thread must not
+/// take the sidebar's scores down with it.
+fn score_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedScore>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, CachedScore>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// How many times [`cached_score`] has actually re-parsed a transcript, as
+/// opposed to answering from the cache. Only the tests read it, but it is
+/// counted unconditionally: an atomic increment on the recompute path costs
+/// nothing next to the parse it is counting, and a `cfg(test)`-only counter
+/// would measure a different code path than the one that ships.
+static SCORE_RECOMPUTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times [`cached_score`] has fallen all the way through the fast
+/// path to `CtxConfig::load` + `adapters::select` (+, for a scorable
+/// adapter, `transcript_path`) -- the expensive resolution `RESOLVE_RETRY_
+/// POLLS` and the eventless-adapter cache (item 12) both exist to bound.
+/// Same test-only purpose and unconditional-counting rationale as
+/// `SCORE_RECOMPUTES`.
+static RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// This session's current rot score, recomputed only when its transcript has
+/// changed since the last call. Built for the dashboard sidebar: up to nine
+/// panes polling about once a second, where a full parse per pane per second
+/// would be far too expensive.
+///
+/// The steady state is a single `metadata` call: the resolved transcript path
+/// is cached with the score, and an unchanged (mtime, len) answers straight
+/// from memory. A changed transcript falls into the same incremental fold the
+/// Stop hook uses ([`score_transcript_cached`]), which costs the appended
+/// bytes rather than the session. Nothing here spawns, waits, or touches the
+/// network.
+///
+/// `None` means *unknown*, never *healthy*: no transcript yet, a transcript
+/// that cannot be read, an unresolvable config or agent. A renderer must show
+/// that as `--`, since "healthy" and "unknown" are opposite things to tell an
+/// operator. A session whose agent has not written its first line yet still
+/// picks its score up once it does: the resolved path is stat-ed on every
+/// poll, and re-resolved every [`RESOLVE_RETRY_POLLS`] polls while nothing is
+/// there.
+///
+/// Consumed by the dashboard: the header renders the focused pane's score and
+/// every sidebar row carries its own, both polled on the facts throttle.
+pub fn cached_score(state: &StateDir, repo: &Path, session_id: &str) -> Option<u32> {
+    cached_score_with(state, repo, session_id, &env_from_process())
+}
+
+fn cached_score_with(
+    state: &StateDir,
+    repo: &Path,
+    session_id: &str,
+    env: EnvLookup<'_>,
+) -> Option<u32> {
+    let cached = {
+        let cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(session_id).cloned()
+    };
+
+    if let Some(entry) = &cached {
+        if entry.eventless {
+            // Item 12: terminal. Not even a `stamp_of` stat is worth paying
+            // for a session that can never be scored.
+            return None;
+        }
+        match stamp_of(&entry.transcript) {
+            // The whole fast path: one stat, no config load, no parse.
+            Some(stamp) => {
+                if let Some((scored, score)) = &entry.scored
+                    && *scored == stamp
+                {
+                    return Some(*score);
+                }
+            }
+            // Nothing written there (yet, or any more). Keep answering
+            // "unknown" off the path already resolved rather than resolving
+            // it again on every frame.
+            None => {
+                let polls = entry.polls_since_resolve.saturating_add(1);
+                if polls < RESOLVE_RETRY_POLLS {
+                    let mut cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(live) = cache.get_mut(session_id) {
+                        live.polls_since_resolve = polls;
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
+    RESOLVE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cfg = CtxConfig::load(repo, env).ok()?;
+    let adapter = adapters::select(cfg.agent.as_deref(), &[], &cfg).ok()?;
+
+    // Item 12: an eventless adapter (`capabilities().events == false`,
+    // codex today) never produces a score, on this transcript or any other
+    // -- `transcript_path` is not even worth resolving for it. Cached as
+    // terminal so every later poll returns off this cheap check above
+    // rather than reaching this same conclusion, the expensive way, again.
+    if !adapter.capabilities().events {
+        let mut cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
+            session_id.to_string(),
+            CachedScore {
+                transcript: PathBuf::new(),
+                scored: None,
+                polls_since_resolve: 0,
+                eventless: true,
+            },
+        );
+        return None;
+    }
+
+    let transcript = adapter.transcript_path(&SessionRef {
+        id: SessionId::parse(session_id),
+        cwd: repo.to_path_buf(),
+    });
+    // Stamped before the parse, so a line appended while it runs invalidates
+    // this entry on the next poll instead of being missed forever.
+    let scored = match stamp_of(&transcript) {
+        Some(stamp) => score_with_checkpoint(state, &transcript, adapter.as_ref(), &cfg.score)
+            .ok()
+            .map(|score| {
+                SCORE_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (stamp, score.score)
+            }),
+        None => None,
+    };
+
+    let mut cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        session_id.to_string(),
+        CachedScore {
+            transcript,
+            eventless: false,
+            scored: scored.clone(),
+            polls_since_resolve: 0,
+        },
+    );
+    scored.map(|(_, score)| score)
 }
 
 pub fn run_with<W: Write>(
@@ -309,6 +540,60 @@ mod tests {
             dir.join("state").display().to_string(),
         )]
         .into()
+    }
+
+    /// D: an adapter with no verified event parsing (`capabilities().events
+    /// == false`, codex today) must refuse rather than compute a `Score`
+    /// from an always-empty parse -- that would read to every caller as a
+    /// genuine `Healthy`/`0`, not the honest "no data" it actually is. A
+    /// transcript with real, healthy-looking content is used deliberately:
+    /// the point is that `full_score` refuses *before* it ever gets to
+    /// parsing, on the adapter alone, not because this particular file
+    /// happened to be empty or unreadable.
+    #[test]
+    fn full_score_refuses_an_adapter_with_no_event_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = write_transcript(dir.path(), 12, true, 20_000);
+        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let err = full_score(&adapter, &transcript, &ScoreConfig::default())
+            .expect_err("codex has no verified event parsing");
+        assert!(err.to_string().contains("codex"), "got {err}");
+    }
+
+    /// D: the incremental fold's bounded-state path never calls `full_score`
+    /// at all, so it needs its own guard -- otherwise `state.feed_all(&[])`
+    /// every poll would still fold to a real `Score { Healthy, 0 }` for an
+    /// adapter whose `parse_events` is permanently empty.
+    #[test]
+    fn incremental_poll_reports_nothing_for_an_adapter_with_no_event_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = write_transcript(dir.path(), 12, true, 20_000);
+        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let mut scorer = IncrementalScorer::new(transcript);
+        assert_eq!(
+            scorer
+                .poll(&adapter, &ScoreConfig::default())
+                .expect("no error"),
+            None,
+            "no data, not a fabricated healthy score"
+        );
+    }
+
+    /// D end to end: `score_transcript_cached` -- the Stop hook's own entry
+    /// point, and what `score::cached_score` (the dashboard's sidebar/header
+    /// score) falls back to via `score_with_checkpoint` -- must refuse for
+    /// codex the same way `full_score` does directly, even though a real
+    /// transcript file exists and is readable.
+    #[test]
+    fn score_transcript_cached_refuses_an_adapter_with_no_event_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = write_transcript(dir.path(), 12, true, 20_000);
+        let env = state_env(dir.path());
+        let err = score_transcript_cached(&transcript, Some("codex"), dir.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect_err("codex has no verified event parsing");
+        assert!(err.to_string().contains("codex"), "got {err}");
     }
 
     /// Grows `transcript` towards `body` in `chunks` appends cut at line
@@ -645,6 +930,174 @@ mod tests {
         })
         .expect_err("must fail");
         assert!(err.to_string().contains("nope.jsonl"), "got {err}");
+    }
+
+    /// Where `ClaudeAdapter::transcript_path` computes this session's
+    /// transcript under a test `HOME`: `~/.claude/projects/<repo slug>/`,
+    /// which uses the same character rule as `state::repo_slug`.
+    fn claude_transcript(home: &Path, repo: &Path, session: &str) -> PathBuf {
+        let dir = home
+            .join(".claude")
+            .join("projects")
+            .join(super::super::state::repo_slug(repo));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir.join(format!("{session}.jsonl"))
+    }
+
+    fn recomputes() -> u64 {
+        SCORE_RECOMPUTES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The dashboard polls this about once a second per pane, for up to nine
+    /// panes. The contract is that an unchanged transcript costs no parse at
+    /// all, and a changed one is picked up on the very next poll.
+    #[test]
+    fn the_cached_score_recomputes_only_when_the_transcript_changes() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(home.path().join("state"));
+        let env: HashMap<String, String> = HashMap::new();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "5c0d0001-1111-4222-8333-444444444444";
+
+        assert_eq!(
+            cached_score_with(&state, repo.path(), session, &lookup),
+            None,
+            "no transcript yet is unknown, and a renderer must show '--' rather than 0"
+        );
+
+        let transcript = claude_transcript(home.path(), repo.path(), session);
+        let body = std::fs::read_to_string(write_transcript(repo.path(), 12, false, 170_000))
+            .expect("read");
+        std::fs::write(&transcript, &body).expect("write");
+
+        let before = recomputes();
+        let first = cached_score_with(&state, repo.path(), session, &lookup).expect("scores");
+        assert_eq!(recomputes() - before, 1, "the first call has to parse");
+        assert_eq!(
+            first,
+            score_transcript(&transcript, None, repo.path(), &lookup)
+                .expect("full")
+                .score,
+            "and it must agree with a full parse"
+        );
+
+        for poll in 0..5 {
+            assert_eq!(
+                cached_score_with(&state, repo.path(), session, &lookup),
+                Some(first),
+                "poll {poll} of an unchanged transcript"
+            );
+        }
+        assert_eq!(
+            recomputes() - before,
+            1,
+            "an unchanged transcript must never be re-parsed"
+        );
+
+        std::fs::write(
+            &transcript,
+            format!("{body}{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n"),
+        )
+        .expect("append a turn");
+
+        let after = cached_score_with(&state, repo.path(), session, &lookup).expect("scores");
+        assert_eq!(
+            recomputes() - before,
+            2,
+            "a changed transcript is picked up on the next poll"
+        );
+        assert_eq!(
+            after,
+            score_transcript(&transcript, None, repo.path(), &lookup)
+                .expect("full")
+                .score,
+            "and still agrees with a full parse of the new bytes"
+        );
+    }
+
+    /// Item 12: a codex pane's `scored` stayed permanently `None` (`full_
+    /// score`'s own refusal collapses to `None` through `.ok()`), which
+    /// never matched any `stamp_of` reading, so every poll fell through to
+    /// `CtxConfig::load` + `adapters::select` + `transcript_path` again --
+    /// at the dashboard's refresh rate, forever. The eventless cache entry
+    /// must bound that to exactly one resolution for the whole session,
+    /// same as `RESOLVE_RETRY_POLLS` already bounds the missing-transcript
+    /// case.
+    #[test]
+    fn a_codex_session_resolves_its_eventless_fact_once_then_never_again() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(home.path().join("state"));
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "5c0d0099-1111-4222-8333-444444444444";
+
+        let before = RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+        for poll in 0..12 {
+            assert_eq!(
+                cached_score_with(&state, repo.path(), session, &lookup),
+                None,
+                "poll {poll}: codex has no event parsing, never a fabricated score"
+            );
+        }
+        assert_eq!(
+            RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) - before,
+            1,
+            "one resolution for the whole session, not one per poll"
+        );
+    }
+
+    /// A transcript that goes away is unknown again, not zero: the two mean
+    /// opposite things to an operator reading the sidebar.
+    #[test]
+    fn a_transcript_that_disappears_reads_as_unknown_not_healthy() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(home.path().join("state"));
+        let env: HashMap<String, String> = HashMap::new();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "5c0d0002-1111-4222-8333-444444444444";
+
+        let transcript = claude_transcript(home.path(), repo.path(), session);
+        std::fs::write(
+            &transcript,
+            std::fs::read_to_string(write_transcript(repo.path(), 4, true, 10_000)).expect("read"),
+        )
+        .expect("write");
+        assert!(cached_score_with(&state, repo.path(), session, &lookup).is_some());
+
+        std::fs::remove_file(&transcript).expect("remove");
+        let before = recomputes();
+        for poll in 0..RESOLVE_RETRY_POLLS - 1 {
+            assert_eq!(
+                cached_score_with(&state, repo.path(), session, &lookup),
+                None,
+                "poll {poll}: a stale score must not outlive the transcript it was read from"
+            );
+        }
+        assert_eq!(
+            recomputes() - before,
+            0,
+            "and a missing transcript must not put a directory walk on every frame"
+        );
+
+        // The transcript comes back (a session relaunched into the same id):
+        // the very next poll after the retry window picks it up.
+        std::fs::write(
+            &transcript,
+            std::fs::read_to_string(write_transcript(repo.path(), 12, false, 170_000))
+                .expect("read"),
+        )
+        .expect("rewrite");
+        assert!(
+            cached_score_with(&state, repo.path(), session, &lookup).is_some(),
+            "a transcript that reappears is scored again"
+        );
     }
 
     #[test]

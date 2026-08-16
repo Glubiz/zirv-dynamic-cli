@@ -405,6 +405,27 @@ fn detect_help_flag(program: &str, bin_args: &[String]) -> bool {
     // the launch there, for two different reasons.
     let resolved =
         super::resolve_program(program).unwrap_or_else(|_| ResolvedProgram::direct(program));
+
+    // SECURITY (FINDING 1): `bin_args` carries repo-controlled tokens on the
+    // interactive path (`program_invocation` forwards every positional before
+    // the first flag, e.g. `zirv chat --resume`'s handoff summary). When
+    // `resolve_program` routes an npm-installed `claude.cmd` through
+    // `cmd.exe /c <shim>`, cmd.exe reparses this whole probe command line, so a
+    // metacharacter in `bin_args` would execute *here*, before the real launch
+    // ever reaches its own `guard_cmd_shim_reparse`. Run the identical
+    // fail-closed guard against the exact argv about to be spawned, and on a
+    // rejection report "unsupported" (the same value every probe failure
+    // yields) WITHOUT spawning -- the caller keeps argv delivery and the
+    // payload is never executed.
+    let mut probe_args: Vec<String> =
+        Vec::with_capacity(resolved.prefix.len() + bin_args.len() + 1);
+    probe_args.extend(resolved.prefix.iter().cloned());
+    probe_args.extend(bin_args.iter().cloned());
+    probe_args.push("--help".to_string());
+    if super::guard_cmd_shim_reparse(&resolved.program, &probe_args).is_err() {
+        return false;
+    }
+
     let Ok(mut child) = Command::new(&resolved.program)
         .args(&resolved.prefix)
         .args(bin_args)
@@ -458,6 +479,13 @@ pub fn project_slug(cwd: &Path) -> String {
 impl AgentAdapter for ClaudeAdapter {
     fn name(&self) -> &'static str {
         "claude"
+    }
+
+    /// Claude Code's subscription windows are Anthropic's, and the account is
+    /// what the limit belongs to: a different Anthropic-backed harness would
+    /// answer `"anthropic"` here too and share these readings.
+    fn provider(&self) -> &'static str {
+        "anthropic"
     }
 
     /// The one thing that can make this adapter unusable before it is asked
@@ -538,6 +566,28 @@ impl AgentAdapter for ClaudeAdapter {
         probe_system_prompt_file_support(&program, &args)
     }
 
+    /// True on a Windows npm install, where `claude` is a `.cmd` shim that
+    /// [`super::resolve_program`] routes through `cmd.exe /c`. That is the one
+    /// launch shape where a headless prompt on argv would be reparsed by
+    /// cmd.exe, so on it the prompt is delivered via stdin instead
+    /// (`headless_cmd_stdin`).
+    fn launches_through_cmd_shim(&self) -> bool {
+        super::launches_through_cmd_shim(&self.program)
+    }
+
+    /// The `-p` headless launch with **no positional prompt**: claude then
+    /// reads the prompt from stdin (verified by the distiller, which does
+    /// exactly this). Everything else matches `headless_cmd`, so a stdin
+    /// launch and an argv launch differ only in where the prompt travels.
+    fn headless_cmd_stdin(&self, session: &SessionId, extra: &[String]) -> Option<Command> {
+        let mut cmd = self.base();
+        cmd.arg("-p")
+            .arg("--session-id")
+            .arg(session.as_str())
+            .args(extra);
+        Some(cmd)
+    }
+
     /// The distillation prompt is piped to stdin so a long transcript tail
     /// never hits argv length limits. This child embeds untrusted repo
     /// CLAUDE.md text in its prompt (the judgment call) and its only job is
@@ -556,6 +606,15 @@ impl AgentAdapter for ClaudeAdapter {
             .arg("text")
             .arg("--disallowedTools=Write,Edit,Bash,NotebookEdit");
         cmd
+    }
+
+    /// A real, verified cheap-model name for claude's own lineup -- the
+    /// value `handoff.model`/`optimize.model` defaulted to before it became
+    /// per-adapter (see `resolve_distiller_model` in `handoff.rs`). Specific
+    /// to claude by construction: a hardcoded model name from one agent's
+    /// lineup has no business leaking into another adapter's default.
+    fn default_distiller_model(&self) -> Option<&'static str> {
+        Some("haiku")
     }
 
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
@@ -603,7 +662,33 @@ impl AgentAdapter for ClaudeAdapter {
             token_usage: true,
             turn_signal: true,
             system_prompt: true,
+            events: true,
         }
+    }
+
+    /// Verified against the real CLI (`claude --help`, v2.1.220): `--model
+    /// <MODEL>` is a real flag.
+    fn model_args(&self, model: &str) -> Vec<String> {
+        vec!["--model".to_string(), model.to_string()]
+    }
+
+    /// `--resume <SESSION_ID>` is already a fact this codebase relies on
+    /// elsewhere -- `wrap::extra_launch_flags` strips it (among the flags
+    /// that pin a launch to an existing conversation) on every restart, and
+    /// `exec.rs`'s own `RESUME_FLAGS_WITH_VALUE` treats it as a two-token
+    /// flag -- so this is wiring up an already-verified flag for the
+    /// dashboard's own restore path, not a fresh claim.
+    fn resume_args(&self, session_id: &str) -> Option<Vec<String>> {
+        Some(vec!["--resume".to_string(), session_id.to_string()])
+    }
+
+    /// The same `--session-id <uuid>` flag `headless_cmd` already pins every
+    /// headless run with (verified against the real CLI), offered here so an
+    /// *interactive* dashboard pane can be pinned too. That is what makes the
+    /// roster's stored uuid the claude conversation id, and therefore what
+    /// makes `resume_args` above resolve to a real conversation after a quit.
+    fn session_pin_args(&self, session: &str) -> Vec<String> {
+        vec!["--session-id".to_string(), session.to_string()]
     }
 
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup {
@@ -629,6 +714,42 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(name)
+    }
+
+    /// SECURITY (FINDING 1): `detect_help_flag` forwards `bin_args` (repo-
+    /// controlled on the interactive path) into the `--help` probe argv. When
+    /// the program resolves to the Windows `cmd.exe /c <shim>` form, cmd.exe
+    /// would reparse a metacharacter in `bin_args` as a command -- so the probe
+    /// must run the fail-closed `guard_cmd_shim_reparse` check *before* it
+    /// spawns, and report "unsupported" (`false`) on rejection without ever
+    /// executing anything. Proven by a shim that writes a sentinel next to
+    /// itself if it ever runs: a metachar `bin_arg` leaves the sentinel absent,
+    /// while a clean one spawns and creates it.
+    #[cfg(windows)]
+    #[test]
+    fn detect_help_flag_refuses_to_spawn_when_a_bin_arg_would_be_reparsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("claude.cmd");
+        // `%~dp0` is the shim's own directory, so the sentinel lands there
+        // regardless of the probe's cwd. If this batch file ever runs, the
+        // sentinel exists.
+        std::fs::write(&shim, "@echo off\r\necho ran> \"%~dp0ran.marker\"\r\n")
+            .expect("write shim");
+        let sentinel = dir.path().join("ran.marker");
+
+        // A metacharacter-bearing bin_arg: the guard must refuse before spawn.
+        let detected = detect_help_flag(&shim.display().to_string(), &["foo&calc".to_string()]);
+        assert!(!detected, "a rejected probe reports unsupported");
+        assert!(!sentinel.exists(), "the shim must never have been spawned");
+
+        // Control: a clean bin_arg passes the guard and does spawn the shim
+        // (which then creates the sentinel), confirming the guard -- not some
+        // unrelated failure -- is what stopped the metachar case above.
+        let _ = detect_help_flag(&shim.display().to_string(), &["--model".to_string()]);
+        assert!(
+            sentinel.exists(),
+            "a clean bin_arg is allowed through and the shim runs"
+        );
     }
 
     /// The needles track `scripts/record-claude-fixture.py`'s SECRET pattern.
@@ -909,18 +1030,12 @@ mod tests {
     use crate::commands::ctx::adapters::{AgentAdapter, SESSION_ENV, SOCKET_ENV};
     use crate::commands::ctx::event::{SessionId, SessionRef};
 
-    /// The flags an adapter-built command carries, with any launcher prefix
-    /// dropped. On a Windows machine where `claude` is an npm `.cmd` shim
-    /// every command this adapter builds starts `cmd.exe /c <shim>`, and
-    /// those tokens are not what a test about agent flags is asserting on.
+    /// I: `super::super::built_args` (`adapters/mod.rs`) takes the program
+    /// string rather than the whole adapter, since `program` is private to
+    /// this module -- this thin wrapper is what lets every call site below
+    /// keep passing `&adapter` unchanged.
     fn built_args(adapter: &ClaudeAdapter, cmd: &Command) -> Vec<String> {
-        let launcher = super::super::resolve_program(&adapter.program)
-            .map(|resolved| resolved.prefix.len())
-            .unwrap_or(0);
-        cmd.get_args()
-            .skip(launcher)
-            .map(|a| a.to_string_lossy().to_string())
-            .collect()
+        super::super::built_args(&adapter.program, cmd)
     }
 
     #[test]
@@ -992,6 +1107,44 @@ mod tests {
                 "--model".to_string(),
                 "sonnet".to_string(),
             ]
+        );
+    }
+
+    /// FIX B: the stdin headless form keeps `-p` and the session pin but never
+    /// puts the prompt on argv -- claude reads it from stdin instead, so a
+    /// prompt bearing a cmd.exe metacharacter is never reparsed on the shim
+    /// form. The extra flags (the file-based system prompt, the operator's own)
+    /// still ride on argv, exactly as `headless_cmd` places them.
+    #[test]
+    fn headless_cmd_stdin_omits_the_prompt_and_reads_it_from_stdin() {
+        let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let cmd = adapter
+            .headless_cmd_stdin(
+                &SessionId::parse("abc"),
+                &[
+                    "--append-system-prompt-file".to_string(),
+                    "/s/p.md".to_string(),
+                ],
+            )
+            .expect("claude has a verified stdin form");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-p".to_string(),
+                "--session-id".to_string(),
+                "abc".to_string(),
+                "--append-system-prompt-file".to_string(),
+                "/s/p.md".to_string(),
+            ],
+            "no positional prompt token: the prompt travels on stdin"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("foo") || a.contains('&')),
+            "the prompt text is nowhere in argv: {args:?}"
         );
     }
 
@@ -1217,6 +1370,34 @@ mod tests {
     #[test]
     fn claude_advertises_the_capability() {
         assert!(ClaudeAdapter::new(None).capabilities().system_prompt);
+    }
+
+    #[test]
+    fn model_args_uses_the_verified_flag() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            adapter.model_args("opus"),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    /// C: claude keeps a real default so `resolve_distiller_model` never has
+    /// to fall back to an empty model for it, unlike codex.
+    #[test]
+    fn claude_defaults_the_distiller_model_to_haiku() {
+        assert_eq!(
+            ClaudeAdapter::new(None).default_distiller_model(),
+            Some("haiku")
+        );
+    }
+
+    #[test]
+    fn resume_args_uses_the_verified_flag() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(
+            adapter.resume_args("sess-1"),
+            Some(vec!["--resume".to_string(), "sess-1".to_string()])
+        );
     }
 
     #[test]

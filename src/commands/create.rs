@@ -368,6 +368,28 @@ mod tests {
         });
     }
 
+    /// S4: NTFS (and APFS by default) resolve a file case-insensitively, so
+    /// `Chat.yaml` and `chat.yaml` are the same collision risk even though
+    /// `zirv Chat` (differently cased) is not literally intercepted as the
+    /// `chat` alias the way `zirv chat` is. The collision guard has to catch
+    /// it anyway, or `--name Chat` creates a script `zirv help` never marks
+    /// as shadowed and a later rename/lookup can resolve unpredictably.
+    #[test]
+    fn create_refuses_a_reserved_name_in_any_case() {
+        let fake_home = tempdir().unwrap();
+        let fake_cwd = tempdir().unwrap();
+
+        with_fake_env(fake_home.path(), fake_cwd.path(), || {
+            for name in ["Help", "CHAT", "Agent", "CtX"] {
+                let result = create_script_core(name, "", false, true, unreachable_confirm);
+                assert!(
+                    result.is_err(),
+                    "'{name}' collides with a reserved command regardless of case"
+                );
+            }
+        });
+    }
+
     #[test]
     fn test_create_script_core_reserved_shortcut_errors_when_non_interactive() {
         let fake_home = tempdir().unwrap();

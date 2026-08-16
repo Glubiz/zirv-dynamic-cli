@@ -1,12 +1,19 @@
 use clap::{Parser, Subcommand};
 
 pub mod adapters;
+pub mod agent;
+pub mod announce;
+pub mod chat;
+pub mod chrome;
 pub mod config;
+pub mod dash;
 pub mod event;
 pub mod exec;
 pub mod handoff;
 pub mod hook;
 pub mod log;
+pub mod mail;
+pub mod memory;
 pub mod optimize;
 pub mod pace;
 pub mod prompt;
@@ -14,6 +21,7 @@ pub mod resume;
 pub mod rot;
 pub mod run_loop;
 pub mod score;
+pub mod sessions;
 pub mod signal;
 pub mod state;
 pub mod status;
@@ -109,6 +117,78 @@ pub(crate) mod testenv {
         }
     }
 
+    /// Sets (or clears) arbitrary environment variables for the duration of a
+    /// test, putting every one of them back on drop -- including on a
+    /// panicking assertion, for the same reason `EnvGuard` restores there.
+    ///
+    /// Needed by the tests that pin *inheritance* behavior: what a child
+    /// process inherits is a fact about the real process environment, and
+    /// `portable_pty::CommandBuilder::new` reads `std::env::vars_os` directly
+    /// rather than through any injectable lookup, so there is nothing to fake.
+    pub(crate) struct VarGuard(Vec<(String, Option<OsString>)>);
+
+    impl VarGuard {
+        pub(crate) fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let previous = vars
+                .iter()
+                .map(|(key, _)| ((*key).to_string(), std::env::var_os(key)))
+                .collect();
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                for (key, value) in vars {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(previous) => std::env::set_var(&key, previous),
+                        None => std::env::remove_var(&key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enters `dir` and returns to the previous working directory on drop --
+    /// including on a panicking assertion, which is the whole point.
+    ///
+    /// The process-wide working directory is the single most damaging thing a
+    /// test can leak: every later test that resolves a relative path, and
+    /// every child process spawned without an explicit `current_dir`, picks
+    /// it up. A `set_current_dir(original)` written at the *end* of a test
+    /// body restores it only when the test passes, which gets it exactly
+    /// backwards -- the failing test is the one that leaks, and the leak then
+    /// shows up as a cascade of unrelated failures (often against a temp
+    /// directory that no longer exists).
+    pub(crate) struct CwdGuard(Option<PathBuf>);
+
+    impl CwdGuard {
+        pub(crate) fn enter(dir: &Path) -> std::io::Result<Self> {
+            let previous = std::env::current_dir().ok();
+            std::env::set_current_dir(dir)?;
+            Ok(Self(previous))
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                let _ = std::env::set_current_dir(previous);
+            }
+        }
+    }
+
     /// `EnvGuard` without the working directory, which is all most tests need.
     pub(crate) struct HomeGuard(#[allow(dead_code)] EnvGuard);
 
@@ -124,15 +204,35 @@ pub(crate) mod testenv {
 pub type CtxResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 // Item 7: named here, in the text `zirv ctx --help` actually prints, so
-// nothing implies codex works today. See adapters::codex::CodexAdapter::ready
-// for the same wording where a user hits it directly (`--agent codex`).
+// nothing implies an unready adapter works today. `readiness_note` generates
+// the not-ready clause from the registry's own `ready()` calls rather than a
+// literal, so it never drifts from adapters::codex::CodexAdapter::ready --
+// the same wording a user hits directly via `--agent codex`.
+//
+// Perf: `clap`'s derive bakes `about` into `CtxCli::command()`, which runs on
+// *every* `try_parse_from` -- i.e. every `dispatch()` call, whether or not
+// help text is ever displayed. `readiness_note()` calls `ready()` on every
+// registered adapter, and on Windows that walks `PATH`/`PATHEXT` per
+// adapter, so an ordinary `ctx hook Stop` (once per turn) or `ctx usage tee`
+// (once per statusline render) used to pay that cost for text nobody was
+// about to read. `ctx_about()` computes it once per process and caches it,
+// which is free within one process (tests, in particular, call `dispatch`
+// hundreds of times) even though a fresh `zirv ctx ...` invocation is still
+// its own process either way.
+fn ctx_about() -> String {
+    static ABOUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ABOUT
+        .get_or_init(|| {
+            format!(
+                "Autonomous context management for AI coding agents. {}",
+                adapters::readiness_note()
+            )
+        })
+        .clone()
+}
+
 #[derive(Debug, Parser)]
-#[command(
-    name = "zirv ctx",
-    about = "Autonomous context management for AI coding agents (Claude Code only today; codex \
-             is not implemented yet, see issue #11)",
-    disable_help_subcommand = true
-)]
+#[command(name = "zirv ctx", about = ctx_about(), disable_help_subcommand = true)]
 pub struct CtxCli {
     #[command(subcommand)]
     pub verb: CtxVerb,
@@ -161,6 +261,22 @@ pub enum CtxVerb {
     Usage(usage::UsageArgs),
     /// Analyse the configuration surfaces that steer every session.
     Optimize(optimize::OptimizeArgs),
+    /// Start an interactive orchestrator session on the resolved adapter.
+    Chat(chat::ChatArgs),
+    /// Run a supervised headless worker on another enabled harness.
+    Agent(agent::AgentArgs),
+    /// Leave a note for other agent sessions on this machine.
+    Send(mail::SendArgs),
+    /// Read notes other agent sessions left for this one.
+    Inbox(mail::InboxArgs),
+    /// Store a durable fact in this repository's memory bank.
+    Remember(memory::RememberArgs),
+    /// List durable facts from this repository's memory bank.
+    Recall(memory::RecallArgs),
+    /// Remove one or all facts from this repository's memory bank.
+    Forget(memory::ForgetArgs),
+    /// Interrupt a live session with a message: durable mail plus a wake-up.
+    Nudge(sessions::NudgeArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -238,6 +354,14 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Wrap(a) => wrap::run(a, &mut out),
         CtxVerb::Usage(a) => usage::run(a, &mut out),
         CtxVerb::Optimize(a) => optimize::run(a, &mut out),
+        CtxVerb::Chat(a) => chat::run(a, &mut out),
+        CtxVerb::Agent(a) => agent::run(a, &mut out),
+        CtxVerb::Send(a) => mail::run_send(a, &mut out),
+        CtxVerb::Inbox(a) => mail::run_inbox(a, &mut out),
+        CtxVerb::Remember(a) => memory::run_remember(a, &mut out),
+        CtxVerb::Recall(a) => memory::run_recall(a, &mut out),
+        CtxVerb::Forget(a) => memory::run_forget(a, &mut out),
+        CtxVerb::Nudge(a) => sessions::run_nudge(a, &mut out),
     };
 
     match result {
@@ -254,29 +378,90 @@ mod tests {
     use super::*;
 
     /// Item 7: `zirv ctx --help` is the first thing a curious user reads, so
-    /// it must say plainly that codex is not implemented yet and point at the
-    /// tracking issue, the same honesty `CodexAdapter::ready` gives a user
-    /// who tries `--agent codex` directly.
+    /// it must say plainly which adapters are not ready yet, the same
+    /// honesty an adapter's own `ready()` gives a user who tries `--agent
+    /// <name>` directly. Pinned as a property over the registry (every
+    /// adapter whose own `ready()` fails must be named, with a not-ready
+    /// indication, and -- the other direction -- nothing is named not-ready
+    /// when every adapter's own `ready()` succeeds, true today now that
+    /// `CodexAdapter::ready` mirrors claude's) rather than a literal
+    /// sentence, so wiring up a real adapter -- or adding a third one that is
+    /// not ready -- keeps this test honest without an edit.
     #[test]
-    fn the_top_level_help_is_honest_about_codex_support() {
+    fn the_top_level_help_names_every_adapter_that_is_not_ready() {
         use clap::CommandFactory;
         let about = CtxCli::command()
             .get_about()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        assert!(
-            about.to_lowercase().contains("not implemented yet"),
-            "must say codex is not implemented yet: {about}"
+
+        let not_ready: Vec<_> = adapters::all(None)
+            .into_iter()
+            .filter(|a| a.ready().is_err())
+            .collect();
+        for adapter in &not_ready {
+            assert!(
+                about.contains(adapter.name()),
+                "about must name not-ready adapter '{}': {about}",
+                adapter.name()
+            );
+        }
+        let claims_not_ready = about.to_lowercase().contains("not implemented yet")
+            || about.to_lowercase().contains("not ready");
+        assert_eq!(
+            claims_not_ready,
+            !not_ready.is_empty(),
+            "about's not-ready claim must match the registry's own ready() calls: {about}"
         );
+    }
+
+    /// Item 16: the property test above reads `about` off `ctx_about()`'s
+    /// process-wide `OnceLock` -- on any real machine both adapters are
+    /// `ready()`, so its `for adapter in &not_ready` loop body has never
+    /// once executed, and by the time this test runs the cache may already
+    /// be warmed by an *earlier* test's own `CtxCli::try_parse_from` call
+    /// (this module has several, and so do `optimize.rs`/`usage.rs`), which
+    /// a same-test PATH rig cannot retroactively change. Rigged directly
+    /// against `adapters::readiness_note()` instead -- the exact function
+    /// `ctx_about()` wraps and caches, so this is the same substance without
+    /// the caching hazard -- using the identical PATH/PATHEXT rig `adapters::
+    /// tests::readiness_note_and_the_fallback_skip_both_stay_covered_when_
+    /// an_adapter_is_genuinely_unready` already established for exactly this
+    /// "force claude genuinely unready" shape.
+    #[cfg(windows)]
+    #[test]
+    fn readiness_note_names_a_genuinely_unready_adapter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("claude.py"), "print('x')\n").expect("write");
+
+        let path = std::env::var("PATH").unwrap_or_default();
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "PATH",
+                Some(format!("{};{}", dir.path().display(), path).as_str()),
+            ),
+            ("PATHEXT", Some(".EXE;.CMD;.PY")),
+        ]);
+
+        let not_ready: Vec<_> = adapters::all(None)
+            .into_iter()
+            .filter(|a| a.ready().is_err())
+            .collect();
         assert!(
-            about.contains("issue #11"),
-            "must point at the tracking issue: {about}"
+            !not_ready.is_empty(),
+            "the rig must genuinely make claude unready"
         );
-        assert!(
-            !about.to_lowercase().contains("codex is supported")
-                && !about.to_lowercase().contains("supports codex"),
-            "must not imply codex works today: {about}"
-        );
+
+        let note = adapters::readiness_note();
+        for adapter in &not_ready {
+            assert!(
+                note.contains(adapter.name()),
+                "readiness_note (what ctx_about's cached `about` is built from) must name \
+                 not-ready adapter '{}': {note}",
+                adapter.name()
+            );
+        }
+        assert!(note.to_lowercase().contains("not ready"), "got {note}");
     }
 
     #[test]

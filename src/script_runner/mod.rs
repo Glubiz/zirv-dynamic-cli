@@ -112,9 +112,11 @@ mod tests {
             })],
         };
 
-        unsafe {
-            std::env::set_var("COMMIT_PASSWORD", "secret123");
-        }
+        // NEW-1: a guard. This was set and *never* removed on any path, so
+        // every later test in the process ran with a `COMMIT_PASSWORD` in
+        // its environment -- which `build_context` reads as a secret.
+        let _password =
+            crate::commands::ctx::testenv::VarGuard::set(&[("COMMIT_PASSWORD", Some("secret123"))]);
 
         let context = build_context(&script, &["value1".to_string(), "value2".to_string()])
             .expect("Failed to build context");

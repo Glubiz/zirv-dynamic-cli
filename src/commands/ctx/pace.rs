@@ -322,15 +322,26 @@ pub struct PaceOutcome {
 /// refreshed the collector) rather than sleeping blind for hours.
 const SLEEP_CHUNK_SECS: u64 = 30;
 
-/// Reads the collector file and, only when a budget is configured, the
-/// estimator. Walking every transcript is not free, so it is skipped whenever
-/// its result could not be used.
+/// Reads `provider`'s own collector file and, only when a budget is
+/// configured, the estimator. Walking every transcript is not free, so it is
+/// skipped whenever its result could not be used.
+///
+/// E: `provider`-scoped since 2026-08-15, via `window::load_for` rather than
+/// the legacy unscoped `window::load` -- the pacing gate used to read the
+/// single global `usage.json` regardless of which adapter's session it was
+/// pacing, so a codex run was paced against whatever Anthropic data claude's
+/// statusline tee happened to have written. `load_for` falls back to that
+/// same legacy file for claude's own provider (`window::LEGACY_USAGE_
+/// PROVIDER`), so this is a no-op for the common case; a provider with no
+/// usage source at all (codex/openai today) now reads as "nothing known"
+/// (`UsageWindows::default()`) rather than another provider's real numbers.
 pub fn current_windows(
     state: &StateDir,
     cfg: &PaceConfig,
     now: u64,
+    provider: &str,
 ) -> (UsageWindows, Option<UsageWindows>) {
-    let collector = usage_window::load(state);
+    let collector = usage_window::load_for(state, provider).unwrap_or_default();
 
     let budgeted = cfg.five_hour_budget_tokens > 0 || cfg.seven_day_budget_tokens > 0;
     if !cfg.estimator || !budgeted {
@@ -354,6 +365,35 @@ pub fn current_windows(
 /// Blocks until the window has room, then returns. Never exits the process and
 /// never returns an error: pacing failing closed would be worse than pacing not
 /// happening, so every unknown proceeds.
+///
+/// `announcer` is `Some` where a session with a live chrome context is
+/// running (`exec`, and by extension `agent`, which delegates to it) and
+/// `None` where there is none to hand in (`loop`, which keeps today's plain
+/// writer as its only channel): either way, `w` keeps receiving the same
+/// text it always has, so nothing that already asserts on it breaks.
+///
+/// `provider` is the resolved adapter's own `AgentAdapter::provider()`
+/// (`"anthropic"` for claude, `"openai"` for codex). E: when `provider` has
+/// **no possible** usage source (`window::has_no_usage_source` -- any
+/// provider but claude, since only claude has a real collector mechanism at
+/// all today), the gate is skipped outright with one announcement rather
+/// than silently entering the loop below and reading "nothing known" as if
+/// it were a fresh, empty collector reading for *this* provider: there is no
+/// collector for this provider at all, which is a materially different fact
+/// than "the collector says 0%". Claude itself is exempt from this check
+/// even before its first statusline tee: "not yet" is still true and
+/// actionable there.
+///
+/// `announced_no_source` is owned by the caller and threaded through every
+/// call across one run (`exec`'s own supervise loop calls this once per
+/// cycle -- the pre-flight check and, on a usage-limit park, again -- and
+/// `loop`'s cycle does the same), the same discipline the wait-loop's own
+/// internal `announced` local already follows *within* a single call: the
+/// no-source fact does not change cycle to cycle, so without this the skip
+/// line and `PacingSkipped` would otherwise repeat on every single restart
+/// of a long-running codex session, drowning out everything else on the
+/// `zirv ▸` channel with a fact already stated once.
+#[allow(clippy::too_many_arguments)]
 pub fn wait_for_window<W: Write>(
     w: &mut W,
     state: &StateDir,
@@ -362,8 +402,30 @@ pub fn wait_for_window<W: Write>(
     session: &str,
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
+    announcer: Option<&super::announce::Announcer>,
+    provider: &str,
+    announced_no_source: &mut bool,
 ) -> PaceOutcome {
     if !cfg.enabled {
+        return PaceOutcome {
+            waited_secs: 0,
+            source: Source::None,
+        };
+    }
+
+    if usage_window::has_no_usage_source(state, provider) {
+        if !*announced_no_source {
+            let _ = writeln!(
+                w,
+                "zirv ctx {verb}: pacing off: {provider} has no usage source"
+            );
+            if let Some(announcer) = announcer {
+                announcer.emit(&super::announce::Event::PacingSkipped {
+                    provider: provider.to_string(),
+                });
+            }
+            *announced_no_source = true;
+        }
         return PaceOutcome {
             waited_secs: 0,
             source: Source::None,
@@ -375,7 +437,7 @@ pub fn wait_for_window<W: Write>(
 
     loop {
         let now = now_fn();
-        let (collector, estimated) = current_windows(state, cfg, now);
+        let (collector, estimated) = current_windows(state, cfg, now, provider);
         let decision = decide(&collector, estimated.as_ref(), now, cfg);
 
         let source = match &decision {
@@ -422,6 +484,18 @@ pub fn wait_for_window<W: Write>(
         if announced != fingerprint {
             announced = fingerprint;
             let _ = writeln!(w, "zirv ctx {verb}: {}", describe(&decision));
+            if let (
+                Some(announcer),
+                PaceDecision::WaitUntil {
+                    window, reset_at, ..
+                },
+            ) = (announcer, &decision)
+            {
+                announcer.emit(&super::announce::Event::PacingWait {
+                    window: (*window).to_string(),
+                    reset_at: *reset_at,
+                });
+            }
             let _ = log::append(
                 state,
                 &log::Decision {
@@ -1060,6 +1134,9 @@ mod tests {
                 clock.slept.borrow_mut().push(d.as_secs());
                 *clock.now.borrow_mut() += d.as_secs();
             },
+            None,
+            "anthropic",
+            &mut false,
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1093,6 +1170,9 @@ mod tests {
                 clock.slept.borrow_mut().push(d.as_secs());
                 *clock.now.borrow_mut() += d.as_secs();
             },
+            None,
+            "anthropic",
+            &mut false,
         );
 
         assert!(outcome.waited_secs >= 600, "waited {}", outcome.waited_secs);
@@ -1131,6 +1211,9 @@ mod tests {
             "sess-1",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
+            "anthropic",
+            &mut false,
         );
 
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
@@ -1167,6 +1250,9 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
+            "anthropic",
+            &mut false,
         );
 
         assert!(
@@ -1203,6 +1289,9 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
+            "anthropic",
+            &mut false,
         );
 
         assert!(
@@ -1235,6 +1324,9 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
+            "anthropic",
+            &mut false,
         );
 
         assert!(
@@ -1246,6 +1338,72 @@ mod tests {
         assert!(
             !printed.contains("proceeding anyway"),
             "the real reset arrived inside the cap, so no valve message: {printed}"
+        );
+    }
+
+    /// E: a provider with no usage source at all (no per-provider file, and
+    /// not claude's own legacy-anthropic fallback) must be skipped outright
+    /// -- naming the provider -- rather than entering the loop and reading
+    /// "nothing known" as a fresh empty collector reading for this provider.
+    /// A totally fresh state dir (no `state_with` at all): the point is that
+    /// nothing has ever been written for "openai", not even an empty file.
+    #[test]
+    fn a_provider_with_no_usage_source_skips_the_gate_and_names_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut announced = false;
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig::default(),
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
+            "openai",
+            &mut announced,
+        );
+
+        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.source, Source::None);
+        let printed = String::from_utf8_lossy(&out).to_string();
+        assert!(printed.contains("openai"), "got {printed}");
+        assert!(printed.contains("no usage source"), "got {printed}");
+        assert!(
+            clock.slept.borrow().is_empty(),
+            "must never enter the wait loop"
+        );
+        assert!(announced, "the latch is set so a caller's next cycle knows");
+
+        // Item 10: a second cycle of the same run (the caller's own
+        // `announced_no_source` threaded straight back in, exactly like
+        // `exec`'s and `loop`'s own supervise loops do) must not repeat the
+        // line or grow `out` at all -- the no-source fact was already stated
+        // once for this run.
+        let before = out.len();
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig::default(),
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
+            "openai",
+            &mut announced,
+        );
+        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.source, Source::None, "still skipped, just quietly");
+        assert_eq!(
+            out.len(),
+            before,
+            "a second cycle in the same run prints nothing new: {:?}",
+            String::from_utf8_lossy(&out)
         );
     }
 
@@ -1263,6 +1421,9 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
+            "anthropic",
+            &mut false,
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1290,6 +1451,9 @@ mod tests {
             "sess",
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
+            None,
+            "anthropic",
+            &mut false,
         );
         assert_eq!(outcome.waited_secs, 0);
         assert!(
@@ -1302,7 +1466,7 @@ mod tests {
     fn the_estimator_is_only_consulted_when_a_budget_is_set() {
         let (_tmp, state) = state_with(UsageWindows::default());
         let cfg = PaceConfig::default();
-        let (collector_windows, estimated) = current_windows(&state, &cfg, NOW);
+        let (collector_windows, estimated) = current_windows(&state, &cfg, NOW, "anthropic");
         assert_eq!(collector_windows, UsageWindows::default());
         assert!(
             estimated.is_none(),
@@ -1313,7 +1477,7 @@ mod tests {
             five_hour_budget_tokens: 1000,
             ..PaceConfig::default()
         };
-        let (_, estimated) = current_windows(&state, &with_budget, NOW);
+        let (_, estimated) = current_windows(&state, &with_budget, NOW, "anthropic");
         assert!(
             estimated.is_some(),
             "a configured budget turns the estimator on"

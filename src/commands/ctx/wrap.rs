@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use super::adapters::AgentAdapter;
+use super::announce::{Announcer, Event};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::NormalizedEvent;
 use super::handoff::{self, Handoff};
+use super::prompt::PromptRole;
 use super::rot::Verdict;
 use super::signal::TurnSignal;
 use super::state::StateDir;
@@ -47,7 +49,11 @@ const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
 /// Answers the `PSUEDOCONSOLE_INHERIT_CURSOR` probe described on
 /// `CURSOR_POSITION_REPORT`. A no-op everywhere else: no other platform's pty
 /// asks anything before it will run a child.
-fn answer_inherit_cursor_probe(writer: &mut (dyn Write + Send)) {
+///
+/// `pub(in crate::commands::ctx)` rather than private: `dash::pane`'s own PTY
+/// spawn (the same deadlock, same fix) reuses this exact function instead of
+/// duplicating it.
+pub(in crate::commands::ctx) fn answer_inherit_cursor_probe(writer: &mut (dyn Write + Send)) {
     #[cfg(windows)]
     {
         let _ = writer.write_all(CURSOR_POSITION_REPORT);
@@ -155,6 +161,11 @@ pub struct WrapArgs {
     /// default. Supervision, pacing and hooks still apply.
     #[arg(long, default_value_t = false)]
     pub simple: bool,
+    /// Start even though this process looks like it is already inside an
+    /// agent session. Off by default: a nested interactive supervisor can
+    /// take the outer session down.
+    #[arg(long, default_value_t = false)]
+    pub allow_nested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,7 +266,107 @@ pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> b
 pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance criteria, the file paths touched so far, any unresolved errors or failing tests, and the exact next step. Drop resolved tangents and full file dumps.";
 
 pub const TRANSCRIPT_ENV: &str = "ZIRV_CTX_TRANSCRIPT";
+
+/// The pre-F5 name: one global file under the state dir root. Still *read*
+/// (see `read_socket_path`) so a supervisor started by an older build stays
+/// discoverable, but never written any more: two concurrent supervisors
+/// clobbered each other's entry, and whoever read it afterwards got a socket
+/// belonging to somebody else's session.
 pub const SOCKET_PATH_FILE: &str = "socket-path";
+
+/// `<state>/socket-path-<short8>`, one per supervisor, named after the same
+/// short id the socket itself and the session registry record already use.
+pub const SOCKET_PATH_PREFIX: &str = "socket-path-";
+
+pub fn socket_path_file_for(session: &str) -> String {
+    format!("{SOCKET_PATH_PREFIX}{}", super::sessions::short_id(session))
+}
+
+/// Publishes where this supervisor bound its turn-signal socket, so `zirv ctx
+/// status`, external tooling and the pty tests can find it. Best-effort, like
+/// every other piece of state-dir housekeeping: failing to publish must never
+/// fail a launch.
+pub fn publish_socket_path(state: &StateDir, session: &str, socket: &Path) {
+    let _ = super::state::create_private_dir_all(state.root());
+    let _ = super::state::write_private(
+        &state.root().join(socket_path_file_for(session)),
+        &socket.display().to_string(),
+    );
+}
+
+/// Removes this supervisor's published socket path. Paired with
+/// `publish_socket_path` at the one place `wrap` leaves the pump, so a dead
+/// session's file does not linger to be picked as "the newest" by a later
+/// reader with no session of its own.
+pub fn unpublish_socket_path(state: &StateDir, session: &str) {
+    let _ = std::fs::remove_file(state.root().join(socket_path_file_for(session)));
+}
+
+/// Resolves the socket path a reader should use.
+///
+/// `session` is the reader's own `ZIRV_CTX_SESSION` (or whichever session it
+/// is asking about). When it is given, only *that* session's file is
+/// considered: silently handing back a different live session's socket is
+/// precisely the cross-session confusion F5 exists to end, so a named session
+/// with no file of its own falls through to the legacy file and then to
+/// `None`, never to a neighbour's socket.
+///
+/// With no session -- an operator at a shell, or a test that never learned
+/// the id -- the newest published file wins, which is the closest honest
+/// approximation of "the session I am looking at" available without one.
+///
+/// The legacy global file is the last fallback either way, so a supervisor
+/// left over from a pre-F5 build is still reachable.
+///
+/// No production caller inside this binary reads it back today -- `wrap` is
+/// the only writer, and everything downstream of it already holds the socket
+/// path directly. It exists because publishing the file is a *contract with
+/// external tooling* (that is why it is written at all), and shipping a
+/// writer whose naming scheme has no canonical reader is how the pre-F5
+/// global file's semantics got lost in the first place. The pty tests are its
+/// in-tree consumer.
+#[allow(dead_code)]
+pub fn read_socket_path(state: &StateDir, session: Option<&str>) -> Option<String> {
+    let read = |path: PathBuf| -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    if let Some(session) = session {
+        return read(state.root().join(socket_path_file_for(session)))
+            .or_else(|| read(state.root().join(SOCKET_PATH_FILE)));
+    }
+
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(entries) = std::fs::read_dir(state.root()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_published = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(SOCKET_PATH_PREFIX));
+            if !is_published {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if newest.as_ref().is_none_or(|(seen, _)| modified >= *seen) {
+                newest = Some((modified, path));
+            }
+        }
+    }
+    if let Some((_, path)) = newest
+        && let Some(found) = read(path)
+    {
+        return Some(found);
+    }
+
+    read(state.root().join(SOCKET_PATH_FILE))
+}
 
 /// Which file wrap watches for compactions and reads handoff context from.
 ///
@@ -320,10 +431,65 @@ pub fn action_for(state: &InjectionState, now: Instant, debounce: Duration) -> A
     }
 }
 
-pub fn advisory_line(score: u32, tokens: u64) -> String {
-    format!(
-        "zirv ctx: context health is slipping (score {score}, {tokens} tokens in context). A /compact soon will keep instruction-following sharp."
-    )
+/// Whether the mailbox has grown since the last check: the only thing that
+/// should ever trigger a fresh advisory. Equal or shrinking (a message was
+/// consumed elsewhere, or the read failed and fell back to the last known
+/// count) never re-fires one.
+pub fn mail_grew(previous: usize, current: usize) -> bool {
+    current > previous
+}
+
+/// Folds one successful mailbox observation into `seen`, returning whether it
+/// is worth advising about.
+///
+/// M4: `seen` used to be assigned *only* inside the "did it grow" arm, which
+/// made it an all-time high-water mark rather than a record of the last
+/// observation. Once a session had been told about 3 messages, reading and
+/// consuming all 3 left the watermark at 3, so the next two arrivals counted
+/// as a shrink and the advisory could never fire again short of exceeding the
+/// old peak. Recording every observation makes growth mean "more than last
+/// time I looked", which is what the advisory has always claimed to report.
+/// A failed read still leaves `seen` untouched (the caller only reaches here
+/// on `Some`), so an unreadable mailbox never fakes a drain.
+pub fn observe_mail(seen: &mut usize, current: usize) -> bool {
+    let grew = mail_grew(*seen, current);
+    *seen = current;
+    grew
+}
+
+/// A plain total over `mail::unread_counts`' `(broadcast, direct)` split, for
+/// the turn-signal arm's `observe_mail` advisory, which only ever needs a
+/// single number and has its own tests pinned to that shape. `None` under the
+/// same conditions `mail::unread_counts` returns `None` for (mail disabled,
+/// or a read error) -- an unreadable mail directory is silently ignored
+/// rather than degrading or interrupting the session: mail is advisory, and a
+/// wrapped session must never be made worse by it. Called from two throttled
+/// call sites -- the turn-signal arm, bounded by how often the agent reports
+/// a turn boundary, and (T12b) the bar's own 1s redraw throttle, never the
+/// raw byte-pump path.
+fn unread_mail_count(
+    state: &super::state::StateDir,
+    repo: &Path,
+    agent: &str,
+    session_short: &str,
+    mail_enabled: bool,
+) -> Option<usize> {
+    unread_mail_counts(state, repo, agent, session_short, mail_enabled)
+        .map(|(broadcast, direct)| broadcast + direct)
+}
+
+/// Thin delegate to `mail::unread_counts` (moved there in Task 7 so the
+/// dashboard's header facts can share it too): the T12b bar's own
+/// `mail 2+1` rendering reads the `(broadcast, direct-to-this-session)`
+/// split this returns.
+fn unread_mail_counts(
+    state: &super::state::StateDir,
+    repo: &Path,
+    agent: &str,
+    session_short: &str,
+    mail_enabled: bool,
+) -> Option<(usize, usize)> {
+    super::mail::unread_counts(state, repo, agent, session_short, mail_enabled)
 }
 
 pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
@@ -366,8 +532,16 @@ do not redo work marked as done.\n\n{}",
 /// One-way switch to pure passthrough. Once supervision has proven unreliable
 /// in a session it stays off: a wrapped session must never be worse than an
 /// unwrapped one.
-pub fn note_failure(state: &mut InjectionState, log_target: Option<(&StateDir, &str)>, what: &str) {
+pub fn note_failure(
+    state: &mut InjectionState,
+    log_target: Option<(&StateDir, &str)>,
+    what: &str,
+    announcer: &Announcer,
+) {
     state.degraded = true;
+    announcer.emit(&Event::Degraded {
+        cause: what.to_string(),
+    });
     if let Some((state_dir, session)) = log_target {
         let _ = super::log::append(
             state_dir,
@@ -400,6 +574,27 @@ fn wait_for_exit(
 
 /// Ask the TUI to quit, then escalate. A TUI that will not leave politely is
 /// killed rather than left running under a supervisor that has moved on.
+///
+/// Two rungs, deliberately: the adapter's own quit sequence, then
+/// `child.kill()`. There is **no Ctrl-C rung**, and one must never be added
+/// back (F1).
+///
+/// Writing `\x03` into the pty master is not a signal to *this* child. On
+/// Windows the master is a ConPTY, and conhost turns that byte into a console
+/// control event that it broadcasts to **every** process attached to the
+/// pseudoconsole -- and portable-pty 0.9.0 spawns without
+/// `CREATE_NEW_PROCESS_GROUP`, so there is no group to narrow the broadcast
+/// to. A `wrap` that had been launched inside another zirv session therefore
+/// took the *outer* session's agent down with the child it meant to quit.
+/// (On unix the byte is only marginally better behaved: the line discipline
+/// delivers SIGINT to the whole foreground process group of that pty.)
+///
+/// `child.kill()` is the narrow primitive that has none of that reach: a
+/// `TerminateProcess`/`kill` against the one handle this supervisor owns.
+/// Note that portable-pty's Windows `do_kill` inverts its own success check
+/// and `kill` swallows the result, so a failed kill is invisible here -- see
+/// Known Issues; that is a reason to be conservative about what else we try,
+/// not a reason to reach for a console-wide broadcast.
 pub fn quit_child(
     sink: &mut dyn Write,
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -415,16 +610,28 @@ pub fn quit_child(
         return Ok(());
     }
 
-    // Ctrl-C twice is the conventional escape hatch before force.
-    let _ = write!(sink, "\x03\x03");
-    let _ = sink.flush();
-    if wait_for_exit(child, Instant::now() + grace)? {
-        return Ok(());
-    }
-
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+/// Builds a child's supervision environment: scrub first, then set whatever
+/// this supervisor actually owns. The single place both the initial launch
+/// and every relaunch go through, so the scrub cannot be forgotten on one of
+/// them (F3).
+///
+/// The scrub is unconditional, and that is the whole point. `turn_env` is
+/// empty whenever the socket bind failed -- and without the scrub the child
+/// then inherited the *outer* session's `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET`
+/// straight out of this process's environment (`CommandBuilder::new` seeds
+/// itself from `std::env::vars_os`), so its hooks reported turn boundaries
+/// into a supervisor that belonged to somebody else's session. "No socket of
+/// my own" has to degrade to unsupervised, never to supervised-by-another.
+fn apply_session_env(builder: &mut CommandBuilder, turn_env: &[(String, String)]) {
+    super::sessions::scrub_supervision_env(builder);
+    for (key, value) in turn_env {
+        builder.env(key, value);
+    }
 }
 
 /// Pumps one pty master's output to stdout for as long as `generation` still
@@ -438,6 +645,7 @@ fn spawn_output_thread(
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     my_generation: u64,
+    stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
 ) {
     std::thread::spawn(move || {
         let still_current =
@@ -467,7 +675,18 @@ fn spawn_output_thread(
                     if !still_current() {
                         continue;
                     }
-                    if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+                    // Held only around the write itself (T12b): the same
+                    // lock the bar's own redraw takes, so one assembled bar
+                    // buffer can never land in the middle of a child-byte
+                    // write and vice versa. A poisoned lock (a panic
+                    // elsewhere while holding it) still yields its guard --
+                    // the child's own output must never be dropped because
+                    // some unrelated code panicked while holding this lock.
+                    let write_result = {
+                        let _guard = stdout_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        stdout.write_all(&buf[..n]).and_then(|()| stdout.flush())
+                    };
+                    if write_result.is_err() {
                         if still_current() {
                             let _ = tx.send(PumpEvent::PtyClosed);
                         }
@@ -528,6 +747,17 @@ fn restart_launch_flags(adapter: &dyn AgentAdapter, launch_command: &[String]) -
     super::exec::extra_launch_flags(launch_command, prefix, None)
 }
 
+/// Item 5 (regression fix): the pty size a restart's fresh session opens at
+/// -- reserved when the bar is still alive, exactly like the initial launch
+/// and every ordinary resize while it stays that way, so a mid-session
+/// restart cannot hand the child the reserved row the bar is about to keep
+/// drawing over. The raw terminal size otherwise (the bar was never
+/// eligible, or has already degraded, in which case the pty tracks full
+/// size like a bar-less session -- see B1's `resize_decision`).
+fn relaunch_size(bar: &BarRuntime, terminal_size: (u16, u16)) -> (u16, u16) {
+    super::chrome::reserved_pty_size(terminal_size, bar.active())
+}
+
 fn relaunch(
     adapter: &dyn AgentAdapter,
     repo: &Path,
@@ -544,16 +774,28 @@ fn relaunch(
     })?;
 
     let command = relaunch_command(adapter, handoff, extra);
+    // FIX 2a (command-injection defense): the relaunch rebuilds its own
+    // CommandBuilder from the adapter's Command, so -- like the first launch
+    // below and the dashboard pane -- it must clear the cmd.exe argv-reparse
+    // guard itself rather than rely on supervise::spawn_tapped (the pty path
+    // never reaches it). A no-op off Windows and for any non-shim program.
+    {
+        let program = command.get_program().to_string_lossy().to_string();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        adapters::guard_cmd_shim_reparse(&program, &args)?;
+    }
     let mut builder = CommandBuilder::new(command.get_program());
     for arg in command.get_args() {
         builder.arg(arg);
     }
     builder.cwd(repo);
     // Without this the fresh session has no socket to report turn boundaries
-    // on, and supervision would silently end at the first restart.
-    for (key, value) in turn_env {
-        builder.env(key, value);
-    }
+    // on, and supervision would silently end at the first restart. Scrubbed
+    // first either way -- see `apply_session_env`.
+    apply_session_env(&mut builder, turn_env);
 
     // Before the spawn, and before anything else touches this pty: on Windows
     // the console host will not service the child at all until it is answered.
@@ -568,21 +810,63 @@ fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
-pub fn run_with<W: Write>(
+/// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
+/// not something a user ever types on the `wrap` command line, only something
+/// another verb (`zirv ctx chat`) decides on the caller's behalf. Every
+/// existing `wrap` caller (the `wrap` verb itself, and every relaunch inside
+/// `pump`) passes `PromptRole::Worker`; `chat` is the one caller that passes
+/// `PromptRole::Orchestrator`.
+/// `session` lets a caller that already generated a session id for its own
+/// purposes (`chat.rs`'s launch banner, printed before this function is ever
+/// called) hand it in rather than have two different ids exist for the same
+/// launch. `None` (every caller but `chat`) keeps today's behavior: a fresh
+/// id minted here.
+///
+/// No writer parameter: this function never had anything of its own to print
+/// on a healthy path, and its one former write (a rare internal pump
+/// failure) went to `output::error` on stderr instead (item 6 audit) --
+/// printing it to a caller-supplied stdout writer, the same stream the
+/// wrapped session's own pty bytes already occupy, is exactly the kind of
+/// silently-lost diagnostic that motivated the fix.
+pub fn run_with(
     args: &WrapArgs,
-    w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
+    role: PromptRole,
+    session: Option<super::event::SessionId>,
+    verb: super::sessions::Verb,
 ) -> CtxResult<i32> {
     if args.command.is_empty() {
         return Err("no command to wrap; pass it after --".into());
     }
 
+    // F2, before anything reads config, resolves an adapter, or touches the
+    // terminal: an interactive supervisor started *inside* another agent's
+    // session can take that outer session down (see
+    // `sessions::nested_session_evidence`). Returned as an `Err` rather than
+    // printed here, because `run_with` deliberately has no writer of its own
+    // (see this function's doc comment); `ctx`'s dispatch prints it on
+    // stderr through `output::error`.
+    if let Some(refusal) = super::sessions::nesting_refusal("wrap", env, args.allow_nested) {
+        return Err(refusal.into());
+    }
+
     let cfg = CtxConfig::load(repo, env)?;
+    // Announcements are gated by `cfg.chrome.events` (which already folds in
+    // `--quiet`, `ZIRV_CTX_QUIET` and `[chrome] events`), never by whether
+    // the terminal is big enough or colour-capable for the banner and bar: a
+    // piped stderr in CI still wants these lines. `--no-supervise` is the one
+    // exception: it promises pure passthrough ("no scoring, no injection"),
+    // so nothing about supervision has anything to narrate either.
+    let announcer = if args.no_supervise {
+        Announcer::silent()
+    } else {
+        Announcer::new(cfg.chrome.events, console::colors_enabled_stderr())
+    };
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     // Selection happens here so an unknown or unverified agent fails before the
     // terminal is touched.
-    let adapter = adapters::select(agent_name, &args.command, cfg.agent_bin.as_deref())?;
+    let adapter = adapters::select(agent_name, &args.command, &cfg)?;
 
     // `select` defaults to claude when detection finds nothing to back it,
     // which is fine for a caller (like `exec`) that already gates every
@@ -602,8 +886,17 @@ pub fn run_with<W: Write>(
         && !adapters::command_matches_adapter(adapter.as_ref(), false, &args.command)
     {
         let program = args.command.first().map(String::as_str).unwrap_or("");
+        // Named generically rather than hardcoding one adapter: the actual
+        // options come from the registry (gate-enabled and `ready()` right
+        // now), so a second working adapter shows up here without an edit.
+        let available = adapters::available_adapter_names(&cfg);
+        let agent_hint = if available.is_empty() {
+            "pass --agent <name>".to_string()
+        } else {
+            format!("pass --agent {}", available.join("/"))
+        };
         return Err(format!(
-            "zirv ctx wrap: could not tell which agent '{program}' is; pass --agent claude \
+            "zirv ctx wrap: could not tell which agent '{program}' is; {agent_hint} \
              (or your agent's name), run it with --no-supervise for pure passthrough, \
              or run this command unwrapped"
         )
@@ -611,7 +904,7 @@ pub fn run_with<W: Write>(
     }
 
     let state_dir = super::state::StateDir::resolve(env)?;
-    let session = super::event::SessionId::new_v4();
+    let session = session.unwrap_or_else(super::event::SessionId::new_v4);
 
     // `--no-supervise` promises pure passthrough (its own help text says so),
     // and so does a wrapped command that matches no adapter: injecting this
@@ -623,11 +916,17 @@ pub fn run_with<W: Write>(
             agent_name.is_some(),
             &args.command,
         );
+    let memory_slug = super::state::repo_slug(repo);
+    let memory_entries =
+        super::memory::render_for_prompt(&state_dir, &memory_slug, &cfg, super::state::now_secs());
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         skip_injection,
         &cfg.prompt,
+        role,
+        &memory_entries,
+        cfg.memory.max_injected_bytes,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -640,7 +939,7 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         &state_dir,
         session.as_str(),
-    );
+    )?;
     super::prompt::log_injection(
         &state_dir,
         "wrap",
@@ -648,6 +947,10 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         adapter.capabilities().system_prompt,
     );
+    announcer.emit(&super::prompt::injection_event(
+        composed.as_ref(),
+        adapter.capabilities().system_prompt,
+    ));
     // Stripping the user's own --append-system-prompt (see
     // merge_command_line_prompt) can empty the argv even though args.command
     // itself was not empty at the top of this function, e.g. `wrap -- --
@@ -665,12 +968,10 @@ pub fn run_with<W: Write>(
     } else {
         match super::signal::SignalServer::bind(&state_dir.socket_for(session.as_str())) {
             Ok(server) => {
-                // Publish the path so `zirv ctx status` and tests can find it.
-                let _ = super::state::create_private_dir_all(state_dir.root());
-                let _ = super::state::write_private(
-                    &state_dir.root().join(SOCKET_PATH_FILE),
-                    &server.path().display().to_string(),
-                );
+                // Published per session (F5): the pre-F5 global file meant a
+                // second supervisor overwrote the first one's entry, and a
+                // reader then found somebody else's socket under it.
+                publish_socket_path(&state_dir, session.as_str(), server.path());
                 Some(server)
             }
             Err(_) => {
@@ -678,24 +979,90 @@ pub fn run_with<W: Write>(
                     &mut supervision,
                     Some((&state_dir, session.as_str())),
                     "socket unavailable",
+                    &announcer,
                 );
                 None
             }
         }
     };
 
+    // Registered here, after the bind, rather than earlier: the record has to
+    // say whether this session can act on a wake-up, and only the bind
+    // result knows.
+    //
+    // N6/NEW-3: `wrap` claims nudge markers exclusively from its turn-signal
+    // arm (`if let Some(server) = server && ...`), so with no socket --
+    // `--no-supervise`, or a bind that failed -- a marker written for this
+    // session is never claimed, and the nudge silently does nothing forever.
+    // The first fix for that dropped such sessions from the registry
+    // entirely, which cured the silent nudge by making the session
+    // *invisible*: it disappeared from `zirv ctx status` too, so an operator
+    // whose `wrap` had failed to bind could not see it running at all.
+    // Recorded as `reachable: false` instead -- `status` shows it as
+    // `unreachable`, and `nudge` refuses it with a reason.
+    //
+    // Keyed on the socket rather than on `--no-supervise`/`--simple` as
+    // such: `--simple` only skips prompt injection, still binds a socket and
+    // still claims markers, so it stays a legitimate (advisory) target; and
+    // a bind failure under a plain `wrap` is exactly as unreachable as
+    // `--no-supervise` is.
+    //
+    // Best-effort, released right after `pump` returns below -- `wrap`'s own
+    // control flow always funnels through that one point, unlike `exec`'s
+    // scattered early returns, so a single release suffices here.
+    let record = super::sessions::Record::new(session.as_str(), adapter.name(), repo, verb);
+    let record = if server.is_some() {
+        record
+    } else {
+        record.unreachable()
+    };
+    let mut session_guard = super::sessions::SessionGuard::register(&state_dir, record);
+
     // Deliberately not derived from `session`: that id belongs to wrap, not to
     // the agent it spawns, so a derived path names a file nobody ever writes.
     let mut transcript = TranscriptSource::new(env(TRANSCRIPT_ENV).map(PathBuf::from));
 
     let (cols, rows) = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
+    // Probed (and, on success, held) ahead of `RawGuard::enter` below: the
+    // chrome eligibility decision (in particular whether the bar may draw at
+    // all) needs to know this before the pty is even sized, and the bar's
+    // own escape sequences need VT on regardless of whether the wrapped
+    // command is itself claude or codex. Restored explicitly alongside
+    // `raw`, at the one place this function ever leaves the pump.
+    let mut vt_guard = super::term::enable_vt_output().ok();
+    let vt_ok = vt_guard.is_some();
+    // `IsTerminal` on stdout specifically, not `window_size(STDIN_FD)`'s own
+    // success: on unix that probes stdin's own fd, so `zirv chat > log` (or
+    // `wrap`) left stdin attached to a real terminal still banered straight
+    // into the redirected file. The size itself still comes from
+    // `window_size`, which is the only source `wrap` has for it.
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let chrome = super::chrome::ChromeCaps::probe(
+        stdout_is_tty,
+        vt_ok,
+        (cols, rows),
+        &cfg.chrome,
+        args.simple,
+        args.no_supervise,
+    );
+    let (pty_cols, pty_rows) = super::chrome::reserved_pty_size((cols, rows), chrome.bar);
     let mut pair = native_pty_system().openpty(PtySize {
-        rows,
-        cols,
+        rows: pty_rows,
+        cols: pty_cols,
         pixel_width: 0,
         pixel_height: 0,
     })?;
 
+    // FIX 2a (command-injection defense): the first-launch pty assembly does
+    // not pass through supervise::spawn_tapped's guard either, so apply the
+    // same cmd.exe argv-reparse policy over the full downstream argv -- the
+    // wrapped command's own args plus zirv's injected prompt args, which carry
+    // repo-sourced text. A no-op off Windows and for any non-shim program.
+    {
+        let mut guarded: Vec<String> = rest.to_vec();
+        guarded.extend(prompt_args.iter().cloned());
+        adapters::guard_cmd_shim_reparse(program, &guarded)?;
+    }
     let mut command = CommandBuilder::new(program);
     for arg in rest {
         command.arg(arg);
@@ -707,7 +1074,13 @@ pub fn run_with<W: Write>(
 
     // Kept for the relaunch too: a fresh session with no socket to report on
     // would leave the rest of the run unsupervised.
-    let turn_env: Vec<(String, String)> = server
+    // `AGENT_ENV` is exported unconditionally, unlike the turn-signal env
+    // (which needs a bound socket): it names the same fact `ctx.toml`'s own
+    // `agent` config key would, so a nested `zirv ctx ...` call inside this
+    // session's own children defaults to this session's own harness. Kept in
+    // `turn_env` (despite the name) because a relaunch reuses this exact
+    // vector, and the freshly relaunched session needs it too.
+    let mut turn_env: Vec<(String, String)> = server
         .as_ref()
         .map(|server| {
             adapter
@@ -721,9 +1094,12 @@ pub fn run_with<W: Write>(
                 .env
         })
         .unwrap_or_default();
-    for (key, value) in &turn_env {
-        command.env(key, value);
-    }
+    turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+    // Scrubbed before any of it is applied -- see `apply_session_env`. When
+    // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
+    // scrub is the only thing standing between this child and the outer
+    // session's identity.
+    apply_session_env(&mut command, &turn_env);
 
     // One writer, shared: the stdin pump and (from Task C4) the injector both
     // need it, and `take_writer` can only be called once. Its contents (not
@@ -745,8 +1121,21 @@ pub fn run_with<W: Write>(
     // never reports a false PtyClosed for the pty that replaced it.
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    // Guards every write to the real stdout: the output thread's own
+    // child-byte writes, and (T12b) the bar's assembled redraw buffer. One
+    // `Mutex<()>` rather than wrapping `Stdout` itself, since both writers
+    // already hold their own handle and only need to serialize *when* they
+    // write, not share the handle.
+    let stdout_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+
     // PTY to stdout.
-    spawn_output_thread(reader, tx.clone(), generation.clone(), 0);
+    spawn_output_thread(
+        reader,
+        tx.clone(),
+        generation.clone(),
+        0,
+        stdout_lock.clone(),
+    );
 
     // Armed for the pty just opened, and re-armed by `pump` for every pty a
     // restart opens after it.
@@ -798,6 +1187,45 @@ pub fn run_with<W: Write>(
     // still passes bytes through.
     let mut raw = RawGuard::enter(STDIN_FD).ok();
 
+    let mut bar = BarRuntime::new(
+        chrome,
+        adapter.name().to_string(),
+        adapter.provider().to_string(),
+        super::sessions::short_id(session.as_str()),
+        cfg.mail.enabled,
+        stdout_lock.clone(),
+        (cols, rows),
+    );
+    // C5: `raw.is_some()` as well as `bar.chrome.bar`. `RawGuard::enter` is
+    // what stashes the console modes and installs the emergency restore
+    // handler (F4), so when it failed there is nothing armed to undo a
+    // scroll region -- writing one anyway would fence off the terminal's
+    // last row with no handler able to put it back, which is strictly worse
+    // than having no bar. A failed `enter` also means this is not a real
+    // terminal in the first place, so the bar has nothing to draw on.
+    if bar.chrome.bar && raw.is_some() {
+        let region = super::chrome::scroll_region_sequence(bar.rows);
+        let region_ok = match stdout_lock.lock() {
+            Ok(_guard) => {
+                let mut stdout = std::io::stdout();
+                stdout
+                    .write_all(region.as_bytes())
+                    .and_then(|()| stdout.flush())
+                    .is_ok()
+            }
+            Err(_) => false,
+        };
+        // Same degrade-on-failure as every other bar write: a scroll region
+        // that never actually got set must not leave the bar thinking it is
+        // still safely confining the child.
+        bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
+        // F4: from here the real console has a scroll region fencing off its
+        // last row, so an external kill owes it a `CSI r` on the way out.
+        // Only when the write actually landed -- a region that was never set
+        // needs no reset.
+        super::term::set_bar_active(region_ok);
+    }
+
     let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
     let inject_timeout = Duration::from_millis(cfg.wrap.inject_timeout_ms);
 
@@ -832,26 +1260,261 @@ pub fn run_with<W: Write>(
         inject_timeout,
         repo,
         cfg.handoff.tail_items,
-        &cfg.handoff.model,
+        &handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref()),
         Duration::from_secs(cfg.handoff.timeout_secs),
+        &cfg,
+        &memory_slug,
         QUIT_GRACE,
         tx,
         generation,
         &relaunch_extra,
         &turn_env,
         &cpr_filter,
+        &announcer,
+        &mut bar,
     );
+    session_guard.release();
+    // Paired with `publish_socket_path` above, at the same single point every
+    // other per-session artifact is released: a dead supervisor's file must
+    // not linger to be picked as "the newest" by a later `read_socket_path`
+    // that has no session id of its own.
+    unpublish_socket_path(&state_dir, session.as_str());
 
+    reset_bar(&bar);
     if let Some(guard) = raw.as_mut() {
+        let _ = guard.restore();
+    }
+    if let Some(guard) = vt_guard.as_mut() {
         let _ = guard.restore();
     }
 
     match exit {
         Ok(code) => Ok(code),
         Err(e) => {
-            writeln!(w, "zirv ctx wrap: {e}")?;
+            // Item 6 audit: `w` is stdout in production, the same stream the
+            // wrapped session's own pty bytes are already occupying -- a
+            // rare internal pump failure (a `try_wait`/`wait` I/O error) used
+            // to print its only diagnostic there, where it could be scrolled
+            // off, overwritten by the child's own next redraw, or -- for
+            // `zirv chat > log` -- land only in a redirected file instead of
+            // the operator's own terminal. `output::error` matches
+            // `output::error`'s own stream and styling, the same fix as
+            // chat.rs's no-adapter diagnostic (item 1).
+            crate::output::error(format!("zirv ctx wrap: {e}"));
             Ok(1)
         }
+    }
+}
+
+/// Mutable T12b bookkeeping for the reserved status bar, bundled into one
+/// struct rather than further widening `pump`'s already-long parameter list.
+/// `disabled` is a one-way switch exactly like `InjectionState::degraded`:
+/// once a probe, lock or write failure sets it, nothing here ever clears it
+/// again, and the child is never touched by that decision (see
+/// `chrome::after_redraw_attempt`). `recovered` (B1) is a second, later
+/// one-way switch: it tracks whether the *disable* has already been reacted
+/// to (row cleared, pty widened back to full size), so that reaction runs
+/// exactly once no matter which caller noticed the disable first.
+struct BarRuntime {
+    chrome: super::chrome::Chrome,
+    disabled: bool,
+    recovered: bool,
+    last_text: Option<String>,
+    last_draw: Instant,
+    harness: String,
+    /// The resolved adapter's own `AgentAdapter::provider()` (`"anthropic"`
+    /// for claude, `"openai"` for codex), so `redraw_bar_if_due` reads the
+    /// usage window for *this* session's account rather than the legacy
+    /// unscoped file every session used to share. See `window::has_no_usage_
+    /// source`/`load_for` and [[Usage and Pacing]].
+    provider: String,
+    /// This session's own short id (`sessions::short_id`'s vocabulary), used
+    /// to scope the mail count `unread_mail_count` reads to messages this
+    /// session may actually see, not every session's mail in the repo.
+    session_short: String,
+    mail_enabled: bool,
+    stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    rows: u16,
+    cols: u16,
+}
+
+impl BarRuntime {
+    fn new(
+        chrome: super::chrome::Chrome,
+        harness: String,
+        provider: String,
+        session_short: String,
+        mail_enabled: bool,
+        stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
+        size: (u16, u16),
+    ) -> Self {
+        Self {
+            disabled: !chrome.bar,
+            chrome,
+            recovered: false,
+            // Never drawn yet, so the first due check always draws. Process
+            // uptime under a second (a fast test run, a fresh container)
+            // would make a bare subtraction panic (an abort, on the release
+            // profile this ships with); `checked_sub` degrades to "draw
+            // immediately" instead, which is the same outcome a real elapsed
+            // second would have produced anyway.
+            last_text: None,
+            last_draw: Instant::now()
+                .checked_sub(BAR_THROTTLE)
+                .unwrap_or_else(Instant::now),
+            harness,
+            provider,
+            session_short,
+            mail_enabled,
+            stdout_lock,
+            cols: size.0,
+            rows: size.1,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.chrome.bar && !self.disabled
+    }
+}
+
+/// The 1s redraw throttle: usage and mail are read from disk only when this
+/// has elapsed, never on the byte-pump path.
+const BAR_THROTTLE: Duration = Duration::from_secs(1);
+
+/// Item 2 (regression fix): applies a `ResizeDecision::disables_bar` outcome
+/// to `bar`'s own bookkeeping. The dims move to the *current* size *before*
+/// `disabled` flips, not after or never: `reset_bar`'s later `bar_reset_
+/// sequence(bar.rows)` (both the recovery call right after a disabling
+/// resize, and the final session cleanup) addresses `bar.rows` to clear the
+/// reserved row, and a stale, larger row number left over from before the
+/// shrink points past the now-smaller terminal. A real terminal clamps an
+/// out-of-range cursor move to its own last row and blanks a line of the
+/// child's own live output there instead of the row that actually used to
+/// hold the bar.
+fn disable_bar_at_current_size(bar: &mut BarRuntime, size: (u16, u16)) {
+    bar.cols = size.0;
+    bar.rows = size.1;
+    bar.disabled = true;
+}
+
+/// Writes the reset sequence: region cleared, reserved row blanked. Called
+/// from two places -- the final cleanup alongside `RawGuard::restore`, and
+/// (B1) `recover_bar_to_full_size` the moment the bar degrades mid-session --
+/// so callers decide when it is due; this just performs it. A no-op when the
+/// bar was never eligible in the first place.
+fn reset_bar(bar: &BarRuntime) {
+    if !bar.chrome.bar {
+        return;
+    }
+    let sequence = super::chrome::bar_reset_sequence(bar.rows);
+    let mut reset_ok = false;
+    if let Ok(_guard) = bar.stdout_lock.lock() {
+        let mut stdout = std::io::stdout();
+        reset_ok = stdout
+            .write_all(sequence.as_bytes())
+            .and_then(|()| stdout.flush())
+            .is_ok();
+    }
+    // F4: `BAR_ACTIVE` means "the real console currently has a scroll region
+    // we set", so it is cleared only once the undo actually landed. A reset
+    // that failed leaves the console still fenced, and the emergency handler
+    // still owes it a `CSI r`.
+    if reset_ok {
+        super::term::set_bar_active(false);
+    }
+}
+
+/// B1 (blocking fix): the moment the bar shows disabled -- whichever caller
+/// noticed first, a too-small resize or a redraw/lock failure with no resize
+/// event of its own -- this clears the reserved row exactly once and widens
+/// the child pty to the full current size. Without it the pty stayed pinned
+/// at its last reserved height forever, and a later widen never reached the
+/// child: a degraded session must behave exactly like a bar-less one from
+/// here on, including tracking every resize after this at full size.
+/// Idempotent (`bar.recovered` guards it), so calling this every tick is
+/// cheap and safe.
+fn recover_bar_to_full_size(
+    bar: &mut BarRuntime,
+    pair: &mut portable_pty::PtyPair,
+    size: (u16, u16),
+) {
+    if !super::chrome::bar_needs_recovery(bar.chrome.bar, bar.disabled, bar.recovered) {
+        return;
+    }
+    bar.recovered = true;
+    reset_bar(bar);
+    let _ = pair.master.resize(PtySize {
+        rows: size.1,
+        cols: size.0,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+}
+
+/// Redraws the bar when it is active, its rendered text actually changed,
+/// and the 1s throttle has elapsed. Usage and mail are read from disk only
+/// here, gated by that same throttle, never from the byte-pump path. Any
+/// lock or write failure disables the bar permanently and leaves the child
+/// untouched; `now` is threaded in rather than read internally so the
+/// throttle itself stays testable without a real clock.
+fn redraw_bar_if_due(
+    bar: &mut BarRuntime,
+    supervision: &InjectionState,
+    state_dir: &super::state::StateDir,
+    repo: &Path,
+    now: Instant,
+) {
+    if !bar.active() || now.duration_since(bar.last_draw) < BAR_THROTTLE {
+        return;
+    }
+    bar.last_draw = now;
+
+    // Per-provider since this fix: `window::load` is the legacy machine-wide
+    // file every session used to share, so a wrapped codex session's bar
+    // used to render whatever Anthropic numbers a claude session happened to
+    // leave there. `load_for` falls back to that same legacy file for
+    // claude's own provider (`anthropic`), so this is a no-op for the common
+    // case; for a provider with no usage source at all (codex/openai today)
+    // it now reads as `UsageWindows::default()`, which `max_used_percentage`
+    // already turns into `None` -- and `status_bar` already renders `None`
+    // as the placeholder dash, never a misleading `0%`. No renderer change
+    // needed at all, only which windows are read.
+    let windows = super::window::load_for(state_dir, &bar.provider).unwrap_or_default();
+    let usage_percent = super::window::max_used_percentage(&windows);
+    let unread_mail = unread_mail_counts(
+        state_dir,
+        repo,
+        &bar.harness,
+        &bar.session_short,
+        bar.mail_enabled,
+    );
+
+    let state = super::chrome::BarState {
+        harness: bar.harness.clone(),
+        score: (supervision.signals_seen > 0).then_some(supervision.score),
+        verdict: (supervision.signals_seen > 0).then_some(supervision.verdict),
+        usage_percent,
+        unread_mail,
+        degraded: supervision.degraded,
+    };
+    let text = super::chrome::status_bar(&state, bar.cols, bar.chrome.colour);
+    if !super::chrome::bar_text_changed(bar.last_text.as_deref(), &text) {
+        return;
+    }
+
+    let sequence = super::chrome::bar_redraw_sequence(bar.rows, &text);
+    let wrote = match bar.stdout_lock.lock() {
+        Ok(_guard) => {
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(sequence.as_bytes())
+                .and_then(|()| stdout.flush())
+        }
+        Err(_) => Err(std::io::Error::other("stdout lock poisoned")),
+    };
+    bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, wrote.is_ok());
+    if wrote.is_ok() {
+        bar.last_text = Some(text);
     }
 }
 
@@ -873,26 +1536,49 @@ fn pump(
     tail_items: usize,
     distiller_model: &str,
     distiller_timeout: Duration,
+    // N6: read alongside `distiller_model`/`distiller_timeout` at the one
+    // restart site below (`Action::Restart`), never anywhere else in the
+    // pump -- the harvest call is gated on `cfg.memory.harvest` internally.
+    cfg: &CtxConfig,
+    memory_slug: &str,
     grace: Duration,
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     extra: &[String],
     turn_env: &[(String, String)],
     cpr_filter: &std::sync::Arc<std::sync::Mutex<CprFilter>>,
+    announcer: &Announcer,
+    bar: &mut BarRuntime,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
+    // Read only from the turn-signal arm below, never from a byte-pump or
+    // per-tick path: see `unread_mail_count`.
+    let mut mail_seen = 0usize;
 
     loop {
         if let Some(status) = child.try_wait()? {
             // Let the reader thread flush whatever is still buffered.
             while rx.recv_timeout(Duration::from_millis(50)).is_ok() {}
-            return Ok(status.exit_code() as i32);
+            let code = status.exit_code() as i32;
+            // Item 6 audit: the wrapped session just ended, whether the
+            // agent quit cleanly or crashed. Previously silent -- nothing
+            // printed at all, so the session appeared to just stop.
+            announcer.emit(&Event::SessionEnded {
+                agent: adapter.name().to_string(),
+                code,
+            });
+            return Ok(code);
         }
 
         while let Ok(event) = rx.try_recv() {
             if event == PumpEvent::PtyClosed {
                 let status = child.wait()?;
-                return Ok(status.exit_code() as i32);
+                let code = status.exit_code() as i32;
+                announcer.emit(&Event::SessionEnded {
+                    agent: adapter.name().to_string(),
+                    code,
+                });
+                return Ok(code);
             }
             supervision.on_event(event, Instant::now());
         }
@@ -901,14 +1587,67 @@ fn pump(
             && let Some(signal) = server.try_recv()
         {
             transcript.adopt(signal.transcript_path.as_deref());
+            let previous_verdict = supervision.verdict;
             supervision.on_turn(&signal);
+            if let Some(event) =
+                super::announce::verdict_change(previous_verdict, supervision.verdict, signal.score)
+            {
+                announcer.emit(&event);
+            }
+
+            // Advisory only: wrap never consumes mail (it stays unread for
+            // `zirv ctx inbox`) and never writes to the pty, only to stderr.
+            // A read error (including no mailbox at all) leaves `mail_seen`
+            // where it was, so it neither advises nor errors.
+            //
+            // M4: `observe_mail` records *every* successful read, so the
+            // advisory measures growth against the previous observation
+            // rather than an all-time high that a consumed mailbox could
+            // never fall back below.
+            if let Some(count) = unread_mail_count(
+                state_dir,
+                repo,
+                adapter.name(),
+                &bar.session_short,
+                bar.mail_enabled,
+            ) && observe_mail(&mut mail_seen, count)
+            {
+                announcer.emit(&Event::MailWaiting { count });
+            }
+
+            // N4: an interactive session is only ever advised of a nudge,
+            // never restarted and never typed into -- the same advisory-only
+            // contract the mail-waiting line above already follows. Claiming
+            // the marker here (rather than leaving it for a byte-pump or
+            // per-tick path) matches `unread_mail_count`'s own throttling:
+            // both only ever run from this turn-signal arm.
+            // C4: `from` is the *sender*, read out of the marker file, and
+            // the disposition is `Advisory` -- an interactive session never
+            // receives message bodies, so the line has to point the operator
+            // at `zirv ctx inbox` rather than promise the guidance will
+            // "be picked up as mail".
+            if let Some(from) = super::sessions::claim_nudge_marker(state_dir, &bar.session_short) {
+                announcer.emit(&Event::Nudge {
+                    from,
+                    disposition: super::announce::NudgeDisposition::Advisory,
+                });
+            }
         }
+
+        // T12b: ticks on the ordinary ~100ms poll, so the bar still
+        // refreshes (usage, mail, a still-degrading session) both right
+        // after a turn signal and during a long turn with none at all.
+        // `redraw_bar_if_due` is what actually enforces the 1s throttle and
+        // the no-op-when-unchanged check; this call is cheap otherwise.
+        redraw_bar_if_due(bar, supervision, state_dir, repo, Instant::now());
 
         match action_for(supervision, Instant::now(), debounce) {
             Action::None => {}
             Action::Advise => {
-                let mut stderr = std::io::stderr();
-                let _ = writeln!(stderr, "\r\n{}\r", advisory_line(supervision.score, 0));
+                announcer.emit(&Event::RotAdvisory {
+                    score: supervision.score,
+                    tokens: 0,
+                });
                 // Advise once per turn.
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
             }
@@ -946,9 +1685,15 @@ fn pump(
                     }
                 };
                 let verified = failure.is_none();
+                announcer.emit(&Event::Compact { verified });
 
                 if let Some(reason) = failure {
-                    note_failure(supervision, Some((state_dir, session.as_str())), reason);
+                    note_failure(
+                        supervision,
+                        Some((state_dir, session.as_str())),
+                        reason,
+                        announcer,
+                    );
                 }
                 let _ = super::log::append(
                     state_dir,
@@ -985,6 +1730,20 @@ fn pump(
                     distiller_timeout,
                 );
                 let stored = handoff::store(state_dir, repo, session.as_str(), &note);
+                // N6: opt-in (`cfg.memory.harvest`, default off) and only
+                // from a genuinely distilled handoff -- never the mechanical
+                // structural fallback. Best-effort: a harvest failure must
+                // never turn a successful restart into a failed one.
+                if source == "distilled" {
+                    let _ = super::memory::harvest_from_handoff(
+                        adapter,
+                        distiller_model,
+                        &note,
+                        state_dir,
+                        memory_slug,
+                        cfg,
+                    );
+                }
 
                 // The writer is taken first, and the generation is bumped only
                 // once this restart is genuinely under way. The two used to be
@@ -1017,15 +1776,29 @@ fn pump(
                 // file, and the replacement reports its own on its first turn.
                 transcript.forget();
 
+                // Item 6 audit: captured so `note_failure`'s own announcement
+                // can name *why* the restart failed -- quit/writer-lock
+                // trouble, or the fresh pty/spawn itself -- rather than the
+                // same generic "relaunch failed" either way. Neither error
+                // used to be kept past this match at all.
+                let mut relaunch_error = quit.as_ref().err().cloned();
                 let relaunched = match (new_generation, quit.is_ok()) {
                     (Some(new_generation), true) => {
-                        match relaunch(adapter, repo, &note, extra, turn_env, last_size) {
+                        match relaunch(
+                            adapter,
+                            repo,
+                            &note,
+                            extra,
+                            turn_env,
+                            relaunch_size(bar, last_size),
+                        ) {
                             Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
                                 spawn_output_thread(
                                     fresh_reader,
                                     tx.clone(),
                                     generation.clone(),
                                     new_generation,
+                                    bar.stdout_lock.clone(),
                                 );
                                 if let Ok(mut sink) = writer.lock() {
                                     *sink = fresh_writer;
@@ -1040,17 +1813,30 @@ fn pump(
                                 *child = fresh_child;
                                 true
                             }
-                            Err(_) => false,
+                            Err(e) => {
+                                relaunch_error = Some(e.to_string());
+                                false
+                            }
                         }
                     }
                     _ => false,
                 };
 
-                if !relaunched {
+                if relaunched {
+                    announcer.emit(&Event::Restart {
+                        style: source.to_string(),
+                        stored: match &stored {
+                            Ok(path) => path.display().to_string(),
+                            Err(e) => format!("not stored: {e}"),
+                        },
+                    });
+                } else {
+                    let reason = relaunch_error.unwrap_or_else(|| "relaunch failed".to_string());
                     note_failure(
                         supervision,
                         Some((state_dir, session.as_str())),
-                        "relaunch failed",
+                        &reason,
+                        announcer,
                     );
                 }
                 let _ = super::log::append(
@@ -1074,7 +1860,15 @@ fn pump(
                 );
                 if !relaunched {
                     let status = child.wait()?;
-                    return Ok(status.exit_code() as i32);
+                    let code = status.exit_code() as i32;
+                    // The `Degraded` announcement just above already said
+                    // *why* (the relaunch failure reason); this says the
+                    // session is over, the same as every other exit point.
+                    announcer.emit(&Event::SessionEnded {
+                        agent: adapter.name().to_string(),
+                        code,
+                    });
+                    return Ok(code);
                 }
             }
         }
@@ -1083,22 +1877,76 @@ fn pump(
             && size != last_size
         {
             last_size = size;
+            // B1: `chrome::resize_decision` is the single source of truth for
+            // what a resize does to the bar and the pty -- see its own tests
+            // for the shrink-below-floor and widen-after-degrade cases this
+            // used to get wrong (the child pinned at a stale reserved size
+            // forever, even once the terminal widened back out).
+            let decision = super::chrome::resize_decision(bar.active(), size);
+            if decision.disables_bar {
+                disable_bar_at_current_size(bar, size);
+            } else if decision.set_scroll_region {
+                bar.cols = size.0;
+                bar.rows = size.1;
+                let region = super::chrome::scroll_region_sequence(bar.rows);
+                let region_ok = match bar.stdout_lock.lock() {
+                    Ok(_guard) => {
+                        let mut stdout = std::io::stdout();
+                        stdout
+                            .write_all(region.as_bytes())
+                            .and_then(|()| stdout.flush())
+                            .is_ok()
+                    }
+                    Err(_) => false,
+                };
+                bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
+                // C5: set on success, never *cleared* on failure. A resize
+                // whose region write failed leaves whatever region was
+                // already in effect still fencing the console, so clearing
+                // the flag here would tell the emergency handler it owes the
+                // terminal nothing while the terminal was still fenced.
+                // `BAR_ACTIVE` means "we have set a region that is still
+                // outstanding", and only a successful `reset_bar` retires it.
+                if region_ok {
+                    super::term::set_bar_active(true);
+                }
+                if !bar.disabled {
+                    // The bar's own row moved; the next throttle tick must
+                    // redraw it even if the text is unchanged.
+                    bar.last_text = None;
+                }
+            }
             let _ = pair.master.resize(PtySize {
-                rows: size.1,
-                cols: size.0,
+                rows: decision.pty_size.1,
+                cols: decision.pty_size.0,
                 pixel_width: 0,
                 pixel_height: 0,
             });
         }
 
+        // B1: catches a disable that just happened above (this tick's
+        // resize shrank below the floor) *and* one that happened earlier
+        // with no resize event at all (a redraw or lock failure) -- either
+        // way, `bar_needs_recovery` makes this a one-time, idempotent
+        // reaction, so calling it unconditionally every tick is cheap and
+        // correct in both cases.
+        recover_bar_to_full_size(bar, pair, last_size);
+
         std::thread::sleep(PUMP_POLL);
     }
 }
 
-pub fn run<W: Write>(args: &WrapArgs, w: &mut W) -> CtxResult<i32> {
+pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env)
+    run_with(
+        args,
+        &repo,
+        &env,
+        PromptRole::Worker,
+        None,
+        super::sessions::Verb::Wrap,
+    )
 }
 
 #[cfg(test)]
@@ -1112,6 +1960,140 @@ mod tests {
     use std::io::Read;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn test_bar(size: (u16, u16)) -> BarRuntime {
+        BarRuntime::new(
+            super::super::chrome::Chrome {
+                banner: true,
+                bar: true,
+                colour: false,
+            },
+            "claude".to_string(),
+            "anthropic".to_string(),
+            "sess0000".to_string(),
+            true,
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+            size,
+        )
+    }
+
+    /// Item 2 (Usage and Pacing follow-up): the status bar used to read the
+    /// single legacy `usage.json` regardless of which adapter it was
+    /// wrapping, so a codex (`openai`) session's bar rendered whatever
+    /// Anthropic numbers a claude session happened to leave there. It now
+    /// reads `window::load_for(state_dir, &bar.provider)`, so a codex
+    /// session's usage segment must show the placeholder dash (no usage
+    /// source) even while a real claude reading sits in the legacy file --
+    /// and a claude session must still see it, via the same legacy-file
+    /// fallback `load_for` already gives `anthropic`.
+    #[test]
+    fn a_codex_sessions_bar_does_not_inherit_claudes_own_legacy_usage_reading() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        super::super::window::store(
+            &state,
+            &super::super::window::UsageWindows {
+                five_hour: Some(super::super::window::Window {
+                    used_percentage: 42.0,
+                    resets_at: 0,
+                    observed_at: 1,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store the legacy (claude) reading");
+
+        let mut codex_bar = test_bar((80, 1));
+        codex_bar.provider = "openai".to_string();
+        redraw_bar_if_due(
+            &mut codex_bar,
+            &InjectionState::new(),
+            &state,
+            tmp.path(),
+            Instant::now(),
+        );
+        let codex_text = codex_bar.last_text.expect("the bar drew something");
+        assert!(
+            !codex_text.contains("42%"),
+            "codex must not inherit claude's own legacy reading: {codex_text}"
+        );
+        assert!(
+            codex_text.contains("usage \u{2013}"),
+            "and must show the placeholder, not a fabricated zero: {codex_text}"
+        );
+
+        let mut claude_bar = test_bar((80, 1));
+        redraw_bar_if_due(
+            &mut claude_bar,
+            &InjectionState::new(),
+            &state,
+            tmp.path(),
+            Instant::now(),
+        );
+        let claude_text = claude_bar.last_text.expect("the bar drew something");
+        assert!(
+            claude_text.contains("42%"),
+            "claude keeps reading the legacy file via its own provider fallback: {claude_text}"
+        );
+    }
+
+    /// Item 2 (regression): a shrink that disables the bar must move
+    /// `bar.rows`/`bar.cols` to the *current* size before disabling, so the
+    /// reset sequence that follows (recovery, or the final session cleanup)
+    /// addresses the row that is actually still on screen. Left stale (the
+    /// old, larger row number), the real terminal clamps the out-of-range
+    /// cursor move to its own last row and blanks a line of the child's own
+    /// live output there.
+    #[test]
+    fn reset_after_a_shrink_degrade_targets_the_current_last_row() {
+        let mut bar = test_bar((100, 30));
+        assert_eq!(bar.rows, 30, "launched tall");
+
+        disable_bar_at_current_size(&mut bar, (100, 5));
+
+        assert_eq!(
+            bar.rows, 5,
+            "the dims move to the current size before disabling"
+        );
+        assert_eq!(bar.cols, 100);
+        assert!(bar.disabled);
+
+        let reset = super::super::chrome::bar_reset_sequence(bar.rows);
+        assert!(
+            reset.contains("\x1b[5;1H"),
+            "the reset must address the CURRENT last row: {reset:?}"
+        );
+        assert!(
+            !reset.contains("\x1b[30;1H"),
+            "must not address the stale, now out-of-range row: {reset:?}"
+        );
+    }
+
+    /// Item 5 (regression): a restart's fresh pty has to reserve the bottom
+    /// row while the bar is still alive, exactly like the initial launch
+    /// and an ordinary resize -- otherwise the freshly relaunched child gets
+    /// the full terminal height and the bar immediately starts drawing over
+    /// its own last line.
+    #[test]
+    fn a_relaunch_while_the_bar_is_active_keeps_the_reserved_row() {
+        let bar = test_bar((100, 30));
+        assert!(bar.active(), "sanity: freshly constructed and eligible");
+        assert_eq!(
+            relaunch_size(&bar, (100, 30)),
+            (100, 29),
+            "the relaunch must reserve the same row the live session already has"
+        );
+    }
+
+    /// And once the bar has degraded, a restart is ordinary full-size
+    /// forwarding, exactly like every other pty operation once `bar.active()`
+    /// is false (B1).
+    #[test]
+    fn a_relaunch_after_the_bar_has_degraded_uses_the_full_size() {
+        let mut bar = test_bar((100, 30));
+        bar.disabled = true;
+        assert_eq!(relaunch_size(&bar, (100, 30)), (100, 30));
+    }
 
     #[cfg(any(unix, windows))]
     pub(crate) fn zirv_bin() -> PathBuf {
@@ -1140,6 +2122,10 @@ mod tests {
         pub reader: Box<dyn Read + Send>,
         pub writer: Box<dyn Write + Send>,
         pub child: Box<dyn portable_pty::Child + Send + Sync>,
+        /// C9: keeps the throwaway state/HOME directory alive for as long as
+        /// the wrapped subprocess is. Dropped with the harness, which is
+        /// after the child has been waited on in every test that uses one.
+        _sandbox: tempfile::TempDir,
     }
 
     /// The general form: `flags` are wrap's own arguments, inserted before the
@@ -1172,6 +2158,57 @@ mod tests {
             cmd.arg(arg);
         }
         cmd.env("TERM", "xterm");
+        // `zirv ctx wrap`'s own `run()` derives its "repo" from
+        // `std::env::current_dir()` of the wrap process itself -- the same
+        // call the test-side helpers (`store_mail_for_cwd`, `repo_slug`
+        // lookups) make from *this* process to compute the slug they file
+        // and expect mail under. Without pinning it here, portable-pty's
+        // `CommandBuilder` (see the HOME comment just below) falls back to
+        // `chdir`-ing into HOME instead, so the two processes silently
+        // disagree on "repo": the spawned `wrap` never finds mail the test
+        // stored, and a test waiting on the mail advisory hangs rather than
+        // failing loudly, since nothing further ever arrives on the pty.
+        cmd.cwd(std::env::current_dir().expect("cwd"));
+        // C9: a throwaway state dir and HOME by default. These tests spawn a
+        // real `zirv ctx wrap`, which resolves its state dir from the
+        // environment -- so without this they registered sessions, published
+        // socket paths, wrote decision logs and dropped handoffs straight
+        // into the developer's own `~/.zirv`/state directory, where a later
+        // real session would then read them. Applied *before* `extra_env`,
+        // so a test that pins its own `ZIRV_CTX_STATE_DIR` (most of them do,
+        // because they read it back) still wins.
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        cmd.env(
+            crate::commands::ctx::state::STATE_ENV,
+            sandbox.path().join("state").display().to_string(),
+        );
+        // The directory has to actually exist, not just be a plausible
+        // path. Historically this was load-bearing for the spawn itself:
+        // with no `.cwd()` set, portable-pty's CommandBuilder falls back to
+        // `chdir`-ing into `HOME` before exec (see `as_command` in its
+        // `cmdbuilder.rs`), and a HOME that only existed on paper made that
+        // chdir fail with ENOENT -- surfaced by `spawn_command` as "No such
+        // file or directory", indistinguishable at a glance from the
+        // wrapped binary itself being missing. The `.cwd()` pin above now
+        // takes precedence over that fallback, but the spawned `zirv` still
+        // resolves real paths under HOME (`~/.zirv`, state fallbacks), so
+        // the sandbox home stays a directory that exists, not a fiction.
+        let home_dir = sandbox.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("create sandbox home");
+        for home in ["HOME", "USERPROFILE"] {
+            cmd.env(home, home_dir.display().to_string());
+        }
+        // Hermetic against the developer's own environment (F2): this spawns
+        // the real `zirv` binary, which reads the process environment, so a
+        // suite run from inside an agent session would otherwise trip the
+        // nesting guard instead of running the test. Removed *before*
+        // `extra_env`, which several tests use to pin `ZIRV_CTX_TRANSCRIPT`
+        // deliberately.
+        for key in super::super::sessions::SUPERVISION_ENV {
+            cmd.env_remove(key);
+        }
+        cmd.env_remove("CLAUDE_PID");
+        cmd.env_remove("CLAUDECODE");
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -1182,6 +2219,7 @@ mod tests {
             reader: pair.master.try_clone_reader().expect("reader"),
             writer: pair.master.take_writer().expect("writer"),
             child,
+            _sandbox: sandbox,
         }
     }
 
@@ -1241,6 +2279,464 @@ mod tests {
         assert_eq!(flag_value(seen, "--session-id"), None);
     }
 
+    // F1: `quit_child` must never write a console control byte into the pty.
+
+    /// A child that never exits on its own, so `quit_child` has to walk its
+    /// whole ladder, and that records whether it was killed.
+    ///
+    /// A stub rather than a real pty child on purpose: the sink is then a
+    /// plain `Vec<u8>` whose exact bytes can be asserted on (the whole point
+    /// of the test), and it runs on Windows too -- which is the platform the
+    /// `\x03\x03` rung was actually dangerous on, and where every other
+    /// `quit_child` test is `cfg(unix)`-gated away.
+    #[derive(Debug, Clone, Default)]
+    struct KillFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl KillFlag {
+        fn killed(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubbornChild {
+        killed: KillFlag,
+    }
+
+    impl portable_pty::ChildKiller for StubbornChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed
+                .0
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(StubbornChild {
+                killed: self.killed.clone(),
+            })
+        }
+    }
+
+    impl portable_pty::Child for StubbornChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(self
+                .killed
+                .killed()
+                .then(|| portable_pty::ExitStatus::with_exit_code(1)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(1))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    fn stubborn_child() -> (Box<dyn portable_pty::Child + Send + Sync>, KillFlag) {
+        let killed = KillFlag::default();
+        (
+            Box::new(StubbornChild {
+                killed: killed.clone(),
+            }),
+            killed,
+        )
+    }
+
+    /// The regression this whole round exists for. On Windows the pty master
+    /// is a ConPTY, and conhost turns a `\x03` written into it into a console
+    /// control event broadcast to *every* process attached to the
+    /// pseudoconsole -- with no `CREATE_NEW_PROCESS_GROUP` to narrow it to,
+    /// because portable-pty 0.9.0 does not spawn with one. A nested `wrap`
+    /// quitting its own child therefore killed the outer session's agent
+    /// too. The ladder is now the adapter's quit sequence, then the single
+    /// narrow `child.kill()`, and nothing in between.
+    #[test]
+    fn quit_child_never_writes_a_control_c_into_the_pty() {
+        let (mut child, killed) = stubborn_child();
+        let mut sink: Vec<u8> = Vec::new();
+
+        quit_child(&mut sink, &mut child, "/exit\r", Duration::from_millis(10)).expect("quit");
+
+        assert!(
+            !sink.contains(&0x03),
+            "no console control byte may reach the pty: {sink:?}"
+        );
+        assert_eq!(
+            sink,
+            b"/exit\r".to_vec(),
+            "only the adapter's own quit sequence is written: {:?}",
+            String::from_utf8_lossy(&sink)
+        );
+        assert!(
+            killed.killed(),
+            "a child that ignores the quit sequence escalates straight to the narrow kill"
+        );
+    }
+
+    #[test]
+    fn quit_child_writes_nothing_at_all_to_a_child_that_has_already_exited() {
+        let (mut child, killed) = stubborn_child();
+        // Already dead before `quit_child` is called.
+        portable_pty::ChildKiller::kill(&mut *child).expect("kill");
+        let mut sink: Vec<u8> = Vec::new();
+
+        quit_child(&mut sink, &mut child, "/exit\r", Duration::from_millis(10)).expect("quit");
+
+        assert!(sink.is_empty(), "nothing to say to a dead child: {sink:?}");
+        assert!(killed.killed());
+    }
+
+    // F2: the nesting guard.
+
+    /// An env map for the guard tests, always pinning `ZIRV_CTX_AGENT_BIN`
+    /// at a path that cannot exist.
+    ///
+    /// Safety belt, not a fixture detail. `adapters::select` calls `ready()`,
+    /// so an unusable agent_bin makes a launch structurally impossible: if
+    /// the guard under test ever regresses, these tests fail on a missing
+    /// binary instead of opening a pty and spawning a real nested agent into
+    /// whatever session the suite is running in.
+    fn nested_env(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        let mut env: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            "/nonexistent/agent-must-never-launch".to_string(),
+        );
+        env
+    }
+
+    fn wrap_args_in(command: &[&str], allow_nested: bool) -> WrapArgs {
+        WrapArgs {
+            agent: Some("claude".to_string()),
+            no_supervise: false,
+            command: command.iter().map(|s| (*s).to_string()).collect(),
+            simple: false,
+            allow_nested,
+        }
+    }
+
+    #[test]
+    fn wrap_refuses_to_start_inside_a_supervised_session_and_names_the_evidence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env = nested_env(&[(
+            adapters::SESSION_ENV,
+            "abcdef12-3456-4789-8abc-def012345678",
+        )]);
+
+        let err = run_with(
+            &wrap_args_in(&["claude"], false),
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("a wrap inside a supervised session must refuse");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to start inside an existing agent session"),
+            "got {msg}"
+        );
+        assert!(
+            msg.contains("abcdef12"),
+            "names the outer session it found: {msg}"
+        );
+        assert!(
+            msg.contains("--allow-nested"),
+            "says how to override: {msg}"
+        );
+    }
+
+    /// The Claude Code marker pair is the second, independent source of
+    /// evidence: a `zirv chat` typed into a Claude Code session's own shell
+    /// exports no `ZIRV_CTX_*` at all when that session was started outside
+    /// zirv, but it is still nested.
+    #[test]
+    fn wrap_refuses_inside_a_claude_code_session_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env = nested_env(&[("CLAUDE_PID", "4242"), ("CLAUDECODE", "1")]);
+
+        let err = run_with(
+            &wrap_args_in(&["claude"], false),
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("refuses");
+        assert!(err.to_string().contains("Claude Code"), "got {err}");
+    }
+
+    /// With the override on, the guard is out of the way and the run reaches
+    /// the *next* refusal in `run_with` -- the undetected-command one. That
+    /// specific later error is the evidence the guard was passed, without
+    /// this test ever having to spawn a pty or an agent.
+    #[test]
+    fn allow_nested_overrides_the_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [(
+            adapters::SESSION_ENV.to_string(),
+            "abcdef12-3456-4789-8abc-def012345678".to_string(),
+        )]
+        .into();
+        let mut args = wrap_args_in(&["echo", "hello"], true);
+        args.agent = None;
+
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("gets past the nesting guard, then fails on the undetected command");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("refusing to start inside"),
+            "the guard was overridden: {msg}"
+        );
+        assert!(msg.contains("could not tell which agent"), "got {msg}");
+    }
+
+    /// And the environment variable is the second, equivalent override, for
+    /// an operator who cannot reach the command line (a wrapper script, a
+    /// CI job).
+    #[test]
+    fn the_allow_nested_environment_variable_overrides_the_guard_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SESSION_ENV.to_string(),
+                "abcdef12-3456-4789-8abc-def012345678".to_string(),
+            ),
+            (
+                super::super::sessions::ALLOW_NESTED_ENV.to_string(),
+                "true".to_string(),
+            ),
+        ]
+        .into();
+        let mut args = wrap_args_in(&["echo", "hello"], false);
+        args.agent = None;
+
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("past the guard, onto the undetected command");
+        assert!(
+            !err.to_string().contains("refusing to start inside"),
+            "got {err}"
+        );
+    }
+
+    /// A plain terminal is not nested, and nothing about the guard changes
+    /// what a normal run does: the same undetected-command refusal, reached
+    /// the same way.
+    #[test]
+    fn a_wrap_outside_any_session_is_not_gated() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut args = wrap_args_in(&["echo", "hello"], false);
+        args.agent = None;
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("echo matches no adapter");
+        assert!(
+            !err.to_string().contains("refusing to start inside"),
+            "got {err}"
+        );
+    }
+
+    // F3: a child never inherits another session's identity.
+
+    /// The bind-failure case, which is the one that actually bit: `wrap`
+    /// binds no socket, so it has no turn-signal env of its own to set, and
+    /// every `ZIRV_CTX_*` the child sees would otherwise be the *outer*
+    /// session's -- inherited straight out of this process's environment,
+    /// because `CommandBuilder::new` seeds itself from `std::env::vars_os`.
+    #[test]
+    fn a_child_never_inherits_the_outer_sessions_socket_or_id() {
+        let _outer = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                adapters::SESSION_ENV,
+                Some("outer111-2222-4333-8444-555555555555"),
+            ),
+            (adapters::SOCKET_ENV, Some("/tmp/outer.sock")),
+            (TRANSCRIPT_ENV, Some("/tmp/outer.jsonl")),
+        ]);
+
+        // Sanity, and the reason the scrub has to be explicit: an untouched
+        // builder really does carry the outer session's values.
+        let inherited = CommandBuilder::new("echo");
+        assert_eq!(
+            inherited
+                .get_env(adapters::SESSION_ENV)
+                .and_then(|v| v.to_str()),
+            Some("outer111-2222-4333-8444-555555555555"),
+            "sanity: portable-pty seeds a builder from the process environment"
+        );
+
+        // No socket of its own: every supervision variable must be *absent*,
+        // not inherited.
+        let mut no_socket = CommandBuilder::new("echo");
+        apply_session_env(&mut no_socket, &[]);
+        for key in super::super::sessions::SUPERVISION_ENV {
+            assert_eq!(
+                no_socket.get_env(key),
+                None,
+                "{key} must not reach a child of an unsupervised wrap"
+            );
+        }
+
+        // And with a socket of its own, only its own values reach the child.
+        let mut supervised = CommandBuilder::new("echo");
+        apply_session_env(
+            &mut supervised,
+            &[(
+                adapters::SESSION_ENV.to_string(),
+                "inner999-2222-4333-8444-555555555555".to_string(),
+            )],
+        );
+        assert_eq!(
+            supervised
+                .get_env(adapters::SESSION_ENV)
+                .and_then(|v| v.to_str()),
+            Some("inner999-2222-4333-8444-555555555555"),
+        );
+        assert_eq!(
+            supervised.get_env(adapters::SOCKET_ENV),
+            None,
+            "the outer socket must not survive alongside the inner id"
+        );
+        assert_eq!(supervised.get_env(TRANSCRIPT_ENV), None);
+    }
+
+    // F5: one published socket path per session.
+
+    #[test]
+    fn two_concurrent_wraps_do_not_clobber_each_others_socket_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let one = "aaaa1111-2222-4333-8444-555555555555";
+        let two = "bbbb2222-2222-4333-8444-555555555555";
+
+        publish_socket_path(&state, one, Path::new("/tmp/one.sock"));
+        publish_socket_path(&state, two, Path::new("/tmp/two.sock"));
+
+        assert_eq!(
+            read_socket_path(&state, Some(one)).as_deref(),
+            Some("/tmp/one.sock"),
+            "the second launch must not have overwritten the first"
+        );
+        assert_eq!(
+            read_socket_path(&state, Some(two)).as_deref(),
+            Some("/tmp/two.sock")
+        );
+        assert!(
+            !state.root().join(SOCKET_PATH_FILE).exists(),
+            "the clobber-prone global file is never written any more"
+        );
+
+        // And releasing one leaves the other reachable.
+        unpublish_socket_path(&state, one);
+        assert_eq!(read_socket_path(&state, Some(one)), None);
+        assert_eq!(
+            read_socket_path(&state, Some(two)).as_deref(),
+            Some("/tmp/two.sock")
+        );
+    }
+
+    #[test]
+    fn a_reader_resolves_its_own_sessions_socket_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mine = "cccc3333-2222-4333-8444-555555555555";
+        let theirs = "dddd4444-2222-4333-8444-555555555555";
+
+        publish_socket_path(&state, mine, Path::new("/tmp/mine.sock"));
+        publish_socket_path(&state, theirs, Path::new("/tmp/theirs.sock"));
+
+        assert_eq!(
+            read_socket_path(&state, Some(mine)).as_deref(),
+            Some("/tmp/mine.sock"),
+            "a reader that knows its own session id never gets somebody else's socket"
+        );
+        // A short id resolves the same file the full session id does.
+        assert_eq!(
+            read_socket_path(&state, Some("cccc3333")).as_deref(),
+            Some("/tmp/mine.sock")
+        );
+        // With no session to go on, *some* published socket is the best
+        // honest answer -- but only one of the two real ones, never a mix.
+        let anonymous = read_socket_path(&state, None).expect("a published socket");
+        assert!(
+            anonymous == "/tmp/mine.sock" || anonymous == "/tmp/theirs.sock",
+            "got {anonymous}"
+        );
+    }
+
+    /// Backward tolerance: a supervisor from a pre-F5 build published the
+    /// global file and nothing else. A reader must still find it.
+    #[test]
+    fn a_reader_still_falls_back_to_the_legacy_global_socket_path_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        super::super::state::create_private_dir_all(state.root()).expect("mkdir");
+        std::fs::write(state.root().join(SOCKET_PATH_FILE), "/tmp/legacy.sock").expect("write");
+
+        assert_eq!(
+            read_socket_path(&state, None).as_deref(),
+            Some("/tmp/legacy.sock")
+        );
+        assert_eq!(
+            read_socket_path(&state, Some("cccc3333")).as_deref(),
+            Some("/tmp/legacy.sock"),
+            "a session with no file of its own still falls back"
+        );
+
+        // A per-session file wins over the legacy one for its own session.
+        publish_socket_path(
+            &state,
+            "cccc3333-2222-4333-8444-555555555555",
+            Path::new("/tmp/mine.sock"),
+        );
+        assert_eq!(
+            read_socket_path(&state, Some("cccc3333")).as_deref(),
+            Some("/tmp/mine.sock")
+        );
+    }
+
+    #[test]
+    fn reading_a_state_dir_with_nothing_published_is_none_rather_than_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        assert_eq!(read_socket_path(&state, None), None);
+        assert_eq!(read_socket_path(&state, Some("cccc3333")), None);
+    }
+
     #[test]
     fn wrap_needs_a_command() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1249,10 +2745,56 @@ mod tests {
             no_supervise: false,
             command: Vec::new(),
             simple: false,
+            allow_nested: false,
         };
-        let mut out = Vec::new();
-        let err = run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("nothing to wrap");
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("nothing to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
+    }
+
+    /// M5's undetected-command refusal used to hardcode "pass --agent
+    /// claude", which only ever named one adapter no matter how many the
+    /// registry actually holds. The error must instead name whatever the
+    /// registry currently reports as available (gate-enabled and `ready()`),
+    /// so a second working adapter shows up here without an edit to this
+    /// string.
+    #[test]
+    fn the_undetected_command_error_names_the_registry_rather_than_claude() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let args = WrapArgs {
+            agent: None,
+            no_supervise: false,
+            command: vec!["echo".to_string(), "hello".to_string()],
+            simple: false,
+            allow_nested: false,
+        };
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("echo matches no adapter");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--agent"),
+            "still tells the user how to fix it: {msg}"
+        );
+        for name in adapters::available_adapter_names(&CtxConfig::default()) {
+            assert!(
+                msg.contains(name),
+                "must name available adapter '{name}': {msg}"
+            );
+        }
     }
 
     /// N1: `merge_command_line_prompt` strips the user's own
@@ -1272,10 +2814,17 @@ mod tests {
             no_supervise: false,
             command: vec!["--append-system-prompt".to_string(), "foo".to_string()],
             simple: false,
+            allow_nested: false,
         };
-        let mut out = Vec::new();
-        let err =
-            run_with(&args, &mut out, tmp.path(), &|_| None).expect_err("nothing left to wrap");
+        let err = run_with(
+            &args,
+            tmp.path(),
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("nothing left to wrap");
         assert!(err.to_string().contains("command"), "got {err}");
     }
 
@@ -1739,15 +3288,214 @@ mod tests {
         assert_eq!(action_for(&state, now, DEBOUNCE), Action::None);
     }
 
+    /// The rot advisory now lives on the `announce::Event` channel
+    /// (`Event::RotAdvisory`) rather than as a wrap-local `advisory_line`
+    /// free function; this pins the same content guarantees the old
+    /// function's own test did.
     #[test]
     fn the_advisory_line_is_one_line_and_plain() {
-        let line = advisory_line(47, 138_000);
+        let line = Event::RotAdvisory {
+            score: 47,
+            tokens: 138_000,
+        }
+        .line();
         assert_eq!(line.lines().count(), 1);
         assert!(line.contains("47"));
         assert!(line.contains("138000") || line.contains("138"));
         assert!(
             !line.contains('\u{2014}'),
             "no em dashes in user-facing copy"
+        );
+    }
+
+    // T8: mail advisory in wrap's pump, now `announce::Event::MailWaiting`.
+
+    #[test]
+    fn the_mail_advisory_line_names_the_count_and_points_at_inbox() {
+        let line = Event::MailWaiting { count: 3 }.line();
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains('3'));
+        assert!(line.contains("zirv ctx inbox"));
+        assert!(
+            !line.contains('\u{2014}'),
+            "no em dashes in user-facing copy"
+        );
+
+        let singular = Event::MailWaiting { count: 1 }.line();
+        assert!(!singular.contains("messages"), "got {singular}");
+    }
+
+    #[test]
+    fn mail_grew_only_fires_on_a_genuine_increase() {
+        assert!(mail_grew(0, 1));
+        assert!(mail_grew(2, 5));
+        assert!(!mail_grew(3, 3), "unchanged is not growth");
+        assert!(
+            !mail_grew(3, 1),
+            "a shrink (consumed elsewhere) is not growth"
+        );
+    }
+
+    /// M4: the watermark used to only ever ratchet upward -- it was assigned
+    /// solely inside the "did it grow" arm, so once it had seen 3 messages a
+    /// drained mailbox that filled back up to 2 could never advise again.
+    #[test]
+    fn the_mail_watermark_follows_the_last_observation_not_the_high_water_mark() {
+        let mut seen = 0usize;
+
+        assert!(observe_mail(&mut seen, 3), "first mail advises");
+        assert!(
+            !observe_mail(&mut seen, 3),
+            "the same three do not re-advise"
+        );
+        assert!(
+            !observe_mail(&mut seen, 0),
+            "draining the mailbox is not growth"
+        );
+        assert!(
+            observe_mail(&mut seen, 2),
+            "two new messages after a drain must advise again"
+        );
+        assert_eq!(seen, 2, "the watermark tracks what was last observed");
+    }
+
+    #[test]
+    fn unread_mail_count_is_zero_for_a_repo_with_no_mailbox_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn unread_mail_count_counts_what_store_wrote() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let msg = crate::commands::ctx::mail::Message {
+            from_session: "other".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 1,
+            body: "note".to_string(),
+        };
+        crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
+            .expect("store");
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            Some(1)
+        );
+    }
+
+    /// B3: `cfg.mail.enabled = false` must gate this the same way it gates
+    /// delivery -- an operator who turned mail off must never see the wrap
+    /// advisory (or the bar's mail count) either.
+    #[test]
+    fn mail_disabled_in_config_reports_no_unread_mail_even_when_some_is_stored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let msg = crate::commands::ctx::mail::Message {
+            from_session: "other".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 1,
+            body: "note".to_string(),
+        };
+        crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
+            .expect("store");
+
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", "sess0000", false),
+            None,
+            "mail.enabled = false must silence the advisory entirely"
+        );
+    }
+
+    /// B3 alignment: a message addressed to a different agent by name must
+    /// not count for this session, the same filter `mail::list`'s own
+    /// `for_agent` already applies to delivery and `zirv ctx inbox`.
+    #[test]
+    fn unread_mail_count_filters_by_the_sessions_own_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let msg = crate::commands::ctx::mail::Message {
+            from_session: "other".to_string(),
+            from_agent: "claude".to_string(),
+            to: "codex".to_string(),
+            to_session: None,
+            sent: 1,
+            body: "note".to_string(),
+        };
+        crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
+            .expect("store");
+
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            Some(0),
+            "addressed to codex, not this claude session"
+        );
+        assert_eq!(
+            unread_mail_count(&state, &repo, "codex", "sess0000", true),
+            Some(1)
+        );
+    }
+
+    /// `mail::list` itself treats "nothing there, or not a directory" as an
+    /// empty mailbox rather than an error (see its own doc), so this is the
+    /// ordinary case, indistinguishable from a repo that has never had mail.
+    #[test]
+    fn a_missing_or_non_directory_mailbox_reads_as_empty_not_as_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        std::fs::create_dir_all(state.mail()).expect("mkdir");
+        // A plain file where `mail::list` expects a directory.
+        std::fs::write(state.mail().join(&slug), "not a directory").expect("write");
+
+        assert_eq!(
+            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            Some(0)
+        );
+    }
+
+    /// A genuine read error -- unlike "missing" or "not a directory", which
+    /// `mail::list` already treats as empty -- is what `unread_mail_count`
+    /// must swallow into `None` rather than propagate: the pump's own
+    /// `if let Some(count) = unread_mail_count(...) { .. }` then does nothing
+    /// at all for this turn, leaving the session untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_mail_directory_the_process_cannot_read_is_reported_as_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let mailbox = state.mail().join(&slug);
+        std::fs::create_dir_all(&mailbox).expect("mkdir");
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let result = unread_mail_count(&state, &repo, "claude", "sess0000", true);
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+
+        assert_eq!(
+            result, None,
+            "a genuine read error must never masquerade as an empty mailbox"
         );
     }
 
@@ -1875,12 +3623,8 @@ mod tests {
 
         // A turn boundary is what unlocks injection, and the hook is what
         // reports one, so drive it exactly the way the real hook does.
-        let socket =
-            std::fs::read_to_string(tmp.path().join("state/socket-path")).unwrap_or_default();
-        assert!(
-            !socket.trim().is_empty(),
-            "wrap must publish its socket path"
-        );
+        let socket = read_socket_path(&StateDir::from_root(tmp.path().join("state")), None)
+            .expect("wrap must publish its socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(3, Verdict::Compact),
@@ -1903,6 +3647,298 @@ mod tests {
         );
 
         h.writer.write_all(b"/exit\r").expect("write");
+        let _ = h.child.wait();
+    }
+
+    // T8: mail advisory driven end to end through a real wrapped session.
+
+    #[cfg(unix)]
+    fn store_mail_for_cwd(state_root: &std::path::Path, body: &str) {
+        let repo = std::env::current_dir().expect("cwd");
+        let state = crate::commands::ctx::state::StateDir::from_root(state_root.to_path_buf());
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: body.to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapped_session_is_told_about_new_mail_on_stderr_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        store_mail_for_cwd(&state, "note");
+
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send turn signal");
+
+        // `wrap`'s own stderr shares the outer pty in this harness (there is
+        // no separate stderr stream to redirect it to), so it arrives on
+        // `h.reader` exactly like the compact/restart tests' own log output
+        // does; the point under test is the wording, not the transport.
+        let seen = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
+        assert!(seen.contains("zirv ctx inbox"), "got {seen:?}");
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    /// N4: an interactive session (`wrap`/`chat`) reacts to a nudge exactly
+    /// like the T8 mail advisory it shares a turn-signal arm with -- named
+    /// on stderr, never restarted, and never typed into the wrapped agent.
+    /// Unlike `exec`'s headless worker, there is no relaunch to fold the
+    /// nudge's own message body into, so that text never has anywhere to
+    /// reach the pty at all; this pins that directly rather than only by
+    /// absence of an injection call.
+    #[cfg(unix)]
+    #[test]
+    fn an_interactive_session_is_only_advised_and_is_never_typed_into() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state_root.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        // Resolved from the registry rather than passed as an empty prefix:
+        // there is exactly one live session, the wrap subprocess `spawn_wrap`
+        // just started under its own (real) pid, and F6 makes `zirv ctx
+        // nudge` refuse any prefix shorter than four characters -- an empty
+        // one most of all.
+        let repo = std::env::current_dir().expect("cwd");
+        let state = super::super::state::StateDir::from_root(state_root.clone());
+        let short = super::super::sessions::list(&state)
+            .into_iter()
+            .find(|(_, liveness)| *liveness == super::super::sessions::Liveness::Live)
+            .map(|(record, _)| record.short)
+            .expect("the wrap subprocess registered a live session");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_root.display().to_string(),
+        )]
+        .into();
+        let args = crate::commands::ctx::sessions::NudgeArgs {
+            prefix: short,
+            message: Some("do-not-type-this-guidance".to_string()),
+            message_file: None,
+        };
+        let mut nudge_out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        crate::commands::ctx::sessions::run_nudge_with(
+            &args,
+            &mut nudge_out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("nudge the live wrap session");
+
+        let socket =
+            read_socket_path(&StateDir::from_root(state_root.clone()), None).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send turn signal");
+
+        let seen = read_until(&mut h.reader, "nudged by", Duration::from_secs(10));
+        assert!(seen.contains("nudged by"), "got {seen:?}");
+        assert!(
+            !seen.contains("do-not-type-this-guidance"),
+            "the nudge's own message body must never reach the wrapped agent's pty: {seen:?}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrap_never_consumes_or_injects_mail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        store_mail_for_cwd(&state, "do-not-type-this-body");
+
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send turn signal");
+
+        let seen = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
+        assert!(seen.contains("zirv ctx inbox"), "advisory fired: {seen:?}");
+        assert!(
+            !seen.contains("do-not-type-this-body"),
+            "the mail body must never be typed into the agent: {seen:?}"
+        );
+
+        // Still unread: wrap only advises. `zirv ctx inbox --consume` is
+        // what moves a message into read/, and wrap never calls it.
+        let repo = std::env::current_dir().expect("cwd");
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state.clone());
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let unread = crate::commands::ctx::mail::list(&state_dir, &slug, None, None).expect("list");
+        assert_eq!(unread.len(), 1, "wrap must never consume mail on its own");
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_advisory_fires_at_most_once_per_turn_boundary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        store_mail_for_cwd(&state, "note");
+
+        let socket_path =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
+        let socket = std::path::PathBuf::from(socket_path.trim());
+
+        crate::commands::ctx::signal::send(&socket, &turn_signal(3, Verdict::Healthy))
+            .expect("send 1");
+        let first = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
+        assert!(
+            first.contains("zirv ctx inbox"),
+            "the first turn advises: {first:?}"
+        );
+
+        // A second turn boundary, no new mail in between.
+        crate::commands::ctx::signal::send(&socket, &turn_signal(4, Verdict::Healthy))
+            .expect("send 2");
+        h.writer.write_all(b"still here\r").expect("write");
+        h.writer.flush().expect("flush");
+        let after = read_until(&mut h.reader, "echo: still here", Duration::from_secs(10));
+
+        assert!(
+            !after.contains("zirv ctx inbox"),
+            "a second turn boundary with no new mail must not advise again: {after:?}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mail_directory_that_cannot_be_read_leaves_the_session_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        let repo = std::env::current_dir().expect("cwd");
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state.clone());
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let mailbox = state_dir.mail().join(&slug);
+        std::fs::create_dir_all(&mailbox).expect("mkdir");
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal(3, Verdict::Healthy),
+        )
+        .expect("send");
+
+        // The session keeps going, unaffected: no advisory (nothing readable
+        // to report), no crash, no degrade.
+        h.writer.write_all(b"still here\r").expect("write");
+        h.writer.flush().expect("flush");
+        let seen = read_until(&mut h.reader, "echo: still here", Duration::from_secs(10));
+
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+
+        assert!(
+            seen.contains("echo: still here"),
+            "the session must keep working: {seen:?}"
+        );
+        assert!(
+            !seen.contains("zirv ctx inbox"),
+            "nothing readable, so no advisory: {seen:?}"
+        );
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
+        assert!(
+            !log.contains("\"action\":\"degrade\""),
+            "an unreadable mailbox must not degrade the session: {log}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
         let _ = h.child.wait();
     }
 
@@ -1999,7 +4035,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal_for(3, Verdict::Compact, &transcript),
@@ -2073,7 +4110,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket_path = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket_path =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         let socket = std::path::PathBuf::from(socket_path.trim());
         crate::commands::ctx::signal::send(&socket, &turn_signal_for(5, Verdict::Restart, &first))
             .expect("send");
@@ -2257,7 +4295,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(5, Verdict::Restart),
@@ -2359,7 +4398,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket = std::fs::read_to_string(state.join("socket-path")).expect("socket path");
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(5, Verdict::Restart),
@@ -2376,7 +4416,17 @@ mod tests {
             log.contains("\"action\":\"degrade\""),
             "note_failure logged: {log}"
         );
-        assert!(log.contains("relaunch failed"), "reason recorded: {log}");
+        // "Item 6 audit" (see the comment at `relaunch_error`'s
+        // declaration) made `note_failure` name the *real* spawn error
+        // instead of the old generic "relaunch failed" placeholder, which
+        // that fallback string is now dead code for -- `relaunch_error` is
+        // always `Some` by the time this arm runs. The nonexistent
+        // `ZIRV_CTX_AGENT_BIN` path is what's actually stable across
+        // portable-pty's own wording for "the binary is missing".
+        assert!(
+            log.contains("zirv-ctx-test-agent-binary"),
+            "reason recorded: {log}"
+        );
         assert!(
             log.contains("\"action\":\"restart-failed\""),
             "restart outcome logged: {log}"
@@ -2389,7 +4439,12 @@ mod tests {
         let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
         let mut supervision = InjectionState::new();
 
-        note_failure(&mut supervision, Some((&state, "sess")), "socket died");
+        note_failure(
+            &mut supervision,
+            Some((&state, "sess")),
+            "socket died",
+            &Announcer::silent(),
+        );
         assert!(supervision.degraded);
 
         // Even a fresh turn signal cannot re-enable injection.
@@ -2408,7 +4463,7 @@ mod tests {
     #[test]
     fn note_failure_without_a_state_dir_still_degrades() {
         let mut supervision = InjectionState::new();
-        note_failure(&mut supervision, None, "no state dir");
+        note_failure(&mut supervision, None, "no state dir", &Announcer::silent());
         assert!(supervision.degraded);
     }
 
@@ -2461,7 +4516,8 @@ mod tests {
         );
         let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
 
-        let socket = std::fs::read_to_string(tmp.path().join("state/socket-path")).expect("path");
+        let socket =
+            read_socket_path(&StateDir::from_root(tmp.path().join("state")), None).expect("path");
         crate::commands::ctx::signal::send(
             std::path::Path::new(socket.trim()),
             &turn_signal(2, Verdict::Compact),
@@ -2515,8 +4571,9 @@ mod tests {
 
         let seen = read_until(&mut reader, "stub-tui ready", Duration::from_secs(10));
         assert!(seen.contains("stub-tui ready"));
-        assert!(
-            !tmp.path().join("state/socket-path").exists(),
+        assert_eq!(
+            read_socket_path(&StateDir::from_root(tmp.path().join("state")), None),
+            None,
             "no socket is bound when supervision is off"
         );
 
@@ -2535,7 +4592,8 @@ mod tests {
 
         fn flags_for(argv: &[&str]) -> Vec<String> {
             let command: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
-            let adapter = adapters::select(Some("claude"), &command, None).expect("claude adapter");
+            let adapter = adapters::select(Some("claude"), &command, &CtxConfig::default())
+                .expect("claude adapter");
             restart_launch_flags(adapter.as_ref(), &command)
         }
 
@@ -2698,6 +4756,17 @@ mod tests {
             cmd.arg("--");
             cmd.args(wrapped);
             cmd.env(crate::commands::ctx::state::STATE_ENV, state);
+            // Hermetic against the *developer's* own environment (F2): these
+            // tests spawn the real `zirv` binary, which reads the process
+            // environment, so a suite run from inside an agent session would
+            // otherwise trip the nesting guard and see exit code 1 instead of
+            // whatever the test is actually about. The guard has its own
+            // dedicated coverage above; here it is noise.
+            for key in super::super::super::sessions::SUPERVISION_ENV {
+                cmd.env_remove(key);
+            }
+            cmd.env_remove("CLAUDE_PID");
+            cmd.env_remove("CLAUDECODE");
             // No terminal: this is also the CI/piped case, which is exactly
             // why the synthetic cursor report cannot be left to a real
             // terminal to send.
@@ -2746,7 +4815,7 @@ mod tests {
                 // Long enough to still be running when the assertion below
                 // looks for the socket entry, short enough to reap itself if
                 // the kill somehow misses.
-                &["cmd", "/c", "ping -n 20 127.0.0.1 >NUL"],
+                &["cmd", "/c", "ping -n 20 127.0.0.1"],
             );
 
             let deadline = Instant::now() + Duration::from_secs(30);

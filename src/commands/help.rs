@@ -2,7 +2,7 @@ use std::{fs, io::Write, path::Path, path::PathBuf};
 
 use crate::utils::{
     SCRIPT_DIR_NAME, SUPPORTED_EXTENSIONS, Shortcuts, home_dir, is_reserved_command,
-    parse_script_content,
+    is_reserved_zirv_file, parse_script_content,
 };
 
 /// Note appended when a script or shortcut name collides with a built-in
@@ -18,8 +18,10 @@ fn write_scripts<W: Write>(writer: &mut W, dir: &Path) -> Result<(), Box<dyn std
         if path.is_file()
             && let Some(ext) = path.extension().and_then(|s| s.to_str())
             && SUPPORTED_EXTENSIONS.contains(&ext)
-            && path.file_name().unwrap() != ".shortcuts.yaml"
-            && path.file_name().unwrap() != crate::commands::ctx::config::CTX_CONFIG_FILE
+            && !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_reserved_zirv_file)
         {
             let content = fs::read_to_string(&path)?;
             let script = parse_script_content(&content, ext)?;
@@ -77,6 +79,14 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
         writer,
         "Usage: zirv <script|command> [params...] [options]\n"
     )?;
+    writeln!(
+        writer,
+        "Bare `zirv` (no arguments) starts `zirv ctx chat` when a `.zirv` directory exists"
+    )?;
+    writeln!(
+        writer,
+        "(locally or in ~/.zirv) and stdin is a real terminal; otherwise it shows this help.\n"
+    )?;
     writeln!(writer, "Commands:")?;
     writeln!(writer, "  help, h        Show this help")?;
     writeln!(writer, "  version, v     Print the version")?;
@@ -86,7 +96,18 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
         writer,
         "  ctx            Context management (score, loop, exec, wrap, handoff, resume,"
     )?;
-    writeln!(writer, "                 hook, status, usage, optimize)")?;
+    writeln!(
+        writer,
+        "                 hook, status, usage, optimize, chat, agent, send, inbox)"
+    )?;
+    writeln!(
+        writer,
+        "  chat           Alias for `zirv ctx chat`: start an interactive orchestrator session"
+    )?;
+    writeln!(
+        writer,
+        "  agent <name> <prompt>  Alias for `zirv ctx agent`: delegate one task to another harness"
+    )?;
     writeln!(writer, "\nOptions:")?;
     writeln!(
         writer,
@@ -151,7 +172,6 @@ pub fn show_help<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs::{create_dir_all, write};
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
@@ -213,8 +233,9 @@ commands: []
         let script_file = zirv_dir.join("test.yaml");
         write(&script_file, script_content)?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
         show_help(&mut buffer)?;
@@ -231,8 +252,6 @@ commands: []
             output.contains("Description:"),
             "Output should contain 'Description:'"
         );
-
-        env::set_current_dir(original_dir)?;
 
         Ok(())
     }
@@ -262,8 +281,9 @@ shortcuts:
         let shortcuts_file = zirv_dir.join(".shortcuts.yaml");
         write(&shortcuts_file, shortcuts_content)?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
         show_help(&mut buffer)?;
@@ -284,8 +304,6 @@ shortcuts:
             "Output should include the built-in commands"
         );
 
-        env::set_current_dir(original_dir)?;
-
         Ok(())
     }
 
@@ -302,11 +320,11 @@ shortcuts:
             "shortcuts:\n  t: \"test.yaml\"\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-        env::set_current_dir(original_dir)?;
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
@@ -314,6 +332,25 @@ shortcuts:
             output.contains("ctx") && output.contains("Context management"),
             "got {output}"
         );
+        Ok(())
+    }
+
+    /// `zirv chat`/`zirv agent` are top-level aliases for `zirv ctx chat`/
+    /// `zirv ctx agent` (see `main.rs`'s `top_level_ctx_alias`); they belong
+    /// in the help listing next to the other built-ins so they're
+    /// discoverable, not just documented.
+    #[test]
+    fn help_lists_chat_and_agent_as_built_ins() -> Result<(), Box<dyn std::error::Error>> {
+        let empty = tempdir()?;
+        let home = tempdir()?;
+        let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
+
+        let mut out = Cursor::new(Vec::new());
+        show_help(&mut out)?;
+        let text = String::from_utf8(out.into_inner())?;
+
+        assert!(text.contains("chat"), "got {text}");
+        assert!(text.contains("agent"), "got {text}");
         Ok(())
     }
 
@@ -331,18 +368,83 @@ shortcuts:
         )?;
         write(zirv_dir.join("ctx.toml"), "[score]\nwindow = 4\n")?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
 
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-
-        env::set_current_dir(original_dir)?;
 
         result?;
         let output = String::from_utf8(buffer.into_inner())?;
         assert!(output.contains("Test Script"));
         assert!(!output.contains("ctx.toml"));
+
+        Ok(())
+    }
+
+    /// `.zirv/.settings.toml` is zirv's own agent switchboard, not a script.
+    /// Mirrors `test_show_help_ignores_ctx_config` above.
+    #[test]
+    fn the_settings_file_is_not_listed_as_a_script() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        write(
+            zirv_dir.join("test.yaml"),
+            "name: \"Test Script\"\ncommands: []\n",
+        )?;
+        write(
+            zirv_dir.join(".settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )?;
+
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
+
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer);
+
+        result?;
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(output.contains("Test Script"));
+        assert!(!output.contains(".settings.toml"));
+
+        Ok(())
+    }
+
+    /// Review finding 2: a differently-cased settings/ctx-config file
+    /// (`.Settings.toml`, honored the same as `.settings.toml` by NTFS) must
+    /// still be skipped, not parsed as a script and hard-error `zirv help`.
+    #[test]
+    fn a_differently_cased_settings_file_is_not_listed_as_a_script()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        write(
+            zirv_dir.join("test.yaml"),
+            "name: \"Test Script\"\ncommands: []\n",
+        )?;
+        write(
+            zirv_dir.join(".Settings.toml"),
+            "[agents.codex]\nenabled = false\n",
+        )?;
+
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
+
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer);
+
+        result?;
+        let output = String::from_utf8(buffer.into_inner())?;
+        assert!(output.contains("Test Script"));
+        assert!(!output.contains(".Settings.toml"));
 
         Ok(())
     }
@@ -367,11 +469,11 @@ shortcuts:
             "name: \"Build\"\ncommands: []\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-        env::set_current_dir(original_dir)?;
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;
@@ -396,6 +498,43 @@ shortcuts:
         Ok(())
     }
 
+    /// S4: NTFS (and APFS by default) resolve a file case-insensitively, so
+    /// `Chat.yaml` is exactly as unreachable as `chat.yaml` would be, even
+    /// though `zirv Chat` is not literally intercepted as the `chat` alias
+    /// (only the lowercase spelling is). The shadow marker has to catch a
+    /// differently-cased collision, or a user creating one gets no warning
+    /// anywhere it's listed.
+    #[test]
+    fn a_differently_cased_reserved_command_is_flagged_as_shadowed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = setup_zirv_dir(&temp_path);
+
+        write(
+            zirv_dir.join("Chat.yaml"),
+            "name: \"My Chat Script\"\ncommands: []\n",
+        )?;
+
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
+        let mut buffer = Cursor::new(Vec::new());
+        let result = show_help(&mut buffer);
+        result?;
+
+        let output = String::from_utf8(buffer.into_inner())?;
+        let chat_line = output
+            .lines()
+            .find(|l| l.starts_with("File: Chat.yaml"))
+            .unwrap_or("");
+        assert!(
+            chat_line.contains("shadowed") || chat_line.contains("unreachable"),
+            "expected 'Chat.yaml' to be marked unreachable, got: {chat_line}"
+        );
+        Ok(())
+    }
+
     /// Same idea for shortcuts: a `.shortcuts.yaml` entry keyed on a reserved
     /// letter (e.g. `c`, already `create`'s alias) can never be reached.
     #[test]
@@ -414,11 +553,11 @@ shortcuts:
             "shortcuts:\n  c: \"commit.yaml\"\n  gc: \"commit.yaml\"\n",
         )?;
 
-        let original_dir = env::current_dir()?;
-        env::set_current_dir(&temp_path)?;
+        // NEW-1: a guard, so a failing assertion below cannot leave the whole
+        // process sitting in a temp directory that is about to be deleted.
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
         let mut buffer = Cursor::new(Vec::new());
         let result = show_help(&mut buffer);
-        env::set_current_dir(original_dir)?;
         result?;
 
         let output = String::from_utf8(buffer.into_inner())?;

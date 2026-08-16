@@ -429,6 +429,7 @@ mod tests {
             token_usage: true,
             turn_signal: true,
             system_prompt: false,
+            events: true,
         }
     }
 
@@ -776,6 +777,7 @@ mod tests {
             token_usage: true,
             turn_signal: true,
             system_prompt: false,
+            events: true,
         };
         assert_eq!(signals(&events, caps, &cfg).marker_miss_rate, None);
     }
@@ -913,6 +915,7 @@ mod tests {
             token_usage: true,
             turn_signal: true,
             system_prompt: false,
+            events: true,
         };
         let mut events = looping_turns(2, "", "[zirv] ok", true, 120_000);
         events.extend(looping_turns(10, "", "sloppy", true, 120_000));
@@ -933,6 +936,7 @@ mod tests {
             token_usage: true,
             turn_signal: true,
             system_prompt: false,
+            events: true,
         };
         let events = looping_turns(12, "", "sloppy", true, 175_000);
         let result = score_events(&events, caps, &cfg);

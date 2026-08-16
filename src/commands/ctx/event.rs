@@ -64,6 +64,18 @@ pub struct Capabilities {
     pub turn_signal: bool,
     /// Whether this agent has a verified per-run system-prompt mechanism.
     pub system_prompt: bool,
+    /// Whether `AgentAdapter::parse_events`/`structural_context` can ever
+    /// produce real data for this agent, as opposed to the empty/default
+    /// stub every "no verified mechanism" adapter ships (codex today, see
+    /// issue #11). `false` here is not "unhealthy" -- `rot.rs` stays pure
+    /// and never reads this field at all, since a session this adapter
+    /// cannot parse is not zero signals of health, it is *no data*. The
+    /// scoring callers that build a `Score`/verdict from real events
+    /// (`score.rs`'s `full_score`/`IncrementalScorer::poll`) are what read
+    /// it, to report "no data" instead of a false `Healthy`/`0` built from
+    /// an always-empty parse -- the same distinction `score::cached_score`'s
+    /// own doc comment already draws for a missing transcript.
+    pub events: bool,
 }
 
 /// Raw material for handoffs, extracted per-agent because it needs fields the

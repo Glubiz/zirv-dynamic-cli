@@ -28,8 +28,12 @@ pub fn spawn(mut command: Command) -> CtxResult<Child> {
 }
 
 /// Polls the child, calling `on_tick` at every interval. Stops on child exit,
-/// on the deadline, or when a tick asks to stop; kills the child in the last two
-/// cases so no supervisor ever leaks a process.
+/// on the deadline, or when a tick asks to stop; in the last two cases it
+/// terminates the child. On Windows that means the whole process tree rooted
+/// at the child, not just the direct child: a shim launch (`cmd.exe /c
+/// claude.cmd`) runs the real agent as a `node` grandchild, and killing only
+/// cmd.exe would leave that grandchild alive to run alongside a freshly
+/// spawned replacement -- two live sessions on one repo. See `terminate`.
 pub fn supervise_child(
     child: &mut Child,
     deadline: Instant,
@@ -68,7 +72,16 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = child.kill();
+        // TerminateProcess (what `child.kill()` calls) kills only the direct
+        // child. On an npm-installed agent that child is `cmd.exe /c
+        // claude.cmd`, which runs `node`; killing cmd.exe leaves the node
+        // grandchild alive (there is no Job Object). `taskkill /T` terminates
+        // the whole tree rooted at the pid instead. Its arguments are fixed
+        // flags plus a decimal pid, so there is no cmd.exe-reparse exposure.
+        // Falls back to a direct kill if taskkill cannot be run.
+        if !taskkill_tree(child.id()) {
+            let _ = child.kill();
+        }
     }
 
     let deadline = Instant::now() + grace;
@@ -82,6 +95,36 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+/// The `taskkill` invocation that terminates the whole process tree rooted at
+/// `pid`: `/T` walks the tree, `/F` forces termination, `/PID <pid>` names the
+/// root. Every element is a fixed flag or a decimal pid, so nothing here can
+/// be reparsed by cmd.exe. Pure, so the wiring is testable without spawning.
+#[cfg(not(unix))]
+fn taskkill_args(pid: u32) -> Vec<String> {
+    vec![
+        "/T".to_string(),
+        "/F".to_string(),
+        "/PID".to_string(),
+        pid.to_string(),
+    ]
+}
+
+/// Runs `taskkill /T /F /PID <pid>` without a shell, waiting briefly for it to
+/// finish. Returns whether taskkill ran *and* reported success; `false` (it is
+/// not on PATH, or it failed) tells the caller to fall back to a direct
+/// `child.kill()`.
+#[cfg(not(unix))]
+fn taskkill_tree(pid: u32) -> bool {
+    Command::new("taskkill")
+        .args(taskkill_args(pid))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Bytes a transcript grew by since the previous poll.
@@ -246,15 +289,69 @@ impl OutputTap {
     }
 }
 
+/// FIX 2a: refuse a launch that would let a downstream argv element be
+/// re-parsed by cmd.exe -- the `cmd.exe /c <shim>` form `resolve_program`
+/// produces on Windows for an npm-installed `.cmd`. Extracts the already-
+/// resolved program and arguments from the assembled `Command` and defers to
+/// the one metacharacter policy in `adapters::guard_cmd_shim_reparse`. A
+/// no-op off Windows and for any non-shim program.
+///
+/// L: `pub(crate)` (not just this module's own `spawn_tapped` chokepoint) so
+/// `handoff::run_model` -- the judgment/distiller child, spawned directly
+/// rather than through `spawn_tapped` -- can reach the same guard at its own
+/// spawn seam, matching every other place a `Command` an adapter built is
+/// actually spawned.
+pub(crate) fn guard_cmd_shim_reparse(command: &Command) -> CtxResult<()> {
+    let program = command.get_program().to_string_lossy().to_string();
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    super::adapters::guard_cmd_shim_reparse(&program, &args).map_err(Into::into)
+}
+
 /// Like `spawn`, but the child's stdout and stderr are piped so they can be
 /// matched. Each stream is forwarded to this process's corresponding stream
 /// unchanged, line by line.
-pub fn spawn_tapped(mut command: Command) -> CtxResult<(Child, OutputTap)> {
+///
+/// `stdin_text` (FIX B) is the headless prompt when it must be delivered on
+/// **stdin** rather than as an argv token: on a Windows `cmd.exe /c <shim>`
+/// launch, an argv prompt would be reparsed by cmd.exe, so the prompt (and any
+/// folded mail) travels on stdin instead -- the same mechanism the distiller
+/// uses. `None` keeps stdin nulled, exactly as before, which is what every
+/// off-shim launch (and every `sh`-based fake-agent test) gets.
+pub fn spawn_tapped(
+    mut command: Command,
+    stdin_text: Option<String>,
+) -> CtxResult<(Child, OutputTap)> {
+    // FIX 2a (command-injection defense): both std::process supervisors
+    // (`exec`, `loop`) reach every spawn -- first launch and every restart --
+    // through here, so this is their single chokepoint for the cmd.exe
+    // argv-reparse guard. A no-op off Windows and for any non-shim program.
+    guard_cmd_shim_reparse(&command)?;
+    let stdin_mode = if stdin_text.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(stdin_mode)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
+    // Write the prompt on its own thread, then drop the handle so the child
+    // sees EOF -- exactly `handoff::run_model`'s stdin discipline. A write
+    // failure (the child exited before draining) is not surfaced here: the
+    // supervisor already reports an early, unsuccessful exit through the
+    // child's own status, which is the more useful of the two reports.
+    if let Some(text) = stdin_text
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(text.as_bytes());
+        });
+    }
 
     let (tx, rx) = std::sync::mpsc::channel::<String>();
 
@@ -402,6 +499,20 @@ mod tests {
             "child is gone"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// HIGH-1: the Windows terminate path kills the whole process tree by
+    /// pid, so a shim's `node` grandchild is not orphaned. The kill itself is
+    /// awkward to assert deterministically; the arg wiring it is built from is
+    /// pure, so pin that instead.
+    #[cfg(not(unix))]
+    #[test]
+    fn taskkill_args_terminate_the_whole_tree_by_pid() {
+        assert_eq!(
+            taskkill_args(4242),
+            ["/T", "/F", "/PID", "4242"].map(String::from),
+            "the tree flag, the force flag, then the numeric pid -- nothing a shell could reparse"
+        );
     }
 
     #[test]
@@ -602,7 +713,7 @@ mod tests {
 
     #[test]
     fn a_tapped_child_still_reports_its_exit_code() {
-        let (mut child, _tap) = spawn_tapped(sh("printf hello\\n; exit 4")).expect("spawn");
+        let (mut child, _tap) = spawn_tapped(sh("printf hello\\n; exit 4"), None).expect("spawn");
         let outcome = supervise_child(
             &mut child,
             Instant::now() + Duration::from_secs(10),
@@ -615,7 +726,8 @@ mod tests {
 
     #[test]
     fn tapped_lines_reach_the_matcher() {
-        let (mut child, tap) = spawn_tapped(sh("printf 'one\\ntwo\\n'; exit 0")).expect("spawn");
+        let (mut child, tap) =
+            spawn_tapped(sh("printf 'one\\ntwo\\n'; exit 0"), None).expect("spawn");
         let mut seen: Vec<String> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
         while seen.len() < 2 && Instant::now() < deadline {
@@ -629,7 +741,8 @@ mod tests {
 
     #[test]
     fn stderr_is_tapped_too_because_notices_can_land_there() {
-        let (mut child, tap) = spawn_tapped(sh("printf 'oops\\n' >&2; exit 0")).expect("spawn");
+        let (mut child, tap) =
+            spawn_tapped(sh("printf 'oops\\n' >&2; exit 0"), None).expect("spawn");
         let mut seen: Vec<String> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
         while seen.is_empty() && Instant::now() < deadline {
@@ -642,10 +755,37 @@ mod tests {
 
     #[test]
     fn try_lines_is_empty_when_nothing_was_written() {
-        let (mut child, tap) = spawn_tapped(sh("exit 0")).expect("spawn");
+        let (mut child, tap) = spawn_tapped(sh("exit 0"), None).expect("spawn");
         let _ = child.wait();
         // Drain whatever arrived; a silent child must not block or panic.
         let _ = tap.try_lines();
         assert!(tap.try_lines().is_empty());
+    }
+
+    /// FIX B: a `Some(stdin_text)` is written to the child's stdin and then
+    /// EOF'd, exactly the shape a shim-form headless prompt takes. `cat`
+    /// echoes stdin to stdout, which the tap forwards -- proving the prompt
+    /// reaches the child off argv. The metacharacter is carried literally,
+    /// never reparsed, because it never touched a command line. Uses the same
+    /// `sh` the other tests in this module rely on.
+    #[test]
+    fn spawn_tapped_delivers_the_prompt_on_stdin() {
+        let (mut child, tap) =
+            spawn_tapped(sh("cat"), Some("refactor foo() & bar()\n".to_string())).expect("spawn");
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if child.try_wait().expect("wait").is_some() {
+                break;
+            }
+            seen.extend(tap.try_lines());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        seen.extend(tap.try_lines());
+        let _ = child.wait();
+        assert!(
+            seen.iter().any(|l| l.contains("refactor foo() & bar()")),
+            "the prompt reached the child verbatim on stdin: {seen:?}"
+        );
     }
 }

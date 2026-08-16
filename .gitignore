@@ -1,1 +1,11 @@
 /target
+
+# Raw PTY capture of a real local session (may contain personal session content;
+# recorded via `cargo run --example vt_spike -- --record ...`, used by vt100 tests
+# when present, tests skip when absent)
+tests/fixtures/claude-session.raw
+
+# Root-level Obsidian workspace state (user-local; the tracked vault config lives at docs/obsidian/.obsidian)
+/.obsidian/
+# User-local Obsidian pane state inside the vault
+docs/obsidian/.obsidian/workspace*.json

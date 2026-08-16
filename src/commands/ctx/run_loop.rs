@@ -64,6 +64,28 @@ pub fn resolve_prompt(args: &LoopArgs) -> CtxResult<String> {
     Err("no prompt: pass --prompt or --prompt-file".into())
 }
 
+/// Whether this cycle's own headless launch reparses its downstream argv on
+/// a Windows launcher -- `cmd.exe /c <shim>` (an npm-installed `.cmd`) or
+/// `powershell -NoProfile -File <script>` (a `.ps1`) -- so the prompt has to
+/// go on stdin instead of argv (FIX B). `adapter.launches_through_cmd_shim()`
+/// only recognises the `cmd.exe` form; probing the real launcher prefix this
+/// cycle's headless spawn will use (`headless_cmd("", ...)`, no prompt token
+/// yet) and asking `adapters::launch_reparses_through_shim` covers both,
+/// matching the M1 fix `dash/mod.rs`'s `task_prompt_fallback_is_safe` made
+/// for the pty path. Split out for the same reason that one was: testable
+/// without spawning anything. Mirrors `exec.rs`'s own `prompt_delivery_via_
+/// stdin` (not shared: the two modules' `Command`-building context differs
+/// enough -- `extra` here, none there -- that a shared helper would need
+/// its own extra parameter for the one caller that has it).
+fn prompt_delivery_via_stdin(
+    adapter: &dyn super::adapters::AgentAdapter,
+    session: &SessionId,
+    extra: &[String],
+) -> bool {
+    let probe = super::adapters::flatten_command(adapter.headless_cmd("", session, extra));
+    super::adapters::launch_reparses_through_shim(&probe)
+}
+
 pub fn run_with<W: Write>(
     args: &LoopArgs,
     w: &mut W,
@@ -76,21 +98,10 @@ pub fn run_with<W: Write>(
 
     let prompt = resolve_prompt(args)?;
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(
-        args.agent.as_deref().or(cfg.agent.as_deref()),
-        &[],
-        cfg.agent_bin.as_deref(),
-    )?;
+    let announcer =
+        super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
+    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let state = StateDir::resolve(env)?;
-
-    let composed = super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        args.simple,
-        &cfg.prompt,
-    );
-    let (user_extra, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
 
     let interval = Duration::from_secs(args.interval_secs.unwrap_or(cfg.supervise.interval_secs));
     let max_cycle =
@@ -102,33 +113,160 @@ pub fn run_with<W: Write>(
     let mut failures = 0u32;
     let now_fn = now_secs;
     let sleep_fn = |d: Duration| std::thread::sleep(d);
+    // One registry record for the whole run, refreshed (not re-registered)
+    // each cycle since every cycle mints a fresh session id -- see
+    // `SessionGuard::refresh_session`. `None` until the first cycle actually
+    // has a session to register. Released explicitly at every arm that
+    // leaves this loop, matching the explicit-arm discipline `RawGuard`
+    // follows under this binary's `panic = "abort"` release profile.
+    let mut session_guard: Option<super::sessions::SessionGuard> = None;
+    // C7: this run's stable delivery address. The first cycle's short id
+    // becomes the registry key and stays put for the whole run (see
+    // `SessionGuard::refresh_session`), so `None` here only for the window
+    // before the first cycle has registered -- in which case this cycle's
+    // own short *is* the address about to be registered.
+    let mut registry_short: Option<String> = None;
+    // Item 10: owned across every cycle, so the no-usage-source skip line
+    // (pace.rs's own `wait_for_window`) prints once for the whole run
+    // rather than once per cycle.
+    let mut pace_no_source_announced = false;
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
         {
+            if let Some(guard) = session_guard.as_mut() {
+                guard.release();
+            }
             return Ok(0);
         }
         cycle += 1;
 
-        pace::wait_for_window(w, &state, &cfg.pace, "loop", "loop", &now_fn, &sleep_fn);
+        pace::wait_for_window(
+            w,
+            &state,
+            &cfg.pace,
+            "loop",
+            "loop",
+            &now_fn,
+            &sleep_fn,
+            None,
+            adapter.provider(),
+            &mut pace_no_source_announced,
+        );
 
+        let mail_slug = super::state::repo_slug(repo);
+        // N5: re-read every cycle, same as mail below -- each cycle is a
+        // fresh, stateless session, so a fact remembered or verified since
+        // the previous cycle must be picked up too, not a snapshot taken
+        // once before the loop started.
+        let memory_entries = super::memory::render_for_prompt(&state, &mail_slug, &cfg, now_fn());
+        // Recomposed every cycle -- the same seam as `injection_args_for_
+        // session` a few lines down -- because each cycle is a fresh,
+        // stateless session: it must pick up whatever mail has arrived since
+        // the previous cycle, not a snapshot taken once before the loop
+        // started.
+        let composed = super::prompt::compose(
+            crate::utils::home_dir().ok().as_deref(),
+            repo,
+            args.simple,
+            &cfg.prompt,
+            super::prompt::PromptRole::Worker,
+            &memory_entries,
+            cfg.memory.max_injected_bytes,
+        );
         // A fresh session id per cycle is the whole point: the orchestrator
-        // never accumulates context across cycles.
+        // never accumulates context across cycles. Minted here, ahead of
+        // mail listing and the nudge-marker check below, both of which need
+        // it.
         let session = SessionId::new_v4();
+        let session_short = super::sessions::short_id(session.as_str());
+        // C7: scoped to this run's stable registry address. `loop` used to
+        // pass `None` here -- "no session filter at all" -- because its
+        // session id rotated every cycle and a directed message would
+        // otherwise become unaddressable the moment the next cycle started.
+        // The cost was that a `loop` swallowed and consumed mail addressed
+        // to *other* sessions entirely: `None` means every directed message
+        // in the repo is visible, and delivery consumes what it lists.
+        // Now that the registry short is stable for the whole run
+        // (`SessionGuard::refresh_session`), the narrow filter gives both
+        // properties at once -- this run's own directed mail stays
+        // addressable across cycles, and nobody else's is touched.
+        //
+        // `mut`: drained right after this cycle's own spawn actually
+        // succeeds (Item 3), not here -- a launch that fails to spawn, or a
+        // pacing park ahead of it, must not move mail to `read/` before any
+        // session has actually started to see it.
+        //
+        // Item 14: `composed.is_some()` alone used to gate this even for an
+        // adapter with no system-prompt mechanism at all, under `--simple`
+        // (`args.simple` above is `compose`'s own `skip_injection`, which
+        // always makes `composed` `None`) -- withholding mail from codex
+        // for a reason that has nothing to do with codex, which has no
+        // `composed`-shaped channel to lose in the first place: `loop`
+        // always builds its own launch (see `prompt_args`'s own comment
+        // below), so the task-prompt-text fallback
+        // (`task_prompt_with_mail_fallback` further down) exists
+        // unconditionally for it. `!system_prompt_supported` is the other
+        // way in; claude (the adapter `composed` actually matters for)
+        // keeps exactly its old gate.
+        let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
+            if cfg.mail.enabled && (composed.is_some() || !adapter.capabilities().system_prompt) {
+                let for_session =
+                    super::sessions::delivery_filter(registry_short.as_deref(), &session_short);
+                super::mail::list(&state, &mail_slug, Some(adapter.name()), for_session)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        let mail_messages: Vec<super::mail::Message> =
+            mail_entries.iter().map(|(_, msg)| msg.clone()).collect();
+        if !mail_messages.is_empty() {
+            announcer.emit(&super::announce::Event::MailDelivered {
+                count: mail_messages.len(),
+            });
+        }
+        // An adapter with no system-prompt injection mechanism never reaches
+        // `injection_args_for_session`'s output at all -- folding mail into
+        // `composed` for one only would silently destroy it, so it is
+        // instead appended straight onto the task prompt text below
+        // (`task_prompt_with_mail_fallback`), the one channel such an
+        // adapter does have. A capable adapter (claude) is unaffected: this
+        // still folds mail into `composed` exactly as before.
+        let system_prompt_supported = adapter.capabilities().system_prompt;
+        let composed = if system_prompt_supported {
+            super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes)
+        } else {
+            composed
+        };
+        let (user_extra, composed) =
+            super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
+
+        match session_guard.as_mut() {
+            Some(guard) => guard.refresh_session(session.as_str()),
+            None => {
+                registry_short = Some(session_short.clone());
+                session_guard = Some(super::sessions::SessionGuard::register(
+                    &state,
+                    super::sessions::Record::new(
+                        session.as_str(),
+                        adapter.name(),
+                        repo,
+                        super::sessions::Verb::Loop,
+                    ),
+                ));
+            }
+        }
         // M7: rebuilt per cycle because the private prompt file is named after
         // the session it belongs to, and every cycle is a new session. The
         // adapter builds this launch itself, so the probe gets an empty argv.
-        let extra: Vec<String> = user_extra
-            .iter()
-            .cloned()
-            .chain(super::prompt::injection_args_for_session(
-                adapter.as_ref(),
-                &[],
-                composed.as_ref(),
-                &state,
-                session.as_str(),
-            ))
-            .collect();
+        let prompt_args = super::prompt::injection_args_for_session(
+            adapter.as_ref(),
+            &[],
+            composed.as_ref(),
+            &state,
+            session.as_str(),
+        )?;
+        let extra: Vec<String> = user_extra.iter().cloned().chain(prompt_args).collect();
         // M2: README promises injection attribution "at every session start",
         // and every cycle is a new session, so the entry is written here under
         // that cycle's own id rather than once under a literal "loop".
@@ -139,19 +277,82 @@ pub fn run_with<W: Write>(
             composed.as_ref(),
             adapter.capabilities().system_prompt,
         );
+        announcer.emit(&super::prompt::injection_event(
+            composed.as_ref(),
+            adapter.capabilities().system_prompt,
+        ));
         let transcript = adapter.transcript_path(&SessionRef {
             id: session.clone(),
             cwd: repo.to_path_buf(),
         });
 
-        let mut command = adapter.headless_cmd(&prompt, &session, &extra);
+        // Mail is the one composed layer that still has somewhere to go for
+        // an adapter with no system-prompt mechanism: the task prompt text
+        // itself. A capable adapter (claude) gets the unchanged `prompt`
+        // back, since its mail already rode the `composed` fold above.
+        let prompt = super::prompt::task_prompt_with_mail_fallback(
+            &prompt,
+            system_prompt_supported,
+            &mail_messages,
+            cfg.mail.max_delivered_bytes,
+        );
+
+        // FIX B: on a Windows npm `.cmd` shim launch, cmd.exe reparses the
+        // downstream argv, so the prompt is delivered on stdin instead of as
+        // the `-p <prompt>` argv token. Off Windows and for a direct `.exe` it
+        // stays on argv, so `sh`-based fake-agent cycles are unchanged.
+        //
+        // Final wave item 1: `adapter.launches_through_cmd_shim()` only
+        // recognises `cmd.exe /c <shim>`; a `.ps1`-resolved `agent_bin` still
+        // reached a `powershell -File` launch with the prompt on the
+        // reparsed argv (the same M1 gap dash/mod.rs closed for the pty
+        // path). Probed the same way exec.rs now does: the real headless
+        // launcher prefix, no prompt token yet, checked with `launch_
+        // reparses_through_shim`, which covers both forms.
+        let (mut command, stdin_prompt) =
+            if prompt_delivery_via_stdin(adapter.as_ref(), &session, &extra) {
+                match adapter.headless_cmd_stdin(&session, &extra) {
+                    Some(command) => (command, Some(prompt.clone())),
+                    None => (adapter.headless_cmd(&prompt, &session, &extra), None),
+                }
+            } else {
+                (adapter.headless_cmd(&prompt, &session, &extra), None)
+            };
         command.current_dir(repo);
+        // F3: `loop` binds no turn-signal socket of its own, so it has no
+        // session identity to set here at all -- which is precisely why the
+        // scrub matters. Without it, a cycle launched from inside another
+        // agent's session inherited that session's `ZIRV_CTX_SESSION` and
+        // `ZIRV_CTX_SOCKET` and reported its own turn boundaries into the
+        // outer supervisor's rot engine.
+        super::sessions::scrub_supervision_env_cmd(&mut command);
+        // Names the same fact `ctx.toml`'s own `agent` key would, so a nested
+        // `zirv ctx ...` call inside this cycle's own child processes
+        // defaults to this cycle's harness rather than re-resolving from
+        // scratch.
+        command.env(super::adapters::AGENT_ENV, adapter.name());
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
-        let (mut child, tap) = supervise::spawn_tapped(command)?;
+        let (mut child, tap) = supervise::spawn_tapped(command, stdin_prompt)?;
+        // Item 3: consumed right after this cycle's own spawn has actually
+        // succeeded, so the next cycle's fresh `mail::list` does not pick
+        // the same message up again -- but a launch that never got this far
+        // (spawn_tapped failed, or `?` above already returned) leaves it
+        // unread. A failed consume must not stop the cycle: the mail has
+        // already reached the prompt either way, and housekeeping failures
+        // are best-effort throughout the state dir.
+        for (path, _) in mail_entries.drain(..) {
+            let _ = super::mail::consume(&state, &mail_slug, &path);
+        }
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
         let mut limit_hit = false;
+        // C7: the stable registry address this run answers to, resolved once
+        // per cycle so the tick closure below borrows a plain `String`
+        // rather than the `Option` the loop keeps mutating.
+        let nudge_address = registry_short
+            .clone()
+            .unwrap_or_else(|| session_short.clone());
 
         let outcome = {
             let mut tick = || {
@@ -164,6 +365,23 @@ pub fn run_with<W: Write>(
                 ) {
                     limit_hit = true;
                     return Tick::Stop("limit");
+                }
+                // N4: `loop` never restarts for a nudge -- each cycle is
+                // already a fresh, stateless session that re-lists mail on
+                // its own natural boundary (see the mail block above), so
+                // the nudge's payload arrives there regardless. Claiming the
+                // marker here only stops it from re-firing and lets the
+                // operator see that it arrived.
+                // C7: claimed under the run's stable registry address, not
+                // this cycle's own short id -- a nudge is addressed to the
+                // supervisor, which outlives any one cycle.
+                // C4: `from` is the sender read out of the marker, not our
+                // own id.
+                if let Some(from) = super::sessions::claim_nudge_marker(&state, &nudge_address) {
+                    announcer.emit(&super::announce::Event::Nudge {
+                        from,
+                        disposition: super::announce::NudgeDisposition::NextCycle,
+                    });
                 }
                 match scorer.poll(adapter.as_ref(), &cfg.score) {
                     Ok(Some(score)) if score.verdict == Verdict::Restart => {
@@ -225,6 +443,9 @@ pub fn run_with<W: Write>(
                 session.as_str(),
                 &now_fn,
                 &sleep_fn,
+                None,
+                adapter.provider(),
+                &mut pace_no_source_announced,
             );
         }
 
@@ -240,6 +461,9 @@ pub fn run_with<W: Write>(
             interval,
             &mut failures,
         )? {
+            if let Some(guard) = session_guard.as_mut() {
+                guard.release();
+            }
             return Ok(code);
         }
     }
@@ -375,6 +599,48 @@ mod tests {
             extra: Vec::new(),
             simple: false,
         }
+    }
+
+    /// Final wave item 1: `adapter.launches_through_cmd_shim()` only
+    /// recognises the `cmd.exe /c <shim>` form -- a `.ps1`-resolved
+    /// `agent_bin` used to report "safe" here (prompt stays on argv) while
+    /// still actually launching through `powershell -File`, which reparses
+    /// that argv exactly like a `.cmd` shim does. `prompt_delivery_via_
+    /// stdin` must report `true` for it too, mirroring the `.cmd` case and
+    /// the same fix dash/mod.rs already got for the pty path.
+    #[cfg(windows)]
+    #[test]
+    fn prompt_delivery_via_stdin_recognises_a_powershell_shim_not_just_a_cmd_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let cmd_shim = dir.path().join("codex.cmd");
+        std::fs::write(&cmd_shim, "@echo off\r\n").expect("write cmd shim");
+        let cmd_adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(Some(
+            &cmd_shim.display().to_string(),
+        ));
+        let session = SessionId::parse("11111111-2222-4333-8444-555555555555");
+        assert!(
+            prompt_delivery_via_stdin(&cmd_adapter, &session, &[]),
+            "the .cmd shim shape must still be recognised"
+        );
+
+        let ps_shim = dir.path().join("codex.ps1");
+        std::fs::write(&ps_shim, "exit 0\r\n").expect("write ps1 shim");
+        let ps_adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(Some(
+            &ps_shim.display().to_string(),
+        ));
+        assert!(
+            prompt_delivery_via_stdin(&ps_adapter, &session, &[]),
+            "the .ps1 shim shape must also route the prompt to stdin"
+        );
+
+        let direct = crate::commands::ctx::adapters::codex::CodexAdapter::new(Some(
+            "/tmp/fake-codex-not-a-real-path",
+        ));
+        assert!(
+            !prompt_delivery_via_stdin(&direct, &session, &[]),
+            "a non-shim program must keep the prompt on argv"
+        );
     }
 
     fn transcripts_in(home: &std::path::Path) -> Vec<PathBuf> {
@@ -867,5 +1133,426 @@ mod tests {
         assert!(log.contains("\"action\":\"limit-park\""), "got {log}");
         assert!(!log.contains("\"action\":\"give-up\""), "got {log}");
         assert_eq!(transcripts_in(&home).len(), 2, "both cycles ran");
+    }
+
+    /// B3: `mail.enabled = false` must gate delivery at the `loop` seam too,
+    /// not just `exec`'s (and not just `send`/`inbox`).
+    #[test]
+    fn disabled_mail_is_not_delivered_into_a_loop_cycle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "a disabled notice".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert("ZIRV_CTX_MAIL".to_string(), "false".to_string());
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+
+        let args = args_for(1);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            !argv.contains("a disabled notice"),
+            "mail.enabled = false must gate delivery at the loop seam too: {argv}"
+        );
+
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None, None).expect("list");
+        assert_eq!(
+            unread.len(),
+            1,
+            "a delivery that never happened must not consume the message either"
+        );
+    }
+
+    /// T7: `run_with` recomposes the system prompt (and re-lists mail) inside
+    /// the per-cycle loop, not once before it starts, so a message sent
+    /// *during* one cycle reaches the next one within the very same `run_
+    /// with` call. A custom one-shot agent script touches a marker file the
+    /// instant its first invocation starts, then pauses briefly; a
+    /// background thread races to write the mail as soon as it sees that
+    /// marker, landing it before cycle 2's own compose-and-list runs.
+    #[test]
+    fn each_loop_cycle_picks_up_mail_that_arrived_since_the_previous_one() {
+        // A plain tempdir, not `testenv::repo()`: this test never matches a
+        // transcript path against `HOME` (the only reason that helper
+        // canonicalizes), and on Windows a canonicalized `\\?\`-prefixed path
+        // embedded in an argv string sh(1) parses loses its backslashes.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let marker = tmp.path().join("cycle-marker");
+        let script = tmp.path().join("mid-loop-agent.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             set -eu\n\
+             [ -z \"${FAKE_AGENT_ARGV_LOG:-}\" ] || printf '%s\\n' \"$*\" >> \"$FAKE_AGENT_ARGV_LOG\"\n\
+             if [ ! -f \"$CYCLE_MARKER\" ]; then\n\
+             \ttouch \"$CYCLE_MARKER\"\n\
+             \tsleep 0.3\n\
+             fi\n\
+             exit 0\n",
+        )
+        .expect("write script");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        // `adapter.headless_cmd` spawns `ZIRV_CTX_AGENT_BIN` directly, unlike
+        // the raw `sh <script>` commands `fake_agent_command`-style helpers
+        // use elsewhere; routing it through `sh` explicitly keeps this
+        // test's spawn portable, the same way the wrap.rs relaunch tests
+        // already do (`("ZIRV_CTX_AGENT_BIN", format!("sh {script}"))`).
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", script.display()),
+        );
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // The spawned script inherits the real process environment (not the
+        // `env` closure above, which only feeds `CtxConfig::load`), so these
+        // two have to be real process env vars.
+        // NEW-1: a guard, so the cleanup survives a panicking assertion (and
+        // the `writer.join().expect(...)` further down, which is exactly how
+        // this pattern leaked before).
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+            ("CYCLE_MARKER", marker.to_str()),
+        ]);
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let marker_for_writer = marker.clone();
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !marker_for_writer.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer);
+            let slug = crate::commands::ctx::state::repo_slug(&repo_for_writer);
+            let _ = crate::commands::ctx::mail::store(
+                &state,
+                &slug,
+                &crate::commands::ctx::mail::Message {
+                    from_session: "other-session".to_string(),
+                    from_agent: "claude".to_string(),
+                    to: "any".to_string(),
+                    to_session: None,
+                    sent: 1,
+                    body: "a fresh notice".to_string(),
+                },
+                &CtxConfig::default(),
+            );
+        });
+
+        // Three cycles, not two: the third is what proves S3 -- mail
+        // delivered into cycle 2's prompt is consumed right after, so cycle
+        // 3's own fresh `mail::list` must not pick the same message up
+        // again.
+        let mut args = args_for(3);
+        args.interval_secs = Some(0);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        writer.join().expect("writer thread");
+        assert_eq!(code.expect("all three cycles run"), 0);
+
+        // Each cycle's own session id, from `zirv ctx loop`'s own "cycle N
+        // session <id>" announcement on `out` -- the anchor used below,
+        // since the composed prompt text itself contains embedded newlines
+        // and would make a naive `argv.lines()` count meaningless.
+        let printed = String::from_utf8(out).expect("utf8");
+        let sessions: Vec<&str> = printed
+            .lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .collect();
+        assert_eq!(sessions.len(), 3, "three cycles ran: {printed:?}");
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        let cycle1_at = argv.find(sessions[0]).expect("cycle 1's own invocation");
+        let cycle2_at = argv.find(sessions[1]).expect("cycle 2's own invocation");
+        assert!(cycle1_at < cycle2_at, "cycle 1 launches before cycle 2");
+
+        let mail_at = argv
+            .find("a fresh notice")
+            .expect("the mail must reach a launch's composed prompt");
+        assert!(
+            mail_at > cycle2_at,
+            "mail sent during cycle 1 must land in cycle 2's own launch, not cycle 1's: {argv}"
+        );
+        assert_eq!(
+            argv.matches("a fresh notice").count(),
+            1,
+            "delivered once in cycle 2, consumed, and must not reappear in cycle 3: {argv}"
+        );
+    }
+
+    /// N4: a nudge sent while cycle 1 is live must not restart or kill it
+    /// (`loop` never restarts for a nudge -- only `exec` does), and its
+    /// payload -- ordinary session-addressed mail -- must reach cycle 2, the
+    /// natural next boundary, the same way `each_loop_cycle_picks_up_mail_
+    /// that_arrived_since_the_previous_one` proves for an undirected
+    /// message.
+    #[test]
+    fn a_loop_cycle_reports_the_nudge_and_picks_it_up_at_its_own_boundary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let marker = tmp.path().join("cycle-marker");
+        let script = tmp.path().join("mid-loop-agent.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             set -eu\n\
+             [ -z \"${FAKE_AGENT_ARGV_LOG:-}\" ] || printf '%s\\n' \"$*\" >> \"$FAKE_AGENT_ARGV_LOG\"\n\
+             if [ ! -f \"$CYCLE_MARKER\" ]; then\n\
+             \ttouch \"$CYCLE_MARKER\"\n\
+             \tsleep 0.3\n\
+             fi\n\
+             exit 0\n",
+        )
+        .expect("write script");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", script.display()),
+        );
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // NEW-1: a guard, so the cleanup survives a panicking assertion (and
+        // the `writer.join().expect(...)` further down, which is exactly how
+        // this pattern leaked before).
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+            ("CYCLE_MARKER", marker.to_str()),
+        ]);
+
+        let state_for_writer = state_dir.clone();
+        let repo_for_writer = tmp.path().to_path_buf();
+        let marker_for_writer = marker.clone();
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !marker_for_writer.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer.clone());
+            // The empty prefix matches whichever session is currently live --
+            // `loop` keeps exactly one registry record at a time, refreshed
+            // each cycle, so this is cycle 1's own short id while it is
+            // still running.
+            let Ok(live) = crate::commands::ctx::sessions::resolve_prefix(&state, "") else {
+                return;
+            };
+            let env = [(
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_for_writer.display().to_string(),
+            )]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            let args = crate::commands::ctx::sessions::NudgeArgs {
+                prefix: live.short,
+                message: Some("switch focus".to_string()),
+                message_file: None,
+            };
+            let mut out = Vec::new();
+            let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+            let _ = crate::commands::ctx::sessions::run_nudge_with(
+                &args,
+                &mut out,
+                &repo_for_writer,
+                &|k| env.get(k).cloned(),
+                &mut stdin,
+            );
+        });
+
+        let mut args = args_for(3);
+        args.interval_secs = Some(0);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        writer.join().expect("writer thread");
+        assert_eq!(
+            code.expect("all three cycles run, none killed by the nudge"),
+            0
+        );
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let sessions: Vec<&str> = printed
+            .lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .collect();
+        assert_eq!(
+            sessions.len(),
+            3,
+            "the nudge must not shorten the run: {printed:?}"
+        );
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        let cycle2_at = argv.find(sessions[1]).expect("cycle 2's own invocation");
+        let mail_at = argv
+            .find("switch focus")
+            .expect("the nudge's payload must reach a launch's composed prompt");
+        assert!(
+            mail_at > cycle2_at,
+            "the nudge landed during cycle 1 and must reach cycle 2, its own next boundary: {argv}"
+        );
+    }
+
+    /// codex has no system-prompt injection mechanism
+    /// (`capabilities().system_prompt == false`), so folding mail into
+    /// `composed` the way claude's own tests prove would silently destroy
+    /// it: `injection_args_for_session` always returns an empty argv for
+    /// codex. `task_prompt_with_mail_fallback` rescues it by appending the
+    /// mail block onto the cycle's task prompt text instead -- the only
+    /// channel such an adapter has.
+    #[test]
+    fn a_codex_cycle_receives_mail_in_its_task_prompt_since_it_cannot_be_injected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_ARGV_LOG",
+            argv_log.to_str(),
+        )]);
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let mut args = args_for(1);
+        args.agent = Some("codex".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("heads up: the webhook route moved"),
+            "the mail must reach codex's task prompt text: {argv}"
+        );
+        assert!(
+            argv.contains("another agent session"),
+            "still labeled as mail, not as an operator instruction: {argv}"
+        );
+
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None, None).expect("list");
+        assert!(
+            unread.is_empty(),
+            "mail actually delivered into the task prompt must be consumed: {unread:?}"
+        );
+    }
+
+    /// Item 14: `args.simple` makes `composed` always `None` (it is `compose`'s
+    /// own `skip_injection`), for either adapter -- but codex's real mail
+    /// channel, the task-prompt text `task_prompt_with_mail_fallback`
+    /// appends to, has nothing to do with `composed` at all, and `loop`
+    /// always builds its own launch regardless of `--simple`. Before this
+    /// fix, gating mail listing on `composed.is_some()` withheld mail from
+    /// codex under `--simple` for a reason that only ever applied to claude.
+    #[test]
+    fn simple_mode_does_not_withhold_mail_from_a_codex_cycle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_ARGV_LOG",
+            argv_log.to_str(),
+        )]);
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let mut args = args_for(1);
+        args.agent = Some("codex".to_string());
+        args.simple = true;
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("heads up: the webhook route moved"),
+            "--simple must not withhold mail from an adapter whose channel does not need \
+             composed: {argv}"
+        );
+
+        let unread = crate::commands::ctx::mail::list(&state, &slug, None, None).expect("list");
+        assert!(
+            unread.is_empty(),
+            "mail actually delivered into the task prompt must be consumed: {unread:?}"
+        );
     }
 }

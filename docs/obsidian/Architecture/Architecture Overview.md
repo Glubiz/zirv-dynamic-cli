@@ -1,0 +1,70 @@
+---
+last-verified: 2026-08-12
+---
+
+# Architecture Overview
+
+## Quick Reference
+
+- Single binary crate `zirv`. Entry point `src/main.rs` intercepts `ctx` and top-level help *before* clap even parses, then dispatches to a built-in command or falls through to `.zirv/` script resolution.
+- Module map: `main.rs` (dispatch) -> `input.rs` (clap args + script-path resolution) -> `utils.rs` (file parsing, shortcuts, suggestions) -> `script_runner/` (execution engine). `commands/` holds the built-ins (`create`, `help`, `init`, `version`) plus the much larger `commands/ctx/` subsystem.
+- **If changed:** update [[Script Resolution]] (dispatch order lives in `main.rs`), [[Technology Stack]] (if a module gains/drops a dependency), [[Script Runner]] and [[Ctx Subsystem]] (module-level detail for their halves of the tree).
+- **Gotchas:** `zirv ctx` is matched on raw `argv[1]`, ahead of clap parsing — a `.zirv/ctx.yaml` script named `ctx` can never be reached (see [[Script Resolution]]). `zirv --help`/`-h` is also intercepted on raw argv so clap's auto-generated help never fires.
+
+## Module map
+
+```
+src/
+├── main.rs              # entry point: ctx interception, help interception, built-in dispatch
+├── input.rs              # clap Input struct; script path resolution (get_file_path)
+├── utils.rs               # SUPPORTED_EXTENSIONS/SCRIPT_DIR_NAME, file parsing, Shortcuts, suggestions
+├── output.rs              # console output helpers (step/error/warn/dry_run)
+├── commands/
+│   ├── create.rs          # `zirv create` / `c` — interactive script scaffolding
+│   ├── help.rs             # `zirv help` / `h` — usage + script/shortcut listing
+│   ├── init.rs             # `zirv init` / `i` — creates a .zirv directory
+│   ├── version.rs          # `zirv version` / `v`
+│   └── ctx/                # `zirv ctx <verb>` — AI-agent context management subsystem
+└── script_runner/
+    ├── script.rs           # Script model + run loop
+    ├── command.rs          # single shell Command: substitution, invoke, fallback
+    ├── command_types.rs    # CommandTypes enum: Command / Commands / Agent
+    ├── agent_command.rs    # AgentCommand step (supervised AI-agent step)
+    ├── options.rs           # per-command Options (interactive, os filter, delay, fallback)
+    ├── fallback_command.rs  # fallback step executed on failure
+    ├── operating_system.rs  # OperatingSystem enum + is_current()
+    ├── secret.rs             # Secret { name, env_var }
+    └── mod.rs                # execute(): build_context + Script::run
+```
+
+See [[Script Runner]] for the execution-loop internals, [[Ctx Subsystem]] for the `commands/ctx/` module breakdown, and [[Utilities]] for what lives in `utils.rs`.
+
+## Execution flow
+
+```mermaid
+graph TB
+    A[argv collected in main] --> B{argv[1] == 'ctx'?}
+    B -- yes --> C[ctx::dispatch - exits process]
+    B -- no --> D{is_top_level_help:<br/>argv[1] in --help/-h?}
+    D -- yes --> E[show_help, return]
+    D -- no --> F[Input::parse via clap]
+    F --> G{misplaced create-only flag<br/>on a non-create command?}
+    G -- yes --> H[error, exit 1]
+    G -- no --> I{input.command}
+    I -- help/h --> E
+    I -- version/v --> J[get_version]
+    I -- init/i --> K[init_zirv]
+    I -- create/c --> L[create_script]
+    I -- other --> M[input.get_file_path]
+    M --> N[Script Resolution:<br/>literal path, local .zirv,<br/>global ~/.zirv, shortcuts]
+    N --> O[file_to_script:<br/>parse YAML/JSON/TOML]
+    O --> P[script_runner::execute]
+    P --> Q[build_context:<br/>params + secrets]
+    Q --> R[Script::run loop<br/>over commands]
+```
+
+`ctx` interception happens on raw `argv`, ahead of everything else, including clap parsing — see [[Script Resolution]] for why that makes a same-named `.zirv/ctx.*` script permanently unreachable. Steps M–O are detailed in [[Script Resolution]]; step R is detailed in [[Script Runner]] and the file format it consumes is [[Script Files]].
+
+## Where `zirv ctx` fits
+
+`commands/ctx/mod.rs` defines its own `clap::Parser` (`CtxCli`) and verb enum (`CtxVerb`), parsed independently from the top-level `Input` struct once `main.rs` has handed off control. Its own dispatch (`dispatch(&argv[1..])`) never returns to `main.rs` — it exits the process directly with a verb-specific or clap-derived exit code. The subsystem is large enough to warrant its own architecture notes; see [[Ctx Subsystem]], [[Ctx Supervisors]], [[Ctx Adapters]], and [[Rot Engine]].

@@ -1,0 +1,7 @@
+# Repo-layer zirv configuration (untrusted layer: operator config and env win;
+# keys listed in REPO_FORBIDDEN are ignored here by design).
+
+[chat]
+# Model for the interactive orchestrator session (displayed in the banner/header).
+# User decision 2026-08-13: the orchestrator runs Fable (claude-fable-5).
+model = "fable"
