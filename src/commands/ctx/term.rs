@@ -335,8 +335,11 @@ fn install_platform_handler() {
     // *previous* disposition, which C6 requires honouring: an inherited
     // `SIG_IGN` is put straight back rather than quietly replaced.
     unsafe {
+        // Coerce to a fn pointer before the integer cast: casting the fn
+        // *item* straight to `sighandler_t` trips `function_casts_as_integer`.
+        let handler: extern "C" fn(libc::c_int) = terminating_signal_handler;
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            let previous = libc::signal(signal, terminating_signal_handler as libc::sighandler_t);
+            let previous = libc::signal(signal, handler as libc::sighandler_t);
             if !may_install_over(previous) {
                 libc::signal(signal, previous);
             }
