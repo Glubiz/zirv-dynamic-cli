@@ -626,8 +626,11 @@ mod tests {
             argv.contains("zirv session conventions"),
             "the shipped default layer proves injection happened: {argv}"
         );
+        // Match the layer's version header, not the bare name: the adapter
+        // layer legitimately references "the zirv meta-harness layer" by name,
+        // and only the header marks the layer itself being present.
         assert!(
-            !argv.contains("zirv meta-harness"),
+            !argv.contains("zirv meta-harness (v"),
             "a worker session must never get the harness delegation layer: {argv}"
         );
     }
