@@ -222,6 +222,14 @@ pub struct PromptConfig {
     pub repo_layer: bool,
     /// Cap on the repo layer only: untrusted text does not get to be long.
     pub max_repo_bytes: usize,
+    /// Whether an Orchestrator session's composed prompt gets the derived
+    /// harness roster (`adapters::harness_prompt_lines`, folded in by
+    /// `prompt::compose` as `PromptSource::Harnesses`). On by default; an
+    /// operator who wants no roster at all (or finds it noisy) turns it off
+    /// here. `REPO_FORBIDDEN` (like `prompt.enabled`/`prompt.repo_layer`): a
+    /// repo checkout must not be able to suppress a layer the operator
+    /// relies on to see what this session may delegate to.
+    pub harnesses: bool,
 }
 
 impl Default for PromptConfig {
@@ -230,6 +238,7 @@ impl Default for PromptConfig {
             enabled: true,
             repo_layer: true,
             max_repo_bytes: 4096,
+            harnesses: true,
         }
     }
 }
@@ -544,6 +553,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["prompt", "max_repo_bytes"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_PROMPT_HARNESSES",
+        &["prompt", "harnesses"],
+        EnvKind::Bool,
+    ),
     ("ZIRV_CTX_MAIL", &["mail", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_MAIL_MAX_MESSAGE_BYTES",
@@ -695,6 +709,12 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["prompt", "max_repo_bytes"],
         "ZIRV_CTX_PROMPT_MAX_REPO_BYTES",
     ),
+    // The harness roster names which other harnesses this session may
+    // delegate to and how to reach them (`zirv agent <name> ...`) -- a repo
+    // checkout must not be able to force that layer back on for an operator
+    // who turned it off, the same trust asymmetry as `prompt.enabled` and
+    // `prompt.repo_layer` right above.
+    (&["prompt", "harnesses"], "ZIRV_CTX_PROMPT_HARNESSES"),
     // Same rationale as prompt.max_repo_bytes above: mail is folded into the
     // composed prompt as its own layer (`with_mail_layer`), and without this
     // a repo could simply raise its own delivered-mail cap, making it
@@ -1170,6 +1190,7 @@ mod tests {
         assert!(prompt.enabled);
         assert!(prompt.repo_layer);
         assert_eq!(prompt.max_repo_bytes, 4096);
+        assert!(prompt.harnesses);
     }
 
     #[test]
@@ -1177,10 +1198,13 @@ mod tests {
         // The same trust boundary as agent_bin: a checkout must not be able to
         // decide that text from the checkout gets injected, nor how much of it.
         // A repo that could raise max_repo_bytes would make the cap decorative.
+        // `harnesses` is here for the same reason: a repo must not be able to
+        // force the derived roster back on for an operator who turned it off.
         for (key, value) in [
             ("enabled", "true"),
             ("repo_layer", "true"),
             ("max_repo_bytes", "1000000"),
+            ("harnesses", "false"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -1217,6 +1241,17 @@ mod tests {
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(
             !cfg.prompt.enabled,
+            "the environment is the operator, not the checkout"
+        );
+    }
+
+    #[test]
+    fn the_operator_may_still_toggle_the_harness_roster() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PROMPT_HARNESSES", "false")]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.prompt.harnesses,
             "the environment is the operator, not the checkout"
         );
     }

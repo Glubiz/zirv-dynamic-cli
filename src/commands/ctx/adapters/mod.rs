@@ -34,6 +34,17 @@ pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 pub trait AgentAdapter: std::fmt::Debug {
     fn name(&self) -> &'static str;
 
+    /// The program this adapter actually spawns -- `agent_bin`'s override, or
+    /// this adapter's own default binary name, whichever `ClaudeAdapter::new`/
+    /// `CodexAdapter::new` resolved to `program` at construction. Distinct
+    /// from `name()`: `name` is the fixed registry key (`"claude"`,
+    /// `"codex"`), while this can be any override an operator's `agent_bin`
+    /// or `--agent-bin` named. Exists so a caller with only a `&dyn
+    /// AgentAdapter` -- `harness_prompt_lines`'s presence check in particular
+    /// -- can ask what binary `ready()` actually resolved, without the
+    /// module-private `program` field each adapter otherwise keeps to itself.
+    fn program(&self) -> &str;
+
     /// The ACCOUNT/vendor whose rate limits this agent spends, as a stable
     /// lowercase slug (`[a-z0-9-]`): `"anthropic"` for claude, `"openai"`
     /// for codex.
@@ -588,6 +599,39 @@ fn resolve_on_path(program: &str) -> Option<(PathBuf, bool)> {
     None
 }
 
+/// Whether `program`'s binary genuinely exists on disk -- either at an
+/// explicit path, or somewhere on `PATH` (`PATHEXT`-aware on Windows).
+///
+/// This is deliberately a *stronger* claim than `resolve_program`/`ready()`
+/// make: `resolve_program` is fail-open by design for a name it cannot find
+/// (a program that resolves to nothing is spawned exactly as written, so a
+/// genuinely missing binary fails with the OS's own "not found" rather than a
+/// zirv-invented error), and several call sites rely on exactly that
+/// fail-open behavior (`agent_bin` naming a not-yet-real path still has to
+/// fall through to whichever adapter it actually matches by name, not error
+/// out early). `harness_prompt_lines` is the one caller that turns "ready"
+/// into a concrete invitation (`zirv agent <name> "<prompt>"`) an orchestrator
+/// may act on immediately, so it alone needs this stronger check layered on
+/// top of -- never in place of -- `ready()`.
+pub fn program_is_present(program: &str) -> bool {
+    if program.is_empty() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        resolve_on_path(program).is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        if program.contains('/') {
+            return Path::new(program).is_file();
+        }
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+            .unwrap_or(false)
+    }
+}
+
 /// An adapter constructor: the same shape `ClaudeAdapter::new` and
 /// `CodexAdapter::new` already share, named so `ADAPTERS` reads as a table
 /// rather than a wall of type punctuation.
@@ -726,6 +770,98 @@ pub fn available_adapter_names(cfg: &CtxConfig) -> Vec<&'static str> {
         .iter()
         .filter(|(name, ctor)| cfg.agents.is_enabled(name) && ctor(bin).ready().is_ok())
         .map(|(name, _)| *name)
+        .collect()
+}
+
+/// One line per registered adapter, describing whether an Orchestrator
+/// session may delegate to it right now via `zirv agent <name> "<prompt>"`.
+/// Rendered by a caller that already has `cfg` in hand (`wrap`, `chat`'s
+/// dashboard orchestrator pane path), never by a Worker call site: the result
+/// is folded into the composed prompt as the harness roster
+/// (`prompt::PromptSource::Harnesses`), and a worker must not learn what it
+/// could delegate to.
+///
+/// `current_adapter` is the resolved adapter running *this* session -- its
+/// line is marked "(this session's harness)" instead of the `zirv agent`
+/// invitation, since `HARNESS_PROMPT` frames delegation as going to *other*
+/// harnesses; a session cannot review-round itself.
+///
+/// Walks `ADAPTERS` in registry order, same as `readiness_note`, but reports
+/// per-adapter gate state too (`readiness_note` only ever speaks about
+/// installed-but-not-ready or degraded adapters, never a disabled one): a
+/// disabled adapter gets its own line naming where the disable came from
+/// (`AgentState::location`) rather than silently vanishing from the roster,
+/// so an operator reading the prompt can tell "not offered because disabled
+/// in .zirv/.settings.toml" from "not offered because not installed".
+///
+/// `ready()` alone is fail-open for a binary that simply is not there (see
+/// [`program_is_present`]'s own doc comment), so a `ready()`-Ok adapter is
+/// checked again against the real filesystem before its line may claim
+/// "ready" and hand out the `zirv agent` invitation -- otherwise it reads as
+/// "not installed" instead, exactly like a genuinely unready one.
+///
+/// `cfg.agent_bin` is one global override (see `agent_bin_names_a_different_
+/// adapter`'s own doc comment), so it is never handed to an adapter whose own
+/// basename it does not name: every `ctor(bin)` call below used to reuse the
+/// same `bin` for every adapter in the registry, which put a real `claude`
+/// binary's presence verdict onto codex's line (and vice versa) whenever an
+/// operator's `agent_bin` named one specific agent -- either wrongly
+/// advertising `zirv agent codex` on the strength of claude's binary, or, for
+/// a not-yet-real wrapper path, wrongly marking every *other* adapter "not
+/// installed" too. `agent_bin_names_a_different_adapter` returning `Some`
+/// means `bin`'s basename names a *different* registered adapter than the one
+/// about to be built, so that adapter is built with `None` instead and its
+/// presence is judged from its own default program name, exactly as if no
+/// override were configured at all.
+pub fn harness_prompt_lines(cfg: &CtxConfig, current_adapter: &str) -> Vec<String> {
+    let bin = cfg.agent_bin.as_deref();
+    ADAPTERS
+        .iter()
+        .map(|(name, ctor)| {
+            let name: &str = name;
+            let is_self = name == current_adapter;
+            let (enabled, location) = cfg
+                .agents
+                .states()
+                .find(|(n, _)| *n == name)
+                .map(|(_, s)| (s.enabled, s.location()))
+                .unwrap_or((true, "default".to_string()));
+            if !enabled {
+                return format!("- {name}: disabled ({location})");
+            }
+
+            let adapter = if agent_bin_names_a_different_adapter(bin, name).is_some() {
+                ctor(None)
+            } else {
+                ctor(bin)
+            };
+            match adapter.ready() {
+                Ok(()) => {
+                    let program = adapter.program();
+                    if !program_is_present(program) {
+                        return format!("- {name}: not installed (no '{program}' found)");
+                    }
+                    let missing = missing_capability_labels(adapter.capabilities());
+                    let degraded = if missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (degraded: no {})", join_with_or(&missing))
+                    };
+                    if is_self {
+                        format!("- {name}: enabled, ready (this session's harness){degraded}")
+                    } else {
+                        format!(
+                            "- {name}: enabled, ready -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
+                        )
+                    }
+                }
+                Err(err) => {
+                    let reason = err.to_string();
+                    let short = reason.lines().next().unwrap_or(&reason);
+                    format!("- {name}: installed? not ready ({short})")
+                }
+            }
+        })
         .collect()
 }
 
@@ -1110,6 +1246,173 @@ mod tests {
         assert!(
             !note.contains("claude (launch-level"),
             "claude is fully capable and must not appear in the degraded clause: {note}"
+        );
+    }
+
+    #[test]
+    fn harness_prompt_lines_returns_one_line_per_registered_adapter() {
+        let lines = harness_prompt_lines(&permissive_cfg(), "");
+        assert_eq!(lines.len(), ADAPTERS.len());
+        for (name, _) in ADAPTERS {
+            assert!(
+                lines.iter().any(|l| l.starts_with(&format!("- {name}:"))),
+                "missing a line for '{name}': {lines:?}"
+            );
+        }
+    }
+
+    /// The one call site (`prompt::compose` for an Orchestrator session) must
+    /// never learn about a disabled adapter as if it were offered for
+    /// delegation: a disabled line names where the disable came from and
+    /// never the `zirv agent <name>` invitation.
+    #[test]
+    fn harness_prompt_lines_names_the_disabled_adapter_and_its_location() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env: std::collections::HashMap<String, String> =
+            [("ZIRV_AGENT_CODEX_ENABLED".to_string(), "false".to_string())]
+                .into_iter()
+                .collect();
+        let cfg = CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| env.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        };
+
+        let lines = harness_prompt_lines(&cfg, "");
+        let codex_line = lines
+            .iter()
+            .find(|l| l.starts_with("- codex:"))
+            .expect("codex line present");
+        assert!(codex_line.contains("disabled"), "got {codex_line}");
+        assert!(
+            codex_line.contains("ZIRV_AGENT_CODEX_ENABLED"),
+            "names the environment source: {codex_line}"
+        );
+        assert!(
+            !codex_line.contains("zirv agent codex"),
+            "a disabled adapter is never offered for delegation: {codex_line}"
+        );
+    }
+
+    /// Finding 1: `ready()` alone is fail-open for a program that simply is
+    /// not on disk anywhere -- `resolve_program` deliberately returns `Ok`
+    /// for it (see its own doc comment), and several other call sites lean on
+    /// that. `harness_prompt_lines` must not repeat the same fail-open claim
+    /// in a roster line an orchestrator can act on immediately: a name that
+    /// resolves to nothing must read as not installed, not ready.
+    #[test]
+    fn harness_prompt_lines_reports_not_installed_when_the_resolved_program_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nonexistent-agent-binary");
+        let cfg = CtxConfig {
+            agent_bin: Some(missing.display().to_string()),
+            ..permissive_cfg()
+        };
+
+        let lines = harness_prompt_lines(&cfg, "");
+        let claude_line = lines
+            .iter()
+            .find(|l| l.starts_with("- claude:"))
+            .expect("claude line present");
+        assert!(claude_line.contains("not installed"), "got {claude_line}");
+        assert!(
+            !claude_line.contains("zirv agent"),
+            "a binary that is not there must never be offered for delegation: {claude_line}"
+        );
+    }
+
+    /// Finding 1's positive case, plus Finding 4: a program that genuinely
+    /// exists on disk is still offered for delegation, except when it is
+    /// this session's own adapter, which is marked as such instead of
+    /// inviting a session to delegate to itself.
+    ///
+    /// Each adapter's own default program name (no `agent_bin` override) is
+    /// planted as a real stub on a PATH restricted to one temp dir, so
+    /// codex's "ready" verdict here is earned by codex's own binary, never
+    /// borrowed from an unrelated stub -- see the follow-up regression right
+    /// below this test for the case where a *shared* override used to make
+    /// that borrowing happen.
+    #[test]
+    fn harness_prompt_lines_offers_delegation_only_to_a_present_non_self_adapter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["claude", "codex"] {
+            std::fs::write(dir.path().join(name), "").expect("write stub");
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        let cfg = permissive_cfg();
+
+        let lines = harness_prompt_lines(&cfg, "claude");
+        let claude_line = lines
+            .iter()
+            .find(|l| l.starts_with("- claude:"))
+            .expect("claude line present");
+        assert!(
+            claude_line.contains("this session's harness"),
+            "got {claude_line}"
+        );
+        assert!(
+            !claude_line.contains("zirv agent claude"),
+            "a session never invites itself to delegate: {claude_line}"
+        );
+
+        let codex_line = lines
+            .iter()
+            .find(|l| l.starts_with("- codex:"))
+            .expect("codex line present");
+        assert!(
+            codex_line.contains("zirv agent codex"),
+            "a present, non-self adapter is still offered on the strength of its own binary: \
+             {codex_line}"
+        );
+    }
+
+    /// Item 1 regression: `harness_prompt_lines` used to build *every*
+    /// adapter with the same global `agent_bin` override, so `agent_bin`
+    /// naming claude's binary made codex's line borrow claude's presence
+    /// verdict and falsely offer `zirv agent codex` -- a wasted delegation
+    /// every review round, since `select` would go on to refuse it
+    /// ("agent_bin names 'claude', not 'codex'"). With no `codex` binary
+    /// anywhere on this test's restricted `PATH`, codex must read as not
+    /// installed regardless of how present claude's own stub is.
+    #[test]
+    fn harness_prompt_lines_never_borrows_a_named_adapters_presence_for_another() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("claude"), "").expect("write stub");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        let cfg = CtxConfig {
+            agent_bin: Some(dir.path().join("claude").display().to_string()),
+            ..permissive_cfg()
+        };
+
+        let lines = harness_prompt_lines(&cfg, "claude");
+        let claude_line = lines
+            .iter()
+            .find(|l| l.starts_with("- claude:"))
+            .expect("claude line present");
+        assert!(
+            claude_line.contains("this session's harness"),
+            "claude's own named override is present: {claude_line}"
+        );
+
+        let codex_line = lines
+            .iter()
+            .find(|l| l.starts_with("- codex:"))
+            .expect("codex line present");
+        assert!(
+            !codex_line.contains("zirv agent codex"),
+            "agent_bin naming claude must never make codex's line claim delegable: {codex_line}"
+        );
+        assert!(
+            codex_line.contains("not installed"),
+            "codex is judged on its own (absent) binary, not claude's override: {codex_line}"
         );
     }
 

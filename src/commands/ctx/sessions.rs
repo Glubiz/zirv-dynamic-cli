@@ -266,6 +266,31 @@ pub struct Record {
     /// reachable session.
     #[serde(default = "reachable_default")]
     pub reachable: bool,
+    /// The process that registered this session, stamped by
+    /// [`SessionGuard::register`] itself (unless a caller already set it) --
+    /// so it is always `Some(pid)` for a record written by this build, and
+    /// `None` only for one written by an older build before this field
+    /// existed. A dashboard pane carries the *dashboard's* pid because
+    /// `Pane::new` registers from inside the dashboard process itself; any
+    /// other session simply carries the pid of whichever process actually
+    /// called `register`. That is not always the dashboard even for a
+    /// session a dashboard pane is morally responsible for: `zirv ctx
+    /// agent`'s dashboard-refused-but-retryable fallback (`agent.rs`'s
+    /// headless path, `agent.rs:126` onward into `exec::run_with`) runs in
+    /// the *requester's* process -- a pane's own child shell, or a plain
+    /// terminal -- never inside the dashboard's, so that fallback session
+    /// registers the requester's pid and is not shown in that dashboard's
+    /// sidebar. Accepted residual: pid-based ownership has no way to express
+    /// "spawned on this dashboard's behalf, but from outside its process," so
+    /// that session is only visible via mail (its own report-back) and `zirv
+    /// ctx status`, same as any other unowned-by-this-dashboard record. The
+    /// dashboard sidebar merge (`dash::assemble_sidebar`) keeps only records
+    /// whose `owner_pid` matches its own pid, so a second, concurrently
+    /// running dashboard's panes never bleed into this one's panel.
+    /// `#[serde(default)]` so an on-disk record from an older build
+    /// deserializes as `None` rather than failing to parse.
+    #[serde(default)]
+    pub owner_pid: Option<u32>,
 }
 
 fn reachable_default() -> bool {
@@ -291,6 +316,10 @@ impl Record {
             // `wrap` (which can run `--no-supervise`, or fail to bind) has
             // any reason to call `unreachable()` below.
             reachable: true,
+            // Left unset here: `SessionGuard::register` stamps this
+            // process's own pid on the way to disk, unless a caller has
+            // already set one (see its own doc comment).
+            owner_pid: None,
         }
     }
 
@@ -333,7 +362,22 @@ pub struct SessionGuard {
 }
 
 impl SessionGuard {
-    pub fn register(state: &StateDir, record: Record) -> Self {
+    /// Stamps `owner_pid` with this process's own pid before writing the
+    /// record, unless the caller already set one -- see the field's own doc
+    /// comment. Every registration path goes through this one function, so
+    /// this is the single seam: a dashboard pane and a standalone `wrap`/
+    /// `exec`/`loop` session both end up attributed to whichever process
+    /// actually called this, without each caller having to remember to stamp
+    /// itself. That is the dashboard's own pid for a pane (registered from
+    /// inside the dashboard process) and the calling process's own pid for
+    /// everything else -- including `zirv ctx agent`'s headless fallback,
+    /// which runs in the *requester's* process rather than the dashboard's
+    /// even when the request named one (see the field's own doc comment for
+    /// that residual).
+    pub fn register(state: &StateDir, mut record: Record) -> Self {
+        if record.owner_pid.is_none() {
+            record.owner_pid = Some(std::process::id());
+        }
         let path = write_record(state, &record);
         Self {
             state: state.clone(),
@@ -373,6 +417,34 @@ impl SessionGuard {
         }
         self.record.session = new_session.to_string();
         self.record.started_at = super::state::now_secs();
+        self.path = write_record(&self.state, &self.record);
+    }
+
+    /// Points this run's record at the pid of the agent child the supervisor
+    /// actually spawned, rather than at the supervisor's own pid.
+    ///
+    /// P5: `Record::new` stamps `std::process::id()`, which for `wrap` is
+    /// zirv's pid -- so a `wrap` record stayed "alive" (and stayed offered
+    /// for restore, and stayed nudge-targetable) for exactly as long as the
+    /// *wrapper* lived, whether or not the agent underneath it was still
+    /// there. `dash::pane::Pane::spawn` has always stamped the real child pid
+    /// for the same reason; this is that same override, on the one seam
+    /// `wrap` has for it. Called right after the spawn, and again after every
+    /// relaunch: a record left pointing at a replaced child's dead pid would
+    /// be swept by `list` and the live session would vanish from `zirv ctx
+    /// status`.
+    ///
+    /// `owner_pid` is deliberately untouched -- it answers "which process
+    /// filed this record", which is still zirv's own, and is what
+    /// `dash::assemble_sidebar` scopes its panel by. Like every other write
+    /// here, best-effort: `short` and the record's path do not move (see
+    /// `refresh_session`), so a failed write costs a stale pid, never an
+    /// address.
+    pub fn adopt_child_pid(&mut self, pid: u32) {
+        if self.released || self.record.pid == pid {
+            return;
+        }
+        self.record.pid = pid;
         self.path = write_record(&self.state, &self.record);
     }
 
@@ -441,6 +513,23 @@ fn is_alive(_pid: u32) -> bool {
     // No portable liveness check: never sweep a record this platform cannot
     // actually verify.
     true
+}
+
+/// Whether the registry still holds a record for `short` whose pid is alive.
+///
+/// P4: a dashboard that was killed (rather than quit) leaves both a restore
+/// roster *and* the sessions its panes registered -- and on Windows, before
+/// the job-object backstop, those panes' agents genuinely outlived it.
+/// Restoring such a candidate spawns a second agent onto a conversation the
+/// first one is still holding. Reads the record file directly rather than
+/// going through `list`, which sweeps as a side effect: this is a question,
+/// not a cleanup. A missing, unreadable or malformed record answers `false`
+/// -- nothing to collide with, so the restore may proceed.
+pub fn short_is_live(state: &StateDir, short: &str) -> bool {
+    std::fs::read_to_string(record_path(state, short))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<Record>(&contents).ok())
+        .is_some_and(|record| is_alive(record.pid))
 }
 
 /// Every record currently on disk, alongside whether its own process is
@@ -875,6 +964,27 @@ mod tests {
     }
 
     #[test]
+    fn a_record_without_owner_pid_deserializes_as_unowned() {
+        // A record written by a build that predates `owner_pid` has no such
+        // key in its JSON at all -- not `null`, simply absent -- which is
+        // what `#[serde(default)]` (rather than a required field) exists to
+        // survive.
+        let json = r#"{
+            "session": "11111111-2222-4333-8444-555555555555",
+            "short": "11111111",
+            "agent": "claude",
+            "repo": "/repo",
+            "repo_slug": "-repo",
+            "verb": "exec",
+            "pid": 1,
+            "started_at": 0,
+            "reachable": true
+        }"#;
+        let record: Record = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(record.owner_pid, None);
+    }
+
+    #[test]
     fn a_record_is_written_at_spawn_and_removed_when_the_supervisor_exits() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = state_in(tmp.path());
@@ -889,6 +999,173 @@ mod tests {
         assert!(
             !path.exists(),
             "the record file is gone once the supervisor exits"
+        );
+    }
+
+    /// Finding 3: `owner_pid` used to be stamped only by `dash/pane.rs`, so
+    /// every *other* registration path -- a standalone `wrap`/`exec`/`loop`
+    /// session in particular -- was written with `owner_pid: None`, an owner
+    /// no dashboard could ever match, even though the registering process
+    /// itself is a perfectly good owner to record. Moving the stamp into
+    /// `register` itself fixes that uniformly: every registration is now
+    /// attributed to whichever process actually called it. (This does not
+    /// reach `zirv ctx agent`'s dashboard-refused-but-retryable fallback,
+    /// which runs in the *requester's* process rather than the dashboard's
+    /// even when it was dispatched on that dashboard's behalf -- a separate,
+    /// accepted residual; see `owner_pid`'s own doc comment.)
+    #[test]
+    fn register_stamps_owner_pid_with_the_current_process_unless_already_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+
+        let record = record_for("11111111-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        assert_eq!(record.owner_pid, None, "unstamped before registration");
+        let guard = SessionGuard::register(&state, record);
+        assert_eq!(
+            guard.record().owner_pid,
+            Some(std::process::id()),
+            "register stamps the current process's own pid"
+        );
+
+        let mut explicit = record_for("22222222-3333-4444-8555-666666666666", &repo, Verb::Exec);
+        explicit.owner_pid = Some(999);
+        let guard = SessionGuard::register(&state, explicit);
+        assert_eq!(
+            guard.record().owner_pid,
+            Some(999),
+            "an owner the caller already set is left alone"
+        );
+    }
+
+    /// P5: `wrap` files its record before it has a child, so `Record::new`
+    /// stamps zirv's own pid; `adopt_child_pid` re-points it at the agent the
+    /// supervisor actually spawned, exactly as `dash::pane::Pane::spawn`
+    /// already does at its own registration. The record's *address* (`short`,
+    /// and therefore its path) must not move with it -- that is what mail and
+    /// `zirv ctx nudge` resolve against.
+    #[test]
+    fn adopt_child_pid_repoints_the_record_at_the_agent_without_moving_its_address() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = record_for("11111111-2222-4333-8444-555555555555", &repo, Verb::Wrap);
+        let short = record.short.clone();
+        let path = record_path(&state, &short);
+
+        let mut guard = SessionGuard::register(&state, record);
+        assert_eq!(
+            guard.record().pid,
+            std::process::id(),
+            "before the spawn there is no child pid to record"
+        );
+
+        guard.adopt_child_pid(4242);
+        assert_eq!(guard.record().pid, 4242);
+        assert_eq!(guard.short(), short, "the delivery address does not move");
+        assert!(path.is_file(), "and neither does the record's own path");
+
+        let on_disk: Record =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(on_disk.pid, 4242, "the override reached disk");
+        assert_eq!(
+            on_disk.owner_pid,
+            Some(std::process::id()),
+            "owner_pid still answers 'which process filed this', untouched"
+        );
+    }
+
+    /// P5, the restart window: the pid a `wrap` record names must never be a
+    /// *dead* one, not even briefly.
+    ///
+    /// `list` sweeps any record whose pid is gone, and it runs on other
+    /// processes' schedules -- `zirv ctx status`, `nudge`, `send
+    /// --to-session`, a dashboard's ~1s registry refresh. So during a rot
+    /// restart, where the old child is killed long before a replacement
+    /// exists, `pump`'s restart arm parks the record on zirv's own pid first
+    /// and adopts the fresh child's only once there is one. This pins that
+    /// three-step sequence, which is all `pump` does to the guard: there is
+    /// no seam to drive the pump's own restart arm from a unit test, and the
+    /// two calls it makes are exactly these.
+    #[test]
+    fn a_restart_never_leaves_the_record_naming_a_dead_pid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = record_for("44444444-2222-4333-8444-555555555555", &repo, Verb::Wrap);
+        let path = record_path(&state, &record.short);
+        let mut guard = SessionGuard::register(&state, record);
+
+        let on_disk = || -> Record {
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse")
+        };
+
+        // 1. First spawn: the record names the agent child.
+        guard.adopt_child_pid(4242);
+        assert_eq!(on_disk().pid, 4242);
+
+        // 2. Restart begins -- the child is about to be killed, so the record
+        //    is parked on this process, which is alive by construction.
+        guard.adopt_child_pid(std::process::id());
+        assert_eq!(on_disk().pid, std::process::id());
+        assert!(
+            is_alive(on_disk().pid),
+            "a concurrent `list` mid-restart must not sweep this record"
+        );
+
+        // 3. Respawn: back onto the fresh child.
+        guard.adopt_child_pid(5353);
+        assert_eq!(on_disk().pid, 5353);
+        assert_eq!(
+            on_disk().short,
+            guard.short(),
+            "and the delivery address never moved through any of it"
+        );
+    }
+
+    /// Idempotent and inert after release, like every other guard write here:
+    /// a relaunch calls it once per fresh child, and a released guard must not
+    /// resurrect the record file it just removed.
+    #[test]
+    fn adopt_child_pid_is_a_no_op_on_a_released_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = record_for("33333333-2222-4333-8444-555555555555", &repo, Verb::Wrap);
+        let path = record_path(&state, &record.short);
+
+        let mut guard = SessionGuard::register(&state, record);
+        guard.release();
+        guard.adopt_child_pid(4242);
+        assert!(!path.exists(), "a released record stays released");
+    }
+
+    /// P4's production probe. A record naming *this* test process is live by
+    /// construction; an absurd pid is not; and no record at all answers
+    /// "nothing to collide with", so the restore may proceed.
+    #[test]
+    fn short_is_live_answers_from_the_record_the_short_names() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+
+        let mut alive = record_for("aaaaaaaa-2222-4333-8444-555555555555", &repo, Verb::Dash);
+        alive.pid = std::process::id();
+        let alive_short = alive.short.clone();
+        let _alive_path = write_record(&state, &alive);
+
+        let mut dead = record_for("bbbbbbbb-2222-4333-8444-555555555555", &repo, Verb::Dash);
+        // Far above any pid Windows or Linux hands out, so it cannot collide
+        // with a real process on the machine running these tests.
+        dead.pid = 4_000_000_003;
+        let dead_short = dead.short.clone();
+        let _dead_path = write_record(&state, &dead);
+
+        assert!(short_is_live(&state, &alive_short));
+        assert!(!short_is_live(&state, &dead_short));
+        assert!(
+            !short_is_live(&state, "nosuchid"),
+            "no record means nothing to collide with"
         );
     }
 

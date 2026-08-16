@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::CtxResult;
@@ -79,7 +80,7 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
         // the whole tree rooted at the pid instead. Its arguments are fixed
         // flags plus a decimal pid, so there is no cmd.exe-reparse exposure.
         // Falls back to a direct kill if taskkill cannot be run.
-        if !taskkill_tree(child.id()) {
+        if !kill_tree(child.id()) {
             let _ = child.kill();
         }
     }
@@ -111,20 +112,367 @@ fn taskkill_args(pid: u32) -> Vec<String> {
     ]
 }
 
+/// The `taskkill` command, assembled but not run. Shared by the synchronous
+/// [`kill_tree`] and by the console-close handler's fire-and-poll sweep, so
+/// there is exactly one place the argv and the stdio discipline are decided.
+#[cfg(not(unix))]
+fn taskkill_command(pid: u32) -> Command {
+    let mut command = Command::new("taskkill");
+    command
+        .args(taskkill_args(pid))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
 /// Runs `taskkill /T /F /PID <pid>` without a shell, waiting briefly for it to
 /// finish. Returns whether taskkill ran *and* reported success; `false` (it is
 /// not on PATH, or it failed) tells the caller to fall back to a direct
 /// `child.kill()`.
+///
+/// `pub(crate)` (P1): the pty seams -- `wrap::quit_child` and
+/// `dash::pane::Pane::finish_shutdown` -- have only ever had portable-pty's
+/// own `Child::kill()`, which is a `TerminateProcess` against the *direct*
+/// child. For an npm-installed agent that direct child is `cmd.exe /c
+/// claude.cmd` and the real agent is a `node` grandchild, so a "killed" pane
+/// left a live agent behind holding the repo. This is the same tree-kill
+/// `terminate` (exec/loop) has always used, reachable from those seams too.
+/// Never a substitute for evidence of death: portable-pty 0.9.0's own
+/// `kill()` inverts its success check, and taskkill's exit status says only
+/// that taskkill ran -- `try_wait`/`wait_for_exit` remain the only proof.
 #[cfg(not(unix))]
-fn taskkill_tree(pid: u32) -> bool {
-    Command::new("taskkill")
-        .args(taskkill_args(pid))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+pub(crate) fn kill_tree(pid: u32) -> bool {
+    taskkill_command(pid)
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// P2: the supervised-child pid registry.
+//
+// The Windows console-close handler (`term::console_ctrl_handler`) restores
+// the console and returns FALSE, which kills *this* process -- and nothing
+// else. A pane's child lives on a ConPTY of its own and never sees
+// CTRL_CLOSE_EVENT, so clicking the X on a dashboard window left every agent
+// running, invisible, holding the repo. The handler needs a list of pids to
+// tree-kill, and it has to be a list it can read without allocating a lock
+// wait it might not survive: Windows gives a console-close handler about five
+// seconds.
+//
+// Deliberately cross-platform (only the *consumer* is Windows-only): the
+// bookkeeping is ordinary safe code, and keeping it off `cfg` means CI --
+// which is Linux -- actually runs its tests.
+// ---------------------------------------------------------------------------
+
+/// Every supervised child pid this process has spawned and not yet confirmed
+/// dead. Registered by [`ChildGuard::adopt`], removed by
+/// [`ChildGuard::release`] (and by its `Drop`).
+static SUPERVISED_PIDS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+
+fn supervised_pids() -> &'static Mutex<Vec<u32>> {
+    SUPERVISED_PIDS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Adds `pid` to the registry, ignoring a duplicate. A poisoned lock is
+/// dropped silently: a registry that cannot be written is a lost tree-kill at
+/// console close, never a failed spawn.
+pub(crate) fn register_child_pid(pid: u32) {
+    if let Ok(mut pids) = supervised_pids().lock()
+        && !pids.contains(&pid)
+    {
+        pids.push(pid);
+    }
+}
+
+/// Removes `pid` from the registry. Idempotent.
+pub(crate) fn deregister_child_pid(pid: u32) {
+    if let Ok(mut pids) = supervised_pids().lock() {
+        pids.retain(|held| *held != pid);
+    }
+}
+
+/// The registry as it stands, for the console-close handler.
+///
+/// `try_lock`, never `lock`: this runs on the handler's own thread inside a
+/// close window the OS will not wait past, and a handler that blocks on a
+/// contended mutex hangs the window instead of killing anything. Losing the
+/// snapshot degrades to today's behaviour (orphans), which is bad; hanging
+/// the close is worse. A poisoned lock takes the same route.
+///
+/// `allow(dead_code)` off Windows rather than `cfg(windows)`: the only
+/// non-test caller is `kill_registered_trees`, which *is* Windows-only, so
+/// on Linux this reads as dead in the bin target and `-D warnings` fails the
+/// ubuntu CI job. Gating the function itself would take the registry tests
+/// with it, and running those on CI is the whole reason the registry is not
+/// `cfg`'d in the first place (see this section's own header comment).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn supervised_pid_snapshot() -> Vec<u32> {
+    supervised_pids()
+        .try_lock()
+        .map(|pids| pids.clone())
+        .unwrap_or_default()
+}
+
+/// How long the console-close sweep waits for its `taskkill` children before
+/// giving up. Windows allows a console control handler roughly five seconds
+/// before it terminates the process anyway, so this stays well inside it.
+#[cfg(windows)]
+const CLOSE_KILL_BUDGET: Duration = Duration::from_millis(1_500);
+
+/// Tree-kills every registered child pid. Called only from the Windows
+/// console control handler (CTRL_CLOSE/LOGOFF/SHUTDOWN), which runs on an
+/// ordinary thread -- spawning processes there is legal, unlike in a POSIX
+/// signal handler, which is why the unix side deliberately has no counterpart.
+///
+/// Every `taskkill` is spawned first and waited on afterwards, against one
+/// shared budget, so N children cost one wait rather than N.
+#[cfg(windows)]
+pub(crate) fn kill_registered_trees() {
+    let mut killers: Vec<Child> = supervised_pid_snapshot()
+        .into_iter()
+        .filter_map(|pid| taskkill_command(pid).spawn().ok())
+        .collect();
+    let deadline = Instant::now() + CLOSE_KILL_BUDGET;
+    while !killers.is_empty() && Instant::now() < deadline {
+        killers.retain_mut(|killer| !matches!(killer.try_wait(), Ok(Some(_))));
+        if killers.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P3: job objects -- the kernel-enforced backstop.
+//
+// Every userspace kill path (P1's tree-kill, P2's console-close sweep) needs
+// this process to still be running to fire. `TerminateProcess` against zirv
+// itself -- `taskkill /F`, a crash, an `abort` from the release profile's
+// `panic = "abort"` -- runs no user code at all. A job object with
+// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` makes the *kernel* the killer: when
+// zirv dies for any reason its handles close, and closing the last job handle
+// terminates every process in the job.
+//
+// Every failure degrades silently to an inert guard. A job that cannot be
+// created or assigned is exactly today's behaviour, and today's behaviour is
+// not an error worth stopping a session for.
+//
+// Known residual: `AssignProcessToJobObject` adds *one* process. Descendants
+// it creates **after** the assignment inherit the job; ones it had already
+// created do not. On a shim launch (`cmd.exe /c claude.cmd` -> `node`) the
+// assignment happens on the very next statement after the spawn, so it
+// normally lands well before cmd.exe has started `node` -- but it is a race,
+// not a guarantee, and portable-pty offers no `CREATE_SUSPENDED` seam to
+// close it. This is why P1 and P2 stay: both go through `taskkill /T`, which
+// walks the tree as it stands *at kill time* and so covers a grandchild the
+// job missed. P3 is the backstop for the case the other two cannot reach at
+// all (no user code runs), not a replacement for either.
+// ---------------------------------------------------------------------------
+
+/// An anonymous kill-on-close job object holding one child's process tree.
+///
+/// The handle is kept as `usize` rather than `HANDLE` for the same reason
+/// `term::StashedConsole` does: a raw pointer field would make every struct
+/// that stores a guard (`dash::pane::Pane`, `wrap`'s own child state) `!Send`
+/// for no reason. `0` means inert -- no job was created, or assignment failed.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct JobGuard {
+    handle: usize,
+}
+
+#[cfg(windows)]
+impl JobGuard {
+    /// The degraded guard every failure produces: holds nothing, kills
+    /// nothing, and closing it is a no-op.
+    pub fn inert() -> Self {
+        Self { handle: 0 }
+    }
+
+    /// Whether a real job actually holds the child. Only this module's own
+    /// tests ask -- production behaviour is deliberately identical either
+    /// way, since every job failure degrades to exactly the pre-P3 behaviour
+    /// rather than to an error.
+    #[allow(dead_code)]
+    pub fn is_active(&self) -> bool {
+        self.handle != 0
+    }
+
+    /// Creates an anonymous job limited to kill-on-close and assigns `pid` to
+    /// it. Returns [`JobGuard::inert`] on any failure -- no job object
+    /// support, an ambient job that refuses nesting, a pid that has already
+    /// exited, or a missing `PROCESS_SET_QUOTA`/`PROCESS_TERMINATE` right.
+    pub fn adopt(pid: u32) -> Self {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        // SAFETY: every call below takes either no pointer or a live local.
+        // `job` and `process` are checked for null before use and closed on
+        // every exit path; `limits` is a plain `#[repr(C)]` POD passed by
+        // reference with its own size.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Self::inert();
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                CloseHandle(job);
+                return Self::inert();
+            }
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                CloseHandle(job);
+                return Self::inert();
+            }
+            let assigned = AssignProcessToJobObject(job, process) != 0;
+            CloseHandle(process);
+            if !assigned {
+                // Nested jobs are supported on every Windows this binary
+                // targets, but an ambient job created without nesting support
+                // (or one that forbids breakaway) still refuses. Degrade.
+                CloseHandle(job);
+                return Self::inert();
+            }
+            Self {
+                handle: job as usize,
+            }
+        }
+    }
+
+    /// Closes the job handle, which is what makes the kernel reap whatever is
+    /// still in the job. Idempotent, and called explicitly rather than left to
+    /// `Drop` alone: the release profile is `panic = "abort"`.
+    pub fn close(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        if self.handle == 0 {
+            return;
+        }
+        let handle = self.handle;
+        self.handle = 0;
+        // SAFETY: a handle this guard created and has not closed before.
+        unsafe {
+            CloseHandle(handle as _);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Unix needs none of this: portable-pty does `setsid` + `TIOCSCTTY`, so
+/// closing the pty master SIGHUPs the child's whole session, and an orphaned
+/// process group is reaped by the same mechanism. The type exists so every
+/// caller compiles unchanged.
+#[cfg(not(windows))]
+#[derive(Debug)]
+pub struct JobGuard;
+
+#[cfg(not(windows))]
+impl JobGuard {
+    pub fn inert() -> Self {
+        Self
+    }
+
+    pub fn is_active(&self) -> bool {
+        false
+    }
+
+    pub fn adopt(_pid: u32) -> Self {
+        Self
+    }
+
+    pub fn close(&mut self) {}
+}
+
+/// Everything a supervised child's *lifetime* owns beyond the `Child` handle
+/// itself: its membership in the console-close pid registry (P2) and the job
+/// object that reaps its tree if zirv dies without running any code (P3).
+///
+/// One guard per live child. A restart drops the old one and adopts a fresh
+/// one, so the replaced child's tree cannot outlive the supervisor that
+/// replaced it.
+#[derive(Debug)]
+pub struct ChildGuard {
+    pid: Option<u32>,
+    job: JobGuard,
+}
+
+impl ChildGuard {
+    /// The no-op guard: a child whose pid this platform (or this pty backend)
+    /// cannot report gets one, and so does every caller that has nothing to
+    /// adopt yet.
+    pub fn inert() -> Self {
+        Self {
+            pid: None,
+            job: JobGuard::inert(),
+        }
+    }
+
+    /// Registers `pid` for the console-close sweep and puts it in a
+    /// kill-on-close job. `None` -- portable-pty could not report a pid --
+    /// degrades to [`ChildGuard::inert`].
+    pub fn adopt(pid: Option<u32>) -> Self {
+        let Some(pid) = pid else {
+            return Self::inert();
+        };
+        register_child_pid(pid);
+        Self {
+            pid: Some(pid),
+            job: JobGuard::adopt(pid),
+        }
+    }
+
+    /// Whether a kernel job actually backs this guard (Windows only; always
+    /// false elsewhere). Test-only, like [`JobGuard::is_active`].
+    #[allow(dead_code)]
+    pub fn job_is_active(&self) -> bool {
+        self.job.is_active()
+    }
+
+    /// The pid this guard holds, if any. Test-only: production just holds the
+    /// guard and releases it.
+    #[allow(dead_code)]
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Deregisters the pid and closes the job handle. Called on *confirmed*
+    /// exit, where closing the job kills nothing because there is nothing left
+    /// to kill. Idempotent, and called explicitly in exit arms because the
+    /// release profile is `panic = "abort"` and `Drop` is no safety net.
+    pub fn release(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            deregister_child_pid(pid);
+        }
+        self.job.close();
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Bytes a transcript grew by since the previous poll.
@@ -320,10 +668,17 @@ pub(crate) fn guard_cmd_shim_reparse(command: &Command) -> CtxResult<()> {
 /// folded mail) travels on stdin instead -- the same mechanism the distiller
 /// uses. `None` keeps stdin nulled, exactly as before, which is what every
 /// off-shim launch (and every `sh`-based fake-agent test) gets.
+///
+/// The third return value is the child's [`ChildGuard`] (P2/P3): every
+/// `exec`/`loop` launch reaches this one chokepoint, so registering the pid
+/// and adopting the job here is what makes those two supervisors' children
+/// impossible to orphan without every call site having to remember. Hold it
+/// for as long as the child may run -- dropping it closes the job, and on
+/// Windows closing a kill-on-close job is itself the kill.
 pub fn spawn_tapped(
     mut command: Command,
     stdin_text: Option<String>,
-) -> CtxResult<(Child, OutputTap)> {
+) -> CtxResult<(Child, OutputTap, ChildGuard)> {
     // FIX 2a (command-injection defense): both std::process supervisors
     // (`exec`, `loop`) reach every spawn -- first launch and every restart --
     // through here, so this is their single chokepoint for the cmd.exe
@@ -339,6 +694,10 @@ pub fn spawn_tapped(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Adopted before anything else can fail: from here on the child is
+    // reapable by the console-close sweep and by the kernel, whatever this
+    // process does next.
+    let guard = ChildGuard::adopt(Some(child.id()));
 
     // Write the prompt on its own thread, then drop the handle so the child
     // sees EOF -- exactly `handoff::run_model`'s stdin discipline. A write
@@ -362,7 +721,7 @@ pub fn spawn_tapped(
         forward(stderr, tx, true);
     }
 
-    Ok((child, OutputTap { rx }))
+    Ok((child, OutputTap { rx }, guard))
 }
 
 fn forward<R: std::io::Read + Send + 'static>(
@@ -713,7 +1072,8 @@ mod tests {
 
     #[test]
     fn a_tapped_child_still_reports_its_exit_code() {
-        let (mut child, _tap) = spawn_tapped(sh("printf hello\\n; exit 4"), None).expect("spawn");
+        let (mut child, _tap, _guard) =
+            spawn_tapped(sh("printf hello\\n; exit 4"), None).expect("spawn");
         let outcome = supervise_child(
             &mut child,
             Instant::now() + Duration::from_secs(10),
@@ -726,7 +1086,7 @@ mod tests {
 
     #[test]
     fn tapped_lines_reach_the_matcher() {
-        let (mut child, tap) =
+        let (mut child, tap, _guard) =
             spawn_tapped(sh("printf 'one\\ntwo\\n'; exit 0"), None).expect("spawn");
         let mut seen: Vec<String> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -741,7 +1101,7 @@ mod tests {
 
     #[test]
     fn stderr_is_tapped_too_because_notices_can_land_there() {
-        let (mut child, tap) =
+        let (mut child, tap, _guard) =
             spawn_tapped(sh("printf 'oops\\n' >&2; exit 0"), None).expect("spawn");
         let mut seen: Vec<String> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -755,7 +1115,7 @@ mod tests {
 
     #[test]
     fn try_lines_is_empty_when_nothing_was_written() {
-        let (mut child, tap) = spawn_tapped(sh("exit 0"), None).expect("spawn");
+        let (mut child, tap, _guard) = spawn_tapped(sh("exit 0"), None).expect("spawn");
         let _ = child.wait();
         // Drain whatever arrived; a silent child must not block or panic.
         let _ = tap.try_lines();
@@ -770,7 +1130,7 @@ mod tests {
     /// `sh` the other tests in this module rely on.
     #[test]
     fn spawn_tapped_delivers_the_prompt_on_stdin() {
-        let (mut child, tap) =
+        let (mut child, tap, _guard) =
             spawn_tapped(sh("cat"), Some("refactor foo() & bar()\n".to_string())).expect("spawn");
         let mut seen = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -786,6 +1146,177 @@ mod tests {
         assert!(
             seen.iter().any(|l| l.contains("refactor foo() & bar()")),
             "the prompt reached the child verbatim on stdin: {seen:?}"
+        );
+    }
+
+    // P2/P3: the supervised-child pid registry and the guard that owns a
+    // child's membership in it. The console-close *sweep* itself needs a real
+    // console and a real external killer (see the recipe at the top of
+    // `term.rs`); the bookkeeping it reads is ordinary safe code and is
+    // pinned here, on every platform, so CI runs it.
+    //
+    // The registry is process-global and shared with every other test in this
+    // binary, so these tests only ever assert about pids they invented
+    // themselves -- never about the snapshot's length.
+
+    /// Pids used by the registry tests. Deliberately absurd, so they cannot
+    /// collide with a real child some concurrently running test spawned.
+    const FAKE_PID_A: u32 = 4_000_000_001;
+    const FAKE_PID_B: u32 = 4_000_000_002;
+
+    #[test]
+    fn a_registered_pid_shows_up_in_the_snapshot_and_leaves_on_deregistration() {
+        register_child_pid(FAKE_PID_A);
+        assert!(
+            supervised_pid_snapshot().contains(&FAKE_PID_A),
+            "the console-close sweep has to be able to see it"
+        );
+
+        deregister_child_pid(FAKE_PID_A);
+        assert!(
+            !supervised_pid_snapshot().contains(&FAKE_PID_A),
+            "a confirmed-dead child must not be tree-killed again at close"
+        );
+    }
+
+    /// A restart re-registers the same slot; a double registration would make
+    /// the close sweep spawn two `taskkill`s for one pid.
+    #[test]
+    fn registering_the_same_pid_twice_records_it_once() {
+        register_child_pid(FAKE_PID_B);
+        register_child_pid(FAKE_PID_B);
+        assert_eq!(
+            supervised_pid_snapshot()
+                .iter()
+                .filter(|pid| **pid == FAKE_PID_B)
+                .count(),
+            1
+        );
+        deregister_child_pid(FAKE_PID_B);
+        // Idempotent: every exit arm calls `release`, and `Drop` may call it
+        // again right after.
+        deregister_child_pid(FAKE_PID_B);
+        assert!(!supervised_pid_snapshot().contains(&FAKE_PID_B));
+    }
+
+    /// The guard is what production actually uses: adopt registers, release
+    /// deregisters, and a second release is a no-op.
+    #[test]
+    fn a_child_guard_registers_on_adopt_and_deregisters_on_release() {
+        let pid = FAKE_PID_A + 10;
+        let mut guard = ChildGuard::adopt(Some(pid));
+        assert_eq!(guard.pid(), Some(pid));
+        assert!(supervised_pid_snapshot().contains(&pid));
+
+        guard.release();
+        assert_eq!(guard.pid(), None);
+        assert!(!supervised_pid_snapshot().contains(&pid));
+        guard.release();
+        assert_eq!(guard.pid(), None, "release is idempotent");
+    }
+
+    /// `panic = "abort"` means `Drop` is no safety net, but it is still the
+    /// backstop for every ordinary scope exit -- and `spawn_tapped`'s callers
+    /// lean on it at the end of each `exec`/`loop` cycle.
+    #[test]
+    fn dropping_a_child_guard_deregisters_its_pid() {
+        let pid = FAKE_PID_A + 11;
+        {
+            let _guard = ChildGuard::adopt(Some(pid));
+            assert!(supervised_pid_snapshot().contains(&pid));
+        }
+        assert!(!supervised_pid_snapshot().contains(&pid));
+    }
+
+    /// A pty backend that cannot report a pid (`Child::process_id() ->
+    /// None`) must degrade to a guard that holds nothing, not to a panic or a
+    /// bogus registration.
+    #[test]
+    fn a_pidless_child_gets_an_inert_guard() {
+        let mut guard = ChildGuard::adopt(None);
+        assert_eq!(guard.pid(), None);
+        assert!(!guard.job_is_active());
+        guard.release();
+    }
+
+    #[test]
+    fn an_inert_job_guard_is_never_active_and_closes_harmlessly() {
+        let mut job = JobGuard::inert();
+        assert!(!job.is_active());
+        job.close();
+        job.close();
+    }
+
+    /// Off Windows there is no job object at all: portable-pty's `setsid` +
+    /// `TIOCSCTTY` already ties the child's session to the pty, so `adopt`
+    /// must compile and no-op rather than pretend to hold anything.
+    #[cfg(not(windows))]
+    #[test]
+    fn job_objects_are_a_windows_only_no_op_elsewhere() {
+        let job = JobGuard::adopt(std::process::id());
+        assert!(!job.is_active());
+    }
+
+    /// P3 end to end: a real child, in a real kill-on-close job, dies when
+    /// the last handle to that job closes -- which is what happens when zirv
+    /// is killed with `taskkill /F` or aborts, running no code of its own.
+    ///
+    /// Spawned with `std::process::Command` (not a pty) so the only thing
+    /// under test is the job. `is_alive` is `sessions`' own probe.
+    #[cfg(windows)]
+    #[test]
+    fn closing_a_kill_on_close_job_kills_the_child_it_holds() {
+        // `waitfor` blocks on a signal that is never raised: a child that
+        // exits only when something kills it, with no console interaction and
+        // no dependency on a shell builtin. It ships in System32, but a
+        // stripped image (or a `PATH` that does not include System32) must
+        // skip rather than fail -- an environment probe is not the thing
+        // under test.
+        let Ok(mut child) = Command::new("waitfor")
+            .arg("/T")
+            .arg("120")
+            .arg("zirvJobObjectProbe")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skipping: waitfor.exe is not available on this machine");
+            return;
+        };
+        let pid = child.id();
+
+        let job = JobGuard::adopt(pid);
+        // An ambient job that refuses nesting is the documented degradation,
+        // not a failure -- but the probe child still has to be reaped either
+        // way, so the cleanup below is shared rather than duplicated into an
+        // early return.
+        let active = job.is_active();
+        drop(job);
+
+        let mut reaped = false;
+        if active {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if child.try_wait().expect("try_wait").is_some() {
+                    reaped = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        if !reaped {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+
+        if !active {
+            eprintln!("skipping: this process could not create or assign a job object");
+            return;
+        }
+        assert!(
+            reaped,
+            "closing the last kill-on-close job handle must reap the child"
         );
     }
 }

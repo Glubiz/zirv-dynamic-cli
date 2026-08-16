@@ -36,6 +36,7 @@ use super::super::prompt::PromptRole;
 use super::super::sessions::{self, Record, SessionGuard, Verb};
 use super::super::signal::SignalServer;
 use super::super::state::StateDir;
+use super::super::supervise;
 use super::super::wrap;
 
 /// Matches `wrap::quit_child`'s own grace period for the same ask-then-
@@ -518,6 +519,12 @@ pub struct Pane {
     parser: vt100::Parser,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// P2/P3: this child's membership in the console-close pid registry and
+    /// its kill-on-close job object. Held for the child's whole life and
+    /// released by `shutdown`/`finish_shutdown` once the child is confirmed
+    /// gone -- so closing the dashboard's window, or killing the dashboard
+    /// outright, takes the pane's agent with it instead of orphaning it.
+    lifecycle: supervise::ChildGuard,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: mpsc::Receiver<Vec<u8>>,
     server: Option<SignalServer>,
@@ -618,6 +625,17 @@ impl Pane {
         let writer = Arc::new(Mutex::new(first_writer));
 
         let child = pair.slave.spawn_command(command)?;
+        // P2/P3: adopted on the very next statement after the spawn, ahead of
+        // every `?` below. Two reasons for that placement: it narrows the
+        // window in which a shim's grandchild can appear before the job
+        // assignment lands (see `JobGuard`'s own residual note), and it means
+        // a `Pane::spawn` that fails half way through -- a reader clone, a
+        // writer -- drops this guard and takes the child with it, rather than
+        // returning `Err` and leaving an agent running that nothing holds a
+        // handle to. `process_id` returns `None` on a backend that cannot
+        // report one; there the guard is inert and behaviour is exactly
+        // today's.
+        let lifecycle = supervise::ChildGuard::adopt(child.process_id());
         // The slave side is not needed past the spawn; dropping it here
         // (rather than keeping the whole `PtyPair` alive) mirrors the
         // explicit `drop(pair.slave)` this codebase's own pty tests already
@@ -655,6 +673,11 @@ impl Pane {
         if let Some(child_pid) = child.process_id() {
             record.pid = child_pid;
         }
+        // `owner_pid` is left unset here: `SessionGuard::register` below
+        // stamps it with this process's own pid -- the dashboard's -- for
+        // every pane, orchestrator and worker alike, the same seam every
+        // other registration path shares (`sessions::Record::owner_pid`,
+        // `dash::assemble_sidebar`).
         let record = if server.is_some() {
             record
         } else {
@@ -670,6 +693,7 @@ impl Pane {
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
             master,
             child,
+            lifecycle,
             writer,
             rx,
             server,
@@ -1062,6 +1086,11 @@ impl Pane {
             let sink: &mut dyn Write = &mut **writer;
             wrap::quit_child(sink, &mut self.child, quit_sequence, QUIT_GRACE)?;
         }
+        // P2/P3: the child is gone (or as gone as `quit_child` could make
+        // it), so it must leave the console-close registry and its job handle
+        // must close -- an explicit call, not `Drop`, because the release
+        // profile is `panic = "abort"`.
+        self.lifecycle.release();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
         self.guard.release();
         Ok(())
@@ -1104,9 +1133,23 @@ impl Pane {
         self.done = true;
         self.poll_exit();
         if self.exit_code.is_none() {
+            // P1: tree-kill first, narrow kill second. `Child::kill()` is a
+            // `TerminateProcess` against the *direct* child, which for an
+            // npm-installed agent is `cmd.exe /c claude.cmd` -- killing it
+            // left the real `node` agent running with nothing watching it.
+            // The tree-kill is best-effort and its return value is not
+            // evidence of anything, so the narrow kill still runs behind it
+            // and `wait` remains the only proof of death. Never a control
+            // byte into the pty master: conhost broadcasts those to every
+            // client of the pseudoconsole (see `wrap::quit_child`).
+            #[cfg(not(unix))]
+            if let Some(pid) = self.child.process_id() {
+                supervise::kill_tree(pid);
+            }
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        self.lifecycle.release();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
         self.guard.release();
         Ok(())

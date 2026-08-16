@@ -396,10 +396,12 @@ fn announce_model_choice<E: Write>(stderr: &mut E, cfg: &CtxConfig, quiet: bool)
 /// delegate.
 ///
 /// This is `wrap::run_with`'s own recipe, in its order and with its
-/// arguments: memory lines, `prompt::compose` (as an `Orchestrator`),
-/// `merge_command_line_prompt` so an operator's own `--append-system-prompt`
-/// in `--` extras is folded in rather than silently duplicated,
-/// `injection_args_for_session`, then `log_injection`.
+/// arguments: memory lines, the derived harness roster
+/// (`adapters::harness_prompt_lines`, only for an `Orchestrator` launch),
+/// `prompt::compose` (as an `Orchestrator`), `merge_command_line_prompt` so
+/// an operator's own `--append-system-prompt` in `--` extras is folded in
+/// rather than silently duplicated, `injection_args_for_session`, then
+/// `log_injection`.
 ///
 /// Deliberately **no** `prompt::with_mail_layer`, exactly like the `wrap`
 /// path it mirrors: an interactive Orchestrator session is never given mail
@@ -419,6 +421,13 @@ pub(crate) fn dash_orchestrator_pane(
     let slug = super::state::repo_slug(repo);
     let memory_entries =
         super::memory::render_for_prompt(state, &slug, cfg, super::state::now_secs());
+    // Only an Orchestrator session hears about other harnesses at all; see
+    // `prompt::PromptSource::Harnesses`.
+    let harness_lines = if launch.role == PromptRole::Orchestrator {
+        adapters::harness_prompt_lines(cfg, adapter.name())
+    } else {
+        Vec::new()
+    };
     let composed = super::prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
@@ -427,6 +436,7 @@ pub(crate) fn dash_orchestrator_pane(
         launch.role,
         &memory_entries,
         cfg.memory.max_injected_bytes,
+        &harness_lines,
     );
     let (mut argv, composed) =
         super::prompt::merge_command_line_prompt(adapter, &launch.argv, composed, None);

@@ -173,6 +173,7 @@ pub fn run_with<W: Write>(
             super::prompt::PromptRole::Worker,
             &memory_entries,
             cfg.memory.max_injected_bytes,
+            &[],
         );
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles. Minted here, ahead of
@@ -333,7 +334,11 @@ pub fn run_with<W: Write>(
         command.env(super::adapters::AGENT_ENV, adapter.name());
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
-        let (mut child, tap) = supervise::spawn_tapped(command, stdin_prompt)?;
+        // P2/P3: see the matching comment in `exec.rs` -- this cycle's child
+        // is registered for the console-close sweep and held in a
+        // kill-on-close job for as long as `_child_guard` is in scope, which
+        // is this cycle.
+        let (mut child, tap, _child_guard) = supervise::spawn_tapped(command, stdin_prompt)?;
         // Item 3: consumed right after this cycle's own spawn has actually
         // succeeded, so the next cycle's fresh `mail::list` does not pick
         // the same message up again -- but a launch that never got this far

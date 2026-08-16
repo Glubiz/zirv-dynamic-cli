@@ -607,23 +607,32 @@ struct PaneRowMeta {
 const VIEW_ONLY_GLYPH: char = '\u{00b7}';
 
 /// Combines this dashboard's own panes (attached, in pane order) with every
-/// OTHER live session in the registry (view-only, `attached: false`), so the
-/// sidebar shows every registered session, not only the ones this process
-/// spawned. Deduped by short id -- a pane's own registry record is never
-/// listed a second time as a view-only row. Dead/stale registry entries
+/// OTHER live session in the registry that THIS SAME dashboard process
+/// itself spawned (view-only, `attached: false`) -- so the sidebar shows
+/// every session this dashboard is responsible for, not only the ones
+/// currently attached as panes. A registry record whose `owner_pid` does not
+/// match `dashboard_pid` (another, concurrently running dashboard's session)
+/// or is `None` (a pre-ownership record, or a session registered outside any
+/// dashboard -- `wrap`/`exec`/`loop`/`chat`) is excluded outright: this
+/// dashboard has no more business showing it than it does attaching to it.
+/// Deduped by short id -- a pane's own registry record is never listed a
+/// second time as a view-only row. Dead/stale registry entries
 /// (`Liveness::Stale`) are excluded outright: `sessions::list` already swept
 /// them from disk, and a dashboard has nothing useful to attach to or nudge
 /// there. `selected` indexes into the combined list this returns; `focused`
 /// indexes into `panes` alone (see `ui::SidebarRow`'s own doc comment for
 /// why the two are separate), and is simply not marked when it is out of
 /// range -- an empty dashboard has nothing to focus. Pure: no I/O of its own
-/// -- `registry` is whatever the caller already read via `sessions::list`.
+/// -- `registry` is whatever the caller already read via `sessions::list`,
+/// and `dashboard_pid` is passed in rather than read via
+/// `std::process::id()` here so tests can exercise foreign vs. own owners.
 fn assemble_sidebar(
     panes: &[PaneRowMeta],
     registry: &[(sessions::Record, sessions::Liveness)],
     scores: &ScoreMap,
     selected: usize,
     focused: usize,
+    dashboard_pid: u32,
 ) -> Vec<ui::SidebarRow> {
     let own_shorts: HashSet<&str> = panes.iter().map(|p| p.short.as_str()).collect();
 
@@ -647,6 +656,9 @@ fn assemble_sidebar(
 
     for (record, liveness) in registry {
         if *liveness != sessions::Liveness::Live {
+            continue;
+        }
+        if record.owner_pid != Some(dashboard_pid) {
             continue;
         }
         if own_shorts.contains(record.short.as_str()) {
@@ -818,9 +830,11 @@ fn due(last: Instant, now: Instant, interval: Duration) -> bool {
 #[derive(Default)]
 struct DiskFacts {
     /// Rot scores for every row the sidebar can draw -- this dashboard's own
-    /// panes and every live registry session. `score::cached_score` is cheap
-    /// in the steady state but still costs one `metadata` call per session,
-    /// which is one per pane per frame if it is not cached here.
+    /// panes and every live registry session it owns (see `assemble_sidebar`'s
+    /// own `owner_pid` filter; a foreign or unowned record is never displayed,
+    /// so scoring it here would be wasted work). `score::cached_score` is
+    /// cheap in the steady state but still costs one `metadata` call per
+    /// session, which is one per pane per frame if it is not cached here.
     scores: ScoreMap,
     mail: Option<(usize, usize)>,
     memory_count: usize,
@@ -900,7 +914,12 @@ impl FactsCache {
             }
         }
         for (record, liveness) in &self.registry {
-            if *liveness != sessions::Liveness::Live || self.disk.scores.contains_key(&record.short)
+            if *liveness != sessions::Liveness::Live
+                || self.disk.scores.contains_key(&record.short)
+                // Undisplayable: `assemble_sidebar` will drop this row for
+                // the same reason (a foreign dashboard's session, or an
+                // unowned pre-upgrade record), so scoring it is wasted work.
+                || record.owner_pid != Some(std::process::id())
             {
                 continue;
             }
@@ -1736,6 +1755,7 @@ fn compose_worker_prompt(
         prompt::PromptRole::Worker,
         &memory_entries,
         cfg.memory.max_injected_bytes,
+        &[],
     );
     let system_prompt_supported = adapter.capabilities().system_prompt;
     let should_list_mail = cfg.mail.enabled && (composed.is_some() || !system_prompt_supported);
@@ -3230,7 +3250,7 @@ pub fn run_dashboard(
     // nothing. There is nothing to draw before the loop starts anyway: the
     // dialog is rendered from inside it.
     let repo_slug = super::state::repo_slug(repo);
-    let restore_candidates: Vec<roster::RosterPane> = roster::take_roster(
+    let taken_candidates: Vec<roster::RosterPane> = roster::take_roster(
         state,
         &repo_slug,
         super::state::now_secs(),
@@ -3238,6 +3258,16 @@ pub fn run_dashboard(
     )
     .map(restorable_candidates)
     .unwrap_or_default();
+    // P4: a roster says what the *previous* dashboard owned, not what is dead.
+    // A dashboard that was killed rather than quit left both a roster and, on
+    // Windows before the job-object backstop, genuinely live pane agents --
+    // and restoring one of those spawns a second agent onto a conversation the
+    // first is still holding. Any candidate whose registry record still names
+    // a live process is skipped, and the skip is announced rather than
+    // silently swallowed: "my pane did not come back" needs a reason attached.
+    let (restore_candidates, still_live) = roster::partition_live(taken_candidates, &|short| {
+        super::sessions::short_is_live(state, short)
+    });
 
     // Two indices, not one (F7): `selected` walks the combined sidebar
     // (panes plus view-only registry rows) and is what a nudge is aimed at;
@@ -3257,6 +3287,21 @@ pub fn run_dashboard(
     // sticky `errors` channel (⚠) so a confirmation like "spawned … as …"
     // shows briefly and then clears instead of pinning behind a warning glyph.
     let mut notices: Vec<Notice> = Vec::new();
+    // P4: one line per candidate the liveness check just held back. Pushed
+    // here rather than at the partition above only because `notices` does not
+    // exist yet up there. It says "kept for next launch" because that is now
+    // literally true (see `deferred_restore` below) -- the notice is no longer
+    // the only trace of a candidate this launch decided not to offer.
+    for pane in &still_live {
+        push_notice(
+            &mut notices,
+            Instant::now(),
+            format!(
+                "not restoring {} ({}): that session is still running (kept for next launch)",
+                pane.title, pane.short
+            ),
+        );
+    }
     // H3: the mail sweep is disk-backed (`mail::list` = read_dir + read per
     // .md) and used to run every 50ms tick; throttled to the same ~1s cadence
     // as the header facts. Seeded a full interval in the past so the first
@@ -3278,7 +3323,17 @@ pub fn run_dashboard(
     // startup) -- carried to every `on_quit` call below so none of them are
     // lost just because the restore dialog that offered them has long since
     // closed.
-    let mut deferred_restore: Vec<roster::RosterPane> = Vec::new();
+    //
+    // P4: seeded with the candidates the liveness gate held back, for exactly
+    // the same reason F5 writes `unoffered` back. `take_roster` claims by
+    // rename *before* reading, so a candidate this launch declines to offer is
+    // already consumed -- and a liveness verdict is a probe of a pid, which a
+    // roster up to `roster.max_age_secs` old can genuinely get wrong (the OS
+    // recycles pids). Dropping the candidate on that verdict would destroy the
+    // pane permanently, with a four-second notice as its only trace. Merged
+    // back into the fresh roster instead, so the worst a false "still live"
+    // costs is one launch's restore rather than the session.
+    let mut deferred_restore: Vec<roster::RosterPane> = still_live;
     // L19: shorts of panes reaped since the last registry refresh, excluded
     // from the view-only sidebar rows so a just-released session does not
     // re-list (and become nudge-targetable) off the up-to-1s-stale snapshot.
@@ -3436,6 +3491,7 @@ pub fn run_dashboard(
             &facts_cache.disk.scores,
             selected,
             focused,
+            std::process::id(),
         );
         let total_rows = rows.len();
         selected = selected.min(total_rows.saturating_sub(1));
@@ -4066,6 +4122,7 @@ pub fn run_dashboard(
             &facts_cache.disk.scores,
             selected,
             focused,
+            std::process::id(),
         );
 
         // L13: a live notice (info) shows as plain text and takes precedence
@@ -4153,11 +4210,24 @@ pub fn run_dashboard(
 
 /// The cleanup a failed terminal setup owes the panes that were already
 /// spawned: the orchestrator pane's child exists by the time raw mode is
-/// enabled, and `Pane` has no `Drop` (the release profile is `panic = abort`,
-/// so `Drop` is not a safety net anyway) -- dropping a `portable-pty` child
-/// does not kill it. R4: all three setup-failure arms used to return `Err`
-/// straight past it, orphaning a live harness process with a registry record
-/// still claiming it was reachable.
+/// enabled. R4: all three setup-failure arms used to return `Err` straight
+/// past it, orphaning a live harness process with a registry record still
+/// claiming it was reachable.
+///
+/// P3 changed what a *dropped* `Pane` costs, and the change is worth stating
+/// precisely, because the old comment here is now wrong. A `Pane` holds a
+/// `supervise::ChildGuard`, whose `Drop` closes the child's kill-on-close job
+/// object -- so on Windows, dropping a `Pane` now does reap the child's whole
+/// tree rather than orphaning it. Dropping is no longer a leak.
+///
+/// This call is still very much wanted, for four reasons that `Drop` does not
+/// cover: it walks the adapter's own quit-sequence-then-grace ladder so the
+/// harness gets a chance to exit cleanly and flush its transcript instead of
+/// being shot; it releases the registry record and unpublishes the socket
+/// (`Pane::finish_shutdown`), which `ChildGuard` knows nothing about; the job
+/// object is Windows-only, so unix has nothing but this; and the release
+/// profile is `panic = "abort"`, under which `Drop` does not run at all. The
+/// guard is the backstop, not the plan.
 ///
 /// Exactly the quit path's own `shutdown_all`, with the error strings
 /// discarded: there is no header left to show them in and the caller is about
@@ -4885,11 +4955,11 @@ mod tests {
     fn assemble_sidebar_marks_the_focused_pane_separately_from_the_selection() {
         let panes = vec![pane_row("aaa11111", "orch"), pane_row("bbb22222", "wrk")];
         let registry = vec![(
-            registry_record("ccc33333", "codex"),
+            registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
         // Selection has walked onto the view-only row; focus is still pane 1.
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 2, 1);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 2, 1, DASHBOARD_PID);
         assert!(
             rows[2].selected,
             "the sidebar cursor is on the view-only row"
@@ -4936,7 +5006,13 @@ mod tests {
         }
     }
 
-    fn registry_record(short: &str, agent: &str) -> sessions::Record {
+    /// This test module's stand-in for "the running dashboard's own pid" --
+    /// arbitrary, since these tests never spawn a real process, but shared
+    /// across every fixture/call so "owned by this dashboard" and "owned by
+    /// a different one" are unambiguous.
+    const DASHBOARD_PID: u32 = 424242;
+
+    fn registry_record(short: &str, agent: &str, owner_pid: Option<u32>) -> sessions::Record {
         sessions::Record {
             session: format!("session-{short}"),
             short: short.to_string(),
@@ -4947,6 +5023,7 @@ mod tests {
             pid: 1,
             started_at: 0,
             reachable: true,
+            owner_pid,
         }
     }
 
@@ -4956,7 +5033,7 @@ mod tests {
             pane_row("aaa11111", "orch"),
             pane_row("bbb22222", "wrk claude"),
         ];
-        let rows = assemble_sidebar(&panes, &[], &no_scores(), 0, 0);
+        let rows = assemble_sidebar(&panes, &[], &no_scores(), 0, 0, DASHBOARD_PID);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].short, "aaa11111");
         assert!(rows[0].attached);
@@ -4965,26 +5042,57 @@ mod tests {
     }
 
     #[test]
-    fn assemble_sidebar_appends_view_only_registry_rows_not_owned_by_this_dashboard() {
+    fn assemble_sidebar_appends_view_only_registry_rows_owned_by_this_dashboard() {
         let panes = vec![pane_row("aaa11111", "orch")];
         let registry = vec![(
-            registry_record("ccc33333", "codex"),
+            registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].short, "ccc33333");
         assert!(!rows[1].attached, "a registry-only row is never attached");
     }
 
     #[test]
+    fn assemble_sidebar_excludes_a_registry_record_owned_by_a_different_dashboard() {
+        let panes = vec![pane_row("aaa11111", "orch")];
+        let registry = vec![(
+            registry_record("ccc33333", "codex", Some(DASHBOARD_PID + 1)),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a session another dashboard spawned must not appear in this one's sidebar"
+        );
+    }
+
+    #[test]
+    fn assemble_sidebar_excludes_a_registry_record_with_no_owner() {
+        let panes = vec![pane_row("aaa11111", "orch")];
+        let registry = vec![(
+            registry_record("ccc33333", "codex", None),
+            sessions::Liveness::Live,
+        )];
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a record with no owner_pid (pre-ownership build, or a session \
+             registered outside any dashboard) must not appear"
+        );
+    }
+
+    #[test]
     fn assemble_sidebar_dedupes_a_panes_own_registry_record() {
         let panes = vec![pane_row("aaa11111", "orch")];
         let registry = vec![(
-            registry_record("aaa11111", "claude"),
+            registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 0, 0, DASHBOARD_PID);
         assert_eq!(
             rows.len(),
             1,
@@ -4996,10 +5104,10 @@ mod tests {
     #[test]
     fn assemble_sidebar_excludes_stale_registry_entries() {
         let registry = vec![(
-            registry_record("ddd44444", "codex"),
+            registry_record("ddd44444", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Stale,
         )];
-        let rows = assemble_sidebar(&[], &registry, &no_scores(), 0, 0);
+        let rows = assemble_sidebar(&[], &registry, &no_scores(), 0, 0, DASHBOARD_PID);
         assert!(
             rows.is_empty(),
             "a dead session must not appear as a view-only row"
@@ -5010,10 +5118,10 @@ mod tests {
     fn assemble_sidebar_marks_the_selected_index_in_the_combined_list() {
         let panes = vec![pane_row("aaa11111", "orch")];
         let registry = vec![(
-            registry_record("ccc33333", "codex"),
+            registry_record("ccc33333", "codex", Some(DASHBOARD_PID)),
             sessions::Liveness::Live,
         )];
-        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 1, 0);
+        let rows = assemble_sidebar(&panes, &registry, &no_scores(), 1, 0, DASHBOARD_PID);
         assert!(!rows[0].selected);
         assert!(rows[1].selected);
     }
@@ -5119,8 +5227,10 @@ mod tests {
             "an unscored session is absent from the map, never a placeholder zero"
         );
 
-        let _guard =
-            sessions::SessionGuard::register(&state, registry_record("aaa11111", "claude"));
+        let _guard = sessions::SessionGuard::register(
+            &state,
+            registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
+        );
 
         cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
         assert!(
@@ -5138,6 +5248,60 @@ mod tests {
         assert!(
             cache.disk.scores.is_empty(),
             "a session with no readable transcript stays unscored: `rot --`, not `rot 0`"
+        );
+    }
+
+    /// Finding 5: `refresh_if_due` used to score every live registry record
+    /// regardless of ownership, even though `assemble_sidebar` was about to
+    /// discard any record this dashboard process does not own. A record with
+    /// a real, scorable transcript must still never reach `score::
+    /// cached_score` at all when a foreign pid owns it.
+    #[test]
+    fn refresh_if_due_scores_only_registry_records_this_dashboard_owns() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path();
+        let cfg = CtxConfig::default();
+
+        let owned_session = "5c0d0002-2222-4222-8333-555555555555";
+        let foreign_session = "5c0d0003-3333-4222-8333-555555555555";
+
+        let transcript_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(super::super::state::repo_slug(repo));
+        std::fs::create_dir_all(&transcript_dir).expect("mkdir");
+        let body = "{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[zirv] done\"}],\"usage\":{\"input_tokens\":170000}}}\n";
+        for session in [owned_session, foreign_session] {
+            std::fs::write(transcript_dir.join(format!("{session}.jsonl")), body).expect("write");
+        }
+
+        let owned = sessions::Record::new(owned_session, "claude", repo, sessions::Verb::Wrap);
+        let owned_short = owned.short.clone();
+        let _owned_guard = sessions::SessionGuard::register(&state, owned);
+
+        let mut foreign =
+            sessions::Record::new(foreign_session, "claude", repo, sessions::Verb::Wrap);
+        let foreign_short = foreign.short.clone();
+        foreign.owner_pid = Some(std::process::id().wrapping_add(1));
+        let _foreign_guard = sessions::SessionGuard::register(&state, foreign);
+
+        let mut cache = FactsCache::new(Instant::now());
+        cache.refresh_if_due(&cfg, &state, owner(repo), &[], Instant::now());
+
+        assert_eq!(cache.registry.len(), 2, "both records are on disk");
+        assert!(
+            cache.disk.scores.contains_key(&owned_short),
+            "an owned record with a real transcript is scored: {:?}",
+            cache.disk.scores
+        );
+        assert!(
+            !cache.disk.scores.contains_key(&foreign_short),
+            "a foreign-owned record must never be scored, undisplayable as it is: {:?}",
+            cache.disk.scores
         );
     }
 
@@ -7739,6 +7903,51 @@ mod tests {
             written.panes,
             vec![deferred],
             "the cap-deferred candidate is offered again next launch"
+        );
+    }
+
+    /// P4, end to end: a candidate the liveness gate holds back must survive
+    /// the launch that declined to offer it.
+    ///
+    /// `take_roster` claims the roster by rename *before* it reads, so by the
+    /// time `partition_live` runs the candidate has already been consumed off
+    /// disk. Simply dropping it would make a *wrong* liveness verdict --
+    /// entirely possible, since the probe is a pid lookup and a roster may be
+    /// days old while the OS recycles pids -- permanently destroy the pane.
+    /// So the skipped half is seeded straight into `deferred_restore` (the
+    /// same pool G3 and H3 already use) and merged back by `on_quit`.
+    ///
+    /// This pins the wiring `run_dashboard` performs inline: partition, then
+    /// hand the skipped half to `on_quit` as deferred.
+    #[test]
+    fn a_candidate_held_back_because_its_session_is_live_is_written_back_to_the_roster() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let live_one = restore_pane("dddd4444", "44444444-2222-4333-8444-555555555555");
+        let dead_one = restore_pane("eeee5555", "55555555-2222-4333-8444-555555555555");
+
+        // Exactly what `run_dashboard` does with `take_roster`'s output.
+        let (offerable, still_live) =
+            roster::partition_live(vec![live_one.clone(), dead_one.clone()], &|short| {
+                short == "dddd4444"
+            });
+        assert_eq!(offerable, vec![dead_one], "only the dead one is offered");
+        let deferred_restore = still_live;
+
+        on_quit(&[], &[], &deferred_restore, &requests_dir, &state, &repo);
+
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is still written");
+        assert_eq!(
+            written.panes,
+            vec![live_one],
+            "a held-back candidate is offered again next launch, not destroyed"
         );
     }
 

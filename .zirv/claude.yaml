@@ -45,18 +45,18 @@ commands:
       of related changes, not one per micro-task; relay findings honestly.
       (7) You own the final integration and summary: resolve conflicts
       between agent outputs and report outcomes, including failures,
-      plainly. (8) The mandatory final step of every development task is a
-      full-diff review by a dedicated subagent running the /code-review
-      skill, with model and effort scaled to the complexity and blast
-      radius of the diff: sonnet at low or medium effort for small
-      mechanical changes (copy tweaks, config, renames, doc updates),
-      sonnet at high effort for routine single-service features and
-      fixes, and opus at xhigh or max effort for changes that are
-      architecturally significant, touch shared crates, auth, payments,
-      or data integrity, or span multiple services. When in doubt, scale
-      up. Run the review only after all quality gates pass so it is not
-      spent on mechanical noise; triage its findings, fix what is real,
-      and rerun until clean before you report the work as done.'
+      plainly. (8) Before reporting development work done, run the
+      /code-review skill as the native full-diff pass for this harness,
+      with model and effort scaled to the complexity and blast radius of
+      the diff: sonnet at low or medium effort for small mechanical
+      changes (copy tweaks, config, renames, doc updates), sonnet at high
+      effort for routine single-service features and fixes, and opus at
+      xhigh or max effort for changes that are architecturally significant,
+      touch shared crates, auth, payments, or data integrity, or span
+      multiple services. When in doubt, scale up. If the zirv meta-harness
+      layer is also present in this session, additionally follow the
+      bounded cross-harness review round that layer defines, on top of
+      this pass.'
     description: "Launch interactive Claude Code session: Fable 5 orchestrates, smaller-model subagents execute"
     options:
       interactive: true
