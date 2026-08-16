@@ -737,6 +737,7 @@ pub fn run_with<W: Write>(
     // the no-usage-source skip line and `PacingSkipped` announce once for
     // the whole run rather than once per restart.
     let mut pace_flags = pace::PaceGateFlags::default();
+    let http_poller = super::poll::HttpPoller;
 
     loop {
         pace::wait_for_window(
@@ -749,7 +750,13 @@ pub fn run_with<W: Write>(
             &sleep_fn,
             Some(&announcer),
             adapter.provider(),
-            pace::PaceGate { use_credits: false },
+            pace::PaceGate {
+                use_credits: cfg.pace.use_credits.for_provider(adapter.provider()),
+                poller: cfg
+                    .pace
+                    .poll_enabled
+                    .then_some(&http_poller as &dyn super::poll::UsagePoller),
+            },
             &mut pace_flags,
         );
 
@@ -1069,7 +1076,17 @@ pub fn run_with<W: Write>(
                 &sleep_fn,
                 Some(&announcer),
                 adapter.provider(),
-                pace::PaceGate { use_credits: false },
+                pace::PaceGate {
+                    // A vendor-reported limit hit parks even with use_credits
+                    // enabled: the vendor limiting us means credits are
+                    // exhausted or not actually enabled plan-side, and an
+                    // immediate relaunch would just re-hit it.
+                    use_credits: false,
+                    poller: cfg
+                        .pace
+                        .poll_enabled
+                        .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                },
                 &mut pace_flags,
             );
 

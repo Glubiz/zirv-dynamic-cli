@@ -362,17 +362,22 @@ pub struct PaceOutcome {
 /// Operator-controlled inputs to the gate that are not part of `PaceConfig`
 /// itself: resolved per call from the adapter's provider, not read from disk
 /// or the environment inside `decide`/`wait_for_window`'s own logic.
-///
-/// Stubbed here without a `poller` field -- Task 6 adds `poller: Option<&'a
-/// dyn crate::commands::ctx::poll::UsagePoller>` once `poll.rs` exists.
-#[derive(Debug, Clone, Copy)]
-pub struct PaceGate {
+#[derive(Clone, Copy)]
+pub struct PaceGate<'a> {
     /// Operator declaration that this harness's vendor plan covers overage
     /// from credits: when true, the proactive throttle/pause is skipped
     /// entirely for this call. A vendor-reported limit hit (the caller's own
     /// `scan_for_limit`/`is_limit_hit` path) still parks -- that is a
     /// separate, untouched path.
     pub use_credits: bool,
+    /// The active poll fallback for this call. `None` means `wait_for_window`
+    /// never polls: polling disabled (`cfg.pace.poll_enabled == false`), or a
+    /// caller on a path that must never make an HTTP call (`wrap` does not
+    /// call `wait_for_window` at all today, so no caller currently supplies
+    /// `None` for that reason -- but the option exists for one that must).
+    /// `Some` lets `wait_for_window` fall back to it once the passive
+    /// collector reading goes stale.
+    pub poller: Option<&'a dyn super::poll::UsagePoller>,
 }
 
 /// Once-per-run announce latches for `wait_for_window`, owned by the caller
@@ -429,6 +434,46 @@ pub fn current_windows(
     (collector, estimated)
 }
 
+/// Best-effort refresh of both usage sources ahead of a pacing decision:
+/// codex's passive rollout scan (`refresh_codex_usage`) plus the active poll
+/// fallback (`maybe_poll`), when the caller supplied a poller via
+/// `gate.poller`. Both refreshes are already cheap no-ops once the stored
+/// reading is fresh -- `refresh_codex_usage`'s own staleness gate,
+/// `maybe_poll`'s staleness check plus its `poll_min_interval_secs` floor --
+/// so calling this on every loop iteration, not just once up front, costs
+/// nothing on the common path where nothing has gone stale since the last
+/// call. Never itself an error path: like the rest of this module, a failed
+/// refresh just leaves the previously-stored reading in place.
+///
+/// The sessions directory is resolved here via `crate::utils::home_dir()`
+/// (`HOME`/`USERPROFILE`) rather than left to `refresh_codex_usage`'s own
+/// internal `dirs::home_dir()` fallback: on Windows, `dirs::home_dir()`
+/// calls `SHGetKnownFolderPath` directly and ignores `HOME`/`USERPROFILE`
+/// entirely, so a test's `HomeGuard` (env-var based, like every other
+/// home-directory override in this crate) could never isolate it. Resolving
+/// it the same way the rest of this crate already does keeps production
+/// behavior identical on a normal machine (`USERPROFILE`/`HOME` always name
+/// the real profile there) while making this call testable. Falling back to
+/// `None` only when even that lookup fails, at which point
+/// `refresh_codex_usage`'s own fallback would not have found anything usable
+/// either.
+fn refresh_sources(state: &StateDir, cfg: &PaceConfig, now: u64, provider: &str, gate: &PaceGate) {
+    if provider == usage_window::CODEX_USAGE_PROVIDER {
+        let sessions_dir = crate::utils::home_dir()
+            .ok()
+            .map(|h| h.join(".codex").join("sessions"));
+        usage_window::refresh_codex_usage(
+            state,
+            sessions_dir.as_deref(),
+            now,
+            cfg.collector_max_age_secs,
+        );
+    }
+    if let Some(poller) = gate.poller {
+        super::poll::maybe_poll(state, cfg, now, provider, poller);
+    }
+}
+
 /// Blocks until the window has room, then returns. Never exits the process and
 /// never returns an error: pacing failing closed would be worse than pacing not
 /// happening, so every unknown proceeds.
@@ -440,12 +485,16 @@ pub fn current_windows(
 /// text it always has, so nothing that already asserts on it breaks.
 ///
 /// `provider` is the resolved adapter's own `AgentAdapter::provider()`
-/// (`"anthropic"` for claude, `"openai"` for codex). When nothing has been
-/// recorded for `provider` (`window::has_no_usage_source`), the gate is
-/// skipped outright with one announcement rather than silently entering the
-/// loop below and reading "nothing known" as if it were a fresh, empty
-/// collector reading. (Tasks 6/7 wire `refresh_codex_usage` and the poller
-/// ahead of this check, so callers refresh sources first.)
+/// (`"anthropic"` for claude, `"openai"` for codex). Both usage sources are
+/// refreshed (`refresh_sources`, below) immediately before the no-source
+/// check -- codex's passive rollout scan, plus a poll through `gate.poller`
+/// when the caller supplied one -- so a first-ever run can still acquire
+/// data before deciding it has none, and again once per loop iteration so a
+/// stale reading can be topped up mid-wait. When nothing has been recorded
+/// for `provider` (`window::has_no_usage_source`) even after that refresh,
+/// the gate is skipped outright with one announcement rather than silently
+/// entering the loop below and reading "nothing known" as if it were a
+/// fresh, empty collector reading.
 ///
 /// `flags` is owned by the caller and threaded through every call across one
 /// run (`exec`'s own supervise loop calls this once per cycle -- the
@@ -467,7 +516,7 @@ pub fn wait_for_window<W: Write>(
     sleep_fn: &dyn Fn(Duration),
     announcer: Option<&super::announce::Announcer>,
     provider: &str,
-    gate: PaceGate,
+    gate: PaceGate<'_>,
     flags: &mut PaceGateFlags,
 ) -> PaceOutcome {
     if !cfg.enabled {
@@ -507,6 +556,8 @@ pub fn wait_for_window<W: Write>(
         };
     }
 
+    refresh_sources(state, cfg, now_fn(), provider, &gate);
+
     if usage_window::has_no_usage_source(state, provider) {
         if !flags.no_source_announced {
             let _ = writeln!(
@@ -532,6 +583,7 @@ pub fn wait_for_window<W: Write>(
 
     loop {
         let now = now_fn();
+        refresh_sources(state, cfg, now, provider, &gate);
         let (collector, estimated) = current_windows(state, cfg, now, provider);
         let decision = decide(&collector, estimated.as_ref(), now, cfg);
 
@@ -766,7 +818,10 @@ mod tests {
             },
             None,
             "anthropic",
-            PaceGate { use_credits: true },
+            PaceGate {
+                use_credits: true,
+                poller: None,
+            },
             &mut flags,
         );
 
@@ -807,7 +862,10 @@ mod tests {
             },
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut flags,
         );
 
@@ -1416,7 +1474,10 @@ mod tests {
             },
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut PaceGateFlags::default(),
         );
 
@@ -1453,7 +1514,10 @@ mod tests {
             },
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut PaceGateFlags::default(),
         );
 
@@ -1495,7 +1559,10 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut PaceGateFlags::default(),
         );
 
@@ -1535,7 +1602,10 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut PaceGateFlags::default(),
         );
 
@@ -1575,7 +1645,10 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut PaceGateFlags::default(),
         );
 
@@ -1611,7 +1684,10 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut PaceGateFlags::default(),
         );
 
@@ -1632,7 +1708,23 @@ mod tests {
     /// -- naming the provider -- rather than entering the loop and reading
     /// "nothing known" as a fresh empty collector reading for this provider.
     /// A totally fresh state dir (no `state_with` at all): the point is that
-    /// nothing has ever been written for "openai", not even an empty file.
+    /// nothing has ever been written for this provider, not even an empty
+    /// file.
+    ///
+    /// Uses a synthetic provider name rather than the real
+    /// `CODEX_USAGE_PROVIDER` ("openai"): since Task 6, `wait_for_window`
+    /// refreshes codex's source via `refresh_codex_usage(state, None, ...)`
+    /// before this very check, and that `None` falls all the way through to
+    /// `dirs::home_dir()` -- a live Win32 `SHGetKnownFolderPath` call on
+    /// Windows that ignores `HOME`/`USERPROFILE` overrides entirely (unlike
+    /// `crate::utils::home_dir()`, used elsewhere in this crate specifically
+    /// for testability). A real `~/.codex/sessions` on the machine running
+    /// this test would make the premise -- "nothing has ever been recorded"
+    /// -- false out from under it. `poller: None` plus a provider that is
+    /// neither the codex nor the legacy-anthropic name keeps this
+    /// deterministic regardless of what the real machine has on disk, while
+    /// still exercising the same generic skip path a real unknown provider
+    /// would take.
     #[test]
     fn a_provider_with_no_usage_source_skips_the_gate_and_names_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1650,15 +1742,18 @@ mod tests {
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
-            "openai",
-            PaceGate { use_credits: false },
+            "example-vendor",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut flags,
         );
 
         assert_eq!(outcome.waited_secs, 0);
         assert_eq!(outcome.source, Source::None);
         let printed = String::from_utf8_lossy(&out).to_string();
-        assert!(printed.contains("openai"), "got {printed}");
+        assert!(printed.contains("example-vendor"), "got {printed}");
         assert!(printed.contains("no usage source"), "got {printed}");
         assert!(
             clock.slept.borrow().is_empty(),
@@ -1684,8 +1779,11 @@ mod tests {
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
-            "openai",
-            PaceGate { use_credits: false },
+            "example-vendor",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut flags,
         );
         assert_eq!(outcome.waited_secs, 0);
@@ -1714,7 +1812,10 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut PaceGateFlags::default(),
         );
 
@@ -1745,7 +1846,10 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            PaceGate { use_credits: false },
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
             &mut PaceGateFlags::default(),
         );
         assert_eq!(outcome.waited_secs, 0);
@@ -1774,6 +1878,169 @@ mod tests {
         assert!(
             estimated.is_some(),
             "a configured budget turns the estimator on"
+        );
+    }
+
+    struct StubPoller {
+        calls: RefCell<u32>,
+        reading: Option<crate::commands::ctx::poll::PollReading>,
+    }
+
+    impl crate::commands::ctx::poll::UsagePoller for StubPoller {
+        fn poll(&self, _provider: &str) -> Option<crate::commands::ctx::poll::PollReading> {
+            *self.calls.borrow_mut() += 1;
+            self.reading.clone()
+        }
+    }
+
+    #[test]
+    fn the_gate_polls_only_when_the_stored_reading_is_stale() {
+        let cfg = PaceConfig::default();
+
+        // Stale stored reading (well past collector_max_age_secs) and above
+        // the ceiling, so a failure to refresh would still park: the poller
+        // returns a fresh below-soft reading and the gate proceeds without
+        // waiting -- proof the poll's result actually drove the decision.
+        let stale = UsageWindows {
+            five_hour: window(95.0, NOW + 600, NOW - 100_000),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(stale);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+        let poller = StubPoller {
+            calls: RefCell::new(0),
+            reading: Some(crate::commands::ctx::poll::PollReading {
+                windows: UsageWindows {
+                    five_hour: window(10.0, NOW + 600, NOW),
+                    seven_day: None,
+                },
+                vendor_credits_enabled: None,
+            }),
+        };
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: Some(&poller),
+            },
+            &mut flags,
+        );
+
+        assert_eq!(
+            *poller.calls.borrow(),
+            1,
+            "the stale reading triggers exactly one poll"
+        );
+        assert_eq!(
+            outcome.waited_secs, 0,
+            "the poll's fresh below-soft reading lets the gate proceed"
+        );
+        assert!(clock.slept.borrow().is_empty());
+
+        // Fresh stored reading: the poller must never be consulted at all.
+        let fresh = UsageWindows {
+            five_hour: window(10.0, NOW + 600, NOW - 10),
+            seven_day: None,
+        };
+        let (_tmp2, state2) = state_with(fresh);
+        let clock2 = FakeClock::new(NOW);
+        let poller2 = StubPoller {
+            calls: RefCell::new(0),
+            reading: None,
+        };
+        let mut flags2 = PaceGateFlags::default();
+        let mut out2 = Vec::new();
+
+        let outcome2 = wait_for_window(
+            &mut out2,
+            &state2,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock2.now.borrow(),
+            &|d| *clock2.now.borrow_mut() += d.as_secs(),
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: Some(&poller2),
+            },
+            &mut flags2,
+        );
+
+        assert_eq!(
+            *poller2.calls.borrow(),
+            0,
+            "a fresh stored reading needs no poll"
+        );
+        assert_eq!(outcome2.waited_secs, 0);
+    }
+
+    #[test]
+    fn a_failing_poller_leaves_the_gate_on_passive_data() {
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        // Stale, but at/above the ceiling with a still-future reset: this
+        // binds via the existing `binding` rule regardless of staleness (see
+        // `a_stale_full_window_keeps_binding_until_its_reset_arrives`), so a
+        // poller that can never produce data must not change the outcome.
+        let stale_but_full = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW - 100_000),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(stale_but_full);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+        let poller = StubPoller {
+            calls: RefCell::new(0),
+            reading: None,
+        };
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: Some(&poller),
+            },
+            &mut flags,
+        );
+
+        assert!(
+            *poller.calls.borrow() >= 1,
+            "the failing poller was actually consulted"
+        );
+        assert!(
+            outcome.waited_secs >= 600,
+            "still parks on the stale-but-binding reading exactly as today, waited {}",
+            outcome.waited_secs
         );
     }
 }

@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::adapters::{self, AgentAdapter};
 use super::config::{CtxConfig, EnvLookup, PaceConfig, env_from_process};
 use super::pace::{self, PaceDecision};
+use super::poll;
 use super::state::{StateDir, now_secs};
 use super::window::{UsageWindows, Window, age_secs};
 use super::{CtxResult, window};
@@ -309,15 +310,62 @@ pub fn run_with<W: Write>(
             // nothing enabled and ready at all).
             let provider = adapters::provider_for_usage_readout(&cfg);
             let now = now_secs();
-            // Check whether anything has been recorded for this provider.
-            // (Tasks 6/7 wire `refresh_codex_usage` and the poller ahead of
-            // this check, so callers refresh sources first.)
+            // Best-effort source refresh, ahead of the no-usage-source check
+            // below -- the same two calls the pacing gate itself makes
+            // (`pace::wait_for_window`'s own `refresh_sources`), since this
+            // command is the manual end-to-end check: it must actually try
+            // to acquire data, not just report whatever happened to already
+            // be on disk.
+            let http_poller = poll::HttpPoller;
+            if provider == window::CODEX_USAGE_PROVIDER {
+                // See `pace::refresh_sources`'s own doc comment: resolved via
+                // `crate::utils::home_dir()`, not left to `refresh_codex_
+                // usage`'s internal `dirs::home_dir()` fallback, which
+                // ignores `HOME`/`USERPROFILE` on Windows and so cannot be
+                // pointed at a test fixture there.
+                let sessions_dir = crate::utils::home_dir()
+                    .ok()
+                    .map(|h| h.join(".codex").join("sessions"));
+                window::refresh_codex_usage(
+                    &state,
+                    sessions_dir.as_deref(),
+                    now,
+                    cfg.pace.collector_max_age_secs,
+                );
+            }
+            let poll_reading = poll::maybe_poll(&state, &cfg.pace, now, provider, &http_poller);
+
+            // Check whether anything has been recorded for this provider,
+            // now that the refresh above has had its chance to acquire some.
             if window::has_no_usage_source(&state, provider) {
                 writeln!(w, "{provider}: no usage source")?;
                 return Ok(0);
             }
             let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
             report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
+
+            if cfg.pace.use_credits.for_provider(provider) {
+                writeln!(
+                    w,
+                    "\nuse_credits: enabled for this harness -- pacing gate skipped"
+                )?;
+            }
+            // Only when a poll just ran and returned an opinion: never invent
+            // vendor state from a stale reading, and no line at all when no
+            // poll ran this time (disabled, floored, or nothing needed it).
+            if let Some(reading) = &poll_reading
+                && let Some(vendor_credits_enabled) = reading.vendor_credits_enabled
+            {
+                writeln!(
+                    w,
+                    "vendor reports credits {} on this plan",
+                    if vendor_credits_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                )?;
+            }
             Ok(0)
         }
     }
@@ -756,6 +804,13 @@ mod tests {
     fn the_verb_names_a_provider_with_no_usage_source() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path();
+        // Task 6's own source refresh (`refresh_codex_usage`, ahead of the
+        // no-usage-source check) resolves the codex sessions directory via
+        // `crate::utils::home_dir()` precisely so a real machine's own
+        // `~/.codex/sessions` cannot leak into this "nothing recorded" test
+        // -- an empty `HomeGuard` home keeps that scan a genuine no-op.
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         // `agent` is `REPO_FORBIDDEN` (final wave item 1) -- configured via
         // `ZIRV_CTX_AGENT` (the operator layer) instead of the repo's own
         // `ctx.toml`.

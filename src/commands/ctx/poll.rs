@@ -90,9 +90,23 @@ fn parse_codex_usage(body: &str, now: u64) -> Option<PollReading> {
 /// Reads the OAuth access token straight from disk on every call: it must
 /// never be cached, logged, or persisted anywhere but the request this call
 /// makes -- see the module's security constraint.
+///
+/// Resolved via `crate::utils::home_dir()` (`HOME`/`USERPROFILE`), not
+/// `dirs::home_dir()`: on Windows the latter calls `SHGetKnownFolderPath`
+/// directly and ignores both env vars, so a test's `HomeGuard` -- the
+/// mechanism every other home-directory override in this crate relies on --
+/// could never point this at a fixture instead of the operator's real
+/// credentials. This is also what keeps `cargo test` from ever making a real
+/// network call with the operator's own token, which is the whole point of
+/// this module's "tests never touch the network" constraint once a real
+/// caller (`wait_for_window`, `zirv ctx usage`) actually constructs an
+/// `HttpPoller`.
 #[allow(dead_code)]
 fn anthropic_token() -> Option<String> {
-    let path = dirs::home_dir()?.join(".claude").join(".credentials.json");
+    let path = crate::utils::home_dir()
+        .ok()?
+        .join(".claude")
+        .join(".credentials.json");
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     Some(
         v.pointer("/claudeAiOauth/accessToken")?
@@ -102,10 +116,14 @@ fn anthropic_token() -> Option<String> {
 }
 
 /// Same contract as [`anthropic_token`]: read fresh on every call, never
-/// cached or logged.
+/// cached or logged, and resolved the same env-aware way for the same
+/// reason.
 #[allow(dead_code)]
 fn codex_token() -> Option<String> {
-    let path = dirs::home_dir()?.join(".codex").join("auth.json");
+    let path = crate::utils::home_dir()
+        .ok()?
+        .join(".codex")
+        .join("auth.json");
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     v.pointer("/tokens/access_token")
         .or_else(|| v.get("access_token"))
