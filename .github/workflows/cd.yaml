@@ -13,7 +13,11 @@ on:
 jobs:
   build:
     name: Build Binaries
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # Only release from main: the workflow_run trigger fires for CI runs on
+    # every branch (PRs included) but checks out the default branch, so an
+    # ungated run rebuilds and re-publishes whatever version main already
+    # has — failing at the release/Chocolatey step on the duplicate.
+    if: ${{ (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main') || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
