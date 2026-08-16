@@ -241,11 +241,26 @@ pub fn report<W: Write>(
         }
     )?;
     let decision = pace::decide(collector, estimator, now, cfg);
-    let verb = match decision {
-        PaceDecision::WaitUntil { .. } => "would wait:",
-        _ => "verdict:",
-    };
-    writeln!(w, "  {verb} {}", pace::describe(&decision))?;
+    match &decision {
+        PaceDecision::Slow {
+            delay_secs,
+            window,
+            percent,
+            source,
+        } => {
+            writeln!(
+                w,
+                "  throttle: would delay ~{delay_secs}s ({percent:.0}% of {window}, {})",
+                source.as_str()
+            )?;
+        }
+        PaceDecision::WaitUntil { .. } => {
+            writeln!(w, "  would wait: {}", pace::describe(&decision))?;
+        }
+        _ => {
+            writeln!(w, "  verdict: {}", pace::describe(&decision))?;
+        }
+    }
     Ok(())
 }
 

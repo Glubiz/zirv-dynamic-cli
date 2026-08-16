@@ -129,7 +129,7 @@ pub fn run_with<W: Write>(
     // Item 10: owned across every cycle, so the no-usage-source skip line
     // (pace.rs's own `wait_for_window`) prints once for the whole run
     // rather than once per cycle.
-    let mut pace_no_source_announced = false;
+    let mut pace_flags = pace::PaceGateFlags::default();
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -151,7 +151,8 @@ pub fn run_with<W: Write>(
             &sleep_fn,
             None,
             adapter.provider(),
-            &mut pace_no_source_announced,
+            pace::PaceGate { use_credits: false },
+            &mut pace_flags,
         );
 
         let mail_slug = super::state::repo_slug(repo);
@@ -450,7 +451,8 @@ pub fn run_with<W: Write>(
                 &sleep_fn,
                 None,
                 adapter.provider(),
-                &mut pace_no_source_announced,
+                pace::PaceGate { use_credits: false },
+                &mut pace_flags,
             );
         }
 

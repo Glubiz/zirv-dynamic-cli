@@ -33,6 +33,15 @@ pub enum PaceDecision {
         percent: f64,
         source: Source,
     },
+    /// Inside the soft-throttle band (`soft_percent` <= percent <
+    /// `max_percent`): not a hard pause, but each cycle is delayed so the
+    /// remaining budget spreads linearly over the time left in the window.
+    Slow {
+        delay_secs: u64,
+        window: &'static str,
+        percent: f64,
+        source: Source,
+    },
     Unknown,
 }
 
@@ -200,6 +209,26 @@ pub fn decide(
     };
 
     if window.used_percentage < cfg.max_percent {
+        let band = cfg.max_percent - cfg.soft_percent;
+        if band > 0.0 && window.used_percentage >= cfg.soft_percent {
+            let t_rem = if window.resets_at > now {
+                window.resets_at - now
+            } else {
+                // Reset unknown (0) or already past while the reading still
+                // binds: pace against the configured fallback horizon.
+                cfg.fallback_delay_secs
+            };
+            let frac = (window.used_percentage - cfg.soft_percent) / band;
+            let delay_secs = (t_rem as f64 * frac) as u64;
+            if delay_secs > 0 {
+                return PaceDecision::Slow {
+                    delay_secs,
+                    window: name,
+                    percent: window.used_percentage,
+                    source,
+                };
+            }
+        }
         return PaceDecision::Proceed {
             source,
             worst_percent: window.used_percentage,
@@ -261,19 +290,22 @@ pub fn wait_deadline(
     cfg: &PaceConfig,
     seed: u64,
 ) -> Option<u64> {
-    let PaceDecision::WaitUntil {
-        reset_at, window, ..
-    } = decision
-    else {
-        return None;
-    };
-
-    let target = match reset_at {
-        Some(at) if *at > now => *at,
-        _ => now + cfg.fallback_delay_secs,
-    };
-    let jittered = apply_jitter(target, cfg.jitter_secs, seed);
-    Some(jittered.min(now + wait_cap(window, cfg)))
+    match decision {
+        PaceDecision::WaitUntil {
+            reset_at, window, ..
+        } => {
+            let target = match reset_at {
+                Some(at) if *at > now => *at,
+                _ => now + cfg.fallback_delay_secs,
+            };
+            let jittered = apply_jitter(target, cfg.jitter_secs, seed);
+            Some(jittered.min(now + wait_cap(window, cfg)))
+        }
+        // No jitter: the delay is already reading-derived, and the wait
+        // loop's own monotonic min-tracking keeps it from creeping forward.
+        PaceDecision::Slow { delay_secs, .. } => Some(now.saturating_add(*delay_secs)),
+        _ => None,
+    }
 }
 
 pub fn describe(decision: &PaceDecision) -> String {
@@ -300,6 +332,15 @@ pub fn describe(decision: &PaceDecision) -> String {
                 source.as_str()
             )
         }
+        PaceDecision::Slow {
+            delay_secs,
+            window,
+            percent,
+            source,
+        } => format!(
+            "{window} window at {percent:.1}% ({} data), throttling ~{delay_secs}s before the next run",
+            source.as_str()
+        ),
         PaceDecision::Unknown => {
             "usage state unknown, no usage data from a fresh collector reading or a configured estimator budget, proceeding without pacing".to_string()
         }
@@ -316,6 +357,32 @@ use super::{log, window as usage_window};
 pub struct PaceOutcome {
     pub waited_secs: u64,
     pub source: Source,
+}
+
+/// Operator-controlled inputs to the gate that are not part of `PaceConfig`
+/// itself: resolved per call from the adapter's provider, not read from disk
+/// or the environment inside `decide`/`wait_for_window`'s own logic.
+///
+/// Stubbed here without a `poller` field -- Task 6 adds `poller: Option<&'a
+/// dyn crate::commands::ctx::poll::UsagePoller>` once `poll.rs` exists.
+#[derive(Debug, Clone, Copy)]
+pub struct PaceGate {
+    /// Operator declaration that this harness's vendor plan covers overage
+    /// from credits: when true, the proactive throttle/pause is skipped
+    /// entirely for this call. A vendor-reported limit hit (the caller's own
+    /// `scan_for_limit`/`is_limit_hit` path) still parks -- that is a
+    /// separate, untouched path.
+    pub use_credits: bool,
+}
+
+/// Once-per-run announce latches for `wait_for_window`, owned by the caller
+/// and threaded through every call across one run -- the same discipline the
+/// wait loop's own internal `announced` local already follows *within* a
+/// single call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaceGateFlags {
+    pub no_source_announced: bool,
+    pub credits_announced: bool,
 }
 
 /// Longest single sleep, so a supervisor rechecks state (a live session may have
@@ -380,14 +447,14 @@ pub fn current_windows(
 /// collector reading. (Tasks 6/7 wire `refresh_codex_usage` and the poller
 /// ahead of this check, so callers refresh sources first.)
 ///
-/// `announced_no_source` is owned by the caller and threaded through every
-/// call across one run (`exec`'s own supervise loop calls this once per
-/// cycle -- the pre-flight check and, on a usage-limit park, again -- and
-/// `loop`'s cycle does the same), the same discipline the wait-loop's own
-/// internal `announced` local already follows *within* a single call: the
-/// no-source fact does not change cycle to cycle, so without this the skip
-/// line and `PacingSkipped` would otherwise repeat on every single restart
-/// of a long-running codex session, drowning out everything else on the
+/// `flags` is owned by the caller and threaded through every call across one
+/// run (`exec`'s own supervise loop calls this once per cycle -- the
+/// pre-flight check and, on a usage-limit park, again -- and `loop`'s cycle
+/// does the same), the same discipline the wait-loop's own internal
+/// `announced` local already follows *within* a single call: neither the
+/// no-source fact nor the use_credits setting changes cycle to cycle, so
+/// without this the skip lines would otherwise repeat on every single
+/// restart of a long-running session, drowning out everything else on the
 /// `zirv ▸` channel with a fact already stated once.
 #[allow(clippy::too_many_arguments)]
 pub fn wait_for_window<W: Write>(
@@ -400,7 +467,8 @@ pub fn wait_for_window<W: Write>(
     sleep_fn: &dyn Fn(Duration),
     announcer: Option<&super::announce::Announcer>,
     provider: &str,
-    announced_no_source: &mut bool,
+    gate: PaceGate,
+    flags: &mut PaceGateFlags,
 ) -> PaceOutcome {
     if !cfg.enabled {
         return PaceOutcome {
@@ -409,8 +477,38 @@ pub fn wait_for_window<W: Write>(
         };
     }
 
+    // Short-circuits before any source refresh or decision: an operator
+    // declaring that this harness's vendor plan covers overage from credits
+    // means the proactive throttle/pause never applies to it. A
+    // vendor-reported limit hit still parks via a separate, untouched path.
+    if gate.use_credits {
+        if !flags.credits_announced {
+            let _ = writeln!(
+                w,
+                "zirv ctx {verb}: pacing: use_credits enabled for this harness, gate skipped"
+            );
+            let _ = log::append(
+                state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session,
+                    verb,
+                    verdict: "n/a",
+                    score: 0,
+                    action: "use-credits-skip",
+                    detail: "use_credits enabled; throttle/pause skipped for this harness",
+                },
+            );
+            flags.credits_announced = true;
+        }
+        return PaceOutcome {
+            waited_secs: 0,
+            source: Source::None,
+        };
+    }
+
     if usage_window::has_no_usage_source(state, provider) {
-        if !*announced_no_source {
+        if !flags.no_source_announced {
             let _ = writeln!(
                 w,
                 "zirv ctx {verb}: pacing off: {provider} has no usage source"
@@ -420,7 +518,7 @@ pub fn wait_for_window<W: Write>(
                     provider: provider.to_string(),
                 });
             }
-            *announced_no_source = true;
+            flags.no_source_announced = true;
         }
         return PaceOutcome {
             waited_secs: 0,
@@ -430,6 +528,7 @@ pub fn wait_for_window<W: Write>(
 
     let started = now_fn();
     let mut announced: Option<(String, Option<u64>)> = None;
+    let mut slow_deadline: Option<u64> = None;
 
     loop {
         let now = now_fn();
@@ -439,11 +538,34 @@ pub fn wait_for_window<W: Write>(
         let source = match &decision {
             PaceDecision::Proceed { source, .. } => *source,
             PaceDecision::WaitUntil { source, .. } => *source,
+            PaceDecision::Slow { source, .. } => *source,
             PaceDecision::Unknown => Source::None,
         };
 
-        let Some(deadline) = wait_deadline(&decision, now, cfg, std::process::id() as u64 ^ now)
-        else {
+        // `WaitUntil`'s deadline is absolute (the window's own reset), so
+        // re-deriving it each chunk is stable. A re-derived `Slow` deadline
+        // creeps forward every chunk instead (`now + (resets_at - now) *
+        // frac` grows as `now` does), which would stretch a soft-band
+        // throttle into a full park -- so its deadline is tracked
+        // monotonically, and a later, larger recheck may never push it out,
+        // only a smaller one may pull it in.
+        let deadline = match &decision {
+            PaceDecision::Slow { .. } => {
+                let cand = wait_deadline(&decision, now, cfg, std::process::id() as u64 ^ now);
+                let resolved = match (slow_deadline, cand) {
+                    (Some(prev), Some(c)) => Some(prev.min(c)),
+                    (None, Some(c)) => Some(c),
+                    (prev, None) => prev,
+                };
+                slow_deadline = resolved;
+                resolved
+            }
+            _ => {
+                slow_deadline = None;
+                wait_deadline(&decision, now, cfg, std::process::id() as u64 ^ now)
+            }
+        };
+        let Some(deadline) = deadline else {
             return PaceOutcome {
                 waited_secs: now.saturating_sub(started),
                 source,
@@ -454,6 +576,7 @@ pub fn wait_for_window<W: Write>(
         // may legitimately wait days, a five-hour trip may not.
         let cap = match &decision {
             PaceDecision::WaitUntil { window, .. } => wait_cap(window, cfg),
+            PaceDecision::Slow { window, .. } => wait_cap(window, cfg),
             _ => 0,
         };
         if now.saturating_sub(started) >= cap {
@@ -470,11 +593,14 @@ pub fn wait_for_window<W: Write>(
 
         // Announce once per distinct decision, not once per sleep chunk: a
         // seven-day park would otherwise write thousands of identical audit
-        // lines and scroll the operator's terminal for days.
+        // lines and scroll the operator's terminal for days. `Slow` is keyed
+        // on the window alone (not the shrinking delay/percent), so one
+        // throttle episode announces once rather than on every recheck.
         let fingerprint = match &decision {
             PaceDecision::WaitUntil {
                 window, reset_at, ..
             } => Some(((*window).to_string(), *reset_at)),
+            PaceDecision::Slow { window, .. } => Some((format!("slow:{window}"), None)),
             _ => None,
         };
         if announced != fingerprint {
@@ -543,6 +669,159 @@ mod tests {
         }
     }
 
+    fn collector_with_reset(percent: f64, resets_at: u64) -> UsageWindows {
+        UsageWindows {
+            five_hour: window(percent, resets_at, NOW - 10),
+            seven_day: None,
+        }
+    }
+
+    #[test]
+    fn below_soft_percent_proceeds_unthrottled() {
+        let d = decide(&collector(79.0), None, NOW, &PaceConfig::default());
+        assert!(matches!(d, PaceDecision::Proceed { .. }));
+    }
+
+    #[test]
+    fn inside_the_band_slows_proportionally_to_time_left() {
+        // soft 80, max 99: at 90% the band fraction is 10/19. Reset in 1900s
+        // -> delay = 1900 * 10/19 = 1000.
+        let w = collector_with_reset(90.0, NOW + 1900);
+        let d = decide(&w, None, NOW, &PaceConfig::default());
+        assert_eq!(
+            d,
+            PaceDecision::Slow {
+                delay_secs: 1000,
+                window: "five_hour",
+                percent: 90.0,
+                source: Source::Collector
+            }
+        );
+    }
+
+    #[test]
+    fn near_reset_the_slow_delay_shrinks_toward_zero() {
+        let w = collector_with_reset(90.0, NOW + 1); // 1s left: delay rounds to 0 -> Proceed
+        assert!(matches!(
+            decide(&w, None, NOW, &PaceConfig::default()),
+            PaceDecision::Proceed { .. }
+        ));
+    }
+
+    #[test]
+    fn at_max_percent_the_hard_pause_still_wins() {
+        let d = decide(&collector(99.0), None, NOW, &PaceConfig::default());
+        assert!(matches!(d, PaceDecision::WaitUntil { .. }));
+    }
+
+    #[test]
+    fn unknown_reset_time_slows_by_the_fallback_delay() {
+        // resets_at == 0 inside the band: t_rem stands in as fallback_delay_secs (900)
+        // at 90%: 900 * 10/19 = 473.
+        let w = collector_with_reset(90.0, 0);
+        let d = decide(&w, None, NOW, &PaceConfig::default());
+        assert!(matches!(
+            d,
+            PaceDecision::Slow {
+                delay_secs: 473,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_empty_band_disables_the_throttle() {
+        let cfg = PaceConfig {
+            soft_percent: 99.0,
+            ..PaceConfig::default()
+        }; // == max
+        assert!(matches!(
+            decide(&collector(98.0), None, NOW, &cfg),
+            PaceDecision::Proceed { .. }
+        ));
+    }
+
+    #[test]
+    fn use_credits_skips_the_gate_entirely() {
+        let exhausted = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig::default(),
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate { use_credits: true },
+            &mut flags,
+        );
+
+        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.source, Source::None);
+        assert!(
+            clock.slept.borrow().is_empty(),
+            "use_credits must never enter the wait loop"
+        );
+    }
+
+    #[test]
+    fn a_slow_wait_does_not_extend_itself_across_rechecks() {
+        // 90% with soft 80/max 99: first computed delay is 1000s (see
+        // inside_the_band_slows_proportionally_to_time_left). Re-deriving the
+        // decision every 30s chunk must not stretch the wait toward the full
+        // reset -- the monotonic slow_deadline must hold the first value.
+        let slow = collector_with_reset(90.0, NOW + 1900);
+        let (_tmp, state) = state_with(slow);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate { use_credits: false },
+            &mut flags,
+        );
+
+        let total_slept: u64 = clock.slept.borrow().iter().sum();
+        assert!(
+            total_slept <= 1000 + SLEEP_CHUNK_SECS,
+            "slept {total_slept}s, wanted <= 1000 + {SLEEP_CHUNK_SECS}"
+        );
+        assert!(
+            outcome.waited_secs <= 1000 + SLEEP_CHUNK_SECS,
+            "waited {}s",
+            outcome.waited_secs
+        );
+    }
+
     #[test]
     fn a_healthy_fresh_collector_reading_proceeds() {
         let decision = decide(&collector(42.0), None, NOW, &PaceConfig::default());
@@ -572,8 +851,12 @@ mod tests {
 
     #[test]
     fn just_below_the_ceiling_still_proceeds() {
+        // With the default soft-throttle band (soft 80, max 99) 98.9% falls
+        // inside the band, so this is now a throttled `Slow`, not a flat
+        // `Proceed` -- but it is still not the hard pause `WaitUntil` gives
+        // at/above the ceiling.
         let decision = decide(&collector(98.9), None, NOW, &PaceConfig::default());
-        assert!(matches!(decision, PaceDecision::Proceed { .. }));
+        assert!(matches!(decision, PaceDecision::Slow { .. }));
     }
 
     #[test]
@@ -1132,7 +1415,8 @@ mod tests {
             },
             None,
             "anthropic",
-            &mut false,
+            PaceGate { use_credits: false },
+            &mut PaceGateFlags::default(),
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1168,7 +1452,8 @@ mod tests {
             },
             None,
             "anthropic",
-            &mut false,
+            PaceGate { use_credits: false },
+            &mut PaceGateFlags::default(),
         );
 
         assert!(outcome.waited_secs >= 600, "waited {}", outcome.waited_secs);
@@ -1209,7 +1494,8 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate { use_credits: false },
+            &mut PaceGateFlags::default(),
         );
 
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
@@ -1248,7 +1534,8 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate { use_credits: false },
+            &mut PaceGateFlags::default(),
         );
 
         assert!(
@@ -1287,7 +1574,8 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate { use_credits: false },
+            &mut PaceGateFlags::default(),
         );
 
         assert!(
@@ -1322,7 +1610,8 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate { use_credits: false },
+            &mut PaceGateFlags::default(),
         );
 
         assert!(
@@ -1349,7 +1638,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
         let clock = FakeClock::new(NOW);
         let mut out = Vec::new();
-        let mut announced = false;
+        let mut flags = PaceGateFlags::default();
 
         let outcome = wait_for_window(
             &mut out,
@@ -1361,7 +1650,8 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "openai",
-            &mut announced,
+            PaceGate { use_credits: false },
+            &mut flags,
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1373,13 +1663,16 @@ mod tests {
             clock.slept.borrow().is_empty(),
             "must never enter the wait loop"
         );
-        assert!(announced, "the latch is set so a caller's next cycle knows");
+        assert!(
+            flags.no_source_announced,
+            "the latch is set so a caller's next cycle knows"
+        );
 
         // Item 10: a second cycle of the same run (the caller's own
-        // `announced_no_source` threaded straight back in, exactly like
-        // `exec`'s and `loop`'s own supervise loops do) must not repeat the
-        // line or grow `out` at all -- the no-source fact was already stated
-        // once for this run.
+        // `flags` threaded straight back in, exactly like `exec`'s and
+        // `loop`'s own supervise loops do) must not repeat the line or grow
+        // `out` at all -- the no-source fact was already stated once for
+        // this run.
         let before = out.len();
         let outcome = wait_for_window(
             &mut out,
@@ -1391,7 +1684,8 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "openai",
-            &mut announced,
+            PaceGate { use_credits: false },
+            &mut flags,
         );
         assert_eq!(outcome.waited_secs, 0);
         assert_eq!(outcome.source, Source::None, "still skipped, just quietly");
@@ -1419,7 +1713,8 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate { use_credits: false },
+            &mut PaceGateFlags::default(),
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1449,7 +1744,8 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate { use_credits: false },
+            &mut PaceGateFlags::default(),
         );
         assert_eq!(outcome.waited_secs, 0);
         assert!(

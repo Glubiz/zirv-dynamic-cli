@@ -736,7 +736,7 @@ pub fn run_with<W: Write>(
     // check and, on a usage-limit park, the second call further down), so
     // the no-usage-source skip line and `PacingSkipped` announce once for
     // the whole run rather than once per restart.
-    let mut pace_no_source_announced = false;
+    let mut pace_flags = pace::PaceGateFlags::default();
 
     loop {
         pace::wait_for_window(
@@ -749,7 +749,8 @@ pub fn run_with<W: Write>(
             &sleep_fn,
             Some(&announcer),
             adapter.provider(),
-            &mut pace_no_source_announced,
+            pace::PaceGate { use_credits: false },
+            &mut pace_flags,
         );
 
         // P2/P3: `_child_guard` holds this cycle's child in the console-close
@@ -1068,7 +1069,8 @@ pub fn run_with<W: Write>(
                 &sleep_fn,
                 Some(&announcer),
                 adapter.provider(),
-                &mut pace_no_source_announced,
+                pace::PaceGate { use_credits: false },
+                &mut pace_flags,
             );
 
             let Some(prompt_text) = prompt.clone() else {
