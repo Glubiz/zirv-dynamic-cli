@@ -19,11 +19,11 @@ const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
 #[allow(dead_code)]
 const HTTP_TIMEOUT_SECS: u64 = 10;
 
-// Every public item below is a vertical slice not yet wired into any call
-// site: Task 6/7 threads `maybe_poll`/`UsagePoller` into the pacing gate.
-// Until then nothing in the production build path constructs or calls them,
-// so each carries its own `#[allow(dead_code)]`, the same convention
-// `window.rs` used for its own forward-looking exports.
+// `maybe_poll`/`UsagePoller` are wired into the pacing gate
+// (`pace::refresh_sources`, all four `wait_for_window` call sites) and into
+// `zirv ctx usage`'s no-subcommand readout. The `#[allow(dead_code)]`
+// markers below predate that wiring and are kept only until the next
+// cleanup pass confirms which items every build target actually reaches.
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
@@ -39,10 +39,12 @@ pub trait UsagePoller {
 }
 
 /// The real poller: makes a blocking HTTP request against the vendor's usage
-/// endpoint using the operator's own OAuth token. Not yet wired into any call
-/// site -- that is Task 6/7's job -- so it is exercised only by compilation,
-/// never by a test (this module's tests never touch the network; see the
-/// module-level security constraint).
+/// endpoint using the operator's own OAuth token. Constructed by the pacing
+/// gate call sites and `zirv ctx usage`; tests never construct it -- they
+/// stub `UsagePoller` instead, and every test that can reach a construction
+/// site redirects home via `HomeGuard` so no token file is ever readable
+/// (this module's tests never touch the network; see the module-level
+/// security constraint).
 #[allow(dead_code)]
 pub struct HttpPoller;
 

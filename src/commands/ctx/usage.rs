@@ -781,6 +781,13 @@ mod tests {
     #[test]
     fn the_verb_reports_without_a_subcommand() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // Like every sibling test here: an empty redirected home keeps the
+        // no-subcommand path's source refresh (rollout scan + HttpPoller
+        // token lookup) away from the real machine's credentials -- without
+        // this, `maybe_poll` would issue a live authenticated request on
+        // every `cargo test` run.
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let env: std::collections::HashMap<String, String> = [(
             crate::commands::ctx::state::STATE_ENV.to_string(),
             tmp.path().join("state").display().to_string(),
