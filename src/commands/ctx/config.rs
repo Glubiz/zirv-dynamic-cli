@@ -209,14 +209,9 @@ impl UseCreditsConfig {
     /// Keyed by agent in config (what the operator thinks in), resolved by
     /// provider at the gate (what pacing knows). Unknown providers gate.
     ///
-    /// No in-tree caller yet outside this module's own tests: a later task
-    /// wires the pacing gate (`pace::decide` and its callers) to call
-    /// `cfg.pace.use_credits.for_provider(adapter.provider())` and skip
-    /// throttle/pause for that harness. `#[allow(dead_code)]` covers it until
-    /// that wiring lands, the same reasoning `dash::pane`'s module-level
-    /// allow documents: a real API with no in-tree caller yet is not the same
-    /// thing as code that should be deleted.
-    #[allow(dead_code)]
+    /// Called at every pacing-gate construction site (`exec`/`run_loop` build
+    /// `PaceGate { use_credits: cfg.pace.use_credits.for_provider(..) }`) and
+    /// by the dashboard header's per-harness usage row.
     pub fn for_provider(&self, provider: &str) -> bool {
         match provider {
             "anthropic" => self.claude,
