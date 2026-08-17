@@ -1,19 +1,22 @@
-# Repo-layer zirv configuration (untrusted layer: operator config and env win;
-# keys listed in REPO_FORBIDDEN are ignored here by design).
+# Repo-layer zirv configuration (untrusted layer: operator config and env win).
 #
-# This file enumerates EVERY configurable key of `CtxConfig` (see
-# src/commands/ctx/config.rs), each written at its exact default value, so it
-# doubles as a reference for what zirv's ctx subsystem can be tuned to do.
-# `config::tests::the_repo_own_ctx_toml_parses_and_matches_defaults` pins this
-# file against config.rs: if a default changes there, that test fails and
-# this file must be updated to match.
+# This file is an exhaustive reference of every configurable key of
+# `CtxConfig` (see src/commands/ctx/config.rs), each shown COMMENTED OUT at
+# its built-in default -- sample-config style. Uncomment a key to override it
+# for this repo.
 #
-# Keys marked REPO-FORBIDDEN below are commented out: a repository checkout
-# may not set them (see REPO_FORBIDDEN in config.rs) -- these keys are
-# ignored when set from a repo checkout; set them in ~/.zirv/ctx.toml, via
-# ZIRV_CTX_* env vars, or flags instead. The commented value shown is still
-# the real default, for reference.
+# A commented key sets nothing, so an operator's own ~/.zirv/ctx.toml
+# customization of that same key keeps working. This matters because the
+# repo layer merges ON TOP of the operator's global config (see
+# `CtxConfig::load`): an ACTIVE default-valued key here would silently
+# clobber any global override of the same key for anyone who checks out this
+# repo. Only uncomment a key you actually mean to pin for this repo.
 #
+# Keys marked REPO-FORBIDDEN may not be set from a repo checkout at all (see
+# REPO_FORBIDDEN in config.rs) -- uncommenting one has no effect here; set it
+# in ~/.zirv/ctx.toml, via ZIRV_CTX_* env vars, or flags instead. The value
+# shown is still the real default, for reference.
+
 # agent = "claude"             # REPO-FORBIDDEN (ZIRV_CTX_AGENT): which adapter zirv drives. Default: unset (auto-detect).
 # agent_bin = "/path/to/bin"   # REPO-FORBIDDEN (ZIRV_CTX_AGENT_BIN): explicit path to the agent binary. Default: unset.
 
@@ -23,105 +26,100 @@
 # Not REPO-FORBIDDEN: this only shapes a session the operator deliberately
 # launched, and the choice is disclosed on the `zirv \u{25b8}` announcement
 # channel rather than spent silently in the background (see ChatConfig's doc
-# comment in config.rs). Default (unset): None -- leaves the agent's own
-# default model in place.
+# comment in config.rs). Commenting this out reverts to the built-in default
+# (unset: leaves the agent's own default model in place). This is the ONLY
+# active key in this file -- every other key below is commented out.
 model = "fable"
 
-[score]
-window = 10                        # trailing turns the rolling rot score looks over
-min_turns = 10                     # turns required before the score is trusted at all
-token_floor = 100_000              # tokens below which token pressure contributes nothing
-token_ceiling = 160_000            # tokens at which token pressure is maxed out
-weight_tool_failure = 40.0         # score weight for repeated tool failures (weights sum to 100)
-weight_repetition = 30.0           # score weight for repeated actions
-weight_marker = 30.0               # score weight for the rot marker appearing in output
-repetition_threshold = 3           # repeat count before the repetition signal trips
-advise_at = 40                     # score at which zirv advises the operator
-compact_at = 60                    # score at which zirv recommends a compact/handoff
-restart_at = 80                    # score at which zirv recommends a restart
-marker = "[zirv]"                  # literal string the rot engine treats as an explicit marker signal
+# [score]
+# window = 10                        # trailing turns the rolling rot score looks over
+# min_turns = 10                     # turns required before the score is trusted at all
+# token_floor = 100_000              # tokens below which token pressure contributes nothing
+# token_ceiling = 160_000            # tokens at which token pressure is maxed out
+# weight_tool_failure = 40.0         # score weight for repeated tool failures (weights sum to 100)
+# weight_repetition = 30.0           # score weight for repeated actions
+# weight_marker = 30.0               # score weight for the rot marker appearing in output
+# repetition_threshold = 3           # repeat count before the repetition signal trips
+# advise_at = 40                     # score at which zirv advises the operator
+# compact_at = 60                    # score at which zirv recommends a compact/handoff
+# restart_at = 80                    # score at which zirv recommends a restart
+# marker = "[zirv]"                  # literal string the rot engine treats as an explicit marker signal
 
-[wrap]
-debounce_ms = 3000                 # quiet time after output before wrap considers a turn settled
-inject_timeout_ms = 20_000         # how long wrap waits for an injected prompt to land
+# [wrap]
+# debounce_ms = 3000                 # quiet time after output before wrap considers a turn settled
+# inject_timeout_ms = 20_000         # how long wrap waits for an injected prompt to land
 
-[supervise]
-max_restarts = 2                   # restarts a supervised run allows before giving up
-poll_ms = 2000                     # polling interval for supervised process state
-interval_secs = 900                # interval between supervised health checks
-max_cycle_secs = 3600              # max wall time for one supervised cycle
-max_failures = 5                   # consecutive failures before supervise gives up entirely
-backoff_base_secs = 60             # base backoff between restart attempts
-# on_failure = "notify-send done"  # REPO-FORBIDDEN (ZIRV_CTX_ON_FAILURE): shell command run on failure. Default: unset.
-max_nudges = 3                     # consecutive nudge-driven restarts tolerated before nudges are ignored
+# [supervise]
+# max_restarts = 2                   # restarts a supervised run allows before giving up
+# poll_ms = 2000                     # polling interval for supervised process state
+# interval_secs = 900                # interval between supervised health checks
+# max_cycle_secs = 3600              # max wall time for one supervised cycle
+# max_failures = 5                   # consecutive failures before supervise gives up entirely
+# backoff_base_secs = 60             # base backoff between restart attempts
+# on_failure = "notify-send done"    # REPO-FORBIDDEN (ZIRV_CTX_ON_FAILURE): shell command run on failure. Default: unset.
+# max_nudges = 3                     # consecutive nudge-driven restarts tolerated before nudges are ignored
 
-[handoff]
-# model = "haiku"                  # REPO-FORBIDDEN (ZIRV_CTX_MODEL): distiller/judgment model override. Default: unset (adapter decides).
-tail_items = 5                     # trailing user/assistant/tool-error items kept in structural context
-timeout_secs = 30                  # time the distiller gets before falling back to structural context
+# [handoff]
+# model = "haiku"                    # REPO-FORBIDDEN (ZIRV_CTX_MODEL): distiller/judgment model override. Default: unset (adapter decides).
+# tail_items = 5                     # trailing user/assistant/tool-error items kept in structural context
+# timeout_secs = 30                  # time the distiller gets before falling back to structural context
 
-[pace]
-enabled = true                     # whether pace-to-reset throttling runs at all
-max_percent = 99.0                 # a supervised window is kept at or below this usage percentage
-collector_max_age_secs = 900       # collector readings older than this are treated as stale
-estimator = true                   # whether the token estimator fallback runs when the collector is stale
-five_hour_budget_tokens = 0        # 0 disables the estimator for the 5h window (no honest default)
-seven_day_budget_tokens = 0        # 0 disables the estimator for the 7d window (no honest default)
-count_cache_reads = false          # whether cache-read tokens count toward the estimator budget
-jitter_secs = 30                   # random jitter added to delays to avoid thundering-herd resumes
-fallback_delay_secs = 900          # delay used when a window's resets_at is unknown
-wait_slack_secs = 3600             # head-room added to the window length to form the default safety cap
-# max_wait_secs = 7200             # absolute override for the safety cap. Default: unset (scales to the tripped window).
-soft_percent = 80.0                # start of the soft-throttle band (delays scale linearly up to max_percent)
-# poll_enabled = true               # REPO-FORBIDDEN (ZIRV_CTX_PACE_POLL): active API-poll fallback when the collector is stale. Default: true.
-# poll_min_interval_secs = 60       # REPO-FORBIDDEN (ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS): floor between poll attempts. Default: 60.
+# [pace]
+# enabled = true                     # whether pace-to-reset throttling runs at all
+# max_percent = 99.0                 # a supervised window is kept at or below this usage percentage
+# collector_max_age_secs = 900       # collector readings older than this are treated as stale
+# estimator = true                   # whether the token estimator fallback runs when the collector is stale
+# five_hour_budget_tokens = 0        # 0 disables the estimator for the 5h window (no honest default)
+# seven_day_budget_tokens = 0        # 0 disables the estimator for the 7d window (no honest default)
+# count_cache_reads = false          # whether cache-read tokens count toward the estimator budget
+# jitter_secs = 30                   # random jitter added to delays to avoid thundering-herd resumes
+# fallback_delay_secs = 900          # delay used when a window's resets_at is unknown
+# wait_slack_secs = 3600             # head-room added to the window length to form the default safety cap
+# max_wait_secs = 7200               # absolute override for the safety cap. Default: unset (scales to the tripped window).
+# soft_percent = 80.0                # start of the soft-throttle band (delays scale linearly up to max_percent)
+# poll_enabled = true                # REPO-FORBIDDEN (ZIRV_CTX_PACE_POLL): active API-poll fallback when the collector is stale. Default: true.
+# poll_min_interval_secs = 60        # REPO-FORBIDDEN (ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS): floor between poll attempts. Default: 60.
 
-# [pace.use_credits]                # REPO-FORBIDDEN (ZIRV_CTX_PACE_USE_CREDITS_CLAUDE / _CODEX): skip pace gating for a harness whose vendor plan covers overage.
-# claude = false                    # Default: false.
-# codex = false                     # Default: false.
+# [pace.use_credits]                 # REPO-FORBIDDEN (ZIRV_CTX_PACE_USE_CREDITS_CLAUDE / _CODEX): skip pace gating for a harness whose vendor plan covers overage.
+# claude = false                     # Default: false.
+# codex = false                      # Default: false.
 
-[optimize]
-enabled = true                     # whether the Stop hook may queue an "optimize recommended" entry
-sessions_sampled = 10              # sessions sampled per optimize run
-max_surface_bytes = 200_000        # cap on the total analysed surface
-# model = ""                       # REPO-FORBIDDEN (ZIRV_CTX_OPTIMIZE_MODEL): distiller model for optimize. Default: "" (reuses handoff.model's own resolution).
-recommend_tool_failure_rate = 0.25 # tool-failure rate that triggers a recommendation
-recommend_corrections = 3          # correction count that triggers a recommendation
-recommend_cooldown_secs = 86_400   # minimum time between optimize recommendations
+# [optimize]
+# enabled = true                     # whether the Stop hook may queue an "optimize recommended" entry
+# sessions_sampled = 10              # sessions sampled per optimize run
+# max_surface_bytes = 200_000        # cap on the total analysed surface
+# model = ""                         # REPO-FORBIDDEN (ZIRV_CTX_OPTIMIZE_MODEL): distiller model for optimize. Default: "" (reuses handoff.model's own resolution).
+# recommend_tool_failure_rate = 0.25 # tool-failure rate that triggers a recommendation
+# recommend_corrections = 3          # correction count that triggers a recommendation
+# recommend_cooldown_secs = 86_400   # minimum time between optimize recommendations
 
-# [prompt]                          # every key below is REPO-FORBIDDEN
-# enabled = true                    # REPO-FORBIDDEN (ZIRV_CTX_PROMPT): whether the composed system prompt is injected at all. Default: true.
-# repo_layer = true                 # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_REPO): whether <repo>/.zirv/system-prompt.md is read. Default: true.
-# max_repo_bytes = 4096             # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_MAX_REPO_BYTES): cap on the untrusted repo layer. Default: 4096.
-# harnesses = true                  # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_HARNESSES): whether the derived harness roster is injected. Default: true.
-#
-# The orchestrator's harness roster (which other harnesses this session can
-# initiate with `zirv agent <name> "<prompt>"`) is derived by zirv at launch
-# from the adapter registry, each adapter's own readiness, and this repo's
-# `.zirv/.settings.toml` gate, then injected into the session prompt per
-# `prompt.harnesses` above.
+# [prompt]                           # every key below is REPO-FORBIDDEN
+# enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_PROMPT): whether the composed system prompt is injected at all. Default: true.
+# repo_layer = true                  # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_REPO): whether <repo>/.zirv/system-prompt.md is read. Default: true.
+# max_repo_bytes = 4096              # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_MAX_REPO_BYTES): cap on the untrusted repo layer. Default: 4096.
+# harnesses = true                   # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_HARNESSES): whether the derived harness roster is injected. Default: true.
 
-[mail]
-# enabled = true                    # REPO-FORBIDDEN (ZIRV_CTX_MAIL): whether the mailbox is on at all. Default: true.
-max_message_bytes = 4096           # cap on a single stored message body
-# max_delivered_bytes = 4096        # REPO-FORBIDDEN (ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES): cap on mail surfaced to a session at once. Default: 4096.
-keep = 50                          # unread messages kept before the oldest are pruned
+# [mail]
+# enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_MAIL): whether the mailbox is on at all. Default: true.
+# max_message_bytes = 4096           # cap on a single stored message body
+# max_delivered_bytes = 4096         # REPO-FORBIDDEN (ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES): cap on mail surfaced to a session at once. Default: 4096.
+# keep = 50                          # unread messages kept before the oldest are pruned
 
-# [memory]                          # every key below is REPO-FORBIDDEN
-# enabled = true                    # REPO-FORBIDDEN (ZIRV_CTX_MEMORY): whether the cross-session memory bank is on at all. Default: true.
-# harvest = false                   # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_HARVEST): whether facts are auto-harvested from distilled handoffs. Default: false.
-# max_entries = 50                  # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_ENTRIES): entries kept before the oldest (by Written) are pruned. Default: 50.
-# max_entry_bytes = 512             # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES): cap on a single entry's body. Default: 512.
-# max_injected_bytes = 2048         # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES): cap on the bank surfaced to a session at once. Default: 2048.
+# [memory]                           # every key below is REPO-FORBIDDEN
+# enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_MEMORY): whether the cross-session memory bank is on at all. Default: true.
+# harvest = false                    # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_HARVEST): whether facts are auto-harvested from distilled handoffs. Default: false.
+# max_entries = 50                   # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_ENTRIES): entries kept before the oldest (by Written) are pruned. Default: 50.
+# max_entry_bytes = 512              # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES): cap on a single entry's body. Default: 512.
+# max_injected_bytes = 2048          # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES): cap on the bank surfaced to a session at once. Default: 2048.
 
-[chrome]
-banner = true                      # the launch banner naming the resolved harness, the rule that chose it, and the session id
-bar = true                         # the reserved bottom status bar
-# events = true                     # REPO-FORBIDDEN (ZIRV_CTX_QUIET, inverted): the `zirv \u{25b8}` announcement channel on stderr. Default: true.
+# [chrome]
+# banner = true                      # the launch banner naming the resolved harness, the rule that chose it, and the session id
+# bar = true                         # the reserved bottom status bar
+# events = true                      # REPO-FORBIDDEN (ZIRV_CTX_QUIET, inverted): the `zirv \u{25b8}` announcement channel on stderr. Default: true.
 
-# [dash]                            # every key below is REPO-FORBIDDEN
-# enabled = true                    # REPO-FORBIDDEN (ZIRV_CTX_DASH): whether `zirv chat` opens the dashboard multiplexer. Default: true.
-# sidebar_cols = 24                 # REPO-FORBIDDEN (ZIRV_CTX_DASH_SIDEBAR_COLS): width, in columns, of the persistent session sidebar. Default: 24.
-# roster_max_age_secs = 604_800     # REPO-FORBIDDEN (ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS): how long a quit-time roster stays offered for restore. Default: 604800 (7 days).
-# max_panes = 9                     # REPO-FORBIDDEN (ZIRV_CTX_DASH_MAX_PANES): most panes one dashboard may hold at once, counting the orchestrator. Default: 9.
-# mouse = true                      # REPO-FORBIDDEN (ZIRV_CTX_DASH_MOUSE): whether the dashboard captures the mouse for wheel-scroll. Default: true.
+# [dash]                             # every key below is REPO-FORBIDDEN
+# enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_DASH): whether `zirv chat` opens the dashboard multiplexer. Default: true.
+# sidebar_cols = 24                  # REPO-FORBIDDEN (ZIRV_CTX_DASH_SIDEBAR_COLS): width, in columns, of the persistent session sidebar. Default: 24.
+# roster_max_age_secs = 604_800      # REPO-FORBIDDEN (ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS): how long a quit-time roster stays offered for restore. Default: 604800 (7 days).
+# max_panes = 9                      # REPO-FORBIDDEN (ZIRV_CTX_DASH_MAX_PANES): most panes one dashboard may hold at once, counting the orchestrator. Default: 9.
+# mouse = true                       # REPO-FORBIDDEN (ZIRV_CTX_DASH_MOUSE): whether the dashboard captures the mouse for wheel-scroll. Default: true.

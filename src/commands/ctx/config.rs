@@ -2002,31 +2002,162 @@ mod tests {
         assert!(cfg.agents.is_enabled("claude"));
     }
 
-    /// The checked-in `.zirv/ctx.toml` is a fully-enumerated reference file:
-    /// every key is written at its exact default. It pins config.rs's
-    /// defaults against drift -- if a `Default` impl changes here, this test
-    /// fails and the file must be updated to match.
+    /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
+    /// pairs. `table path` is dot-joined to match how a nested table's
+    /// header appears in the sample-config file (`"pace.use_credits"`); the
+    /// empty string is the top-level (pre-`[table]`) scope.
     ///
-    /// Two adjustments to a literal "equals `CtxConfig::default()`":
+    /// Hand-maintained against config.rs's struct definitions rather than
+    /// derived from `ENV_MAP`: `ENV_MAP` only covers keys that have an
+    /// environment override and is missing several real config keys (every
+    /// `score` weight/threshold, `handoff.tail_items`,
+    /// `optimize.max_surface_bytes` and its `recommend_*` siblings), so it
+    /// is not a complete key list on its own.
+    const ALL_CONFIG_KEYS: &[(&str, &str)] = &[
+        ("", "agent"),
+        ("", "agent_bin"),
+        ("chat", "model"),
+        ("score", "window"),
+        ("score", "min_turns"),
+        ("score", "token_floor"),
+        ("score", "token_ceiling"),
+        ("score", "weight_tool_failure"),
+        ("score", "weight_repetition"),
+        ("score", "weight_marker"),
+        ("score", "repetition_threshold"),
+        ("score", "advise_at"),
+        ("score", "compact_at"),
+        ("score", "restart_at"),
+        ("score", "marker"),
+        ("wrap", "debounce_ms"),
+        ("wrap", "inject_timeout_ms"),
+        ("supervise", "max_restarts"),
+        ("supervise", "poll_ms"),
+        ("supervise", "interval_secs"),
+        ("supervise", "max_cycle_secs"),
+        ("supervise", "max_failures"),
+        ("supervise", "backoff_base_secs"),
+        ("supervise", "on_failure"),
+        ("supervise", "max_nudges"),
+        ("handoff", "model"),
+        ("handoff", "tail_items"),
+        ("handoff", "timeout_secs"),
+        ("pace", "enabled"),
+        ("pace", "max_percent"),
+        ("pace", "collector_max_age_secs"),
+        ("pace", "estimator"),
+        ("pace", "five_hour_budget_tokens"),
+        ("pace", "seven_day_budget_tokens"),
+        ("pace", "count_cache_reads"),
+        ("pace", "jitter_secs"),
+        ("pace", "fallback_delay_secs"),
+        ("pace", "wait_slack_secs"),
+        ("pace", "max_wait_secs"),
+        ("pace", "soft_percent"),
+        ("pace", "poll_enabled"),
+        ("pace", "poll_min_interval_secs"),
+        ("pace.use_credits", "claude"),
+        ("pace.use_credits", "codex"),
+        ("optimize", "enabled"),
+        ("optimize", "sessions_sampled"),
+        ("optimize", "max_surface_bytes"),
+        ("optimize", "model"),
+        ("optimize", "recommend_tool_failure_rate"),
+        ("optimize", "recommend_corrections"),
+        ("optimize", "recommend_cooldown_secs"),
+        ("prompt", "enabled"),
+        ("prompt", "repo_layer"),
+        ("prompt", "max_repo_bytes"),
+        ("prompt", "harnesses"),
+        ("mail", "enabled"),
+        ("mail", "max_message_bytes"),
+        ("mail", "max_delivered_bytes"),
+        ("mail", "keep"),
+        ("memory", "enabled"),
+        ("memory", "harvest"),
+        ("memory", "max_entries"),
+        ("memory", "max_entry_bytes"),
+        ("memory", "max_injected_bytes"),
+        ("chrome", "banner"),
+        ("chrome", "bar"),
+        ("chrome", "events"),
+        ("dash", "enabled"),
+        ("dash", "sidebar_cols"),
+        ("dash", "roster_max_age_secs"),
+        ("dash", "max_panes"),
+        ("dash", "mouse"),
+    ];
+
+    /// The lines belonging to table `path` in a sample-config file like
+    /// `.zirv/ctx.toml`: from the line naming `[path]` (commented or not,
+    /// e.g. `# [pace.use_credits]`) up to (but excluding) the next such
+    /// header line, or from the top of the file up to the first header when
+    /// `path` is empty. Table-scoped so a key name that repeats across
+    /// tables (`enabled`, `model`) can't produce a false positive from an
+    /// unrelated section.
+    fn table_section(text: &str, path: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let is_header = |line: &str| {
+            line.trim_start()
+                .trim_start_matches('#')
+                .trim_start()
+                .starts_with('[')
+        };
+        let wanted = format!("[{path}]");
+        let start = if path.is_empty() {
+            0
+        } else {
+            let idx = lines
+                .iter()
+                .position(|l| {
+                    l.trim_start()
+                        .trim_start_matches('#')
+                        .trim_start()
+                        .starts_with(&wanted)
+                })
+                .unwrap_or_else(|| panic!("no [{path}] header found in the file"));
+            idx + 1
+        };
+        let end = lines[start..]
+            .iter()
+            .position(|l| is_header(l))
+            .map_or(lines.len(), |i| start + i);
+        lines[start..end].join("\n")
+    }
+
+    /// Whether `key` appears as its own assignment (`key = ...`) somewhere in
+    /// `section`, active or commented out. Only the key name is checked, not
+    /// the value, so this must not fail when someone edits a value.
+    fn section_has_key(section: &str, key: &str) -> bool {
+        section.lines().any(|line| {
+            line.trim_start()
+                .trim_start_matches('#')
+                .trim_start()
+                .starts_with(&format!("{key} ="))
+        })
+    }
+
+    /// The checked-in `.zirv/ctx.toml` is a sample-config reference: every
+    /// key is shown, commented out, at its built-in default, so it doubles
+    /// as documentation of what `CtxConfig` can be tuned to do without ever
+    /// actually setting anything (see the file's own header for why an
+    /// *active* default-valued key would be a real bug: the repo layer
+    /// merges on top of the operator's own global `~/.zirv/ctx.toml` in
+    /// `CtxConfig::load`, so an active key here would silently clobber a
+    /// real customization of the same key).
     ///
-    /// 1. `agents` is `#[serde(skip)]` and is always populated fresh by
-    ///    `AgentGate::load` at the end of `CtxConfig::load` (never left at
-    ///    `AgentGate::default()`'s empty state map, even with no settings
-    ///    files at all) -- so it can never equal `CtxConfig::default().agents`
-    ///    structurally, regardless of file content. This test copies the
-    ///    loaded `agents` onto the expected value and separately asserts the
-    ///    *behavior* it must have: both known adapters still enabled, since
-    ///    `.zirv/.settings.toml` only sets `enabled = true` (a no-op; a repo
-    ///    layer can only narrow).
-    /// 2. `chat.model` is deliberately NOT `REPO_FORBIDDEN` (see
-    ///    `ChatConfig`'s doc comment) and this repo's own `ctx.toml` already
-    ///    carries a real, previously-committed operator decision pinning the
-    ///    orchestrator to Fable -- preserved here rather than reverted, since
-    ///    destroying a documented prior decision would not serve the
-    ///    reference file's purpose either. Every other key in the file is the
-    ///    literal default.
+    /// Two things are pinned:
+    /// (a) the file still parses cleanly through the real repo-layer path,
+    ///     and `chat.model = "fable"` -- a real, previously-committed
+    ///     operator decision (see the file's own comment) and the one key
+    ///     that is deliberately NOT `REPO_FORBIDDEN`, see `ChatConfig`'s doc
+    ///     comment -- is the ONLY active, non-default value it produces;
+    /// (b) every key in `ALL_CONFIG_KEYS` still appears in the file text,
+    ///     active or commented, so the reference stays exhaustive as
+    ///     config.rs grows: this must fail only when a key is missing from
+    ///     the file entirely, never when someone edits a value.
     #[test]
-    fn the_repo_own_ctx_toml_parses_and_matches_defaults() {
+    fn the_repo_ctx_toml_parses_and_stays_exhaustive() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -2035,11 +2166,6 @@ mod tests {
         let cfg = CtxConfig::load(repo, &|k| empty.get(k).cloned())
             .expect("the repo's own .zirv/ctx.toml must parse cleanly");
 
-        assert!(
-            cfg.agents.is_enabled("claude") && cfg.agents.is_enabled("codex"),
-            "the repo's .settings.toml only sets enabled = true, a no-op"
-        );
-
         let expected = CtxConfig {
             agents: cfg.agents.clone(),
             chat: ChatConfig {
@@ -2047,17 +2173,29 @@ mod tests {
             },
             ..CtxConfig::default()
         };
-
         assert_eq!(
             cfg, expected,
-            "every key in .zirv/ctx.toml other than the documented chat.model \
-             override must be the literal CtxConfig default"
+            "chat.model must be the only active, non-default key in .zirv/ctx.toml"
         );
+
+        let path = repo
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join(CTX_CONFIG_FILE);
+        let text = std::fs::read_to_string(&path).expect("read .zirv/ctx.toml");
+        for (table, key) in ALL_CONFIG_KEYS {
+            let section = table_section(&text, table);
+            assert!(
+                section_has_key(&section, key),
+                "{}: key `{key}` missing from table `[{table}]` (active or commented)",
+                path.display()
+            );
+        }
     }
 
     /// Companion to the test above: `.zirv/.settings.toml` parses cleanly
-    /// through the real settings loader, and (per the fold) a repo-layer
-    /// `enabled = true` is a silent no-op, so both known agents stay enabled.
+    /// through the real settings loader. Every line in it is commented out
+    /// (sample-config style, same as ctx.toml), so both known agents stay
+    /// enabled at their default.
     #[test]
     fn the_repo_own_settings_toml_parses_without_error() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
