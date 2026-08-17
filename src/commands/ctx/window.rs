@@ -394,15 +394,14 @@ pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
     // Split the time from the offset: "Z", or the last '+'/'-' in the string.
     let (time, offset_secs) = if let Some(t) = rest.strip_suffix('Z') {
         (t, 0i64)
-    } else if let Some(idx) = rest.rfind(['+', '-']) {
+    } else {
+        let idx = rest.rfind(['+', '-'])?;
         let (t, off) = rest.split_at(idx);
         let sign = if off.starts_with('-') { -1i64 } else { 1i64 };
         let (oh, om) = off[1..].split_once(':')?;
         let oh: i64 = oh.parse().ok()?;
         let om: i64 = om.parse().ok()?;
         (t, sign * (oh * 3600 + om * 60))
-    } else {
-        return None;
     };
     let time = time.split_once('.').map_or(time, |(t, _frac)| t);
     let mut tp = time.split(':');
