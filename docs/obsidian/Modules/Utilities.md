@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-16
+last-verified: 2026-08-17
 ---
 
 # Utilities
@@ -53,7 +53,7 @@ Args (`OptimizeArgs`): `--agent` (adapter override), `--no-model` (skip the judg
 
 **Layers, in fixed order** (`v5` as of 2026-08-16; `v2` added the Adapter layer, `v3` added Harness, `v4` added Memory, `v5` added the Harnesses roster), each separated by a `---` divider — Mail and Command-line are not part of `compose` itself, added afterward by separate calls (see below):
 
-1. **Default** — `DEFAULT_PROMPT`, a zirv-authored, deliberately short, three-rule floor (follow the repo's own conventions and let a repository instruction file win over these defaults; prefer deterministic tool use; report failures honestly rather than describing unverified work as done).
+1. **Default** — `DEFAULT_PROMPT`, a zirv-authored, deliberately short, five-rule floor, `(v2)` as of 2026-08-17 (follow the repo's own conventions and let a repository instruction file win over these defaults; prefer deterministic tool use; report failures honestly rather than describing unverified work as done; verify once then trust the result instead of re-checking; keep scope to what was asked and prefer the simplest solution). For an adapter with no system-prompt mechanism (codex), `task_prompt_with_conventions_fallback` appends this same layer onto a headless worker's task prompt text — applied before the mail and report-back fallbacks at all six finalization sites, and unlike mail it respects `--simple` (conventions are zirv guidance; mail would otherwise be destroyed). See [[Ctx Adapters]] for the delivery-channel table.
 2. **Adapter** (spliced in right after Default, by `with_adapter_layer`, called from the supervisor after the adapter is known — `compose` itself doesn't see the adapter) — `AgentAdapter::base_system_prompt()`, agent-specific text naming that agent's own tools, so only that agent ever gets it. `None` by default; only the claude adapter currently overrides it.
 3. **Harness** (`HARNESS_PROMPT`, orchestrator only — `compose` inserts this itself, immediately after Default, when `role == PromptRole::Orchestrator`) — deterministic, agent-agnostic teaching about zirv as a meta-harness: self-initiative guidance (delegate via `zirv ctx agent`, poll `zirv ctx status`/`inbox` at checkpoints, steer via `send`/`nudge`, persist via `remember`/`recall`), exchanging notes via `zirv ctx send`/`inbox`, and zirv's own bounded cross-harness review policy. A `PromptRole::Worker` session never gets this layer, which is what keeps a delegated run from being taught to delegate further.
 4. **Harnesses** (the derived roster, orchestrator only, immediately after Harness — `PromptSource::Harnesses`, added 2026-08-16) — one line per registered adapter (`harness_lines`, rendered by the caller via `adapters::harness_prompt_lines`; see [[Ctx Adapters]]) naming whether each is enabled+ready and how to reach it with `zirv agent <name> "<prompt>"`, installed-but-not-ready, or disabled-and-where. Gated on both `role == Orchestrator` and `cfg.harnesses`, and a no-op when the rendered slice is empty.
