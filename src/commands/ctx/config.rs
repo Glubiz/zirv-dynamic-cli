@@ -2001,4 +2001,74 @@ mod tests {
         assert!(!cfg.agents.is_enabled("codex"));
         assert!(cfg.agents.is_enabled("claude"));
     }
+
+    /// The checked-in `.zirv/ctx.toml` is a fully-enumerated reference file:
+    /// every key is written at its exact default. It pins config.rs's
+    /// defaults against drift -- if a `Default` impl changes here, this test
+    /// fails and the file must be updated to match.
+    ///
+    /// Two adjustments to a literal "equals `CtxConfig::default()`":
+    ///
+    /// 1. `agents` is `#[serde(skip)]` and is always populated fresh by
+    ///    `AgentGate::load` at the end of `CtxConfig::load` (never left at
+    ///    `AgentGate::default()`'s empty state map, even with no settings
+    ///    files at all) -- so it can never equal `CtxConfig::default().agents`
+    ///    structurally, regardless of file content. This test copies the
+    ///    loaded `agents` onto the expected value and separately asserts the
+    ///    *behavior* it must have: both known adapters still enabled, since
+    ///    `.zirv/.settings.toml` only sets `enabled = true` (a no-op; a repo
+    ///    layer can only narrow).
+    /// 2. `chat.model` is deliberately NOT `REPO_FORBIDDEN` (see
+    ///    `ChatConfig`'s doc comment) and this repo's own `ctx.toml` already
+    ///    carries a real, previously-committed operator decision pinning the
+    ///    orchestrator to Fable -- preserved here rather than reverted, since
+    ///    destroying a documented prior decision would not serve the
+    ///    reference file's purpose either. Every other key in the file is the
+    ///    literal default.
+    #[test]
+    fn the_repo_own_ctx_toml_parses_and_matches_defaults() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo, &|k| empty.get(k).cloned())
+            .expect("the repo's own .zirv/ctx.toml must parse cleanly");
+
+        assert!(
+            cfg.agents.is_enabled("claude") && cfg.agents.is_enabled("codex"),
+            "the repo's .settings.toml only sets enabled = true, a no-op"
+        );
+
+        let expected = CtxConfig {
+            agents: cfg.agents.clone(),
+            chat: ChatConfig {
+                model: Some("fable".to_string()),
+            },
+            ..CtxConfig::default()
+        };
+
+        assert_eq!(
+            cfg, expected,
+            "every key in .zirv/ctx.toml other than the documented chat.model \
+             override must be the literal CtxConfig default"
+        );
+    }
+
+    /// Companion to the test above: `.zirv/.settings.toml` parses cleanly
+    /// through the real settings loader, and (per the fold) a repo-layer
+    /// `enabled = true` is a silent no-op, so both known agents stay enabled.
+    #[test]
+    fn the_repo_own_settings_toml_parses_without_error() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty: HashMap<String, String> = HashMap::new();
+        let gate = crate::settings::AgentGate::load(repo, &|k| empty.get(k).cloned())
+            .expect("the repo's own .zirv/.settings.toml must parse cleanly");
+
+        assert!(gate.is_enabled("claude"));
+        assert!(gate.is_enabled("codex"));
+    }
 }

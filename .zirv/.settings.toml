@@ -1,0 +1,20 @@
+# Repo-layer zirv agent settings (untrusted layer): a repository checkout may
+# only DISABLE an agent here, never enable one. `enabled = true` in this file
+# is a silent no-op -- the operator's own ~/.zirv/.settings.toml or the
+# ZIRV_AGENT_<NAME>_ENABLED environment variable is the only place an agent
+# can actually be enabled. See src/settings.rs for the exact fold:
+#
+#   final(name) = env(name) if set
+#               else home(name).unwrap_or(true) && repo(name).unwrap_or(true)
+#
+# Every agent known to this build's adapter registry (src/commands/ctx/
+# adapters/mod.rs::ADAPTERS) is listed below at its default enablement
+# (true). Flip a value to `false` to disable that agent from this checkout;
+# do not set `true` expecting to re-enable an agent an operator disabled
+# elsewhere -- it will not take effect (see the fold above).
+
+[agents.claude]
+enabled = true
+
+[agents.codex]
+enabled = true
