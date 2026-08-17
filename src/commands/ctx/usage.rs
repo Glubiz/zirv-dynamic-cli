@@ -333,7 +333,18 @@ pub fn run_with<W: Write>(
                     cfg.pace.collector_max_age_secs,
                 );
             }
-            let poll_reading = poll::maybe_poll(&state, &cfg.pace, now, provider, &http_poller);
+            // Gated on `pace.enabled` (review finding): pacing disabled means
+            // zirv makes no proactive vendor request on this operator's
+            // behalf -- `ZIRV_CTX_PACE=false` must not still send an OAuth
+            // token to a usage endpoint. Passive sources above still refresh;
+            // only the active poll is withheld. The gate paths need no such
+            // check here because `wait_for_window` already returns before its
+            // own `refresh_sources` when pacing is off.
+            let poll_reading = if cfg.pace.enabled {
+                poll::maybe_poll(&state, &cfg.pace, now, provider, &http_poller)
+            } else {
+                None
+            };
 
             // Check whether anything has been recorded for this provider,
             // now that the refresh above has had its chance to acquire some.

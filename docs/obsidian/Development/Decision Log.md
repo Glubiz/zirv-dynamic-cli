@@ -24,6 +24,13 @@ last-verified: 2026-08-17
 
 ## Decisions
 
+### 2026-08-17 — Final review round: `pace.enabled` is a master off-switch for the active poll; the failed-poll announcement ships as a recorded deviation
+**Context:** The whole-branch review found a spec promise (one-time announcement on a failed poll attempt) that the shipped `maybe_poll` cannot deliver without a return-type change; the cross-harness `/code-review` verifier confirmed `zirv ctx usage` polled (blocking, authenticated) even under `ZIRV_CTX_PACE=false`, because `maybe_poll` gates only on `poll_enabled`.
+**Decision:** The usage verb now gates its `maybe_poll` call on `cfg.pace.enabled` directly — pacing disabled means zirv sends no proactive vendor request from any surface (`wait_for_window` already returned early). The missing failed-poll announcement is recorded in [[Known Issues]] as a deliberate deviation instead of a rushed patch: doing it right wants `maybe_poll` to distinguish "did not poll" from "polled and failed", plus a mockable transport to test it.
+**Rejected:** Announcing from inside `poll.rs` via a process-global — the announcer lives with the callers, and a global latch bypasses the per-run `PaceGateFlags` discipline every other announcement follows.
+**Spec / link:** [[Usage and Pacing]], [[Known Issues]]; `docs/superpowers/specs/2026-08-16-usage-credits-throttle-design.md`.
+
+
 ### 2026-08-16 — Hybrid usage source: passive collector primary, active HTTP poll fallback-only; `ureq` is this crate's first HTTP dependency
 **Context:** The passive collector (statusline tee for claude, rollout-file scan for codex) can go stale between observations — nothing refreshes it if a session is idle, or if the statusline was never wired up at all. A real vendor usage API exists for both providers, but calling it proactively on every gate check would spend a network round-trip (and the operator's own OAuth token) on every supervised cycle, including the overwhelming majority where the passive reading is already fresh.
 **Decision:** `poll.rs`'s `HttpPoller` (behind the new `UsagePoller` trait, so every test stubs it) is consulted only through `maybe_poll`, which is a no-op whenever the stored reading is already fresher than `collector_max_age_secs`, and otherwise floored to at most one attempt per `poll_min_interval_secs` (default 60s) via a per-provider marker file, written on both success and failure. `ureq = "3"` was chosen for the one blocking GET this needs — no async runtime coupling for an occasional call — pulling in `rustls`/`ring` rather than a system TLS dependency.
