@@ -1259,6 +1259,11 @@ mod tests {
                 "ZIRV_CTX_AGENT_BIN".to_string(),
                 "Z:/nonexistent/agent-bin".to_string(),
             ),
+            // Pacing off: with the claude exemption gone from
+            // `has_no_usage_source`, this empty state dir would otherwise
+            // make the gate write its one no-source skip line into `out`,
+            // and this test's whole proof is that `out` stayed empty.
+            ("ZIRV_CTX_PACE".to_string(), "false".to_string()),
         ]
         .into();
         env.insert(

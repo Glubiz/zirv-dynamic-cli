@@ -6259,7 +6259,22 @@ mod tests {
         cfg.mail.enabled = false;
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
         let prompt = worker_task_prompt(&req, &adapter, &[], &cfg, fallback_is_safe);
-        assert_eq!(prompt, "do the work");
+        // The conventions layer still rides along when the fallback channel
+        // is safe (it is gated on the prompt config and the shim guard, not
+        // on mail) -- `fallback_is_safe` is platform-dependent: false on a
+        // Windows cmd-shim resolution, true on a plain binary. What disabled
+        // mail must omit either way is the report-back instruction, which
+        // only makes sense as mail.
+        assert!(prompt.starts_with("do the work"), "got {prompt}");
+        assert_eq!(
+            prompt.contains("zirv session conventions (v2)"),
+            fallback_is_safe,
+            "conventions ride the fallback exactly when it is safe: {prompt}"
+        );
+        assert!(
+            !prompt.contains("--to-session"),
+            "no report-back instruction when mail is disabled: {prompt}"
+        );
     }
 
     /// Runs `fulfill_spawn_request` against an empty pane list. Every
