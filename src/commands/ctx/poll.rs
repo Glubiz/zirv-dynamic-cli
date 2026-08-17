@@ -18,6 +18,11 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
 #[allow(dead_code)]
 const HTTP_TIMEOUT_SECS: u64 = 10;
+/// Distinct from the overall/body timeout above: an unreachable endpoint
+/// must not hold a supervisor's cycle-launch gate for up to `HTTP_TIMEOUT_
+/// SECS` per attempt just to fail to connect.
+#[allow(dead_code)]
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 3;
 
 // `maybe_poll`/`UsagePoller` are wired into the pacing gate
 // (`pace::refresh_sources`, all four `wait_for_window` call sites) and into
@@ -47,6 +52,29 @@ pub trait UsagePoller {
 /// security constraint).
 #[allow(dead_code)]
 pub struct HttpPoller;
+
+/// Built once and reused for every call: constructing a `ureq::Agent`
+/// spins up a fresh rustls config and root store, which is wasted work on
+/// every `HttpPoller::poll` call otherwise. The connect timeout is kept
+/// short (`HTTP_CONNECT_TIMEOUT_SECS`) and distinct from the overall/body
+/// timeout (`HTTP_TIMEOUT_SECS`) so an unreachable endpoint fails fast
+/// instead of blocking a supervisor's cycle-launch gate for up to 10s per
+/// attempt.
+#[allow(dead_code)]
+static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+
+#[allow(dead_code)]
+fn shared_agent() -> &'static ureq::Agent {
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS)))
+            .timeout_connect(Some(std::time::Duration::from_secs(
+                HTTP_CONNECT_TIMEOUT_SECS,
+            )))
+            .build()
+            .into()
+    })
+}
 
 #[allow(dead_code)]
 fn parse_anthropic_usage(body: &str, now: u64) -> Option<PollReading> {
@@ -148,10 +176,7 @@ impl UsagePoller for HttpPoller {
             super::window::CODEX_USAGE_PROVIDER => (CODEX_USAGE_URL, codex_token()?, None),
             _ => return None,
         };
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS)))
-            .build()
-            .into();
+        let agent = shared_agent();
         let mut req = agent
             .get(url)
             .header("Authorization", &format!("Bearer {token}"));
@@ -379,6 +404,20 @@ mod tests {
             *failing.calls.borrow(),
             1,
             "a failed attempt still floors the next poll"
+        );
+    }
+
+    /// Item 3 (review): the shared agent is built once and reused. No live
+    /// HTTP is exercised here -- constructing the `ureq::Agent` config and
+    /// confirming the `OnceLock` hands back the same instance on repeat
+    /// calls is the cheapest honest probe available without a real request.
+    #[test]
+    fn the_shared_agent_is_constructed_once_and_reused() {
+        let first = shared_agent() as *const ureq::Agent;
+        let second = shared_agent() as *const ureq::Agent;
+        assert_eq!(
+            first, second,
+            "repeat calls must reuse the same agent instance, not rebuild one"
         );
     }
 

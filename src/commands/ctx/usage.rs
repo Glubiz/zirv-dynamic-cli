@@ -348,7 +348,20 @@ pub fn run_with<W: Write>(
 
             // Check whether anything has been recorded for this provider,
             // now that the refresh above has had its chance to acquire some.
-            if window::has_no_usage_source(&state, provider) {
+            //
+            // Item 4 (review): a fresh claude machine has no usage source
+            // either -- there is no active poll for anthropic, only the
+            // statusline tee, and it has never run yet. The generic
+            // "<provider>: no usage source" line used to be printed for
+            // every provider alike here, which made `report`'s "not
+            // reported ... wire your statusline through `zirv ctx usage
+            // tee`" guidance unreachable exactly where it used to help.
+            // Anthropic alone falls through to the old, richer report;
+            // every other provider (no collector, no guidance to give)
+            // keeps the plain line.
+            if window::has_no_usage_source(&state, provider)
+                && provider != window::LEGACY_USAGE_PROVIDER
+            {
                 writeln!(w, "{provider}: no usage source")?;
                 return Ok(0);
             }
@@ -973,6 +986,51 @@ mod tests {
         assert_eq!(code, 0);
         let printed = String::from_utf8(out).expect("utf8");
         assert_eq!(printed, "openai: no usage source\n");
+    }
+
+    /// Item 4 (review): a fresh claude machine -- nothing ever recorded for
+    /// anthropic, no legacy file either -- must still fall through to
+    /// `report`'s own "not reported ... wire your statusline through `zirv
+    /// ctx usage tee`" guidance, not the generic "<provider>: no usage
+    /// source" line the codex/openai branches above correctly use (there is
+    /// nothing more helpful to say for a provider with no collector at
+    /// all). Explicit `ZIRV_CTX_AGENT=claude` so this does not depend on
+    /// which adapter `resolve_default` happens to pick on the test machine.
+    #[test]
+    fn a_fresh_claude_machine_still_gets_the_tee_guidance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                tmp.path().join("state").display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "claude".to_string()),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            !printed.starts_with("anthropic: no usage source"),
+            "the generic no-source line must not shadow the tee guidance: {printed}"
+        );
+        assert!(
+            printed.contains("not reported"),
+            "the old report format is still shown: {printed}"
+        );
+        assert!(
+            printed.contains("zirv ctx usage tee"),
+            "the actionable tee-wiring hint must still be reachable: {printed}"
+        );
     }
 
     /// Final wave item 4: no `agent` configured anywhere, and claude

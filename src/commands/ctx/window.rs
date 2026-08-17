@@ -373,7 +373,19 @@ pub fn estimate_windows(
 pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
     let (date, rest) = s.split_once('T')?;
     let mut dp = date.split('-');
-    let y: i64 = dp.next()?.parse().ok()?;
+    // Bounded the same way `parse_iso8601_utc` is bounded: exactly 4 digits,
+    // so `days_from_civil(y, ..) * 86_400` can never see a year absurd enough
+    // to overflow `i64` and panic in debug builds. Reachable from wrap's
+    // status-bar redraw via the codex rollout scan, so this must degrade to
+    // `None`, never panic.
+    let y_field = dp.next()?;
+    if y_field.len() != 4 || !y_field.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = y_field.parse().ok()?;
+    if !(1970..=9999).contains(&y) {
+        return None;
+    }
     let mo: u64 = dp.next()?.parse().ok()?;
     let d: u64 = dp.next()?.parse().ok()?;
     if dp.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
@@ -590,7 +602,12 @@ pub fn refresh_codex_usage(
     let Some(fresh) = scan_codex_rollouts(dir, ROLLOUT_SCAN_FILES, now) else {
         return;
     };
-    let merged = merge(existing.unwrap_or_default(), fresh);
+    let merged = merge(existing.clone().unwrap_or_default(), fresh);
+    if Some(&merged) == existing.as_ref() {
+        // The scan produced nothing newer than what is already stored:
+        // rewriting an identical file on every refresh is pure churn.
+        return;
+    }
     let _ = store_for(state, CODEX_USAGE_PROVIDER, &merged);
 }
 
@@ -1505,5 +1522,72 @@ mod tests {
         )
         .expect("store");
         assert!(!has_no_usage_source(&state2, "anthropic"));
+    }
+
+    /// Item 1 (review): an absurd year must never reach `days_from_civil`'s
+    /// multiplication, which overflows `i64` and panics in debug builds.
+    /// Reachable from wrap's status-bar redraw via the codex rollout scan.
+    #[test]
+    fn an_absurd_year_is_rejected_not_overflowed() {
+        assert_eq!(
+            parse_rfc3339_utc("999999999999-01-01T00:00:00Z"),
+            None,
+            "must reject, never panic"
+        );
+        assert_eq!(parse_rfc3339_utc("99999-01-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_utc("1969-12-31T23:59:59Z"), None);
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert!(parse_rfc3339_utc("9999-12-31T23:59:59Z").is_some());
+
+        // Same absurd year, carried through a full rollout line: must yield
+        // `None` end to end, never panic.
+        let line = r#"{"timestamp":"999999999999-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":1.0,"window_minutes":300,"resets_at":1}}}}"#;
+        assert_eq!(parse_rollout_line(line), None);
+    }
+
+    /// Item 2 (review): `refresh_codex_usage` must not rewrite the stored
+    /// file when a scan produces exactly what is already on disk -- that is
+    /// pure churn on every passive refresh. Proven via the file's mtime: a
+    /// real `store_for` always renames a fresh temp file over the target,
+    /// which would move the mtime forward.
+    #[test]
+    fn refresh_skips_the_store_when_the_merge_produces_no_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        let sessions_dir = tmp.path().join("codex_sessions");
+        let day = sessions_dir.join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let test_json = r#"{"timestamp":"2026-02-26T18:52:21Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.0,"window_minutes":300,"resets_at":1772135737}}}}"#;
+        std::fs::write(day.join("rollout.jsonl"), format!("{}\n", test_json)).unwrap();
+        let line_ts = parse_rfc3339_utc("2026-02-26T18:52:21Z").expect("test timestamp parses");
+
+        // Seed the store with exactly what a scan of this file produces, so
+        // the merge that follows is a genuine no-op.
+        let scanned = scan_codex_rollouts(&sessions_dir, ROLLOUT_SCAN_FILES, line_ts + 60)
+            .expect("scan finds the seeded snapshot");
+        store_for(&state, CODEX_USAGE_PROVIDER, &scanned).expect("seed store");
+
+        let usage_path = state.usage_for(CODEX_USAGE_PROVIDER);
+        // Back-date the file's mtime so a rewrite would be observable.
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let f = std::fs::File::options()
+            .append(true)
+            .open(&usage_path)
+            .unwrap();
+        f.set_modified(old_mtime).unwrap();
+        let before = std::fs::metadata(&usage_path).unwrap().modified().unwrap();
+
+        // `now` is far enough past the seeded observation that the existing
+        // reading counts as stale, forcing the function past the early
+        // freshness return and into the scan-and-merge path.
+        let now = line_ts + 60 + 10_000;
+        refresh_codex_usage(&state, Some(sessions_dir.as_path()), now, 900);
+
+        let after = std::fs::metadata(&usage_path).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "store_for must be skipped when the merge is unchanged"
+        );
     }
 }
