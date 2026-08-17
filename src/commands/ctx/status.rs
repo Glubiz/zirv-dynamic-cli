@@ -228,8 +228,16 @@ pub fn run_with<W: Write>(
             writeln!(w, "\nusage windows: {provider}: no usage source")?;
         }
         Some(provider) => {
-            let windows =
-                crate::commands::ctx::window::load_for(&state, provider).unwrap_or_default();
+            // A window whose `resets_at` has provably passed (or, absent a
+            // `resets_at`, that has outlived its own span) says nothing about
+            // current usage, so it is filtered out before `describe` ever
+            // sees it -- the same rule `wrap`'s status bar and the dashboard
+            // header apply, so all three usage surfaces agree on what
+            // "unknown" means.
+            let windows = crate::commands::ctx::window::available(
+                &crate::commands::ctx::window::load_for(&state, provider).unwrap_or_default(),
+                crate::commands::ctx::state::now_secs(),
+            );
             let describe =
                 |name: &str, window: Option<&crate::commands::ctx::window::Window>| match window {
                     Some(found) => format!("{name} {:.0}%", found.used_percentage),
@@ -565,7 +573,12 @@ mod tests {
             &crate::commands::ctx::window::UsageWindows {
                 five_hour: Some(crate::commands::ctx::window::Window {
                     used_percentage: 77.0,
-                    resets_at: 1_785_509_000,
+                    // A window still ahead of us in wall-clock time, not a
+                    // fixed timestamp from whenever this test was written --
+                    // `available` now filters on real `now_secs()`, so a
+                    // hardcoded past instant would eventually go stale and
+                    // start failing this test for reasons unrelated to it.
+                    resets_at: crate::commands::ctx::state::now_secs() + 1000,
                     observed_at: crate::commands::ctx::state::now_secs(),
                 }),
                 seven_day: None,
@@ -581,6 +594,46 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("usage"), "got {text}");
         assert!(text.contains("77"), "got {text}");
+    }
+
+    /// The fourth surface change: a window whose `resets_at` has provably
+    /// passed must read as "unknown", the same wording the line already uses
+    /// for a genuinely absent window -- never a stale percent presented as
+    /// current.
+    #[test]
+    fn status_shows_unknown_for_a_usage_window_that_has_expired() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        crate::commands::ctx::window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 77.0,
+                    resets_at: 1, // long past any real wall clock
+                    observed_at: 1,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("77"),
+            "an expired window must not render as a current percent: {text}"
+        );
+        assert!(
+            text.contains("five_hour unknown"),
+            "expired reads the same as never-recorded: {text}"
+        );
     }
 
     /// The third of the three usage surfaces this fixes (alongside `zirv ctx

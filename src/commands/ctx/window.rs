@@ -147,20 +147,30 @@ pub fn age_secs(window: &Window, now: u64) -> u64 {
     now.saturating_sub(window.observed_at)
 }
 
-/// The worse (higher) of the two subscription windows' `used_percentage`,
-/// or `None` when neither is known. Shared by wrap's status bar
-/// (`wrap.rs`'s `redraw_bar_if_due`) and the dashboard's header
-/// (`dash::mod::refresh_if_due`) so the two never compute this figure
-/// differently.
-pub fn max_used_percentage(windows: &UsageWindows) -> Option<f64> {
-    windows
-        .five_hour
-        .iter()
-        .chain(windows.seven_day.iter())
-        .map(|w| w.used_percentage)
-        .fold(None, |acc: Option<f64>, p| {
-            Some(acc.map_or(p, |a| a.max(p)))
-        })
+/// Keeps each window slot only if it is still *available*, dropping the rest.
+/// A window whose `resets_at` has certainly passed says nothing about current
+/// usage -- the vendor has already rolled it over -- so it is dropped. A
+/// window still inside its own live span (`resets_at` unknown, i.e. `0`, but
+/// observed no longer ago than the slot's own length) is kept: within a live
+/// window a vendor-reported percent is still an honest lower bound on current
+/// usage, even without a reset timestamp to confirm it. Each slot is judged
+/// independently, so a stale five_hour reading never drops a still-live
+/// seven_day one, or vice versa. Pure: `now` is always the caller's own unix
+/// second, never read internally.
+pub fn available(windows: &UsageWindows, now: u64) -> UsageWindows {
+    fn keep(window: Option<Window>, span: u64, now: u64) -> Option<Window> {
+        let w = window?;
+        let is_available = if w.resets_at != 0 {
+            w.resets_at >= now
+        } else {
+            age_secs(&w, now) <= span
+        };
+        is_available.then_some(w)
+    }
+    UsageWindows {
+        five_hour: keep(windows.five_hour, FIVE_HOUR_SECS, now),
+        seven_day: keep(windows.seven_day, SEVEN_DAY_SECS, now),
+    }
 }
 
 pub const FIVE_HOUR_SECS: u64 = 5 * 3600;
@@ -674,47 +684,93 @@ mod tests {
         );
     }
 
-    fn window_at_pct(pct: f64) -> Window {
-        Window {
-            used_percentage: pct,
-            resets_at: 0,
-            observed_at: 0,
-        }
-    }
-
     #[test]
-    fn max_used_percentage_is_none_when_neither_window_is_known() {
-        assert_eq!(max_used_percentage(&UsageWindows::default()), None);
-    }
-
-    #[test]
-    fn max_used_percentage_picks_the_worse_of_the_two_windows() {
+    fn available_drops_a_window_whose_resets_at_has_certainly_passed() {
         let windows = UsageWindows {
-            five_hour: Some(window_at_pct(20.0)),
-            seven_day: Some(window_at_pct(75.0)),
-        };
-        assert_eq!(max_used_percentage(&windows), Some(75.0));
-
-        let flipped = UsageWindows {
-            five_hour: Some(window_at_pct(90.0)),
-            seven_day: Some(window_at_pct(10.0)),
-        };
-        assert_eq!(max_used_percentage(&flipped), Some(90.0));
-    }
-
-    #[test]
-    fn max_used_percentage_falls_back_to_whichever_window_is_present() {
-        let five_only = UsageWindows {
-            five_hour: Some(window_at_pct(42.0)),
+            five_hour: Some(Window {
+                used_percentage: 14.0,
+                resets_at: 1000,
+                observed_at: 500,
+            }),
             seven_day: None,
         };
-        assert_eq!(max_used_percentage(&five_only), Some(42.0));
+        let out = available(&windows, 1001);
+        assert_eq!(
+            out.five_hour, None,
+            "resets_at in the past means the reading says nothing about now"
+        );
+    }
 
-        let seven_only = UsageWindows {
-            five_hour: None,
-            seven_day: Some(window_at_pct(13.0)),
+    #[test]
+    fn available_keeps_a_window_whose_resets_at_is_still_in_the_future() {
+        let windows = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 14.0,
+                resets_at: 1000,
+                observed_at: 500,
+            }),
+            seven_day: None,
         };
-        assert_eq!(max_used_percentage(&seven_only), Some(13.0));
+        let out = available(&windows, 999);
+        assert_eq!(out.five_hour, windows.five_hour);
+    }
+
+    #[test]
+    fn available_keeps_a_zero_resets_at_window_that_is_still_fresh() {
+        let windows = UsageWindows {
+            five_hour: None,
+            seven_day: Some(Window {
+                used_percentage: 20.0,
+                resets_at: 0,
+                observed_at: 1000,
+            }),
+        };
+        // Just inside the seven_day span from observation.
+        let out = available(&windows, 1000 + SEVEN_DAY_SECS);
+        assert_eq!(out.seven_day, windows.seven_day);
+    }
+
+    #[test]
+    fn available_drops_a_zero_resets_at_window_older_than_its_span() {
+        let windows = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 20.0,
+                resets_at: 0,
+                observed_at: 1000,
+            }),
+            seven_day: None,
+        };
+        // One second past the five_hour span from observation.
+        let out = available(&windows, 1000 + FIVE_HOUR_SECS + 1);
+        assert_eq!(
+            out.five_hour, None,
+            "no resets_at and older than the window's own span is stale, not honest"
+        );
+    }
+
+    #[test]
+    fn available_judges_each_slot_independently() {
+        let windows = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 14.0,
+                resets_at: 100,
+                observed_at: 0,
+            }),
+            seven_day: Some(Window {
+                used_percentage: 20.0,
+                resets_at: 100_000,
+                observed_at: 0,
+            }),
+        };
+        let out = available(&windows, 5000);
+        assert_eq!(
+            out.five_hour, None,
+            "the expired five_hour reading must not survive"
+        );
+        assert_eq!(
+            out.seven_day, windows.seven_day,
+            "a stale five_hour slot must not drop a still-live seven_day slot"
+        );
     }
 
     #[test]
