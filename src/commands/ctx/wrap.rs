@@ -1452,7 +1452,11 @@ const BAR_THROTTLE: Duration = Duration::from_secs(1);
 /// redraw cadence: a rollout scan is a real filesystem walk, not a single
 /// stat call, so it must not run on every redraw tick just because the bar
 /// text happened to change. Never HTTP -- see `redraw_bar_if_due`.
-const CODEX_BAR_SCAN_SECS: u64 = 60;
+///
+/// Item 5: shared with `pace::refresh_sources`'s own codex scan floor via
+/// `window::CODEX_SCAN_FLOOR_SECS` rather than a second, independently
+/// numbered constant.
+use super::window::CODEX_SCAN_FLOOR_SECS as CODEX_BAR_SCAN_SECS;
 
 /// Item 2 (regression fix): applies a `ResizeDecision::disables_bar` outcome
 /// to `bar`'s own bookkeeping. The dims move to the *current* size *before*

@@ -483,6 +483,13 @@ pub fn parse_rollout_line(line: &str) -> Option<UsageWindows> {
 #[allow(dead_code)]
 pub const CODEX_USAGE_PROVIDER: &str = "openai";
 
+/// Floor between codex rollout-tree scan *attempts*, shared by
+/// `pace::refresh_sources` (item 5: a parked codex session's wait loop must
+/// not re-walk `~/.codex/sessions` on every 30s recheck) and `wrap.rs`'s
+/// status-bar refresh (`redraw_bar_if_due`, formerly its own private
+/// `CODEX_BAR_SCAN_SECS`) -- one constant so the two floors cannot drift.
+pub(crate) const CODEX_SCAN_FLOOR_SECS: u64 = 60;
+
 /// Rollout files grow large; only the tail can hold the newest snapshot.
 #[allow(dead_code)]
 const ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;

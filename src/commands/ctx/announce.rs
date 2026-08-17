@@ -79,6 +79,18 @@ pub enum Event {
     /// codex session does not wonder why no pacing lines ever appear, and
     /// does not mistake the silence for "usage is healthy".
     PacingSkipped { provider: String },
+    /// Item 4: the pacing gate is inside the soft-throttle band, delaying
+    /// cycles rather than hard-pausing (`PaceDecision::Slow`). Unlike
+    /// `PacingWait`, this is a recurring per-cycle delay rather than a wait
+    /// to an absolute deadline, so `delay_secs` is a snapshot of the delay
+    /// at the moment this throttle episode latched, not a live countdown.
+    /// Emitted once per latched episode, the same discipline `PacingWait`
+    /// already follows.
+    PacingThrottled {
+        window: String,
+        delay_secs: u64,
+        percent: f64,
+    },
     /// Supervision degraded to permanent passthrough, naming what caused it.
     Degraded { cause: String },
     /// Context health is slipping (the rot advisory `wrap`'s pump used to
@@ -210,6 +222,13 @@ impl Event {
             Event::PacingSkipped { provider } => {
                 format!("pacing off: {provider} has no usage source")
             }
+            Event::PacingThrottled {
+                window,
+                delay_secs,
+                percent,
+            } => format!(
+                "pacing: throttling the {window} window at {percent:.1}%, ~{delay_secs}s before the next run"
+            ),
             Event::Degraded { cause } => format!("supervision degraded: {cause}"),
             Event::RotAdvisory { score, tokens } => format!(
                 "context health is slipping (score {score}, {tokens} tokens in context); a \
@@ -482,6 +501,22 @@ mod tests {
         assert!(line.contains("no usage source"), "got {line}");
     }
 
+    /// Item 4: `Slow` used to be invisible on the `zirv ▸` channel -- only
+    /// `PacingWait` (the hard pause) ever announced anything, so a
+    /// potentially hours-long soft throttle produced no visible line at all.
+    #[test]
+    fn a_pacing_throttled_announcement_names_the_window_delay_and_percent() {
+        let event = Event::PacingThrottled {
+            window: "five_hour".to_string(),
+            delay_secs: 473,
+            percent: 90.0,
+        };
+        let line = event.line();
+        assert!(line.contains("five_hour"), "got {line}");
+        assert!(line.contains("473"), "got {line}");
+        assert!(line.contains("90.0"), "got {line}");
+    }
+
     #[test]
     fn a_mail_delivery_announcement_counts_the_notes_it_added() {
         let one = Event::MailDelivered { count: 1 };
@@ -643,6 +678,11 @@ mod tests {
             },
             Event::PacingSkipped {
                 provider: "openai".to_string(),
+            },
+            Event::PacingThrottled {
+                window: "five_hour".to_string(),
+                delay_secs: 100,
+                percent: 85.0,
             },
             Event::Degraded {
                 cause: "x".to_string(),
