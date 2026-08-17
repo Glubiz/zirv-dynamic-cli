@@ -588,9 +588,14 @@ mod tests {
     /// used to read the one machine-wide file regardless of which adapter
     /// this repo is actually configured for, so a codex-only repo's `zirv
     /// ctx status` could show a stale claude session's Anthropic percentages
-    /// as its own. Codex has no usage collector at all
-    /// (`window::has_no_usage_source`), so the honest line names that
-    /// instead of a number.
+    /// as its own. When nothing has been recorded for a provider
+    /// (`window::has_no_usage_source`), the status shows "no source" instead
+    /// of a number. Task 6 wired an active source refresh ahead of this same
+    /// check in the pacing gate (`pace::wait_for_window`'s own
+    /// `refresh_sources`) and in `zirv ctx usage`'s own report -- this
+    /// `status` readout does not itself refresh anything, so it still shows
+    /// whatever either of those two paths (or the statusline tee) last
+    /// stored.
     #[test]
     fn status_shows_no_usage_source_for_a_codex_configured_repo_rather_than_anthropic_numbers() {
         let tmp = tempfile::tempdir().expect("tempdir");

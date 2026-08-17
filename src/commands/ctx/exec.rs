@@ -682,8 +682,16 @@ pub fn run_with<W: Write>(
             "no command to supervise; pass the agent command after --, \
              or --prompt to have zirv build the launch itself",
         )?;
+        let prompt_text = if composed.is_some() {
+            super::prompt::task_prompt_with_conventions_fallback(
+                prompt_text,
+                system_prompt_supported,
+            )
+        } else {
+            prompt_text.to_string()
+        };
         let prompt_text = super::prompt::task_prompt_with_mail_fallback(
-            prompt_text,
+            &prompt_text,
             system_prompt_supported,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
@@ -736,7 +744,8 @@ pub fn run_with<W: Write>(
     // check and, on a usage-limit park, the second call further down), so
     // the no-usage-source skip line and `PacingSkipped` announce once for
     // the whole run rather than once per restart.
-    let mut pace_no_source_announced = false;
+    let mut pace_flags = pace::PaceGateFlags::default();
+    let http_poller = super::poll::HttpPoller;
 
     loop {
         pace::wait_for_window(
@@ -749,7 +758,14 @@ pub fn run_with<W: Write>(
             &sleep_fn,
             Some(&announcer),
             adapter.provider(),
-            &mut pace_no_source_announced,
+            pace::PaceGate {
+                use_credits: cfg.pace.use_credits.for_provider(adapter.provider()),
+                poller: cfg
+                    .pace
+                    .poll_enabled
+                    .then_some(&http_poller as &dyn super::poll::UsagePoller),
+            },
+            &mut pace_flags,
         );
 
         // P2/P3: `_child_guard` holds this cycle's child in the console-close
@@ -1018,6 +1034,14 @@ pub fn run_with<W: Write>(
             )?;
 
             let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+            let combined = if composed.is_some() {
+                super::prompt::task_prompt_with_conventions_fallback(
+                    &combined,
+                    system_prompt_supported,
+                )
+            } else {
+                combined
+            };
             // A nudge relaunch re-lists mail fresh (`nudge_mail_msgs` above),
             // so the fallback for an uninjectable adapter has to use that
             // same fresh listing, not the launch-time `mail_messages`.
@@ -1068,7 +1092,18 @@ pub fn run_with<W: Write>(
                 &sleep_fn,
                 Some(&announcer),
                 adapter.provider(),
-                &mut pace_no_source_announced,
+                pace::PaceGate {
+                    // A vendor-reported limit hit parks even with use_credits
+                    // enabled: the vendor limiting us means credits are
+                    // exhausted or not actually enabled plan-side, and an
+                    // immediate relaunch would just re-hit it.
+                    use_credits: false,
+                    poller: cfg
+                        .pace
+                        .poll_enabled
+                        .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                },
+                &mut pace_flags,
             );
 
             let Some(prompt_text) = prompt.clone() else {
@@ -1105,6 +1140,14 @@ pub fn run_with<W: Write>(
                 .cloned()
                 .chain(prompt_args.iter().cloned())
                 .collect();
+            let prompt_text = if composed.is_some() {
+                super::prompt::task_prompt_with_conventions_fallback(
+                    &prompt_text,
+                    system_prompt_supported,
+                )
+            } else {
+                prompt_text
+            };
             // A park does not itself re-list mail (matching every other
             // value it reuses here), so the fallback for an uninjectable
             // adapter reuses whatever `mail_messages` currently holds --
@@ -1255,6 +1298,11 @@ pub fn run_with<W: Write>(
             adapter.capabilities().system_prompt,
         ));
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
+        let combined = if composed.is_some() {
+            super::prompt::task_prompt_with_conventions_fallback(&combined, system_prompt_supported)
+        } else {
+            combined
+        };
         // A rot/timeout restart, like a park, does not itself re-list mail,
         // so the fallback for an uninjectable adapter reuses whatever
         // `mail_messages` currently holds -- the launch-time listing, or a

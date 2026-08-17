@@ -133,6 +133,17 @@ cargo clippy --all-targets -- -D warnings
   process-wide `OnceLock` (`ctx_about()`) since it otherwise re-runs on every
   `dispatch()` call, including hook/statusline invocations that never
   display it.
+- `pace.use_credits`/`poll_enabled`/`poll_min_interval_secs` are
+  `REPO_FORBIDDEN`: a repo checkout must not change how often zirv polls a
+  vendor usage endpoint or declare its own credits-cover-overage exemption.
+  `pace.soft_percent` is deliberately **not** repo-forbidden (the spec rules
+  it a tuning knob, and a repo can already set `pace.enabled = false`, so
+  forbidding the band alone would be security theater). `poll.rs`'s `HttpPoller` reads an OAuth
+  token fresh from disk on every call and never caches, logs, or persists it
+  anywhere but that one outbound request; it is consulted only as a fallback
+  once the passive collector reading has gone stale, floored to at most one
+  attempt per `poll_min_interval_secs`, and never called from a path that
+  must stay network-free (`wrap`'s status-bar redraw never constructs one).
 
 ## Using the Obsidian Vault
 

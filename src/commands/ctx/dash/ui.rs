@@ -17,7 +17,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use super::super::chrome::right_truncate;
+use super::super::chrome::{PLACEHOLDER, right_truncate};
 use super::super::mail::Message;
 use super::pane::PaneState;
 
@@ -30,13 +30,26 @@ use super::pane::PaneState;
 /// whose grid is on screen and its own rot score. The remaining counts are
 /// whole-session facts.
 ///
-/// Subscription usage is deliberately absent. It was shown here until the
-/// only reading that could be trusted required the operator to have wired
-/// `zirv ctx usage tee` into Claude's statusline, which almost nobody has, so
-/// the segment read "no usage source" for everyone else -- a line of chrome
-/// saying nothing, at the cost of a whole row of the pane grid. `zirv ctx
-/// usage`, `pace` and wrap's status bar still read the stored readings; the
-/// dashboard header simply no longer renders them.
+/// Subscription usage (`usage`) used to be absent here: the only reading that
+/// could be trusted required the operator to have wired `zirv ctx usage tee`
+/// into Claude's statusline, which almost nobody has, so the segment read "no
+/// usage source" for everyone else -- a line of chrome saying nothing, at the
+/// cost of a whole row of the pane grid. It is back now that the sources
+/// feeding it are no longer that narrow: the pacing gate's own passive codex
+/// scan and poll fallback (Tasks 4-6) and wrap's own throttled passive codex
+/// scan (`wrap::redraw_bar_if_due`) keep the stored per-provider readings
+/// fresh for most sessions without any statusline wiring at all, and a
+/// genuinely unknown reading still renders honestly -- `PLACEHOLDER`, never a
+/// fabricated `0%` (see `header_line`). This dashboard's own event loop still
+/// never scans rollouts or polls itself: `usage` is filled from whatever the
+/// wrapped/headless sessions already left on disk (`window::load_for`).
+///
+/// One entry per enabled harness in the roster (`cfg.agents`), as `(harness
+/// name, percent, credits-mode)`: `percent` is `None` when nothing has ever
+/// been recorded for that harness's provider, and `credits` mirrors
+/// `cfg.pace.use_credits` for that provider -- a credits-mode harness shows
+/// "credits" instead of a percentage, since a percent of an unbounded
+/// allowance is not a meaningful number.
 pub struct HeaderFacts {
     pub harness: String,
     pub score: Option<u32>,
@@ -44,6 +57,7 @@ pub struct HeaderFacts {
     pub mail_direct: usize,
     pub memory_count: usize,
     pub sessions: usize,
+    pub usage: Vec<(&'static str, Option<f64>, bool)>,
 }
 
 /// One sidebar row: a dashboard pane (`attached: true`) or a view-only
@@ -324,6 +338,16 @@ pub fn header_line(facts: &HeaderFacts, cols: u16) -> String {
         parts.push(format!("mem {}", facts.memory_count));
     }
     parts.push(format!("sessions {}", facts.sessions));
+    for (name, percent, credits) in &facts.usage {
+        parts.push(if *credits {
+            format!("{name} credits")
+        } else {
+            match percent {
+                Some(p) => format!("{name} {p:.0}%"),
+                None => format!("{name} {PLACEHOLDER}"),
+            }
+        });
+    }
     right_truncate(&parts.join("  "), cols as usize)
 }
 
@@ -1036,6 +1060,7 @@ mod tests {
             mail_direct: 0,
             memory_count: 0,
             sessions: 1,
+            usage: Vec::new(),
         }
     }
 
@@ -1069,6 +1094,55 @@ mod tests {
         let area = Rect::new(0, 0, 60, 1);
         let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
         assert!(!text.contains("mail"), "header text was: {text}");
+    }
+
+    /// A known percentage renders rounded to the nearest whole percent, and an
+    /// unknown one renders as the same placeholder glyph `chrome::status_bar`
+    /// uses for its own usage segment -- never a fabricated `0%`.
+    #[test]
+    fn header_renders_per_harness_usage_with_honest_placeholders() {
+        let mut facts = base_facts();
+        facts.usage = vec![("claude", Some(72.4), false), ("codex", None, false)];
+        let line = header_line(&facts, 80);
+        assert!(
+            line.contains("claude 72%"),
+            "expected a rounded percent: {line}"
+        );
+        assert!(
+            line.contains(&format!("codex {PLACEHOLDER}")),
+            "expected the shared placeholder glyph: {line}"
+        );
+    }
+
+    /// A credits-mode harness (`cfg.pace.use_credits`) has no meaningful
+    /// percentage to show -- the allowance is not bounded the way a
+    /// subscription window is -- so it renders "credits" instead, with no
+    /// percent at all.
+    #[test]
+    fn a_credits_harness_shows_credits_instead_of_a_percent() {
+        let mut facts = base_facts();
+        facts.usage = vec![("claude", Some(72.4), true)];
+        let line = header_line(&facts, 80);
+        assert!(line.contains("claude credits"), "header text was: {line}");
+        assert!(
+            !line.contains("72%"),
+            "credits mode must not also show a percent: {line}"
+        );
+    }
+
+    /// No enabled harness (or no usage feature at all) must render the header
+    /// exactly as it did before this feature existed -- no trailing double
+    /// space, no empty segment.
+    #[test]
+    fn empty_usage_facts_render_no_usage_segment() {
+        let facts = base_facts();
+        let with_usage = header_line(&facts, 80);
+        let mut facts_no_usage = base_facts();
+        facts_no_usage.usage = vec![];
+        let without_usage = header_line(&facts_no_usage, 80);
+        assert_eq!(with_usage, without_usage);
+        assert!(!with_usage.contains("credits"));
+        assert_eq!(with_usage, "claude  rot --  sessions 1");
     }
 
     /// "Unknown" and "healthy" are opposite things to tell an operator, so an

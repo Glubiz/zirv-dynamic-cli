@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::adapters::{self, AgentAdapter};
 use super::config::{CtxConfig, EnvLookup, PaceConfig, env_from_process};
 use super::pace::{self, PaceDecision};
+use super::poll;
 use super::state::{StateDir, now_secs};
 use super::window::{UsageWindows, Window, age_secs};
 use super::{CtxResult, window};
@@ -241,11 +242,26 @@ pub fn report<W: Write>(
         }
     )?;
     let decision = pace::decide(collector, estimator, now, cfg);
-    let verb = match decision {
-        PaceDecision::WaitUntil { .. } => "would wait:",
-        _ => "verdict:",
-    };
-    writeln!(w, "  {verb} {}", pace::describe(&decision))?;
+    match &decision {
+        PaceDecision::Slow {
+            delay_secs,
+            window,
+            percent,
+            source,
+        } => {
+            writeln!(
+                w,
+                "  throttle: would delay ~{delay_secs}s ({percent:.0}% of {window}, {})",
+                source.as_str()
+            )?;
+        }
+        PaceDecision::WaitUntil { .. } => {
+            writeln!(w, "  would wait: {}", pace::describe(&decision))?;
+        }
+        _ => {
+            writeln!(w, "  verdict: {}", pace::describe(&decision))?;
+        }
+    }
     Ok(())
 }
 
@@ -294,19 +310,86 @@ pub fn run_with<W: Write>(
             // nothing enabled and ready at all).
             let provider = adapters::provider_for_usage_readout(&cfg);
             let now = now_secs();
-            // E: a provider with no *possible* usage source (codex/openai
-            // today) must not fall through to `report`'s own "no readings
-            // yet, wire the statusline tee" message -- that suggestion only
-            // ever helps claude, whose windows come from Claude Code's own
-            // statusline. `window::has_no_usage_source` is what keeps claude
-            // itself exempt even before its first tee, where "not yet" is
-            // still the true, actionable answer.
-            if window::has_no_usage_source(&state, provider) {
+            // Best-effort source refresh, ahead of the no-usage-source check
+            // below -- the same two calls the pacing gate itself makes
+            // (`pace::wait_for_window`'s own `refresh_sources`), since this
+            // command is the manual end-to-end check: it must actually try
+            // to acquire data, not just report whatever happened to already
+            // be on disk.
+            let http_poller = poll::HttpPoller;
+            if provider == window::CODEX_USAGE_PROVIDER {
+                // See `pace::refresh_sources`'s own doc comment: resolved via
+                // `crate::utils::home_dir()`, not left to `refresh_codex_
+                // usage`'s internal `dirs::home_dir()` fallback, which
+                // ignores `HOME`/`USERPROFILE` on Windows and so cannot be
+                // pointed at a test fixture there.
+                let sessions_dir = crate::utils::home_dir()
+                    .ok()
+                    .map(|h| h.join(".codex").join("sessions"));
+                window::refresh_codex_usage(
+                    &state,
+                    sessions_dir.as_deref(),
+                    now,
+                    cfg.pace.collector_max_age_secs,
+                );
+            }
+            // Gated on `pace.enabled` (review finding): pacing disabled means
+            // zirv makes no proactive vendor request on this operator's
+            // behalf -- `ZIRV_CTX_PACE=false` must not still send an OAuth
+            // token to a usage endpoint. Passive sources above still refresh;
+            // only the active poll is withheld. The gate paths need no such
+            // check here because `wait_for_window` already returns before its
+            // own `refresh_sources` when pacing is off.
+            let poll_reading = if cfg.pace.enabled {
+                poll::maybe_poll(&state, &cfg.pace, now, provider, &http_poller)
+            } else {
+                None
+            };
+
+            // Check whether anything has been recorded for this provider,
+            // now that the refresh above has had its chance to acquire some.
+            //
+            // Item 4 (review): a fresh claude machine has no usage source
+            // either -- there is no active poll for anthropic, only the
+            // statusline tee, and it has never run yet. The generic
+            // "<provider>: no usage source" line used to be printed for
+            // every provider alike here, which made `report`'s "not
+            // reported ... wire your statusline through `zirv ctx usage
+            // tee`" guidance unreachable exactly where it used to help.
+            // Anthropic alone falls through to the old, richer report;
+            // every other provider (no collector, no guidance to give)
+            // keeps the plain line.
+            if window::has_no_usage_source(&state, provider)
+                && provider != window::LEGACY_USAGE_PROVIDER
+            {
                 writeln!(w, "{provider}: no usage source")?;
                 return Ok(0);
             }
             let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
             report(w, &collector, estimator.as_ref(), now, &cfg.pace)?;
+
+            if cfg.pace.use_credits.for_provider(provider) {
+                writeln!(
+                    w,
+                    "\nuse_credits: enabled for this harness -- pacing gate skipped"
+                )?;
+            }
+            // Only when a poll just ran and returned an opinion: never invent
+            // vendor state from a stale reading, and no line at all when no
+            // poll ran this time (disabled, floored, or nothing needed it).
+            if let Some(reading) = &poll_reading
+                && let Some(vendor_credits_enabled) = reading.vendor_credits_enabled
+            {
+                writeln!(
+                    w,
+                    "vendor reports credits {} on this plan",
+                    if vendor_credits_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                )?;
+            }
             Ok(0)
         }
     }
@@ -722,6 +805,13 @@ mod tests {
     #[test]
     fn the_verb_reports_without_a_subcommand() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // Like every sibling test here: an empty redirected home keeps the
+        // no-subcommand path's source refresh (rollout scan + HttpPoller
+        // token lookup) away from the real machine's credentials -- without
+        // this, `maybe_poll` would issue a live authenticated request on
+        // every `cargo test` run.
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let env: std::collections::HashMap<String, String> = [(
             crate::commands::ctx::state::STATE_ENV.to_string(),
             tmp.path().join("state").display().to_string(),
@@ -745,6 +835,13 @@ mod tests {
     fn the_verb_names_a_provider_with_no_usage_source() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path();
+        // Task 6's own source refresh (`refresh_codex_usage`, ahead of the
+        // no-usage-source check) resolves the codex sessions directory via
+        // `crate::utils::home_dir()` precisely so a real machine's own
+        // `~/.codex/sessions` cannot leak into this "nothing recorded" test
+        // -- an empty `HomeGuard` home keeps that scan a genuine no-op.
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         // `agent` is `REPO_FORBIDDEN` (final wave item 1) -- configured via
         // `ZIRV_CTX_AGENT` (the operator layer) instead of the repo's own
         // `ctx.toml`.
@@ -889,6 +986,51 @@ mod tests {
         assert_eq!(code, 0);
         let printed = String::from_utf8(out).expect("utf8");
         assert_eq!(printed, "openai: no usage source\n");
+    }
+
+    /// Item 4 (review): a fresh claude machine -- nothing ever recorded for
+    /// anthropic, no legacy file either -- must still fall through to
+    /// `report`'s own "not reported ... wire your statusline through `zirv
+    /// ctx usage tee`" guidance, not the generic "<provider>: no usage
+    /// source" line the codex/openai branches above correctly use (there is
+    /// nothing more helpful to say for a provider with no collector at
+    /// all). Explicit `ZIRV_CTX_AGENT=claude` so this does not depend on
+    /// which adapter `resolve_default` happens to pick on the test machine.
+    #[test]
+    fn a_fresh_claude_machine_still_gets_the_tee_guidance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                tmp.path().join("state").display().to_string(),
+            ),
+            ("ZIRV_CTX_AGENT".to_string(), "claude".to_string()),
+        ]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_with(&UsageArgs { action: None }, &mut out, repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            !printed.starts_with("anthropic: no usage source"),
+            "the generic no-source line must not shadow the tee guidance: {printed}"
+        );
+        assert!(
+            printed.contains("not reported"),
+            "the old report format is still shown: {printed}"
+        );
+        assert!(
+            printed.contains("zirv ctx usage tee"),
+            "the actionable tee-wiring hint must still be reachable: {printed}"
+        );
     }
 
     /// Final wave item 4: no `agent` configured anywhere, and claude

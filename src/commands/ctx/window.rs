@@ -118,22 +118,11 @@ pub fn load_for(state: &StateDir, provider: &str) -> Option<UsageWindows> {
     None
 }
 
-/// E: whether `provider` has **no possible** usage source, as distinct from
-/// "nothing recorded yet." Only claude (`LEGACY_USAGE_PROVIDER`) has a real
-/// collector mechanism today (`usage::run_tee`, Claude Code's own statusline
-/// hook) -- a fresh machine that has never tee'd a statusline has no reading
-/// for it either, but "wire your statusline through `zirv ctx usage tee`" is
-/// still the true, actionable answer there, so claude is exempt from this
-/// check regardless of whether [`load_for`] currently finds a file.
-///
-/// Any other provider (codex/openai today) has no write path at all by
-/// design, so [`load_for`] returning `None` for it *is* the honest, durable
-/// answer: pacing (`pace::wait_for_window`) and `zirv ctx usage`'s own report
-/// both key off this, rather than `load_for(..).is_none()` alone, which
-/// cannot tell "structurally impossible" from "claude, not tee'd yet."
+/// True when nothing has ever been recorded for this provider. Since the
+/// codex collector and the poller exist, no provider is structurally exempt
+/// any more — callers refresh sources first, then ask.
 pub fn has_no_usage_source(state: &StateDir, provider: &str) -> bool {
-    super::state::provider_slug(provider) != LEGACY_USAGE_PROVIDER
-        && load_for(state, provider).is_none()
+    load_for(state, provider).is_none()
 }
 
 fn newer(existing: Option<Window>, fresh: Option<Window>) -> Option<Window> {
@@ -377,6 +366,250 @@ pub fn estimate_windows(
     }
 }
 
+/// Parses an RFC 3339 timestamp ("2026-08-16T20:49:59.785342+00:00", trailing
+/// "Z" or "+/-HH:MM", fraction ignored) to unix seconds. None on anything
+/// malformed or pre-epoch. Used by the codex collector and the rollout parser.
+#[allow(dead_code)]
+pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
+    let (date, rest) = s.split_once('T')?;
+    let mut dp = date.split('-');
+    // Bounded the same way `parse_iso8601_utc` is bounded: exactly 4 digits,
+    // so `days_from_civil(y, ..) * 86_400` can never see a year absurd enough
+    // to overflow `i64` and panic in debug builds. Reachable from wrap's
+    // status-bar redraw via the codex rollout scan, so this must degrade to
+    // `None`, never panic.
+    let y_field = dp.next()?;
+    if y_field.len() != 4 || !y_field.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = y_field.parse().ok()?;
+    if !(1970..=9999).contains(&y) {
+        return None;
+    }
+    let mo: u64 = dp.next()?.parse().ok()?;
+    let d: u64 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Split the time from the offset: "Z", or the last '+'/'-' in the string.
+    let (time, offset_secs) = if let Some(t) = rest.strip_suffix('Z') {
+        (t, 0i64)
+    } else {
+        let idx = rest.rfind(['+', '-'])?;
+        let (t, off) = rest.split_at(idx);
+        let sign = if off.starts_with('-') { -1i64 } else { 1i64 };
+        let (oh, om) = off[1..].split_once(':')?;
+        let oh: i64 = oh.parse().ok()?;
+        let om: i64 = om.parse().ok()?;
+        (t, sign * (oh * 3600 + om * 60))
+    };
+    let time = time.split_once('.').map_or(time, |(t, _frac)| t);
+    let mut tp = time.split(':');
+    let h: i64 = tp.next()?.parse().ok()?;
+    let mi: i64 = tp.next()?.parse().ok()?;
+    let sec: i64 = tp.next()?.parse().ok()?;
+    if tp.next().is_some()
+        || !(0..24).contains(&h)
+        || !(0..60).contains(&mi)
+        || !(0..61).contains(&sec)
+    {
+        return None;
+    }
+    let total =
+        days_from_civil(y, mo as i64, d as i64) * 86_400 + h * 3600 + mi * 60 + sec - offset_secs;
+    u64::try_from(total).ok()
+}
+
+/// Which UsageWindows slot a window of this length belongs to: the nearest of
+/// 5h/7d, accepted only within a factor of two — anything else is a window
+/// shape we do not understand and must drop, never guess.
+fn window_slot(window_secs: u64) -> Option<bool /* true = five_hour */> {
+    if (FIVE_HOUR_SECS / 2..=FIVE_HOUR_SECS * 2).contains(&window_secs) {
+        Some(true)
+    } else if (SEVEN_DAY_SECS / 2..=SEVEN_DAY_SECS * 2).contains(&window_secs) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Maps a codex `rate_limits` object (primary/secondary with used_percent,
+/// window_minutes, resets_at in unix seconds) onto UsageWindows. Shared by the
+/// rollout collector and the codex poller.
+#[allow(dead_code)]
+pub fn windows_from_rate_limits(
+    limits: &serde_json::Value,
+    observed_at: u64,
+) -> Option<UsageWindows> {
+    let mut out = UsageWindows::default();
+    for key in ["primary", "secondary"] {
+        let Some(w) = limits.get(key).filter(|w| w.is_object()) else {
+            continue;
+        };
+        let Some(used) = w.get("used_percent").and_then(|p| p.as_f64()) else {
+            continue;
+        };
+        let minutes = w
+            .get("window_minutes")
+            .and_then(|m| m.as_u64())
+            .unwrap_or(0);
+        let resets_at = w.get("resets_at").and_then(|r| r.as_u64()).unwrap_or(0);
+        // Saturating: `window_minutes` comes straight from untrusted JSON, and
+        // a value near u64::MAX would otherwise panic in debug builds instead
+        // of falling through to the slot rejection below.
+        let Some(five_hour) = window_slot(minutes.saturating_mul(60)) else {
+            continue;
+        };
+        let win = Window {
+            used_percentage: used,
+            resets_at,
+            observed_at,
+        };
+        if five_hour {
+            out.five_hour = Some(win);
+        } else {
+            out.seven_day = Some(win);
+        }
+    }
+    (out.five_hour.is_some() || out.seven_day.is_some()).then_some(out)
+}
+
+/// One codex session-rollout JSONL line -> usage windows, if it is a
+/// token_count event carrying rate limits.
+#[allow(dead_code)]
+pub fn parse_rollout_line(line: &str) -> Option<UsageWindows> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type")?.as_str()? != "event_msg" {
+        return None;
+    }
+    let payload = v.get("payload")?;
+    if payload.get("type")?.as_str()? != "token_count" {
+        return None;
+    }
+    let observed_at = parse_rfc3339_utc(v.get("timestamp")?.as_str()?)?;
+    windows_from_rate_limits(payload.get("rate_limits")?, observed_at)
+}
+
+/// The account the codex provider's usage is attributed to.
+#[allow(dead_code)]
+pub const CODEX_USAGE_PROVIDER: &str = "openai";
+
+/// Floor between codex rollout-tree scan *attempts*, shared by
+/// `pace::refresh_sources` (item 5: a parked codex session's wait loop must
+/// not re-walk `~/.codex/sessions` on every 30s recheck) and `wrap.rs`'s
+/// status-bar refresh (`redraw_bar_if_due`, formerly its own private
+/// `CODEX_BAR_SCAN_SECS`) -- one constant so the two floors cannot drift.
+pub(crate) const CODEX_SCAN_FLOOR_SECS: u64 = 60;
+
+/// Rollout files grow large; only the tail can hold the newest snapshot.
+#[allow(dead_code)]
+const ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;
+#[allow(dead_code)]
+const ROLLOUT_SCAN_FILES: usize = 3;
+
+#[allow(dead_code)]
+fn collect_jsonl(
+    dir: &Path,
+    depth: u8,
+    out: &mut Vec<(std::time::SystemTime, std::path::PathBuf)>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl(&path, depth + 1, out);
+        } else if path.extension().is_some_and(|e| e == "jsonl")
+            && let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+        {
+            out.push((modified, path));
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn last_snapshot_in(path: &Path, now: u64) -> Option<UsageWindows> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(ROLLOUT_TAIL_BYTES)))
+        .ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    // The tail may start mid-line/mid-char; lossy decode + rev line scan copes.
+    let text = String::from_utf8_lossy(&buf);
+    // Collect all valid snapshots (skew-valid), then return the one with max timestamp
+    text.lines()
+        .filter_map(parse_rollout_line)
+        .filter(|w| newest_observation(w) <= now.saturating_add(FUTURE_SKEW_TOLERANCE_SECS))
+        .max_by_key(newest_observation)
+}
+
+/// Newest rate-limit snapshot across the most recently modified rollout files.
+#[allow(dead_code)]
+pub fn scan_codex_rollouts(
+    sessions_dir: &Path,
+    max_files: usize,
+    now: u64,
+) -> Option<UsageWindows> {
+    let mut files = Vec::new();
+    collect_jsonl(sessions_dir, 0, &mut files);
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    files
+        .into_iter()
+        .take(max_files)
+        .filter_map(|(_, p)| last_snapshot_in(&p, now))
+        .max_by_key(newest_observation)
+}
+
+#[allow(dead_code)]
+pub(crate) fn newest_observation(windows: &UsageWindows) -> u64 {
+    windows
+        .five_hour
+        .iter()
+        .chain(windows.seven_day.iter())
+        .map(|w| w.observed_at)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Opportunistic passive refresh for codex: scan its session rollouts only
+/// when the stored reading is stale. Best-effort by design — every failure
+/// leaves the stored state exactly as it was.
+#[allow(dead_code)]
+pub fn refresh_codex_usage(
+    state: &StateDir,
+    sessions_dir: Option<&Path>,
+    now: u64,
+    max_age_secs: u64,
+) {
+    let existing = load_for(state, CODEX_USAGE_PROVIDER);
+    if let Some(w) = &existing
+        && now.saturating_sub(newest_observation(w)) <= max_age_secs
+    {
+        return;
+    }
+    let default_dir = dirs::home_dir().map(|h| h.join(".codex").join("sessions"));
+    let Some(dir) = sessions_dir.or(default_dir.as_deref()) else {
+        return;
+    };
+    let Some(fresh) = scan_codex_rollouts(dir, ROLLOUT_SCAN_FILES, now) else {
+        return;
+    };
+    let merged = merge(existing.clone().unwrap_or_default(), fresh);
+    if Some(&merged) == existing.as_ref() {
+        // The scan produced nothing newer than what is already stored:
+        // rewriting an identical file on every refresh is pure churn.
+        return;
+    }
+    let _ = store_for(state, CODEX_USAGE_PROVIDER, &merged);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,17 +836,16 @@ mod tests {
         );
     }
 
-    /// E: claude is exempt even before its first statusline tee -- "not yet"
-    /// is still the true, actionable answer for the one provider with a real
-    /// collector mechanism, so `has_no_usage_source` must stay `false` for it
-    /// regardless of whether a file happens to exist yet.
+    /// E: the codex collector and poller now exist, so no provider is
+    /// structurally exempt any more. Callers refresh sources first, then ask
+    /// whether one is available.
     #[test]
-    fn has_no_usage_source_is_false_for_claude_even_before_the_first_tee() {
+    fn has_no_usage_source_is_true_for_any_provider_when_nothing_recorded() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert!(
-            !has_no_usage_source(&state, "anthropic"),
-            "claude has a real collector mechanism, just nothing recorded yet"
+            has_no_usage_source(&state, "anthropic"),
+            "no provider is exempt: all are 'nothing recorded' when no file exists"
         );
     }
 
@@ -1019,5 +1251,342 @@ mod tests {
         let five = windows.five_hour.expect("five");
         assert_eq!(five.used_percentage, 0.0);
         assert_eq!(five.resets_at, now, "nothing to wait for");
+    }
+
+    #[test]
+    fn rfc3339_utc_parses_fraction_and_offset() {
+        // 2026-02-26T18:52:21.222Z -> known epoch; verify against a precomputed value.
+        let z = parse_rfc3339_utc("2026-02-26T18:52:21.222Z").unwrap();
+        let plus = parse_rfc3339_utc("2026-02-26T18:52:21.222+00:00").unwrap();
+        assert_eq!(z, plus);
+        // +01:00 is one hour EARLIER in UTC
+        let cet = parse_rfc3339_utc("2026-02-26T19:52:21+01:00").unwrap();
+        assert_eq!(z, cet);
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_utc("not a time"), None);
+        assert_eq!(parse_rfc3339_utc("2026-13-40T99:00:00Z"), None);
+    }
+
+    #[test]
+    fn rollout_snapshot_maps_primary_and_secondary_by_window_length() {
+        let lines: Vec<&str> =
+            include_str!("../../../tests/fixtures/codex-rollout-rate-limits.jsonl")
+                .lines()
+                .collect();
+        let w = parse_rollout_line(lines[0]).unwrap();
+        let fh = w.five_hour.unwrap();
+        assert_eq!(fh.used_percentage, 10.0);
+        assert_eq!(fh.resets_at, 1772135737);
+        let sd = w.seven_day.unwrap();
+        assert_eq!(sd.used_percentage, 3.0);
+        assert_eq!(sd.resets_at, 1772722537);
+        // observed_at comes from the line's own timestamp, not scan time
+        assert_eq!(
+            fh.observed_at,
+            parse_rfc3339_utc("2026-02-26T18:52:21.222Z").unwrap()
+        );
+        // populated-info shape parses identically
+        assert!(parse_rollout_line(lines[1]).is_some());
+        // non-token_count lines and garbage yield None
+        assert!(parse_rollout_line(lines[2]).is_none());
+        assert!(parse_rollout_line("{broken").is_none());
+        // a 1-minute window maps to neither slot -> dropped -> no windows -> None
+        assert!(parse_rollout_line(lines[3]).is_none());
+        // an absurd window_minutes must reject, never overflow-panic (review
+        // finding on 4a44eb2: `minutes * 60` panicked in debug builds)
+        let huge = format!(
+            "{{\"timestamp\":\"2026-02-26T18:52:21.222Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"rate_limits\":{{\"primary\":{{\"used_percent\":1.0,\"window_minutes\":{},\"resets_at\":1}}}}}}}}",
+            u64::MAX
+        );
+        assert!(parse_rollout_line(&huge).is_none());
+    }
+
+    #[test]
+    fn scan_finds_newest_by_timestamp_not_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let fixture = include_str!("../../../tests/fixtures/codex-rollout-rate-limits.jsonl");
+        let lines: Vec<&str> = fixture.lines().collect();
+        // lines[0]: 10% snapshot at 2026-02-26T18:52:21.222Z
+        // lines[1]: 12% snapshot at 2026-02-26T18:52:27.310Z (newer timestamp)
+        // rollout-a.jsonl: mtime older, holds 12% (newer timestamp) -> should win
+        // rollout-b.jsonl: mtime newer, holds 10% (older timestamp) -> should lose
+        std::fs::write(day.join("rollout-a.jsonl"), format!("{}\n", lines[1])).unwrap();
+        std::fs::write(day.join("rollout-b.jsonl"), format!("{}\n", lines[0])).unwrap();
+        // make b's mtime strictly newer (but it has the older timestamp)
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = std::fs::File::options()
+            .append(true)
+            .open(day.join("rollout-b.jsonl"))
+            .unwrap();
+        f.set_modified(newer).unwrap();
+        let now = 1_784_999_000u64;
+        let w = scan_codex_rollouts(dir.path(), 3, now).unwrap();
+        assert_eq!(
+            w.five_hour.unwrap().used_percentage,
+            12.0,
+            "should pick the snapshot with the newest embedded timestamp, not mtime"
+        );
+    }
+
+    #[test]
+    fn scan_of_missing_or_empty_dir_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_784_999_000u64;
+        assert!(scan_codex_rollouts(&dir.path().join("nope"), 3, now).is_none());
+        assert!(scan_codex_rollouts(dir.path(), 3, now).is_none());
+    }
+
+    #[test]
+    fn scan_finds_newest_snapshot_among_out_of_order_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let fixture = include_str!("../../../tests/fixtures/codex-rollout-rate-limits.jsonl");
+        let lines: Vec<&str> = fixture.lines().collect();
+        // Write lines in reverse order: 12% first, then 10%, so the first one is NOT the max
+        // Verifies we pick the max timestamp, not just the first or last line
+        std::fs::write(
+            day.join("rollout.jsonl"),
+            format!("{}\n{}\n", lines[1], lines[0]),
+        )
+        .unwrap();
+        let now = 1_784_999_000u64;
+        let w = scan_codex_rollouts(dir.path(), 3, now).unwrap();
+        assert_eq!(
+            w.five_hour.unwrap().used_percentage,
+            12.0,
+            "should pick snapshot with newest timestamp despite line order"
+        );
+    }
+
+    #[test]
+    fn scan_skips_far_future_dated_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let now = 1_784_999_000u64;
+        // Create a line with far-future timestamp beyond the skew tolerance
+        let far_future_json = r#"{"timestamp":"2099-12-31T23:59:59Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":50.0,"window_minutes":300,"resets_at":1772135737},"secondary":{"used_percent":3.0,"window_minutes":10080,"resets_at":1772722537}}}}"#;
+        std::fs::write(day.join("rollout.jsonl"), format!("{}\n", far_future_json)).unwrap();
+        // Should find no snapshot (far-future is skipped)
+        assert!(
+            scan_codex_rollouts(dir.path(), 3, now).is_none(),
+            "far-future snapshot should be skipped"
+        );
+    }
+
+    #[test]
+    fn scan_uses_valid_snapshot_after_skipping_future_dated_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let fixture = include_str!("../../../tests/fixtures/codex-rollout-rate-limits.jsonl");
+        let lines: Vec<&str> = fixture.lines().collect();
+        let now = 1_784_999_000u64;
+        // Create a line with far-future timestamp
+        let far_future_json = r#"{"timestamp":"2099-12-31T23:59:59Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":99.0,"window_minutes":300,"resets_at":1772135737}}}}"#;
+        // Write future line first, then valid 12% line
+        std::fs::write(
+            day.join("rollout.jsonl"),
+            format!("{}\n{}\n", far_future_json, lines[1]),
+        )
+        .unwrap();
+        let w = scan_codex_rollouts(dir.path(), 3, now).unwrap();
+        assert_eq!(
+            w.five_hour.unwrap().used_percentage,
+            12.0,
+            "should use the valid (non-future) snapshot when future-dated line is present"
+        );
+    }
+
+    #[test]
+    fn refresh_skips_when_stored_reading_is_fresh_and_stores_when_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        // Create a codex sessions dir with a test file
+        let sessions_dir = tmp.path().join("codex_sessions");
+        let day = sessions_dir.join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+
+        // A rollout line just before `now`, so a scan of it is genuinely
+        // newer than the "stale" stored reading below and the merge must
+        // prefer it -- the review of c3c7fe9 caught this test asserting
+        // nothing when the line's timestamp predated the stale reading.
+        let test_json = r#"{"timestamp":"2026-02-26T18:52:21Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.0,"window_minutes":300,"resets_at":1772135737}}}}"#;
+        let line_ts = parse_rfc3339_utc("2026-02-26T18:52:21Z").expect("test timestamp parses");
+        let now = line_ts + 60;
+        let max_age = 900u64;
+        std::fs::write(day.join("rollout.jsonl"), format!("{}\n", test_json)).unwrap();
+
+        let scanned = scan_codex_rollouts(sessions_dir.as_path(), ROLLOUT_SCAN_FILES, now);
+        assert!(
+            scanned.is_some(),
+            "scan should find snapshot with compatible timestamp"
+        );
+        let scanned_val = scanned.unwrap();
+        assert_eq!(
+            scanned_val.five_hour.unwrap().used_percentage,
+            12.0,
+            "scan should find 12%"
+        );
+
+        // Pre-store a fresh openai reading (observed_at close to now)
+        let fresh = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 50.0,
+                resets_at: 1000,
+                observed_at: now - 100, // well within max_age
+            }),
+            seven_day: None,
+        };
+        store_for(&state, CODEX_USAGE_PROVIDER, &fresh).expect("store fresh");
+
+        refresh_codex_usage(&state, Some(sessions_dir.as_path()), now, max_age);
+        let after_fresh_refresh = load_for(&state, CODEX_USAGE_PROVIDER);
+        assert_eq!(
+            after_fresh_refresh,
+            Some(fresh),
+            "fresh reading should not be updated"
+        );
+
+        // Now pre-store a stale reading (observed_at = now - 10_000)
+        let stale = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 20.0,
+                resets_at: 500,
+                observed_at: now - 10_000, // well beyond max_age
+            }),
+            seven_day: None,
+        };
+        store_for(&state, CODEX_USAGE_PROVIDER, &stale).expect("store stale");
+
+        refresh_codex_usage(&state, Some(sessions_dir.as_path()), now, max_age);
+        let after_stale_refresh = load_for(&state, CODEX_USAGE_PROVIDER);
+
+        // The scanned 12% (observed_at = now - 60) is newer than the stale
+        // 20% (observed_at = now - 10_000), so the merge must replace it.
+        let merged = after_stale_refresh.expect("merged present");
+        let five = merged.five_hour.expect("five_hour after refresh");
+        assert_eq!(
+            five.used_percentage, 12.0,
+            "a stale stored reading is replaced by the fresher scan"
+        );
+        assert_eq!(five.resets_at, 1772135737);
+    }
+
+    #[test]
+    fn no_usage_source_is_now_a_plain_no_data_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        // openai has nothing stored -> true
+        assert!(has_no_usage_source(&state, CODEX_USAGE_PROVIDER));
+
+        // Store something for openai -> false
+        store_for(
+            &state,
+            CODEX_USAGE_PROVIDER,
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 50.0,
+                    resets_at: 1000,
+                    observed_at: 10,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+        assert!(!has_no_usage_source(&state, CODEX_USAGE_PROVIDER));
+
+        // anthropic with nothing stored -> true (previously hardcoded false)
+        let tmp2 = tempfile::tempdir().unwrap();
+        let state2 = StateDir::from_root(tmp2.path().to_path_buf());
+        assert!(has_no_usage_source(&state2, "anthropic"));
+
+        // Store something for anthropic -> false
+        store_for(
+            &state2,
+            "anthropic",
+            &UsageWindows {
+                five_hour: Some(Window {
+                    used_percentage: 75.0,
+                    resets_at: 2000,
+                    observed_at: 20,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store");
+        assert!(!has_no_usage_source(&state2, "anthropic"));
+    }
+
+    /// Item 1 (review): an absurd year must never reach `days_from_civil`'s
+    /// multiplication, which overflows `i64` and panics in debug builds.
+    /// Reachable from wrap's status-bar redraw via the codex rollout scan.
+    #[test]
+    fn an_absurd_year_is_rejected_not_overflowed() {
+        assert_eq!(
+            parse_rfc3339_utc("999999999999-01-01T00:00:00Z"),
+            None,
+            "must reject, never panic"
+        );
+        assert_eq!(parse_rfc3339_utc("99999-01-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_utc("1969-12-31T23:59:59Z"), None);
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert!(parse_rfc3339_utc("9999-12-31T23:59:59Z").is_some());
+
+        // Same absurd year, carried through a full rollout line: must yield
+        // `None` end to end, never panic.
+        let line = r#"{"timestamp":"999999999999-01-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":1.0,"window_minutes":300,"resets_at":1}}}}"#;
+        assert_eq!(parse_rollout_line(line), None);
+    }
+
+    /// Item 2 (review): `refresh_codex_usage` must not rewrite the stored
+    /// file when a scan produces exactly what is already on disk -- that is
+    /// pure churn on every passive refresh. Proven via the file's mtime: a
+    /// real `store_for` always renames a fresh temp file over the target,
+    /// which would move the mtime forward.
+    #[test]
+    fn refresh_skips_the_store_when_the_merge_produces_no_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        let sessions_dir = tmp.path().join("codex_sessions");
+        let day = sessions_dir.join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let test_json = r#"{"timestamp":"2026-02-26T18:52:21Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.0,"window_minutes":300,"resets_at":1772135737}}}}"#;
+        std::fs::write(day.join("rollout.jsonl"), format!("{}\n", test_json)).unwrap();
+        let line_ts = parse_rfc3339_utc("2026-02-26T18:52:21Z").expect("test timestamp parses");
+
+        // Seed the store with exactly what a scan of this file produces, so
+        // the merge that follows is a genuine no-op.
+        let scanned = scan_codex_rollouts(&sessions_dir, ROLLOUT_SCAN_FILES, line_ts + 60)
+            .expect("scan finds the seeded snapshot");
+        store_for(&state, CODEX_USAGE_PROVIDER, &scanned).expect("seed store");
+
+        let usage_path = state.usage_for(CODEX_USAGE_PROVIDER);
+        // Back-date the file's mtime so a rewrite would be observable.
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let f = std::fs::File::options()
+            .append(true)
+            .open(&usage_path)
+            .unwrap();
+        f.set_modified(old_mtime).unwrap();
+        let before = std::fs::metadata(&usage_path).unwrap().modified().unwrap();
+
+        // `now` is far enough past the seeded observation that the existing
+        // reading counts as stale, forcing the function past the early
+        // freshness return and into the scan-and-merge path.
+        let now = line_ts + 60 + 10_000;
+        refresh_codex_usage(&state, Some(sessions_dir.as_path()), now, 900);
+
+        let after = std::fs::metadata(&usage_path).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "store_for must be skipped when the merge is unchanged"
+        );
     }
 }

@@ -33,6 +33,15 @@ pub enum PaceDecision {
         percent: f64,
         source: Source,
     },
+    /// Inside the soft-throttle band (`soft_percent` <= percent <
+    /// `max_percent`): not a hard pause, but each cycle is delayed so the
+    /// remaining budget spreads linearly over the time left in the window.
+    Slow {
+        delay_secs: u64,
+        window: &'static str,
+        percent: f64,
+        source: Source,
+    },
     Unknown,
 }
 
@@ -200,6 +209,33 @@ pub fn decide(
     };
 
     if window.used_percentage < cfg.max_percent {
+        let band = cfg.max_percent - cfg.soft_percent;
+        // Item 3: a nonzero `resets_at` at or before `now` means this
+        // reading predates a completed reset -- the window genuinely rolled
+        // over, so pacing against its old percentage (via the fallback
+        // horizon below) would phantom-throttle a window that is actually
+        // back near 0%. Only a truly unknown reset (0, "never reported")
+        // still falls to the fallback branch.
+        let reset_passed = window.resets_at != 0 && window.resets_at <= now;
+        if band > 0.0 && window.used_percentage >= cfg.soft_percent && !reset_passed {
+            let t_rem = if window.resets_at > now {
+                window.resets_at - now
+            } else {
+                // Reset unknown (0): pace against the configured fallback
+                // horizon.
+                cfg.fallback_delay_secs
+            };
+            let frac = (window.used_percentage - cfg.soft_percent) / band;
+            let delay_secs = (t_rem as f64 * frac) as u64;
+            if delay_secs > 0 {
+                return PaceDecision::Slow {
+                    delay_secs,
+                    window: name,
+                    percent: window.used_percentage,
+                    source,
+                };
+            }
+        }
         return PaceDecision::Proceed {
             source,
             worst_percent: window.used_percentage,
@@ -261,19 +297,22 @@ pub fn wait_deadline(
     cfg: &PaceConfig,
     seed: u64,
 ) -> Option<u64> {
-    let PaceDecision::WaitUntil {
-        reset_at, window, ..
-    } = decision
-    else {
-        return None;
-    };
-
-    let target = match reset_at {
-        Some(at) if *at > now => *at,
-        _ => now + cfg.fallback_delay_secs,
-    };
-    let jittered = apply_jitter(target, cfg.jitter_secs, seed);
-    Some(jittered.min(now + wait_cap(window, cfg)))
+    match decision {
+        PaceDecision::WaitUntil {
+            reset_at, window, ..
+        } => {
+            let target = match reset_at {
+                Some(at) if *at > now => *at,
+                _ => now + cfg.fallback_delay_secs,
+            };
+            let jittered = apply_jitter(target, cfg.jitter_secs, seed);
+            Some(jittered.min(now + wait_cap(window, cfg)))
+        }
+        // No jitter: the delay is already reading-derived, and the wait
+        // loop's own monotonic min-tracking keeps it from creeping forward.
+        PaceDecision::Slow { delay_secs, .. } => Some(now.saturating_add(*delay_secs)),
+        _ => None,
+    }
 }
 
 pub fn describe(decision: &PaceDecision) -> String {
@@ -300,6 +339,15 @@ pub fn describe(decision: &PaceDecision) -> String {
                 source.as_str()
             )
         }
+        PaceDecision::Slow {
+            delay_secs,
+            window,
+            percent,
+            source,
+        } => format!(
+            "{window} window at {percent:.1}% ({} data), throttling ~{delay_secs}s before the next run",
+            source.as_str()
+        ),
         PaceDecision::Unknown => {
             "usage state unknown, no usage data from a fresh collector reading or a configured estimator budget, proceeding without pacing".to_string()
         }
@@ -316,6 +364,41 @@ use super::{log, window as usage_window};
 pub struct PaceOutcome {
     pub waited_secs: u64,
     pub source: Source,
+}
+
+/// Operator-controlled inputs to the gate that are not part of `PaceConfig`
+/// itself: resolved per call from the adapter's provider, not read from disk
+/// or the environment inside `decide`/`wait_for_window`'s own logic.
+#[derive(Clone, Copy)]
+pub struct PaceGate<'a> {
+    /// Operator declaration that this harness's vendor plan covers overage
+    /// from credits: when true, the proactive throttle/pause is skipped
+    /// entirely for this call. A vendor-reported limit hit (the caller's own
+    /// `scan_for_limit`/`is_limit_hit` path) still parks -- that is a
+    /// separate, untouched path.
+    pub use_credits: bool,
+    /// The active poll fallback for this call. `None` means `wait_for_window`
+    /// never polls: polling disabled (`cfg.pace.poll_enabled == false`), or a
+    /// caller on a path that must never make an HTTP call (`wrap` does not
+    /// call `wait_for_window` at all today, so no caller currently supplies
+    /// `None` for that reason -- but the option exists for one that must).
+    /// `Some` lets `wait_for_window` fall back to it once the passive
+    /// collector reading goes stale.
+    pub poller: Option<&'a dyn super::poll::UsagePoller>,
+}
+
+/// Once-per-run announce latches for `wait_for_window`, owned by the caller
+/// and threaded through every call across one run -- the same discipline the
+/// wait loop's own internal `announced` local already follows *within* a
+/// single call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaceGateFlags {
+    pub no_source_announced: bool,
+    pub credits_announced: bool,
+    /// Item 5: unix-seconds of the last codex rollout scan *attempt* made
+    /// by `refresh_sources` (`0` means never), floored to
+    /// `usage_window::CODEX_SCAN_FLOOR_SECS`.
+    pub last_codex_scan: u64,
 }
 
 /// Longest single sleep, so a supervisor rechecks state (a live session may have
@@ -335,6 +418,17 @@ const SLEEP_CHUNK_SECS: u64 = 30;
 /// PROVIDER`), so this is a no-op for the common case; a provider with no
 /// usage source at all (codex/openai today) now reads as "nothing known"
 /// (`UsageWindows::default()`) rather than another provider's real numbers.
+/// Whether `cfg` alone -- regardless of what the collector has ever
+/// recorded -- means the estimator layer can contribute a decision: enabled,
+/// and at least one window has a nonzero budget configured. Shared by
+/// `current_windows` (whether to bother estimating at all) and
+/// `wait_for_window`'s no-usage-source check (item 1): a collector-less
+/// machine with estimator pacing configured must not read as "no usage
+/// source" just because nothing has ever been observed passively.
+fn estimator_configured(cfg: &PaceConfig) -> bool {
+    cfg.estimator && (cfg.five_hour_budget_tokens > 0 || cfg.seven_day_budget_tokens > 0)
+}
+
 pub fn current_windows(
     state: &StateDir,
     cfg: &PaceConfig,
@@ -343,8 +437,7 @@ pub fn current_windows(
 ) -> (UsageWindows, Option<UsageWindows>) {
     let collector = usage_window::load_for(state, provider).unwrap_or_default();
 
-    let budgeted = cfg.five_hour_budget_tokens > 0 || cfg.seven_day_budget_tokens > 0;
-    if !cfg.estimator || !budgeted {
+    if !estimator_configured(cfg) {
         return (collector, None);
     }
 
@@ -362,6 +455,94 @@ pub fn current_windows(
     (collector, estimated)
 }
 
+/// Best-effort refresh of both usage sources ahead of a pacing decision:
+/// codex's passive rollout scan (`refresh_codex_usage`) plus the active poll
+/// fallback (`maybe_poll`), when the caller supplied a poller via
+/// `gate.poller`. Both refreshes are already cheap no-ops once the stored
+/// reading is fresh -- `refresh_codex_usage`'s own staleness gate,
+/// `maybe_poll`'s staleness check plus its `poll_min_interval_secs` floor --
+/// so calling this on every loop iteration, not just once up front, costs
+/// nothing on the common path where nothing has gone stale since the last
+/// call. Never itself an error path: like the rest of this module, a failed
+/// refresh just leaves the previously-stored reading in place.
+///
+/// The sessions directory is resolved here via `crate::utils::home_dir()`
+/// (`HOME`/`USERPROFILE`) rather than left to `refresh_codex_usage`'s own
+/// internal `dirs::home_dir()` fallback: on Windows, `dirs::home_dir()`
+/// calls `SHGetKnownFolderPath` directly and ignores `HOME`/`USERPROFILE`
+/// entirely, so a test's `HomeGuard` (env-var based, like every other
+/// home-directory override in this crate) could never isolate it. Resolving
+/// it the same way the rest of this crate already does keeps production
+/// behavior identical on a normal machine (`USERPROFILE`/`HOME` always name
+/// the real profile there) while making this call testable. Falling back to
+/// `None` only when even that lookup fails, at which point
+/// `refresh_codex_usage`'s own fallback would not have found anything usable
+/// either.
+///
+/// Item 5: codex's scan is additionally floored to
+/// `usage_window::CODEX_SCAN_FLOOR_SECS` between *attempts*
+/// (`flags.last_codex_scan`), independent of `refresh_codex_usage`'s own
+/// internal staleness gate (which floors how old a *stored* reading has to
+/// be before a scan is worth doing at all, and does nothing for a provider
+/// that has never stored a reading in the first place). Without this outer
+/// floor, a parked codex session that writes no rollouts never satisfies
+/// the inner gate either, so every 30s wait-loop iteration re-walks the
+/// whole `~/.codex/sessions` tree for nothing. Shares the same constant
+/// `wrap.rs`'s status-bar refresh uses, so the two floors cannot drift.
+fn refresh_sources(
+    state: &StateDir,
+    cfg: &PaceConfig,
+    now: u64,
+    provider: &str,
+    gate: &PaceGate,
+    flags: &mut PaceGateFlags,
+) {
+    if provider == usage_window::CODEX_USAGE_PROVIDER
+        && now.saturating_sub(flags.last_codex_scan) >= usage_window::CODEX_SCAN_FLOOR_SECS
+    {
+        flags.last_codex_scan = now;
+        let sessions_dir = crate::utils::home_dir()
+            .ok()
+            .map(|h| h.join(".codex").join("sessions"));
+        usage_window::refresh_codex_usage(
+            state,
+            sessions_dir.as_deref(),
+            now,
+            cfg.collector_max_age_secs,
+        );
+    }
+    if let Some(poller) = gate.poller {
+        super::poll::maybe_poll(state, cfg, now, provider, poller);
+    }
+}
+
+/// Item 4: which `zirv ▸` announcement, if any, a decision should produce.
+/// Pulled out of `wait_for_window`'s announce block as a pure mapping so it
+/// is unit-testable on its own -- `Announcer::emit` always writes to real
+/// stderr (see `Announcer::silent()`'s use in this crate's other tests), so
+/// nothing downstream of it is easily assertable in a unit test.
+fn pacing_event(decision: &PaceDecision) -> Option<super::announce::Event> {
+    match decision {
+        PaceDecision::WaitUntil {
+            window, reset_at, ..
+        } => Some(super::announce::Event::PacingWait {
+            window: (*window).to_string(),
+            reset_at: *reset_at,
+        }),
+        PaceDecision::Slow {
+            window,
+            delay_secs,
+            percent,
+            ..
+        } => Some(super::announce::Event::PacingThrottled {
+            window: (*window).to_string(),
+            delay_secs: *delay_secs,
+            percent: *percent,
+        }),
+        _ => None,
+    }
+}
+
 /// Blocks until the window has room, then returns. Never exits the process and
 /// never returns an error: pacing failing closed would be worse than pacing not
 /// happening, so every unknown proceeds.
@@ -373,25 +554,25 @@ pub fn current_windows(
 /// text it always has, so nothing that already asserts on it breaks.
 ///
 /// `provider` is the resolved adapter's own `AgentAdapter::provider()`
-/// (`"anthropic"` for claude, `"openai"` for codex). E: when `provider` has
-/// **no possible** usage source (`window::has_no_usage_source` -- any
-/// provider but claude, since only claude has a real collector mechanism at
-/// all today), the gate is skipped outright with one announcement rather
-/// than silently entering the loop below and reading "nothing known" as if
-/// it were a fresh, empty collector reading for *this* provider: there is no
-/// collector for this provider at all, which is a materially different fact
-/// than "the collector says 0%". Claude itself is exempt from this check
-/// even before its first statusline tee: "not yet" is still true and
-/// actionable there.
+/// (`"anthropic"` for claude, `"openai"` for codex). Both usage sources are
+/// refreshed (`refresh_sources`, below) immediately before the no-source
+/// check -- codex's passive rollout scan, plus a poll through `gate.poller`
+/// when the caller supplied one -- so a first-ever run can still acquire
+/// data before deciding it has none, and again once per loop iteration so a
+/// stale reading can be topped up mid-wait. When nothing has been recorded
+/// for `provider` (`window::has_no_usage_source`) even after that refresh,
+/// the gate is skipped outright with one announcement rather than silently
+/// entering the loop below and reading "nothing known" as if it were a
+/// fresh, empty collector reading.
 ///
-/// `announced_no_source` is owned by the caller and threaded through every
-/// call across one run (`exec`'s own supervise loop calls this once per
-/// cycle -- the pre-flight check and, on a usage-limit park, again -- and
-/// `loop`'s cycle does the same), the same discipline the wait-loop's own
-/// internal `announced` local already follows *within* a single call: the
-/// no-source fact does not change cycle to cycle, so without this the skip
-/// line and `PacingSkipped` would otherwise repeat on every single restart
-/// of a long-running codex session, drowning out everything else on the
+/// `flags` is owned by the caller and threaded through every call across one
+/// run (`exec`'s own supervise loop calls this once per cycle -- the
+/// pre-flight check and, on a usage-limit park, again -- and `loop`'s cycle
+/// does the same), the same discipline the wait-loop's own internal
+/// `announced` local already follows *within* a single call: neither the
+/// no-source fact nor the use_credits setting changes cycle to cycle, so
+/// without this the skip lines would otherwise repeat on every single
+/// restart of a long-running session, drowning out everything else on the
 /// `zirv ▸` channel with a fact already stated once.
 #[allow(clippy::too_many_arguments)]
 pub fn wait_for_window<W: Write>(
@@ -404,7 +585,8 @@ pub fn wait_for_window<W: Write>(
     sleep_fn: &dyn Fn(Duration),
     announcer: Option<&super::announce::Announcer>,
     provider: &str,
-    announced_no_source: &mut bool,
+    gate: PaceGate<'_>,
+    flags: &mut PaceGateFlags,
 ) -> PaceOutcome {
     if !cfg.enabled {
         return PaceOutcome {
@@ -413,8 +595,45 @@ pub fn wait_for_window<W: Write>(
         };
     }
 
-    if usage_window::has_no_usage_source(state, provider) {
-        if !*announced_no_source {
+    // Short-circuits before any source refresh or decision: an operator
+    // declaring that this harness's vendor plan covers overage from credits
+    // means the proactive throttle/pause never applies to it. A
+    // vendor-reported limit hit still parks via a separate, untouched path.
+    if gate.use_credits {
+        if !flags.credits_announced {
+            let _ = writeln!(
+                w,
+                "zirv ctx {verb}: pacing: use_credits enabled for this harness, gate skipped"
+            );
+            let _ = log::append(
+                state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session,
+                    verb,
+                    verdict: "n/a",
+                    score: 0,
+                    action: "use-credits-skip",
+                    detail: "use_credits enabled; throttle/pause skipped for this harness",
+                },
+            );
+            flags.credits_announced = true;
+        }
+        return PaceOutcome {
+            waited_secs: 0,
+            source: Source::None,
+        };
+    }
+
+    refresh_sources(state, cfg, now_fn(), provider, &gate, flags);
+
+    // Item 1: a provider with nothing in the collector is only truly
+    // pacing-blind when the estimator cannot fill in either -- otherwise
+    // this early return would skip `current_windows` entirely and silently
+    // disable an operator's estimator-only pacing setup (no statusline tee,
+    // no working poll, but a configured budget).
+    if usage_window::has_no_usage_source(state, provider) && !estimator_configured(cfg) {
+        if !flags.no_source_announced {
             let _ = writeln!(
                 w,
                 "zirv ctx {verb}: pacing off: {provider} has no usage source"
@@ -424,7 +643,7 @@ pub fn wait_for_window<W: Write>(
                     provider: provider.to_string(),
                 });
             }
-            *announced_no_source = true;
+            flags.no_source_announced = true;
         }
         return PaceOutcome {
             waited_secs: 0,
@@ -434,20 +653,64 @@ pub fn wait_for_window<W: Write>(
 
     let started = now_fn();
     let mut announced: Option<(String, Option<u64>)> = None;
+    // Item 2: the monotonic Slow deadline, latched together with the window
+    // that produced it. Latching the window alongside the deadline (rather
+    // than just the deadline alone) is what lets a later staleness-driven
+    // `Unknown` recheck keep using the right `wait_cap` too -- see below.
+    let mut slow: Option<(u64, &'static str)> = None;
 
     loop {
         let now = now_fn();
+        refresh_sources(state, cfg, now, provider, &gate, flags);
         let (collector, estimated) = current_windows(state, cfg, now, provider);
         let decision = decide(&collector, estimated.as_ref(), now, cfg);
 
         let source = match &decision {
             PaceDecision::Proceed { source, .. } => *source,
             PaceDecision::WaitUntil { source, .. } => *source,
+            PaceDecision::Slow { source, .. } => *source,
             PaceDecision::Unknown => Source::None,
         };
 
-        let Some(deadline) = wait_deadline(&decision, now, cfg, std::process::id() as u64 ^ now)
-        else {
+        let seed = std::process::id() as u64 ^ now;
+
+        // `WaitUntil`'s deadline is absolute (the window's own reset), so
+        // re-deriving it each chunk is stable. A re-derived `Slow` deadline
+        // creeps forward every chunk instead (`now + (resets_at - now) *
+        // frac` grows as `now` does), which would stretch a soft-band
+        // throttle into a full park -- so its deadline is tracked
+        // monotonically, and a later, larger recheck may never push it out,
+        // only a smaller one may pull it in.
+        //
+        // Item 2: once a Slow deadline has latched, a recheck that reads as
+        // `Unknown` purely because the stored reading crossed
+        // `collector_max_age_secs` mid-wait carries no new information --
+        // it must not be read as "nothing to wait for" and exit the gate
+        // hours before the announced deadline. The latch holds until a
+        // `WaitUntil` supersedes it outright (a hard pause is a stronger
+        // signal than a soft throttle) or fresh data recomputes a smaller
+        // `Slow` deadline via the min rule above.
+        let deadline = match &decision {
+            PaceDecision::Slow { window, .. } => {
+                let cand = wait_deadline(&decision, now, cfg, seed);
+                let resolved = match (slow, cand) {
+                    (Some((prev, _)), Some(c)) => prev.min(c),
+                    (None, Some(c)) => c,
+                    (Some((prev, _)), None) => prev,
+                    // Unreachable in practice: `wait_deadline` always
+                    // returns `Some` for a `Slow` decision.
+                    (None, None) => now,
+                };
+                slow = Some((resolved, window));
+                Some(resolved)
+            }
+            PaceDecision::Unknown if slow.is_some() => slow.map(|(deadline, _)| deadline),
+            _ => {
+                slow = None;
+                wait_deadline(&decision, now, cfg, seed)
+            }
+        };
+        let Some(deadline) = deadline else {
             return PaceOutcome {
                 waited_secs: now.saturating_sub(started),
                 source,
@@ -457,7 +720,18 @@ pub fn wait_for_window<W: Write>(
         // The safety valve, scaled to the window that tripped: a seven-day trip
         // may legitimately wait days, a five-hour trip may not.
         let cap = match &decision {
-            PaceDecision::WaitUntil { window, .. } => wait_cap(window, cfg),
+            PaceDecision::WaitUntil { window, .. } | PaceDecision::Slow { window, .. } => {
+                wait_cap(window, cfg)
+            }
+            // A latched Slow episode surviving a stale-data `Unknown`
+            // recheck (item 2) still needs the cap of the window that
+            // latched it, not the bare `0` a plain `Unknown` gets --
+            // otherwise the very next line's cap check would immediately
+            // read "already over cap" and exit early regardless of the
+            // deadline fix above.
+            PaceDecision::Unknown if slow.is_some() => {
+                wait_cap(slow.map(|(_, window)| window).unwrap_or("five_hour"), cfg)
+            }
             _ => 0,
         };
         if now.saturating_sub(started) >= cap {
@@ -474,27 +748,33 @@ pub fn wait_for_window<W: Write>(
 
         // Announce once per distinct decision, not once per sleep chunk: a
         // seven-day park would otherwise write thousands of identical audit
-        // lines and scroll the operator's terminal for days.
+        // lines and scroll the operator's terminal for days. `Slow` is keyed
+        // on the window alone (not the shrinking delay/percent), so one
+        // throttle episode announces once rather than on every recheck. A
+        // latched-but-currently-`Unknown` recheck (item 2) reuses the same
+        // `slow:<window>` fingerprint it had while still reading `Slow`, so
+        // it is silently absorbed by the `announced == fingerprint` check
+        // below rather than re-announcing (or misreporting the episode as
+        // "usage state unknown, proceeding").
         let fingerprint = match &decision {
             PaceDecision::WaitUntil {
                 window, reset_at, ..
             } => Some(((*window).to_string(), *reset_at)),
+            PaceDecision::Slow { window, .. } => Some((format!("slow:{window}"), None)),
+            PaceDecision::Unknown if slow.is_some() => {
+                slow.map(|(_, window)| (format!("slow:{window}"), None))
+            }
             _ => None,
         };
         if announced != fingerprint {
             announced = fingerprint;
             let _ = writeln!(w, "zirv ctx {verb}: {}", describe(&decision));
-            if let (
-                Some(announcer),
-                PaceDecision::WaitUntil {
-                    window, reset_at, ..
-                },
-            ) = (announcer, &decision)
-            {
-                announcer.emit(&super::announce::Event::PacingWait {
-                    window: (*window).to_string(),
-                    reset_at: *reset_at,
-                });
+            // Item 4: `Slow` used to be invisible on the `zirv ▸` channel --
+            // only `WaitUntil` ever reached `announcer.emit`, so a
+            // potentially hours-long soft throttle produced no announcement
+            // at all. See `pacing_event` for the actual mapping.
+            if let (Some(announcer), Some(event)) = (announcer, pacing_event(&decision)) {
+                announcer.emit(&event);
             }
             let _ = log::append(
                 state,
@@ -547,6 +827,233 @@ mod tests {
         }
     }
 
+    fn collector_with_reset(percent: f64, resets_at: u64) -> UsageWindows {
+        UsageWindows {
+            five_hour: window(percent, resets_at, NOW - 10),
+            seven_day: None,
+        }
+    }
+
+    #[test]
+    fn below_soft_percent_proceeds_unthrottled() {
+        let d = decide(&collector(79.0), None, NOW, &PaceConfig::default());
+        assert!(matches!(d, PaceDecision::Proceed { .. }));
+    }
+
+    #[test]
+    fn inside_the_band_slows_proportionally_to_time_left() {
+        // soft 80, max 99: at 90% the band fraction is 10/19. Reset in 1900s
+        // -> delay = 1900 * 10/19 = 1000.
+        let w = collector_with_reset(90.0, NOW + 1900);
+        let d = decide(&w, None, NOW, &PaceConfig::default());
+        assert_eq!(
+            d,
+            PaceDecision::Slow {
+                delay_secs: 1000,
+                window: "five_hour",
+                percent: 90.0,
+                source: Source::Collector
+            }
+        );
+    }
+
+    #[test]
+    fn near_reset_the_slow_delay_shrinks_toward_zero() {
+        let w = collector_with_reset(90.0, NOW + 1); // 1s left: delay rounds to 0 -> Proceed
+        assert!(matches!(
+            decide(&w, None, NOW, &PaceConfig::default()),
+            PaceDecision::Proceed { .. }
+        ));
+    }
+
+    #[test]
+    fn at_max_percent_the_hard_pause_still_wins() {
+        let d = decide(&collector(99.0), None, NOW, &PaceConfig::default());
+        assert!(matches!(d, PaceDecision::WaitUntil { .. }));
+    }
+
+    #[test]
+    fn unknown_reset_time_slows_by_the_fallback_delay() {
+        // resets_at == 0 inside the band: t_rem stands in as fallback_delay_secs (900)
+        // at 90%: 900 * 10/19 = 473.
+        let w = collector_with_reset(90.0, 0);
+        let d = decide(&w, None, NOW, &PaceConfig::default());
+        assert!(matches!(
+            d,
+            PaceDecision::Slow {
+                delay_secs: 473,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_empty_band_disables_the_throttle() {
+        let cfg = PaceConfig {
+            soft_percent: 99.0,
+            ..PaceConfig::default()
+        }; // == max
+        assert!(matches!(
+            decide(&collector(98.0), None, NOW, &cfg),
+            PaceDecision::Proceed { .. }
+        ));
+    }
+
+    #[test]
+    fn use_credits_skips_the_gate_entirely() {
+        let exhausted = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &PaceConfig::default(),
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: true,
+                poller: None,
+            },
+            &mut flags,
+        );
+
+        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.source, Source::None);
+        assert!(
+            clock.slept.borrow().is_empty(),
+            "use_credits must never enter the wait loop"
+        );
+    }
+
+    #[test]
+    fn a_slow_wait_does_not_extend_itself_across_rechecks() {
+        // 90% with soft 80/max 99: first computed delay is 1000s (see
+        // inside_the_band_slows_proportionally_to_time_left). Re-deriving the
+        // decision every 30s chunk must not stretch the wait toward the full
+        // reset -- the monotonic slow_deadline must hold the first value.
+        let slow = collector_with_reset(90.0, NOW + 1900);
+        let (_tmp, state) = state_with(slow);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            // Item 2: the stored reading (observed 10s before `NOW`, see
+            // `collector_with_reset`) must stay fresh for the whole ~1000s
+            // wait, or the staleness gate rescues this test at ~890s and it
+            // stops proving anything about the monotonic rule at all --
+            // which is exactly what the masked version of this test used
+            // to do.
+            collector_max_age_secs: 3000,
+            ..PaceConfig::default()
+        };
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut flags,
+        );
+
+        let total_slept: u64 = clock.slept.borrow().iter().sum();
+        assert!(
+            total_slept <= 1000 + SLEEP_CHUNK_SECS,
+            "slept {total_slept}s, wanted <= 1000 + {SLEEP_CHUNK_SECS}"
+        );
+        assert!(
+            outcome.waited_secs <= 1000 + SLEEP_CHUNK_SECS,
+            "waited {}s",
+            outcome.waited_secs
+        );
+        assert!(
+            outcome.waited_secs >= 1000,
+            "the wait must reach the latched deadline in full now that the \
+             reading stays fresh, waited {}s",
+            outcome.waited_secs
+        );
+    }
+
+    /// Item 2: once a Slow deadline has latched, a reading that goes stale
+    /// mid-wait (crossing `collector_max_age_secs`, which `decide` then
+    /// reads as `Unknown`) must not truncate the wait to roughly
+    /// `collector_max_age_secs` -- the gate must keep waiting until the
+    /// latched deadline, exactly as if the reading had stayed fresh.
+    #[test]
+    fn a_latched_slow_deadline_survives_the_reading_going_stale_mid_wait() {
+        // Same 90%/reset-in-1900s shape as the test above (delay_secs =
+        // 1000), but with `collector_max_age_secs` tight enough that the
+        // stored reading goes stale well before that deadline arrives.
+        let slow = collector_with_reset(90.0, NOW + 1900);
+        let (_tmp, state) = state_with(slow);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            collector_max_age_secs: 200,
+            ..PaceConfig::default()
+        };
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut flags,
+        );
+
+        assert!(
+            outcome.waited_secs >= 1000,
+            "the latched deadline must survive the reading going stale \
+             mid-wait, waited only {}s (~collector_max_age_secs would be \
+             the old, truncated behavior)",
+            outcome.waited_secs
+        );
+        assert!(
+            outcome.waited_secs <= 1000 + SLEEP_CHUNK_SECS,
+            "waited {}s",
+            outcome.waited_secs
+        );
+    }
+
     #[test]
     fn a_healthy_fresh_collector_reading_proceeds() {
         let decision = decide(&collector(42.0), None, NOW, &PaceConfig::default());
@@ -576,8 +1083,12 @@ mod tests {
 
     #[test]
     fn just_below_the_ceiling_still_proceeds() {
+        // With the default soft-throttle band (soft 80, max 99) 98.9% falls
+        // inside the band, so this is now a throttled `Slow`, not a flat
+        // `Proceed` -- but it is still not the hard pause `WaitUntil` gives
+        // at/above the ceiling.
         let decision = decide(&collector(98.9), None, NOW, &PaceConfig::default());
-        assert!(matches!(decision, PaceDecision::Proceed { .. }));
+        assert!(matches!(decision, PaceDecision::Slow { .. }));
     }
 
     #[test]
@@ -793,6 +1304,24 @@ mod tests {
         );
         let deadline = wait_deadline(&decision, NOW, &PaceConfig::default(), 0).expect("deadline");
         assert_eq!(deadline, NOW + 900);
+    }
+
+    /// Item 3: a fresh reading inside the soft-throttle band whose own
+    /// `resets_at` has already passed must not phantom-throttle -- the
+    /// window genuinely rolled over, so this stale-looking percentage no
+    /// longer describes the current window.
+    #[test]
+    fn a_reading_after_a_genuine_reset_does_not_phantom_throttle() {
+        let w = collector_with_reset(95.0, NOW - 120);
+        let d = decide(&w, None, NOW, &PaceConfig::default());
+        assert_eq!(
+            d,
+            PaceDecision::Proceed {
+                source: Source::Collector,
+                worst_percent: 95.0
+            },
+            "a completed reset must not pace against its own stale percentage"
+        );
     }
 
     #[test]
@@ -1136,7 +1665,11 @@ mod tests {
             },
             None,
             "anthropic",
-            &mut false,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1172,7 +1705,11 @@ mod tests {
             },
             None,
             "anthropic",
-            &mut false,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
         );
 
         assert!(outcome.waited_secs >= 600, "waited {}", outcome.waited_secs);
@@ -1213,7 +1750,11 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
         );
 
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
@@ -1224,6 +1765,100 @@ mod tests {
             log.lines().filter(|l| l.contains("pace-wait")).count(),
             1,
             "one audit line per pause, not one per sleep chunk: {log}"
+        );
+    }
+
+    /// Item 4: `Slow` used to be invisible on the `zirv ▸` channel -- only
+    /// `WaitUntil` ever mapped to an announcement. This is the direct,
+    /// mutation-sensitive proof of the fix: `pacing_event`'s mapping, with
+    /// no need to capture real stderr.
+    #[test]
+    fn pacing_event_maps_wait_until_and_slow_and_nothing_else() {
+        let wait = PaceDecision::WaitUntil {
+            reset_at: Some(NOW + 600),
+            window: "five_hour",
+            percent: 99.0,
+            source: Source::Collector,
+        };
+        assert_eq!(
+            pacing_event(&wait),
+            Some(crate::commands::ctx::announce::Event::PacingWait {
+                window: "five_hour".to_string(),
+                reset_at: Some(NOW + 600),
+            })
+        );
+
+        let slow = PaceDecision::Slow {
+            delay_secs: 473,
+            window: "five_hour",
+            percent: 90.0,
+            source: Source::Collector,
+        };
+        assert_eq!(
+            pacing_event(&slow),
+            Some(crate::commands::ctx::announce::Event::PacingThrottled {
+                window: "five_hour".to_string(),
+                delay_secs: 473,
+                percent: 90.0,
+            })
+        );
+
+        assert_eq!(pacing_event(&PaceDecision::Unknown), None);
+        assert_eq!(
+            pacing_event(&PaceDecision::Proceed {
+                source: Source::Collector,
+                worst_percent: 1.0
+            }),
+            None
+        );
+    }
+
+    /// Item 4: the plain writer `w` and the announcer are gated by the
+    /// exact same `announced != fingerprint` check, so counting the
+    /// writer's "throttling" lines is an honest proxy for "the announce arm
+    /// fired once, not once per 30s recheck" without needing to capture
+    /// real stderr (this crate's other announcer tests use
+    /// `Announcer::silent()` for the same reason -- see `wrap.rs`'s
+    /// supervision tests).
+    #[test]
+    fn a_slow_pass_announces_once_not_per_recheck() {
+        let slow = collector_with_reset(90.0, NOW + 1900);
+        let (_tmp, state) = state_with(slow);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+        let announcer = crate::commands::ctx::announce::Announcer::silent();
+
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            max_wait_secs: Some(60),
+            ..PaceConfig::default()
+        };
+        let _outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            Some(&announcer),
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut flags,
+        );
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            printed.lines().filter(|l| l.contains("throttling")).count(),
+            1,
+            "one throttle announcement per latched episode, not once per recheck: {printed}"
         );
     }
 
@@ -1252,7 +1887,11 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
         );
 
         assert!(
@@ -1291,7 +1930,11 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
         );
 
         assert!(
@@ -1326,7 +1969,11 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
         );
 
         assert!(
@@ -1346,14 +1993,30 @@ mod tests {
     /// -- naming the provider -- rather than entering the loop and reading
     /// "nothing known" as a fresh empty collector reading for this provider.
     /// A totally fresh state dir (no `state_with` at all): the point is that
-    /// nothing has ever been written for "openai", not even an empty file.
+    /// nothing has ever been written for this provider, not even an empty
+    /// file.
+    ///
+    /// Uses a synthetic provider name rather than the real
+    /// `CODEX_USAGE_PROVIDER` ("openai"): since Task 6, `wait_for_window`
+    /// refreshes codex's source via `refresh_codex_usage(state, None, ...)`
+    /// before this very check, and that `None` falls all the way through to
+    /// `dirs::home_dir()` -- a live Win32 `SHGetKnownFolderPath` call on
+    /// Windows that ignores `HOME`/`USERPROFILE` overrides entirely (unlike
+    /// `crate::utils::home_dir()`, used elsewhere in this crate specifically
+    /// for testability). A real `~/.codex/sessions` on the machine running
+    /// this test would make the premise -- "nothing has ever been recorded"
+    /// -- false out from under it. `poller: None` plus a provider that is
+    /// neither the codex nor the legacy-anthropic name keeps this
+    /// deterministic regardless of what the real machine has on disk, while
+    /// still exercising the same generic skip path a real unknown provider
+    /// would take.
     #[test]
     fn a_provider_with_no_usage_source_skips_the_gate_and_names_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         let clock = FakeClock::new(NOW);
         let mut out = Vec::new();
-        let mut announced = false;
+        let mut flags = PaceGateFlags::default();
 
         let outcome = wait_for_window(
             &mut out,
@@ -1364,26 +2027,33 @@ mod tests {
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
-            "openai",
-            &mut announced,
+            "example-vendor",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut flags,
         );
 
         assert_eq!(outcome.waited_secs, 0);
         assert_eq!(outcome.source, Source::None);
         let printed = String::from_utf8_lossy(&out).to_string();
-        assert!(printed.contains("openai"), "got {printed}");
+        assert!(printed.contains("example-vendor"), "got {printed}");
         assert!(printed.contains("no usage source"), "got {printed}");
         assert!(
             clock.slept.borrow().is_empty(),
             "must never enter the wait loop"
         );
-        assert!(announced, "the latch is set so a caller's next cycle knows");
+        assert!(
+            flags.no_source_announced,
+            "the latch is set so a caller's next cycle knows"
+        );
 
         // Item 10: a second cycle of the same run (the caller's own
-        // `announced_no_source` threaded straight back in, exactly like
-        // `exec`'s and `loop`'s own supervise loops do) must not repeat the
-        // line or grow `out` at all -- the no-source fact was already stated
-        // once for this run.
+        // `flags` threaded straight back in, exactly like `exec`'s and
+        // `loop`'s own supervise loops do) must not repeat the line or grow
+        // `out` at all -- the no-source fact was already stated once for
+        // this run.
         let before = out.len();
         let outcome = wait_for_window(
             &mut out,
@@ -1394,8 +2064,12 @@ mod tests {
             &|| *clock.now.borrow(),
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
-            "openai",
-            &mut announced,
+            "example-vendor",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut flags,
         );
         assert_eq!(outcome.waited_secs, 0);
         assert_eq!(outcome.source, Source::None, "still skipped, just quietly");
@@ -1404,6 +2078,81 @@ mod tests {
             before,
             "a second cycle in the same run prints nothing new: {:?}",
             String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Item 1: a machine with no collector at all (no statusline tee, no
+    /// working poll) but a configured estimator budget must not take the
+    /// no-usage-source early return -- that would silently disable
+    /// estimator-only pacing and, via `exec.rs`'s vendor-limit park, spin
+    /// the caller in a zero-wait hot loop. `estimator_configured` is what
+    /// carves the exemption; this proves it reaches all the way through
+    /// `wait_for_window`.
+    #[test]
+    fn estimator_only_pacing_engages_when_the_collector_has_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        // A recent transcript whose usage alone, against a configured
+        // budget, pushes the five_hour estimate to (and past) the ceiling --
+        // with nothing at all recorded in the collector.
+        let event_ts = "2026-08-16T20:00:00Z";
+        let event_time = window::parse_iso8601_utc(event_ts).expect("test timestamp parses");
+        let now = event_time + 10;
+
+        let projects_dir = home.path().join(".claude").join("projects").join("proj");
+        std::fs::create_dir_all(&projects_dir).expect("mkdir");
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"{event_ts}","message":{{"usage":{{"input_tokens":2000}}}}}}"#
+        );
+        std::fs::write(projects_dir.join("t.jsonl"), format!("{line}\n")).expect("write");
+
+        let clock = FakeClock::new(now);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            max_wait_secs: Some(60),
+            five_hour_budget_tokens: 1000,
+            ..PaceConfig::default()
+        };
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut flags,
+        );
+
+        assert!(
+            !flags.no_source_announced,
+            "estimator pacing configured must not take the no-source skip path"
+        );
+        let printed = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            !printed.contains("no usage source"),
+            "must not print the skip line: {printed}"
+        );
+        assert!(
+            outcome.waited_secs > 0,
+            "estimator-only pacing must actually pace, not zero-wait hot loop, got {}",
+            outcome.waited_secs
         );
     }
 
@@ -1423,7 +2172,11 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
         );
 
         assert_eq!(outcome.waited_secs, 0);
@@ -1453,7 +2206,11 @@ mod tests {
             &|d| *clock.now.borrow_mut() += d.as_secs(),
             None,
             "anthropic",
-            &mut false,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
         );
         assert_eq!(outcome.waited_secs, 0);
         assert!(
@@ -1482,5 +2239,280 @@ mod tests {
             estimated.is_some(),
             "a configured budget turns the estimator on"
         );
+    }
+
+    struct StubPoller {
+        calls: RefCell<u32>,
+        reading: Option<crate::commands::ctx::poll::PollReading>,
+    }
+
+    impl crate::commands::ctx::poll::UsagePoller for StubPoller {
+        fn poll(&self, _provider: &str) -> Option<crate::commands::ctx::poll::PollReading> {
+            *self.calls.borrow_mut() += 1;
+            self.reading.clone()
+        }
+    }
+
+    #[test]
+    fn the_gate_polls_only_when_the_stored_reading_is_stale() {
+        let cfg = PaceConfig::default();
+
+        // Stale stored reading (well past collector_max_age_secs) and above
+        // the ceiling, so a failure to refresh would still park: the poller
+        // returns a fresh below-soft reading and the gate proceeds without
+        // waiting -- proof the poll's result actually drove the decision.
+        let stale = UsageWindows {
+            five_hour: window(95.0, NOW + 600, NOW - 100_000),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(stale);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+        let poller = StubPoller {
+            calls: RefCell::new(0),
+            reading: Some(crate::commands::ctx::poll::PollReading {
+                windows: UsageWindows {
+                    five_hour: window(10.0, NOW + 600, NOW),
+                    seven_day: None,
+                },
+                vendor_credits_enabled: None,
+            }),
+        };
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: Some(&poller),
+            },
+            &mut flags,
+        );
+
+        assert_eq!(
+            *poller.calls.borrow(),
+            1,
+            "the stale reading triggers exactly one poll"
+        );
+        assert_eq!(
+            outcome.waited_secs, 0,
+            "the poll's fresh below-soft reading lets the gate proceed"
+        );
+        assert!(clock.slept.borrow().is_empty());
+
+        // Fresh stored reading: the poller must never be consulted at all.
+        let fresh = UsageWindows {
+            five_hour: window(10.0, NOW + 600, NOW - 10),
+            seven_day: None,
+        };
+        let (_tmp2, state2) = state_with(fresh);
+        let clock2 = FakeClock::new(NOW);
+        let poller2 = StubPoller {
+            calls: RefCell::new(0),
+            reading: None,
+        };
+        let mut flags2 = PaceGateFlags::default();
+        let mut out2 = Vec::new();
+
+        let outcome2 = wait_for_window(
+            &mut out2,
+            &state2,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock2.now.borrow(),
+            &|d| *clock2.now.borrow_mut() += d.as_secs(),
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: Some(&poller2),
+            },
+            &mut flags2,
+        );
+
+        assert_eq!(
+            *poller2.calls.borrow(),
+            0,
+            "a fresh stored reading needs no poll"
+        );
+        assert_eq!(outcome2.waited_secs, 0);
+    }
+
+    #[test]
+    fn a_failing_poller_leaves_the_gate_on_passive_data() {
+        let cfg = PaceConfig {
+            jitter_secs: 0,
+            ..PaceConfig::default()
+        };
+        // Stale, but at/above the ceiling with a still-future reset: this
+        // binds via the existing `binding` rule regardless of staleness (see
+        // `a_stale_full_window_keeps_binding_until_its_reset_arrives`), so a
+        // poller that can never produce data must not change the outcome.
+        let stale_but_full = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW - 100_000),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(stale_but_full);
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+        let poller = StubPoller {
+            calls: RefCell::new(0),
+            reading: None,
+        };
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: Some(&poller),
+            },
+            &mut flags,
+        );
+
+        assert!(
+            *poller.calls.borrow() >= 1,
+            "the failing poller was actually consulted"
+        );
+        assert!(
+            outcome.waited_secs >= 600,
+            "still parks on the stale-but-binding reading exactly as today, waited {}",
+            outcome.waited_secs
+        );
+    }
+
+    /// Item 5: `refresh_sources` floors codex scan *attempts* to
+    /// `window::CODEX_SCAN_FLOOR_SECS`, independent of
+    /// `refresh_codex_usage`'s own internal staleness gate. `cfg
+    /// .collector_max_age_secs` is set to `1` here specifically so that
+    /// inner gate never blocks a rescan on its own -- isolating the outer
+    /// floor as the only thing that can explain a skipped scan in this
+    /// test.
+    #[test]
+    fn refresh_sources_floors_codex_scan_attempts_to_the_shared_constant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let sessions_dir = home.path().join(".codex").join("sessions");
+        let day = sessions_dir.join("2026").join("03").join("01");
+        std::fs::create_dir_all(&day).expect("mkdir");
+
+        let ts1 = "2026-03-01T10:00:00Z";
+        let ts2 = "2026-03-01T10:05:00Z";
+        let t1 = window::parse_iso8601_utc(ts1).expect("ts1 parses");
+        let t2 = window::parse_iso8601_utc(ts2).expect("ts2 parses");
+
+        std::fs::write(
+            day.join("a.jsonl"),
+            format!(
+                r#"{{"timestamp":"{ts1}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":12.0,"window_minutes":300,"resets_at":{}}}}}}}}}
+"#,
+                t1 + 100_000
+            ),
+        )
+        .expect("write a");
+
+        let cfg = PaceConfig {
+            collector_max_age_secs: 1,
+            ..PaceConfig::default()
+        };
+        let gate = PaceGate {
+            use_credits: false,
+            poller: None,
+        };
+        let mut flags = PaceGateFlags::default();
+        let first_now = t1 + 60;
+
+        // Call 1: nothing scanned yet (`last_codex_scan == 0`), so the floor
+        // is open regardless of how large `now` is.
+        refresh_sources(
+            &state,
+            &cfg,
+            first_now,
+            window::CODEX_USAGE_PROVIDER,
+            &gate,
+            &mut flags,
+        );
+        let after_first = window::load_for(&state, window::CODEX_USAGE_PROVIDER)
+            .and_then(|w| w.five_hour)
+            .expect("stored after first scan");
+        assert_eq!(after_first.used_percentage, 12.0, "first scan finds file a");
+        assert_eq!(flags.last_codex_scan, first_now);
+
+        // A second, fresher rollout now appears on disk -- but the next
+        // call lands only 30s later, under the 60s floor.
+        std::fs::write(
+            day.join("b.jsonl"),
+            format!(
+                r#"{{"timestamp":"{ts2}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":99.0,"window_minutes":300,"resets_at":{}}}}}}}}}
+"#,
+                t2 + 100_000
+            ),
+        )
+        .expect("write b");
+
+        refresh_sources(
+            &state,
+            &cfg,
+            first_now + 30,
+            window::CODEX_USAGE_PROVIDER,
+            &gate,
+            &mut flags,
+        );
+        let after_second = window::load_for(&state, window::CODEX_USAGE_PROVIDER)
+            .and_then(|w| w.five_hour)
+            .expect("still stored");
+        assert_eq!(
+            after_second.used_percentage, 12.0,
+            "30s < the 60s floor: the second file must not have been picked up yet"
+        );
+        assert_eq!(
+            flags.last_codex_scan, first_now,
+            "a floored attempt must not move the last-scan clock"
+        );
+
+        // A third call, 90s after the first (>= the 60s floor since the
+        // last actual scan), is due again and picks up the fresher file.
+        refresh_sources(
+            &state,
+            &cfg,
+            first_now + 90,
+            window::CODEX_USAGE_PROVIDER,
+            &gate,
+            &mut flags,
+        );
+        let after_third = window::load_for(&state, window::CODEX_USAGE_PROVIDER)
+            .and_then(|w| w.five_hour)
+            .expect("still stored");
+        assert_eq!(
+            after_third.used_percentage, 99.0,
+            "once the floor has elapsed, the newer file is picked up"
+        );
+        assert_eq!(flags.last_codex_scan, first_now + 90);
     }
 }

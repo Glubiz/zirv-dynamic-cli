@@ -237,7 +237,11 @@ use super::rot::Verdict;
 
 /// A placeholder for a value that is not yet known -- an en dash, never a
 /// zero: a session with no usage reading yet must not look like it is at 0%.
-const PLACEHOLDER: &str = "\u{2013}";
+///
+/// `pub(crate)` so the dashboard header (`dash::ui::header_line`) can reuse
+/// the exact same glyph for its own per-harness usage segment rather than
+/// retyping the escape.
+pub(crate) const PLACEHOLDER: &str = "\u{2013}";
 
 /// Everything the bar draws. Every field that can be unknown is an `Option`
 /// so `status_bar` can render the placeholder instead of a misleading zero.

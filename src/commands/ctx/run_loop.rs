@@ -129,7 +129,8 @@ pub fn run_with<W: Write>(
     // Item 10: owned across every cycle, so the no-usage-source skip line
     // (pace.rs's own `wait_for_window`) prints once for the whole run
     // rather than once per cycle.
-    let mut pace_no_source_announced = false;
+    let mut pace_flags = pace::PaceGateFlags::default();
+    let http_poller = super::poll::HttpPoller;
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -151,7 +152,14 @@ pub fn run_with<W: Write>(
             &sleep_fn,
             None,
             adapter.provider(),
-            &mut pace_no_source_announced,
+            pace::PaceGate {
+                use_credits: cfg.pace.use_credits.for_provider(adapter.provider()),
+                poller: cfg
+                    .pace
+                    .poll_enabled
+                    .then_some(&http_poller as &dyn super::poll::UsagePoller),
+            },
+            &mut pace_flags,
         );
 
         let mail_slug = super::state::repo_slug(repo);
@@ -287,6 +295,16 @@ pub fn run_with<W: Write>(
             cwd: repo.to_path_buf(),
         });
 
+        // The session conventions (`DEFAULT_PROMPT`) are the first task-
+        // prompt-text fallback applied, ahead of mail: gated identically to
+        // composition (`composed.is_some()`), unlike mail's own gate just
+        // below, which deliberately does not depend on `composed` for an
+        // uninjectable adapter (see the `mail_entries` gate above).
+        let prompt = if composed.is_some() {
+            super::prompt::task_prompt_with_conventions_fallback(&prompt, system_prompt_supported)
+        } else {
+            prompt.clone()
+        };
         // Mail is the one composed layer that still has somewhere to go for
         // an adapter with no system-prompt mechanism: the task prompt text
         // itself. A capable adapter (claude) gets the unchanged `prompt`
@@ -450,7 +468,18 @@ pub fn run_with<W: Write>(
                 &sleep_fn,
                 None,
                 adapter.provider(),
-                &mut pace_no_source_announced,
+                pace::PaceGate {
+                    // A vendor-reported limit hit parks even with use_credits
+                    // enabled: the vendor limiting us means credits are
+                    // exhausted or not actually enabled plan-side, and an
+                    // immediate relaunch would just re-hit it.
+                    use_credits: false,
+                    poller: cfg
+                        .pace
+                        .poll_enabled
+                        .then_some(&http_poller as &dyn super::poll::UsagePoller),
+                },
+                &mut pace_flags,
             );
         }
 
@@ -1558,6 +1587,69 @@ mod tests {
         assert!(
             unread.is_empty(),
             "mail actually delivered into the task prompt must be consumed: {unread:?}"
+        );
+    }
+
+    /// Pins the gate asymmetry between the two task-prompt fallbacks: unlike
+    /// mail (see `simple_mode_does_not_withhold_mail_from_a_codex_cycle`
+    /// just above), the conventions fallback is gated on `composed.is_some()`
+    /// -- the same `simple`/`cfg.prompt.enabled` pair `compose` itself
+    /// checks -- so `--simple` withholds `DEFAULT_PROMPT` from a codex cycle
+    /// even though mail still gets through on that same task-prompt-text
+    /// channel. Without this test, flipping the conventions call site's gate
+    /// to match mail's looser one would pass every other test.
+    #[test]
+    fn simple_mode_withholds_conventions_but_not_mail_from_a_codex_cycle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_ARGV_LOG",
+            argv_log.to_str(),
+        )]);
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+
+        let mut args = args_for(1);
+        args.agent = Some("codex".to_string());
+        args.simple = true;
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            !argv.contains("zirv, the harness that started this session"),
+            "--simple must withhold the conventions fallback, same as every other composed \
+             layer: {argv}"
+        );
+        assert!(
+            argv.contains("heads up: the webhook route moved"),
+            "but must not withhold mail, whose channel does not depend on composed: {argv}"
         );
     }
 }

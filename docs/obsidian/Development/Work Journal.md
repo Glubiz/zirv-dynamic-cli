@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-16
+last-verified: 2026-08-17
 ---
 
 # Work Journal
@@ -19,6 +19,16 @@ last-verified: 2026-08-16
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-16: vendor usage monitoring, use_credits gating, pace-to-reset throttle (`feat/usage-credits-throttle`)
+**What:** Nine-task plan landing usage-window pacing beyond the passive statusline tee. `pace.rs` gained a `Slow` decision (soft-throttle band between new `soft_percent`/`max_percent`, spreading remaining budget linearly to reset, with a monotonic deadline across rechecks) and a `PaceGate{use_credits, poller}` — `use_credits` (new `[pace.use_credits]` table, `REPO_FORBIDDEN`) skips proactive throttle/pause but never the vendor-reported limit park. `window.rs` gained a codex passive collector (rollout-file rate-limit snapshots, RFC 3339 parsing) and `poll.rs` (new) is an active HTTP poll fallback (`ureq`, first HTTP dependency) behind a staleness/interval floor — Anthropic verified against a real response, codex ships best-effort/unverified. Task 7 (already journaled 2026-08-16 below) put per-harness usage back in the dashboard header; Task 9 delivered conventions v2 (verify-once, scope discipline) to codex workers via a task-prompt fallback.
+**Key changes:** `config.rs` (`pace.soft_percent`/`poll_enabled`/`poll_min_interval_secs`/`use_credits`), `pace.rs` (`Slow`, `PaceGate`, `refresh_sources`), `poll.rs` (new), `window.rs` (codex collector), `usage.rs` (source refresh + advisory lines), `prompt.rs` (`task_prompt_with_conventions_fallback`), `Cargo.toml` (`ureq = "3"`, version 2.9.0).
+**Follow-up:** see [[Decision Log]] for the four decisions and [[Known Issues]] for the three residuals recorded (codex poll endpoint unverified, codex collector pinned to codex-cli 0.105.0's shape, Anthropic endpoint unofficial). PR pending after final review rounds.
+
+### 2026-08-16: usage returns to the dashboard header; a wrapped codex bar gets its own passive scan
+**What:** Task 7 of the usage-credits-throttle plan. `ui::HeaderFacts` gained `usage: Vec<(&'static str, Option<f64>, bool)>`, one entry per harness enabled in `cfg.agents`, assembled in `FactsCache::refresh_if_due` from `window::load_for`/`max_used_percentage` (file reads only — the dashboard's event loop never scans or polls). `header_line` renders a percent, the shared `chrome::PLACEHOLDER` en dash for unknown, or `<harness> credits` when `cfg.pace.use_credits` is on for that provider. Separately, `wrap::redraw_bar_if_due` now runs its own throttled (`CODEX_BAR_SCAN_SECS`, 60s) passive `refresh_codex_usage` scan for a wrapped codex session, since it has no statusline tee to keep its bar fresh otherwise — file-only, never HTTP, per `wrap`'s own invariant.
+**Key changes:** `chrome.rs` (`PLACEHOLDER` → `pub(crate)`), `dash/ui.rs` (`HeaderFacts`, `header_line`), `dash/mod.rs` (`DiskFacts::usage`, `refresh_if_due`, `assemble_header_facts`), `wrap.rs` (`BarRuntime::{last_codex_scan,collector_max_age_secs}`, `CODEX_BAR_SCAN_SECS`, `redraw_bar_if_due`).
+**Follow-up:** see [[Decision Log]] (reverses the 2026-08-15 header removal) and [[Usage and Pacing]]/[[Ctx Supervisors]] for the mechanism.
 
 ### 2026-08-16: reap child process trees on every teardown path (Windows lifecycle)
 **What:** Two commits on `fix/process-lifecycle` (stacked on `feat/harness-roster-prompt`) closing every Windows teardown path that could leave an agent's process tree running unsupervised. Three layers: (P1) `supervise::kill_tree` (renamed/`pub(crate)`'d from `taskkill_tree`) now runs at `wrap::quit_child`, `dash::pane::Pane::finish_shutdown`, and the distiller's timeout escalation, not just `exec`/`loop`. (P2) a cross-platform supervised-pid registry swept by the Windows console-close handler on terminal events only (Ctrl-C exempt). (P3) kill-on-close Job Objects (`ChildGuard`/`JobGuard`, new `windows-sys` feature) as the kernel backstop for crash/`taskkill /F`/`panic=abort`. Review round (`222b24f`) added the roster liveness fail-safe (`partition_live`/`short_is_live`, deferred-not-dropped) and parked `wrap`'s registry record on zirv's own pid during the kill→respawn window so a concurrent `sessions::list` can't sweep a live record.
@@ -60,14 +70,4 @@ last-verified: 2026-08-16
 **Key changes:** src/commands/ctx/memory.rs (`harvest_from_handoff`, `harvest_prompt`, `parse_harvest`), exec.rs/wrap.rs (harvest call sites in the rot-restart paths only, not nudge), status.rs (`sessions_lines`, `format_age`), optimize.rs (`MemorySummary`, `memory_bank_summary`, `render_memory_section`), chrome.rs/wrap.rs (`BarState::unread_mail` now `(broadcast, direct)`), tests/fixtures/fake-model.sh (`harvest` mode).
 **Follow-up:** none for this wave.
 
-### 2026-08-12: `zirv chat`/`zirv agent`, bare-zirv alias, and `status`'s chat/mail lines
-**What:** Top-level routing for the "just run `zirv`" wave: bare `zirv` aliases to `zirv ctx chat` (repo has a `.zirv` dir, stdin is a tty) or `zirv help` otherwise, exiting 0 either way instead of clap's old usage-error exit 2. `zirv chat`/`zirv agent` are further top-level aliases for `zirv ctx chat`/`zirv ctx agent`, reserved so a script can never shadow them. `zirv ctx status` gained a `chat:` line (the adapter `chat` would launch and the rule that picked it, or why nothing qualifies) and a `mail: N unread` line, both degrading rather than failing the rest of the command.
-**Key changes:** src/main.rs (`top_level_ctx_alias`, `rewrite_ctx_alias_args`, `bare_invocation_target`, `zirv_dir_present`), src/utils.rs (`RESERVED_COMMANDS` +chat/+agent), src/commands/help.rs, src/commands/ctx/status.rs (`describe_chat`), README, CLAUDE.md, vault pages. Landed alongside (not touched by this wave): `chat.rs`/`agent.rs`/`mail.rs` verbs, `chrome.rs`/`announce.rs` terminal chrome.
-**Follow-up:** none for this wave; `announce.rs`'s event channel was still a placeholder at the time these docs were written — see its own module doc.
-
-### 2026-08-12: Agent enable/disable gate (.zirv/.settings.toml)
-**What:** New zirv-wide settings file toggling the claude/codex harnesses, enforced in `adapters::select` before `ready()`. Repo layer can only narrow; env is operator authority. Malformed repo file falls back to an operator-only/deny-all gate.
-**Key changes:** src/settings.rs (new), adapters/mod.rs + 10 call sites, utils/help/input reserved-name guards, ctx status, README, vault pages. PR #18.
-**Follow-up:** harness roadmap (session registry, mailbox, codex completion) awaits prioritization — see [[Decision Log]] and PR #18 description.
-
-Older entries: see [[journal-archive/2026-Q3|2026 Q3 archive]] (2026-08-12: Obsidian vault created).
+Older entries: see [[journal-archive/2026-Q3|2026 Q3 archive]] (2026-08-12: `zirv chat`/`zirv agent` aliases, Agent enable/disable gate, Obsidian vault created).

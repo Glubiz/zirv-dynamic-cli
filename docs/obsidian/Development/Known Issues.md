@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-16
+last-verified: 2026-08-17
 ---
 
 # Known Issues
@@ -14,6 +14,8 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-17 (feat/usage-credits-throttle, final review round): recorded the silent-poll-failure deviation (spec promised a one-time zirv announcement on a failed poll attempt; the shipped code degrades silently -- deviation recorded, fix deferred to a mockable-transport follow-up) and gated the usage verb's active poll on pace.enabled -->
+<!-- Updated 2026-08-17 (feat/usage-credits-throttle): resolved "a limit-park is guaranteed unthrottled for a provider with no usage collector" -- codex now has both a passive rollout-file collector and an active HTTP poll fallback, so the "no collector exists at all" premise no longer holds; added three residuals -- the codex ChatGPT-backend poll endpoint ships unverified (no readable token on the reference machine), the codex rollout collector is verified against codex-cli 0.105.0's shape only, and the Anthropic OAuth usage endpoint is unofficial and may drift without notice -->
 <!-- Updated 2026-08-16 (fix/process-lifecycle, c843891+222b24f): resolved the roster liveness gap (dash::roster::partition_live + sessions::short_is_live) but recorded three residuals -- the age window still applies to a genuinely-dead candidate, a live session's roster entry is re-seeded every launch and so never ages out while it stays alive, and a held-back candidate is lost if the dashboard never reaches on_quit (abort_setup's terminal-setup failure arms); narrowed the portable-pty do_kill and supervise::terminate entries to note every teardown path now tree-kills first; added three new gotchas -- a dropped ChildGuard kills its child on Windows, Job-Object assignment races a shim's own grandchild, and the distiller's kill_tree escalation ships without a dedicated test on either platform -->
 <!-- Updated 2026-08-16 (feat/harness-roster-prompt, review round): owner_pid stamping moved from dash/pane.rs into SessionGuard::register itself, uniformly attributing every registration path -- a new entry records the residual it does not close: a raw pid cannot express "owned by dashboard X" from a genuinely separate process, so a dashboard pane's own child falling back to zirv ctx agent's in-process headless worker is correctly, but unhelpfully, invisible to that dashboard's own sidebar -->
 <!-- Updated 2026-08-16 (feat/harness-roster-prompt): dashboard sidebar scoped to sessions owned by this dashboard (owner_pid), reversing ac40418's "show every registered session" -- a new entry records the roster-restore liveness gap found while investigating this, not fixed -->
@@ -194,21 +196,53 @@ prompt (the one residual claude's distiller has too, and cannot close either
 npm-published codex-cli ships them, verified against that installed CLI the
 same way `-s, --sandbox` was.
 
-## A limit-park is guaranteed unthrottled for a provider with no usage collector
+## The codex ChatGPT-backend poll endpoint ships unverified
 
-`pace::wait_for_window`'s own early return for `window::has_no_usage_source`
-(codex/openai today: no collector mechanism exists at all) skips the wait
-entirely and reports `Source::None` -- so a `limit-park` restart after
-codex reports a usage limit relaunches immediately, with no backoff, and can
-re-hit the same limit and park again right away. This is not a new failure
-mode: claude gets the identical *observable* behavior before its first
-statusline tee ever runs (`nothing_known_is_unknown_not_zero` -- an unknown
-reading also proceeds without waiting), so a fresh claude session parks and
-relaunches just as fast until a real reading exists. For codex the gap is
-structural rather than transient, though: there is no tee to eventually
-populate a reading, so it never self-resolves. Recorded, not fixed -- a real
-fix needs either a fallback delay specifically for the no-source case or a
-codex-side usage collector to exist at all (there is none today).
+`poll::HttpPoller`'s codex arm (`https://chatgpt.com/backend-api/codex/usage`)
+was implemented and unit-tested against synthetic response bodies only — no
+readable `~/.codex/auth.json` token existed on the reference machine to
+exercise it against the real endpoint. `parse_codex_usage` is exercised by
+`codex_response_parser_accepts_rate_limits_shapes_and_rejects_junk` against
+hand-built JSON, but nothing in the suite has ever seen a genuine response
+from this URL. It ships best-effort per an explicit user ruling (see
+`docs/superpowers/specs/2026-08-16-usage-credits-throttle-design.md`): every
+failure mode (wrong shape, wrong auth header, endpoint moved) degrades to
+`None`, same as any other poll failure, so the worst case is "the fallback
+poll never contributes data," not a crash or a bad reading. Verify against a
+real response and add a fixture (mirroring
+`tests/fixtures/anthropic-oauth-usage.json`) once a working codex OAuth token
+is available to test with.
+
+## The codex rollout collector is verified against codex-cli 0.105.0's shape only
+
+`window::parse_rollout_line`/`windows_from_rate_limits` were verified against
+the real rollout JSON codex-cli 0.105.0 writes (the same npm-published
+version the rest of this codebase's codex-shim work is pinned against —
+see [[Ctx Adapters]]'s distiller-sandbox residual for the sibling case), and
+`tests/fixtures/codex-rollout-rate-limits.jsonl` is a fixture of that exact
+shape. A future codex-cli release that changes the `token_count` event's
+`rate_limits` object (renamed fields, restructured `primary`/`secondary`, a
+different timestamp format) silently degrades to "snapshot not recognized,
+provider treated as having no data" rather than erroring loudly — the
+collector was built to fail this way on purpose (an unrecognized shape must
+never crash a pacing decision), but that also means a real shape change on a
+newer codex-cli would ship silently broken until someone notices codex usage
+never appears in the header/status. No version-detection or shape-versioning
+exists to catch this.
+
+## The Anthropic OAuth usage endpoint is unofficial and may drift
+
+`https://api.anthropic.com/api/oauth/usage` is not a documented, versioned
+public API — it is the same endpoint Claude Code's own CLI calls internally,
+reverse-engineered for `poll::HttpPoller`'s Anthropic arm and verified
+against one real response (`tests/fixtures/anthropic-oauth-usage.json`).
+Anthropic can change or remove it without notice. `parse_anthropic_usage`
+degrades to `None` on any shape it doesn't recognize (missing `five_hour`/
+`seven_day` objects, a renamed `utilization` field, a body that isn't valid
+JSON at all) rather than erroring, so a drifted endpoint silently stops
+contributing to the poll fallback — the passive statusline-tee collector is
+unaffected either way, since it reads Claude Code's own rendered payload,
+not this endpoint.
 
 ## `x.saturating_sub(n).clamp(1, x)` panics when `x` is 0
 
@@ -556,3 +590,11 @@ cannot unwind to a cleanup handler — raw-mode terminal restore must happen in
 explicit arms, not in a `Drop` guard relying on unwind. No `unwrap`/`expect` on
 that path; any supervision failure must degrade to pure passthrough instead of
 leaving the terminal in raw mode.
+
+## A failed usage poll is silent (recorded spec deviation)
+
+The approved design (spec §3/§6, `docs/superpowers/specs/2026-08-16-usage-credits-throttle-design.md`) called for a one-time `zirv ▸` announcement per process the first time an active usage poll is attempted and fails, mirroring the `pace_no_source_announced` latch. The shipped `poll::maybe_poll` cannot distinguish "did not poll" from "polled and failed" in its return type, so no caller can announce the failure, and an operator with an expired or missing OAuth token sees only silently stale usage. Recorded as a deliberate deviation at the final whole-branch review (2026-08-17) rather than an oversight; the fix wants a `maybe_poll` return-type change plus a mockable transport for testing (see the Task 5 deferred note), not a quick patch. Until then: if usage looks stuck-stale on a machine that should be polling, check the token files by hand.
+
+## Polling is structurally inert on keychain / API-key setups
+
+`poll::anthropic_token` reads only `~/.claude/.credentials.json`. Claude Code installs that store OAuth tokens elsewhere (macOS Keychain) or authenticate via API key / Bedrock have no such file, so the active poll can never acquire data there. Combined with `has_no_usage_source` being a plain no-data check, a claude machine with no statusline tee and no readable credentials file gets no usage-based pacing at all — the gate announces `pacing off: anthropic has no usage source` once per run (that one-time announcement is the signal; estimator-based pacing, if configured, still applies as of the 2026-08-17 fix round). The remedy on such machines is wiring the statusline tee (`zirv ctx usage tee`), which needs no credentials.

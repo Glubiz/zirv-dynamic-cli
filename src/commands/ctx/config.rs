@@ -161,6 +161,19 @@ pub struct PaceConfig {
     /// wait-until-reset semantics require: a global cap would resume early and
     /// spend tokens against a window that is still exhausted.
     pub max_wait_secs: Option<u64>,
+    /// Start of the soft-throttle band. At or above this (and below
+    /// `max_percent`) cycles are delayed so the remaining budget spreads
+    /// linearly over the time left in the window. `>= max_percent` means no
+    /// throttle band -- hard pause only.
+    pub soft_percent: f64,
+    /// Active API-poll fallback: only consulted when the passive collector
+    /// reading is stale at a gating point.
+    pub poll_enabled: bool,
+    /// Per-provider floor between poll attempts, shared across processes.
+    pub poll_min_interval_secs: u64,
+    /// Operator declaration that a harness's vendor plan covers overage from
+    /// credits: gating (throttle and pause) is skipped for that harness.
+    pub use_credits: UseCreditsConfig,
 }
 
 impl Default for PaceConfig {
@@ -177,6 +190,33 @@ impl Default for PaceConfig {
             fallback_delay_secs: 900,
             wait_slack_secs: 3600,
             max_wait_secs: None,
+            soft_percent: 80.0,
+            poll_enabled: true,
+            poll_min_interval_secs: 60,
+            use_credits: UseCreditsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UseCreditsConfig {
+    pub claude: bool,
+    pub codex: bool,
+}
+
+impl UseCreditsConfig {
+    /// Keyed by agent in config (what the operator thinks in), resolved by
+    /// provider at the gate (what pacing knows). Unknown providers gate.
+    ///
+    /// Called at every pacing-gate construction site (`exec`/`run_loop` build
+    /// `PaceGate { use_credits: cfg.pace.use_credits.for_provider(..) }`) and
+    /// by the dashboard header's per-harness usage row.
+    pub fn for_provider(&self, provider: &str) -> bool {
+        match provider {
+            "anthropic" => self.claude,
+            "openai" => self.codex,
+            _ => false,
         }
     }
 }
@@ -531,6 +571,31 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["pace", "seven_day_budget_tokens"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_PACE_SOFT_PERCENT",
+        &["pace", "soft_percent"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_PACE_POLL",
+        &["pace", "poll_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
+        &["pace", "poll_min_interval_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
+        &["pace", "use_credits", "claude"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PACE_USE_CREDITS_CODEX",
+        &["pace", "use_credits", "codex"],
+        EnvKind::Bool,
+    ),
     ("ZIRV_CTX_OPTIMIZE", &["optimize", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_OPTIMIZE_SESSIONS",
@@ -766,6 +831,19 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // way that trade goes is the operator's call about their own terminal,
     // not a checked-out repo's.
     (&["dash", "mouse"], "ZIRV_CTX_DASH_MOUSE"),
+    // A repo checkout must not be able to flip a spend decision (skipping
+    // throttle/pause gating on the operator's own vendor plan), re-enable
+    // the active API-poll fallback an operator turned off, or change its
+    // cadence -- credential reads and network calls are the operator's
+    // budget to spend, not the checkout's. `value_at` matches a table node
+    // the same way it matches a leaf, so this one entry also catches a repo
+    // setting only `[pace.use_credits]\ncodex = true` without `claude`.
+    (&["pace", "use_credits"], "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE"),
+    (&["pace", "poll_enabled"], "ZIRV_CTX_PACE_POLL"),
+    (
+        &["pace", "poll_min_interval_secs"],
+        "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
+    ),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -1147,6 +1225,94 @@ mod tests {
         let env = env_map(&[("ZIRV_CTX_PACE", "yes-please")]);
         let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad bool");
         assert!(err.to_string().contains("ZIRV_CTX_PACE"));
+    }
+
+    #[test]
+    fn pace_gains_soft_and_poll_and_use_credits_defaults() {
+        let cfg = PaceConfig::default();
+        assert_eq!(cfg.soft_percent, 80.0);
+        assert!(cfg.poll_enabled);
+        assert_eq!(cfg.poll_min_interval_secs, 60);
+        assert!(!cfg.use_credits.claude);
+        assert!(!cfg.use_credits.codex);
+    }
+
+    #[test]
+    fn use_credits_maps_providers_to_agent_flags() {
+        let uc = UseCreditsConfig {
+            claude: true,
+            codex: false,
+        };
+        assert!(uc.for_provider("anthropic"));
+        assert!(!uc.for_provider("openai"));
+        assert!(
+            !uc.for_provider("something-else"),
+            "unknown provider: gate stays on"
+        );
+    }
+
+    #[test]
+    fn a_repo_layer_may_not_touch_use_credits_or_poll_keys() {
+        for (toml, key, variable) in [
+            (
+                "[pace.use_credits]\nclaude = true\n",
+                "pace.use_credits",
+                "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
+            ),
+            (
+                "[pace]\npoll_enabled = false\n",
+                "pace.poll_enabled",
+                "ZIRV_CTX_PACE_POLL",
+            ),
+            (
+                "[pace]\npoll_min_interval_secs = 1\n",
+                "pace.poll_min_interval_secs",
+                "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(key), "name the offending key: {err}");
+            assert!(
+                err.contains(variable),
+                "names the operator escape hatch: {err}"
+            );
+        }
+
+        // The rejection is real, not decorative: a clean repo layer still
+        // loads and keeps the new keys at their defaults.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.pace.soft_percent, 80.0);
+        assert!(cfg.pace.poll_enabled);
+        assert_eq!(cfg.pace.poll_min_interval_secs, 60);
+        assert!(!cfg.pace.use_credits.claude);
+    }
+
+    #[test]
+    fn env_overrides_use_credits_and_poll() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE_USE_CREDITS_CLAUDE", "true"),
+            ("ZIRV_CTX_PACE_POLL", "false"),
+            ("ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS", "120"),
+            ("ZIRV_CTX_PACE_SOFT_PERCENT", "70"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.pace.use_credits.claude);
+        assert!(!cfg.pace.use_credits.codex);
+        assert!(!cfg.pace.poll_enabled);
+        assert_eq!(cfg.pace.poll_min_interval_secs, 120);
+        assert_eq!(cfg.pace.soft_percent, 70.0);
     }
 
     #[test]
@@ -1834,5 +2000,213 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert!(!cfg.agents.is_enabled("codex"));
         assert!(cfg.agents.is_enabled("claude"));
+    }
+
+    /// Every configurable key in `CtxConfig`'s tree, as (table path, key)
+    /// pairs. `table path` is dot-joined to match how a nested table's
+    /// header appears in the sample-config file (`"pace.use_credits"`); the
+    /// empty string is the top-level (pre-`[table]`) scope.
+    ///
+    /// Hand-maintained against config.rs's struct definitions rather than
+    /// derived from `ENV_MAP`: `ENV_MAP` only covers keys that have an
+    /// environment override and is missing several real config keys (every
+    /// `score` weight/threshold, `handoff.tail_items`,
+    /// `optimize.max_surface_bytes` and its `recommend_*` siblings), so it
+    /// is not a complete key list on its own.
+    const ALL_CONFIG_KEYS: &[(&str, &str)] = &[
+        ("", "agent"),
+        ("", "agent_bin"),
+        ("chat", "model"),
+        ("score", "window"),
+        ("score", "min_turns"),
+        ("score", "token_floor"),
+        ("score", "token_ceiling"),
+        ("score", "weight_tool_failure"),
+        ("score", "weight_repetition"),
+        ("score", "weight_marker"),
+        ("score", "repetition_threshold"),
+        ("score", "advise_at"),
+        ("score", "compact_at"),
+        ("score", "restart_at"),
+        ("score", "marker"),
+        ("wrap", "debounce_ms"),
+        ("wrap", "inject_timeout_ms"),
+        ("supervise", "max_restarts"),
+        ("supervise", "poll_ms"),
+        ("supervise", "interval_secs"),
+        ("supervise", "max_cycle_secs"),
+        ("supervise", "max_failures"),
+        ("supervise", "backoff_base_secs"),
+        ("supervise", "on_failure"),
+        ("supervise", "max_nudges"),
+        ("handoff", "model"),
+        ("handoff", "tail_items"),
+        ("handoff", "timeout_secs"),
+        ("pace", "enabled"),
+        ("pace", "max_percent"),
+        ("pace", "collector_max_age_secs"),
+        ("pace", "estimator"),
+        ("pace", "five_hour_budget_tokens"),
+        ("pace", "seven_day_budget_tokens"),
+        ("pace", "count_cache_reads"),
+        ("pace", "jitter_secs"),
+        ("pace", "fallback_delay_secs"),
+        ("pace", "wait_slack_secs"),
+        ("pace", "max_wait_secs"),
+        ("pace", "soft_percent"),
+        ("pace", "poll_enabled"),
+        ("pace", "poll_min_interval_secs"),
+        ("pace.use_credits", "claude"),
+        ("pace.use_credits", "codex"),
+        ("optimize", "enabled"),
+        ("optimize", "sessions_sampled"),
+        ("optimize", "max_surface_bytes"),
+        ("optimize", "model"),
+        ("optimize", "recommend_tool_failure_rate"),
+        ("optimize", "recommend_corrections"),
+        ("optimize", "recommend_cooldown_secs"),
+        ("prompt", "enabled"),
+        ("prompt", "repo_layer"),
+        ("prompt", "max_repo_bytes"),
+        ("prompt", "harnesses"),
+        ("mail", "enabled"),
+        ("mail", "max_message_bytes"),
+        ("mail", "max_delivered_bytes"),
+        ("mail", "keep"),
+        ("memory", "enabled"),
+        ("memory", "harvest"),
+        ("memory", "max_entries"),
+        ("memory", "max_entry_bytes"),
+        ("memory", "max_injected_bytes"),
+        ("chrome", "banner"),
+        ("chrome", "bar"),
+        ("chrome", "events"),
+        ("dash", "enabled"),
+        ("dash", "sidebar_cols"),
+        ("dash", "roster_max_age_secs"),
+        ("dash", "max_panes"),
+        ("dash", "mouse"),
+    ];
+
+    /// The lines belonging to table `path` in a sample-config file like
+    /// `.zirv/ctx.toml`: from the line naming `[path]` (commented or not,
+    /// e.g. `# [pace.use_credits]`) up to (but excluding) the next such
+    /// header line, or from the top of the file up to the first header when
+    /// `path` is empty. Table-scoped so a key name that repeats across
+    /// tables (`enabled`, `model`) can't produce a false positive from an
+    /// unrelated section.
+    fn table_section(text: &str, path: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let is_header = |line: &str| {
+            line.trim_start()
+                .trim_start_matches('#')
+                .trim_start()
+                .starts_with('[')
+        };
+        let wanted = format!("[{path}]");
+        let start = if path.is_empty() {
+            0
+        } else {
+            let idx = lines
+                .iter()
+                .position(|l| {
+                    l.trim_start()
+                        .trim_start_matches('#')
+                        .trim_start()
+                        .starts_with(&wanted)
+                })
+                .unwrap_or_else(|| panic!("no [{path}] header found in the file"));
+            idx + 1
+        };
+        let end = lines[start..]
+            .iter()
+            .position(|l| is_header(l))
+            .map_or(lines.len(), |i| start + i);
+        lines[start..end].join("\n")
+    }
+
+    /// Whether `key` appears as its own assignment (`key = ...`) somewhere in
+    /// `section`, active or commented out. Only the key name is checked, not
+    /// the value, so this must not fail when someone edits a value.
+    fn section_has_key(section: &str, key: &str) -> bool {
+        section.lines().any(|line| {
+            line.trim_start()
+                .trim_start_matches('#')
+                .trim_start()
+                .starts_with(&format!("{key} ="))
+        })
+    }
+
+    /// The checked-in `.zirv/ctx.toml` is a sample-config reference: every
+    /// key is shown, commented out, at its built-in default, so it doubles
+    /// as documentation of what `CtxConfig` can be tuned to do without ever
+    /// actually setting anything (see the file's own header for why an
+    /// *active* default-valued key would be a real bug: the repo layer
+    /// merges on top of the operator's own global `~/.zirv/ctx.toml` in
+    /// `CtxConfig::load`, so an active key here would silently clobber a
+    /// real customization of the same key).
+    ///
+    /// Two things are pinned:
+    /// (a) the file still parses cleanly through the real repo-layer path,
+    ///     and `chat.model = "fable"` -- a real, previously-committed
+    ///     operator decision (see the file's own comment) and the one key
+    ///     that is deliberately NOT `REPO_FORBIDDEN`, see `ChatConfig`'s doc
+    ///     comment -- is the ONLY active, non-default value it produces;
+    /// (b) every key in `ALL_CONFIG_KEYS` still appears in the file text,
+    ///     active or commented, so the reference stays exhaustive as
+    ///     config.rs grows: this must fail only when a key is missing from
+    ///     the file entirely, never when someone edits a value.
+    #[test]
+    fn the_repo_ctx_toml_parses_and_stays_exhaustive() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo, &|k| empty.get(k).cloned())
+            .expect("the repo's own .zirv/ctx.toml must parse cleanly");
+
+        let expected = CtxConfig {
+            agents: cfg.agents.clone(),
+            chat: ChatConfig {
+                model: Some("fable".to_string()),
+            },
+            ..CtxConfig::default()
+        };
+        assert_eq!(
+            cfg, expected,
+            "chat.model must be the only active, non-default key in .zirv/ctx.toml"
+        );
+
+        let path = repo
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join(CTX_CONFIG_FILE);
+        let text = std::fs::read_to_string(&path).expect("read .zirv/ctx.toml");
+        for (table, key) in ALL_CONFIG_KEYS {
+            let section = table_section(&text, table);
+            assert!(
+                section_has_key(&section, key),
+                "{}: key `{key}` missing from table `[{table}]` (active or commented)",
+                path.display()
+            );
+        }
+    }
+
+    /// Companion to the test above: `.zirv/.settings.toml` parses cleanly
+    /// through the real settings loader. Every line in it is commented out
+    /// (sample-config style, same as ctx.toml), so both known agents stay
+    /// enabled at their default.
+    #[test]
+    fn the_repo_own_settings_toml_parses_without_error() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty: HashMap<String, String> = HashMap::new();
+        let gate = crate::settings::AgentGate::load(repo, &|k| empty.get(k).cloned())
+            .expect("the repo's own .zirv/.settings.toml must parse cleanly");
+
+        assert!(gate.is_enabled("claude"));
+        assert!(gate.is_enabled("codex"));
     }
 }
