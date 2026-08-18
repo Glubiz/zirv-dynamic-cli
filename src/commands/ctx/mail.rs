@@ -457,7 +457,16 @@ pub struct SendArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct InboxArgs {
-    /// Move each printed message to `read/` once it has been shown.
+    /// Read without consuming: leaves every printed message in place instead
+    /// of moving it to `read/`. This is the old default behavior of a plain
+    /// `zirv ctx inbox` -- a broad, human-facing view of everything meant
+    /// for this agent, including mail addressed to other sessions.
+    #[arg(long, default_value_t = false)]
+    pub peek: bool,
+    /// Accepted for backward compatibility and otherwise ignored: consuming
+    /// is now what a plain `zirv ctx inbox` does by default (see `peek`
+    /// above for the read-only alternative), so this flag has nothing left
+    /// to opt into.
     #[arg(long, default_value_t = false)]
     pub consume: bool,
     /// Emit one JSON object per line instead of markdown.
@@ -482,7 +491,13 @@ pub(crate) fn identity_or_unknown(env: EnvLookup<'_>, key: &str) -> String {
 /// unidentified sender is fine (the recipient judges an unknown sender), but
 /// an unidentified *reader* must never be handed a short id that could match
 /// somebody's addressed mail.
-fn session_identity(env: EnvLookup<'_>) -> Option<String> {
+///
+/// `pub(crate)`, not private: `status.rs`'s "mail: N unread" line needs the
+/// exact same identity to filter `mail::list` by (see item 3 of the
+/// read-once contract work) rather than a second, possibly drifting,
+/// reimplementation of "how do I read my own session id out of the
+/// environment".
+pub(crate) fn session_identity(env: EnvLookup<'_>) -> Option<String> {
     env(SESSION_ENV)
         .map(|id| sessions::short_id(&id))
         .filter(|short| !short.is_empty())
@@ -594,30 +609,42 @@ pub fn run_inbox_with<W: Write>(
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
     let for_agent = env(AGENT_ENV);
+    // `--consume` is a no-op alias now that consuming is the default; it is
+    // still read here (rather than left to rot as dead code) so its meaning
+    // stays documented at the one place that would otherwise silently drop
+    // it.
+    let _ = args.consume;
+
     // Reading and consuming are different acts and get different listings.
     //
-    // Reading (no `--consume`) passes `None` for the session filter: a human
-    // reading their inbox (or a session-addressed nudge payload arriving
-    // there) sees everything meant for their agent, not just what was
-    // addressed to one particular session id. A broad view is the feature.
+    // `--peek` passes `None` for the session filter: a human peeking at
+    // their inbox (or a session-addressed nudge payload arriving there) sees
+    // everything meant for their agent, not just what was addressed to one
+    // particular session id. A broad, read-only view is what `--peek` is
+    // for.
     //
-    // M1: consuming moves a message into `read/`, where no other session
-    // will ever find it. Doing that over the *broad* listing meant one
-    // `inbox --consume` swallowed every other session's directed mail --
-    // messages this caller was never the addressee of and, worse, that their
-    // real addressee would then never see. So a consume is only ever allowed
-    // over what is genuinely addressed to the caller:
+    // M1: the default consumes -- moves a message into `read/`, where no
+    // other session will ever find it. Doing that over the *broad* listing
+    // would let one plain `zirv ctx inbox` swallow every other session's
+    // directed mail -- messages this caller was never the addressee of and,
+    // worse, that their real addressee would then never see. So a default
+    // read only ever displays (and thus only ever consumes) what is
+    // genuinely addressed to the caller:
     //
     // * with an identity (`ZIRV_CTX_SESSION`), the per-session listing every
     //   real delivery seam uses: broadcast mail plus mail directed at *this*
     //   session, never another's;
     // * without one, only mail that is not session-directed at all. An
     //   unidentified caller cannot be the addressee of a directed message,
-    //   so it may not claim one.
+    //   so it may not claim -- or even be shown, since displaying what it
+    //   cannot consume would misrepresent the read-once contract -- one.
     //
     // Either way `for_agent` still applies, and directed mail for another
-    // session is unconsumable here with or without an identity.
-    let messages = if args.consume {
+    // session is neither shown nor consumed here, with or without an
+    // identity.
+    let messages = if args.peek {
+        list(&state, &slug, for_agent.as_deref(), None)?
+    } else {
         match session_identity(env) {
             Some(short) => list(&state, &slug, for_agent.as_deref(), Some(&short))?,
             None => list(&state, &slug, for_agent.as_deref(), None)?
@@ -625,8 +652,6 @@ pub fn run_inbox_with<W: Write>(
                 .filter(|(_, msg)| msg.to_session.is_none())
                 .collect(),
         }
-    } else {
-        list(&state, &slug, for_agent.as_deref(), None)?
     };
 
     for (path, msg) in &messages {
@@ -635,7 +660,7 @@ pub fn run_inbox_with<W: Write>(
         } else {
             write!(w, "{}", msg.to_markdown())?;
         }
-        if args.consume {
+        if !args.peek {
             consume(&state, &slug, path)?;
         }
     }
@@ -1281,6 +1306,7 @@ This should not appear in the body.\n";
             state_dir.to_str().expect("utf8"),
         )]);
         let args = InboxArgs {
+            peek: false,
             consume: false,
             json: false,
         };
@@ -1291,8 +1317,12 @@ This should not appear in the body.\n";
         assert!(out.is_empty(), "nothing to print: {out:?}");
     }
 
+    /// `--consume` is accepted purely for backward compatibility: it is a
+    /// no-op now that consuming is the default (see
+    /// `a_default_read_leaves_the_second_read_empty` for the same behavior
+    /// without the flag), so passing it must not change anything.
     #[test]
-    fn inbox_with_consume_leaves_the_second_read_empty() {
+    fn inbox_with_the_legacy_consume_flag_still_consumes() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -1307,6 +1337,7 @@ This should not appear in the body.\n";
             state_dir.to_str().expect("utf8"),
         )]);
         let args = InboxArgs {
+            peek: false,
             consume: true,
             json: false,
         };
@@ -1327,7 +1358,7 @@ This should not appear in the body.\n";
     }
 
     #[test]
-    fn inbox_without_consume_is_idempotent() {
+    fn inbox_peek_is_idempotent() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -1342,6 +1373,7 @@ This should not appear in the body.\n";
             state_dir.to_str().expect("utf8"),
         )]);
         let args = InboxArgs {
+            peek: true,
             consume: false,
             json: false,
         };
@@ -1354,7 +1386,7 @@ This should not appear in the body.\n";
         assert!(!first.is_empty());
         assert_eq!(
             first, second,
-            "reading without --consume must not change anything"
+            "reading with --peek must not change anything"
         );
     }
 
@@ -1395,6 +1427,7 @@ This should not appear in the body.\n";
         assert!(err.to_string().contains("disabled"), "got {err}");
 
         let inbox_args = InboxArgs {
+            peek: false,
             consume: false,
             json: false,
         };
@@ -1661,12 +1694,13 @@ This should not appear in the body.\n";
         );
     }
 
-    // M1: `inbox --consume` is a destructive act on somebody else's behalf
-    // unless the caller can say who it is.
+    // M1: a default (non-`--peek`) `inbox` read is a destructive act on
+    // somebody else's behalf unless the caller can say who it is.
 
-    fn inbox_args(consume: bool) -> InboxArgs {
+    fn inbox_args(peek: bool) -> InboxArgs {
         InboxArgs {
-            consume,
+            peek,
+            consume: false,
             json: false,
         }
     }
@@ -1705,7 +1739,7 @@ This should not appear in the body.\n";
         );
 
         let mut out = Vec::new();
-        run_inbox_with(&inbox_args(true), &mut out, tmp.path(), &|k| {
+        run_inbox_with(&inbox_args(false), &mut out, tmp.path(), &|k| {
             env.get(k).cloned()
         })
         .expect("inbox");
@@ -1739,7 +1773,7 @@ This should not appear in the body.\n";
         );
 
         let mut out = Vec::new();
-        run_inbox_with(&inbox_args(true), &mut out, tmp.path(), &|k| {
+        run_inbox_with(&inbox_args(false), &mut out, tmp.path(), &|k| {
             env.get(k).cloned()
         })
         .expect("inbox");
@@ -1759,7 +1793,7 @@ This should not appear in the body.\n";
     }
 
     #[test]
-    fn inbox_without_consume_still_shows_every_sessions_mail() {
+    fn inbox_peek_still_shows_every_sessions_mail() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -1772,14 +1806,22 @@ This should not appear in the body.\n";
         );
 
         let mut out = Vec::new();
-        run_inbox_with(&inbox_args(false), &mut out, tmp.path(), &|k| {
+        run_inbox_with(&inbox_args(true), &mut out, tmp.path(), &|k| {
             env.get(k).cloned()
         })
         .expect("inbox");
 
         assert!(
             String::from_utf8(out).expect("utf8").contains("aaaa1111"),
-            "the read-only broad view is a feature and must be unchanged"
+            "--peek's read-only broad view is a feature and must be unchanged"
+        );
+        let state = StateDir::from_root(state_dir);
+        assert_eq!(
+            list(&state, &repo_slug(tmp.path()), None, None)
+                .expect("list")
+                .len(),
+            1,
+            "--peek must never consume what it shows"
         );
     }
 
@@ -1797,7 +1839,7 @@ This should not appear in the body.\n";
         );
 
         let mut out = Vec::new();
-        run_inbox_with(&inbox_args(true), &mut out, tmp.path(), &|k| {
+        run_inbox_with(&inbox_args(false), &mut out, tmp.path(), &|k| {
             env.get(k).cloned()
         })
         .expect("inbox");
@@ -1808,12 +1850,12 @@ This should not appear in the body.\n";
             list(&state, &repo_slug(tmp.path()), None, None)
                 .expect("list")
                 .is_empty(),
-            "and consuming it is exactly what --consume is for"
+            "and consuming it is exactly what a default (non-`--peek`) read does"
         );
     }
 
     #[test]
-    fn inbox_consume_still_takes_broadcast_mail_with_an_identity_set() {
+    fn inbox_default_still_takes_broadcast_mail_with_an_identity_set() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -1826,7 +1868,7 @@ This should not appear in the body.\n";
         );
 
         let mut out = Vec::new();
-        run_inbox_with(&inbox_args(true), &mut out, tmp.path(), &|k| {
+        run_inbox_with(&inbox_args(false), &mut out, tmp.path(), &|k| {
             env.get(k).cloned()
         })
         .expect("inbox");
@@ -1838,6 +1880,119 @@ This should not appear in the body.\n";
                 .expect("list")
                 .is_empty(),
             "broadcast mail stays consumable"
+        );
+    }
+
+    /// The comprehensive version of item 2's "a default read consumes only
+    /// caller-visible mail": seeds one broadcast message, one message
+    /// directed at the caller, and one directed at a different session, then
+    /// checks both what a single default read *displays* and what it leaves
+    /// behind.
+    #[test]
+    fn default_inbox_consumes_only_mail_visible_to_the_caller() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(tmp.path());
+
+        store(
+            &state,
+            &slug,
+            &sample("broadcast-sender", 1_700_000_000),
+            &cfg,
+        )
+        .expect("store broadcast");
+        store(
+            &state,
+            &slug,
+            &session_addressed("direct-sender", "aaaa1111", "any"),
+            &cfg,
+        )
+        .expect("store direct");
+        store(
+            &state,
+            &slug,
+            &session_addressed("other-sender", "bbbb2222", "any"),
+            &cfg,
+        )
+        .expect("store foreign");
+
+        let mut env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        env.insert(SESSION_ENV.to_string(), "aaaa1111".to_string());
+
+        let mut out = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("inbox");
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("broadcast-sender"),
+            "own-visible broadcast mail is shown: {printed}"
+        );
+        assert!(
+            printed.contains("direct-sender"),
+            "mail addressed to the caller is shown: {printed}"
+        );
+        assert!(
+            !printed.contains("other-sender"),
+            "another session's directed mail must not be displayed: {printed}"
+        );
+
+        let remaining = list(&state, &slug, None, None).expect("list");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the foreign-directed message should survive: {remaining:?}"
+        );
+        assert_eq!(remaining[0].1.from_session, "other-sender");
+    }
+
+    /// Item 2's "twice-read shows nothing the second time", for the default
+    /// (non-`--peek`) read specifically -- `inbox_with_the_legacy_consume_
+    /// flag_still_consumes` below covers the same thing when `--consume` is
+    /// also passed.
+    #[test]
+    fn a_default_read_leaves_the_second_read_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(tmp.path());
+        store(&state, &slug, &sample("s1", 1_700_000_000), &cfg).expect("store");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+
+        let mut first = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut first, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("inbox");
+        assert!(
+            !first.is_empty(),
+            "the stored message must be printed the first time"
+        );
+
+        let mut second = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut second, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("inbox");
+        assert!(
+            second.is_empty(),
+            "consumed on the first read, so the second finds nothing: {second:?}"
         );
     }
 

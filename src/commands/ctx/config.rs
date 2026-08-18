@@ -393,6 +393,25 @@ pub struct DashConfig {
     /// more discoverable of the two, so it wins the default, and anyone who
     /// disagrees sets `mouse = false` and still has `Ctrl+A PageUp`/`Home`.
     pub mouse: bool,
+    /// How long, in milliseconds, a pane's pty output must have been quiet
+    /// before a pane whose adapter has no turn-signal mechanism
+    /// (`AgentAdapter::capabilities().turn_signal == false`, codex today) is
+    /// treated as `Idle`. Such a pane never reports a turn boundary at all
+    /// (`register_turn_signal` is a no-op for it), so `Pane::state`'s usual
+    /// `signal_still_stands` gate -- which requires a signal to have been seen
+    /// even once -- would leave it `Working` forever, and the mail sweep/nudge
+    /// drain, both gated on `Idle`, would never fire into it. This is the
+    /// output-quiescence fallback for that case only: a signal-carrying
+    /// adapter's pane is untouched by this key, unchanged from before.
+    ///
+    /// Deliberately **not** `REPO_FORBIDDEN`, unlike every other key in this
+    /// table: it is a pure timing/tuning knob over a session the operator
+    /// already chose to run interactively in the dashboard, the same class of
+    /// decision `pace.soft_percent` is (see that field's own doc comment) --
+    /// not a cap standing between an untrusted layer and something it must not
+    /// raise for itself (`dash.max_panes`), and not a switch over the
+    /// operator's own terminal/machine (`dash.mouse`/`dash.sidebar_cols`).
+    pub idle_quiet_ms: u64,
 }
 
 impl Default for DashConfig {
@@ -403,6 +422,7 @@ impl Default for DashConfig {
             roster_max_age_secs: 604_800,
             max_panes: 9,
             mouse: true,
+            idle_quiet_ms: 10_000,
         }
     }
 }
@@ -743,6 +763,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     ("ZIRV_CTX_DASH_MOUSE", &["dash", "mouse"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_DASH_IDLE_QUIET_MS",
+        &["dash", "idle_quiet_ms"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_REVIEW_MODEL_CLAUDE",
@@ -2118,6 +2143,36 @@ mod tests {
             cfg.dash.mouse,
             "the wheel scrolls a pane's scrollback out of the box"
         );
+        assert_eq!(cfg.dash.idle_quiet_ms, 10_000);
+    }
+
+    /// Unlike every other `dash.*` key, `idle_quiet_ms` is a pure timing knob
+    /// over a session the operator already chose to run in the dashboard --
+    /// the same class of decision `pace.soft_percent` is -- so a repo checkout
+    /// may set it, same as `chat.model`.
+    #[test]
+    fn a_repository_config_may_set_dash_idle_quiet_ms() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[dash]\nidle_quiet_ms = 5000\n",
+        )
+        .expect("write");
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.dash.idle_quiet_ms, 5000);
+    }
+
+    #[test]
+    fn env_overrides_dash_idle_quiet_ms() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_DASH_IDLE_QUIET_MS", "2500")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.dash.idle_quiet_ms, 2500);
     }
 
     #[test]
@@ -2422,6 +2477,7 @@ mod tests {
         ("dash", "roster_max_age_secs"),
         ("dash", "max_panes"),
         ("dash", "mouse"),
+        ("dash", "idle_quiet_ms"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like

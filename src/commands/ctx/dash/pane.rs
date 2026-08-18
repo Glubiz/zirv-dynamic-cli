@@ -84,6 +84,12 @@ pub struct PaneSpec {
 /// idea, applied to the pane's *state* rather than to one injection decision.
 pub(crate) const IDLE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Compiled-in fallback for [`Pane::idle_quiet`] when a caller has no
+/// `CtxConfig` to read `dash.idle_quiet_ms` from (every test call site in
+/// this module). Matches `DashConfig::default`'s own `idle_quiet_ms` so a
+/// test that does not care about this knob still exercises the real default.
+pub(crate) const DEFAULT_IDLE_QUIET: Duration = Duration::from_millis(10_000);
+
 /// Pure: whether the turn signal at `signal_at` still stands as of `now`,
 /// given the child's most recent output at `output_at` -- that is, whether a
 /// turn boundary has been reported and the child has since been quiet for
@@ -127,6 +133,54 @@ pub(crate) fn signal_still_stands(
     // Output from *before* the signal is what the signal already accounted
     // for, and measuring from it only makes the pane idle sooner, never later.
     now.duration_since(output_at.unwrap_or(signal)) >= debounce
+}
+
+/// Pure: whether `output_at` is old enough, as of `now`, to count as quiet.
+/// The signal-less half of [`pane_is_idle`] -- mirrors `signal_still_stands`'s
+/// own "no signal ever seen -- not idle" rule: no output ever recorded is not
+/// quiet either, whatever else has happened. A pane still starting up (its
+/// harness has not drawn its first frame yet) is not the same thing as one
+/// sitting quietly at its prompt, and the two must not be confused just
+/// because both currently read `None`/old.
+pub(crate) fn output_quiescent(output_at: Option<Instant>, now: Instant, quiet: Duration) -> bool {
+    let Some(output) = output_at else {
+        return false;
+    };
+    now.duration_since(output) >= quiet
+}
+
+/// Pure: whether a pane counts as idle right now, branching on whether its
+/// adapter actually has a turn-signal mechanism
+/// (`AgentAdapter::capabilities().turn_signal`).
+///
+/// * `turn_signal_capable`: unchanged from before this branch existed --
+///   [`signal_still_stands`], gated on having seen at least one turn
+///   boundary. A claude-shaped adapter reports one on every turn, so this is
+///   the precise, low-latency signal and stays the only thing consulted for
+///   it.
+/// * signal-less (codex today): `register_turn_signal` is a no-op for it, so
+///   `last_signal_at` never advances past `None` and gating on a signal would
+///   leave such a pane `Working` forever -- the mail sweep and nudge drain,
+///   both gated on `Idle`
+///   (`Pane::injectable`/`dash::mod::is_delivery_eligible`), would then never
+///   reach it at all. Its own pty *output* stands in for the signal instead:
+///   [`output_quiescent`] against `dash.idle_quiet_ms`
+///   (`Pane::idle_quiet`), independent of `signal_at` entirely -- a
+///   signal-less pane is never consulted on that axis, so nothing sent to its
+///   (unreachable) turn-signal socket could ever matter to it.
+pub(crate) fn pane_is_idle(
+    turn_signal_capable: bool,
+    signal_at: Option<Instant>,
+    output_at: Option<Instant>,
+    now: Instant,
+    debounce: Duration,
+    idle_quiet: Duration,
+) -> bool {
+    if turn_signal_capable {
+        signal_still_stands(signal_at, output_at, now, debounce)
+    } else {
+        output_quiescent(output_at, now, idle_quiet)
+    }
 }
 
 /// Pure: a pane's `PaneState` from whether its last turn-boundary signal still
@@ -537,6 +591,17 @@ pub struct Pane {
     /// boolean (O1).
     last_signal_at: Option<Instant>,
     last_output_at: Option<Instant>,
+    /// Whether this pane's adapter has a real turn-signal mechanism
+    /// (`AgentAdapter::capabilities().turn_signal`), captured once at spawn
+    /// time from the adapter the caller resolved for `spec.agent_name`. Drives
+    /// which branch of [`pane_is_idle`] `state()` uses, and whether `drain()`
+    /// clears a pending injection/operator-typing flag on quiescence rather
+    /// than waiting for a turn signal that will never come for this pane.
+    turn_signal_capable: bool,
+    /// `dash.idle_quiet_ms`, resolved to a `Duration` once at spawn time --
+    /// the quiet window [`output_quiescent`] measures a signal-less pane's
+    /// idleness against. Unread by a signal-carrying pane.
+    idle_quiet: Duration,
     /// Set by a successful `inject_visible`, cleared by the next turn signal
     /// (`on_turn_signal`): "this pane was handed something to do and has not
     /// reported finishing it yet." See `state_from`'s own doc comment -- this
@@ -571,12 +636,20 @@ impl Pane {
     /// dashboard pane that cannot act on a wake-up is still a legitimate,
     /// visible session, the same call `wrap` makes for `--no-supervise`/a
     /// failed bind.
+    ///
+    /// `turn_signal_capable`/`idle_quiet` seed [`Pane::turn_signal_capable`]/
+    /// [`Pane::idle_quiet`]: the caller resolves the adapter for
+    /// `spec.agent_name` anyway (to build `argv`/`turn_env`), so it passes
+    /// `adapter.capabilities().turn_signal` and `dash.idle_quiet_ms` straight
+    /// through rather than this module re-resolving the adapter itself.
     pub fn spawn(
         spec: PaneSpec,
         state: &StateDir,
         repo: &Path,
         size: (u16, u16),
         turn_env: &[(String, String)],
+        turn_signal_capable: bool,
+        idle_quiet: Duration,
     ) -> CtxResult<Pane> {
         let PaneSpec {
             agent_name,
@@ -701,6 +774,8 @@ impl Pane {
             state_dir: state.clone(),
             last_signal_at: None,
             last_output_at: None,
+            turn_signal_capable,
+            idle_quiet,
             injected_awaiting_turn: false,
             user_typed_since_turn: false,
             exit_code: None,
@@ -729,6 +804,25 @@ impl Pane {
             // `signal_still_stands`' decision, and it needs the timestamp to
             // make it.
             self.last_output_at = Some(Instant::now());
+        }
+        // A signal-less pane's `on_turn_signal` never fires (its socket is
+        // never written to -- `register_turn_signal` is a no-op for it), so
+        // it is the only place besides a turn signal that clears
+        // `injected_awaiting_turn`/`user_typed_since_turn`. Without this, the
+        // very first `inject_visible` (or the very first forwarded keystroke)
+        // into such a pane would latch it `Working` forever -- exactly the O1
+        // bug this module already fixed once for the signal-carrying case,
+        // recurring on the one axis that case never had to consider.
+        // Quiescence is this pane's only stand-in for a turn boundary, so it
+        // is what retires both flags here, the same job a fresh signal does
+        // in `on_turn_signal`. Runs every tick (not just when `any`), since a
+        // pane that produced nothing at all this tick can still be the tick
+        // its quiet window finally closes.
+        if !self.turn_signal_capable
+            && output_quiescent(self.last_output_at, Instant::now(), self.idle_quiet)
+        {
+            self.injected_awaiting_turn = false;
+            self.user_typed_since_turn = false;
         }
         more
     }
@@ -965,11 +1059,13 @@ impl Pane {
     /// cheap enough to call every frame.
     pub fn state(&self) -> PaneState {
         state_from(
-            signal_still_stands(
+            pane_is_idle(
+                self.turn_signal_capable,
                 self.last_signal_at,
                 self.last_output_at,
                 Instant::now(),
                 IDLE_DEBOUNCE,
+                self.idle_quiet,
             ),
             self.exit_code,
             self.injected_awaiting_turn,
@@ -1303,6 +1399,113 @@ pub(crate) mod tests {
         assert!(
             signal_still_stands(Some(now), Some(now - Duration::from_secs(5)), now, debounce),
             "output from before the signal is what the signal already accounted for"
+        );
+    }
+
+    // Task A: the signal-less idleness path (`output_quiescent`/
+    // `pane_is_idle`). A codex-shaped adapter never reports a turn boundary at
+    // all, so gating idleness on one leaves such a pane `Working` forever;
+    // these cover the output-quiescence stand-in on its own terms, pure and
+    // without a real child.
+
+    /// No output ever recorded is not quiet, whatever else has happened --
+    /// the signal-less mirror of `signal_still_stands`' own "no signal ever
+    /// seen -- not idle" rule. A pane still starting up (its harness has not
+    /// drawn a first frame yet) must not read the same as one sitting quietly
+    /// at its prompt just because both currently have no timestamp.
+    #[test]
+    fn output_quiescent_is_false_with_no_output_ever_recorded() {
+        let quiet = Duration::from_millis(200);
+        let now = Instant::now();
+        assert!(!output_quiescent(None, now, quiet));
+        assert!(
+            !output_quiescent(None, now + Duration::from_secs(30), quiet),
+            "no amount of elapsed time substitutes for output that never happened"
+        );
+    }
+
+    /// Once there is a last-output timestamp, quiet is a plain elapsed-time
+    /// check against it -- false inside the window, true once it closes, and
+    /// it does not decay back to working with nothing further happening.
+    #[test]
+    fn output_quiescent_flips_once_the_quiet_window_elapses_since_the_last_output() {
+        let quiet = Duration::from_millis(200);
+        let output = Instant::now();
+        assert!(
+            !output_quiescent(Some(output), output + Duration::from_millis(50), quiet),
+            "still inside the quiet window"
+        );
+        assert!(
+            !output_quiescent(Some(output), output + Duration::from_millis(199), quiet),
+            "one tick short of the window is still not quiet"
+        );
+        assert!(
+            output_quiescent(Some(output), output + Duration::from_millis(200), quiet),
+            "exactly at the window is quiet"
+        );
+        assert!(
+            output_quiescent(Some(output), output + Duration::from_secs(30), quiet),
+            "and it does not decay back once quiet"
+        );
+    }
+
+    /// `pane_is_idle`'s branch selection: a signal-capable pane is exactly
+    /// `signal_still_stands` -- quiet output alone, with no signal ever seen,
+    /// is not enough -- while a signal-less pane is exactly
+    /// `output_quiescent`, and `signal_at` is never consulted for it at all
+    /// (matching reality: nothing ever writes to a signal-less pane's own
+    /// turn-signal socket, so a `Some` there could not honestly arise, but
+    /// the branch must not depend on that being true to behave correctly).
+    #[test]
+    fn pane_is_idle_branches_on_turn_signal_capability() {
+        let debounce = Duration::from_millis(500);
+        let idle_quiet = Duration::from_millis(200);
+        let output = Instant::now();
+
+        assert!(
+            !pane_is_idle(
+                true,
+                None,
+                Some(output),
+                output + Duration::from_secs(30),
+                debounce,
+                idle_quiet
+            ),
+            "signal-capable: no signal ever seen stays working, however long the output has been quiet"
+        );
+
+        assert!(
+            !pane_is_idle(
+                false,
+                Some(output),
+                Some(output),
+                output + Duration::from_millis(50),
+                debounce,
+                idle_quiet
+            ),
+            "signal-less: still inside its own quiet window"
+        );
+        assert!(
+            pane_is_idle(
+                false,
+                Some(output),
+                Some(output),
+                output + Duration::from_millis(200),
+                debounce,
+                idle_quiet
+            ),
+            "signal-less: quiet window elapsed, idle with a signal present"
+        );
+        assert!(
+            pane_is_idle(
+                false,
+                None,
+                Some(output),
+                output + Duration::from_millis(200),
+                debounce,
+                idle_quiet
+            ),
+            "signal-less: same outcome with no signal_at at all -- it is never consulted"
         );
     }
 
@@ -1890,6 +2093,30 @@ pub(crate) mod tests {
         vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()]
     }
 
+    /// Task A: a child that prints exactly one line at startup -- standing in
+    /// for a real harness drawing its first frame -- and then produces
+    /// nothing further for the rest of its (long) life. Lets a test observe a
+    /// signal-less pane's quiet window closing against a real, deterministic
+    /// last-output timestamp rather than racing a harness that might repaint
+    /// on its own.
+    #[cfg(windows)]
+    fn silent_after_first_line_argv() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "echo hello & ping -n 60 127.0.0.1 >nul".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn silent_after_first_line_argv() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo hello; sleep 60".to_string(),
+        ]
+    }
+
     /// Drives one turn signal into `pane`'s own socket and waits, bounded, for
     /// the pane to report `Idle`. Returns whether it got there. Gives up
     /// immediately if the child exited (`Ended` outranks every other state, so
@@ -1958,7 +2185,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
         let spec = test_spec("11111111-2222-4333-8444-555555555555");
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
 
         assert_eq!(pane.agent(), "test-agent");
         assert_eq!(pane.title(), "wrk test");
@@ -2004,7 +2232,8 @@ pub(crate) mod tests {
         let session_id = "33333333-2222-4333-8444-555555555555";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
@@ -2043,7 +2272,8 @@ pub(crate) mod tests {
         let session_id = "44444444-2222-4333-8444-555555555555";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
@@ -2076,6 +2306,110 @@ pub(crate) mod tests {
         pane.shutdown("").expect("shutdown");
     }
 
+    /// Task A end to end: a signal-less pane's real supervised child prints
+    /// once at startup and then goes quiet for the rest of its life. The pane
+    /// must read `Working` while still inside the quiet window and
+    /// `Idle`/`injectable` once the window closes -- with no turn signal ever
+    /// sent to it (a codex-shaped adapter never sends one; nothing in this
+    /// test's own child does either).
+    #[test]
+    fn a_signal_less_pane_becomes_idle_after_the_quiet_period_and_not_before() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "77777777-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = silent_after_first_line_argv();
+        let idle_quiet = Duration::from_millis(1000);
+        let mut pane =
+            Pane::spawn(spec, &state, &repo, (80, 24), &[], false, idle_quiet).expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if pane.last_line().contains("hello") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pane.last_line().contains("hello"),
+            "the startup line must have landed before the rest of this test can mean anything: {:?}",
+            pane.last_line()
+        );
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "still inside the quiet window right after the startup line: {:?}",
+            pane.state()
+        );
+        assert!(!pane.injectable(), "not yet reachable while still working");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut became_idle = false;
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if matches!(pane.state(), PaneState::Idle) {
+                became_idle = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            became_idle,
+            "must become idle once the quiet window closes, with no turn signal ever sent"
+        );
+        assert!(
+            pane.injectable(),
+            "and therefore reachable by the mail sweep/nudge drain"
+        );
+
+        pane.shutdown("").expect("shutdown");
+    }
+
+    /// Task A regression guard: a signal-carrying pane must ignore output
+    /// quiescence entirely, exactly as before this feature existed -- it
+    /// stays `Working` well past the quiet window with no turn signal ever
+    /// sent, so the two branches of `pane_is_idle` provably do not bleed into
+    /// each other.
+    #[test]
+    fn a_signal_carrying_pane_ignores_output_quiescence_entirely() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "88888888-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = silent_after_first_line_argv();
+        let idle_quiet = Duration::from_millis(200);
+        let mut pane =
+            Pane::spawn(spec, &state, &repo, (80, 24), &[], true, idle_quiet).expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if pane.last_line().contains("hello") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.last_line().contains("hello"), "sanity: the child ran");
+
+        std::thread::sleep(idle_quiet * 10);
+        pane.drain();
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "a signal-carrying pane stays working through a long quiet period with no \
+             signal sent: {:?}",
+            pane.state()
+        );
+        assert!(!pane.injectable());
+
+        pane.shutdown("").expect("shutdown");
+    }
+
     #[test]
     fn shutdown_is_idempotent() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2084,7 +2418,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
         let spec = test_spec("22222222-2222-4333-8444-555555555555");
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
 
         pane.shutdown("")
             .expect("first shutdown releases the guard");
@@ -2152,7 +2487,8 @@ pub(crate) mod tests {
 
         let mut spec = test_spec("66666666-2222-4333-8444-555555555555");
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
         let short = pane.short().to_string();
         let record_path = state.sessions().join(format!("{short}.json"));
         assert!(

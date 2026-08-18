@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use super::adapters::{self, DefaultOrigin};
+use super::adapters::{self, AGENT_ENV, DefaultOrigin};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::handoff::latest_for_repo;
 use super::mail;
@@ -162,7 +162,22 @@ pub fn run_with<W: Write>(
     }
 
     let mail_slug = repo_slug(repo);
-    match mail::list(&state, &mail_slug, None, None) {
+    // Item 3 (read-once contract): this must apply the same visibility
+    // `mail::list` gives every other caller identity, or a message queued
+    // for one idle session inflated *every* session's "unread" count in this
+    // same repo -- `None`/`None` here means "no filter at all", not "this
+    // session's view". `mail::session_identity` is the exact same
+    // ZIRV_CTX_SESSION-derived short id `zirv ctx inbox`'s default (now
+    // consuming) read uses, so this count and what a plain `zirv ctx inbox`
+    // would actually consume never disagree.
+    let mail_agent = env(AGENT_ENV);
+    let mail_session = mail::session_identity(env);
+    match mail::list(
+        &state,
+        &mail_slug,
+        mail_agent.as_deref(),
+        mail_session.as_deref(),
+    ) {
         Ok(messages) => writeln!(w, "mail: {} unread", messages.len())?,
         Err(_) => writeln!(w, "mail: (unreadable)")?,
     }
@@ -559,6 +574,87 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
 
         assert!(text.contains("mail: 2 unread"), "got {text}");
+    }
+
+    /// Item 3 (read-once contract): a message directed at a different
+    /// session must not inflate *this* session's "unread" count -- observed
+    /// as a message queued for one idle pane showing as unread to every
+    /// session in the repo. Broadcast mail (no `to_session`) and mail
+    /// directed at this exact session still count.
+    #[test]
+    fn status_mail_count_ignores_mail_directed_at_a_different_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let slug = repo_slug(tmp.path());
+        let cfg = CtxConfig::default();
+        // Directed at a session other than the one asking: must not count.
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "sender-one".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: Some("bbbb2222".to_string()),
+                sent: 1_700_000_000,
+                body: "not for you".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store directed elsewhere");
+        // Directed at the asking session itself: must count.
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "sender-two".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: Some("aaaa1111".to_string()),
+                sent: 1_700_000_100,
+                body: "for you".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store directed here");
+        // Broadcast: visible and counted regardless of identity.
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "sender-three".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1_700_000_200,
+                body: "for everyone".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store broadcast");
+
+        let mut env = env_for(state.root());
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaa1111".to_string(),
+        );
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            text.contains("mail: 2 unread"),
+            "only the broadcast and the directed-here message count, not the one \
+             directed at bbbb2222: {text}"
+        );
     }
 
     #[test]
