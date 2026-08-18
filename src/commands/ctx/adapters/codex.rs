@@ -261,6 +261,25 @@ impl AgentAdapter for CodexAdapter {
         cmd
     }
 
+    /// Codex's own model ladder, top to bottom: `gpt-5.6-sol` (the default
+    /// used when no `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, and the
+    /// older, hidden `gpt-5.4-mini` -- verified via `codex debug models` in
+    /// docs/superpowers/notes/2026-07-31-codex-cli-facts.md's "Cheap model
+    /// alias for distillation" section (codex-cli 0.146.0). Matched by
+    /// substring on `seat`, same as claude's own ladder. `gpt-5.4-mini` is
+    /// already the floor, so it maps to itself; an absent or unrecognised
+    /// seat (including one naming another adapter's model, e.g. a claude
+    /// orchestrator's own `chat.model`) assumes the top tier.
+    fn review_model_below(&self, seat: Option<&str>) -> &'static str {
+        match seat {
+            Some(s) if s.contains("gpt-5.6-sol") => "gpt-5.6-terra",
+            Some(s) if s.contains("gpt-5.6-terra") => "gpt-5.6-luna",
+            Some(s) if s.contains("gpt-5.6-luna") => "gpt-5.4-mini",
+            Some(s) if s.contains("gpt-5.4-mini") => "gpt-5.4-mini",
+            _ => "gpt-5.6-terra",
+        }
+    }
+
     fn launch_prefix_len(&self) -> usize {
         1 + self.bin_args.len()
     }
@@ -488,6 +507,48 @@ mod tests {
     #[test]
     fn codex_has_no_default_distiller_model() {
         assert_eq!(CodexAdapter::new(None).default_distiller_model(), None);
+    }
+
+    /// The codex ladder, top to bottom: `gpt-5.6-sol` (the default when no
+    /// `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini` --
+    /// verified via `codex debug models` in docs/superpowers/notes/
+    /// 2026-07-31-codex-cli-facts.md's "Cheap model alias for distillation"
+    /// section (codex-cli 0.146.0; the version installed on this machine,
+    /// 0.105.0, has no `debug models` subcommand to re-verify the catalog
+    /// against, the same gap `distiller_cmd`'s own doc comment records for
+    /// `--ignore-rules`/`--ignore-user-config`). `review_model_below` returns
+    /// the tier one below `seat`; an unknown or absent seat assumes the top
+    /// tier (`gpt-5.6-sol`), and `gpt-5.4-mini` (already the floor) maps to
+    /// itself.
+    #[test]
+    fn review_model_below_walks_the_codex_ladder() {
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-5.6-sol")),
+            "gpt-5.6-terra"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-5.6-terra")),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-5.6-luna")),
+            "gpt-5.4-mini"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-5.4-mini")),
+            "gpt-5.4-mini"
+        );
+        assert_eq!(
+            adapter.review_model_below(None),
+            "gpt-5.6-terra",
+            "no seat configured: assume the top tier"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("claude-fable-5")),
+            "gpt-5.6-terra",
+            "a seat naming another adapter's model is unrecognised: assume the top tier"
+        );
     }
 
     /// B: `--sandbox read-only` (verified against `codex exec --help` on
