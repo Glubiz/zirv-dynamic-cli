@@ -1579,12 +1579,22 @@ fn redraw_bar_if_due(
     // leave there. `load_for` falls back to that same legacy file for
     // claude's own provider (`anthropic`), so this is a no-op for the common
     // case; for a provider with no usage source at all (codex/openai today)
-    // it now reads as `UsageWindows::default()`, which `max_used_percentage`
-    // already turns into `None` -- and `status_bar` already renders `None`
-    // as the placeholder dash, never a misleading `0%`. No renderer change
-    // needed at all, only which windows are read.
-    let windows = super::window::load_for(state_dir, &bar.provider).unwrap_or_default();
-    let usage_percent = super::window::max_used_percentage(&windows);
+    // it now reads as `UsageWindows::default()`, which `status_bar` already
+    // renders as the placeholder dash, never a misleading `0%`. No renderer
+    // change needed at all, only which windows are read.
+    //
+    // `window::available` drops any window whose `resets_at` has provably
+    // passed (or, absent a `resets_at`, that has outlived its own span)
+    // before the reading ever reaches the bar: a reading that old is a stale
+    // number pretending to be current, exactly what motivated this filter.
+    // Still a pure in-memory/file read -- no scan, no network -- on this
+    // throttled redraw path.
+    let windows = super::window::available(
+        &super::window::load_for(state_dir, &bar.provider).unwrap_or_default(),
+        super::state::now_secs(),
+    );
+    let usage_five_hour = windows.five_hour.map(|w| w.used_percentage);
+    let usage_seven_day = windows.seven_day.map(|w| w.used_percentage);
     let unread_mail = unread_mail_counts(
         state_dir,
         repo,
@@ -1597,7 +1607,8 @@ fn redraw_bar_if_due(
         harness: bar.harness.clone(),
         score: (supervision.signals_seen > 0).then_some(supervision.score),
         verdict: (supervision.signals_seen > 0).then_some(supervision.verdict),
-        usage_percent,
+        usage_five_hour,
+        usage_seven_day,
         unread_mail,
         degraded: supervision.degraded,
     };
@@ -2148,7 +2159,11 @@ mod tests {
                 five_hour: Some(super::super::window::Window {
                     used_percentage: 42.0,
                     resets_at: 0,
-                    observed_at: 1,
+                    // Fresh, not epoch-1: this test is about the legacy-file
+                    // fallback, not about `window::available`'s own staleness
+                    // filter (covered separately), so the reading must still
+                    // be inside its own five_hour span.
+                    observed_at: super::super::state::now_secs(),
                 }),
                 seven_day: None,
             },
@@ -2186,6 +2201,47 @@ mod tests {
         assert!(
             claude_text.contains("42%"),
             "claude keeps reading the legacy file via its own provider fallback: {claude_text}"
+        );
+    }
+
+    /// A reading whose window has certainly reset (`resets_at` long past)
+    /// must not render as a live percentage just because it is the newest
+    /// thing on disk -- that is exactly the stale-14%-months-old bug this
+    /// fix addresses. The bar must fall back to its usual placeholder, same
+    /// as the true no-source case.
+    #[test]
+    fn a_bar_with_an_expired_window_shows_the_placeholder_not_a_stale_percent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        super::super::window::store(
+            &state,
+            &super::super::window::UsageWindows {
+                five_hour: Some(super::super::window::Window {
+                    used_percentage: 14.0,
+                    resets_at: 1, // long past any real wall clock
+                    observed_at: 1,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store an expired reading");
+
+        let mut bar = test_bar((80, 1));
+        redraw_bar_if_due(
+            &mut bar,
+            &InjectionState::new(),
+            &state,
+            tmp.path(),
+            Instant::now(),
+        );
+        let text = bar.last_text.expect("the bar drew something");
+        assert!(
+            !text.contains("14%"),
+            "an expired window must not render as a current percent: {text}"
+        );
+        assert!(
+            text.contains("usage \u{2013}"),
+            "expired-and-nothing-else renders the placeholder: {text}"
         );
     }
 

@@ -44,12 +44,24 @@ use super::pane::PaneState;
 /// never scans rollouts or polls itself: `usage` is filled from whatever the
 /// wrapped/headless sessions already left on disk (`window::load_for`).
 ///
-/// One entry per enabled harness in the roster (`cfg.agents`), as `(harness
-/// name, percent, credits-mode)`: `percent` is `None` when nothing has ever
-/// been recorded for that harness's provider, and `credits` mirrors
-/// `cfg.pace.use_credits` for that provider -- a credits-mode harness shows
-/// "credits" instead of a percentage, since a percent of an unbounded
-/// allowance is not a meaningful number.
+/// One usage entry per enabled harness. `five_hour`/`seven_day` are each
+/// `None` when nothing has ever been recorded for that window on this
+/// harness's provider, *or* when the caller (`FactsCache::refresh_if_due`)
+/// filtered out a reading whose window has provably reset via
+/// `window::available` -- a stale-by-months reading rendering as a live
+/// percentage is exactly the bug this struct's two-window shape fixes.
+/// `credits` mirrors `cfg.pace.use_credits` for that provider: a credits-mode
+/// harness shows "credits" instead of either percentage, since a percent of
+/// an unbounded allowance is not a meaningful number.
+#[derive(Clone)]
+pub struct HarnessUsage {
+    pub name: &'static str,
+    pub five_hour: Option<f64>,
+    pub seven_day: Option<f64>,
+    pub credits: bool,
+}
+
+/// One entry per enabled harness in the roster (`cfg.agents`).
 pub struct HeaderFacts {
     pub harness: String,
     pub score: Option<u32>,
@@ -57,7 +69,7 @@ pub struct HeaderFacts {
     pub mail_direct: usize,
     pub memory_count: usize,
     pub sessions: usize,
-    pub usage: Vec<(&'static str, Option<f64>, bool)>,
+    pub usage: Vec<HarnessUsage>,
 }
 
 /// One sidebar row: a dashboard pane (`attached: true`) or a view-only
@@ -338,13 +350,21 @@ pub fn header_line(facts: &HeaderFacts, cols: u16) -> String {
         parts.push(format!("mem {}", facts.memory_count));
     }
     parts.push(format!("sessions {}", facts.sessions));
-    for (name, percent, credits) in &facts.usage {
+    for entry in &facts.usage {
+        let HarnessUsage {
+            name,
+            five_hour,
+            seven_day,
+            credits,
+        } = entry;
         parts.push(if *credits {
             format!("{name} credits")
         } else {
-            match percent {
-                Some(p) => format!("{name} {p:.0}%"),
-                None => format!("{name} {PLACEHOLDER}"),
+            match (five_hour, seven_day) {
+                (Some(five), Some(week)) => format!("{name} 5h {five:.0}% wk {week:.0}%"),
+                (Some(five), None) => format!("{name} 5h {five:.0}%"),
+                (None, Some(week)) => format!("{name} wk {week:.0}%"),
+                (None, None) => format!("{name} {PLACEHOLDER}"),
             }
         });
     }
@@ -1096,22 +1116,81 @@ mod tests {
         assert!(!text.contains("mail"), "header text was: {text}");
     }
 
-    /// A known percentage renders rounded to the nearest whole percent, and an
-    /// unknown one renders as the same placeholder glyph `chrome::status_bar`
-    /// uses for its own usage segment -- never a fabricated `0%`.
+    fn usage(
+        name: &'static str,
+        five_hour: Option<f64>,
+        seven_day: Option<f64>,
+        credits: bool,
+    ) -> HarnessUsage {
+        HarnessUsage {
+            name,
+            five_hour,
+            seven_day,
+            credits,
+        }
+    }
+
+    /// Both windows known render as two labeled segments, and a harness with
+    /// nothing known at all renders the same placeholder glyph
+    /// `chrome::status_bar` uses for its own usage segment -- never a
+    /// fabricated `0%`.
     #[test]
     fn header_renders_per_harness_usage_with_honest_placeholders() {
         let mut facts = base_facts();
-        facts.usage = vec![("claude", Some(72.4), false), ("codex", None, false)];
+        facts.usage = vec![
+            usage("claude", Some(72.4), Some(51.0), false),
+            usage("codex", None, None, false),
+        ];
         let line = header_line(&facts, 80);
         assert!(
-            line.contains("claude 72%"),
-            "expected a rounded percent: {line}"
+            line.contains("claude 5h 72% wk 51%"),
+            "expected both rounded percents: {line}"
         );
         assert!(
             line.contains(&format!("codex {PLACEHOLDER}")),
             "expected the shared placeholder glyph: {line}"
         );
+    }
+
+    /// Only one window known (the other absent, or filtered out by
+    /// `window::available` upstream) renders just that one labeled segment,
+    /// not a placeholder for the missing side.
+    #[test]
+    fn header_renders_a_single_known_window_without_the_other_label() {
+        let mut facts = base_facts();
+        facts.usage = vec![usage("claude", Some(11.0), None, false)];
+        let five_hour_only = header_line(&facts, 80);
+        assert!(
+            five_hour_only.contains("claude 5h 11%"),
+            "got {five_hour_only}"
+        );
+        assert!(!five_hour_only.contains("wk"), "got {five_hour_only}");
+
+        facts.usage = vec![usage("claude", None, Some(51.0), false)];
+        let seven_day_only = header_line(&facts, 80);
+        assert!(
+            seven_day_only.contains("claude wk 51%"),
+            "got {seven_day_only}"
+        );
+        assert!(!seven_day_only.contains("5h"), "got {seven_day_only}");
+    }
+
+    /// A window entry with nothing available -- both filtered out by
+    /// `window::available` because their readings had expired -- must still
+    /// render the honest placeholder, exactly like a harness with no source
+    /// recorded at all. Ties the header rendering to the same "expired is not
+    /// available" rule wrap's status bar and `refresh_if_due` now share.
+    #[test]
+    fn a_harness_with_every_window_filtered_out_as_expired_renders_the_placeholder() {
+        let mut facts = base_facts();
+        facts.usage = vec![usage("claude", None, None, false)];
+        let line = header_line(&facts, 80);
+        assert!(
+            line.contains(&format!("claude {PLACEHOLDER}")),
+            "got {line}"
+        );
+        assert!(!line.contains("5h"), "got {line}");
+        assert!(!line.contains("wk"), "got {line}");
     }
 
     /// A credits-mode harness (`cfg.pace.use_credits`) has no meaningful
@@ -1121,11 +1200,11 @@ mod tests {
     #[test]
     fn a_credits_harness_shows_credits_instead_of_a_percent() {
         let mut facts = base_facts();
-        facts.usage = vec![("claude", Some(72.4), true)];
+        facts.usage = vec![usage("claude", Some(72.4), Some(51.0), true)];
         let line = header_line(&facts, 80);
         assert!(line.contains("claude credits"), "header text was: {line}");
         assert!(
-            !line.contains("72%"),
+            !line.contains("72%") && !line.contains("51%"),
             "credits mode must not also show a percent: {line}"
         );
     }

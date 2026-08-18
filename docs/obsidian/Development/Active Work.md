@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-17
+last-verified: 2026-08-18
 ---
 
 # Active Work
@@ -21,6 +21,10 @@ _None right now — see Recently Completed below for the latest landed work._
 ## Recently Completed
 
 <!-- Cap at ~10 entries; drop the oldest when adding a new one. -->
+
+### `feat/usage-two-window-display` — both usage windows shown, staleness-filtered (2026-08-17/18)
+**Status (2026-08-18):** Three commits (`34b178e`, `2adcd6b`, `dff607b`) landed on top of `feat/usage-credits-throttle`. Per-agent usage now shows both the 5h and 7d windows (`5h X% wk Y%`) instead of the worse-of-both collapse, at the dash header, `wrap`'s status bar, and `zirv ctx status`; a new `window::available(windows, now)` drops a window whose `resets_at` has passed or that has outlived its own span before any of those three render it. `zirv ctx usage` deliberately stays raw/unfiltered — the diagnostic surface explaining pacing. Both refresh gates (`poll::maybe_poll`, `window::refresh_codex_usage`) now treat a display-dropped slot as staleness (`window::freshest_available_observation`) so a rolled-over window refreshes promptly instead of sitting blank up to `collector_max_age_secs`. `Cargo.toml` bumped 2.9.0 → 2.10.0. See [[Work Journal]] and [[Decision Log]] (2026-08-18 entry) for the mechanism.
+**Next:** open the PR against main. Two residuals recorded in [[Known Issues]], not fixed: pace's hard-park path deliberately admits a rolled-over-but-recently-observed reading (a different, pre-existing staleness rule from `available`'s own), and `zirv ctx usage` prints a bare unix epoch for a passed `resets_at` with no "already reset" wording.
 
 ### `feat/usage-credits-throttle` — vendor usage monitoring, use_credits gating, pace-to-reset throttle (2026-08-16/17)
 **Status (2026-08-17):** Nine-task plan complete and committed on `feat/usage-credits-throttle`, docs/version/gates done (Task 8). `pace.rs` gained a `Slow` pace-to-reset decision (soft-throttle band between new `soft_percent`/`max_percent`) and `PaceGate{use_credits, poller}` (`use_credits` skips proactive throttle/pause only, never the vendor-reported limit park). `window.rs` gained a passive codex rollout-file collector; `poll.rs` (new) is an active HTTP poll fallback (`ureq`, this crate's first HTTP dependency) behind a staleness/interval floor. Task 7 put per-harness usage back in the dashboard header; Task 9 delivered session-conventions v2 to codex workers via a task-prompt fallback. `Cargo.toml` bumped 2.8.0 → 2.9.0. See [[Work Journal]] and [[Decision Log]] (four new entries) for the mechanism.
