@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-18 (feat/chat-token-economy): recorded an operator-machine gotcha -- a ~/.codex/config.toml model pin unsupported by a ChatGPT-plan login breaks every zirv codex delegation with a 400, since zirv passes no --model by default; resolved on this machine by removing the pin -->
 <!-- Updated 2026-08-18 (feat/review-model-config): recorded the codex review-ladder model catalog as sourced from a codex-cli 0.146.0 capture, not re-verified against 0.105.0 (npm) -- the same version-split residual as the existing distiller --ignore-rules/--ignore-user-config gap -- and the equals-seat wording residual (an operator-configured review model equal in tier but spelled differently from a full-id seat keeps the strict never-clause wording, since equality is checked case-insensitively on the exact strings only) -->
 
 <!-- Updated 2026-08-18 (feat/usage-two-window-display): both usage windows now render per harness, filtered through the new window::available staleness rule, at every display surface (dash header, wrap's bar, zirv ctx status); the refresh gates were fixed to treat a display-dropped slot as stale so a rolled-over window refreshes promptly; two residuals recorded, not fixed -- pace's hard-park path deliberately admits a rolled-over-but-recently-observed reading (test-pinned, pre-existing, distinct from `available`'s own rule), and `zirv ctx usage` prints a bare unix epoch for a passed resets_at with no "already reset" wording -->
@@ -198,6 +199,10 @@ prompt (the one residual claude's distiller has too, and cannot close either
 `--ignore-rules --ignore-user-config` to `distiller_cmd` once the
 npm-published codex-cli ships them, verified against that installed CLI the
 same way `-s, --sandbox` was.
+
+## A `~/.codex/config.toml` model pin unsupported by the operator's login breaks every zirv codex delegation with a 400
+
+zirv passes no `--model` to codex by default (`CodexAdapter::default_worker_model()` is `None`, and `worker.codex`/`review.codex` are both unset unless the operator configures them — see [[Ctx Adapters]]'s "The delegated-worker model default"), so an unconfigured codex launch runs on whatever `codex exec`'s own resolution picks. If the operator's own `~/.codex/config.toml` pins a `model` that the account's actual login (a ChatGPT-plan session, not an API key) does not support, every codex launch fails at the vendor with an HTTP 400 — indistinguishable at zirv's level from any other codex startup failure, since zirv never sees or validates the pinned name; it is entirely outside zirv's own config surface. Resolved on this machine by removing the pin from `~/.codex/config.toml` and letting codex's own default apply. If a codex delegation (`zirv ctx agent codex ...`, a dashboard codex pane, or codex code review) fails outright with a 400 and no obviously bad zirv config, check `~/.codex/config.toml` for a `model` line before looking anywhere in this codebase.
 
 ## The codex review-ladder model catalog is sourced from a 0.146.0 capture, not re-verified against npm's 0.105.0
 
