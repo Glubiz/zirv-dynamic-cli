@@ -66,12 +66,22 @@ pub fn validate_flags(flags: &[String]) -> CtxResult<()> {
 }
 
 /// Whether `flags` already pins an explicit model choice -- a bare
-/// `--model`, or the `--model=value` joined form. The operator's own choice
-/// always wins, so `worker_launch_flags` below never overrides it.
+/// `--model`/`-m`, or the `--model=value`/`-m=value` joined form. The
+/// operator's own choice always wins, so `worker_launch_flags` below never
+/// overrides it.
+///
+/// `-m` is codex's own verified short alias for `--model` (`CodexAdapter`'s
+/// doc comments around `distiller_cmd`/`model_args` in `adapters/codex.rs`,
+/// citing `codex exec --help`/top-level `codex --help`), so without it
+/// `zirv ctx agent codex "<prompt>" -- -m opus` with `worker.codex`
+/// configured got a conflicting `--model` prepended ahead of the operator's
+/// own `-m opus`. Recognising `-m` is harmless for claude, which has no such
+/// alias: treating it as pinning there only ever skips a prepend that would
+/// otherwise have happened, never breaks a launch.
 fn flags_pin_model(flags: &[String]) -> bool {
     flags
         .iter()
-        .any(|f| f == "--model" || f.starts_with("--model="))
+        .any(|f| f == "--model" || f.starts_with("--model=") || f == "-m" || f.starts_with("-m="))
 }
 
 /// The effective trailing flags a delegated headless spawn launches with.
@@ -432,6 +442,35 @@ mod tests {
             worker_launch_flags(&cfg, "claude", &adapter, &joined),
             joined,
             "the --model=value joined form must also be recognised as already pinned"
+        );
+    }
+
+    /// FIX 2: codex's own `-m` short alias must pin exactly like `--model`,
+    /// or a configured `worker.codex` gets a conflicting `--model` prepended
+    /// ahead of an operator's own `-m <value>`.
+    #[test]
+    fn codexs_short_m_alias_also_pins_the_model_for_worker_launches() {
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: None,
+                codex: Some("gpt-5.6-terra".to_string()),
+            },
+            ..CtxConfig::default()
+        };
+
+        let bare = vec!["-m".to_string(), "opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &adapter, &bare),
+            bare,
+            "the operator's own -m must reach argv unchanged, not gain a conflicting --model"
+        );
+
+        let joined = vec!["-m=opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &adapter, &joined),
+            joined,
+            "the -m=value joined form must also be recognised as already pinned"
         );
     }
 

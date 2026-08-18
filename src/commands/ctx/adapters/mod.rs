@@ -43,21 +43,65 @@ pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 /// exactly like `SESSION_ENV`/`SOCKET_ENV`.
 pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
 
+/// The last `--model <value>` (two-token) or `--model=<value>` (joined)
+/// occurrence in `flags` -- CLI last-wins semantics, the same rule a real
+/// argv parser applies when a flag is repeated. `None` when `flags` names no
+/// model at all.
+///
+/// Deliberately scans only the two `--model` spellings, not codex's `-m`
+/// short alias: this feeds `seat_model_env`, which only ever sees the
+/// zirv-built launch argv (`extra_with_model`'s own output, always the long
+/// form -- see `AgentAdapter::model_args`) plus whatever the operator typed
+/// after `--`, and disclosure of a seat this scan misses only fails open
+/// (the pretool guard), never closed.
+fn last_model_flag(flags: &[String]) -> Option<&str> {
+    let mut found = None;
+    let mut i = 0;
+    while i < flags.len() {
+        let arg = flags[i].as_str();
+        if arg == "--model" {
+            if let Some(value) = flags.get(i + 1) {
+                found = Some(value.as_str());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--model=") {
+            found = Some(value);
+        }
+        i += 1;
+    }
+    found
+}
+
 /// The `SEAT_MODEL_ENV` pair a launch exports, or nothing. Pure, so which
 /// launches disclose a seat is testable without a pty.
 ///
-/// Only an `Orchestrator` launch with a non-blank configured model discloses
+/// Only an `Orchestrator` launch with a non-blank resolved model discloses
 /// one: a `Worker` is not a seat that dispatches subagents, and with no
-/// configured model the harness picks its own default, which zirv cannot name
+/// resolved model the harness picks its own default, which zirv cannot name
 /// and therefore must not claim to.
+///
+/// The resolved model prefers an operator-passed `--model`/`--model=` in
+/// `flags` (the last occurrence, CLI last-wins) over `cfg_model`
+/// (`cfg.chat.model`): `flags` is the argv the launch actually uses, built by
+/// `extra_with_model` from `cfg_model` and then the operator's own trailing
+/// flags appended after it, so an operator passthrough like `zirv chat --
+/// --model fable` with no `chat.model` configured must still disclose the
+/// seat it actually launches on, and a configured `chat.model` that an
+/// operator's own passthrough then overrides must disclose the flag's value,
+/// not the configured one -- both directions the guard was blind to when
+/// this only ever read `cfg.chat.model`.
 pub fn seat_model_env(
     role: super::prompt::PromptRole,
-    model: Option<&str>,
+    flags: &[String],
+    cfg_model: Option<&str>,
 ) -> Vec<(String, String)> {
     if role != super::prompt::PromptRole::Orchestrator {
         return Vec::new();
     }
-    match model.map(str::trim).filter(|m| !m.is_empty()) {
+    let resolved = last_model_flag(flags).or(cfg_model);
+    match resolved.map(str::trim).filter(|m| !m.is_empty()) {
         Some(model) => vec![(SEAT_MODEL_ENV.to_string(), model.to_string())],
         None => Vec::new(),
     }

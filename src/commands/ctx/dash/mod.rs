@@ -3169,10 +3169,15 @@ pub fn run_dashboard(
     // the first pane -- `fulfill_spawn_request` and the restore path each
     // build their own from scratch -- so a worker pane never picks it up,
     // and `Pane::spawn`'s own `scrub_supervision_env` clears any copy the
-    // dashboard process itself might have inherited. Mirrors `wrap.rs`'s own
-    // orchestrator arm; see `adapters::seat_model_env`.
+    // dashboard process itself might have inherited. `first.argv` is the
+    // exact launch argv `build_launch`/`extra_with_model` built (config
+    // model folded in, then the operator's own trailing flags appended after
+    // it), so a passthrough `--model`/`--model=` in it is preferred over
+    // `cfg.chat.model` the same way `wrap.rs`'s own orchestrator arm prefers
+    // its own `rest`; see `adapters::seat_model_env`.
     turn_env.extend(super::adapters::seat_model_env(
         first.role,
+        &first.argv,
         cfg.chat.model.as_deref(),
     ));
 

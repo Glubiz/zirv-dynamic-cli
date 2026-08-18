@@ -1625,20 +1625,128 @@ mod tests {
         use crate::commands::ctx::prompt::PromptRole;
 
         assert_eq!(
-            seat_model_env(PromptRole::Orchestrator, Some("fable")),
+            seat_model_env(PromptRole::Orchestrator, &[], Some("fable")),
             vec![(SEAT_MODEL_ENV.to_string(), "fable".to_string())]
         );
         assert!(
-            seat_model_env(PromptRole::Worker, Some("fable")).is_empty(),
+            seat_model_env(PromptRole::Worker, &[], Some("fable")).is_empty(),
             "a worker is not a seat that spawns subagents"
         );
         assert!(
-            seat_model_env(PromptRole::Orchestrator, None).is_empty(),
+            seat_model_env(PromptRole::Orchestrator, &[], None).is_empty(),
             "nothing configured, nothing to inherit"
         );
         assert!(
-            seat_model_env(PromptRole::Orchestrator, Some("   ")).is_empty(),
+            seat_model_env(PromptRole::Orchestrator, &[], Some("   ")).is_empty(),
             "a blank model names no tier"
+        );
+    }
+
+    /// FIX 1: an operator passthrough `--model` with no `chat.model`
+    /// configured must still disclose the seat it actually launches on --
+    /// the guard used to fail open on exactly this shape.
+    #[test]
+    fn an_operator_passed_model_flag_exports_the_seat_with_no_config_at_all() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec!["--model".to_string(), "fable".to_string()];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &flags, None),
+            vec![(SEAT_MODEL_ENV.to_string(), "fable".to_string())]
+        );
+    }
+
+    /// FIX 1: an operator passthrough overriding a configured `chat.model`
+    /// must disclose the flag's own value, not the configured one -- the
+    /// launch actually runs on the flag.
+    #[test]
+    fn an_operator_passed_model_flag_wins_over_a_configured_chat_model() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec!["--model".to_string(), "sonnet".to_string()];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &flags, Some("fable")),
+            vec![(SEAT_MODEL_ENV.to_string(), "sonnet".to_string())]
+        );
+    }
+
+    /// With no operator passthrough at all, behavior is unchanged from
+    /// before FIX 1: the configured `chat.model` alone decides.
+    #[test]
+    fn with_no_operator_flag_the_configured_model_still_decides() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &[], Some("fable")),
+            vec![(SEAT_MODEL_ENV.to_string(), "fable".to_string())]
+        );
+    }
+
+    /// The `--model=<value>` joined form is recognised too, not just the
+    /// two-token spelling.
+    #[test]
+    fn the_joined_equals_form_of_the_model_flag_is_recognised() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec!["--model=opus".to_string()];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &flags, None),
+            vec![(SEAT_MODEL_ENV.to_string(), "opus".to_string())]
+        );
+    }
+
+    /// A repeated `--model` is CLI last-wins: the later occurrence in argv
+    /// order is the one the real harness actually launches on.
+    #[test]
+    fn a_repeated_model_flag_resolves_to_the_last_occurrence() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--model".to_string(),
+            "haiku".to_string(),
+        ];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &flags, None),
+            vec![(SEAT_MODEL_ENV.to_string(), "haiku".to_string())]
+        );
+
+        // Mixed spellings: the joined form arriving last still wins over an
+        // earlier two-token occurrence.
+        let mixed = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--model=haiku".to_string(),
+        ];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &mixed, None),
+            vec![(SEAT_MODEL_ENV.to_string(), "haiku".to_string())]
+        );
+    }
+
+    /// FIX 1 still respects the two guards `seat_model_env` already had: a
+    /// `Worker` role never exports regardless of what the flags carry, and a
+    /// blank resolved model (however it was resolved) exports nothing.
+    #[test]
+    fn fix_1_still_respects_the_role_gate_and_the_blank_model_suppression() {
+        use crate::commands::ctx::adapters::seat_model_env;
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec!["--model".to_string(), "fable".to_string()];
+        assert!(
+            seat_model_env(PromptRole::Worker, &flags, None).is_empty(),
+            "a worker pane must never export a seat, flags or not"
+        );
+        let blank = vec!["--model".to_string(), "   ".to_string()];
+        assert!(
+            seat_model_env(PromptRole::Orchestrator, &blank, None).is_empty(),
+            "a blank flag value names no tier, same as a blank configured model"
         );
     }
 
