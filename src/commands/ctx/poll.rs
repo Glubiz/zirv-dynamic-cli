@@ -447,6 +447,57 @@ mod tests {
         );
     }
 
+    /// Both windows are always written from one snapshot, so in practice they
+    /// share an `observed_at` (parse_statusline, parse_anthropic_usage, and
+    /// windows_from_rate_limits all do this). When five_hour rolls over but
+    /// seven_day is still live, `available` drops five_hour while seven_day
+    /// survives with the shared recent `observed_at` -- so a gate that judged
+    /// freshness off the raw newest observation, instead of the freshest
+    /// *available* one, would wrongly call this fresh and leave five_hour
+    /// blank for up to `collector_max_age_secs` after every five-hour
+    /// boundary. The single-window fixture above (`seven_day: None`) cannot
+    /// catch this: this case pins the two-window shape.
+    #[test]
+    fn maybe_poll_proceeds_when_one_of_two_shared_observation_windows_has_rolled_over() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = PaceConfig::default();
+        let provider = "anthropic";
+        let now = 1_000_000u64;
+
+        let mixed = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 90.0,
+                resets_at: now - 1,
+                observed_at: now - 10,
+            }),
+            seven_day: Some(Window {
+                used_percentage: 30.0,
+                resets_at: now + 7 * 24 * 3600,
+                observed_at: now - 10,
+            }),
+        };
+        window::store_for(&state, provider, &mixed).expect("store mixed reading");
+
+        let poller = CountingPoller {
+            calls: RefCell::new(0),
+            reading: Some(PollReading {
+                windows: UsageWindows::default(),
+                vendor_credits_enabled: None,
+            }),
+        };
+        let r = maybe_poll(&state, &cfg, now, provider, &poller);
+        assert!(
+            r.is_some(),
+            "a dropped five_hour slot must trigger a poll even though seven_day is still live"
+        );
+        assert_eq!(
+            *poller.calls.borrow(),
+            1,
+            "the poller must actually run rather than being gated out"
+        );
+    }
+
     /// Item 3 (review): the shared agent is built once and reused. No live
     /// HTTP is exercised here -- constructing the `ureq::Agent` config and
     /// confirming the `OnceLock` hands back the same instance on repeat

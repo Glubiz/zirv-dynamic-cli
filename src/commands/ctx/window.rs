@@ -604,9 +604,31 @@ pub(crate) fn newest_observation(windows: &UsageWindows) -> u64 {
 /// operator is already looking at a blank reading. Returns `0` -- "stale" --
 /// when nothing survives the filter, same as `newest_observation` on an empty
 /// set.
-#[allow(dead_code)]
+///
+/// Both windows are always written from a single snapshot (`parse_statusline`,
+/// `parse_anthropic_usage`, and `windows_from_rate_limits` all stamp both
+/// slots with the same `observed_at`), so a plain `newest_observation` over
+/// `available`'s output is not enough: when five_hour rolls over but
+/// seven_day is still live, `available` drops five_hour and keeps seven_day
+/// -- and seven_day's shared `observed_at` would still read as recent, even
+/// though five_hour has nothing to show. So any slot `available` dropped
+/// counts as staleness (`0`) here, not just an empty result overall. While a
+/// dropped slot has no newer data to replace it, this makes the gate report
+/// stale continuously, so the poll re-fires every `poll_min_interval_secs`
+/// and the codex scan every `CODEX_SCAN_FLOOR_SECS` -- the same behavior the
+/// code already had when *both* slots drop. `refresh_codex_usage`'s
+/// merged-equals-existing no-op guard keeps the state file from being
+/// rewritten on each of those re-fires, so the added cost is bounded and
+/// accepted.
 pub(crate) fn freshest_available_observation(windows: &UsageWindows, now: u64) -> u64 {
-    newest_observation(&available(windows, now))
+    let avail = available(windows, now);
+    let dropped = (windows.five_hour.is_some() && avail.five_hour.is_none())
+        || (windows.seven_day.is_some() && avail.seven_day.is_none());
+    if dropped {
+        0
+    } else {
+        newest_observation(&avail)
+    }
 }
 
 /// Opportunistic passive refresh for codex: scan its session rollouts only
@@ -844,6 +866,38 @@ mod tests {
         assert_eq!(
             out.five_hour, None,
             "a far-future resets_at must not make an ancient observation immortal"
+        );
+    }
+
+    /// Both windows are always written from one snapshot, so they share an
+    /// `observed_at` in practice. When five_hour rolls over but seven_day is
+    /// still live, `available` drops five_hour and keeps seven_day -- and
+    /// `newest_observation` on that surviving set would still report the
+    /// shared recent timestamp, wrongly reading as fresh even though
+    /// five_hour has nothing to show. `freshest_available_observation` must
+    /// treat a dropped slot as staleness (`0`) rather than let the surviving
+    /// slot's shared timestamp paper over it.
+    #[test]
+    fn freshest_available_observation_is_stale_when_one_of_two_shared_observation_windows_rolled_over()
+     {
+        let now = 1_000_000u64;
+        let windows = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 90.0,
+                resets_at: now - 1,
+                observed_at: now - 10,
+            }),
+            seven_day: Some(Window {
+                used_percentage: 30.0,
+                resets_at: now + SEVEN_DAY_SECS,
+                observed_at: now - 10,
+            }),
+        };
+        assert_eq!(
+            freshest_available_observation(&windows, now),
+            0,
+            "a dropped five_hour slot must make the reading read as stale, \
+             even though seven_day's shared observed_at is recent"
         );
     }
 
