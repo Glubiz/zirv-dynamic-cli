@@ -15,11 +15,19 @@
 # block and set `enabled = false` to disable that agent from this checkout; a
 # commented line sets nothing.
 #
+# `capacity = "small"` marks an agent capacity-limited ("small tasks only" in
+# the harness roster) and has the same narrow-only trust shape as `enabled`:
+# a repo checkout may set it, but a commented (or absent) line here can never
+# clear a `capacity = "small"` set by the operator's own home file back to
+# full -- only ZIRV_AGENT_<NAME>_CAPACITY can do that, in either direction.
+#
 # Every agent known to this build's adapter registry (src/commands/ctx/
 # adapters/mod.rs::ADAPTERS) is listed below at its default enablement.
 
 # [agents.claude]
 # enabled = true
+# capacity = "small"
 
 # [agents.codex]
 # enabled = true
+# capacity = "small"

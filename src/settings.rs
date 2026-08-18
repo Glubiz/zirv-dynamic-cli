@@ -24,6 +24,17 @@
 //! nothing else touched. The environment is the operator, in both
 //! directions; the home file is the operator only in the narrowing
 //! direction the fold actually gives it.
+//!
+//! `[agents.<name>]` also carries an optional `capacity` key (the only
+//! recognized value is `"small"`; absent means full capacity), mirroring the
+//! `enabled` gate's exact trust shape: `ZIRV_AGENT_<NAME>_CAPACITY` sits above
+//! the fold and wins outright (it may set `"small"` or clear back to `"full"`
+//! in either direction, same as the environment always can for `enabled`),
+//! and otherwise the answer is `home(name) || repo(name)` -- a repo checkout
+//! may narrow a full-capacity agent to `"small"`, but a repo file that is
+//! silent on capacity can never undo a `"small"` the home file already set
+//! (there is no `"full"` value to write; the only way to widen back is the
+//! environment).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,6 +67,33 @@ pub struct SettingsFile {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentSettings {
     pub enabled: Option<bool>,
+    pub capacity: Option<Capacity>,
+}
+
+/// The only file-settable capacity marker. There is deliberately no `"full"`
+/// variant: absence already means full capacity (see `AgentSettings::
+/// capacity`'s doc), and the only value a file needs to spell is the
+/// narrowing one -- widening back to full is the environment's job alone
+/// (see the module doc's fold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capacity {
+    Small,
+}
+
+impl<'de> Deserialize<'de> for Capacity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        if raw.eq_ignore_ascii_case("small") {
+            Ok(Capacity::Small)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "expected \"small\", got '{raw}'"
+            )))
+        }
+    }
 }
 
 /// Where a `false` came from, for the refusal message and `zirv ctx status`.
@@ -79,6 +117,11 @@ pub struct AgentState {
     /// `None` whenever `enabled` is true: there is nothing to attribute a
     /// permissive default to.
     pub disabled_by: Option<Source>,
+    /// Whether this agent is capacity-limited ("small tasks only") right
+    /// now, folded with the same env-wins/home-or-repo-narrows shape as
+    /// `enabled` (see the module doc). `false` is full capacity, the
+    /// permissive default for an agent no layer mentions.
+    pub capacity_small: bool,
 }
 
 impl AgentState {
@@ -144,6 +187,10 @@ fn env_var_for(name: &str) -> String {
     format!("ZIRV_AGENT_{}_ENABLED", name.to_uppercase())
 }
 
+fn capacity_env_var_for(name: &str) -> String {
+    format!("ZIRV_AGENT_{}_CAPACITY", name.to_uppercase())
+}
+
 fn known_adapter_names() -> Vec<&'static str> {
     crate::commands::ctx::adapters::all(None)
         .iter()
@@ -176,6 +223,32 @@ fn file_enabled(layer: Option<&SettingsFile>, name: &str) -> Option<bool> {
         .and_then(|a| a.enabled)
 }
 
+/// Whether `layer` marks `name` capacity-small. Unlike `file_enabled` there
+/// is no tri-state to return: the only value a file can write is `"small"`,
+/// so "not mentioned" and "explicitly full" are indistinguishable on disk,
+/// and both mean `false` here.
+fn file_capacity_small(layer: Option<&SettingsFile>, name: &str) -> bool {
+    layer
+        .and_then(|s| s.agents.get(name))
+        .is_some_and(|a| a.capacity == Some(Capacity::Small))
+}
+
+/// `Ok(None)` when the environment is silent on this agent's capacity;
+/// `Err` names the variable when it is set but neither `"small"` nor
+/// `"full"`. Unlike `env_override` (a plain bool), this env var has real
+/// two-way authority: `"full"` is how an operator clears a home- or
+/// repo-narrowed agent back to full capacity, since no file can write that
+/// value itself.
+fn capacity_env_override(name: &str, env: EnvLookup<'_>) -> CtxResult<Option<bool>> {
+    let env_var = capacity_env_var_for(name);
+    match env(&env_var) {
+        Some(raw) if raw.eq_ignore_ascii_case("small") => Ok(Some(true)),
+        Some(raw) if raw.eq_ignore_ascii_case("full") => Ok(Some(false)),
+        Some(raw) => Err(format!("{env_var}: expected 'small' or 'full', got '{raw}'").into()),
+        None => Ok(None),
+    }
+}
+
 impl AgentGate {
     /// Layers `~/.zirv/.settings.toml`, then `<repo>/.zirv/.settings.toml`,
     /// then `ZIRV_AGENT_<NAME>_ENABLED`, per agent name known to
@@ -194,10 +267,19 @@ impl AgentGate {
 
         let mut states = HashMap::new();
         for name in known {
+            let capacity_small = match capacity_env_override(name, env)? {
+                Some(small) => small,
+                None => {
+                    file_capacity_small(operator.as_ref(), name)
+                        || file_capacity_small(repo_layer.as_ref(), name)
+                }
+            };
+
             let state = match env_override(name, env)? {
                 Some(enabled) => AgentState {
                     enabled,
                     disabled_by: (!enabled).then(|| Source::Env(env_var_for(name))),
+                    capacity_small,
                 },
                 None => {
                     let operator_component = file_enabled(operator.as_ref(), name).unwrap_or(true);
@@ -213,6 +295,7 @@ impl AgentGate {
                     AgentState {
                         enabled,
                         disabled_by,
+                        capacity_small,
                     }
                 }
             };
@@ -262,10 +345,21 @@ impl AgentGate {
 
         let mut states = HashMap::new();
         for name in known {
+            // Capacity errors are scoped the same way `enabled`'s own env
+            // override errors are below: one agent's malformed
+            // `ZIRV_AGENT_<NAME>_CAPACITY` denies only that agent, never the
+            // whole operator-only fallback.
+            let capacity_small = match capacity_env_override(name, env) {
+                Ok(Some(small)) => small,
+                Ok(None) => file_capacity_small(operator.as_ref(), name),
+                Err(_) => false,
+            };
+
             let state = match env_override(name, env) {
                 Ok(Some(enabled)) => AgentState {
                     enabled,
                     disabled_by: (!enabled).then(|| Source::Env(env_var_for(name))),
+                    capacity_small,
                 },
                 Ok(None) => {
                     let enabled = file_enabled(operator.as_ref(), name).unwrap_or(true);
@@ -275,11 +369,13 @@ impl AgentGate {
                     AgentState {
                         enabled,
                         disabled_by,
+                        capacity_small,
                     }
                 }
                 Err(e) => AgentState {
                     enabled: false,
                     disabled_by: Some(Source::Unavailable(e.to_string())),
+                    capacity_small,
                 },
             };
             states.insert((*name).to_string(), state);
@@ -296,6 +392,7 @@ impl AgentGate {
                     AgentState {
                         enabled: false,
                         disabled_by: Some(Source::Unavailable(reason.to_string())),
+                        capacity_small: false,
                     },
                 )
             })
@@ -307,6 +404,13 @@ impl AgentGate {
     /// adapters may do, never what a caller thinks a name means.
     pub fn is_enabled(&self, name: &str) -> bool {
         self.states.get(name).is_none_or(|s| s.enabled)
+    }
+
+    /// Whether `name` is capacity-limited ("small tasks only") right now.
+    /// Unknown names are full capacity, the same permissive default
+    /// `is_enabled` gives an unknown name.
+    pub fn is_capacity_small(&self, name: &str) -> bool {
+        self.states.get(name).is_some_and(|s| s.capacity_small)
     }
 
     /// `None` when the agent is enabled (or unknown); otherwise a message
@@ -366,6 +470,7 @@ impl AgentGate {
             Some(AgentState {
                 enabled: false,
                 disabled_by: Some(Source::RepoFile(_)),
+                ..
             })
         )
     }
@@ -751,5 +856,118 @@ mod tests {
             "the whole-file-unreadable case never even consults env, so this remedy is a dead \
              end: {msg}"
         );
+    }
+
+    // -- capacity ("small tasks only") --------------------------------
+
+    #[test]
+    fn defaults_are_full_capacity() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!gate.is_capacity_small("claude"));
+        assert!(!gate.is_capacity_small("codex"));
+    }
+
+    #[test]
+    fn a_home_file_can_mark_an_agent_capacity_small() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[agents.codex]\ncapacity = \"small\"\n");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(gate.is_capacity_small("codex"));
+        assert!(!gate.is_capacity_small("claude"), "only codex was marked");
+    }
+
+    #[test]
+    fn a_repository_can_mark_an_agent_capacity_small() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        write_settings(repo.path(), "[agents.codex]\ncapacity = \"small\"\n");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(gate.is_capacity_small("codex"));
+    }
+
+    /// The repo-cannot-widen half of the fold: a repo file that says nothing
+    /// about capacity must not undo a home-set `"small"` -- there is no
+    /// `"full"` value a file can write at all, so the only way this could go
+    /// wrong is the fold silently treating "repo is silent" as "repo says
+    /// full". It must not.
+    #[test]
+    fn a_repository_cannot_widen_a_home_narrowed_agent_back_to_full() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), "[agents.codex]\ncapacity = \"small\"\n");
+        let repo = tempfile::tempdir().expect("tempdir");
+        // The repo file exists and mentions this agent, but says nothing
+        // about capacity -- still must not clear the home-set narrowing.
+        write_settings(repo.path(), "[agents.codex]\nenabled = true\n");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            gate.is_capacity_small("codex"),
+            "a repo silent on capacity must not widen a home-set narrowing"
+        );
+    }
+
+    /// The environment is the operator in both directions for capacity too:
+    /// it can narrow an agent nothing else marked, and it can widen one a
+    /// file narrowed back to full -- the one case no file can express on its
+    /// own.
+    #[test]
+    fn the_environment_can_narrow_or_widen_capacity_in_either_direction() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let narrow = env_map(&[("ZIRV_AGENT_CODEX_CAPACITY", "small")]);
+        let gate = AgentGate::load(repo.path(), &|k| narrow.get(k).cloned()).expect("load");
+        assert!(gate.is_capacity_small("codex"), "env can narrow");
+
+        write_settings(home.path(), "[agents.codex]\ncapacity = \"small\"\n");
+        let widen = env_map(&[("ZIRV_AGENT_CODEX_CAPACITY", "full")]);
+        let gate = AgentGate::load(repo.path(), &|k| widen.get(k).cloned()).expect("load");
+        assert!(
+            !gate.is_capacity_small("codex"),
+            "env can widen back to full even over a home-set 'small'"
+        );
+    }
+
+    #[test]
+    fn an_invalid_capacity_env_override_is_rejected_with_the_variable_named() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let env = env_map(&[("ZIRV_AGENT_CODEX_CAPACITY", "medium")]);
+        let err = AgentGate::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("an invalid capacity override must be rejected");
+        assert!(
+            err.to_string().contains("ZIRV_AGENT_CODEX_CAPACITY"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_capacity_file_value_is_rejected_loudly() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        write_settings(repo.path(), "[agents.codex]\ncapacity = \"medium\"\n");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let err = AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("only 'small' is a valid capacity value");
+        assert!(err.to_string().contains("small"), "got {err}");
     }
 }

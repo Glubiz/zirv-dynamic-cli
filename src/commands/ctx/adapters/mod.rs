@@ -923,11 +923,24 @@ pub fn harness_prompt_lines(cfg: &CtxConfig, current_adapter: &str) -> Vec<Strin
                     } else {
                         format!(" (degraded: no {})", join_with_or(&missing))
                     };
+                    // Repo `.settings.toml` (or the operator, or the
+                    // environment) may mark a harness capacity-limited; the
+                    // roster line carries that forward so an orchestrator
+                    // routes only small, bounded briefs its way -- both for
+                    // reviews and for `zirv agent` delegations (see
+                    // `HARNESS_PROMPT`'s final paragraph).
+                    let capacity_note = if cfg.agents.is_capacity_small(name) {
+                        " -- small tasks only"
+                    } else {
+                        ""
+                    };
                     if is_self {
-                        format!("- {name}: enabled, ready (this session's harness){degraded}")
+                        format!(
+                            "- {name}: enabled, ready{capacity_note} (this session's harness){degraded}"
+                        )
                     } else {
                         format!(
-                            "- {name}: enabled, ready -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
+                            "- {name}: enabled, ready{capacity_note} -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
                         )
                     }
                 }
@@ -1838,6 +1851,58 @@ mod tests {
         assert!(
             codex_line.contains("not installed"),
             "codex is judged on its own (absent) binary, not claude's override: {codex_line}"
+        );
+    }
+
+    /// A capacity-limited harness's roster line gets the `-- small tasks
+    /// only` suffix; an unmarked harness's line does not. This is the
+    /// signal `HARNESS_PROMPT`'s final paragraph tells an orchestrator to
+    /// route only small, bounded briefs by, for both reviews and `zirv
+    /// agent` delegations.
+    #[test]
+    fn harness_prompt_lines_marks_a_capacity_limited_harness_small_tasks_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["claude", "codex"] {
+            std::fs::write(dir.path().join(name), "").expect("write stub");
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.codex]\ncapacity = \"small\"\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let cfg = CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        };
+
+        let lines = harness_prompt_lines(&cfg, "claude");
+        let codex_line = lines
+            .iter()
+            .find(|l| l.starts_with("- codex:"))
+            .expect("codex line present");
+        assert!(
+            codex_line.contains("ready -- small tasks only"),
+            "got {codex_line}"
+        );
+
+        let claude_line = lines
+            .iter()
+            .find(|l| l.starts_with("- claude:"))
+            .expect("claude line present");
+        assert!(
+            !claude_line.contains("small tasks only"),
+            "claude was never marked capacity-small: {claude_line}"
         );
     }
 
