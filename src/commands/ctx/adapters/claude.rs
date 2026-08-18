@@ -624,14 +624,21 @@ impl AgentAdapter for ClaudeAdapter {
 
     /// Claude's own model ladder, top to bottom: `fable`/`mythos` (the
     /// orchestrator-tier aliases), `opus`, `sonnet`, `haiku`. Matched by
-    /// substring on `seat` (so `"claude-fable-5"` and a bare `"fable"` both
-    /// hit the fable rung) rather than exact equality, since a seat string
-    /// can carry a full id (`claude-opus-4-1`) or a bare alias. `haiku` is
-    /// already the floor, so it maps to itself instead of falling off the
-    /// ladder; an absent or unrecognised seat assumes the top tier, same as
-    /// `AgentAdapter::review_model_below`'s own doc comment requires.
+    /// substring on `seat`, lowercased first so `"claude-Opus-4-5"` and a
+    /// bare `"opus"` both hit the same rung regardless of case (so
+    /// `"claude-fable-5"` and a bare `"fable"` both hit the fable rung)
+    /// rather than exact equality, since a seat string can carry a full id
+    /// (`claude-opus-4-1`) or a bare alias. `haiku` is already the floor, so
+    /// it maps to itself instead of falling off the ladder; an absent or
+    /// unrecognised seat assumes the top tier, same as
+    /// `AgentAdapter::review_model_below`'s own doc comment requires -- the
+    /// deliberate consequence is that the computed default can then resolve
+    /// to a model *more expensive* than the seat actually in use (an
+    /// accepted spend-up default; the operator can override it with
+    /// `[review]` or by setting `chat.model`).
     fn review_model_below(&self, seat: Option<&str>) -> &'static str {
-        match seat {
+        let seat = seat.map(str::to_lowercase);
+        match seat.as_deref() {
             Some(s) if s.contains("fable") || s.contains("mythos") => "opus",
             Some(s) if s.contains("opus") => "sonnet",
             Some(s) if s.contains("sonnet") => "haiku",
@@ -1436,6 +1443,24 @@ mod tests {
             "opus",
             "unrecognised seat: assume the top tier"
         );
+    }
+
+    /// Seat matching must be case-insensitive: a mixed-case seat like
+    /// "Opus" (or a full id with mixed-case segments) must land on the same
+    /// ladder rung as its lowercase form, not fall through to the unknown
+    /// arm and assume the top tier.
+    #[test]
+    fn review_model_below_matches_the_seat_case_insensitively() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(adapter.review_model_below(Some("Opus")), "sonnet");
+        assert_eq!(
+            adapter.review_model_below(Some("claude-Opus-4-5")),
+            "sonnet"
+        );
+        assert_eq!(adapter.review_model_below(Some("SONNET")), "haiku");
+        assert_eq!(adapter.review_model_below(Some("Haiku")), "haiku");
+        assert_eq!(adapter.review_model_below(Some("Fable")), "opus");
+        assert_eq!(adapter.review_model_below(Some("MYTHOS")), "opus");
     }
 
     #[test]

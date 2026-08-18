@@ -444,6 +444,14 @@ pub struct ChatConfig {
 /// `adapters/mod.rs`, the one place both halves (operator override, ladder
 /// default) are combined into the harness-roster line an Orchestrator
 /// session actually sees.
+///
+/// That trust claim is fully true only of this table's own keys directly: a
+/// repo checkout can still shift the *derived* ladder default indirectly, by
+/// setting `chat.model` (deliberately repo-settable -- see that field's own
+/// comment -- and disclosed on screen via `announce_model_choice`, unlike
+/// this table). That indirection is accepted because it is disclosed the
+/// same way a direct `chat.model` choice is, and it can only ever move the
+/// ladder default, never set an explicit `review.<agent>` value outright.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewConfig {
@@ -1001,14 +1009,17 @@ impl CtxConfig {
             validate_model_str("chat.model", model)?;
         }
 
-        // `review.claude`/`review.codex` reach the very same argv surface as
-        // `chat.model` above once a `zirv agent <name>` review round launches
-        // that adapter's own headless child (`model_args`/`distiller_cmd`),
-        // so they get the identical charset/length/leading-dash guard --
-        // `REPO_FORBIDDEN` (see its own comment on the `review` entry) is
-        // what keeps a checked-out repo from setting these at all; this is
-        // the second, independent layer that bounds what even an operator's
-        // own value can carry onto that argv.
+        // `review.claude`/`review.codex` land in injected prompt text (see
+        // `review_roster_line` in `adapters/mod.rs`, the harness-roster line
+        // an Orchestrator session's own base prompt reads), not in argv
+        // directly -- but that session may itself later re-type the value
+        // onto a real command line (e.g. `zirv agent <name> ...`), so the
+        // same charset/length/leading-dash guard is defense for both: the
+        // prompt-injection surface today, and the argv it may be re-typed
+        // onto tomorrow. `REPO_FORBIDDEN` (see its own comment on the
+        // `review` entry) is what keeps a checked-out repo from setting
+        // these at all; this is the second, independent layer that bounds
+        // what even an operator's own value can carry.
         if let Some(model) = cfg.review.claude.as_deref() {
             validate_model_str("review.claude", model)?;
         }
