@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-17
+last-verified: 2026-08-18
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-08-17
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-18: both usage windows shown, filtered by availability; refresh gates fixed at reset boundaries (`feat/usage-two-window-display`)
+**What:** Three commits landing per-agent usage as two labeled windows instead of the worse-of-both collapse. `HarnessUsage`/`BarState.usage_five_hour`+`usage_seven_day` replace the single-percent tuple at the dash header and `wrap`'s bar (`5h X% wk Y%`, either window alone, or the placeholder); `window::max_used_percentage` is removed. New `window::available(windows, now)` drops a window whose `resets_at` has passed (boundary at `==` matches `pace.rs`'s own `reset_passed`) or that has outlived its own span, applied at the header, the bar, and `zirv ctx status`; `zirv ctx usage` deliberately stays raw. Both refresh gates (`poll::maybe_poll`, `window::refresh_codex_usage`) now treat a display-dropped slot as staleness (`window::freshest_available_observation`) rather than trusting a surviving sibling window's shared `observed_at`, so a rolled-over window refreshes promptly instead of sitting blank for up to `collector_max_age_secs`.
+**Key changes:** `window.rs` (`available`, `freshest_available_observation`, `max_used_percentage` removed), `poll.rs`/`window.rs` (gate fix), `chrome.rs` (`BarState`), `dash/ui.rs` (`HarnessUsage`), `dash/mod.rs`, `wrap.rs`, `status.rs`, `Cargo.toml` (2.9.0 → 2.10.0).
+**Follow-up:** see [[Decision Log]] (2026-08-18 entry) and [[Known Issues]] for the two residuals recorded, not fixed: pace's hard-park path admits a rolled-over-but-recently-observed reading under a different rule than `available`'s own, and `zirv ctx usage` prints a bare unix epoch for a passed `resets_at`. PR pending.
 
 ### 2026-08-16: vendor usage monitoring, use_credits gating, pace-to-reset throttle (`feat/usage-credits-throttle`)
 **What:** Nine-task plan landing usage-window pacing beyond the passive statusline tee. `pace.rs` gained a `Slow` decision (soft-throttle band between new `soft_percent`/`max_percent`, spreading remaining budget linearly to reset, with a monotonic deadline across rechecks) and a `PaceGate{use_credits, poller}` — `use_credits` (new `[pace.use_credits]` table, `REPO_FORBIDDEN`) skips proactive throttle/pause but never the vendor-reported limit park. `window.rs` gained a codex passive collector (rollout-file rate-limit snapshots, RFC 3339 parsing) and `poll.rs` (new) is an active HTTP poll fallback (`ureq`, first HTTP dependency) behind a staleness/interval floor — Anthropic verified against a real response, codex ships best-effort/unverified. Task 7 (already journaled 2026-08-16 below) put per-harness usage back in the dashboard header; Task 9 delivered conventions v2 (verify-once, scope discipline) to codex workers via a task-prompt fallback.
@@ -65,9 +70,4 @@ last-verified: 2026-08-17
 **Key changes:** `src/commands/ctx/dash/{mod,pane,ui,spawnreq,roster}.rs` (new), `adapters/{mod,claude,codex}.rs` (`model_args`/`resume_args`), `chat.rs`/`chrome.rs` (`dash_eligible`, `chat.model` splice), `config.rs` (`[dash]`, `[chat]`), `agent.rs` (`try_join_dashboard`), `sessions.rs` (`Verb::Dash`), `mail.rs`/`window.rs` (shared `unread_counts`/`max_used_percentage`, moved out of `wrap.rs`).
 **Follow-up:** no rot score wired into a pane's own header yet (`score: None` always — see [[Ctx Supervisors]]). Spec: `docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md`; plan: `docs/superpowers/plans/2026-08-13-zirv-dashboard.md`.
 
-### 2026-08-13: Handoff harvest, richer `status`, and split mail counts (agent-coordination wave 3)
-**What:** Opt-in handoff-to-memory harvesting (`[memory] harvest`, default off): right after a *distilled* (never structural-fallback) rot restart, one extra cheap-model call extracts durable repository facts (`Gotchas learned`/`Files touched` only) as strict `key: body` lines, stored via `remember` with `source = "handoff"`. `zirv ctx status` gained a registry-backed `sessions:` block (agent/verb/pid/age/live-or-stale, plus orphaned sockets labeled `(no record)`) and a `memory:` summary line. `zirv ctx optimize`'s report now includes a memory-bank size summary that never quotes an entry's key or body. The T12b bar's mail count now splits broadcast from session-addressed (`mail 2+1`).
-**Key changes:** src/commands/ctx/memory.rs (`harvest_from_handoff`, `harvest_prompt`, `parse_harvest`), exec.rs/wrap.rs (harvest call sites in the rot-restart paths only, not nudge), status.rs (`sessions_lines`, `format_age`), optimize.rs (`MemorySummary`, `memory_bank_summary`, `render_memory_section`), chrome.rs/wrap.rs (`BarState::unread_mail` now `(broadcast, direct)`), tests/fixtures/fake-model.sh (`harvest` mode).
-**Follow-up:** none for this wave.
-
-Older entries: see [[journal-archive/2026-Q3|2026 Q3 archive]] (2026-08-12: `zirv chat`/`zirv agent` aliases, Agent enable/disable gate, Obsidian vault created).
+Older entries: see [[journal-archive/2026-Q3|2026 Q3 archive]] (2026-08-13: handoff harvest/status/mail split; 2026-08-12: `zirv chat`/`zirv agent` aliases, Agent enable/disable gate, Obsidian vault created).
