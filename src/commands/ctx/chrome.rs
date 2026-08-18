@@ -250,8 +250,13 @@ pub struct BarState {
     pub harness: String,
     pub score: Option<u32>,
     pub verdict: Option<Verdict>,
-    /// The worse of the two usage windows, 0.0..=100.0.
-    pub usage_percent: Option<f64>,
+    /// Both subscription windows, 0.0..=100.0 each, already filtered through
+    /// `window::available` by the caller so a value here is honest -- never a
+    /// reading whose window has provably reset. `None` in either slot renders
+    /// as no segment for that window, not a fabricated zero; both `None`
+    /// renders the same placeholder the bar has always shown for "unknown".
+    pub usage_five_hour: Option<f64>,
+    pub usage_seven_day: Option<f64>,
     /// N7: `(broadcast, direct-to-this-session)` unread counts, split so a
     /// message addressed to this session specifically is not lost inside an
     /// undifferentiated total. `None` under the same conditions the bar's
@@ -269,10 +274,16 @@ pub fn status_bar(state: &BarState, cols: u16, colour: bool) -> String {
         (Some(score), Some(verdict)) => format!("{score} {}", verdict.as_str()),
         _ => PLACEHOLDER.to_string(),
     };
-    let usage = state
-        .usage_percent
-        .map(|p| format!("{p:.0}%"))
-        .unwrap_or_else(|| PLACEHOLDER.to_string());
+    // Both windows are honest lower bounds by the time they reach here --
+    // `window::available` already dropped whichever had provably reset -- so
+    // each present value gets its own labeled segment; an absent one is
+    // simply omitted, never shown as a fabricated zero.
+    let usage = match (state.usage_five_hour, state.usage_seven_day) {
+        (Some(five), Some(week)) => format!("5h {five:.0}% wk {week:.0}%"),
+        (Some(five), None) => format!("5h {five:.0}%"),
+        (None, Some(week)) => format!("wk {week:.0}%"),
+        (None, None) => PLACEHOLDER.to_string(),
+    };
     // N7: a direct count of zero renders as plain `mail N` -- identical to
     // the bar's pre-N7 wording -- and only grows a `+direct` suffix once
     // something is actually addressed to this session specifically.
@@ -629,7 +640,8 @@ mod tests {
             harness: "claude".to_string(),
             score: Some(42),
             verdict: Some(Verdict::Advise),
-            usage_percent: Some(63.4),
+            usage_five_hour: Some(63.4),
+            usage_seven_day: Some(51.0),
             unread_mail: Some((2, 0)),
             degraded: false,
         }
@@ -641,9 +653,28 @@ mod tests {
         assert!(line.contains("claude"), "got {line}");
         assert!(line.contains("42"), "got {line}");
         assert!(line.contains("advise"), "got {line}");
-        assert!(line.contains("63%"), "got {line}");
+        assert!(line.contains("5h 63%"), "got {line}");
+        assert!(line.contains("wk 51%"), "got {line}");
         assert!(line.contains("mail 2"), "got {line}");
         assert!(line.contains("supervised"), "got {line}");
+    }
+
+    #[test]
+    fn only_the_five_hour_window_renders_without_a_week_segment() {
+        let mut state = bar_state();
+        state.usage_seven_day = None;
+        let line = status_bar(&state, 200, false);
+        assert!(line.contains("5h 63%"), "got {line}");
+        assert!(!line.contains("wk"), "got {line}");
+    }
+
+    #[test]
+    fn only_the_seven_day_window_renders_without_a_five_hour_segment() {
+        let mut state = bar_state();
+        state.usage_five_hour = None;
+        let line = status_bar(&state, 200, false);
+        assert!(line.contains("wk 51%"), "got {line}");
+        assert!(!line.contains("5h"), "got {line}");
     }
 
     #[test]
@@ -674,7 +705,8 @@ mod tests {
     #[test]
     fn unknown_usage_or_unread_mail_renders_as_a_placeholder_not_a_zero() {
         let mut unknown = bar_state();
-        unknown.usage_percent = None;
+        unknown.usage_five_hour = None;
+        unknown.usage_seven_day = None;
         unknown.unread_mail = None;
         unknown.score = None;
         unknown.verdict = None;

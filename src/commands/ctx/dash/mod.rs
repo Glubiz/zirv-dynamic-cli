@@ -773,7 +773,7 @@ fn assemble_header_facts(
     mail: Option<(usize, usize)>,
     memory_count: usize,
     sessions: usize,
-    usage: Vec<(&'static str, Option<f64>, bool)>,
+    usage: Vec<ui::HarnessUsage>,
 ) -> ui::HeaderFacts {
     let (mail_broadcast, mail_direct) = mail.unwrap_or((0, 0));
     ui::HeaderFacts {
@@ -842,15 +842,17 @@ struct DiskFacts {
     mail: Option<(usize, usize)>,
     memory_count: usize,
     /// Per-harness usage snapshot for the header row, one entry per enabled
-    /// harness (`cfg.agents`) in registry order: `(harness name, percent,
-    /// credits-mode)`. Filled from whatever `window::load_for` already has on
-    /// disk -- a file read only, never a rollout scan or a poll. Those live in
-    /// the sessions that actually gate on pacing (Tasks 4-6's `PaceGate`
-    /// call sites) and, for a wrapped codex session with no statusline tee,
-    /// in wrap's own throttled passive scan (`wrap::redraw_bar_if_due`); this
-    /// dashboard's event loop must never do either itself, or a redraw could
-    /// stall on a stale rollout file or the network.
-    usage: Vec<(&'static str, Option<f64>, bool)>,
+    /// harness (`cfg.agents`) in registry order. Filled from whatever
+    /// `window::load_for` already has on disk -- a file read only, never a
+    /// rollout scan or a poll -- and then run through `window::available` so
+    /// a reading whose window has provably reset never renders as a live
+    /// percentage. Those scans/polls live in the sessions that actually gate
+    /// on pacing (Tasks 4-6's `PaceGate` call sites) and, for a wrapped codex
+    /// session with no statusline tee, in wrap's own throttled passive scan
+    /// (`wrap::redraw_bar_if_due`); this dashboard's event loop must never do
+    /// either itself, or a redraw could stall on a stale rollout file or the
+    /// network.
+    usage: Vec<ui::HarnessUsage>,
 }
 
 /// Who the dashboard is, for the reads that are scoped to it: the repo it
@@ -918,17 +920,24 @@ impl FactsCache {
         // Task 7: one usage entry per enabled harness, read straight off
         // disk. `window::load_for` is a file read, never a scan/poll -- see
         // `DiskFacts::usage`'s own doc comment for why this loop must stay
-        // that way.
+        // that way. `window::available` is a pure in-memory filter over what
+        // was just read, so it costs nothing extra here.
+        let now_secs = super::state::now_secs();
         self.disk.usage = adapters::ADAPTERS
             .iter()
             .filter(|(name, _)| cfg.agents.is_enabled(name))
             .map(|(name, _)| {
                 let provider = adapters::provider_for_agent_name(Some(name));
-                let percent = window::load_for(state, provider)
-                    .as_ref()
-                    .and_then(window::max_used_percentage);
+                let windows = window::load_for(state, provider)
+                    .map(|w| window::available(&w, now_secs))
+                    .unwrap_or_default();
                 let credits = cfg.pace.use_credits.for_provider(provider);
-                (*name, percent, credits)
+                ui::HarnessUsage {
+                    name,
+                    five_hour: windows.five_hour.map(|w| w.used_percentage),
+                    seven_day: windows.seven_day.map(|w| w.used_percentage),
+                    credits,
+                }
             })
             .collect();
 
@@ -5209,7 +5218,7 @@ mod tests {
                 five_hour: Some(super::super::window::Window {
                     used_percentage: 55.0,
                     resets_at: 0,
-                    observed_at: 1,
+                    observed_at: super::super::state::now_secs(),
                 }),
                 seven_day: None,
             },
@@ -5223,21 +5232,63 @@ mod tests {
             .disk
             .usage
             .iter()
-            .find(|(name, _, _)| *name == "claude")
+            .find(|u| u.name == "claude")
             .expect("claude is enabled by default");
-        assert_eq!(claude.1, Some(55.0));
-        assert!(!claude.2, "use_credits is off by default");
+        assert_eq!(claude.five_hour, Some(55.0));
+        assert_eq!(claude.seven_day, None);
+        assert!(!claude.credits, "use_credits is off by default");
 
         let codex = cache
             .disk
             .usage
             .iter()
-            .find(|(name, _, _)| *name == "codex")
+            .find(|u| u.name == "codex")
             .expect("codex is enabled by default");
         assert_eq!(
-            codex.1, None,
+            codex.five_hour, None,
             "nothing was ever stored for codex's own provider"
         );
+    }
+
+    /// The same rule wrap's status bar now applies: a reading whose window
+    /// has provably reset must not render as a live percentage just because
+    /// it is the newest thing `window::load_for` finds on disk.
+    #[test]
+    fn refresh_if_due_filters_out_an_expired_window_before_it_reaches_the_header() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let now = Instant::now();
+
+        super::super::window::store_for(
+            &state,
+            "anthropic",
+            &super::super::window::UsageWindows {
+                five_hour: Some(super::super::window::Window {
+                    used_percentage: 14.0,
+                    resets_at: 1, // long past any real wall clock
+                    observed_at: 1,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store an expired reading");
+
+        let mut cache = FactsCache::new(now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+
+        let claude = cache
+            .disk
+            .usage
+            .iter()
+            .find(|u| u.name == "claude")
+            .expect("claude is enabled by default");
+        assert_eq!(
+            claude.five_hour, None,
+            "an expired window must not render as a current percent"
+        );
+        assert_eq!(claude.seven_day, None);
     }
 
     /// The harness segment names the pane the score beside it belongs to,
