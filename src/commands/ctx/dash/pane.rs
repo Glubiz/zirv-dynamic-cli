@@ -1244,25 +1244,26 @@ impl Pane {
     /// acted on. A failed write leaves the flag alone: nothing was typed, so
     /// nothing is pending.
     ///
-    /// H1 (review): a successful write also stamps `last_local_input_at`, on
-    /// the same successful-write-only terms as `injected_awaiting_turn`
-    /// right above. A signal-less pane's quiescence check folds this in
-    /// ([`signal_less_quiescent`]): without it, this injection itself did not
-    /// move `last_output_at` (the child has not answered yet), so the very
-    /// next `drain()` tick -- tens of milliseconds later -- still read the
-    /// pane as quiet and cleared `injected_awaiting_turn` right back to
-    /// false, letting a second injector (the unthrottled nudge drain
-    /// following the mail sweep in the same tick) land on top of this one.
-    /// Stamping here gives the child a full `idle_quiet` window to actually
-    /// start responding before anything else may be typed at it.
+    /// H1 (review): the injection also stamps `last_local_input_at`, and it
+    /// stamps *before* the write, on the same "bytes may already have
+    /// reached the cursor" rationale as `write_operator_input`: `write_all`/
+    /// `flush` can fail after delivering part of the line, and an unstamped
+    /// early return would leave a signal-less pane reading as quiet again on
+    /// the very next tick, letting a retry (or the unthrottled nudge drain
+    /// following the mail sweep in the same tick) type on top of the partial
+    /// delivery. A wasted quiet window on a fully-failed write is the safe
+    /// direction; a double-typed line is not. `injected_awaiting_turn` stays
+    /// successful-write-only: a failed write has no turn to await, and for a
+    /// signal-less pane the freshly stamped clock alone holds the pane
+    /// non-idle for a full `idle_quiet` window either way.
     pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
         // One write, not two (line then `\r`): a single `write_all` cannot
         // leave a half-typed line behind if the second write fails. The
         // control-character scrub is applied inside `injection_bytes` for
         // every caller, mail sweep and operator nudge alike (R3).
+        self.last_local_input_at = Some(Instant::now());
         self.write_input(&injection_bytes(label, body))?;
         self.injected_awaiting_turn = true;
-        self.last_local_input_at = Some(Instant::now());
         Ok(())
     }
 
