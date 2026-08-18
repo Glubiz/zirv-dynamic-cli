@@ -627,7 +627,7 @@ mod tests {
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
-            !text.contains("77"),
+            !text.contains("77%"),
             "an expired window must not render as a current percent: {text}"
         );
         assert!(

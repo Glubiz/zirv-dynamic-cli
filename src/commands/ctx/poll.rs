@@ -246,7 +246,8 @@ pub fn maybe_poll(
     }
     let existing = super::window::load_for(state, provider);
     if let Some(w) = &existing
-        && now.saturating_sub(super::window::newest_observation(w)) <= cfg.collector_max_age_secs
+        && now.saturating_sub(super::window::freshest_available_observation(w, now))
+            <= cfg.collector_max_age_secs
     {
         return None; // passive data is fresh enough; the poll exists only as fallback
     }
@@ -404,6 +405,45 @@ mod tests {
             *failing.calls.borrow(),
             1,
             "a failed attempt still floors the next poll"
+        );
+    }
+
+    /// Fix 3: a stored reading whose window has already rolled over
+    /// (`resets_at` in the past) must not count as "fresh" just because it
+    /// was `observed_at` recently -- `available` would blank it from the
+    /// display, so the gate must judge freshness the same way the display
+    /// does and let the poll proceed, instead of refusing for up to
+    /// `collector_max_age_secs` while the operator sees nothing.
+    #[test]
+    fn maybe_poll_proceeds_when_the_recent_reading_has_already_rolled_over() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = PaceConfig::default();
+        let provider = "anthropic";
+        let now = 1_000_000u64;
+
+        // observed_at is 10 seconds old (well within collector_max_age_secs),
+        // but resets_at is already in the past: `available` drops this
+        // window, so the gate must treat it as stale too.
+        let rolled_over = windows_at(10.0, now - 1, now - 10);
+        window::store_for(&state, provider, &rolled_over).expect("store rolled-over reading");
+
+        let poller = CountingPoller {
+            calls: RefCell::new(0),
+            reading: Some(PollReading {
+                windows: UsageWindows::default(),
+                vendor_credits_enabled: None,
+            }),
+        };
+        let r = maybe_poll(&state, &cfg, now, provider, &poller);
+        assert!(
+            r.is_some(),
+            "a rolled-over-but-recently-observed reading must trigger a poll, not be treated as fresh"
+        );
+        assert_eq!(
+            *poller.calls.borrow(),
+            1,
+            "the poller must actually run rather than being gated out"
         );
     }
 

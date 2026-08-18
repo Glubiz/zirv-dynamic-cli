@@ -148,23 +148,30 @@ pub fn age_secs(window: &Window, now: u64) -> u64 {
 }
 
 /// Keeps each window slot only if it is still *available*, dropping the rest.
-/// A window whose `resets_at` has certainly passed says nothing about current
-/// usage -- the vendor has already rolled it over -- so it is dropped. A
-/// window still inside its own live span (`resets_at` unknown, i.e. `0`, but
-/// observed no longer ago than the slot's own length) is kept: within a live
-/// window a vendor-reported percent is still an honest lower bound on current
-/// usage, even without a reset timestamp to confirm it. Each slot is judged
-/// independently, so a stale five_hour reading never drops a still-live
-/// seven_day one, or vice versa. Pure: `now` is always the caller's own unix
-/// second, never read internally.
+/// Two independent rules both have to hold:
+///
+/// 1. A window whose `resets_at` has certainly passed says nothing about
+///    current usage -- the vendor has already rolled it over -- so it is
+///    dropped. The boundary is `resets_at > now`, i.e. `resets_at == now` is
+///    already treated as rolled over. This deliberately matches pace.rs's own
+///    `reset_passed` convention (`resets_at != 0 && resets_at <= now`) so the
+///    two never disagree about whether the reset second itself has passed.
+///    A `resets_at` of `0` means the field was never reported, so this rule
+///    does not apply to it.
+/// 2. A reading inside a live window can be at most one span old, so age is
+///    always checked too, regardless of `resets_at`: a live-looking but
+///    implausibly old observation (e.g. a bogus far-future `resets_at`
+///    persisted once and never refreshed) must not stay displayable forever.
+///
+/// So a window is kept only when it has not certainly reset *and* it is no
+/// older than its own span. Each slot is judged independently, so a stale
+/// five_hour reading never drops a still-live seven_day one, or vice versa.
+/// Pure: `now` is always the caller's own unix second, never read internally.
 pub fn available(windows: &UsageWindows, now: u64) -> UsageWindows {
     fn keep(window: Option<Window>, span: u64, now: u64) -> Option<Window> {
         let w = window?;
-        let is_available = if w.resets_at != 0 {
-            w.resets_at >= now
-        } else {
-            age_secs(&w, now) <= span
-        };
+        let not_reset = w.resets_at == 0 || w.resets_at > now;
+        let is_available = not_reset && age_secs(&w, now) <= span;
         is_available.then_some(w)
     }
     UsageWindows {
@@ -588,6 +595,20 @@ pub(crate) fn newest_observation(windows: &UsageWindows) -> u64 {
         .unwrap_or(0)
 }
 
+/// The freshness a refresh gate should actually trust: the newest observation
+/// among only the slots `available` still considers live. A window whose
+/// `resets_at` has rolled over (or that has aged past its own span) is
+/// dropped by `available` before the display ever sees it, so a gate that
+/// judged freshness off the raw `newest_observation` instead would keep
+/// refusing to refresh for up to the staleness budget even though the
+/// operator is already looking at a blank reading. Returns `0` -- "stale" --
+/// when nothing survives the filter, same as `newest_observation` on an empty
+/// set.
+#[allow(dead_code)]
+pub(crate) fn freshest_available_observation(windows: &UsageWindows, now: u64) -> u64 {
+    newest_observation(&available(windows, now))
+}
+
 /// Opportunistic passive refresh for codex: scan its session rollouts only
 /// when the stored reading is stale. Best-effort by design — every failure
 /// leaves the stored state exactly as it was.
@@ -600,7 +621,7 @@ pub fn refresh_codex_usage(
 ) {
     let existing = load_for(state, CODEX_USAGE_PROVIDER);
     if let Some(w) = &existing
-        && now.saturating_sub(newest_observation(w)) <= max_age_secs
+        && now.saturating_sub(freshest_available_observation(w, now)) <= max_age_secs
     {
         return;
     }
@@ -770,6 +791,59 @@ mod tests {
         assert_eq!(
             out.seven_day, windows.seven_day,
             "a stale five_hour slot must not drop a still-live seven_day slot"
+        );
+    }
+
+    #[test]
+    fn available_drops_a_window_exactly_at_its_reset_second() {
+        // Matches pace.rs's own `reset_passed` convention: `resets_at == now`
+        // is already rolled over, not the last still-live second.
+        let windows = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 14.0,
+                resets_at: 1000,
+                observed_at: 999,
+            }),
+            seven_day: None,
+        };
+        let out = available(&windows, 1000);
+        assert_eq!(
+            out.five_hour, None,
+            "resets_at == now must read as already rolled over"
+        );
+    }
+
+    #[test]
+    fn available_keeps_a_window_one_second_before_its_reset() {
+        let windows = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 14.0,
+                resets_at: 1000,
+                observed_at: 999,
+            }),
+            seven_day: None,
+        };
+        let out = available(&windows, 999);
+        assert_eq!(out.five_hour, windows.five_hour);
+    }
+
+    #[test]
+    fn available_drops_a_far_future_resets_at_once_the_observation_outlives_its_span() {
+        // A bogus far-future `resets_at`, persisted once and never refreshed,
+        // must not keep an arbitrarily old reading displayable forever -- a
+        // reading inside a live window can be at most one span old.
+        let windows = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 14.0,
+                resets_at: 4_102_444_800, // year 2100, i.e. "certainly not reset"
+                observed_at: 0,
+            }),
+            seven_day: None,
+        };
+        let out = available(&windows, FIVE_HOUR_SECS + 1);
+        assert_eq!(
+            out.five_hour, None,
+            "a far-future resets_at must not make an ancient observation immortal"
         );
     }
 
@@ -1489,11 +1563,16 @@ mod tests {
             "scan should find 12%"
         );
 
-        // Pre-store a fresh openai reading (observed_at close to now)
+        // Pre-store a fresh openai reading (observed_at close to now). Its
+        // `resets_at` must sit safely in the future: the refresh gate now
+        // filters through `window::available` before judging freshness (Fix
+        // 3), so a `resets_at` in the past -- as this fixture used to have --
+        // would read as already rolled over and force a rescan regardless of
+        // how recent `observed_at` is, defeating the point of this case.
         let fresh = UsageWindows {
             five_hour: Some(Window {
                 used_percentage: 50.0,
-                resets_at: 1000,
+                resets_at: now + 100_000,
                 observed_at: now - 100, // well within max_age
             }),
             seven_day: None,
@@ -1531,6 +1610,60 @@ mod tests {
             "a stale stored reading is replaced by the fresher scan"
         );
         assert_eq!(five.resets_at, 1772135737);
+    }
+
+    /// Fix 3: the same rule `maybe_poll`'s gate now applies. A stored reading
+    /// whose `resets_at` has already passed must not count as fresh just
+    /// because `observed_at` is recent -- `available` blanks it from the
+    /// display, so the passive-refresh gate has to agree, or the operator
+    /// sees a blank reading for up to `max_age_secs` at every reset
+    /// boundary even though a rescan would find something.
+    ///
+    /// To prove the rescan actually ran (not just that it was harmless), the
+    /// stored reading's `observed_at` is set slightly *older* than the
+    /// scanned rollout line's own timestamp: `merge` always keeps whichever
+    /// side has the newer `observed_at`, so if the gate wrongly short-circuited
+    /// on staleness the stored 20% would remain; only an actual rescan lets
+    /// the scanned 12% win the merge and reach storage.
+    #[test]
+    fn refresh_proceeds_when_the_recently_observed_reading_has_already_rolled_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        let sessions_dir = tmp.path().join("codex_sessions");
+        let day = sessions_dir.join("2026").join("02").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let test_json = r#"{"timestamp":"2026-02-26T18:52:21Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.0,"window_minutes":300,"resets_at":1772135737}}}}"#;
+        std::fs::write(day.join("rollout.jsonl"), format!("{}\n", test_json)).unwrap();
+        let line_ts = parse_rfc3339_utc("2026-02-26T18:52:21Z").expect("test timestamp parses");
+        // `now` is only 15s after the scanned line's own timestamp, so both
+        // the scanned reading and the stored one below are "recently
+        // observed" in real terms.
+        let now = line_ts + 15;
+        let max_age = 900u64;
+
+        // Stored reading: observed 20 seconds before `now` (well inside
+        // max_age, and older than the scanned line so the merge only prefers
+        // it if the scan never actually ran), but its own window rolled over
+        // 1 second before `now` -- `available` must drop it, so the gate
+        // must not treat it as fresh.
+        let rolled_over = UsageWindows {
+            five_hour: Some(Window {
+                used_percentage: 20.0,
+                resets_at: now - 1,
+                observed_at: now - 20,
+            }),
+            seven_day: None,
+        };
+        store_for(&state, CODEX_USAGE_PROVIDER, &rolled_over).expect("store rolled-over reading");
+
+        refresh_codex_usage(&state, Some(sessions_dir.as_path()), now, max_age);
+        let after = load_for(&state, CODEX_USAGE_PROVIDER).expect("stored after refresh");
+        let five = after.five_hour.expect("five_hour after refresh");
+        assert_eq!(
+            five.used_percentage, 12.0,
+            "a rolled-over-but-recently-observed reading must not gate out the rescan"
+        );
     }
 
     #[test]
