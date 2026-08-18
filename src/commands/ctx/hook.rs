@@ -335,6 +335,13 @@ pub struct PreToolPayload {
 pub struct PreToolInput {
     pub subagent_type: String,
     pub model: String,
+    /// The subagent's own task text. Every real `Agent`/`Task` dispatch
+    /// carries a non-empty one; `pretool_decision` reads its absence as
+    /// schema drift -- a missing `tool_input`, an empty `{}`, or one that
+    /// simply does not name a `prompt` -- rather than an actual dispatch,
+    /// and fails open on it instead of denying on the zero values `#[serde(
+    /// default)]` invented for fields the payload never carried at all.
+    pub prompt: String,
 }
 
 impl PreToolPayload {
@@ -365,16 +372,26 @@ fn pretool_deny_reason(seat: &str) -> String {
 ///
 /// `seat` is `SEAT_MODEL_ENV`'s value, absent for any session zirv did not
 /// launch as an expensive orchestrator seat. Every gate below is a reason to
-/// allow, so an unrecognised tool, an unset seat, a cheap seat or a payload
-/// this function does not understand all fall through to allow. That is
-/// deliberate: this hook runs in front of every tool call in the session, and
-/// the cost of a wrong deny is far higher than the cost of a missed one.
+/// allow, so an unrecognised tool, an unset seat, a cheap seat, a payload
+/// with no `prompt` (see `PreToolInput::prompt`'s own doc comment -- that is
+/// schema drift, not a dispatch), or a payload this function does not
+/// understand at all fall through to allow. That is deliberate: this hook
+/// runs in front of every tool call in the session, and the cost of a wrong
+/// deny is far higher than the cost of a missed one.
 pub fn pretool_decision(seat: Option<&str>, payload: &PreToolPayload) -> Option<String> {
     let seat = seat?;
     if !names_expensive_tier(seat) {
         return None;
     }
     if !SUBAGENT_TOOLS.contains(&payload.tool_name.as_str()) {
+        return None;
+    }
+    // A payload with no `tool_input` at all, an empty `{}`, or one that
+    // simply omits `prompt` is schema drift, not a subagent dispatch: every
+    // genuine `Agent`/`Task` call carries a non-empty `prompt` (the
+    // subagent's own task text), so this guard must not deny on `#[serde(
+    // default)]`'s own zero values for a call it never actually recognised.
+    if payload.tool_input.prompt.trim().is_empty() {
         return None;
     }
 
@@ -1329,8 +1346,12 @@ mod tests {
 
     #[test]
     fn a_fork_is_denied_because_it_always_inherits_the_seat_model() {
-        let reason = decide(SEAT, "Agent", serde_json::json!({"subagent_type": "fork"}))
-            .expect("a fork from an expensive seat must be blocked");
+        let reason = decide(
+            SEAT,
+            "Agent",
+            serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"}),
+        )
+        .expect("a fork from an expensive seat must be blocked");
         assert!(reason.contains("fable"), "name the seat: {reason}");
         assert!(reason.contains("Fork"), "say forks are out: {reason}");
         assert!(!reason.contains('\u{2014}'), "no em dashes in user copy");
@@ -1344,7 +1365,7 @@ mod tests {
             decide(
                 SEAT,
                 "Agent",
-                serde_json::json!({"subagent_type": "fork", "model": "haiku"})
+                serde_json::json!({"subagent_type": "fork", "model": "haiku", "prompt": "do the thing"})
             )
             .is_some()
         );
@@ -1356,7 +1377,7 @@ mod tests {
             decide(
                 SEAT,
                 "Agent",
-                serde_json::json!({"subagent_type": "general-purpose", "model": "fable"})
+                serde_json::json!({"subagent_type": "general-purpose", "model": "fable", "prompt": "do the thing"})
             )
             .is_some(),
             "re-asking for the seat tier by name is the exact spend being guarded"
@@ -1382,20 +1403,28 @@ mod tests {
     fn an_omitted_model_on_a_generic_subagent_type_is_denied() {
         for kind in ["fork", "claude", "general-purpose", "Explore", "Plan"] {
             assert!(
-                decide(SEAT, "Agent", serde_json::json!({"subagent_type": kind})).is_some(),
+                decide(
+                    SEAT,
+                    "Agent",
+                    serde_json::json!({"subagent_type": kind, "prompt": "do the thing"})
+                )
+                .is_some(),
                 "{kind} pins no model of its own, so it inherits the seat"
             );
         }
     }
 
+    /// A real dispatch (a non-empty `prompt`) with both `model` and
+    /// `subagent_type` omitted/blank is denied exactly like an explicit
+    /// generic type -- empty is the same as absent, once the payload is
+    /// recognised as a real dispatch at all.
     #[test]
     fn an_omitted_model_and_an_omitted_subagent_type_is_denied() {
-        assert!(decide(SEAT, "Agent", serde_json::json!({})).is_some());
         assert!(
             decide(
                 SEAT,
                 "Agent",
-                serde_json::json!({"subagent_type": "", "model": ""})
+                serde_json::json!({"subagent_type": "", "model": "", "prompt": "do the thing"})
             )
             .is_some(),
             "empty is the same as absent"
@@ -1436,7 +1465,12 @@ mod tests {
     fn both_spellings_of_the_subagent_tool_are_covered() {
         for tool in ["Agent", "Task"] {
             assert!(
-                decide(SEAT, tool, serde_json::json!({"subagent_type": "fork"})).is_some(),
+                decide(
+                    SEAT,
+                    tool,
+                    serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"})
+                )
+                .is_some(),
                 "{tool} dispatches subagents"
             );
         }
@@ -1449,7 +1483,7 @@ mod tests {
                 decide(
                     Some(seat),
                     "Agent",
-                    serde_json::json!({"subagent_type": "fork"})
+                    serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"})
                 )
                 .is_some(),
                 "{seat} is an expensive seat"
@@ -1460,7 +1494,7 @@ mod tests {
                 decide(
                     SEAT,
                     "Agent",
-                    serde_json::json!({"subagent_type": "general-purpose", "model": model})
+                    serde_json::json!({"subagent_type": "general-purpose", "model": model, "prompt": "do the thing"})
                 )
                 .is_some(),
                 "{model} names the seat tier"
@@ -1469,6 +1503,57 @@ mod tests {
     }
 
     // -- fail open ---------------------------------------------------------
+
+    /// A payload naming the subagent tool but carrying no `tool_input` field
+    /// at all is schema drift, not a dispatch -- `#[serde(default)]` still
+    /// fills in `PreToolInput::default()`, and with no `prompt` in it the
+    /// guard must not deny on those defaulted zero values.
+    #[test]
+    fn agent_tool_with_no_tool_input_field_at_all_is_allowed() {
+        let payload = PreToolPayload::parse(r#"{"tool_name":"Agent"}"#)
+            .expect("tool_input is optional at the top level");
+        assert_eq!(pretool_decision(SEAT, &payload), None);
+    }
+
+    /// An explicit empty `tool_input: {}` is the same case as a missing one:
+    /// no `prompt`, so nothing recognisable as a real dispatch.
+    #[test]
+    fn agent_tool_with_an_empty_tool_input_object_is_allowed() {
+        assert_eq!(decide(SEAT, "Agent", serde_json::json!({})), None);
+    }
+
+    /// `tool_input` present, with fields that would have denied under the
+    /// old rule (a fork naming the seat tier itself), but no `prompt` at
+    /// all -- still not a recognisable dispatch, so this must fail open.
+    /// This is the exact defect the `prompt` gate fixes: before it, this
+    /// payload was denied on defaulted zero values alone.
+    #[test]
+    fn agent_tool_input_lacking_a_prompt_field_is_allowed() {
+        assert_eq!(
+            decide(
+                SEAT,
+                "Agent",
+                serde_json::json!({"subagent_type": "fork", "model": "fable"})
+            ),
+            None,
+            "no prompt means this payload is not recognised as a real dispatch"
+        );
+    }
+
+    /// Regression: once a payload actually carries a `prompt`, the existing
+    /// deny rule for an omitted model on a generic subagent type still
+    /// applies exactly as it did before the `prompt` gate.
+    #[test]
+    fn a_prompt_carrying_dispatch_with_omitted_model_on_a_generic_type_is_still_denied() {
+        assert!(
+            decide(
+                SEAT,
+                "Agent",
+                serde_json::json!({"subagent_type": "general-purpose", "prompt": "do the thing"})
+            )
+            .is_some()
+        );
+    }
 
     #[test]
     fn with_no_seat_env_nothing_is_ever_denied() {
@@ -1533,7 +1618,10 @@ mod tests {
         let mut out = Vec::new();
         let code = run_pretool(
             &mut out,
-            &pretool_stdin("Agent", serde_json::json!({"subagent_type": "fork"})),
+            &pretool_stdin(
+                "Agent",
+                serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"}),
+            ),
             &|k| env.get(k).cloned(),
         )
         .expect("never errors");
@@ -1556,7 +1644,7 @@ mod tests {
             &mut out,
             &pretool_stdin(
                 "Agent",
-                serde_json::json!({"subagent_type": "general-purpose", "model": "sonnet"}),
+                serde_json::json!({"subagent_type": "general-purpose", "model": "sonnet", "prompt": "do the thing"}),
             ),
             &|k| env.get(k).cloned(),
         )
