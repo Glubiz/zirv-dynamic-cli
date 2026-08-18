@@ -43,9 +43,14 @@ pub fn short_id(session: &str) -> String {
 /// Every supervisor scrubs all three off a child command builder before
 /// setting whichever of them it actually owns, so "no socket of my own"
 /// degrades to *unsupervised*, never to *supervised by somebody else*.
-pub const SUPERVISION_ENV: [&str; 3] = [
+/// `SEAT_MODEL_ENV` rides along for the same reason: it names *this*
+/// session's seat, and a worker that inherits an orchestrator's copy would
+/// have its own subagent dispatches refused by a guard describing a seat it
+/// is not sitting in.
+pub const SUPERVISION_ENV: [&str; 4] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
+    super::adapters::SEAT_MODEL_ENV,
     super::wrap::TRANSCRIPT_ENV,
 ];
 

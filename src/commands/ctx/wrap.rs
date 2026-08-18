@@ -1122,6 +1122,12 @@ pub fn run_with(
         })
         .unwrap_or_default();
     turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+    // The seat this session sits in, for the `zirv ctx hook pretool` guard
+    // running inside it. Orchestrator-only and configured-model-only; see
+    // `adapters::seat_model_env`. Kept in `turn_env` for the same reason
+    // `AGENT_ENV` is: a relaunch reuses this exact vector, and the fresh
+    // session sits in the same seat.
+    turn_env.extend(adapters::seat_model_env(role, cfg.chat.model.as_deref()));
     // Scrubbed before any of it is applied -- see `apply_session_env`. When
     // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
     // scrub is the only thing standing between this child and the outer

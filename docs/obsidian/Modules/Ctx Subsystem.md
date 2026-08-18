@@ -28,7 +28,7 @@ last-verified: 2026-08-18
 - **`score`** — rot-score a transcript and print JSON (one-shot; see [[Rot Engine]])
 - **`handoff`** — distill a transcript into a stored handoff document
 - **`resume`** — start a clean interactive session with the latest handoff injected
-- **`hook`** — agent hook entrypoints (`Stop`, `Prompt`, `PreCompact`, `Notify`)
+- **`hook`** — agent hook entrypoints (`Stop`, `Prompt`, `PreCompact`, `Pretool`, `Notify`)
 - **`status`** — show supervised sessions, scores and handoffs
 - **`loop`** (renamed from the Rust keyword via `#[command(name = "loop")]`) — stateless loop runner, a fresh headless session per cycle
 - **`exec`** — supervise one headless run
@@ -142,7 +142,38 @@ These five are the "read a transcript, decide, maybe write state" verbs; the dee
 - **`score`** (`ScoreArgs { transcript, agent }`) parses a transcript with the selected `AgentAdapter` and prints its rot score as JSON. `score_transcript` is the one-shot path with no persisted state; `IncrementalScorer` (also in this file) is the checkpoint-folding path the Stop hook uses so a growing transcript costs only the bytes appended since the last pass, always falling back to a full reparse on any doubt (unreadable/corrupt checkpoint, rewritten file, or a rules/schema-version mismatch).
 - **`handoff`** (`HandoffArgs { transcript, agent, session_id, stdout, no_model }`) distills a transcript into a `Handoff` document, storing it under `<state>/handoffs/<repo_slug>/<timestamp>-<session>.md` via `store()`. It first tries a real model call (`run_model`/`distill`, bounded by `handoff.timeout_secs` because `wrap` calls this synchronously from its terminal-facing pump) and falls back to a mechanical `structural()` extraction — which never fails — if the distiller is unavailable or times out. `latest_for_repo` finds the newest stored handoff for `resume` to read back.
 - **`resume`** (`ResumeArgs { agent, print_prompt, extra, simple }`) looks up the latest handoff for the repo and launches a clean interactive agent session with a composed prompt (`resume_prompt`) injected, unless `--simple` skips zirv's own instructions (supervision, pacing, and hooks still apply either way).
-- **`hook`** (`HookArgs { event: HookEvent }`) is the multi-event agent hook entrypoint: `Stop` scores the turn and forwards or advises (deciding what to print, where `None` — the same as every failure path — means print nothing); `Prompt` (UserPromptSubmit) installs the reply-marker instruction, since it's the only hook that can add context to the model; `PreCompact` can't influence compaction at all (verified against Claude Code's hook reference) but still logs that one started, so decision-log scores don't step down with no visible cause; `Notify` is codex's equivalent of `Stop`, mapping its differently-named payload fields onto the same shape rather than aliasing them (an alias could silently parse a renamed field as an empty transcript path).
+- **`hook`** (`HookArgs { event: HookEvent }`) is the multi-event agent hook entrypoint: `Stop` scores the turn and forwards or advises (deciding what to print, where `None` — the same as every failure path — means print nothing); `Prompt` (UserPromptSubmit) installs the reply-marker instruction, since it's the only hook that can add context to the model; `PreCompact` can't influence compaction at all (verified against Claude Code's hook reference) but still logs that one started, so decision-log scores don't step down with no visible cause; `Pretool` (PreToolUse, CLI name `zirv ctx hook pretool`) hard-blocks a subagent dispatch that would silently inherit an expensive orchestrator seat model; `Notify` is codex's equivalent of `Stop`, mapping its differently-named payload fields onto the same shape rather than aliasing them (an alias could silently parse a renamed field as an empty transcript path).
+
+### The expensive-seat guard (`hook pretool`)
+
+Prompt-level guidance failed in practice — a `/code-review` fork fan-out inherited Fable and burned roughly half a five-hour usage window — so this is a deterministic gate rather than an instruction. `zirv` never writes `~/.claude/settings.json`; the operator wires the hook manually:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [{ "type": "command", "command": "zirv ctx hook pretool" }]
+      }
+    ]
+  }
+}
+```
+
+`ZIRV_CTX_SEAT_MODEL` (`adapters::SEAT_MODEL_ENV`) carries the seat into the session. It is exported only by the two **orchestrator** launch paths — `wrap::run_with` when `role == PromptRole::Orchestrator`, and the dashboard's first pane in `dash::run_dashboard` — both through the pure `adapters::seat_model_env(role, cfg.chat.model)`, and only when `chat.model` is configured and non-blank. It is listed in `sessions::SUPERVISION_ENV`, so `exec`/`loop`/worker panes scrub it rather than inherit it: a seat belongs to the session that sits in it.
+
+`hook::pretool_decision` is pure and denies only when **all** of these hold: the env var is present, its value contains `fable`/`mythos` (case-insensitive substring, so `us.anthropic.mythos-...` and `fable[1m]` both land), `tool_name` is `Agent` or `Task`, and the payload parsed. Then:
+
+| Dispatch | Verdict |
+|----------|---------|
+| `subagent_type == "fork"` | deny (a fork always inherits the seat and ignores `model`) |
+| `model` names the seat tier | deny |
+| `model` given and cheaper | allow |
+| no `model`, and `subagent_type` absent or in {`fork`, `claude`, `general-purpose`, `Explore`, `Plan`} | deny (nothing pins a model, so the seat is inherited) |
+| no `model`, named custom `subagent_type` | allow (a `.claude/agents/<name>.md` definition pins its own model) |
+
+Everything else fails **open**: no env var, unparseable stdin, an unmodelled `tool_input`, a cheap seat, an unknown tool. The hook prints the documented `hookSpecificOutput` deny envelope on stdout and **always exits 0** — exit 2 blocks on stderr text and cannot be overridden by JSON, and this hook runs in front of every tool call in the session, so a wrong deny costs far more than a missed one.
 - **`status`** (`StatusArgs { decisions }`) prints the state dir root, an `agents:` block, a `chat:` line naming the adapter `zirv ctx chat` would launch and the rule that picked it (or, degrading rather than failing, why nothing qualifies — reusing `adapters::resolve_default`'s own aggregated per-adapter reasons), a `mail: N unread` line for the current repo (`mail::list`, `(unreadable)` on error), a `sessions:` block from the session registry (one line per record — `<short> <agent> <verb> pid <pid> <age> live|stale <repo_slug>` — plus any `s/*.sock` with no matching record, labeled `(no record)`, so an older zirv binary that predates the registry still shows up), a `memory:` line summarizing the bank (`memory: N entries, oldest <age>, M stale >30d`, or `memory: empty`, reusing `optimize::memory_bank_summary`), and the tail of the decision log (`decisions` controls how many lines). Every block degrades independently rather than failing the whole command.
 
 ## Chat, Agent and Mail

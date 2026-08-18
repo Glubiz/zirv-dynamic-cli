@@ -17,6 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::CtxResult;
+use super::adapters::{self, AgentAdapter};
 use super::announce::{Announcer, Event};
 use super::chat::quiet_env;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
@@ -62,6 +63,50 @@ pub fn validate_flags(flags: &[String]) -> CtxResult<()> {
         .into());
     }
     Ok(())
+}
+
+/// Whether `flags` already pins an explicit model choice -- a bare
+/// `--model`, or the `--model=value` joined form. The operator's own choice
+/// always wins, so `worker_launch_flags` below never overrides it.
+fn flags_pin_model(flags: &[String]) -> bool {
+    flags
+        .iter()
+        .any(|f| f == "--model" || f.starts_with("--model="))
+}
+
+/// The effective trailing flags a delegated headless spawn launches with.
+///
+/// Unchanged when the operator's own `flags` already pin `--model`
+/// themselves -- the operator's own choice always wins. Otherwise
+/// `worker.<name>`'s configured model, or `adapter`'s own hard default
+/// (`AgentAdapter::default_worker_model`), is prepended ahead of `flags` via
+/// `adapters::worker_model_args`, so a delegated headless worker stops
+/// silently inheriting the operator's own (often far pricier) interactive
+/// default model.
+///
+/// Mirrors `chat.rs`'s own `extra_with_model`: the model flags are prepended
+/// as trailing extras rather than spliced into an already-built argv, which
+/// is what keeps them from ever landing inside a launcher prefix.
+///
+/// This resolution runs only on the delegation spawn path -- `zirv ctx
+/// agent`'s own headless fallback (this function's caller, `run_with`,
+/// below) and the dashboard's own spawn-request pane variant
+/// (`dash::mod::fulfill_spawn_request`). It deliberately never touches `zirv
+/// ctx exec`/`zirv ctx loop`, whose trailing command the operator typed
+/// verbatim, nor `chat`/`wrap`, whose model comes from the orchestrator seat
+/// (`chat.model`) instead.
+fn worker_launch_flags(
+    cfg: &CtxConfig,
+    name: &str,
+    adapter: &dyn AgentAdapter,
+    flags: &[String],
+) -> Vec<String> {
+    if flags_pin_model(flags) {
+        return flags.to_vec();
+    }
+    let mut out = adapters::worker_model_args(cfg, name, adapter);
+    out.extend_from_slice(flags);
+    out
 }
 
 /// `"-"` reads the whole of `stdin` (trimmed); anything else is the prompt
@@ -318,6 +363,14 @@ pub fn run_with<W: Write>(
     );
     let env = quiet_env(env, args.quiet);
 
+    // Resolved here, ahead of `exec::run_with`'s own (identical) selection
+    // further down, purely to compute the default worker model this spawn
+    // launches with -- see `worker_launch_flags`. `&[]` for the command: it
+    // only matters to `select` when `name` is `None`, and this call always
+    // passes the delegation target explicitly.
+    let adapter = adapters::select(Some(&args.name), &[], &cfg)?;
+    let command = worker_launch_flags(&cfg, &args.name, adapter.as_ref(), &args.flags);
+
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
         session_id: Some(SessionId::new_v4().to_string()),
@@ -330,7 +383,7 @@ pub fn run_with<W: Write>(
         prompt: Some(prompt),
         max_restarts: args.max_restarts,
         timeout_secs: args.timeout_secs,
-        command: args.flags.clone(),
+        command,
         simple: false,
     };
 
@@ -359,6 +412,70 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    // `worker_launch_flags`/`flags_pin_model`: pure, so these are testable
+    // against a plain adapter without spawning anything.
+
+    #[test]
+    fn flag_passthrough_wins_over_the_configured_or_default_worker_model() {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let flags = vec!["--model".to_string(), "opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &adapter, &flags),
+            flags,
+            "the operator's own --model must reach argv unchanged"
+        );
+
+        let joined = vec!["--model=opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &adapter, &joined),
+            joined,
+            "the --model=value joined form must also be recognised as already pinned"
+        );
+    }
+
+    #[test]
+    fn a_configured_worker_model_is_prepended_ahead_of_the_operators_own_flags() {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: Some("opus".to_string()),
+                codex: None,
+            },
+            ..CtxConfig::default()
+        };
+        let flags = vec!["--allowedTools".to_string(), "Bash".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &adapter, &flags),
+            vec![
+                "--model".to_string(),
+                "opus".to_string(),
+                "--allowedTools".to_string(),
+                "Bash".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_gets_the_sonnet_default_when_nothing_is_configured_or_passed() {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &adapter, &[]),
+            vec!["--model".to_string(), "sonnet".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_gets_no_model_flag_when_nothing_is_configured_or_passed() {
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let cfg = CtxConfig::default();
+        assert!(
+            worker_launch_flags(&cfg, "codex", &adapter, &[]).is_empty(),
+            "codex has no adapter-owned default, so its own config default applies untouched"
+        );
+    }
 
     fn fixture(name: &str) -> PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

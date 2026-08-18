@@ -2048,7 +2048,22 @@ fn fulfill_spawn_request(
     let effective_prompt =
         worker_task_prompt(req, adapter.as_ref(), &mail_messages, cfg, fallback_is_safe);
 
-    let extra = pane_launch_extra(adapter.as_ref(), prompt_args, &session_id);
+    // A spawn request never carries the operator's own trailing flags (a
+    // request with any set falls back to the headless path in `agent.rs`
+    // before it ever reaches here -- see `try_join_dashboard`'s own
+    // options-a-pane-cannot-honour check), so there is no "operator already
+    // pinned --model" case to detect on this path, unlike `agent.rs`'s own
+    // `worker_launch_flags`: the resolved worker model (config or the
+    // adapter's own hard default) always applies. Prepended ahead of the
+    // prompt/session-pin args -- appended as trailing extras, not spliced
+    // into an already-built argv, the same discipline `chat.rs`'s own
+    // `extra_with_model` follows for the orchestrator pane.
+    let mut extra = adapters::worker_model_args(cfg, &req.agent, adapter.as_ref());
+    extra.extend(pane_launch_extra(
+        adapter.as_ref(),
+        prompt_args,
+        &session_id,
+    ));
     let argv = flatten_command(adapter.interactive_cmd(Some(&effective_prompt), &extra));
     let spec = PaneSpec {
         agent_name: req.agent.clone(),
@@ -3149,6 +3164,17 @@ pub fn run_dashboard(
     if let Some(e) = turn_env_err {
         push_error(&mut errors, e);
     }
+    // The seat this pane sits in, for the `zirv ctx hook pretool` guard
+    // running inside it. This `turn_env` belongs to the first pane and only
+    // the first pane -- `fulfill_spawn_request` and the restore path each
+    // build their own from scratch -- so a worker pane never picks it up,
+    // and `Pane::spawn`'s own `scrub_supervision_env` clears any copy the
+    // dashboard process itself might have inherited. Mirrors `wrap.rs`'s own
+    // orchestrator arm; see `adapters::seat_model_env`.
+    turn_env.extend(super::adapters::seat_model_env(
+        first.role,
+        cfg.chat.model.as_deref(),
+    ));
 
     // Task 10: the spawn-request channel. `dashboard_short` is derivable
     // before any pane has actually spawned -- `Record::new`'s own `short`

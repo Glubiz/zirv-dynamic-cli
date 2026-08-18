@@ -28,6 +28,41 @@ pub const SESSION_ENV: &str = "ZIRV_CTX_SESSION";
 /// calling session without requiring an explicit `--to`/`--agent` flag.
 pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 
+/// Tells a spawned **orchestrator** session which model its own seat runs on,
+/// so the `zirv ctx hook pretool` guard inside it can refuse a subagent
+/// dispatch that would silently inherit that seat (see `hook::pretool_
+/// decision`). Prompt-level guidance was tried first and failed: a fork
+/// fan-out inherited the seat model and spent roughly half a five-hour usage
+/// window in one run, so the gate is deterministic rather than advisory.
+///
+/// Set only by the two orchestrator launch paths (`wrap::run_with` for an
+/// `Orchestrator` role, and the dashboard's first pane), never by
+/// `exec`/`loop`/worker panes -- and listed in `sessions::SUPERVISION_ENV` so
+/// a worker spawned from inside an orchestrator session has it scrubbed
+/// rather than inherited. A seat is a property of the session that owns it,
+/// exactly like `SESSION_ENV`/`SOCKET_ENV`.
+pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
+
+/// The `SEAT_MODEL_ENV` pair a launch exports, or nothing. Pure, so which
+/// launches disclose a seat is testable without a pty.
+///
+/// Only an `Orchestrator` launch with a non-blank configured model discloses
+/// one: a `Worker` is not a seat that dispatches subagents, and with no
+/// configured model the harness picks its own default, which zirv cannot name
+/// and therefore must not claim to.
+pub fn seat_model_env(
+    role: super::prompt::PromptRole,
+    model: Option<&str>,
+) -> Vec<(String, String)> {
+    if role != super::prompt::PromptRole::Orchestrator {
+        return Vec::new();
+    }
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(model) => vec![(SEAT_MODEL_ENV.to_string(), model.to_string())],
+        None => Vec::new(),
+    }
+}
+
 /// `Debug` is a supertrait so `Box<dyn AgentAdapter>` can appear in
 /// `Result::expect_err` (the registry tests assert on the unknown-adapter
 /// error path); every adapter already derives it.
@@ -110,6 +145,27 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn review_model_below(&self, seat: Option<&str>) -> &'static str {
         let _ = seat;
         ""
+    }
+
+    /// This adapter's own hard-coded model for a delegated headless worker
+    /// (`zirv ctx agent`, and the dashboard's own spawn-request pane
+    /// variant) when the operator has not set `worker.<name>` explicitly.
+    /// Used only by `resolve_worker_model` in this module, the one place
+    /// this and the operator override are combined into the argv a
+    /// delegation spawn actually launches with.
+    ///
+    /// `None` -- the default, and codex's own answer -- means this adapter
+    /// has no verified cheap-enough default of its own to guess, the same
+    /// "nothing verified to guess" answer `default_distiller_model` gives:
+    /// the launch omits `--model` entirely and the agent's own
+    /// configuration (codex's `~/.codex/config.toml`) picks instead.
+    /// Claude's own default is `"sonnet"`, a real hard-coded value specific
+    /// to claude's lineup: a delegated worker used to silently inherit
+    /// whatever the operator's own interactive default happened to be
+    /// (often a far pricier model than the work actually needs), which is
+    /// exactly the spend this default exists to stop.
+    fn default_worker_model(&self) -> Option<&'static str> {
+        None
     }
 
     /// Arguments that add `prompt` to this agent's system prompt for one run.
@@ -921,6 +977,42 @@ fn resolve_review_model(
             .review_model_below(cfg.chat.model.as_deref())
             .to_string(),
         configured: false,
+    }
+}
+
+/// The resolved `worker.<name>` model for a delegated headless worker: the
+/// operator's own `cfg.worker.<name>` value if set, else `adapter`'s own
+/// `AgentAdapter::default_worker_model`. `None` means neither exists, so a
+/// delegation spawn adds no `--model` flag at all and the agent's own
+/// configuration picks (codex, with no `worker.codex` set). Unlike
+/// `resolve_review_model` above, there is no ladder to fall back to: a
+/// delegated worker has no orchestrator seat of its own to be "one tier
+/// below", so the adapter-owned default is a fixed model name, not a
+/// function of `cfg.chat.model`.
+fn resolve_worker_model<'a>(
+    cfg: &'a CtxConfig,
+    name: &str,
+    adapter: &'a dyn AgentAdapter,
+) -> Option<&'a str> {
+    let configured = match name {
+        "claude" => cfg.worker.claude.as_deref(),
+        "codex" => cfg.worker.codex.as_deref(),
+        _ => None,
+    };
+    configured.or_else(|| adapter.default_worker_model())
+}
+
+/// Argv tokens (`AgentAdapter::model_args`) for the resolved worker model, or
+/// empty when `resolve_worker_model` resolves nothing. The one place a
+/// delegation spawn (`zirv ctx agent`'s own headless path in `agent.rs`, and
+/// the dashboard's own spawn-request pane variant in `dash/mod.rs`) turns the
+/// resolved model into a flag; neither caller applies this when the
+/// operator's own trailing flags already pin a model explicitly (see each
+/// caller's own doc comment for why that check lives there and not here).
+pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter) -> Vec<String> {
+    match resolve_worker_model(cfg, name, adapter) {
+        Some(model) => adapter.model_args(model),
+        None => Vec::new(),
     }
 }
 
@@ -2532,5 +2624,65 @@ mod tests {
         let adapter = claude::ClaudeAdapter::new(None);
         let command = vec!["/opt/homebrew/bin/claude".to_string()];
         assert!(command_matches_adapter(&adapter, false, &command));
+    }
+
+    // Worker model resolution (`resolve_worker_model`/`worker_model_args`):
+    // the delegated-headless-worker analogue of `resolve_review_model`
+    // above, but with a fixed adapter-owned default instead of a ladder.
+
+    #[test]
+    fn worker_model_args_uses_the_configured_value_over_the_adapter_default() {
+        let adapter = claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: Some("opus".to_string()),
+                codex: None,
+            },
+            ..permissive_cfg()
+        };
+        assert_eq!(
+            worker_model_args(&cfg, "claude", &adapter),
+            vec!["--model".to_string(), "opus".to_string()],
+            "the operator's own worker.claude wins over the hard default"
+        );
+    }
+
+    #[test]
+    fn worker_model_args_falls_back_to_claudes_hard_sonnet_default() {
+        let adapter = claude::ClaudeAdapter::new(None);
+        let cfg = permissive_cfg();
+        assert_eq!(cfg.worker.claude, None, "nothing configured");
+        assert_eq!(
+            worker_model_args(&cfg, "claude", &adapter),
+            vec!["--model".to_string(), "sonnet".to_string()],
+            "claude's own hard default stops a worker inheriting the operator's seat model"
+        );
+    }
+
+    #[test]
+    fn worker_model_args_adds_nothing_for_codex_with_no_configured_default() {
+        let adapter = codex::CodexAdapter::new(None);
+        let cfg = permissive_cfg();
+        assert_eq!(cfg.worker.codex, None, "nothing configured");
+        assert!(
+            worker_model_args(&cfg, "codex", &adapter).is_empty(),
+            "codex has no adapter-owned default, so its own CLI/config default applies untouched"
+        );
+    }
+
+    #[test]
+    fn worker_model_args_uses_the_configured_codex_value_when_set() {
+        let adapter = codex::CodexAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: None,
+                codex: Some("gpt-5.6-terra".to_string()),
+            },
+            ..permissive_cfg()
+        };
+        assert_eq!(
+            worker_model_args(&cfg, "codex", &adapter),
+            vec!["--model".to_string(), "gpt-5.6-terra".to_string()],
+        );
     }
 }

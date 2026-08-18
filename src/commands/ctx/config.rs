@@ -459,6 +459,35 @@ pub struct ReviewConfig {
     pub codex: Option<String>,
 }
 
+/// Per-agent override for which model a delegated headless worker
+/// (`zirv ctx agent <name> "<prompt>"`, and the dashboard's own
+/// spawn-request pane variant) launches on. Named `worker`, not `agent`,
+/// because a top-level `agent` key already exists (default-agent
+/// selection) -- this section is not that.
+///
+/// `None` -- the default for both -- defers to that adapter's own hard
+/// default (`AgentAdapter::default_worker_model`: `"sonnet"` for claude,
+/// none for codex, whose own CLI/config default applies untouched). See
+/// `adapters::worker_model_args`, the one place both halves (operator
+/// override, adapter-owned default) are combined into the argv a
+/// delegation spawn actually launches with.
+///
+/// `REPO_FORBIDDEN` as a whole table, the same trust asymmetry as
+/// `review.claude`/`review.codex` right above: a repo checkout must not be
+/// able to choose which model -- and so which vendor account -- spends the
+/// operator's tokens running a delegated worker. Unlike `review.*`, which
+/// only lands in injected prompt *text*, these keys reach a real launch
+/// argv directly (`AgentAdapter::model_args`), so the same charset/length/
+/// leading-dash guard `validate_model_str` applies to `chat.model`/
+/// `review.*` applies to both keys here too -- see the call sites in
+/// `CtxConfig::load`.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerConfig {
+    pub claude: Option<String>,
+    pub codex: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -477,6 +506,7 @@ pub struct CtxConfig {
     pub dash: DashConfig,
     pub chat: ChatConfig,
     pub review: ReviewConfig,
+    pub worker: WorkerConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -724,6 +754,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["review", "codex"],
         EnvKind::Str,
     ),
+    (
+        "ZIRV_CTX_WORKER_MODEL_CLAUDE",
+        &["worker", "claude"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_WORKER_MODEL_CODEX",
+        &["worker", "codex"],
+        EnvKind::Str,
+    ),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -912,6 +952,16 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // leaf (see `pace.use_credits` above), so this one entry blocks both
     // `review.claude` and `review.codex` together.
     (&["review"], "ZIRV_CTX_REVIEW_MODEL_CLAUDE"),
+    // `worker.claude`/`worker.codex` are the same call as `review.*` right
+    // above, for the same reason: a repo checkout must not be able to pick
+    // which model -- and so which vendor account -- spends the operator's
+    // tokens running a delegated headless worker (`zirv ctx agent`, and the
+    // dashboard's own spawn-request pane variant), which is background spend
+    // an operator never explicitly launched an interactive session for. See
+    // `WorkerConfig`'s own doc comment. `value_at` matches a table node the
+    // same way it matches a leaf (see `pace.use_credits`/`review` above), so
+    // this one entry blocks both `worker.claude` and `worker.codex` together.
+    (&["worker"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -1027,6 +1077,17 @@ impl CtxConfig {
             validate_model_str("review.codex", model)?;
         }
 
+        // `worker.claude`/`worker.codex` reach a real launch argv directly
+        // (`adapters::worker_model_args` -> `AgentAdapter::model_args`), an
+        // even more direct path than `review.*`'s own prompt-text injection
+        // above, so the same guard applies.
+        if let Some(model) = cfg.worker.claude.as_deref() {
+            validate_model_str("worker.claude", model)?;
+        }
+        if let Some(model) = cfg.worker.codex.as_deref() {
+            validate_model_str("worker.codex", model)?;
+        }
+
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
         Ok(cfg)
     }
@@ -1034,10 +1095,11 @@ impl CtxConfig {
 
 /// SECURITY (command-injection defense): shared charset/length/leading-dash
 /// guard for every argv-bound model string this config exposes (`chat.model`,
-/// `review.claude`, `review.codex`) -- see the call site above `chat.model`'s
-/// own doc comment for the full Windows cmd.exe-reparse threat model this
-/// defends against. `key` is the dotted config path named in the returned
-/// error, so a caller can tell which of several model fields failed.
+/// `review.claude`, `review.codex`, `worker.claude`, `worker.codex`) -- see
+/// the call site above `chat.model`'s own doc comment for the full Windows
+/// cmd.exe-reparse threat model this defends against. `key` is the dotted
+/// config path named in the returned error, so a caller can tell which of
+/// several model fields failed.
 fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
     if model.is_empty()
         || model.len() > 128
@@ -1488,6 +1550,103 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.review.claude.as_deref(), Some("opus"));
         assert_eq!(cfg.review.codex.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn worker_config_defaults_to_unset_for_both_agents() {
+        let worker = WorkerConfig::default();
+        assert_eq!(worker.claude, None);
+        assert_eq!(worker.codex, None);
+    }
+
+    #[test]
+    fn the_operator_may_set_worker_models_from_home_config_and_env() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[worker]\nclaude = \"opus\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worker.claude.as_deref(), Some("opus"));
+        assert_eq!(cfg.worker.codex, None);
+
+        let env = env_map(&[("ZIRV_CTX_WORKER_MODEL_CODEX", "gpt-5.6-terra")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.worker.claude.as_deref(),
+            Some("opus"),
+            "the home layer still applies under the env layer"
+        );
+        assert_eq!(cfg.worker.codex.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    /// Same trust boundary as `review.claude`/`review.codex`: a repo checkout
+    /// must not be able to pick which model spends the operator's vendor
+    /// account running a delegated headless worker.
+    #[test]
+    fn a_repo_layer_may_not_touch_worker_model_keys() {
+        for toml in [
+            "[worker]\nclaude = \"opus\"\n",
+            "[worker]\ncodex = \"gpt-5.6-terra\"\n",
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains("worker"), "names the offending key: {err}");
+            assert!(
+                err.contains("ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+
+        // The rejection is real, not decorative: a clean repo layer still
+        // loads and keeps both worker keys unset.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worker.claude, None);
+        assert_eq!(cfg.worker.codex, None);
+    }
+
+    /// FIX 1's charset guard applies identically to `worker.claude`/
+    /// `worker.codex`: both reach a delegation spawn's own launch argv
+    /// directly (`adapters::worker_model_args`).
+    #[test]
+    fn worker_model_charset_is_validated_like_chat_model() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let env = env_map(&[("ZIRV_CTX_WORKER_MODEL_CLAUDE", "opus&calc")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a metacharacter worker model must fail the load");
+        assert!(err.to_string().contains("worker.claude"), "got {err}");
+
+        let env = env_map(&[("ZIRV_CTX_WORKER_MODEL_CODEX", "--dangerously-bypass")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a leading-dash worker model must fail the load");
+        assert!(err.to_string().contains("worker.codex"), "got {err}");
+
+        let env = env_map(&[
+            ("ZIRV_CTX_WORKER_MODEL_CLAUDE", "opus"),
+            ("ZIRV_CTX_WORKER_MODEL_CODEX", "gpt-5.6-terra"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worker.claude.as_deref(), Some("opus"));
+        assert_eq!(cfg.worker.codex.as_deref(), Some("gpt-5.6-terra"));
     }
 
     #[test]

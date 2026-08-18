@@ -516,6 +516,15 @@ mod tests {
         assert_eq!(CodexAdapter::new(None).default_distiller_model(), None);
     }
 
+    /// Codex has no adapter-owned hard default for a delegated worker
+    /// either: its own CLI/config default applies untouched when the
+    /// operator has not set `worker.codex` -- see
+    /// `adapters::resolve_worker_model`.
+    #[test]
+    fn codex_has_no_default_worker_model() {
+        assert_eq!(CodexAdapter::new(None).default_worker_model(), None);
+    }
+
     /// The codex ladder, top to bottom: `gpt-5.6-sol` (the default when no
     /// `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini` --
     /// verified via `codex debug models` in docs/superpowers/notes/

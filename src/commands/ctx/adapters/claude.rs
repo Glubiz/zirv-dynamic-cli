@@ -622,6 +622,17 @@ impl AgentAdapter for ClaudeAdapter {
         Some("haiku")
     }
 
+    /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
+    /// own spawn-request pane variant) used to silently inherit whatever the
+    /// operator's own interactive default model happened to be -- often a
+    /// far pricier model than the delegated task actually needs. `"sonnet"`
+    /// is the user-approved hard default that stops that, used only when
+    /// the operator has not set `worker.claude` explicitly (see
+    /// `adapters::resolve_worker_model`).
+    fn default_worker_model(&self) -> Option<&'static str> {
+        Some("sonnet")
+    }
+
     /// Claude's own model ladder, top to bottom: `fable`/`mythos` (the
     /// orchestrator-tier aliases), `opus`, `sonnet`, `haiku`. Matched by
     /// substring on `seat`, lowercased first so `"claude-Opus-4-5"` and a
@@ -1418,6 +1429,17 @@ mod tests {
         assert_eq!(
             ClaudeAdapter::new(None).default_distiller_model(),
             Some("haiku")
+        );
+    }
+
+    /// A delegated headless worker with no operator `worker.claude` override
+    /// gets claude's own hard default, not the operator's interactive seat
+    /// model -- see `adapters::resolve_worker_model`.
+    #[test]
+    fn claude_defaults_the_worker_model_to_sonnet() {
+        assert_eq!(
+            ClaudeAdapter::new(None).default_worker_model(),
+            Some("sonnet")
         );
     }
 
