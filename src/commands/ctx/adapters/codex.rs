@@ -261,6 +261,32 @@ impl AgentAdapter for CodexAdapter {
         cmd
     }
 
+    /// Codex's own model ladder, top to bottom: `gpt-5.6-sol` (the default
+    /// used when no `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, and the
+    /// older, hidden `gpt-5.4-mini` -- verified via `codex debug models` in
+    /// docs/superpowers/notes/2026-07-31-codex-cli-facts.md's "Cheap model
+    /// alias for distillation" section (codex-cli 0.146.0). Matched by
+    /// substring on `seat`, lowercased first (same as claude's own ladder)
+    /// so a mixed-case seat still lands on the right rung instead of
+    /// falling through to the unknown arm. `gpt-5.4-mini` is already the
+    /// floor, so it maps to itself; an absent or unrecognised seat
+    /// (including one naming another adapter's model, e.g. a claude
+    /// orchestrator's own `chat.model`) assumes the top tier -- the
+    /// deliberate consequence is that the computed default can then resolve
+    /// to a model *more expensive* than the seat actually in use (an
+    /// accepted spend-up default; the operator can override it with
+    /// `[review]` or by setting `chat.model`).
+    fn review_model_below(&self, seat: Option<&str>) -> &'static str {
+        let seat = seat.map(str::to_lowercase);
+        match seat.as_deref() {
+            Some(s) if s.contains("gpt-5.6-sol") => "gpt-5.6-terra",
+            Some(s) if s.contains("gpt-5.6-terra") => "gpt-5.6-luna",
+            Some(s) if s.contains("gpt-5.6-luna") => "gpt-5.4-mini",
+            Some(s) if s.contains("gpt-5.4-mini") => "gpt-5.4-mini",
+            _ => "gpt-5.6-terra",
+        }
+    }
+
     fn launch_prefix_len(&self) -> usize {
         1 + self.bin_args.len()
     }
@@ -488,6 +514,74 @@ mod tests {
     #[test]
     fn codex_has_no_default_distiller_model() {
         assert_eq!(CodexAdapter::new(None).default_distiller_model(), None);
+    }
+
+    /// The codex ladder, top to bottom: `gpt-5.6-sol` (the default when no
+    /// `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini` --
+    /// verified via `codex debug models` in docs/superpowers/notes/
+    /// 2026-07-31-codex-cli-facts.md's "Cheap model alias for distillation"
+    /// section, sourced from a 0.146.0 capture; codex is not installed on
+    /// this machine to re-verify the catalog against 0.105.0 (the version
+    /// most operators actually get, per `distiller_cmd`'s own doc comment),
+    /// so treat this ladder as unverified for that version specifically --
+    /// the cited note documents the `--ignore-rules`/`--ignore-user-config`
+    /// gap only, not this catalog. `review_model_below` returns the tier one
+    /// below `seat`; an unknown or absent seat assumes the top tier
+    /// (`gpt-5.6-sol`), and `gpt-5.4-mini` (already the floor) maps to
+    /// itself.
+    #[test]
+    fn review_model_below_walks_the_codex_ladder() {
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-5.6-sol")),
+            "gpt-5.6-terra"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-5.6-terra")),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-5.6-luna")),
+            "gpt-5.4-mini"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-5.4-mini")),
+            "gpt-5.4-mini"
+        );
+        assert_eq!(
+            adapter.review_model_below(None),
+            "gpt-5.6-terra",
+            "no seat configured: assume the top tier"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("claude-fable-5")),
+            "gpt-5.6-terra",
+            "a seat naming another adapter's model is unrecognised: assume the top tier"
+        );
+    }
+
+    /// Seat matching must be case-insensitive: a mixed-case seat must land
+    /// on the same ladder rung as its lowercase form, not fall through to
+    /// the unknown arm and assume the top tier.
+    #[test]
+    fn review_model_below_matches_the_seat_case_insensitively() {
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(
+            adapter.review_model_below(Some("GPT-5.6-Sol")),
+            "gpt-5.6-terra"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("Gpt-5.6-Terra")),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("GPT-5.6-LUNA")),
+            "gpt-5.4-mini"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("GPT-5.4-Mini")),
+            "gpt-5.4-mini"
+        );
     }
 
     /// B: `--sandbox read-only` (verified against `codex exec --help` on

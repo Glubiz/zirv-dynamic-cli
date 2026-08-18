@@ -433,6 +433,32 @@ pub struct ChatConfig {
     pub model: Option<String>,
 }
 
+/// Per-agent override for which model runs code review, keyed the same way
+/// as `UseCreditsConfig` (operator thinks in agent names). `None` -- the
+/// default for both -- defers to that adapter's own `AgentAdapter::
+/// review_model_below` ladder, computed one tier below the orchestrator
+/// seat's model (`chat.model`, or the top tier when unset). `REPO_FORBIDDEN`
+/// as a whole table: a repo checkout must not be able to choose which model
+/// spends the operator's vendor account running review, the same asymmetry
+/// as `handoff.model`/`optimize.model` above. See `resolve_review_model` in
+/// `adapters/mod.rs`, the one place both halves (operator override, ladder
+/// default) are combined into the harness-roster line an Orchestrator
+/// session actually sees.
+///
+/// That trust claim is fully true only of this table's own keys directly: a
+/// repo checkout can still shift the *derived* ladder default indirectly, by
+/// setting `chat.model` (deliberately repo-settable -- see that field's own
+/// comment -- and disclosed on screen via `announce_model_choice`, unlike
+/// this table). That indirection is accepted because it is disclosed the
+/// same way a direct `chat.model` choice is, and it can only ever move the
+/// ladder default, never set an explicit `review.<agent>` value outright.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewConfig {
+    pub claude: Option<String>,
+    pub codex: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -450,6 +476,7 @@ pub struct CtxConfig {
     pub chrome: ChromeConfig,
     pub dash: DashConfig,
     pub chat: ChatConfig,
+    pub review: ReviewConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -687,6 +714,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
     ("ZIRV_CTX_DASH_MOUSE", &["dash", "mouse"], EnvKind::Bool),
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
+    (
+        "ZIRV_CTX_REVIEW_MODEL_CLAUDE",
+        &["review", "claude"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_REVIEW_MODEL_CODEX",
+        &["review", "codex"],
+        EnvKind::Str,
+    ),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -864,6 +901,17 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // purpose survives (real model ids only ever use that charset); the RCE
     // does not. This is a narrower, correctness-preserving guard than banning
     // the key outright, which is why it stays out of `REPO_FORBIDDEN`.
+    //
+    // `review.claude`/`review.codex` are the opposite call from `chat.model`
+    // right above, on purpose: those pick which model spends the operator's
+    // vendor account running review work in the *background* (every `zirv
+    // ctx chat` orchestrator session), not a model chosen and disclosed for
+    // one interactive session the operator themselves launched -- the same
+    // "spent silently" distinction that puts `handoff.model`/`optimize.model`
+    // in this list. `value_at` matches a table node the same way it matches a
+    // leaf (see `pace.use_credits` above), so this one entry blocks both
+    // `review.claude` and `review.codex` together.
+    (&["review"], "ZIRV_CTX_REVIEW_MODEL_CLAUDE"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -957,29 +1005,59 @@ impl CtxConfig {
         // merged above is validated identically, since it merges before here,
         // and every downstream surface (banner, dashboard header, `model_args`)
         // reads the value only after this point.
-        if let Some(model) = cfg.chat.model.as_deref()
-            && (model.is_empty()
-                || model.len() > 128
-                // A leading `-` would let the value pose as its own flag on the
-                // launch argv (`--model --dangerously-skip-permissions`), so it
-                // is rejected even though `-` is otherwise a legal model-id
-                // character. Anchored here rather than dropped from the charset,
-                // since a hyphen mid-id (`claude-opus-5`) is legitimate.
-                || model.starts_with('-')
-                || !model.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/' | '@')
-                }))
-        {
-            return Err(format!(
-                "invalid ctx config: `chat.model` may contain only ASCII letters, digits and \
-                 `-._:/@` and may not begin with `-`, got '{model}'"
-            )
-            .into());
+        if let Some(model) = cfg.chat.model.as_deref() {
+            validate_model_str("chat.model", model)?;
+        }
+
+        // `review.claude`/`review.codex` land in injected prompt text (see
+        // `review_roster_line` in `adapters/mod.rs`, the harness-roster line
+        // an Orchestrator session's own base prompt reads), not in argv
+        // directly -- but that session may itself later re-type the value
+        // onto a real command line (e.g. `zirv agent <name> ...`), so the
+        // same charset/length/leading-dash guard is defense for both: the
+        // prompt-injection surface today, and the argv it may be re-typed
+        // onto tomorrow. `REPO_FORBIDDEN` (see its own comment on the
+        // `review` entry) is what keeps a checked-out repo from setting
+        // these at all; this is the second, independent layer that bounds
+        // what even an operator's own value can carry.
+        if let Some(model) = cfg.review.claude.as_deref() {
+            validate_model_str("review.claude", model)?;
+        }
+        if let Some(model) = cfg.review.codex.as_deref() {
+            validate_model_str("review.codex", model)?;
         }
 
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
         Ok(cfg)
     }
+}
+
+/// SECURITY (command-injection defense): shared charset/length/leading-dash
+/// guard for every argv-bound model string this config exposes (`chat.model`,
+/// `review.claude`, `review.codex`) -- see the call site above `chat.model`'s
+/// own doc comment for the full Windows cmd.exe-reparse threat model this
+/// defends against. `key` is the dotted config path named in the returned
+/// error, so a caller can tell which of several model fields failed.
+fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
+    if model.is_empty()
+        || model.len() > 128
+        // A leading `-` would let the value pose as its own flag on the
+        // launch argv (`--model --dangerously-skip-permissions`), so it is
+        // rejected even though `-` is otherwise a legal model-id character.
+        // Anchored here rather than dropped from the charset, since a hyphen
+        // mid-id (`claude-opus-5`) is legitimate.
+        || model.starts_with('-')
+        || !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/' | '@'))
+    {
+        return Err(format!(
+            "invalid ctx config: `{key}` may contain only ASCII letters, digits and `-._:/@` and \
+             may not begin with `-`, got '{model}'"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1313,6 +1391,103 @@ mod tests {
         assert!(!cfg.pace.poll_enabled);
         assert_eq!(cfg.pace.poll_min_interval_secs, 120);
         assert_eq!(cfg.pace.soft_percent, 70.0);
+    }
+
+    #[test]
+    fn review_config_defaults_to_unset_for_both_agents() {
+        let review = ReviewConfig::default();
+        assert_eq!(review.claude, None);
+        assert_eq!(review.codex, None);
+    }
+
+    #[test]
+    fn the_operator_may_set_review_models_from_home_config_and_env() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[review]\nclaude = \"opus\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.review.claude.as_deref(), Some("opus"));
+        assert_eq!(cfg.review.codex, None);
+
+        let env = env_map(&[("ZIRV_CTX_REVIEW_MODEL_CODEX", "gpt-5.6-terra")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.review.claude.as_deref(),
+            Some("opus"),
+            "the home layer still applies under the env layer"
+        );
+        assert_eq!(cfg.review.codex.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    /// Same trust boundary as `pace.use_credits`/`handoff.model`: a repo
+    /// checkout must not be able to pick which model spends the operator's
+    /// vendor account running review.
+    #[test]
+    fn a_repo_layer_may_not_touch_review_model_keys() {
+        for toml in [
+            "[review]\nclaude = \"opus\"\n",
+            "[review]\ncodex = \"gpt-5.6-terra\"\n",
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains("review"), "names the offending key: {err}");
+            assert!(
+                err.contains("ZIRV_CTX_REVIEW_MODEL_CLAUDE"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+
+        // The rejection is real, not decorative: a clean repo layer still
+        // loads and keeps both review keys unset.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.review.claude, None);
+        assert_eq!(cfg.review.codex, None);
+    }
+
+    /// FIX 1's charset guard applies identically to `review.claude`/
+    /// `review.codex`: both reach the same argv surface `chat.model` does
+    /// once a review round launches that adapter's own child.
+    #[test]
+    fn review_model_charset_is_validated_like_chat_model() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let env = env_map(&[("ZIRV_CTX_REVIEW_MODEL_CLAUDE", "opus&calc")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a metacharacter review model must fail the load");
+        assert!(err.to_string().contains("review.claude"), "got {err}");
+
+        let env = env_map(&[("ZIRV_CTX_REVIEW_MODEL_CODEX", "--dangerously-bypass")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a leading-dash review model must fail the load");
+        assert!(err.to_string().contains("review.codex"), "got {err}");
+
+        let env = env_map(&[
+            ("ZIRV_CTX_REVIEW_MODEL_CLAUDE", "opus"),
+            ("ZIRV_CTX_REVIEW_MODEL_CODEX", "gpt-5.6-terra"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.review.claude.as_deref(), Some("opus"));
+        assert_eq!(cfg.review.codex.as_deref(), Some("gpt-5.6-terra"));
     }
 
     #[test]
@@ -2017,6 +2192,8 @@ mod tests {
         ("", "agent"),
         ("", "agent_bin"),
         ("chat", "model"),
+        ("review", "claude"),
+        ("review", "codex"),
         ("score", "window"),
         ("score", "min_turns"),
         ("score", "token_floor"),

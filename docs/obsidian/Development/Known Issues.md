@@ -14,6 +14,8 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-18 (feat/review-model-config): recorded the codex review-ladder model catalog as sourced from a codex-cli 0.146.0 capture, not re-verified against 0.105.0 (npm) -- the same version-split residual as the existing distiller --ignore-rules/--ignore-user-config gap -- and the equals-seat wording residual (an operator-configured review model equal in tier but spelled differently from a full-id seat keeps the strict never-clause wording, since equality is checked case-insensitively on the exact strings only) -->
+
 <!-- Updated 2026-08-18 (feat/usage-two-window-display): both usage windows now render per harness, filtered through the new window::available staleness rule, at every display surface (dash header, wrap's bar, zirv ctx status); the refresh gates were fixed to treat a display-dropped slot as stale so a rolled-over window refreshes promptly; two residuals recorded, not fixed -- pace's hard-park path deliberately admits a rolled-over-but-recently-observed reading (test-pinned, pre-existing, distinct from `available`'s own rule), and `zirv ctx usage` prints a bare unix epoch for a passed resets_at with no "already reset" wording -->
 <!-- Updated 2026-08-17 (feat/usage-credits-throttle, final review round): recorded the silent-poll-failure deviation (spec promised a one-time zirv announcement on a failed poll attempt; the shipped code degrades silently -- deviation recorded, fix deferred to a mockable-transport follow-up) and gated the usage verb's active poll on pace.enabled -->
 <!-- Updated 2026-08-17 (feat/usage-credits-throttle): resolved "a limit-park is guaranteed unthrottled for a provider with no usage collector" -- codex now has both a passive rollout-file collector and an active HTTP poll fallback, so the "no collector exists at all" premise no longer holds; added three residuals -- the codex ChatGPT-backend poll endpoint ships unverified (no readable token on the reference machine), the codex rollout collector is verified against codex-cli 0.105.0's shape only, and the Anthropic OAuth usage endpoint is unofficial and may drift without notice -->
@@ -196,6 +198,32 @@ prompt (the one residual claude's distiller has too, and cannot close either
 `--ignore-rules --ignore-user-config` to `distiller_cmd` once the
 npm-published codex-cli ships them, verified against that installed CLI the
 same way `-s, --sandbox` was.
+
+## The codex review-ladder model catalog is sourced from a 0.146.0 capture, not re-verified against npm's 0.105.0
+
+`CodexAdapter::review_model_below`'s ladder (`gpt-5.6-sol` → `gpt-5.6-terra` →
+`gpt-5.6-luna` → `gpt-5.4-mini`) is sourced from `codex debug models` in
+`docs/superpowers/notes/2026-07-31-codex-cli-facts.md`, captured on codex-cli
+**0.146.0** (a brew-only capture). It has **not** been re-verified against
+0.105.0, the version `npm install -g @openai/codex` actually publishes and
+the version most operators get — the same version-split residual as the
+existing `distiller_cmd` gap ("Codex's distiller sandbox still reads the
+repo's `.rules`...", below): a real catalog difference on 0.105.0 would ship
+silently wrong review-model names in the harness-roster prompt line, not a
+crash. Verify against a real 0.105.0 install and update the ladder (or note
+the split) once one is available to test with.
+
+**Related, narrower wording residual:** `review_roster_line`'s never-clause
+softens to "never on a model above the named one" only when a resolved
+review model's text equals the orchestrator seat's text, checked
+case-insensitively on the *exact strings*. An operator who configures a
+review model equal in tier but spelled differently from a full-id seat (e.g.
+`chat.model = "claude-opus-4-5"` with `review.claude = "opus"`) is not
+detected as equal, so the line keeps the strict "never on an orchestrator
+seat's own model" wording even though the two names may resolve to the same
+underlying model. Not a security gap (the routing rule itself still holds,
+`review.claude` still wins), just a cosmetic case the equality check does not
+catch.
 
 ## The codex ChatGPT-backend poll endpoint ships unverified
 

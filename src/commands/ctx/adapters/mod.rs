@@ -92,6 +92,26 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
+    /// This adapter's own verified model ladder, one tier below `seat` --
+    /// `seat` is the orchestrator seat's own model (`cfg.chat.model`), or
+    /// `None`/unrecognised when unset, which this must read as "assume the
+    /// top tier" rather than guess low. Used only when the operator has not
+    /// set `review.<agent>` explicitly (see `resolve_review_model` below,
+    /// the one place this and the operator override are combined into the
+    /// harness-roster line an Orchestrator session sees).
+    ///
+    /// `""` -- the default, and not meant to be a real model id -- means
+    /// this adapter has no verified ladder of its own, the same "nothing
+    /// verified to guess" answer `default_distiller_model`'s `None` gives.
+    /// Both registered adapters (claude, codex) override this with real,
+    /// verified tier names; `resolve_review_model` is the only caller, and
+    /// treats a `""` result the same way it treats any other resolved
+    /// string (harmless here because every reachable adapter overrides it).
+    fn review_model_below(&self, seat: Option<&str>) -> &'static str {
+        let _ = seat;
+        ""
+    }
+
     /// Arguments that add `prompt` to this agent's system prompt for one run.
     /// Empty when the agent has no verified mechanism, which is how an
     /// unsupported agent ships without injection rather than with a guess.
@@ -815,7 +835,7 @@ pub fn available_adapter_names(cfg: &CtxConfig) -> Vec<&'static str> {
 /// override were configured at all.
 pub fn harness_prompt_lines(cfg: &CtxConfig, current_adapter: &str) -> Vec<String> {
     let bin = cfg.agent_bin.as_deref();
-    ADAPTERS
+    let mut lines: Vec<String> = ADAPTERS
         .iter()
         .map(|(name, ctor)| {
             let name: &str = name;
@@ -862,7 +882,124 @@ pub fn harness_prompt_lines(cfg: &CtxConfig, current_adapter: &str) -> Vec<Strin
                 }
             }
         })
-        .collect()
+        .collect();
+    if let Some(review_line) = review_roster_line(cfg) {
+        lines.push(review_line);
+    }
+    lines
+}
+
+/// The resolved review-model choice for one enabled harness: either the
+/// operator's own `cfg.review.<agent>` value, or `adapter`'s own
+/// `AgentAdapter::review_model_below` ladder default computed from the
+/// orchestrator seat (`cfg.chat.model`, or the top tier when unset). This is
+/// the one place both halves are combined -- `review_roster_line` below is
+/// its only caller.
+struct ReviewModelChoice {
+    model: String,
+    configured: bool,
+}
+
+fn resolve_review_model(
+    cfg: &CtxConfig,
+    name: &str,
+    adapter: &dyn AgentAdapter,
+) -> ReviewModelChoice {
+    let configured = match name {
+        "claude" => cfg.review.claude.as_deref(),
+        "codex" => cfg.review.codex.as_deref(),
+        _ => None,
+    };
+    if let Some(model) = configured {
+        return ReviewModelChoice {
+            model: model.to_string(),
+            configured: true,
+        };
+    }
+    ReviewModelChoice {
+        model: adapter
+            .review_model_below(cfg.chat.model.as_deref())
+            .to_string(),
+        configured: false,
+    }
+}
+
+/// The trailing "- code review: ..." line `harness_prompt_lines` appends
+/// after its per-harness lines: names every *enabled* harness's resolved
+/// review model (an operator override or the ladder default, each marked as
+/// such) and states the rule that outranks any other model-routing guidance
+/// a session's own base prompt carries (see `ORCHESTRATOR_PROMPT`'s
+/// model-routing bullet in claude.rs, which now points back at this line).
+/// Returns `None` when no harness is enabled at all -- absence, not a line
+/// naming zero harnesses.
+///
+/// A disabled harness's entry is simply absent, the same "absence, not
+/// silence" rule its own per-harness line above follows -- readiness is
+/// deliberately not checked here (unlike the per-harness lines): the rule
+/// this line states applies to a harness the moment it is enabled, whether
+/// or not its binary happens to be on disk on this machine right now.
+///
+/// The rendered sentence must never be false for any entry. Two cases would
+/// otherwise make it false: a harness whose ladder default is already at
+/// the floor tier (seat "haiku" resolves claude's own default to "haiku"
+/// too -- neither "one tier below the seat" nor "never on the seat's own
+/// model" holds), and an operator who explicitly configures `review.<agent>`
+/// equal to the seat (allowed -- the operator's choice wins -- but then
+/// "never on the seat's own model" is false of that entry). Both are the
+/// same underlying condition -- the resolved model's text equals the seat's
+/// text, case-insensitively -- so both are detected by one `equals_seat`
+/// check per entry, regardless of whether the model came from the ladder
+/// default or an operator override. (Deliberately a plain text comparison,
+/// not a second call into the ladder: re-running `review_model_below` on
+/// the *resolved* model would also self-map at the floor tier for a seat
+/// one rung *above* the floor -- e.g. seat "sonnet" resolves to "haiku",
+/// and "haiku" maps to itself too -- which would wrongly flag a perfectly
+/// true "one tier below the seat" note as a floor case.) When any entry's
+/// `equals_seat` is true, the trailing clause softens from the strict
+/// "never on an orchestrator seat's own model" to the weaker but always-true
+/// "never on a model above the named one" (the named model is by
+/// construction never ranked above the seat, so this holds in every case).
+fn review_roster_line(cfg: &CtxConfig) -> Option<String> {
+    let bin = cfg.agent_bin.as_deref();
+    let seat = cfg.chat.model.as_deref();
+    let mut any_equals_seat = false;
+    let entries: Vec<String> = ADAPTERS
+        .iter()
+        .filter(|(name, _)| cfg.agents.is_enabled(name))
+        .map(|(name, ctor)| {
+            let adapter = if agent_bin_names_a_different_adapter(bin, name).is_some() {
+                ctor(None)
+            } else {
+                ctor(bin)
+            };
+            let choice = resolve_review_model(cfg, name, adapter.as_ref());
+            let equals_seat = seat.is_some_and(|s| s.eq_ignore_ascii_case(&choice.model));
+            if equals_seat {
+                any_equals_seat = true;
+            }
+            let note = if choice.configured {
+                "configured".to_string()
+            } else if equals_seat {
+                "floor tier: the seat is already at the bottom rung".to_string()
+            } else {
+                "default: one tier below the seat".to_string()
+            };
+            format!("{name} -> \"{}\" ({note})", choice.model)
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let never_clause = if any_equals_seat {
+        "never on a model above the named one"
+    } else {
+        "never on an orchestrator seat's own model"
+    };
+    Some(format!(
+        "- code review: {} -- run every code review on the named model, {never_clause}. This \
+         outranks any other model-routing guidance.",
+        entries.join(", ")
+    ))
 }
 
 /// A `Capabilities` predicate paired with its user-facing label -- factored
@@ -1252,13 +1389,209 @@ mod tests {
     #[test]
     fn harness_prompt_lines_returns_one_line_per_registered_adapter() {
         let lines = harness_prompt_lines(&permissive_cfg(), "");
-        assert_eq!(lines.len(), ADAPTERS.len());
+        // One line per adapter, plus one trailing "- code review: ..." line
+        // naming every enabled harness's resolved review model.
+        assert_eq!(lines.len(), ADAPTERS.len() + 1);
         for (name, _) in ADAPTERS {
             assert!(
                 lines.iter().any(|l| l.starts_with(&format!("- {name}:"))),
                 "missing a line for '{name}': {lines:?}"
             );
         }
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.starts_with("- code review:")),
+            "the review line comes last: {lines:?}"
+        );
+    }
+
+    /// Unconfigured `review.claude`/`review.codex`: the roster line names
+    /// each enabled harness's ladder-computed default (one tier below the
+    /// seat -- unset `chat.model` assumes the top tier), marks each entry as
+    /// a default rather than an operator choice, and states the never-the-
+    /// seat / outranks-other-routing rule.
+    #[test]
+    fn harness_prompt_lines_review_line_shows_computed_defaults_when_unset() {
+        let lines = harness_prompt_lines(&permissive_cfg(), "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude -> \"opus\" (default: one tier below the seat)"),
+            "got {review_line}"
+        );
+        assert!(
+            review_line.contains("codex -> \"gpt-5.6-terra\" (default: one tier below the seat)"),
+            "got {review_line}"
+        );
+        assert!(
+            review_line.contains("never on an orchestrator seat's own model"),
+            "got {review_line}"
+        );
+        assert!(
+            review_line.contains("outranks"),
+            "states it outranks other routing guidance: {review_line}"
+        );
+    }
+
+    /// An operator-configured `review.<agent>` wins over the ladder default
+    /// and is marked `(configured)` rather than `(default: ...)`.
+    #[test]
+    fn harness_prompt_lines_review_line_uses_the_operators_configured_model() {
+        let cfg = CtxConfig {
+            review: crate::commands::ctx::config::ReviewConfig {
+                claude: Some("custom-review-model".to_string()),
+                codex: None,
+            },
+            ..permissive_cfg()
+        };
+        let lines = harness_prompt_lines(&cfg, "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude -> \"custom-review-model\" (configured)"),
+            "got {review_line}"
+        );
+        assert!(
+            review_line.contains("codex -> \"gpt-5.6-terra\" (default: one tier below the seat)"),
+            "codex stays on its computed default: {review_line}"
+        );
+    }
+
+    /// A disabled harness gets no entry in the review line at all -- same
+    /// absence-not-silence rule its own per-harness line above follows.
+    #[test]
+    fn harness_prompt_lines_review_line_omits_a_disabled_harnesses_entry() {
+        let cfg = cfg_disabling("codex");
+        let lines = harness_prompt_lines(&cfg, "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude ->"),
+            "claude stays: {review_line}"
+        );
+        assert!(
+            !review_line.contains("codex ->"),
+            "a disabled harness must not appear in the review line: {review_line}"
+        );
+    }
+
+    /// Normal case (no entry's resolved model equals the orchestrator seat):
+    /// the strict "never on an orchestrator seat's own model" clause is
+    /// true for every entry, so it stays.
+    #[test]
+    fn review_roster_line_normal_case_keeps_the_strict_clause() {
+        let lines = harness_prompt_lines(&permissive_cfg(), "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("never on an orchestrator seat's own model"),
+            "got {review_line}"
+        );
+        assert!(
+            !review_line.contains("never on a model above the named one"),
+            "the softened clause must not appear when nothing is contradictory: {review_line}"
+        );
+    }
+
+    /// Floor-tier case: seat "haiku" resolves (unconfigured) to claude's own
+    /// floor default "haiku" too -- neither "one tier below the seat" nor
+    /// "never on an orchestrator seat's own model" would be true of that
+    /// entry, so both the per-entry note and the global clause must adjust
+    /// to stay honest.
+    #[test]
+    fn review_roster_line_floor_seat_case_is_not_contradictory() {
+        let cfg = CtxConfig {
+            chat: crate::commands::ctx::config::ChatConfig {
+                model: Some("haiku".to_string()),
+            },
+            ..permissive_cfg()
+        };
+        let lines = harness_prompt_lines(&cfg, "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude -> \"haiku\""),
+            "got {review_line}"
+        );
+        assert!(
+            !review_line.contains("claude -> \"haiku\" (default: one tier below the seat)"),
+            "that note would be false when the seat is already the floor: {review_line}"
+        );
+        assert!(review_line.contains("floor tier"), "got {review_line}");
+        assert!(
+            !review_line.contains("never on an orchestrator seat's own model"),
+            "that clause would be false for the floor-tier entry: {review_line}"
+        );
+    }
+
+    /// Configured-equals-seat case: the operator's own `review.claude`
+    /// explicitly names the same model as the orchestrator seat -- allowed
+    /// (the operator's choice wins), but then "never on an orchestrator
+    /// seat's own model" is false of that entry, so the global clause must
+    /// soften to something that stays true.
+    #[test]
+    fn review_roster_line_configured_equals_seat_case_is_not_contradictory() {
+        let cfg = CtxConfig {
+            chat: crate::commands::ctx::config::ChatConfig {
+                model: Some("opus".to_string()),
+            },
+            review: crate::commands::ctx::config::ReviewConfig {
+                claude: Some("opus".to_string()),
+                codex: None,
+            },
+            ..permissive_cfg()
+        };
+        let lines = harness_prompt_lines(&cfg, "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude -> \"opus\" (configured)"),
+            "got {review_line}"
+        );
+        assert!(
+            !review_line.contains("never on an orchestrator seat's own model"),
+            "that clause would be false for the operator's own configured entry: {review_line}"
+        );
+    }
+
+    /// The seat threads all the way from `cfg.chat.model` through to the
+    /// rendered claude entry: seat "sonnet" resolves claude's own ladder
+    /// default to "haiku" (one tier below sonnet).
+    #[test]
+    fn harness_prompt_lines_review_line_threads_the_seat_for_claude() {
+        let cfg = CtxConfig {
+            chat: crate::commands::ctx::config::ChatConfig {
+                model: Some("sonnet".to_string()),
+            },
+            ..permissive_cfg()
+        };
+        let lines = harness_prompt_lines(&cfg, "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude -> \"haiku\" (default: one tier below the seat)"),
+            "got {review_line}"
+        );
+    }
+
+    /// No enabled harness at all: `review_roster_line` must not emit a
+    /// line naming zero harnesses -- absence, not an empty-handed line.
+    #[test]
+    fn harness_prompt_lines_omits_the_review_line_when_no_harness_is_enabled() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let cfg = CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        };
+        let lines = harness_prompt_lines(&cfg, "");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("- code review:")),
+            "no harness enabled: there must be no review line at all: {lines:?}"
+        );
     }
 
     /// The one call site (`prompt::compose` for an Orchestrator session) must

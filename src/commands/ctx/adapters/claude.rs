@@ -41,7 +41,8 @@ just handled, continue that worker instead of spawning a fresh one.
 - Route each dispatch to the cheapest model that can do the job, always cheaper than the model in \
 this seat: the cheapest tier for mechanical and bulk work, a middle tier for ordinary exploration, \
 implementation and test writing, and the most capable tier only for hard debugging and design \
-exploration. Agents defined in .claude/agents pin their own models; do not override those.
+exploration. Agents defined in .claude/agents pin their own models; do not override those, except \
+the review-model rule in the harness roster, which outranks this.
 - Write self-contained briefs. Subagents share none of your context, so state the goal, the \
 constraints, the relevant file paths and the exact output format expected, and nothing else. Ask \
 for compact structured findings, never raw file dumps.
@@ -55,8 +56,9 @@ project's format, lint and test commands before reporting back.
 micro-task. You own the final integration, so resolve conflicts between agent outputs and report \
 outcomes, including failures, plainly.
 - Before reporting development work done, run this harness's own /code-review pass over the full \
-diff; a session that also carries the zirv meta-harness layer follows that layer's cross-harness \
-review round on top.";
+diff, routed to the session's configured review model (named in the harness roster) and never \
+this seat's own model; a session that also carries the zirv meta-harness layer follows that \
+layer's cross-harness review round on top.";
 
 fn text_of(message: &Value) -> String {
     message
@@ -618,6 +620,31 @@ impl AgentAdapter for ClaudeAdapter {
     /// lineup has no business leaking into another adapter's default.
     fn default_distiller_model(&self) -> Option<&'static str> {
         Some("haiku")
+    }
+
+    /// Claude's own model ladder, top to bottom: `fable`/`mythos` (the
+    /// orchestrator-tier aliases), `opus`, `sonnet`, `haiku`. Matched by
+    /// substring on `seat`, lowercased first so `"claude-Opus-4-5"` and a
+    /// bare `"opus"` both hit the same rung regardless of case (so
+    /// `"claude-fable-5"` and a bare `"fable"` both hit the fable rung)
+    /// rather than exact equality, since a seat string can carry a full id
+    /// (`claude-opus-4-1`) or a bare alias. `haiku` is already the floor, so
+    /// it maps to itself instead of falling off the ladder; an absent or
+    /// unrecognised seat assumes the top tier, same as
+    /// `AgentAdapter::review_model_below`'s own doc comment requires -- the
+    /// deliberate consequence is that the computed default can then resolve
+    /// to a model *more expensive* than the seat actually in use (an
+    /// accepted spend-up default; the operator can override it with
+    /// `[review]` or by setting `chat.model`).
+    fn review_model_below(&self, seat: Option<&str>) -> &'static str {
+        let seat = seat.map(str::to_lowercase);
+        match seat.as_deref() {
+            Some(s) if s.contains("fable") || s.contains("mythos") => "opus",
+            Some(s) if s.contains("opus") => "sonnet",
+            Some(s) if s.contains("sonnet") => "haiku",
+            Some(s) if s.contains("haiku") => "haiku",
+            _ => "opus",
+        }
     }
 
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
@@ -1394,6 +1421,48 @@ mod tests {
         );
     }
 
+    /// The claude ladder, top to bottom: fable/mythos, opus, sonnet, haiku.
+    /// `review_model_below` returns the tier one below `seat`; an unknown or
+    /// absent seat assumes the top tier, and haiku (already the floor) maps
+    /// to itself rather than falling off the ladder.
+    #[test]
+    fn review_model_below_walks_the_claude_ladder() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(adapter.review_model_below(Some("claude-fable-5")), "opus");
+        assert_eq!(adapter.review_model_below(Some("mythos")), "opus");
+        assert_eq!(adapter.review_model_below(Some("opus")), "sonnet");
+        assert_eq!(adapter.review_model_below(Some("sonnet")), "haiku");
+        assert_eq!(adapter.review_model_below(Some("haiku")), "haiku");
+        assert_eq!(
+            adapter.review_model_below(None),
+            "opus",
+            "no seat configured: assume the top tier"
+        );
+        assert_eq!(
+            adapter.review_model_below(Some("some-unreleased-model")),
+            "opus",
+            "unrecognised seat: assume the top tier"
+        );
+    }
+
+    /// Seat matching must be case-insensitive: a mixed-case seat like
+    /// "Opus" (or a full id with mixed-case segments) must land on the same
+    /// ladder rung as its lowercase form, not fall through to the unknown
+    /// arm and assume the top tier.
+    #[test]
+    fn review_model_below_matches_the_seat_case_insensitively() {
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(adapter.review_model_below(Some("Opus")), "sonnet");
+        assert_eq!(
+            adapter.review_model_below(Some("claude-Opus-4-5")),
+            "sonnet"
+        );
+        assert_eq!(adapter.review_model_below(Some("SONNET")), "haiku");
+        assert_eq!(adapter.review_model_below(Some("Haiku")), "haiku");
+        assert_eq!(adapter.review_model_below(Some("Fable")), "opus");
+        assert_eq!(adapter.review_model_below(Some("MYTHOS")), "opus");
+    }
+
     #[test]
     fn resume_args_uses_the_verified_flag() {
         let adapter = ClaudeAdapter::new(None);
@@ -1644,6 +1713,30 @@ mod tests {
                 "the layer is claude-specific by construction: '{claude_specific}'"
             );
         }
+    }
+
+    /// The review bullet must route review to the harness roster's own
+    /// configured review model rather than let it silently run on this
+    /// seat's own model, and the model-routing bullet's "pin" clause must
+    /// carve out that one exception rather than blanket-forbid every
+    /// override.
+    #[test]
+    fn the_orchestrator_prompt_routes_review_to_the_rosters_configured_model() {
+        assert!(
+            ORCHESTRATOR_PROMPT.contains(
+                "routed to the session's configured review model (named in the harness \
+                 roster) and never this seat's own model"
+            ),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains(
+                "do not override those, except the review-model rule in the harness roster, \
+                 which outranks this"
+            ),
+            "the model-routing bullet's pin clause must carve out the review-model exception: \
+             {ORCHESTRATOR_PROMPT}"
+        );
     }
 
     /// `exec` strips this many leading tokens off the argv the operator

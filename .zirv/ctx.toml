@@ -31,6 +31,10 @@
 # active key in this file -- every other key below is commented out.
 model = "fable"
 
+# [review]                          # every key below is REPO-FORBIDDEN (ZIRV_CTX_REVIEW_MODEL_CLAUDE / ZIRV_CTX_REVIEW_MODEL_CODEX)
+# claude = "opus"                   # code-review model for a claude harness. Default: unset (one tier below the orchestrator seat's model on claude's ladder -- see AgentAdapter::review_model_below).
+# codex = "gpt-5.6-terra"           # code-review model for a codex harness. Default: unset (one tier below the seat on codex's own ladder).
+
 # [score]
 # window = 10                        # trailing turns the rolling rot score looks over
 # min_turns = 10                     # turns required before the score is trusted at all
