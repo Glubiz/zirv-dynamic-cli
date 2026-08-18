@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-17
+last-verified: 2026-08-18
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-08-17
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-18 — Per-agent review-model routing: `[review]` is repo-forbidden as a whole table; the ladder default is derived from `chat.model`
+**Context:** Nothing named which model actually runs code review — claude's `ORCHESTRATOR_PROMPT` just said "run this harness's own `/code-review` pass," with no way for an operator to pin a specific model, and no way to tell a session "never review on the same seat that's doing the orchestrating."
+**Decision:** New `review.claude`/`review.codex` config keys (`ZIRV_CTX_REVIEW_MODEL_CLAUDE`/`_CODEX`), `REPO_FORBIDDEN` as a whole table — same asymmetry as `handoff.model`/`optimize.model`, since review runs silently in the background of every `zirv ctx chat` session, not a session the operator watches spend tokens interactively. Unconfigured, each adapter's own `AgentAdapter::review_model_below(seat)` picks the tier one below the orchestrator seat (`cfg.chat.model`, top tier assumed when unset — a deliberate spend-up default). `harness_prompt_lines` appends one roster line naming the resolved choice per enabled harness and the routing rule ("never on the seat's own model," softened to "never on a model above the named one" at the floor tier or an operator-configured equal). Both values are charset-validated like `chat.model` (defense for the argv this text may later be re-typed onto).
+**Rejected:** Leaving `chat.model` itself as the review model with no separate key — conflates "what an operator watches spend tokens interactively" with "what runs unattended in the background," the same distinction that already splits `chat.model` from `handoff.model`. A hand-authored review-model mapping in the prompt text — drifts from the registry the moment an adapter's own ladder or a repo's `chat.model` changes, the same rationale that made `harness_prompt_lines` itself derived rather than hand-written.
+**Consequences:** A repo can still shift the *derived* review default indirectly via the repo-settable `chat.model` — accepted, since it's disclosed the same way a direct `chat.model` choice is, and it can only move the ladder default, never set `review.<agent>` outright. Codex's ladder is sourced from a codex-cli 0.146.0 capture, not re-verified against 0.105.0 (npm) — see [[Known Issues]].
+**Spec / link:** [[Ctx Adapters]] (`review_model_below`, `review_roster_line`), [[Untrusted Configuration]], [[Ctx Subsystem]].
 
 ### 2026-08-17 — Final review round: `pace.enabled` is a master off-switch for the active poll; the failed-poll announcement ships as a recorded deviation
 **Context:** The whole-branch review found a spec promise (one-time announcement on a failed poll attempt) that the shipped `maybe_poll` cannot deliver without a return-type change; the cross-harness `/code-review` verifier confirmed `zirv ctx usage` polled (blocking, authenticated) even under `ZIRV_CTX_PACE=false`, because `maybe_poll` gates only on `poll_enabled`.

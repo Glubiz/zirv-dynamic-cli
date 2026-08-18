@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-17
+last-verified: 2026-08-18
 ---
 
 # Active Work
@@ -21,6 +21,10 @@ _None right now — see Recently Completed below for the latest landed work._
 ## Recently Completed
 
 <!-- Cap at ~10 entries; drop the oldest when adding a new one. -->
+
+### `feat/review-model-config` — per-agent code-review model config (2026-08-18, v2.11.0)
+**Status (2026-08-18):** Two commits (`7da7ed5`, `e8454d3`) on `feat/review-model-config`, committed. New `[review]` section in `ctx.toml` (`review.claude`/`review.codex`, `REPO_FORBIDDEN` as a whole table) lets an operator pin the code-review model per harness; unconfigured, `AgentAdapter::review_model_below(seat)` picks one tier below the orchestrator seat on each adapter's own verified ladder. `harness_prompt_lines` appends a roster line naming every enabled harness's resolved choice and the routing rule; claude's `ORCHESTRATOR_PROMPT` review bullet now points at it. The fix-up commit made the roster line honest at the floor tier and for an operator-configured equal, and matched seats case-insensitively. `Cargo.toml` bumped to 2.11.0. See [[Work Journal]] and [[Decision Log]].
+**Next:** open the PR against main. **Version-ordering note:** this branch is 2.11.0; PR #26 (`feat/usage-credits-throttle`, 2.10.0) must merge first so version numbers stay ordered. Two residuals recorded in [[Known Issues]], not fixed: the codex review ladder is sourced from a codex-cli 0.146.0 capture, not re-verified against npm's 0.105.0; the equals-seat check compares exact resolved-model strings only, so a differently-spelled-but-equal-tier configured model keeps the strict never-clause wording.
 
 ### `feat/usage-credits-throttle` — vendor usage monitoring, use_credits gating, pace-to-reset throttle (2026-08-16/17)
 **Status (2026-08-17):** Nine-task plan complete and committed on `feat/usage-credits-throttle`, docs/version/gates done (Task 8). `pace.rs` gained a `Slow` pace-to-reset decision (soft-throttle band between new `soft_percent`/`max_percent`) and `PaceGate{use_credits, poller}` (`use_credits` skips proactive throttle/pause only, never the vendor-reported limit park). `window.rs` gained a passive codex rollout-file collector; `poll.rs` (new) is an active HTTP poll fallback (`ureq`, this crate's first HTTP dependency) behind a staleness/interval floor. Task 7 put per-harness usage back in the dashboard header; Task 9 delivered session-conventions v2 to codex workers via a task-prompt fallback. `Cargo.toml` bumped 2.8.0 → 2.9.0. See [[Work Journal]] and [[Decision Log]] (four new entries) for the mechanism.

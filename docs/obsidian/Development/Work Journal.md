@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-17
+last-verified: 2026-08-18
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-08-17
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-18: per-agent code-review model config (`feat/review-model-config`, v2.11.0)
+**What:** New `[review]` section in `ctx.toml` (`review.claude`/`review.codex`, `REPO_FORBIDDEN` as a whole table, env `ZIRV_CTX_REVIEW_MODEL_CLAUDE`/`_CODEX`) lets an operator pin which model runs code review per harness. Unconfigured, `AgentAdapter::review_model_below(seat)` picks one tier below the orchestrator seat on that adapter's own verified ladder (claude: fable/mythos→opus→sonnet→haiku; codex: gpt-5.6-sol→gpt-5.6-terra→gpt-5.6-luna→gpt-5.4-mini). `harness_prompt_lines` appends a trailing roster line naming every enabled harness's resolved choice and the routing rule; claude's `ORCHESTRATOR_PROMPT` review bullet now points at it. A fix-up commit (`e8454d3`) made the roster line honest at the floor tier and for an operator-configured equal, and matched seats case-insensitively.
+**Key changes:** `config.rs` (`ReviewConfig`, `validate_model_str`), `adapters/mod.rs` (`review_model_below` trait method, `resolve_review_model`, `review_roster_line`), `adapters/{claude,codex}.rs` (the two ladders, `ORCHESTRATOR_PROMPT` wording), `.zirv/ctx.toml`, `Cargo.toml` (2.9.0 → 2.11.0, ordered after PR #26's 2.10.0).
+**Follow-up:** see [[Decision Log]] for the repo-forbidden/indirection rationale and [[Known Issues]] for the codex-ladder version-split residual (0.146.0 capture, not re-verified against npm's 0.105.0) and the equals-seat wording residual.
 
 ### 2026-08-16: vendor usage monitoring, use_credits gating, pace-to-reset throttle (`feat/usage-credits-throttle`)
 **What:** Nine-task plan landing usage-window pacing beyond the passive statusline tee. `pace.rs` gained a `Slow` decision (soft-throttle band between new `soft_percent`/`max_percent`, spreading remaining budget linearly to reset, with a monotonic deadline across rechecks) and a `PaceGate{use_credits, poller}` — `use_credits` (new `[pace.use_credits]` table, `REPO_FORBIDDEN`) skips proactive throttle/pause but never the vendor-reported limit park. `window.rs` gained a codex passive collector (rollout-file rate-limit snapshots, RFC 3339 parsing) and `poll.rs` (new) is an active HTTP poll fallback (`ureq`, first HTTP dependency) behind a staleness/interval floor — Anthropic verified against a real response, codex ships best-effort/unverified. Task 7 (already journaled 2026-08-16 below) put per-harness usage back in the dashboard header; Task 9 delivered conventions v2 (verify-once, scope discipline) to codex workers via a task-prompt fallback.
@@ -65,9 +70,4 @@ last-verified: 2026-08-17
 **Key changes:** `src/commands/ctx/dash/{mod,pane,ui,spawnreq,roster}.rs` (new), `adapters/{mod,claude,codex}.rs` (`model_args`/`resume_args`), `chat.rs`/`chrome.rs` (`dash_eligible`, `chat.model` splice), `config.rs` (`[dash]`, `[chat]`), `agent.rs` (`try_join_dashboard`), `sessions.rs` (`Verb::Dash`), `mail.rs`/`window.rs` (shared `unread_counts`/`max_used_percentage`, moved out of `wrap.rs`).
 **Follow-up:** no rot score wired into a pane's own header yet (`score: None` always — see [[Ctx Supervisors]]). Spec: `docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md`; plan: `docs/superpowers/plans/2026-08-13-zirv-dashboard.md`.
 
-### 2026-08-13: Handoff harvest, richer `status`, and split mail counts (agent-coordination wave 3)
-**What:** Opt-in handoff-to-memory harvesting (`[memory] harvest`, default off): right after a *distilled* (never structural-fallback) rot restart, one extra cheap-model call extracts durable repository facts (`Gotchas learned`/`Files touched` only) as strict `key: body` lines, stored via `remember` with `source = "handoff"`. `zirv ctx status` gained a registry-backed `sessions:` block (agent/verb/pid/age/live-or-stale, plus orphaned sockets labeled `(no record)`) and a `memory:` summary line. `zirv ctx optimize`'s report now includes a memory-bank size summary that never quotes an entry's key or body. The T12b bar's mail count now splits broadcast from session-addressed (`mail 2+1`).
-**Key changes:** src/commands/ctx/memory.rs (`harvest_from_handoff`, `harvest_prompt`, `parse_harvest`), exec.rs/wrap.rs (harvest call sites in the rot-restart paths only, not nudge), status.rs (`sessions_lines`, `format_age`), optimize.rs (`MemorySummary`, `memory_bank_summary`, `render_memory_section`), chrome.rs/wrap.rs (`BarState::unread_mail` now `(broadcast, direct)`), tests/fixtures/fake-model.sh (`harvest` mode).
-**Follow-up:** none for this wave.
-
-Older entries: see [[journal-archive/2026-Q3|2026 Q3 archive]] (2026-08-12: `zirv chat`/`zirv agent` aliases, Agent enable/disable gate, Obsidian vault created).
+Older entries: see [[journal-archive/2026-Q3|2026 Q3 archive]] (2026-08-12: `zirv chat`/`zirv agent` aliases, Agent enable/disable gate, Obsidian vault created; 2026-08-13: handoff harvest, richer `status`, split mail counts).
