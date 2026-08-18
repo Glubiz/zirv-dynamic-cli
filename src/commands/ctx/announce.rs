@@ -149,7 +149,8 @@ pub enum NudgeDisposition {
     /// running, so the next cycle's own listing picks it up.
     NextCycle,
     /// `wrap`/`chat`: an interactive session is never restarted and never
-    /// typed into, and never receives bodies -- a human has to go read it.
+    /// receives bodies -- at most a one-line advisory is typed in at a
+    /// verified-idle boundary; the body waits in the inbox.
     Advisory,
 }
 

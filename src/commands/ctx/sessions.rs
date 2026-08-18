@@ -917,15 +917,17 @@ pub fn run_nudge_with<W: Write>(
         record.short, record.agent, record.verb, record.repo_slug
     )?;
     // N6: an interactive session is only ever *advised* of a nudge -- it is
-    // never restarted and never typed into, and it never receives message
-    // bodies. Saying so here is the difference between "nothing happened,
-    // the nudge is broken" and "the operator on the other end has to go read
-    // it", which is the actual contract.
+    // never restarted and never receives message bodies. The supervisor may
+    // type a one-line advisory into the agent at a verified-idle boundary,
+    // but the guidance body itself always waits in the inbox. Saying so here
+    // is the difference between "nothing happened, the nudge is broken" and
+    // "the agent will be pointed at its inbox", which is the actual contract.
     if matches!(record.verb, Verb::Wrap | Verb::Chat) {
         writeln!(
             w,
             "zirv ctx nudge: {} is an interactive session; the guidance is delivered as \
-             inbox mail plus an on-screen advisory, never typed into the agent",
+             inbox mail plus a one-line advisory (typed in only at a verified-idle \
+             boundary), never the message body itself",
             record.short
         )?;
     }
