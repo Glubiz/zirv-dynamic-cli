@@ -65,23 +65,26 @@ pub fn validate_flags(flags: &[String]) -> CtxResult<()> {
     Ok(())
 }
 
-/// Whether `flags` already pins an explicit model choice -- a bare
-/// `--model`/`-m`, or the `--model=value`/`-m=value` joined form. The
-/// operator's own choice always wins, so `worker_launch_flags` below never
-/// overrides it.
+/// Whether `flags` already pins an explicit model choice -- any form
+/// `adapters::classify_model_flag` recognises: `--model`/`-m` bare, the
+/// `--model=value`/`-m=value` joined form, or the attached `-mvalue` short
+/// form. The operator's own choice always wins, so `worker_launch_flags`
+/// below never overrides it.
 ///
 /// `-m` is codex's own verified short alias for `--model` (`CodexAdapter`'s
 /// doc comments around `distiller_cmd`/`model_args` in `adapters/codex.rs`,
 /// citing `codex exec --help`/top-level `codex --help`), so without it
-/// `zirv ctx agent codex "<prompt>" -- -m opus` with `worker.codex`
-/// configured got a conflicting `--model` prepended ahead of the operator's
-/// own `-m opus`. Recognising `-m` is harmless for claude, which has no such
-/// alias: treating it as pinning there only ever skips a prepend that would
-/// otherwise have happened, never breaks a launch.
+/// `zirv ctx agent codex "<prompt>" -- -m opus` (or the attached
+/// `-mopus`) with `worker.codex` configured got a conflicting `--model`
+/// prepended ahead of the operator's own flag. Recognising `-m` is harmless
+/// for claude, which has no such alias: treating it as pinning there only
+/// ever skips a prepend that would otherwise have happened, never breaks a
+/// launch. Shared with `adapters::last_model_flag` via `classify_model_flag`
+/// so the two can never drift on what counts as a model flag.
 fn flags_pin_model(flags: &[String]) -> bool {
     flags
         .iter()
-        .any(|f| f == "--model" || f.starts_with("--model=") || f == "-m" || f.starts_with("-m="))
+        .any(|f| adapters::classify_model_flag(f).is_some())
 }
 
 /// The effective trailing flags a delegated headless spawn launches with.
@@ -471,6 +474,44 @@ mod tests {
             worker_launch_flags(&cfg, "codex", &adapter, &joined),
             joined,
             "the -m=value joined form must also be recognised as already pinned"
+        );
+
+        // FIX 2 (round 2): the attached short form, `-mopus` with no
+        // separator at all, must be recognised too, or `zirv ctx agent
+        // codex "p" -- -mopus` with `worker.codex` configured gets a
+        // conflicting `--model` prepended ahead of the operator's own flag.
+        let attached = vec!["-mopus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &adapter, &attached),
+            attached,
+            "the attached -mvalue short form must also be recognised as already pinned"
+        );
+    }
+
+    /// A long flag that merely starts with `-m` once its leading `-` is
+    /// peeled (`--model-foo`) must not be misread as the attached short
+    /// form: `worker.codex`'s configured model still gets prepended ahead
+    /// of it, exactly as for any other unrelated flag.
+    #[test]
+    fn a_long_flag_starting_with_m_does_not_false_positive_as_pinning() {
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: None,
+                codex: Some("gpt-5.6-terra".to_string()),
+            },
+            ..CtxConfig::default()
+        };
+        let flags = vec!["--model-foo".to_string(), "opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &adapter, &flags),
+            vec![
+                "--model".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "--model-foo".to_string(),
+                "opus".to_string(),
+            ],
+            "an unrelated flag must not suppress the configured-model prepend"
         );
     }
 

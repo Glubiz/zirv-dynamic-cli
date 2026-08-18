@@ -43,31 +43,75 @@ pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 /// exactly like `SESSION_ENV`/`SOCKET_ENV`.
 pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
 
-/// The last `--model <value>` (two-token) or `--model=<value>` (joined)
-/// occurrence in `flags` -- CLI last-wins semantics, the same rule a real
-/// argv parser applies when a flag is repeated. `None` when `flags` names no
-/// model at all.
+/// How one argv token spells a model-selecting flag -- `--model`/`-m`, in
+/// separated (bare, value is the next token), joined-by-`=`
+/// (`--model=x`/`-m=x`), or (short form only) attached (`-mx`) form. Shared
+/// by `last_model_flag` below (which needs the value) and `agent::
+/// flags_pin_model` (which only needs to know a token pins something at
+/// all, never the value), so the two can never drift on what counts as a
+/// model flag between them.
 ///
-/// Deliberately scans only the two `--model` spellings, not codex's `-m`
-/// short alias: this feeds `seat_model_env`, which only ever sees the
-/// zirv-built launch argv (`extra_with_model`'s own output, always the long
-/// form -- see `AgentAdapter::model_args`) plus whatever the operator typed
-/// after `--`, and disclosure of a seat this scan misses only fails open
-/// (the pretool guard), never closed.
+/// `Separated` deliberately carries no value itself: `last_model_flag` reads
+/// the following token from `flags` when it wants one, and `flags_pin_model`
+/// never needs to at all -- the flag's own presence is enough to say
+/// "already pinned", matching the pre-existing bare `--model`/`-m` rule.
+pub(crate) enum ModelFlagForm<'a> {
+    Separated,
+    Joined(&'a str),
+}
+
+/// Classifies `arg`, or `None` when it is not a model flag at all.
+///
+/// The attached short form (`-mopus`) is recognised only when `arg` is not
+/// itself a `--`-prefixed long flag -- `--model-foo` starts with `-m` too,
+/// once its own leading `-` is peeled, and must not match -- and carries at
+/// least one character of value (`arg.len() > 2`, so a bare `-m` is
+/// `Separated`, not an attached value of `""`).
+pub(crate) fn classify_model_flag(arg: &str) -> Option<ModelFlagForm<'_>> {
+    if arg == "--model" || arg == "-m" {
+        return Some(ModelFlagForm::Separated);
+    }
+    if let Some(value) = arg.strip_prefix("--model=") {
+        return Some(ModelFlagForm::Joined(value));
+    }
+    if let Some(value) = arg.strip_prefix("-m=") {
+        return Some(ModelFlagForm::Joined(value));
+    }
+    if !arg.starts_with("--") && arg.starts_with("-m") && arg.len() > 2 {
+        return Some(ModelFlagForm::Joined(&arg[2..]));
+    }
+    None
+}
+
+/// The last model-flag occurrence in `flags`, in any form `classify_model_
+/// flag` recognises -- CLI last-wins semantics, the same rule a real argv
+/// parser applies when a flag is repeated, honored across mixed spellings
+/// (a later `-mhaiku` still overrides an earlier `--model opus`). `None`
+/// when `flags` names no model at all, or when a trailing bare `--model`/
+/// `-m` has nothing after it to be its value -- a dangling flag with no
+/// value contributes nothing, it does not clear an earlier match.
+///
+/// Recognises codex's `-m` short alias (all three forms) as well as
+/// claude's long `--model`, unlike the version of this function before FIX
+/// A: this feeds `seat_model_env`, and a codex-adapter launch built with a
+/// bare `-m <expensive>`/`-m=<expensive>`/`-m<expensive>` passthrough used
+/// to export no seat env at all, leaving the pretool guard blind to it.
 fn last_model_flag(flags: &[String]) -> Option<&str> {
     let mut found = None;
     let mut i = 0;
     while i < flags.len() {
-        let arg = flags[i].as_str();
-        if arg == "--model" {
-            if let Some(value) = flags.get(i + 1) {
-                found = Some(value.as_str());
+        match classify_model_flag(&flags[i]) {
+            Some(ModelFlagForm::Separated) => {
+                if let Some(value) = flags.get(i + 1) {
+                    found = Some(value.as_str());
+                }
+                i += 2;
+                continue;
             }
-            i += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--model=") {
-            found = Some(value);
+            Some(ModelFlagForm::Joined(value)) => {
+                found = Some(value);
+            }
+            None => {}
         }
         i += 1;
     }
@@ -2793,5 +2837,74 @@ mod tests {
             worker_model_args(&cfg, "codex", &adapter),
             vec!["--model".to_string(), "gpt-5.6-terra".to_string()],
         );
+    }
+
+    // FIX A: `last_model_flag` recognises codex's `-m` short alias in every
+    // form, not just claude's long `--model`.
+
+    fn flags(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn last_model_flag_reads_the_separated_short_form() {
+        assert_eq!(last_model_flag(&flags(&["-m", "opus"])), Some("opus"));
+    }
+
+    #[test]
+    fn last_model_flag_reads_the_joined_equals_short_form() {
+        assert_eq!(last_model_flag(&flags(&["-m=opus"])), Some("opus"));
+    }
+
+    #[test]
+    fn last_model_flag_reads_the_attached_short_form() {
+        assert_eq!(last_model_flag(&flags(&["-mopus"])), Some("opus"));
+    }
+
+    /// Last occurrence wins across every mixed spelling -- long, short
+    /// separated, short joined, short attached -- in argv order.
+    #[test]
+    fn last_model_flag_last_wins_across_mixed_forms() {
+        assert_eq!(
+            last_model_flag(&flags(&["--model", "opus", "-mhaiku"])),
+            Some("haiku"),
+            "a later attached -m overrides an earlier long --model"
+        );
+        assert_eq!(
+            last_model_flag(&flags(&["-mopus", "--model=sonnet"])),
+            Some("sonnet"),
+            "a later joined --model= overrides an earlier attached -m"
+        );
+        assert_eq!(
+            last_model_flag(&flags(&["-m", "opus", "-m=haiku", "-msonnet"])),
+            Some("sonnet"),
+            "every short form in argv order, last wins"
+        );
+    }
+
+    /// `--model-foo` starts with `-m` once its own leading `-` is peeled,
+    /// but it is a `--`-prefixed long flag, not codex's short alias, and
+    /// must never be misread as `-m` with an attached value of `odel-foo`.
+    #[test]
+    fn a_long_flag_that_merely_starts_with_m_does_not_match() {
+        assert_eq!(last_model_flag(&flags(&["--model-foo", "opus"])), None);
+    }
+
+    /// A bare `-m` with nothing after it (end of args) has no value to
+    /// contribute -- it must not be read as naming an empty/wrong model, and
+    /// must not clear an earlier real match either.
+    #[test]
+    fn a_trailing_bare_short_flag_with_no_value_contributes_nothing() {
+        assert_eq!(last_model_flag(&flags(&["-m"])), None);
+        assert_eq!(
+            last_model_flag(&flags(&["-m", "opus", "-m"])),
+            Some("opus"),
+            "a later dangling -m must not erase the earlier real match"
+        );
+    }
+
+    #[test]
+    fn last_model_flag_returns_none_with_no_model_flag_at_all() {
+        assert_eq!(last_model_flag(&flags(&["--verbose", "-x"])), None);
     }
 }
