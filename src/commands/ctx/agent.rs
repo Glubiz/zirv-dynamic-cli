@@ -239,8 +239,9 @@ const EXIT_DASH_UNCONFIRMED: i32 = 1;
 /// `None` means the caller falls through to today's headless behavior
 /// unchanged, which covers: no dashboard to ask (env unset, or the directory
 /// is gone -- both silent, byte-for-byte the pre-Task-11 behavior); options a
-/// pane cannot honour (`--max-restarts`/`--timeout-secs`/`-- flags`, notice
-/// printed); a prompt that would be misread as a flag (notice printed); a
+/// pane cannot honour (`--max-restarts`/`--timeout-secs`/`-- flags` other than
+/// a bare `--model` pin, notice printed); a prompt that would be misread as a
+/// flag (notice printed); a
 /// request that could not even be written (notice printed); an unclaimed ack
 /// timeout (notice printed, since that is a live channel that simply did not
 /// respond); and a `retryable` refusal, where the dashboard has answered that
@@ -267,10 +268,21 @@ fn try_join_dashboard<W: Write>(
     // `--quiet` is deliberately still allowed: it only shapes the
     // announcement channel of a run that is not happening in this process
     // anyway.
-    if args.max_restarts.is_some() || args.timeout_secs.is_some() || !args.flags.is_empty() {
+    // A model pin is the one trailing flag a pane *can* honour -- it travels
+    // in the request and the pane builds it into its own argv -- and the
+    // harness layer now teaches orchestrators to write one on every
+    // delegation, so declining the pane for it would cost a dashboard session
+    // a visible pane per delegated task. Anything else in `flags` still
+    // declines: honouring some of what the operator typed and dropping the
+    // rest would be worse than not using the dashboard at all.
+    let pinned_model = super::adapters::model_only_flags(&args.flags);
+    if args.max_restarts.is_some()
+        || args.timeout_secs.is_some()
+        || (!args.flags.is_empty() && pinned_model.is_none())
+    {
         eprintln!(
-            "zirv ctx agent: dashboard panes don't support --max-restarts/--timeout-secs/-- flags; \
-             running headless"
+            "zirv ctx agent: dashboard panes don't support --max-restarts/--timeout-secs/-- flags \
+             other than a --model pin; running headless"
         );
         return None;
     }
@@ -296,6 +308,7 @@ fn try_join_dashboard<W: Write>(
         prompt: prompt.to_string(),
         cwd: repo.to_path_buf(),
         requested_by,
+        model: pinned_model.map(str::to_string),
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -962,6 +975,41 @@ mod tests {
         );
     }
 
+    /// A lone `--model` pin is the one trailing flag a pane can honour, so it
+    /// joins the dashboard instead of declining to the headless path -- the
+    /// harness layer now teaches orchestrators to write one on every
+    /// delegation, and declining would cost a dashboard session its pane every
+    /// time. The pinned model travels in the request, for the fulfilment side
+    /// to build into the pane's own argv.
+    #[test]
+    fn a_lone_model_pin_still_joins_the_dashboard_and_travels_in_the_request() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
+        });
+
+        let mut args = joinable_args("claude", "go");
+        args.flags = vec!["--model".to_string(), "haiku".to_string()];
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let req: spawnreq::SpawnRequest =
+            serde_json::from_str(&request_body).expect("the request parses");
+        assert_eq!(
+            req.model.as_deref(),
+            Some("haiku"),
+            "the pinned model reaches the fulfilment side: {request_body}"
+        );
+    }
+
     /// A refusal ack (the dashboard's own `cfg.agents.refusal` gate, or an
     /// unknown/unready adapter) prints the reason and returns `Ok(1)` --
     /// still short-circuiting the headless path, since the dashboard already
@@ -1070,7 +1118,17 @@ mod tests {
         for mutate in [
             (|a: &mut AgentArgs| a.max_restarts = Some(2)) as fn(&mut AgentArgs),
             |a: &mut AgentArgs| a.timeout_secs = Some(90),
-            |a: &mut AgentArgs| a.flags = vec!["--model".to_string(), "opus".to_string()],
+            |a: &mut AgentArgs| a.flags = vec!["--verbose".to_string()],
+            // A model pin plus anything else is still a decline: honouring
+            // half of what the operator typed is worse than not using the
+            // dashboard at all.
+            |a: &mut AgentArgs| {
+                a.flags = vec![
+                    "--model".to_string(),
+                    "haiku".to_string(),
+                    "--verbose".to_string(),
+                ]
+            },
         ] {
             let mut args = joinable_args("claude", "go");
             mutate(&mut args);

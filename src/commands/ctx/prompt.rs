@@ -82,7 +82,9 @@ dashboard it instead spawns an attached pane and returns that pane's short id st
 work continues in that pane, which is visible in the dashboard and addressable by that short id \
 with `zirv ctx nudge` and `zirv ctx send`, and a worker spawned from this session is instructed to \
 report its outcome back to this session by mail when it finishes (`zirv ctx inbox`). Either way \
-the worker runs unattended and must not delegate further.
+the worker runs unattended and must not delegate further. Pick the cheapest model that can do the \
+delegated task and name it as a trailing flag -- `zirv agent <name> \"<prompt>\" -- --model <m>` -- \
+or omit it to use the operator's own default worker tier.
 - Use zirv on your own initiative, without waiting to be asked: delegate substantial independent \
 work to another harness with `zirv agent`; check `zirv ctx status` and `zirv ctx inbox` at natural \
 checkpoints (task start, after long steps, before reporting done); steer a live worker with `zirv \
@@ -2890,6 +2892,25 @@ mod tests {
             !HARNESS_PROMPT.contains("results arriving by mail"),
             "the old unbacked promise is gone:\n{HARNESS_PROMPT}"
         );
+    }
+
+    /// The orchestrator is taught to route a delegated worker's model too: the
+    /// trailing-flag form `zirv ctx agent` already honours (`adapters::
+    /// classify_model_flag` recognises every spelling), plus the policy in one
+    /// sentence. No new flag machinery -- naming the form the CLI already takes
+    /// is the whole change.
+    #[test]
+    fn the_harness_layer_teaches_model_routing_for_delegated_workers() {
+        for claim in [
+            "zirv agent <name> \"<prompt>\" -- --model <m>",
+            "cheapest model that can do the delegated task",
+            "operator's own default worker tier",
+        ] {
+            assert!(
+                HARNESS_PROMPT.contains(claim),
+                "the delegation bullet must say '{claim}':\n{HARNESS_PROMPT}"
+            );
+        }
     }
 
     /// TASK 2: the cross-harness review round is for a substantive or risky

@@ -1849,6 +1849,39 @@ fn compose_worker_prompt(
     (composed, mail_entries, mail_messages)
 }
 
+/// The model flags one worker pane launches with.
+///
+/// A spawn request carries no trailing flags of the operator's own except one:
+/// the model this worker was pinned to (`zirv agent <name> "<prompt>" --
+/// --model <m>`, which `agent::try_join_dashboard` recognises; a request
+/// carrying anything else never reaches the dashboard at all). That pin wins
+/// over the operator's resolved worker default, the same precedence
+/// `agent.rs`'s own `worker_launch_flags` applies on the headless path.
+///
+/// Re-checked here rather than trusted: `req.model` becomes an argv token, so a
+/// blank or flag-shaped value falls back to the resolved default instead --
+/// the same authority-side defense in depth the request's prompt gets from
+/// `argv_unsafe_prompt`, rather than relying on the requester's own filtering.
+///
+/// Split out of `fulfill_spawn_request` for the same reason
+/// `compose_worker_prompt` is: what a worker pane actually launches with stays
+/// testable without spawning a pty.
+fn pane_model_args(
+    req: &spawnreq::SpawnRequest,
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+) -> Vec<String> {
+    match req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !argv_unsafe_prompt(model))
+    {
+        Some(model) => adapter.model_args(model),
+        None => adapters::worker_model_args(cfg, &req.agent, adapter),
+    }
+}
+
 /// Low 7: both `render_mail_block` and `render_report_back_block` open with
 /// a `"\n\n---\n\n"` separator meant to set their labeled content apart from
 /// the real task prompt text *above* it. When `req_prompt` is empty or
@@ -2066,17 +2099,7 @@ fn fulfill_spawn_request(
     let effective_prompt =
         worker_task_prompt(req, adapter.as_ref(), &mail_messages, cfg, fallback_is_safe);
 
-    // A spawn request never carries the operator's own trailing flags (a
-    // request with any set falls back to the headless path in `agent.rs`
-    // before it ever reaches here -- see `try_join_dashboard`'s own
-    // options-a-pane-cannot-honour check), so there is no "operator already
-    // pinned --model" case to detect on this path, unlike `agent.rs`'s own
-    // `worker_launch_flags`: the resolved worker model (config or the
-    // adapter's own hard default) always applies. Prepended ahead of the
-    // prompt/session-pin args -- appended as trailing extras, not spliced
-    // into an already-built argv, the same discipline `chat.rs`'s own
-    // `extra_with_model` follows for the orchestrator pane.
-    let mut extra = adapters::worker_model_args(cfg, &req.agent, adapter.as_ref());
+    let mut extra = pane_model_args(req, cfg, adapter.as_ref());
     extra.extend(pane_launch_extra(
         adapter.as_ref(),
         prompt_args,
@@ -3804,6 +3827,11 @@ pub fn run_dashboard(
                                                     prompt,
                                                     cwd: repo.to_path_buf(),
                                                     requested_by: dashboard_short.clone(),
+                                                    // The overlay asks for an agent and
+                                                    // a prompt, nothing else, so this
+                                                    // spawn takes the operator's own
+                                                    // configured worker default.
+                                                    model: None,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 let fulfilled = fulfill_spawn_request(
@@ -6584,6 +6612,51 @@ mod tests {
             prompt: prompt.to_string(),
             cwd: cwd.to_path_buf(),
             requested_by: "aaaa1111".to_string(),
+            model: None,
+        }
+    }
+
+    /// The pin an orchestrator wrote (`zirv agent claude "..." -- --model
+    /// haiku`) is what the pane launches with, ahead of the operator's own
+    /// configured worker default: a delegation that named its own model must
+    /// not be silently re-pointed at a pricier one.
+    #[test]
+    fn a_pinned_request_model_beats_the_configured_worker_default_for_a_pane() {
+        let adapter = adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: Some("opus".to_string()),
+                codex: None,
+            },
+            ..CtxConfig::default()
+        };
+        let mut req = spawn_request("go", Path::new("/repo"));
+        req.model = Some("haiku".to_string());
+
+        assert_eq!(
+            pane_model_args(&req, &cfg, &adapter),
+            vec!["--model".to_string(), "haiku".to_string()]
+        );
+    }
+
+    /// No pin, and a pin the authority side refuses to build an argv token out
+    /// of, both fall back to the resolved worker default. A request is data,
+    /// never authority: this end re-checks the value even though
+    /// `agent::try_join_dashboard` already filtered it.
+    #[test]
+    fn a_missing_or_flag_shaped_request_model_falls_back_to_the_worker_default() {
+        let adapter = adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let sonnet = vec!["--model".to_string(), "sonnet".to_string()];
+
+        for model in [None, Some("  "), Some("--dangerously-skip-permissions")] {
+            let mut req = spawn_request("go", Path::new("/repo"));
+            req.model = model.map(str::to_string);
+            assert_eq!(
+                pane_model_args(&req, &cfg, &adapter),
+                sonnet,
+                "claude's own worker default applies for {model:?}"
+            );
         }
     }
 

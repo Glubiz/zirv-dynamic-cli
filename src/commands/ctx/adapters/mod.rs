@@ -118,6 +118,42 @@ fn last_model_flag(flags: &[String]) -> Option<&str> {
     found
 }
 
+/// The model `flags` pins when it pins **nothing else** -- every token in it
+/// is part of one model flag, in any form `classify_model_flag` recognises.
+/// `None` when `flags` is empty, names any other flag, leaves a bare
+/// `--model`/`-m` dangling with no value, or names a value that is itself
+/// flag-shaped (a leading `-` is never a model name, and this value becomes an
+/// argv token).
+///
+/// The one caller is `agent::try_join_dashboard`: a dashboard pane cannot
+/// honour arbitrary trailing flags (they belong to `exec::run_with`), so a
+/// request carrying any declines the pane and runs headless. A model pin is
+/// the exception the harness layer now teaches orchestrators to write on every
+/// delegation, and it is the one flag a pane *can* honour, since the pane
+/// builds its own argv from a resolved worker model anyway -- so recognising
+/// exactly that shape is what keeps "pick the cheapest model" from silently
+/// costing every dashboard delegation its pane.
+pub(crate) fn model_only_flags(flags: &[String]) -> Option<&str> {
+    let mut found = None;
+    let mut i = 0;
+    while i < flags.len() {
+        match classify_model_flag(&flags[i]) {
+            Some(ModelFlagForm::Separated) => {
+                found = Some(flags.get(i + 1)?.as_str());
+                i += 2;
+            }
+            Some(ModelFlagForm::Joined(value)) => {
+                found = Some(value);
+                i += 1;
+            }
+            None => return None,
+        }
+    }
+    found
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.starts_with('-'))
+}
+
 /// The `SEAT_MODEL_ENV` pair a launch exports, or nothing. Pure, so which
 /// launches disclose a seat is testable without a pty.
 ///
@@ -2922,5 +2958,55 @@ mod tests {
     #[test]
     fn last_model_flag_returns_none_with_no_model_flag_at_all() {
         assert_eq!(last_model_flag(&flags(&["--verbose", "-x"])), None);
+    }
+
+    // `model_only_flags`: the one trailing-flag shape a dashboard pane can
+    // honour, in every spelling `classify_model_flag` reads.
+
+    #[test]
+    fn model_only_flags_reads_every_spelling_of_a_lone_model_pin() {
+        for spelling in [
+            vec!["--model", "haiku"],
+            vec!["--model=haiku"],
+            vec!["-m", "haiku"],
+            vec!["-m=haiku"],
+            vec!["-mhaiku"],
+        ] {
+            assert_eq!(
+                model_only_flags(&flags(&spelling)),
+                Some("haiku"),
+                "{spelling:?} pins a model and nothing else"
+            );
+        }
+    }
+
+    /// Anything beyond a model pin means the pane cannot honour what the
+    /// operator typed, so the delegation goes headless instead of silently
+    /// dropping the rest.
+    #[test]
+    fn model_only_flags_rejects_flags_a_pane_cannot_honour() {
+        for other in [
+            vec![],
+            vec!["--verbose"],
+            vec!["--model", "haiku", "--verbose"],
+            vec!["--dangerously-skip-permissions", "--model=haiku"],
+        ] {
+            assert_eq!(
+                model_only_flags(&flags(&other)),
+                None,
+                "{other:?} is not a lone model pin"
+            );
+        }
+    }
+
+    /// A pin with no usable value is not a pin: a dangling bare flag, a blank
+    /// value, and a flag-shaped value all decline the pane rather than build a
+    /// `--model` argv token out of nonsense.
+    #[test]
+    fn model_only_flags_rejects_a_pin_with_no_usable_value() {
+        assert_eq!(model_only_flags(&flags(&["--model"])), None);
+        assert_eq!(model_only_flags(&flags(&["--model", "  "])), None);
+        assert_eq!(model_only_flags(&flags(&["--model="])), None);
+        assert_eq!(model_only_flags(&flags(&["--model", "--verbose"])), None);
     }
 }
