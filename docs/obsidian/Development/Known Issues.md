@@ -648,14 +648,23 @@ the default parallel test runner.
 ## `wrap`'s pty-harness tests wedge their spawned child on at least one macOS machine
 
 Every `#[cfg(unix)]` test in `wrap.rs` that goes through `spawn_wrap`/`spawn_wrap_with_flags`
-(24 as of 2026-08-19; a local run skips 27, adding the three that open a pty directly with
-`native_pty_system`) hangs on one reference macOS machine (Darwin 25.5.0): the spawned
+(21 as of 2026-08-19; a local skip list wants 24, adding the three that open a pty directly
+with `native_pty_system`) hangs on one reference macOS machine (Darwin 25.5.0): the spawned
 `zirv ctx wrap` child reaches kernel
 exit state `?Es` after its `/exit` and never reaps, so the test blocks forever in
 `Child::wait`. **Pre-existing and unrelated to any branch** — A/B-verified 6/6 against
 unmodified `main`, both sandboxed and unsandboxed. Killing the parent test binary's specific
 pid clears the wedge (never `pkill`/`killall` by name — other real sessions share those
 names). Linux CI runs the whole family normally, and it is the authority for them.
+
+Two traps when building that skip list, both hit on 2026-08-19: three *windows-only* tests
+inside `#[cfg(windows)] mod win` have their own `spawn_wrap` helper, so a grep for the helper
+name over the whole file returns 27 and three of those names do not exist on macOS at all
+(`--skip` on a name nothing matches is silently a no-op, and the runner's own "N filtered out"
+count is what gives it away); and `cargo test` must be run with stdin closed
+(`< /dev/null`), or `commands::ctx::tests::a_rejected_statusline_tee_still_exits_zero` — which
+exercises `zirv ctx usage tee`, and so reads stdin to EOF — blocks the whole suite
+indefinitely, roughly two thirds of the way through, with no failure output.
 
 Practical consequence: a full local suite on such a machine must skip the family, e.g. one
 `--skip commands::ctx::wrap::tests::<name>` per test, and any change to a pty test's own
