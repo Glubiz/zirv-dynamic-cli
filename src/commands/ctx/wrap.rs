@@ -1401,11 +1401,19 @@ pub fn run_with(
     // `adapters::seat_model_env`. Kept in `turn_env` for the same reason
     // `AGENT_ENV` is: a relaunch reuses this exact vector, and the fresh
     // session sits in the same seat.
-    turn_env.extend(adapters::seat_model_env(
-        role,
-        rest,
-        cfg.chat.model.as_deref(),
-    ));
+    //
+    // Only a `chat` launch may fall back to `cfg.chat.model`: that is `chat`'s
+    // own knob, spliced into the argv it hands us (`chat::extra_with_model`),
+    // so for that caller the fallback and `rest` agree anyway. The bare `wrap`
+    // verb never applies it, and became an Orchestrator (so it reaches this at
+    // all) only once the role also picked its prompt layers -- claiming a
+    // configured model this launch did not spawn with would have the guard
+    // refuse dispatches at a tier the session is not actually on.
+    let seat_cfg_model = match verb {
+        super::sessions::Verb::Chat => cfg.chat.model.as_deref(),
+        _ => None,
+    };
+    turn_env.extend(adapters::seat_model_env(role, rest, seat_cfg_model));
     // Scrubbed before any of it is applied -- see `apply_session_env`. When
     // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
     // scrub is the only thing standing between this child and the outer
