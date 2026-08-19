@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-18
+last-verified: 2026-08-19
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-19 (feat/chat-token-economy, role-gated worker prompt): recorded three gotchas -- the user-layer role split means a Worker no longer reads ~/.zirv/system-prompt.md at all (an operator with standing worker instructions must create ~/.zirv/system-prompt.worker.md), wrap's pty-harness tests wedge a spawned child in kernel exit state ?Es on this macOS machine (pre-existing on unmodified main, A/B-verified, run them on Linux CI), and five exec nudge tests time out (exit 76) intermittently in a full-suite batch while passing in isolation -->
 <!-- Updated 2026-08-18 (feat/chat-token-economy, live inter-session messaging): recorded that on a standalone-installer codex-cli 0.147.0 with [windows] sandbox = "elevated", `codex exec --sandbox read-only` fails outright with a missing-helper error, so CodexAdapter::distiller_cmd's pinned --sandbox read-only breaks optimize/handoff on such installs until the sandbox helper exists or the pin is made conditional -->
 <!-- Updated 2026-08-18 (feat/chat-token-economy, live inter-session messaging): recorded that a nudge/mail delivery queued for a live codex dashboard pane before dash.idle_quiet_ms output-quiescence existed simply waited forever, since a signal-less pane never reported Idle at all -- now resolved by pane_is_idle's signal-less branch, kept here as a historical trap for anyone reading an older build's behavior -->
 <!-- Updated 2026-08-18 (feat/chat-token-economy): recorded an operator-machine gotcha -- a ~/.codex/config.toml model pin unsupported by a ChatGPT-plan login breaks every zirv codex delegation with a 400, since zirv passes no --model by default; resolved on this machine by removing the pin -->
@@ -604,6 +605,21 @@ fails with `prefix too short`, and — if its cleanup runs after the call —
 can leak `FAKE_AGENT_*` environment variables into every later test in the
 same process.
 
+## A delegated worker no longer reads `~/.zirv/system-prompt.md` at all
+
+The user prompt layer became role-scoped on 2026-08-19: an Orchestrator session reads
+`~/.zirv/system-prompt.md` as before, a Worker session reads the separate, optional
+`~/.zirv/system-prompt.worker.md` (`prompt::WORKER_PROMPT_FILE`) instead, and **neither role
+reads the other's file**. Before the split a Worker read `system-prompt.md` too, so an
+operator whose standing instructions there were partly aimed at delegated workers silently
+loses that half on upgrade: the fix is to copy the worker-relevant part into the new file.
+Nothing warns about this — an absent worker file is a completely normal state (it means "no
+worker user layer", exactly like an absent `system-prompt.md` means no orchestrator one), so
+there is no signal zirv could honestly distinguish from an operator who never wanted one.
+Both files live in the operator's home directory; a repo checkout has no equivalent (its own
+`.zirv/system-prompt.md` is still the single, capped, labeled Repo layer for both roles).
+See [[Utilities]] for the layer list and [[Decision Log]] for the reasoning.
+
 ## `ctx` shadows `.zirv/ctx.yaml`
 
 `zirv ctx` is a built-in resolved in `main.rs` before YAML script lookup, so a
@@ -628,6 +644,36 @@ worth knowing: a mis-cased built-in like `zirv Help` now exits 1 with
 `cargo test --verbose -- --test-threads=1` is required, not optional — tests
 share state (state dir, fixtures) and will flake or corrupt each other under
 the default parallel test runner.
+
+## `wrap`'s pty-harness tests wedge their spawned child on at least one macOS machine
+
+Every `#[cfg(unix)]` test in `wrap.rs` that goes through `spawn_wrap`/`spawn_wrap_with_flags`
+(27 of them as of 2026-08-19, including the four `native_pty_system`-direct ones) hangs on
+one reference macOS machine (Darwin 25.5.0): the spawned `zirv ctx wrap` child reaches kernel
+exit state `?Es` after its `/exit` and never reaps, so the test blocks forever in
+`Child::wait`. **Pre-existing and unrelated to any branch** — A/B-verified 6/6 against
+unmodified `main`, both sandboxed and unsandboxed. Killing the parent test binary's specific
+pid clears the wedge (never `pkill`/`killall` by name — other real sessions share those
+names). Linux CI runs the whole family normally, and it is the authority for them.
+
+Practical consequence: a full local suite on such a machine must skip the family, e.g. one
+`--skip commands::ctx::wrap::tests::<name>` per test, and any change to a pty test's own
+synchronisation can only be reasoned about locally, not executed — see the 2026-08-19
+[[Work Journal]] entry for a change made under exactly that constraint.
+
+## Five `exec` nudge tests time out intermittently in a full-suite batch
+
+`commands::ctx::exec::tests::a_nudge_on_a_simple_codex_run_still_delivers_its_own_guidance`,
+`…::a_nudge_on_an_explicit_command_codex_run_delivers_the_nudge_mail_on_the_relaunch`,
+`…::a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_launch_mail`,
+`…::a_nudge_restart_does_not_spend_the_rot_restart_budget`, and
+`…::a_headless_worker_stops_at_the_next_poll_and_relaunches_with_the_guidance` fail with
+exit-76 (`EXIT_TIMEOUT`) assertions when run as part of a full `cargo test -- --test-threads=1`
+sweep, and pass when run alone or as a small filtered set. Pre-existing on `main`, not
+branch-specific: these tests spawn real supervised children with wall-clock timeouts, and a
+loaded machine partway through a ~15-minute suite is enough to miss one. If the quartet (or
+this fifth) is red after a full sweep, rerun just that family before treating it as a
+regression, and report both outcomes rather than either alone.
 
 ## `wrap`'s hot path assumes `panic = "abort"`
 

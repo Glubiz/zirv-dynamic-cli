@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-18
+last-verified: 2026-08-19
 ---
 
 # Decision Log
@@ -23,6 +23,14 @@ last-verified: 2026-08-18
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-19 — `PromptRole` gates every role-specific layer, not just the harness one; the bare `wrap` verb is an Orchestrator
+**Context:** `PromptRole` only ever gated `HARNESS_PROMPT` and the roster. The adapter layer was role-blind, so a delegated headless worker received claude's `ORCHESTRATOR_PROMPT` — "delegate every substantive piece of work to subagents" — which is exactly the recursion `zirv agent` workers must not do, and the operator's `~/.zirv/system-prompt.md` went to workers whether or not it was written for one.
+**Decision:** The role now picks all three: the harness layer (as before), the adapter layer (`base_system_prompt` for an Orchestrator, the new `worker_system_prompt` for a Worker — claude's `WORKER_PROMPT`: execute the brief, never delegate onward, no fork subagents, report compactly), and the user-layer file (`system-prompt.md` vs the new optional `system-prompt.worker.md`). Exactly one adapter layer reaches any launch. The bare `zirv ctx wrap` verb switched from `Worker` to `Orchestrator`, which is what it always was in substance — an operator driving a command themselves, the seat CLAUDE.md classes with `chat`.
+**Rejected:** Keeping one shared user file and letting the adapter layer stay role-blind — the layer's own text is what invites the recursion, so scoping the harness layer alone was never the whole fix. Warning an operator that their worker file is missing: absence is the normal state, indistinguishable from not wanting one.
+**Consequences (migration, in the operator's home, not any repo):** a Worker no longer reads `~/.zirv/system-prompt.md` at all, so standing worker instructions there must be copied into `~/.zirv/system-prompt.worker.md` to survive — silently lost otherwise (see [[Known Issues]]). Leaving the bare verb on `Worker` would have injected worker conventions into an operator's own interactive session and dropped their user layer, which is `wrap`'s one prohibition. Dashboard **worker panes** are unchanged and still get no adapter layer at all: `compose_worker_prompt` never spliced one, and giving them the worker layer is a separate change (recorded as a residual, not done here).
+**Also this round:** `HARNESS_PROMPT` (still v5) teaches naming a model on delegation (`zirv agent <n> "<p>" -- --model <m>`), and `agent::try_join_dashboard` stopped declining the dashboard for a **lone** model pin — it travels in the `SpawnRequest` and is re-checked at the authority side — since otherwise that new guidance would have cost a dashboard session its visible pane on every delegated task.
+**Spec / link:** [[Utilities]] (layer list), [[Ctx Adapters]], [[Ctx Supervisors]].
 
 ### 2026-08-18 — Live mail delivery still never hands an orchestrator a message body, only a one-line advisory
 **Context:** Mail delivery had stayed advisory-only for every interactive session (`chat`/`wrap`, and a dashboard's orchestrator pane) since the original mail design — a human at the keyboard could always run `zirv ctx inbox`. That advisory previously only ever reached stderr/a header segment, so an operator not watching the chrome could miss it indefinitely, and a signal-less (codex) pane could never even be swept because it never reported `Idle`.
