@@ -36,7 +36,7 @@ use ratatui::layout::{Position, Rect};
 use super::CtxResult;
 use super::adapters;
 use super::adapters::AgentAdapter;
-use super::config::{CtxConfig, EnvLookup};
+use super::config::{CtxConfig, EnvLookup, validate_model_str};
 use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
 use super::term;
@@ -1862,6 +1862,11 @@ fn compose_worker_prompt(
 /// blank or flag-shaped value falls back to the resolved default instead --
 /// the same authority-side defense in depth the request's prompt gets from
 /// `argv_unsafe_prompt`, rather than relying on the requester's own filtering.
+/// It also has to pass `validate_model_str`'s own charset/length/leading-dash
+/// guard, the same one `config.rs` applies to `worker.claude`/`worker.codex`
+/// before either ever reaches a launch argv: a request's `model` reaches this
+/// pane's argv exactly the same way, so an over-long or bad-charset value
+/// falls back to the configured default rather than reaching `model_args`.
 ///
 /// Split out of `fulfill_spawn_request` for the same reason
 /// `compose_worker_prompt` is: what a worker pane actually launches with stays
@@ -1871,12 +1876,11 @@ fn pane_model_args(
     cfg: &CtxConfig,
     adapter: &dyn AgentAdapter,
 ) -> Vec<String> {
-    match req
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty() && !argv_unsafe_prompt(model))
-    {
+    match req.model.as_deref().map(str::trim).filter(|model| {
+        !model.is_empty()
+            && !argv_unsafe_prompt(model)
+            && validate_model_str("spawn_request.model", model).is_ok()
+    }) {
         Some(model) => adapter.model_args(model),
         None => adapters::worker_model_args(cfg, &req.agent, adapter),
     }
@@ -6648,8 +6652,18 @@ mod tests {
         let adapter = adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let sonnet = vec!["--model".to_string(), "sonnet".to_string()];
+        let too_long = "a".repeat(129);
 
-        for model in [None, Some("  "), Some("--dangerously-skip-permissions")] {
+        for model in [
+            None,
+            Some("  "),
+            Some("--dangerously-skip-permissions"),
+            // Bad charset: would still fail `argv_unsafe_prompt` (no leading
+            // `-`), so this is `validate_model_str`'s own guard being what
+            // catches it.
+            Some("claude; rm -rf /"),
+            Some(too_long.as_str()),
+        ] {
             let mut req = spawn_request("go", Path::new("/repo"));
             req.model = model.map(str::to_string);
             assert_eq!(

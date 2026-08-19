@@ -1125,7 +1125,13 @@ impl CtxConfig {
 /// cmd.exe-reparse threat model this defends against. `key` is the dotted
 /// config path named in the returned error, so a caller can tell which of
 /// several model fields failed.
-fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
+///
+/// `pub(crate)`: `dash/mod.rs`'s `pane_model_args` also needs this exact
+/// guard, for the same reason -- a dashboard spawn request's `model` reaches
+/// a launch argv just like `worker.claude`/`worker.codex` do, so it gets the
+/// same charset/length/leading-dash check rather than a second, possibly
+/// drifting copy of it.
+pub(crate) fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
     if model.is_empty()
         || model.len() > 128
         // A leading `-` would let the value pose as its own flag on the
