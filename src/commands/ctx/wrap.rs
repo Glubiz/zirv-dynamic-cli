@@ -4780,6 +4780,20 @@ mod tests {
             "the first idle poll advises: {first:?}"
         );
 
+        // Drain the stub's own `echo:` response to the injected advisory
+        // before phase 2: `read_until` above stops at the typed line's pty
+        // echo, so the stub's echo of that same line may still be in flight,
+        // and a later read would mistake that leftover for a second
+        // advisory. The stub answers lines in order, so once the sync
+        // sentinel's echo is back, the advisory's echo is fully consumed.
+        h.writer.write_all(b"sync-after-advisory\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(
+            &mut h.reader,
+            "echo: sync-after-advisory",
+            Duration::from_secs(10),
+        );
+
         // A second turn boundary, no new mail in between. Long enough for
         // several `MAIL_POLL` ticks to come and go.
         crate::commands::ctx::signal::send(&socket, &turn_signal(4, Verdict::Healthy))
