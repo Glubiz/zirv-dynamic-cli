@@ -9,3 +9,6 @@ tests/fixtures/claude-session.raw
 /.obsidian/
 # User-local Obsidian pane state inside the vault
 docs/obsidian/.obsidian/workspace*.json
+
+# Session scratch from agent harnesses
+.superpowers/
