@@ -803,22 +803,6 @@ pub fn extract_user_prompt_flag(
     Ok((cleaned, extracted))
 }
 
-/// Splices the launched agent's own base layer in directly after the shipped
-/// default and before every layer a human wrote, so the user, repo and
-/// command-line layers all still append after it and still take precedence
-/// over it. `None` in means `None` out, exactly like the command-line layer:
-/// `--simple` and a disabled prompt suppress this layer with all the others.
-///
-/// Spliced rather than appended because `compose` cannot see the adapter (it
-/// runs before the launch is known) and this layer is a base, not an
-/// override. `compose` always begins the text with `DEFAULT_PROMPT` verbatim,
-/// so its length is the insertion point exactly: no scanning for a separator
-/// that a layer's own text could contain. That also means `insert(1, ..)`
-/// works regardless of whether the harness layer already sits at index 1 (an
-/// orchestrator role): it always lands right after `Default`, pushing the
-/// harness (and, when present, harness-roster) layers down by one rather
-/// than replacing them, so the final order is Default -> Adapter -> Harness
-/// -> Harnesses -> Memory -> User -> Repo -> CommandLine.
 /// Re-applies the two launch-time layers -- the adapter layer and the
 /// operator's own command-line instruction -- to a prompt recomposed
 /// mid-run.
@@ -840,12 +824,27 @@ pub fn relayer_recomposed(
     with_command_line_layer(with_adapter_layer(composed, adapter, role), cli_text)
 }
 
-/// Splices in the adapter's own layer for `role`: `AgentAdapter::
+/// Splices in the adapter's own layer for `role` -- `AgentAdapter::
 /// base_system_prompt` for `PromptRole::Orchestrator`, `AgentAdapter::
-/// worker_system_prompt` for `PromptRole::Worker`. Only one of the two is ever
-/// spliced in for a given launch -- a worker must never receive the
-/// orchestrator layer's own "delegate everything" coaching, which is what
-/// invites the recursive delegation a worker session must not do.
+/// worker_system_prompt` for `PromptRole::Worker` -- directly after the shipped
+/// default and before every layer a human wrote, so the user, repo and
+/// command-line layers all still append after it and still take precedence over
+/// it. Only one of the two is ever spliced in for a given launch: a worker must
+/// never receive the orchestrator layer's own "delegate everything" coaching,
+/// which is what invites the recursive delegation a worker session must not do.
+/// `None` in means `None` out, exactly like the command-line layer: `--simple`
+/// and a disabled prompt suppress this layer with all the others.
+///
+/// Spliced rather than appended because `compose` cannot see the adapter (it
+/// runs before the launch is known) and this layer is a base, not an override.
+/// `compose` always begins the text with `DEFAULT_PROMPT` verbatim, so its
+/// length is the insertion point exactly: no scanning for a separator that a
+/// layer's own text could contain. That also means `insert(1, ..)` works
+/// regardless of whether the harness layer already sits at index 1 (an
+/// orchestrator role): it always lands right after `Default`, pushing the
+/// harness (and, when present, harness-roster) layers down by one rather than
+/// replacing them, so the final order is Default -> Adapter -> Harness ->
+/// Harnesses -> Memory -> User -> Repo -> CommandLine.
 fn with_adapter_layer(
     composed: Option<ComposedPrompt>,
     adapter: &dyn AgentAdapter,

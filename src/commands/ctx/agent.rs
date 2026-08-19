@@ -240,9 +240,9 @@ const EXIT_DASH_UNCONFIRMED: i32 = 1;
 /// unchanged, which covers: no dashboard to ask (env unset, or the directory
 /// is gone -- both silent, byte-for-byte the pre-Task-11 behavior); options a
 /// pane cannot honour (`--max-restarts`/`--timeout-secs`/`-- flags` other than
-/// a bare `--model` pin, notice printed); a prompt that would be misread as a
-/// flag (notice printed); a
-/// request that could not even be written (notice printed); an unclaimed ack
+/// a lone `--model` pin, notice printed); a prompt that would be misread as a
+/// flag (notice printed); a request that could not even be written (notice
+/// printed); an unclaimed ack
 /// timeout (notice printed, since that is a live channel that simply did not
 /// respond); and a `retryable` refusal, where the dashboard has answered that
 /// it spawned nothing for a reason that says nothing about whether the task
