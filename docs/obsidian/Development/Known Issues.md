@@ -669,12 +669,19 @@ synchronisation can only be reasoned about locally, not executed — see the 202
 `…::a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_launch_mail`,
 `…::a_nudge_restart_does_not_spend_the_rot_restart_budget`, and
 `…::a_headless_worker_stops_at_the_next_poll_and_relaunches_with_the_guidance` fail with
-exit-76 (`EXIT_TIMEOUT`) assertions when run as part of a full `cargo test -- --test-threads=1`
-sweep, and pass when run alone or as a small filtered set. Pre-existing on `main`, not
-branch-specific: these tests spawn real supervised children with wall-clock timeouts, and a
-loaded machine partway through a ~15-minute suite is enough to miss one. If the quartet (or
-this fifth) is red after a full sweep, rerun just that family before treating it as a
-regression, and report both outcomes rather than either alone.
+exit-76 (`EXIT_TIMEOUT`) assertions, and each of them passes on its own in well under a
+second. **Pre-existing and non-deterministic, verified by A/B on 2026-08-19:** running exactly
+these five as one filtered batch fails two of them in ~61s on both `feat/chat-token-economy`
+and its own merge-base commit — and *which* two differs between runs (branch:
+`…explicit_command_codex_run…` + `…post_nudge_park…`; base: `…rot_restart_budget…` +
+`…post_nudge_park…`). Each spawns a real supervised child whose progress depends on a nudge
+landing inside a 5-second window (`nudge_live_session`'s own wait gives up silently), so on a
+loaded machine the nudge misses, the fake agent stays in `hang` mode, and the run burns its
+whole 30-second wall clock instead.
+
+Practical consequence: a red result here is only evidence when the test is run alone. Rerun
+the individual test before treating it as a regression, and report both outcomes rather than
+either one alone — a batch result on its own cannot tell a regression from this.
 
 ## `wrap`'s hot path assumes `panic = "abort"`
 
