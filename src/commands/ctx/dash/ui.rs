@@ -494,11 +494,48 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, rows: &[SidebarRow]) {
     f.render_widget(List::new(items).block(block.title(title)), area);
 }
 
+/// Pure: whether visible-grid cell `(row, col)` falls inside a selection
+/// already normalized to `start <= end` in row-major (row, then col) order
+/// (`dash::normalize_selection` does the normalizing; this only ever sees the
+/// result). Mirrors exactly the span `vt100::Screen::contents_between(
+/// start.0, start.1, end.0, end.1)` copies, so the highlighted cells and the
+/// copied text always agree: the whole of every row strictly between the
+/// two, the tail of the start row from `start.1` onward, and the head of the
+/// end row up to but not including `end.1` -- the same "up until end_col"
+/// vt100 itself documents on `contents_between`.
+fn cell_in_selection(row: u16, col: u16, start: (u16, u16), end: (u16, u16)) -> bool {
+    if row < start.0 || row > end.0 {
+        return false;
+    }
+    if start.0 == end.0 {
+        return col >= start.1 && col < end.1;
+    }
+    if row == start.0 {
+        col >= start.1
+    } else if row == end.0 {
+        col < end.1
+    } else {
+        true
+    }
+}
+
 /// Walks every `vt100` cell in `screen` into `area`'s buffer, cell for cell.
 /// A wide cell's own contents are drawn once and the following column is
 /// skipped, matching how `vt100` itself represents double-width glyphs (the
 /// continuation cell carries no contents of its own).
-pub fn render_grid(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
+///
+/// `selection`, when given, is a normalized `(start, end)` pair of
+/// visible-grid `(row, col)` cells (`dash::mod`'s own click-drag selection,
+/// already ordered by `normalize_selection`) drawn with `Modifier::REVERSED`
+/// layered on top of the cell's own style -- the same tmux-style highlight a
+/// terminal's native selection would have shown, now that mouse reporting
+/// has displaced it (see `term::dash_mouse_on_bytes`).
+pub fn render_grid(
+    f: &mut Frame,
+    area: Rect,
+    screen: &vt100::Screen,
+    selection: Option<((u16, u16), (u16, u16))>,
+) {
     let (rows, cols) = screen.size();
     let buf = f.buffer_mut();
 
@@ -539,6 +576,11 @@ pub fn render_grid(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
                 modifiers |= Modifier::UNDERLINED;
             }
             if cell.inverse() {
+                modifiers |= Modifier::REVERSED;
+            }
+            if let Some((start, end)) = selection
+                && cell_in_selection(row, col, start, end)
+            {
                 modifiers |= Modifier::REVERSED;
             }
 
@@ -1147,7 +1189,7 @@ mod tests {
         let mut term = Terminal::new(backend).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_grid(f, area, parser.screen());
+            render_grid(f, area, parser.screen(), None);
             render_dialog(f, area, "spawn", &["> prompt".to_string()]);
         })
         .expect("draw");
@@ -1177,7 +1219,7 @@ mod tests {
         parser.process(b"\x1b[31mred\x1b[0m plain");
         let backend = TestBackend::new(20, 4);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render_grid(f, f.area(), parser.screen()))
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), None))
             .unwrap();
         let cell = &term.backend().buffer()[(0, 0)];
         assert_eq!(cell.symbol(), "r");
@@ -1192,7 +1234,7 @@ mod tests {
         parser.process("\u{4e2d}ab".as_bytes());
         let backend = TestBackend::new(10, 2);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render_grid(f, f.area(), parser.screen()))
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), None))
             .unwrap();
         let buf = term.backend().buffer();
         assert_eq!(buf[(0, 0)].symbol(), "\u{4e2d}");
@@ -1202,6 +1244,98 @@ mod tests {
         assert_eq!(buf[(1, 0)].symbol(), " ");
         assert_eq!(buf[(2, 0)].symbol(), "a");
         assert_eq!(buf[(3, 0)].symbol(), "b");
+    }
+
+    /// `cell_in_selection` mirrors `vt100::Screen::contents_between`'s own
+    /// span exactly, cell for cell: the tail of the start row, every column
+    /// of a middle row, and the head of the end row up to but not including
+    /// `end.1`. Pinned against a multi-row selection first.
+    #[test]
+    fn cell_in_selection_spans_a_multi_row_selection_like_contents_between() {
+        let start = (1, 5);
+        let end = (3, 2);
+
+        // Row above the selection: nothing is selected.
+        assert!(!cell_in_selection(0, 0, start, end));
+        assert!(!cell_in_selection(0, 40, start, end));
+
+        // Start row: only from col 5 onward.
+        assert!(!cell_in_selection(1, 4, start, end));
+        assert!(cell_in_selection(1, 5, start, end));
+        assert!(cell_in_selection(1, 999, start, end));
+
+        // A middle row: every column, including 0.
+        assert!(cell_in_selection(2, 0, start, end));
+        assert!(cell_in_selection(2, 999, start, end));
+
+        // End row: only up to (not including) col 2.
+        assert!(cell_in_selection(3, 0, start, end));
+        assert!(cell_in_selection(3, 1, start, end));
+        assert!(!cell_in_selection(3, 2, start, end));
+        assert!(!cell_in_selection(3, 40, start, end));
+
+        // Row below the selection: nothing is selected.
+        assert!(!cell_in_selection(4, 0, start, end));
+    }
+
+    /// A single-row selection is the half-open `[start.1, end.1)` range on
+    /// that one row and nothing on any other row -- the `Ordering::Equal`
+    /// branch `contents_between` itself takes.
+    #[test]
+    fn cell_in_selection_on_a_single_row_is_the_half_open_column_range() {
+        let start = (2, 3);
+        let end = (2, 7);
+
+        assert!(!cell_in_selection(2, 2, start, end));
+        assert!(cell_in_selection(2, 3, start, end));
+        assert!(cell_in_selection(2, 6, start, end));
+        assert!(!cell_in_selection(2, 7, start, end), "end col is exclusive");
+
+        // Same row, but outside the selection's own row range.
+        assert!(!cell_in_selection(1, 5, start, end));
+        assert!(!cell_in_selection(3, 5, start, end));
+
+        // A zero-width same-row "selection" (anchor == end, i.e. a click
+        // rather than a drag) selects nothing at all.
+        assert!(!cell_in_selection(2, 3, (2, 3), (2, 3)));
+    }
+
+    /// `render_grid` layers `Modifier::REVERSED` onto exactly the cells
+    /// `cell_in_selection` reports, leaving every other cell's style alone.
+    #[test]
+    fn render_grid_highlights_only_the_selected_cells() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc");
+        let backend = TestBackend::new(10, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        // Row 1, cols 2..5 selected (single row).
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), Some(((1, 2), (1, 5)))))
+            .unwrap();
+        let buf = term.backend().buffer();
+        assert!(!buf[(1, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(2, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(4, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(5, 1)].modifier.contains(Modifier::REVERSED));
+        // Untouched rows carry no highlight at all.
+        assert!(!buf[(2, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(2, 2)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// No selection at all leaves every cell exactly as it was rendered
+    /// before this feature existed -- the `None` default every other caller
+    /// still passes.
+    #[test]
+    fn render_grid_with_no_selection_reverses_nothing_the_cell_itself_did_not_ask_for() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process(b"plain text");
+        let backend = TestBackend::new(10, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        for x in 0..10 {
+            assert!(!buf[(x, 0)].modifier.contains(Modifier::REVERSED));
+        }
     }
 
     /// HIGH-1: the focused pane's cursor translates from a screen-relative
@@ -2250,7 +2384,7 @@ mod tests {
 
         let backend = TestBackend::new(120, 40);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render_grid(f, f.area(), parser.screen()))
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), None))
             .unwrap();
 
         let buf = term.backend().buffer();

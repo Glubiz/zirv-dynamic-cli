@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-19 (feat/dash-adaptive-poll-help-overlay, uncommitted, extends PR #29): resolved a mail-routing gap -- a dashboard-spawned worker pane's report-back reply used to broadcast rather than address, claimable by the wrong pane (issue #30); extended the Shift+Enter ESC-CR entry to cover Alt+Enter and the Windows-Terminal key-folding root cause; extended the crossterm::EnableMouseCapture entry for ?1002 now being on (click-drag text selection + OSC 52 copy) -->
 <!-- Updated 2026-08-19 (feat/chat-token-economy, role-gated worker prompt): recorded three gotchas -- the user-layer role split means a Worker no longer reads ~/.zirv/system-prompt.md at all (an operator with standing worker instructions must create ~/.zirv/system-prompt.worker.md), wrap's pty-harness tests wedge a spawned child in kernel exit state ?Es on this macOS machine (pre-existing on unmodified main, A/B-verified, run them on Linux CI), and five exec nudge tests time out (exit 76) intermittently in a full-suite batch while passing in isolation -->
 <!-- Updated 2026-08-18 (feat/chat-token-economy, live inter-session messaging): recorded that on a standalone-installer codex-cli 0.147.0 with [windows] sandbox = "elevated", `codex exec --sandbox read-only` fails outright with a missing-helper error, so CodexAdapter::distiller_cmd's pinned --sandbox read-only breaks optimize/handoff on such installs until the sandbox helper exists or the pin is made conditional -->
 <!-- Updated 2026-08-18 (feat/chat-token-economy, live inter-session messaging): recorded that a nudge/mail delivery queued for a live codex dashboard pane before dash.idle_quiet_ms output-quiescence existed simply waited forever, since a signal-less pane never reported Idle at all -- now resolved by pane_is_idle's signal-less branch, kept here as a historical trap for anyone reading an older build's behavior -->
@@ -45,6 +46,12 @@ Each entry gets a changelog comment at the top of the file, newest first:
 **Resolved 2026-08-18 (live inter-session messaging).** Before `pane::pane_is_idle` gained a signal-less branch, a pane's idleness was decided purely by `signal_still_stands`, which requires at least one turn-boundary signal to have been seen. Codex's adapter has no turn-signal mechanism at all (`register_turn_signal` is a no-op for it), so a codex pane's `last_signal_at` never advanced past `None` and the pane read `Working` forever — the mail sweep and the nudge drain, both gated on `Idle`/`Pane::injectable`, could queue something for such a pane and it would simply sit there, undelivered, for the pane's entire life. Fixed by branching `pane_is_idle` on `AgentAdapter::capabilities().turn_signal`: a signal-less pane is now read idle by `dash.idle_quiet_ms` of pty-output quiescence instead (further hardened the same day to measure from the *latest* of output and zirv's own local input — see the 2026-08-18 [[Decision Log]] entry).
 
 **Residual: `wrap`'s own live mail advisory (T13, above) has no equivalent for a signal-less adapter.** `wrap::may_inject` requires `InjectionState.signals_seen > 0`, sourced from the same turn-signal socket a codex session never posts to — this is a separate mechanism from `dash::pane`'s own idleness check, and only the latter gained a signal-less branch. A plain `zirv ctx wrap --agent codex` (or `chat`/bare `zirv` falling through to `wrap` on a too-small terminal) therefore never types the mail advisory line at all; `MailWatch::decide` always takes the `Announce` branch instead, which is harmless (the stderr line still fires, mail is still readable via `zirv ctx inbox`) but means live-typed delivery is a dashboard-only capability for codex today, unlike claude, which gets it in both supervisors.
+
+## A dashboard-spawned worker pane's report-back mail used to broadcast, not address, and could be claimed by the wrong pane
+
+**Resolved 2026-08-19 (uncommitted, extends PR #29, issue #30).** A dashboard-spawned worker pane (codex especially — its `register_turn_signal` legitimately returns an empty `env`, since it has no turn-signal mechanism at all) launched without `ZIRV_CTX_SESSION` set, so its own `zirv ctx send` recorded `from_session = "unknown"` and, more importantly, could not `--to-session`-address its reply back at the requester even though `compose_worker_prompt`'s `with_report_back_layer` told it to. The reply landed as *broadcast* mail (no `to_session`) instead — deliverable to any session matching the recipient agent — so a later worker-pane mail sweep or spawn-time harvest running on a **different** pane could claim the reply first, archiving it into `read/` invisibly to the pane whose result it actually was, with nothing in `zirv ctx inbox` ever showing it to the intended recipient.
+
+Fixed by making `build_turn_env` set the session-identity env var **unconditionally** for every spawned pane (skipped only when a turn-signal-capable adapter's own `setup.env` already set it, so no duplicate), so a report-back send is always directed regardless of which adapter's pane sent it. Also added as a review-visibility measure for the underlying trust gap: every mail consumption that happens *on a session's behalf* rather than through that session's own `zirv ctx inbox` call (`exec`/`loop`'s launch-prompt drain, the dashboard's spawn-time drain, its mail sweep, its mail-overlay `Consume`) now logs a `mail-consumed` decision-log entry naming the file and the claimant — see [[Ctx Subsystem]]'s mail section and [[Ctx Supervisors]]'s "Injection semantics". Broadcast-harvest semantics for mail genuinely addressed to `"any"` worker of an agent are deliberately unchanged; this fix removed only the *accidental* broadcast source, not the intentional one.
 
 ## Sidebar ownership is a raw pid, so a pane child's own in-process headless fallback is invisibly unowned
 
@@ -351,19 +358,26 @@ to it either way.
 ## `crossterm::EnableMouseCapture` must never be used in the dashboard
 
 It turns on `?1000h` (click) **and** `?1002h`/`?1003h` (motion tracking)
-together, with no way to enable only wheel/button reporting. A probe on a real
+together, with no way to enable only wheel/button/drag reporting without also
+getting `?1003`'s free-running any-motion flood. A probe on a real
 Windows Terminal session showed `?1003` emitting a `MouseEventKind::Moved`
 event for every pixel of pointer movement -- dozens from one sweep across the
-window -- competing with keystrokes inside the bounded per-tick input drain,
-for a feature (`Ctrl+A`-scrolled panes) that only ever reads
-`ScrollUp`/`ScrollDown`. The dashboard writes `?1000h?1006h` itself as raw
-bytes instead (`term::dash_mouse_on_bytes` -- wheel + button reporting, SGR
-coordinates only) and resets all four modes on exit regardless of which were
-enabled. `[dash] mouse` (default true, `REPO_FORBIDDEN`, env override
+window, with no button ever held -- competing with keystrokes inside the
+bounded per-tick input drain. The dashboard writes `?1000h?1002h?1006h` itself
+as raw bytes instead (`term::dash_mouse_on_bytes` -- wheel + button reporting,
+button-*drag* tracking, SGR coordinates; `?1003` stays off) and resets all
+four modes on exit regardless of which were enabled. `?1002` was off too until
+2026-08-19 (uncommitted, extends PR #29) — it was excluded for the same
+"nothing reads it" reason `?1003` still is, until the dashboard's own
+click-drag text selection/OSC-52-copy feature gave its `Drag` events a
+consumer (see [[Ctx Supervisors]] "Click-drag text selection and clipboard
+copy"). `[dash] mouse` (default true, `REPO_FORBIDDEN`, env override
 `ZIRV_CTX_DASH_MOUSE`) is a genuine trade, not a strict improvement: enabling
 mouse reporting takes over the terminal's own native click-drag text
-selection (hold Shift to bypass it -- the same trade every real terminal
-multiplexer makes).
+selection -- the dashboard's own replacement only covers a pane whose child
+does not itself want mouse reporting; a pane that does still has no zirv-side
+selection (hold Shift to bypass the terminal's own capture there, the same
+trade every real terminal multiplexer makes).
 
 ## Dashboard special-key encoding must carry the xterm modifier parameter, and crossterm's own control-key pre-mapping must be undone explicitly
 
@@ -383,6 +397,8 @@ Ctrl+\→`0x1c`, Ctrl+]→`0x1d`, Ctrl+^→`0x1e`, Ctrl+_→`0x1f`. Shift+Enter 
 terminal-input feature must check both failure modes — a missing modifier
 parameter, and a control combination crossterm already collapsed to a bare
 character — not just the common `Char` + `CONTROL` shape.
+
+**`ESC CR` now also fires on Alt+Enter, not just Shift+Enter (2026-08-19, uncommitted, extends PR #29) — because Windows Terminal itself can turn one into the other.** An empirical ConPTY probe against real claude v2.1.235 found the actual root cause of Shift+Enter *submitting* instead of newlining in a pane on some setups: once an operator's Windows Terminal has claude's own `/terminal-setup` binding installed, WT rewrites Shift+Enter into `ESC CR` itself before zirv ever reads a keystroke, and zirv's own console layer folds that byte pair back into a single `Enter` keydown carrying **ALT**, not SHIFT — which fell straight through to the bare-`\r` submit branch. `encode_key`'s `Enter` arm now checks `modifiers.intersects(SHIFT | ALT)` rather than SHIFT alone; bare Enter and Ctrl+Enter are unaffected. The same probe also established claude treats `\x1b\r` as a newline regardless of chunking and negotiates win32-input-mode (`?9001`), never the kitty protocol — reinforcing the original `ESC CR` choice over CSI-u.
 
 ## The `Ctrl+A ?` help overlay clips its tail on a terminal shorter than ~22 rows
 

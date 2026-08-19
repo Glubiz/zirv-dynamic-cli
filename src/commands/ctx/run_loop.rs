@@ -370,7 +370,14 @@ pub fn run_with<W: Write>(
         // already reached the prompt either way, and housekeeping failures
         // are best-effort throughout the state dir.
         for (path, _) in mail_entries.drain(..) {
-            let _ = super::mail::consume(&state, &mail_slug, &path);
+            let _ = super::mail::consume_and_log(
+                &state,
+                &mail_slug,
+                &path,
+                &session_short,
+                "loop",
+                "loop:cycle-prompt",
+            );
         }
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
         let mut rotted = false;
@@ -1172,6 +1179,64 @@ mod tests {
         assert!(log.contains("\"action\":\"limit-park\""), "got {log}");
         assert!(!log.contains("\"action\":\"give-up\""), "got {log}");
         assert_eq!(transcripts_in(&home).len(), 2, "both cycles ran");
+    }
+
+    /// Issue #30, item 3: mail consumed on a session's behalf -- here, a
+    /// loop cycle folding it into its own launch prompt, never in answer to
+    /// that session's own explicit `zirv ctx inbox` -- must leave a
+    /// decision-log trail naming the mail file and who claimed it.
+    #[test]
+    fn consuming_mail_into_a_loop_cycle_prompt_is_logged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        let path = crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+        let file_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf8")
+            .to_string();
+
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+
+        let args = args_for(1);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"mail-consumed\""), "got {log}");
+        assert!(
+            log.contains(&file_id),
+            "the entry names the mail file: {log}"
+        );
     }
 
     /// B3: `mail.enabled = false` must gate delivery at the `loop` seam too,

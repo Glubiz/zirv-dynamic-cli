@@ -848,18 +848,25 @@ impl Pane {
     }
 
     /// Pumps queued reader-channel bytes into the `vt100` parser, up to
-    /// [`DRAIN_BUDGET_BYTES`] per call, and returns whether the budget cut the
-    /// drain short with bytes still queued -- so the event loop knows to come
-    /// back to this pane next tick rather than blocking on it now. Also polls
-    /// the child's exit status (see `poll_exit`): a pane's own output is the
-    /// natural place to notice it has stopped producing any.
+    /// [`DRAIN_BUDGET_BYTES`] per call, and returns `(any, more)`: whether
+    /// any bytes were actually processed this call, and whether the budget
+    /// cut the drain short with bytes still queued -- so the event loop
+    /// knows to come back to this pane next tick rather than blocking on it
+    /// now. Also polls the child's exit status (see `poll_exit`): a pane's
+    /// own output is the natural place to notice it has stopped producing
+    /// any.
     ///
     /// M10: the drain used to loop until the channel was empty. A `cat` of a
     /// large file fills the unbounded channel faster than `vt100` parses it, so
     /// the drain never returned and the whole event loop -- input included, so
     /// `Ctrl+A q` too -- was unreachable for the duration. The budget bounds
     /// one call's work; the remainder waits for the next tick.
-    pub fn drain(&mut self) -> bool {
+    ///
+    /// HIGH (review): `any` exists on the return so the caller can cancel a
+    /// stale mouse selection the moment new output rewrites this pane's grid
+    /// under it -- see `dash::output_cancels_selection` -- without a second,
+    /// separate probe of whether this call did anything.
+    pub fn drain(&mut self) -> (bool, bool) {
         self.poll_exit();
         let (any, more) = drain_into(&self.rx, &mut self.parser, DRAIN_BUDGET_BYTES);
         if any {
@@ -902,7 +909,7 @@ impl Pane {
             self.injected_awaiting_turn = false;
             self.user_typed_since_turn = false;
         }
-        more
+        (any, more)
     }
 
     /// The current screen, for `dash::ui`'s renderers. Already reflects this
@@ -1001,10 +1008,17 @@ impl Pane {
     /// a click over a child that never asked is dropped rather than typed at
     /// it.
     ///
-    /// The dashboard enables `?1000h` + `?1006h` at its own terminal and
-    /// deliberately not the motion modes (`term::dash_mouse_on_bytes`), so
-    /// what can arrive here -- and therefore what a child can be sent -- is
-    /// the wheel and button presses/releases, never hover or drag.
+    /// The dashboard enables `?1000h` + `?1002h` + `?1006h` at its own
+    /// terminal and deliberately not `?1003h` (`term::dash_mouse_on_bytes`),
+    /// so what can arrive here -- and therefore what a child can be sent --
+    /// is the wheel and button presses/releases, never free-running hover.
+    /// `?1002h` does let a `Drag` event reach the dashboard's own event loop
+    /// now, but `dash::mod` never routes one here: a child that wants mouse
+    /// events gets its click forwarded through this function exactly as
+    /// before, and the drag itself is simply not acted on for it (the same
+    /// "unhandled mouse kind" fate every `Drag` had before `?1002h` was even
+    /// turned on). Only a pane that does *not* want mouse reporting gets
+    /// zirv's own click-drag text selection out of that same event.
     pub fn forward_mouse_button(
         &mut self,
         button: u8,

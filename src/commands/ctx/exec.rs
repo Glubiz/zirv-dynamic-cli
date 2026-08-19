@@ -787,7 +787,14 @@ pub fn run_with<W: Write>(
         // rest of state-dir housekeeping -- since the mail has already
         // reached the prompt either way.
         for (path, _) in mail_entries.drain(..) {
-            let _ = super::mail::consume(&state, &mail_slug, &path);
+            let _ = super::mail::consume_and_log(
+                &state,
+                &mail_slug,
+                &path,
+                &registry_short,
+                "exec",
+                "exec:launch-prompt",
+            );
         }
         // Fresh scorer per iteration, over the current session's transcript.
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
@@ -3581,6 +3588,69 @@ mod tests {
         assert!(
             !argv2.contains("heads up: the webhook route moved"),
             "the mail was already delivered once and must not be redelivered: {argv2}"
+        );
+    }
+
+    /// Issue #30, item 3: mail consumed on a session's behalf -- here, an
+    /// exec cycle folding it into its own launch prompt, never in answer to
+    /// that session's own explicit `zirv ctx inbox` -- must leave a
+    /// decision-log trail naming the mail file and who claimed it.
+    #[test]
+    fn consuming_mail_into_the_launch_prompt_is_logged() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        let path = crate::commands::ctx::mail::store(
+            &state,
+            &slug,
+            &crate::commands::ctx::mail::Message {
+                from_session: "other-session".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "heads up: the webhook route moved".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store mail");
+        let file_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf8")
+            .to_string();
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let session = "10111011-2222-4333-8444-555555555555";
+        let argv_log = tmp.path().join("argv.log");
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
+        ]);
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"mail-consumed\""), "got {log}");
+        assert!(
+            log.contains(&file_id),
+            "the entry names the mail file: {log}"
         );
     }
 

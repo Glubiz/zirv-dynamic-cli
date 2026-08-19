@@ -105,9 +105,9 @@ const EMERGENCY_RESET: &[u8] = b"\x1b[r\x1b[?25h";
 /// notch spews escape sequences at the prompt. That is a badly broken
 /// terminal, and it is exactly the failure an external kill or a panic would
 /// otherwise produce, so it belongs in the shared constant rather than in the
-/// one clean exit path that could remember to undo it. Covering the two modes
-/// zirv does not turn on also means a future change to the enable set cannot
-/// silently outrun the cleanup.
+/// one clean exit path that could remember to undo it. Covering `?1003`, the
+/// one mode zirv still does not turn on, also means a future change to the
+/// enable set cannot silently outrun the cleanup.
 ///
 /// A fixed constant for the same reason `EMERGENCY_RESET` is one: this runs
 /// from a console-control/signal handler as well as from the ordinary
@@ -145,19 +145,35 @@ pub fn dash_reset_bytes() -> &'static [u8] {
     DASH_RESET
 }
 
-/// Mouse reporting, at exactly the level the dashboard's wheel-scrolling
-/// needs and no more: `?1000` (button press/release, which is what a wheel
-/// notch is reported as) plus `?1006` (SGR extended coordinates).
+/// Mouse reporting, at exactly the level the dashboard needs and no more:
+/// `?1000` (button press/release, which is what a wheel notch is reported
+/// as), `?1002` (button-event tracking -- motion reports only while a button
+/// is held down), and `?1006` (SGR extended coordinates).
 ///
 /// Deliberately **not** crossterm's `EnableMouseCapture`, and deliberately
-/// without `?1002`/`?1003`. Those are the motion-tracking modes, and a probe
-/// on a real Windows Terminal session confirmed what they cost: `?1003`
-/// reports *every* pointer movement, so simply sweeping the mouse across the
-/// window produced dozens of `MouseEventKind::Moved` events. Inside the
-/// dashboard's bounded per-tick input drain that flood competes directly with
-/// the operator's keystrokes, and it buys nothing -- the dashboard acts on
-/// `ScrollUp`/`ScrollDown` and discards every other mouse kind. Do not
-/// "simplify" this back to `EnableMouseCapture`.
+/// without `?1003`. `?1003` is the any-motion mode, and a probe on a real
+/// Windows Terminal session confirmed what it costs: it reports *every*
+/// pointer movement, so simply sweeping the mouse across the window produced
+/// dozens of `MouseEventKind::Moved` events with no button ever held. Inside
+/// the dashboard's bounded per-tick input drain that flood competes directly
+/// with the operator's keystrokes, and it would buy nothing beyond what
+/// `?1002` already gives the one thing that needs motion at all: the
+/// dashboard's own tmux-style click-drag text selection (`dash::mod`'s
+/// `MouseEventKind::Drag` handling), which only ever needs to know where the
+/// pointer is *while a button is down*. Do not "simplify" this back to
+/// `EnableMouseCapture`, and do not add `?1003`.
+///
+/// `?1002` used to be excluded for the same "nothing reads it" reason `?1003`
+/// still is -- before drag selection existed, a `Drag` event landed in the
+/// same bounded drain and was simply dropped, so turning the mode on bought
+/// nothing but the theoretical flood risk. It is turned on now because
+/// something finally consumes it: enabling mouse reporting at all (any of
+/// `?1000`/`?1002`/`?1006`) already displaced the terminal's own native
+/// click-drag selection, and until this change nothing in the dashboard
+/// offered a replacement -- selecting text out of a pane was simply
+/// impossible. A `?1002` drag event only ever arrives while the operator is
+/// already holding a button down, which is a bounded, self-limiting stream,
+/// unlike `?1003`'s free-running one.
 ///
 /// `?1006` is not optional either: the default X10 encoding packs the column
 /// into a single byte and so cannot express a column past 223, and terminals
@@ -168,7 +184,7 @@ pub fn dash_mouse_on_bytes() -> &'static [u8] {
 
 /// See [`dash_mouse_on_bytes`]. A constant for the same allocation-free
 /// reason every other sequence in this module is one.
-const DASH_MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const DASH_MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 
 /// Installed exactly once, however many guards are entered.
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -1040,26 +1056,27 @@ mod tests {
         }
     }
 
-    /// The enable set is button+wheel reporting with SGR coordinates, and
-    /// nothing else. `?1002`/`?1003` are the motion-tracking modes: a probe on
-    /// a real Windows Terminal session showed `?1003` reporting every pointer
-    /// movement, which floods the dashboard's bounded per-tick input drain and
-    /// competes with the operator's own keystrokes for it. The dashboard only
-    /// ever acts on wheel events, so tracking motion buys nothing at all.
+    /// The enable set is button+wheel reporting, button-drag tracking, and
+    /// SGR coordinates -- `?1000`/`?1002`/`?1006` -- and nothing else. `?1003`
+    /// is the free-running any-motion mode: a probe on a real Windows
+    /// Terminal session showed it reporting every pointer movement with no
+    /// button ever held, which floods the dashboard's bounded per-tick input
+    /// drain and competes with the operator's own keystrokes for it. `?1002`
+    /// only ever reports while a button is down, which is exactly the stream
+    /// the dashboard's own click-drag selection consumes, so it stays on;
+    /// `?1003` still buys nothing over it and stays off.
     #[test]
-    fn mouse_reporting_is_enabled_for_the_wheel_only_never_for_motion() {
+    fn mouse_reporting_is_enabled_for_the_wheel_and_drag_but_never_free_motion() {
         let on = dash_mouse_on_bytes();
         assert_eq!(
-            on, b"\x1b[?1000h\x1b[?1006h",
-            "button+wheel reporting with SGR coordinates, exactly"
+            on, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+            "button+wheel reporting, button-drag tracking, SGR coordinates -- exactly"
         );
-        for motion in [&b"\x1b[?1002h"[..], &b"\x1b[?1003h"[..]] {
-            assert!(
-                !on.windows(motion.len()).any(|w| w == motion),
-                "motion tracking must stay off: {}",
-                String::from_utf8_lossy(motion)
-            );
-        }
+        assert!(
+            !on.windows(8).any(|w| w == b"\x1b[?1003h"),
+            "free-running motion tracking must stay off: {}",
+            String::from_utf8_lossy(on)
+        );
         // SGR coordinates are not optional: the default X10 encoding cannot
         // express a column past 223, and terminals are routinely wider.
         assert!(on.windows(8).any(|w| w == b"\x1b[?1006h"));
@@ -1068,6 +1085,7 @@ mod tests {
         // reset -- the invariant that actually protects the operator's shell.
         for (on_seq, off_seq) in [
             (&b"\x1b[?1000h"[..], &b"\x1b[?1000l"[..]),
+            (&b"\x1b[?1002h"[..], &b"\x1b[?1002l"[..]),
             (&b"\x1b[?1006h"[..], &b"\x1b[?1006l"[..]),
         ] {
             assert!(on.windows(on_seq.len()).any(|w| w == on_seq));
