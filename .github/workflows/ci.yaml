@@ -61,15 +61,19 @@ jobs:
       # `ureq` -> `rustls` -> `ring` compiles C sources through its build
       # script, so the cross-target clippy pass needs a Windows-targeting C
       # compiler on the Linux runner.
-      # Retries and short connection timeouts because a wedged runner mirror
-      # otherwise hangs this ~30s step indefinitely; the step timeout is the
-      # backstop that turns a stall into a fast, retryable failure.
+      # The runner's azure apt mirror wedges regularly (every index fetch
+      # stalling or Ign'd), so this swaps sources to the canonical archive
+      # up front, forces IPv4, and bounds every fetch; the step timeout is
+      # the backstop that turns any remaining stall into a fast, retryable
+      # failure instead of a six-hour hang.
       - name: Install mingw-w64 (ring's build script needs a cross C compiler)
-        timeout-minutes: 5
-        run: >-
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update &&
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20
-          install -y --no-install-recommends gcc-mingw-w64-x86-64
+        timeout-minutes: 8
+        run: |
+          if command -v x86_64-w64-mingw32-gcc >/dev/null; then exit 0; fi
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null || true
+          APT_OPTS="-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::ForceIPv4=true"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y --no-install-recommends gcc-mingw-w64-x86-64
 
       - name: Run Clippy Lint (Windows target)
         run: cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
