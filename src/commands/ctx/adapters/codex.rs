@@ -525,6 +525,15 @@ mod tests {
         assert_eq!(CodexAdapter::new(None).default_worker_model(), None);
     }
 
+    /// Same "nothing verified to guess" answer for the role layers: codex
+    /// contributes neither an orchestrator nor a worker layer of its own, so
+    /// `prompt::with_adapter_layer` splices nothing in for either role rather
+    /// than handing codex text written for claude's tools.
+    #[test]
+    fn codex_contributes_no_worker_layer_of_its_own() {
+        assert_eq!(CodexAdapter::new(None).worker_system_prompt(), None);
+    }
+
     /// The codex ladder, top to bottom: `gpt-5.6-sol` (the default when no
     /// `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini` --
     /// verified via `codex debug models` in docs/superpowers/notes/

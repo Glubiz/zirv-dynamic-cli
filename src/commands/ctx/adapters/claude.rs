@@ -66,6 +66,29 @@ harness roster, never this seat's own model, and never a high-or-above fan-out, 
 agents that inherit the seat's expensive model. A session that also carries the zirv meta-harness \
 layer follows that layer's cross-harness review round on top.";
 
+/// Claude's own layer for a delegated **Worker** session (see
+/// `AgentAdapter::worker_system_prompt`), spliced in place of
+/// [`ORCHESTRATOR_PROMPT`] for `PromptRole::Worker`. A worker never gets that
+/// layer's coaching to delegate everything onward -- that would invite
+/// recursion into a session that was itself already delegated to -- so this is
+/// deliberately its own, much shorter text: execute the brief, do not spawn
+/// further zirv workers, and report back plainly.
+pub const WORKER_PROMPT: &str = "\
+zirv worker conventions (claude)
+
+You are a delegated worker session. Execute your brief directly and completely, then report \
+compact results.
+
+- Do not delegate onward: never run `zirv agent` or spawn further zirv workers; this task was \
+already routed to you.
+- If you use subagents for fan-out within your task, set each dispatch's model explicitly to the \
+cheapest one that can do the job, never one above your own session's model, and never use \
+fork-type subagents, which inherit this session's model and ignore overrides.
+- Run code-review or verification passes only when your brief asks for them; the orchestrator that \
+spawned you owns review rounds.
+- Your final message is your report: lead with the outcome, keep it self-contained, and never dump \
+raw file contents into it.";
+
 fn text_of(message: &Value) -> String {
     message
         .get("content")
@@ -554,6 +577,10 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn base_system_prompt(&self) -> Option<&'static str> {
         Some(ORCHESTRATOR_PROMPT)
+    }
+
+    fn worker_system_prompt(&self) -> Option<&'static str> {
+        Some(WORKER_PROMPT)
     }
 
     /// Counted over the argv the operator wrote, not over the argv `base()`
@@ -1447,6 +1474,28 @@ mod tests {
             ClaudeAdapter::new(None).default_worker_model(),
             Some("sonnet")
         );
+    }
+
+    /// Claude's two role layers are distinct texts, and the worker one carries
+    /// none of the orchestrator's own delegate-everything coaching: a session
+    /// that was itself delegated to must not be told its job is to delegate.
+    #[test]
+    fn claude_has_its_own_worker_layer_distinct_from_the_orchestrator_layer() {
+        let layer = ClaudeAdapter::new(None)
+            .worker_system_prompt()
+            .expect("claude has a worker layer");
+        assert_eq!(layer, WORKER_PROMPT);
+        assert!(layer.starts_with("zirv worker conventions"));
+        assert!(
+            !layer.contains("Coordination and judgment are the job"),
+            "the worker layer must not carry the orchestrator's own coaching: {layer}"
+        );
+        for claim in ["never run `zirv agent`", "fork-type subagents"] {
+            assert!(
+                layer.contains(claim),
+                "the worker layer must say '{claim}': {layer}"
+            );
+        }
     }
 
     /// The claude ladder, top to bottom: fable/mythos, opus, sonnet, haiku.

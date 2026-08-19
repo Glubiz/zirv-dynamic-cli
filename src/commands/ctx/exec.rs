@@ -497,6 +497,7 @@ pub fn run_with<W: Write>(
         &args.command,
         composed,
         prompt_value_at,
+        super::prompt::PromptRole::Worker,
     );
 
     // The user's own flags from the original `--` command (anything beyond
@@ -975,6 +976,7 @@ pub fn run_with<W: Write>(
                 adapter.as_ref(),
                 fresh,
                 operator_prompt_text.as_deref(),
+                super::prompt::PromptRole::Worker,
             );
             composed = fresh;
             prompt_args = super::prompt::injection_args_for_session(

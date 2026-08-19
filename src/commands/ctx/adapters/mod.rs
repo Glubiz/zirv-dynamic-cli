@@ -274,6 +274,22 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
+    /// This agent's own layer for a delegated **Worker** session -- the
+    /// role-scoped counterpart to [`base_system_prompt`](Self::
+    /// base_system_prompt), which is spliced in for an **Orchestrator**
+    /// session only. Exactly one of the two ever reaches a launch, so a
+    /// worker never receives the orchestrator layer's own delegate-and-review
+    /// coaching: telling a session that was itself delegated to that its job
+    /// is to delegate is what invites the recursion `zirv agent`'s workers
+    /// must not do.
+    ///
+    /// `None` (the default) means this agent contributes no worker-specific
+    /// layer of its own, the same "no verified mechanism" shape every other
+    /// optional layer on this trait uses.
+    fn worker_system_prompt(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The user-facing flag name `system_prompt_args` emits, when the agent has
     /// one. Lets a caller find and merge a user's own use of the flag instead
     /// of silently overriding it with a second occurrence. `None` when the

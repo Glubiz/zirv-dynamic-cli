@@ -125,8 +125,13 @@ pub fn run_with<W: Write>(
         cfg.memory.max_injected_bytes,
         &[],
     );
-    let (user_extra, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
+    let (user_extra, composed) = super::prompt::merge_command_line_prompt(
+        adapter.as_ref(),
+        &args.extra,
+        composed,
+        None,
+        super::prompt::PromptRole::Worker,
+    );
     // M2: attribution is logged per session, not once per verb. A resumed run
     // is interactive, so the agent mints its own transcript id and this one is
     // zirv's; exporting it is what makes the two meet, because the hook inside

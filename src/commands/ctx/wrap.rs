@@ -1096,10 +1096,12 @@ fn relaunch(
 
 /// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
 /// not something a user ever types on the `wrap` command line, only something
-/// another verb (`zirv ctx chat`) decides on the caller's behalf. Every
-/// existing `wrap` caller (the `wrap` verb itself, and every relaunch inside
-/// `pump`) passes `PromptRole::Worker`; `chat` is the one caller that passes
-/// `PromptRole::Orchestrator`.
+/// another verb (`zirv ctx chat`) decides on the caller's behalf. Both callers
+/// pass `PromptRole::Orchestrator` today -- `chat`, and the bare `wrap` verb
+/// itself, whose command an operator is sitting in front of and driving
+/// interactively. A relaunch inside `pump` never re-decides: it reuses this
+/// launch's own composed prompt, so it keeps this launch's role by
+/// construction.
 /// `session` lets a caller that already generated a session id for its own
 /// purposes (`chat.rs`'s launch banner, printed before this function is ever
 /// called) hand it in rather than have two different ids exist for the same
@@ -1223,8 +1225,13 @@ pub fn run_with(
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
     // silently override it with a second occurrence.
-    let (launch_command, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed, None);
+    let (launch_command, composed) = super::prompt::merge_command_line_prompt(
+        adapter.as_ref(),
+        &args.command,
+        composed,
+        None,
+        role,
+    );
     let prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),
         &launch_command,
@@ -2414,6 +2421,15 @@ fn pump(
     }
 }
 
+/// `Orchestrator`, not `Worker`: the operator is sitting in front of the
+/// command `wrap` supervises, driving it themselves, which is the same seat
+/// `chat` builds (CLAUDE.md classifies both as interactive Orchestrator
+/// sessions). The role now also picks the adapter's own layer and the
+/// user-layer file (`prompt::with_adapter_layer`, `prompt::
+/// WORKER_PROMPT_FILE`), so passing `Worker` here would inject
+/// worker-conventions text into an operator's own session and silently drop
+/// their `~/.zirv/system-prompt.md` -- a session made worse by being wrapped,
+/// which is the one thing `wrap` must never do.
 pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
@@ -2421,7 +2437,7 @@ pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
         args,
         &repo,
         &env,
-        PromptRole::Worker,
+        PromptRole::Orchestrator,
         None,
         super::sessions::Verb::Wrap,
     )
