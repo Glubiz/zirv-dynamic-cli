@@ -710,6 +710,32 @@ impl MailWatch {
         }
     }
 
+    /// Records an announcement **only when it actually reached the
+    /// operator** (`Announcer::try_emit`'s own answer).
+    ///
+    /// R5: this used to be an unconditional `commit_announced` right after an
+    /// `Announcer::emit` that returns `()` and quietly swallows both a
+    /// disabled channel (`--quiet`, `[chrome] events = false`) and a failed
+    /// stderr write. `announced` then said "the operator has been told" about
+    /// a line nobody ever saw, and since `announced` suppresses the next
+    /// poll's announcement, the advisory was never repeated either. For an
+    /// adapter with no turn-signal mechanism `may_inject` never becomes true
+    /// at all, so this channel is that advisory's *only* surface: one
+    /// swallowed emit meant it was never injected and never announced --
+    /// lost, permanently, on a session that had no other way to hear about
+    /// it. (The message itself was never at risk: it stays unread in the
+    /// mailbox and keeps counting in the status bar. This is about the
+    /// advisory surface, not durable state.)
+    ///
+    /// Leaving the ids unannounced on a failure is the whole fix: the next
+    /// poll simply tries again, and `injected` is untouched either way, so
+    /// the injection stays owed exactly as before.
+    fn note_announcement(&mut self, ids: &[String], landed: bool) {
+        if landed {
+            self.commit_announced(ids);
+        }
+    }
+
     fn commit_announced(&mut self, ids: &[String]) {
         for id in ids {
             self.announced.insert(id.clone());
@@ -2292,8 +2318,11 @@ fn pump(
                 match mail_watch.decide(&facts, may_inject(supervision, now, debounce)) {
                     MailAction::None => {}
                     MailAction::Announce { count, ids } => {
-                        announcer.emit(&Event::MailWaiting { count });
-                        mail_watch.commit_announced(&ids);
+                        // R5: `try_emit`, not `emit` -- an advisory the
+                        // channel swallowed must stay unannounced so the next
+                        // poll retries it. See `MailWatch::note_announcement`.
+                        let landed = announcer.try_emit(&Event::MailWaiting { count });
+                        mail_watch.note_announcement(&ids, landed);
                     }
                     MailAction::Inject {
                         count,
@@ -2311,8 +2340,11 @@ fn pump(
                         if wrote {
                             mail_watch.commit_injected(&ids);
                         } else {
-                            announcer.emit(&Event::MailWaiting { count });
-                            mail_watch.commit_announced(&ids);
+                            // Same R5 rule on the degrade path: a poisoned
+                            // writer plus a swallowed announcement must leave
+                            // the advisory owed, not quietly discharged.
+                            let landed = announcer.try_emit(&Event::MailWaiting { count });
+                            mail_watch.note_announcement(&ids, landed);
                         }
                     }
                 }
@@ -3929,6 +3961,62 @@ mod tests {
             watch.decide(&facts, false),
             MailAction::None,
             "the same message must not re-announce on every 2s poll"
+        );
+    }
+
+    /// R5: `Announcer::emit` returns `()` and swallows both a disabled
+    /// channel and a failed stderr write, so committing ids as announced
+    /// right after it recorded advisories nobody ever saw -- and `announced`
+    /// then suppressed every later announcement of them. On a signal-less
+    /// adapter `may_inject` never becomes true, so that channel is the only
+    /// surface the advisory has: it was never injected and never announced.
+    #[test]
+    fn an_announcement_that_never_surfaced_is_retried_at_the_next_poll() {
+        let mut watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "body",
+        )]);
+
+        let MailAction::Announce { ids, .. } = watch.decide(&facts, false) else {
+            panic!("a busy child announces first");
+        };
+        // The channel was quiet, or stderr was gone: nothing surfaced.
+        watch.note_announcement(&ids, false);
+
+        assert!(
+            matches!(watch.decide(&facts, false), MailAction::Announce { .. }),
+            "an advisory nobody saw must be announced again, not treated as delivered"
+        );
+    }
+
+    /// The other half of R5: a landed announcement must still dedupe exactly
+    /// as it did before, and must still leave the injection owed.
+    #[test]
+    fn an_announcement_that_landed_still_suppresses_the_next_poll_and_still_owes_an_injection() {
+        let mut watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "body",
+        )]);
+
+        let MailAction::Announce { ids, .. } = watch.decide(&facts, false) else {
+            panic!("a busy child announces first");
+        };
+        watch.note_announcement(&ids, true);
+
+        assert_eq!(
+            watch.decide(&facts, false),
+            MailAction::None,
+            "a landed announcement is not repeated on every 2s poll"
+        );
+        assert!(
+            matches!(watch.decide(&facts, true), MailAction::Inject { .. }),
+            "announcing never discharges the injection"
         );
     }
 
