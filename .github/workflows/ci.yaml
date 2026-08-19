@@ -11,6 +11,9 @@ jobs:
   test:
     name: Test, Lint, and Format Check
     runs-on: ubuntu-latest
+    # A wedged apt mirror or a hung test must fail the run, not hold it for
+    # the 6-hour default.
+    timeout-minutes: 45
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -58,8 +61,15 @@ jobs:
       # `ureq` -> `rustls` -> `ring` compiles C sources through its build
       # script, so the cross-target clippy pass needs a Windows-targeting C
       # compiler on the Linux runner.
+      # Retries and short connection timeouts because a wedged runner mirror
+      # otherwise hangs this ~30s step indefinitely; the step timeout is the
+      # backstop that turns a stall into a fast, retryable failure.
       - name: Install mingw-w64 (ring's build script needs a cross C compiler)
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        timeout-minutes: 5
+        run: >-
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update &&
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20
+          install -y --no-install-recommends gcc-mingw-w64-x86-64
 
       - name: Run Clippy Lint (Windows target)
         run: cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
