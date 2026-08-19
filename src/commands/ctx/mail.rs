@@ -435,6 +435,62 @@ pub fn consume(state: &StateDir, repo_slug: &str, path: &Path) -> CtxResult<()> 
     Ok(())
 }
 
+/// `consume`, plus a decision-log trail naming the mail file and who claimed
+/// it (issue #30). Every path that consumes mail on a session's *behalf*
+/// -- rather than in answer to that session's own explicit `zirv ctx inbox`
+/// call -- goes through this instead of the bare `consume` above: a
+/// supervisor folding mail into a launch prompt (`exec`/`loop`), a
+/// dashboard sweep injecting it into a pane, `fulfill_spawn_request`
+/// consuming what a freshly spawned worker's own prompt already carries,
+/// and the dashboard's mail-overlay `Consume` effect. Without a trail, a
+/// message one of these claimed on a session's behalf simply vanished from
+/// every consumer's view -- `zirv ctx inbox` included -- with nothing
+/// recorded anywhere to say who took it or why.
+///
+/// `zirv ctx inbox` itself deliberately stays on the bare `consume`: it is
+/// the read-once contract's own primary, expected consumer, and logging
+/// every ordinary inbox read would just be noise for the common case this
+/// mechanism exists to make visible.
+///
+/// `session` is whose registry short/session id the `Decision` is filed
+/// under (usually the consuming session's own address); `consumer` is a
+/// short free-form label naming who or what actually did the claiming (a
+/// pane short, `"exec"`, `"loop"`, ...) -- the two are not always the same
+/// value, so both are named on the entry.
+///
+/// Best-effort like every other piece of state-dir housekeeping: a log
+/// write that fails must never make an already-successful consume look like
+/// it failed, so only `consume`'s own result is returned, and the log write
+/// is attempted (its own failure swallowed) only once that has already
+/// succeeded.
+pub fn consume_and_log(
+    state: &StateDir,
+    repo_slug: &str,
+    path: &Path,
+    session: &str,
+    verb: &str,
+    consumer: &str,
+) -> CtxResult<()> {
+    consume(state, repo_slug, path)?;
+    let file_id = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown mail file>");
+    let _ = super::log::append(
+        state,
+        &super::log::Decision {
+            ts: now_secs(),
+            session,
+            verb,
+            verdict: "n/a",
+            score: 0,
+            action: "mail-consumed",
+            detail: &format!("{file_id} claimed by {consumer}"),
+        },
+    );
+    Ok(())
+}
+
 #[derive(Debug, clap::Args)]
 pub struct SendArgs {
     /// Recipient agent name, or "any" (the default) for every agent.
@@ -881,6 +937,51 @@ mod tests {
         assert!(listed[1].0.ends_with("1700000900-bbbb.md"));
         assert_eq!(listed[0].1.from_session, "aaaa");
         assert_eq!(listed[1].1.from_session, "bbbb");
+    }
+
+    /// Issue #30: every path that consumes mail on a session's *behalf*
+    /// (rather than in answer to that session's own explicit `zirv ctx
+    /// inbox` call) must leave a decision-log trail naming the mail file and
+    /// who claimed it, so a message that vanished from `inbox` is at least
+    /// traceable.
+    #[test]
+    fn consume_and_log_moves_the_message_and_records_who_claimed_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let path = store(&state, "-work-repo", &sample("s1", 1), &cfg).expect("store");
+        let file_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf8")
+            .to_string();
+
+        consume_and_log(
+            &state,
+            "-work-repo",
+            &path,
+            "recv0001",
+            "dash",
+            "dash:sweep",
+        )
+        .expect("consume_and_log");
+
+        assert!(!path.exists(), "the original path is gone");
+        let moved = state.mail().join("-work-repo").join("read").join(&file_id);
+        assert!(moved.exists(), "moved into read/, exactly like consume");
+
+        let log = std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE))
+            .expect("decision log");
+        assert!(log.contains("\"action\":\"mail-consumed\""), "got {log}");
+        assert!(log.contains("\"session\":\"recv0001\""), "got {log}");
+        assert!(
+            log.contains(&file_id),
+            "detail must name the mail file: {log}"
+        );
+        assert!(
+            log.contains("dash:sweep"),
+            "detail must name the consumer: {log}"
+        );
     }
 
     #[test]

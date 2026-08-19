@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -19,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use super::super::chrome::{PLACEHOLDER, right_truncate};
 use super::super::mail::Message;
+use super::DashAction;
 use super::pane::PaneState;
 
 /// The header's live facts. `mail_broadcast`/`mail_direct` render as
@@ -232,6 +234,10 @@ pub enum Overlay {
     /// roster (`dash::mod::run_dashboard`); never re-opened later in a
     /// session's life the way the other overlays are.
     Restore(RestoreView),
+    /// `Ctrl+A ?`/`h`/`H`: the key-binding reference. No payload -- its
+    /// content is the static [`HELP_BINDINGS`] table, not per-session state,
+    /// and any key closes it.
+    Help,
 }
 
 /// Pure: how many rows the header gets in an `area_height`-row frame.
@@ -488,11 +494,48 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, rows: &[SidebarRow]) {
     f.render_widget(List::new(items).block(block.title(title)), area);
 }
 
+/// Pure: whether visible-grid cell `(row, col)` falls inside a selection
+/// already normalized to `start <= end` in row-major (row, then col) order
+/// (`dash::normalize_selection` does the normalizing; this only ever sees the
+/// result). Mirrors exactly the span `vt100::Screen::contents_between(
+/// start.0, start.1, end.0, end.1)` copies, so the highlighted cells and the
+/// copied text always agree: the whole of every row strictly between the
+/// two, the tail of the start row from `start.1` onward, and the head of the
+/// end row up to but not including `end.1` -- the same "up until end_col"
+/// vt100 itself documents on `contents_between`.
+fn cell_in_selection(row: u16, col: u16, start: (u16, u16), end: (u16, u16)) -> bool {
+    if row < start.0 || row > end.0 {
+        return false;
+    }
+    if start.0 == end.0 {
+        return col >= start.1 && col < end.1;
+    }
+    if row == start.0 {
+        col >= start.1
+    } else if row == end.0 {
+        col < end.1
+    } else {
+        true
+    }
+}
+
 /// Walks every `vt100` cell in `screen` into `area`'s buffer, cell for cell.
 /// A wide cell's own contents are drawn once and the following column is
 /// skipped, matching how `vt100` itself represents double-width glyphs (the
 /// continuation cell carries no contents of its own).
-pub fn render_grid(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
+///
+/// `selection`, when given, is a normalized `(start, end)` pair of
+/// visible-grid `(row, col)` cells (`dash::mod`'s own click-drag selection,
+/// already ordered by `normalize_selection`) drawn with `Modifier::REVERSED`
+/// layered on top of the cell's own style -- the same tmux-style highlight a
+/// terminal's native selection would have shown, now that mouse reporting
+/// has displaced it (see `term::dash_mouse_on_bytes`).
+pub fn render_grid(
+    f: &mut Frame,
+    area: Rect,
+    screen: &vt100::Screen,
+    selection: Option<((u16, u16), (u16, u16))>,
+) {
     let (rows, cols) = screen.size();
     let buf = f.buffer_mut();
 
@@ -533,6 +576,11 @@ pub fn render_grid(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
                 modifiers |= Modifier::UNDERLINED;
             }
             if cell.inverse() {
+                modifiers |= Modifier::REVERSED;
+            }
+            if let Some((start, end)) = selection
+                && cell_in_selection(row, col, start, end)
+            {
                 modifiers |= Modifier::REVERSED;
             }
 
@@ -830,6 +878,260 @@ fn overlay_area(frame: Rect, main: Rect) -> Rect {
     }
 }
 
+/// Which section of the help overlay a row belongs to -- `help_lines` groups
+/// by this so the dialog says outright which keys need `Ctrl+A` first and
+/// which don't, rather than one flat list that never mentions the prefix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelpSection {
+    /// Needs the `Ctrl+A` prefix first.
+    Prefixed,
+    /// No prefix -- reaches the dashboard directly.
+    Unprefixed,
+    /// Not a keybinding: a closing reminder for whatever dialog is open.
+    Note,
+}
+
+/// One row of the `Ctrl+A ?` help overlay: what is shown, and -- for a row
+/// that is itself one or more real armed keystrokes -- the `filter_key`
+/// outcome each one must produce. `checks` is the single source of truth a
+/// sync test walks against the real dispatch, so this table can never drift
+/// from what `Ctrl+A <key>` actually does; it is empty for a row that is not
+/// one `filter_key` outcome (the unprefixed mouse wheel, or the closing note).
+struct HelpBinding {
+    label: &'static str,
+    description: &'static str,
+    section: HelpSection,
+    // Only the sync tests below read this outside `#[cfg(test)]`, which the
+    // plain bin target does not build.
+    #[allow(dead_code)]
+    checks: &'static [(KeyEvent, DashAction)],
+}
+
+/// The help overlay's content, in display order -- see [`HelpBinding`]. A
+/// `static`, not a function rebuilding a `Vec` on every call: `render_overlay`
+/// reaches this on every frame, which during the adaptive poll's hot window
+/// (`input_poll_wait`) is up to ~100/s. `KeyEvent::new` is `const fn` in
+/// crossterm 0.29, so the whole table is built once at compile time.
+///
+/// Width budget: every description stays at or under 30 characters, which
+/// with the label column below at 18 plus one separator space keeps every
+/// rendered line at or under 49 -- the text width `render_dialog` leaves
+/// inside its bordered box on an 80-column terminal at the default
+/// `dash.sidebar_cols`; see the test `every_help_line_fits_an_eighty_column_terminal_with_the_default_sidebar`.
+/// `Paragraph` clips rather than wraps, so anything longer loses its tail
+/// silently.
+///
+/// Height budget: the overlay is also checked against a standard 24-row
+/// terminal (see `the_help_overlay_fits_a_standard_24_row_terminal`); a
+/// terminal shorter than ~22 rows still clips the dialog's tail, which is
+/// known and accepted rather than solved with scrolling.
+static HELP_BINDINGS: &[HelpBinding] = &[
+    HelpBinding {
+        label: "Ctrl+A",
+        description: "send a literal Ctrl+A",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            DashAction::LiteralPrefix,
+        )],
+    },
+    HelpBinding {
+        label: "Tab",
+        description: "next pane",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            DashAction::NextPane,
+        )],
+    },
+    HelpBinding {
+        label: "Up / Down",
+        description: "select pane",
+        section: HelpSection::Prefixed,
+        checks: &[
+            (
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                DashAction::SelectUp,
+            ),
+            (
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                DashAction::SelectDown,
+            ),
+        ],
+    },
+    HelpBinding {
+        label: "1-9",
+        description: "jump to pane",
+        section: HelpSection::Prefixed,
+        checks: &[
+            (
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+                DashAction::Switch(0),
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE),
+                DashAction::Switch(8),
+            ),
+        ],
+    },
+    HelpBinding {
+        label: "PageUp / PageDown",
+        description: "scroll",
+        section: HelpSection::Prefixed,
+        checks: &[
+            (
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                DashAction::ScrollPageUp,
+            ),
+            (
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                DashAction::ScrollPageDown,
+            ),
+        ],
+    },
+    HelpBinding {
+        label: "Home / End",
+        description: "scroll top / live",
+        section: HelpSection::Prefixed,
+        checks: &[
+            (
+                KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+                DashAction::ScrollTop,
+            ),
+            (
+                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+                DashAction::ScrollLive,
+            ),
+        ],
+    },
+    HelpBinding {
+        label: "s",
+        description: "spawn",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            DashAction::Spawn,
+        )],
+    },
+    HelpBinding {
+        label: "n",
+        description: "nudge",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            DashAction::Nudge,
+        )],
+    },
+    HelpBinding {
+        label: "m",
+        description: "mail",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            DashAction::Mail,
+        )],
+    },
+    HelpBinding {
+        label: "M",
+        description: "memory",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE),
+            DashAction::Memory,
+        )],
+    },
+    HelpBinding {
+        label: "z",
+        description: "zoom",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            DashAction::Zoom,
+        )],
+    },
+    HelpBinding {
+        label: "q",
+        description: "quit",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            DashAction::Quit,
+        )],
+    },
+    HelpBinding {
+        label: "? / h",
+        description: "this help screen",
+        section: HelpSection::Prefixed,
+        // A real terminal delivers SHIFT alongside both '?' (shift-slash on
+        // most layouts) and 'H' itself; `filter_key` matches on `key.code`
+        // alone, so all five must (and do) land on the same action.
+        checks: &[
+            (
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                DashAction::Help,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+                DashAction::Help,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+                DashAction::Help,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE),
+                DashAction::Help,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT),
+                DashAction::Help,
+            ),
+        ],
+    },
+    HelpBinding {
+        label: "(mouse wheel)",
+        description: "scroll the focused pane",
+        section: HelpSection::Unprefixed,
+        checks: &[],
+    },
+    HelpBinding {
+        label: "",
+        description: "Esc closes, Enter confirms",
+        section: HelpSection::Note,
+        checks: &[],
+    },
+];
+
+/// Pure: the help overlay's displayed lines, grouped by [`HelpSection`] so the
+/// dialog reads as "here's what's behind Ctrl+A", then "here's what needs no
+/// prefix", then a closing reminder -- see [`HELP_BINDINGS`].
+fn help_lines() -> Vec<String> {
+    let row = |b: &HelpBinding| format!("{:<18} {}", b.label, b.description);
+    let mut lines = vec!["Ctrl+A, then:".to_string()];
+    lines.extend(
+        HELP_BINDINGS
+            .iter()
+            .filter(|b| b.section == HelpSection::Prefixed)
+            .map(row),
+    );
+    lines.push(String::new());
+    lines.push("no prefix:".to_string());
+    lines.extend(
+        HELP_BINDINGS
+            .iter()
+            .filter(|b| b.section == HelpSection::Unprefixed)
+            .map(row),
+    );
+    lines.push(String::new());
+    lines.extend(
+        HELP_BINDINGS
+            .iter()
+            .filter(|b| b.section == HelpSection::Note)
+            .map(|b| b.description.to_string()),
+    );
+    lines
+}
+
 pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
     // Never an early return on a too-small `area`: see `overlay_area`. Only a
     // frame with no cells at all leaves nothing to draw into, and
@@ -848,6 +1150,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
         Overlay::Mail(d) => render_mail_dialog(f, area, d),
         Overlay::Memory(d) => render_memory_dialog(f, area, d),
         Overlay::Restore(d) => render_restore_dialog(f, area, d),
+        Overlay::Help => render_dialog(f, area, "help", &help_lines()),
     }
 }
 
@@ -864,6 +1167,7 @@ pub fn glyph_for(state: &PaneState) -> char {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{InputVerdict, filter_key};
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -885,7 +1189,7 @@ mod tests {
         let mut term = Terminal::new(backend).expect("terminal");
         term.draw(|f| {
             let area = f.area();
-            render_grid(f, area, parser.screen());
+            render_grid(f, area, parser.screen(), None);
             render_dialog(f, area, "spawn", &["> prompt".to_string()]);
         })
         .expect("draw");
@@ -915,7 +1219,7 @@ mod tests {
         parser.process(b"\x1b[31mred\x1b[0m plain");
         let backend = TestBackend::new(20, 4);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render_grid(f, f.area(), parser.screen()))
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), None))
             .unwrap();
         let cell = &term.backend().buffer()[(0, 0)];
         assert_eq!(cell.symbol(), "r");
@@ -930,7 +1234,7 @@ mod tests {
         parser.process("\u{4e2d}ab".as_bytes());
         let backend = TestBackend::new(10, 2);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render_grid(f, f.area(), parser.screen()))
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), None))
             .unwrap();
         let buf = term.backend().buffer();
         assert_eq!(buf[(0, 0)].symbol(), "\u{4e2d}");
@@ -940,6 +1244,98 @@ mod tests {
         assert_eq!(buf[(1, 0)].symbol(), " ");
         assert_eq!(buf[(2, 0)].symbol(), "a");
         assert_eq!(buf[(3, 0)].symbol(), "b");
+    }
+
+    /// `cell_in_selection` mirrors `vt100::Screen::contents_between`'s own
+    /// span exactly, cell for cell: the tail of the start row, every column
+    /// of a middle row, and the head of the end row up to but not including
+    /// `end.1`. Pinned against a multi-row selection first.
+    #[test]
+    fn cell_in_selection_spans_a_multi_row_selection_like_contents_between() {
+        let start = (1, 5);
+        let end = (3, 2);
+
+        // Row above the selection: nothing is selected.
+        assert!(!cell_in_selection(0, 0, start, end));
+        assert!(!cell_in_selection(0, 40, start, end));
+
+        // Start row: only from col 5 onward.
+        assert!(!cell_in_selection(1, 4, start, end));
+        assert!(cell_in_selection(1, 5, start, end));
+        assert!(cell_in_selection(1, 999, start, end));
+
+        // A middle row: every column, including 0.
+        assert!(cell_in_selection(2, 0, start, end));
+        assert!(cell_in_selection(2, 999, start, end));
+
+        // End row: only up to (not including) col 2.
+        assert!(cell_in_selection(3, 0, start, end));
+        assert!(cell_in_selection(3, 1, start, end));
+        assert!(!cell_in_selection(3, 2, start, end));
+        assert!(!cell_in_selection(3, 40, start, end));
+
+        // Row below the selection: nothing is selected.
+        assert!(!cell_in_selection(4, 0, start, end));
+    }
+
+    /// A single-row selection is the half-open `[start.1, end.1)` range on
+    /// that one row and nothing on any other row -- the `Ordering::Equal`
+    /// branch `contents_between` itself takes.
+    #[test]
+    fn cell_in_selection_on_a_single_row_is_the_half_open_column_range() {
+        let start = (2, 3);
+        let end = (2, 7);
+
+        assert!(!cell_in_selection(2, 2, start, end));
+        assert!(cell_in_selection(2, 3, start, end));
+        assert!(cell_in_selection(2, 6, start, end));
+        assert!(!cell_in_selection(2, 7, start, end), "end col is exclusive");
+
+        // Same row, but outside the selection's own row range.
+        assert!(!cell_in_selection(1, 5, start, end));
+        assert!(!cell_in_selection(3, 5, start, end));
+
+        // A zero-width same-row "selection" (anchor == end, i.e. a click
+        // rather than a drag) selects nothing at all.
+        assert!(!cell_in_selection(2, 3, (2, 3), (2, 3)));
+    }
+
+    /// `render_grid` layers `Modifier::REVERSED` onto exactly the cells
+    /// `cell_in_selection` reports, leaving every other cell's style alone.
+    #[test]
+    fn render_grid_highlights_only_the_selected_cells() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc");
+        let backend = TestBackend::new(10, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        // Row 1, cols 2..5 selected (single row).
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), Some(((1, 2), (1, 5)))))
+            .unwrap();
+        let buf = term.backend().buffer();
+        assert!(!buf[(1, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(2, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(4, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(5, 1)].modifier.contains(Modifier::REVERSED));
+        // Untouched rows carry no highlight at all.
+        assert!(!buf[(2, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(2, 2)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// No selection at all leaves every cell exactly as it was rendered
+    /// before this feature existed -- the `None` default every other caller
+    /// still passes.
+    #[test]
+    fn render_grid_with_no_selection_reverses_nothing_the_cell_itself_did_not_ask_for() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process(b"plain text");
+        let backend = TestBackend::new(10, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        for x in 0..10 {
+            assert!(!buf[(x, 0)].modifier.contains(Modifier::REVERSED));
+        }
     }
 
     /// HIGH-1: the focused pane's cursor translates from a screen-relative
@@ -1785,6 +2181,7 @@ mod tests {
                 }],
                 cursor: 0,
             }),
+            Overlay::Help,
         ]
     }
 
@@ -1832,6 +2229,140 @@ mod tests {
         }
     }
 
+    /// The help table's own ground truth: every `checks` entry must produce
+    /// exactly the `filter_key` outcome it claims, in the armed state, so the
+    /// help overlay can never drift from what `Ctrl+A <key>` actually does.
+    #[test]
+    fn help_bindings_match_the_real_filter_key_dispatch() {
+        for binding in HELP_BINDINGS {
+            for &(event, expected) in binding.checks {
+                let (_, verdict) = filter_key(true, event);
+                assert_eq!(
+                    verdict,
+                    InputVerdict::Dash(expected),
+                    "help row {:?}: filter_key({event:?}) disagreed",
+                    binding.label
+                );
+            }
+        }
+    }
+
+    /// One flag per [`DashAction`] variant, all false until the test below
+    /// sees that action in some row's `checks`. The match against it (in the
+    /// test) has no wildcard arm, so adding a `DashAction` variant without
+    /// giving it a flag here -- and a help row that sets it -- is a compile
+    /// error, not a silently-uncovered help row.
+    #[derive(Default)]
+    struct DashActionCoverage {
+        switch: bool,
+        next_pane: bool,
+        select_up: bool,
+        select_down: bool,
+        spawn: bool,
+        nudge: bool,
+        mail: bool,
+        memory: bool,
+        zoom: bool,
+        quit: bool,
+        scroll_page_up: bool,
+        scroll_page_down: bool,
+        scroll_top: bool,
+        scroll_live: bool,
+        literal_prefix: bool,
+        help: bool,
+    }
+
+    /// Completeness, not just correctness: the test above proves every
+    /// claimed row is right, this one proves no `DashAction` variant is
+    /// missing a row at all.
+    #[test]
+    fn help_bindings_cover_every_dash_action() {
+        let mut cov = DashActionCoverage::default();
+        for binding in HELP_BINDINGS {
+            for &(_, action) in binding.checks {
+                match action {
+                    DashAction::Switch(_) => cov.switch = true,
+                    DashAction::NextPane => cov.next_pane = true,
+                    DashAction::SelectUp => cov.select_up = true,
+                    DashAction::SelectDown => cov.select_down = true,
+                    DashAction::Spawn => cov.spawn = true,
+                    DashAction::Nudge => cov.nudge = true,
+                    DashAction::Mail => cov.mail = true,
+                    DashAction::Memory => cov.memory = true,
+                    DashAction::Zoom => cov.zoom = true,
+                    DashAction::Quit => cov.quit = true,
+                    DashAction::ScrollPageUp => cov.scroll_page_up = true,
+                    DashAction::ScrollPageDown => cov.scroll_page_down = true,
+                    DashAction::ScrollTop => cov.scroll_top = true,
+                    DashAction::ScrollLive => cov.scroll_live = true,
+                    DashAction::LiteralPrefix => cov.literal_prefix = true,
+                    DashAction::Help => cov.help = true,
+                }
+            }
+        }
+        assert!(
+            cov.switch
+                && cov.next_pane
+                && cov.select_up
+                && cov.select_down
+                && cov.spawn
+                && cov.nudge
+                && cov.mail
+                && cov.memory
+                && cov.zoom
+                && cov.quit
+                && cov.scroll_page_up
+                && cov.scroll_page_down
+                && cov.scroll_top
+                && cov.scroll_live
+                && cov.literal_prefix
+                && cov.help,
+            "help table is missing a row for at least one DashAction variant"
+        );
+    }
+
+    #[test]
+    fn help_lines_is_non_empty_and_documents_the_prefix() {
+        let lines = help_lines();
+        assert!(!lines.is_empty());
+        assert!(lines.iter().any(|l| l == "Ctrl+A, then:"));
+        assert!(lines.iter().any(|l| l == "no prefix:"));
+        assert!(lines.iter().any(|l| l.contains("quit")));
+        assert!(lines.iter().any(|l| l.contains("Esc closes")));
+    }
+
+    /// `render_dialog` leaves 49 text columns inside its bordered box on an
+    /// 80-column terminal at the default `dash.sidebar_cols` (24): main width
+    /// is `80 - 24 - 1` (the sidebar separator) `= 55`, `dialog_width(55) =
+    /// 51`, minus 2 for the block's own left/right border. `Paragraph` clips
+    /// rather than wraps, so a longer line loses its tail silently.
+    #[test]
+    fn every_help_line_fits_an_eighty_column_terminal_with_the_default_sidebar() {
+        for line in help_lines() {
+            assert!(
+                line.chars().count() <= 49,
+                "help line too long for an 80-col terminal: {line:?} ({} chars)",
+                line.chars().count()
+            );
+        }
+    }
+
+    /// The width test's companion: `render_dialog`'s own height is
+    /// `lines.len() + 2` (top/bottom border), clamped to `area.height`. On a
+    /// standard 80x24 terminal at the default `dash.sidebar_cols`, `area` is
+    /// the main rect left after the 1-row header (`header_rows`), so its
+    /// height is `24 - 1 = 23`. If the content height ever exceeds that, the
+    /// clamp silently drops rows off the bottom instead of growing the box.
+    #[test]
+    fn the_help_overlay_fits_a_standard_24_row_terminal() {
+        let content_height = help_lines().len() + 2;
+        assert!(
+            content_height <= 23,
+            "help overlay ({content_height} rows incl. borders) no longer fits a standard \
+             24-row terminal (23 rows after the header) and will clip"
+        );
+    }
+
     /// `tests/fixtures/claude-session.raw` is a gitignored capture of a real
     /// interactive session (see the vt100 spike,
     /// `docs/superpowers/notes/2026-08-13-vt100-spike.md`) -- present on the
@@ -1853,7 +2384,7 @@ mod tests {
 
         let backend = TestBackend::new(120, 40);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render_grid(f, f.area(), parser.screen()))
+        term.draw(|f| render_grid(f, f.area(), parser.screen(), None))
             .unwrap();
 
         let buf = term.backend().buffer();

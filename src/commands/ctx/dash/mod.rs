@@ -73,6 +73,9 @@ pub enum DashAction {
     Memory,
     Zoom,
     Quit,
+    /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
+    /// binding below.
+    Help,
     /// Scroll the focused pane a half-screen back into its history
     /// (`Ctrl+A PageUp`) or toward the live view (`Ctrl+A PageDown`).
     ScrollPageUp,
@@ -139,6 +142,7 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Char('M') => Some(DashAction::Memory),
         KeyCode::Char('z') => Some(DashAction::Zoom),
         KeyCode::Char('q') => Some(DashAction::Quit),
+        KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Some(DashAction::Help),
         _ => None,
     };
 
@@ -225,9 +229,24 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
         // literal `[13;2u` typed into its prompt. `ESC CR` is what Claude
         // Code's own `/terminal-setup` binds Shift+Enter to, and it is the
         // long-standing Meta+Enter convention, so it degrades to "newline"
-        // rather than to garbage. Other modifiers on Enter still submit.
+        // rather than to garbage.
+        //
+        // ALT is checked here too, not just SHIFT: an empirical probe of the
+        // real claude CLI under ConPTY established that once an operator's
+        // Windows Terminal has claude's own `/terminal-setup` binding, WT
+        // rewrites Shift+Enter itself into `ESC CR` before zirv ever sees a
+        // keystroke -- and zirv's own console layer folds that byte pair back
+        // into a single Enter keydown carrying ALT rather than SHIFT (the
+        // `ALT` fast-path above this match is gated on `KeyCode::Char`, so
+        // `Enter`+ALT is not intercepted there and still reaches this arm).
+        // Without this, that keydown fell through to the bare-`\r` branch and
+        // silently submitted instead of inserting the newline the operator
+        // asked for. Ctrl+Enter (neither SHIFT nor ALT) still submits.
         KeyCode::Enter => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            {
                 b"\x1b\r".to_vec()
             } else {
                 b"\r".to_vec()
@@ -320,6 +339,7 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::Mail(_) => "mail",
         ui::Overlay::Memory(_) => "memory",
         ui::Overlay::Restore(_) => "restore",
+        ui::Overlay::Help => "help",
     }
 }
 
@@ -1303,6 +1323,266 @@ fn pane_local_mouse(area: Rect, column: u16, row: u16) -> (u16, u16) {
     (col, row)
 }
 
+/// Pure: a frame-relative mouse position translated into the pane's own
+/// visible-grid cell -- 0-based `(row, col)`, in exactly the coordinate space
+/// `vt100::Screen::cell`/`contents_between` use, which already accounts for
+/// the pane's scrollback offset (`Pane::screen`'s own doc comment). The
+/// selection counterpart of [`pane_local_mouse`], which produces the 1-based
+/// xterm-protocol coordinates a *forwarded* mouse report needs instead --
+/// this one is never sent to a child, only used to index the pane's own
+/// grid.
+///
+/// Clamped into the pane's actual grid size (`grid_rows`/`grid_cols`) as
+/// well as `area`: the two are expected to agree (a pane is resized to its
+/// rendered area), but a resize race should degrade to "clamped to the last
+/// known grid" rather than indexing past it. `None` only for a grid that
+/// cannot be indexed at all (zero rows or columns, or an empty area).
+fn pane_local_cell(
+    area: Rect,
+    column: u16,
+    row: u16,
+    grid_rows: u16,
+    grid_cols: u16,
+) -> Option<(u16, u16)> {
+    if area.is_empty() || grid_rows == 0 || grid_cols == 0 {
+        return None;
+    }
+    let col = column
+        .saturating_sub(area.x)
+        .min(area.width.saturating_sub(1))
+        .min(grid_cols - 1);
+    let row = row
+        .saturating_sub(area.y)
+        .min(area.height.saturating_sub(1))
+        .min(grid_rows - 1);
+    Some((row, col))
+}
+
+/// Pure: a selection's anchor/end pair, ordered so `start <= end` in (row,
+/// col) reading order -- tuple comparison is already lexicographic, which is
+/// exactly row-major order. `vt100::Screen::contents_between` does not
+/// normalize its own arguments (a `start_row` past `end_row` silently
+/// returns an empty string), so the caller owns it; `ui::render_grid`'s
+/// `cell_in_selection` expects the same already-ordered pair this returns.
+fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// A pane-local text selection dragged out with the mouse: the `?1002`
+/// `Drag` events `term::dash_mouse_on_bytes` now enables let the dashboard
+/// offer tmux-style click-drag selection in place of the terminal's own
+/// native one, which enabling any mouse reporting displaced. Only ever
+/// started against a pane that does not itself want mouse events
+/// (`Pane::wants_mouse`) -- one that does keeps getting its clicks forwarded
+/// exactly as before, untouched by any of this.
+///
+/// `anchor`/`end` are 0-based visible-grid `(row, col)` cells, in whichever
+/// order the drag actually went (not yet normalized -- `normalize_selection`
+/// does that at read time, so a drag that moved up or left works the same as
+/// one that moved down or right). They are only meaningful against the
+/// pane's *current* scrollback offset (`Pane::screen`'s own doc comment:
+/// `vt100::Screen::cell`/`contents_between` both reinterpret a `(row, col)`
+/// against whatever is presently scrolled into view) -- so a scroll on this
+/// pane, wheel or `Ctrl+A PageUp`/`Home`/`End` alike, cancels the selection
+/// outright (`scroll_cancels_selection`) rather than carrying a captured
+/// offset here to compare against; see the callers of that function for
+/// where. `pane_short` names the pane the selection belongs to, not a
+/// `panes` index: an index shifts under a reap (`reap_fixup`), while a short
+/// id still names the same pane or plainly does not match any more, which is
+/// all a stale-selection check needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Selection {
+    pane_short: String,
+    anchor: (u16, u16),
+    end: (u16, u16),
+}
+
+/// Pure: whether a scroll on `scrolled_pane_short` that moved a pane's
+/// scrollback offset from `before` to `after` must cancel `selection`.
+///
+/// Any nonzero movement on the *same* pane the selection belongs to
+/// invalidates it, whatever state the selection is in -- still being dragged
+/// (a wheel notch spun while the button is held arrives as its own
+/// `MouseEventKind::ScrollUp`/`ScrollDown` event, not a `Drag`, so nothing
+/// else observes it) or already released and highlighted (`Ctrl+A PageUp`,
+/// or the wheel, scrolled after the button came up). Both `Screen::cell`
+/// (rendering, via `ui::render_grid`) and `Screen::contents_between`
+/// (extraction) reinterpret a `(row, col)` against whatever is presently
+/// scrolled into view, so continuing to use stale coordinates would
+/// highlight -- and copy -- whichever rows now happen to occupy those
+/// coordinates, not what the operator actually dragged over. A scroll on a
+/// *different* pane, or one that clamped to a no-op (already at the oldest
+/// line or already live), leaves the selection alone.
+fn scroll_cancels_selection(
+    selection: &Selection,
+    scrolled_pane_short: &str,
+    before: usize,
+    after: usize,
+) -> bool {
+    before != after && selection.pane_short == scrolled_pane_short
+}
+
+/// Pure: whether newly processed child output on `output_pane_short` must
+/// cancel `selection`.
+///
+/// The unifying invariant behind every one of these `*_cancels_selection`
+/// functions is that a `Selection`'s `(row, col)` coordinates only stay
+/// meaningful while the pane's *visible content* is static.
+/// `scroll_cancels_selection` covers the offset moving; this covers the far
+/// more common case of the offset staying at `0` while the child simply
+/// keeps printing -- new rows scroll the old ones up under the very
+/// coordinates a selection is still using, and a release after that would
+/// copy whatever text now happens to sit there, not what the operator
+/// dragged over. Any output at all on the selected pane cancels it: telling
+/// "the screen changed" apart from "bytes arrived but repainted the exact
+/// same content" would need a full-screen diff for a benefit no operator
+/// would notice, while the cost of a false cancel here is at most a
+/// selection the operator can just redraw. Output on a *different* pane
+/// leaves the selection alone.
+fn output_cancels_selection(selection: &Selection, output_pane_short: &str) -> bool {
+    selection.pane_short == output_pane_short
+}
+
+/// Pure: whether resizing `resized_pane_short`'s grid from `old_size` to
+/// `new_size` (both `(rows, cols)`, `vt100::Screen::size`'s own order) must
+/// cancel `selection`. The same invariant as `scroll_cancels_selection`/
+/// `output_cancels_selection` from the third angle: a resize does not move
+/// content, but it does mean the pane's grid this selection's `(row, col)`
+/// cells index into is no longer the one they were captured against --
+/// `ui::cell_in_selection`'s middle-row arm would highlight every remaining
+/// row of a shrunk grid, and `contents_between` would copy the trailing row
+/// in full, if the coordinates were left to point past the new bounds.
+fn resize_cancels_selection(
+    selection: &Selection,
+    resized_pane_short: &str,
+    old_size: (u16, u16),
+    new_size: (u16, u16),
+) -> bool {
+    old_size != new_size && selection.pane_short == resized_pane_short
+}
+
+/// Glue for [`resize_cancels_selection`], shared by every path that resizes
+/// a pane's grid -- `apply_terminal_resize` (covering both `Event::Resize`
+/// and the per-frame reconciliation) and the `Ctrl+A z` zoom toggle's own
+/// inline resize -- so none of the three can independently forget the check.
+/// `new_size` is `(rows, cols)`, the size every pane in `panes` is about to
+/// be resized to (all three call sites resize every pane to the same
+/// geometry); the selected pane's *current* size is read fresh out of its
+/// own screen rather than threaded through as a parameter, since the caller
+/// has not resized anything yet at the point this runs.
+fn cancel_selection_on_resize(
+    selection: &mut Option<Selection>,
+    panes: &[Pane],
+    new_size: (u16, u16),
+) {
+    let Some(sel) = selection.as_ref() else {
+        return;
+    };
+    let stale = panes
+        .iter()
+        .find(|pane| pane.short() == sel.pane_short)
+        .is_some_and(|pane| {
+            resize_cancels_selection(sel, pane.short(), pane.screen().size(), new_size)
+        });
+    if stale {
+        *selection = None;
+    }
+}
+
+/// Pure: what releasing the left button does to an in-progress selection --
+/// keep it (now highlighted, with its text copied) or drop it as a bare
+/// click. `Down` then `Up` with no `Drag` in between leaves `end == anchor`,
+/// and a click must never copy: that is the one invariant every terminal's
+/// own native selection already honours, and the operator's expectation
+/// carries straight over.
+fn selection_on_release(sel: Selection) -> (Option<Selection>, bool) {
+    if sel.end == sel.anchor {
+        (None, false)
+    } else {
+        (Some(sel), true)
+    }
+}
+
+/// The standard (padded) base64 alphabet, RFC 4648 §4. OSC 52 is the only
+/// place this dashboard needs base64, and a ~15-line encoder was not worth a
+/// new dependency (or reaching for a transitive one another crate happens to
+/// pull in, which is not a contract this code can rely on staying true).
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Pure: standard, padded base64 of `bytes`. See [`B64_ALPHABET`] for why
+/// this exists instead of a dependency.
+fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(B64_ALPHABET[usize::from(b0 >> 2)] as char);
+        out.push(B64_ALPHABET[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[usize::from(b2 & 0x3f)] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// OSC 52's own practical ceiling here, in bytes of base64 *output*: some
+/// terminals cap how much a single OSC 52 write will accept, and this
+/// dashboard has no way to ask the host terminal what its own limit is. 64
+/// KiB of base64 is about 48 KiB of source text -- generous for anything
+/// selected by hand, and cheap insurance against writing something enormous
+/// to the host terminal's stdout.
+const OSC52_MAX_BASE64_BYTES: usize = 64 * 1024;
+
+/// Pure: `text`, truncated on a UTF-8 boundary so its base64 encoding never
+/// exceeds [`OSC52_MAX_BASE64_BYTES`]. Base64 expands every 3 raw bytes into
+/// 4 output bytes with no partial-group form that stays valid mid-group, so
+/// the raw cap is derived from the output cap rather than truncating the
+/// already-encoded string after the fact.
+fn cap_for_osc52(text: &str) -> &str {
+    let max_raw = (OSC52_MAX_BASE64_BYTES / 4) * 3;
+    if text.len() <= max_raw {
+        return text;
+    }
+    let mut end = max_raw;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Pure: the full OSC 52 "set clipboard" escape sequence for `text`, capped
+/// by [`cap_for_osc52`]. `c` selects the system clipboard (as opposed to
+/// `p`, the primary selection) -- what every terminal implementing OSC 52
+/// treats as "the" clipboard a paste reads from.
+fn osc52_copy_sequence(text: &str) -> Vec<u8> {
+    let capped = cap_for_osc52(text);
+    let encoded = b64_encode(capped.as_bytes());
+    let mut seq = Vec::with_capacity(encoded.len() + 8);
+    seq.extend_from_slice(b"\x1b]52;c;");
+    seq.extend_from_slice(encoded.as_bytes());
+    seq.push(0x07);
+    seq
+}
+
+/// Writes an OSC 52 clipboard-set sequence to the host terminal, the same
+/// way `term::dash_mouse_on_bytes` is written at startup: raw to stdout,
+/// flushed immediately. Best-effort like that write -- a terminal that
+/// ignores or does not support OSC 52, or a write that simply fails, loses
+/// the copy, not the session.
+fn copy_to_host_clipboard(text: &str) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.write_all(&osc52_copy_sequence(text))?;
+    stdout.flush()
+}
+
 /// Pure: the most recent notice still live as of `now`, if any. The header
 /// prefers a live notice over the sticky error line, so the latest action's
 /// confirmation is what the operator sees while it is fresh; once it expires
@@ -1435,13 +1715,20 @@ fn apply_terminal_resize(
     full: &mut Rect,
     panes: &mut [Pane],
     errors: &mut Vec<String>,
+    selection: &mut Option<Selection>,
 ) {
     *term_cols = cols;
     *term_rows = rows;
     *full = Rect::new(0, 0, cols, rows);
     let m = effective_main(*full, sidebar_cols, zoomed);
+    let new_size = (m.height.max(1), m.width.max(1));
+    // MEDIUM (review): a resize is one of the ways a selection's grid
+    // coordinates go stale -- see `cancel_selection_on_resize`. Read before
+    // any pane is actually resized, since it compares against each pane's
+    // *current* size.
+    cancel_selection_on_resize(selection, panes, new_size);
     for pane in panes.iter_mut() {
-        if let Err(e) = pane.resize(m.height.max(1), m.width.max(1)) {
+        if let Err(e) = pane.resize(new_size.0, new_size.1) {
             push_error(errors, format!("resize: {e}"));
         }
     }
@@ -1498,6 +1785,22 @@ fn build_turn_env(
             );
             let mut env = setup.env;
             env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+            // Issue #30, item 1: a worker pane's own session identity must
+            // not depend on whether its adapter has a turn-signal mechanism
+            // to register at all. `register_turn_signal` legitimately
+            // returns an empty `env` for an adapter with no such mechanism
+            // (codex today, `capabilities().turn_signal == false`) -- that
+            // silence is correct for the socket/signal env it owns, but it
+            // used to also leave `SESSION_ENV` entirely unset, so any `zirv
+            // ctx send` such a pane ran recorded `identity_or_unknown`'s
+            // `"unknown"` as its sender and had no address of its own for a
+            // reply to be `--to-session`-directed at. A turn-signal-capable
+            // adapter (claude) already sets this as part of its own `setup.
+            // env`, so it is added here only when not already present,
+            // rather than risking a duplicate entry.
+            if !env.iter().any(|(k, _)| k == adapters::SESSION_ENV) {
+                env.push((adapters::SESSION_ENV.to_string(), session_id.to_string()));
+            }
             (env, None)
         }
         Err(e) => (
@@ -2145,7 +2448,19 @@ fn fulfill_spawn_request(
     nudge_queues.push(VecDeque::new());
 
     for (path, _) in mail_entries.drain(..) {
-        let _ = mail::consume(state, &slug, &path);
+        // Issue #30, item 3: this pane's own launch prompt already carried
+        // these messages (`compose_worker_prompt`/`worker_task_prompt`), so
+        // consumption here is on the freshly spawned pane's behalf, never in
+        // answer to its own explicit `zirv ctx inbox` -- logged so a message
+        // that no longer shows up in anyone's inbox is at least traceable.
+        let _ = mail::consume_and_log(
+            state,
+            &slug,
+            &path,
+            &short,
+            "dash",
+            &format!("dash:spawn:{short}"),
+        );
     }
 
     Ok(short)
@@ -2486,7 +2801,14 @@ fn apply_mail_effect(
     let slug = super::state::repo_slug(repo);
     match effect {
         ui::MailEffect::Consume(path) => {
-            if let Err(e) = mail::consume(state, &slug, &path) {
+            // Issue #30, item 3: the operator drives this from the
+            // dashboard's own mail overlay, on behalf of the orchestrator
+            // pane's identity (`from_session`), not through `zirv ctx
+            // inbox` -- logged the same as every other on-behalf-of
+            // consumption seam.
+            if let Err(e) =
+                mail::consume_and_log(state, &slug, &path, from_session, "dash", "dash:overlay")
+            {
                 push_error(errors, format!("mail consume: {e}"));
             }
         }
@@ -2845,16 +3167,30 @@ impl Injector for Pane {
 
 /// Delivers one mail message visibly into `injector`, consuming the source
 /// file (moving it to `read/`) ONLY if the injection itself returned `Ok`.
+///
+/// `short` is the delivering pane's own registry short id: consumption here
+/// happens on that pane's behalf, not in answer to its own explicit `zirv
+/// ctx inbox` call, so it goes through `mail::consume_and_log` (issue #30)
+/// rather than the bare `consume`, leaving a decision-log trail naming the
+/// mail file and the pane that claimed it.
 fn deliver_and_consume<I: Injector>(
     injector: &mut I,
     state: &StateDir,
     slug: &str,
+    short: &str,
     label: &str,
     path: &Path,
     body: &str,
 ) -> CtxResult<()> {
     injector.try_inject(label, body)?;
-    mail::consume(state, slug, path)
+    mail::consume_and_log(
+        state,
+        slug,
+        path,
+        short,
+        "dash",
+        &format!("dash:sweep:{short}"),
+    )
 }
 
 /// Pure: whether a pane in `verb`, with `injectable` as `Pane::injectable`
@@ -2939,7 +3275,7 @@ fn sweep_one_pane<I: Injector>(
         &msg.body,
         cap,
     );
-    match deliver_and_consume(injector, state, slug, &label, &path, &body) {
+    match deliver_and_consume(injector, state, slug, short, &label, &path, &body) {
         Ok(()) => true,
         Err(e) => {
             push_error(errors, format!("mail sweep: {e}"));
@@ -3229,6 +3565,39 @@ fn input_stream_is_dead(consecutive_errors: usize) -> bool {
     consecutive_errors >= MAX_CONSECUTIVE_INPUT_ERRORS
 }
 
+/// The first `event::poll` wait of a tick once no activity (a keyboard or
+/// mouse event read from crossterm) has happened recently -- the old flat
+/// behaviour, cheap on CPU while the operator is idle. Deliberately NOT
+/// refreshed by pane output: a streaming response or an animated spinner is
+/// the normal state of an active dashboard, and holding the loop in the hot
+/// window for that would multiply its wakeup rate for no benefit -- the
+/// operator's own keystroke already opens the window, which is all typing
+/// latency needs.
+const INPUT_POLL_IDLE_WAIT: Duration = Duration::from_millis(50);
+/// The first `event::poll` wait right after activity: short enough that the
+/// repaint showing a child's echo of a keystroke does not lag behind typing.
+const INPUT_POLL_HOT_WAIT: Duration = Duration::from_millis(10);
+/// How long after the last activity the loop stays in the hot-poll window
+/// before falling back to [`INPUT_POLL_IDLE_WAIT`]. For that whole window the
+/// entire tick -- not just the poll -- runs at up to ~100/s: every per-pane
+/// drain, the spawn-request `read_dir`, the mail sweep gate check, the sidebar
+/// rebuild, the draw. Bounded and deliberate: 300ms of a busier tick during
+/// active typing is the trade for the fast repaint, and the window closes
+/// back to the cheap 50ms cadence the instant activity stops.
+const INPUT_POLL_HOT_WINDOW: Duration = Duration::from_millis(300);
+
+/// Pure: the poll wait for this tick's first `event::poll`, given how long ago
+/// the loop last saw activity. Hot (short) inside the window so a burst of
+/// typing keeps getting fast repaints; idle (long, cheap) once it has passed --
+/// see `INPUT_POLL_HOT_WAIT`/`INPUT_POLL_IDLE_WAIT`.
+fn input_poll_wait(since_activity: Duration) -> Duration {
+    if since_activity <= INPUT_POLL_HOT_WINDOW {
+        INPUT_POLL_HOT_WAIT
+    } else {
+        INPUT_POLL_IDLE_WAIT
+    }
+}
+
 /// Pure: whether this tick's reap left the dashboard with nothing to
 /// supervise, which is a quit (D4).
 ///
@@ -3433,18 +3802,21 @@ pub fn run_dashboard(
     term::set_dash_active(true);
 
     // Mouse reporting, which is what makes the wheel scroll a pane's
-    // scrollback (`Event::Mouse` below).
+    // scrollback, a click reach a child that wants one, and a click-drag
+    // select text out of one that doesn't (`Event::Mouse` below).
     //
     // Written as raw bytes from `term::dash_mouse_on_bytes` rather than
     // through crossterm's `EnableMouseCapture`, on purpose: that helper also
-    // turns on `?1002`/`?1003`, the motion-tracking modes, and a probe on a
-    // real Windows Terminal session showed `?1003` emitting a
+    // turns on `?1003`, the free-running any-motion mode, and a probe on a
+    // real Windows Terminal session showed it emitting a
     // `MouseEventKind::Moved` event for every pointer movement -- dozens from
-    // one sweep across the window. Those land in the same bounded per-tick
-    // input drain the operator's keystrokes do (`MAX_INPUT_DRAIN_PER_TICK`),
-    // so motion tracking would have the pointer competing with the keyboard
-    // for a feature that only ever reads `ScrollUp`/`ScrollDown`. See
-    // `term::dash_mouse_on_bytes` for the full reasoning before changing this.
+    // one sweep across the window, with no button ever held. Those would land
+    // in the same bounded per-tick input drain the operator's keystrokes do
+    // (`MAX_INPUT_DRAIN_PER_TICK`), competing with the keyboard for a mode
+    // nothing here reads. See `term::dash_mouse_on_bytes` for the full
+    // reasoning -- including why `?1002`, the *button*-drag mode, is turned
+    // on despite the same competing-with-the-keyboard concern -- before
+    // changing this.
     //
     // Best-effort: a terminal that will not report mouse events still has
     // `Ctrl+A PageUp`/`Home`, so a failure here is a header notice, never a
@@ -3531,6 +3903,19 @@ pub fn run_dashboard(
     let mut focused: usize = 0;
     let mut zoomed = false;
     let mut prefix_armed = false;
+    // Tmux-style in-dashboard click-drag text selection (`Selection`'s own
+    // doc comment). `None` whenever nothing is selected or highlighted;
+    // `Some` both while a drag is in progress and, after release, for
+    // whatever stays highlighted until the next `Down` clears it.
+    let mut selection: Option<Selection> = None;
+    // The adaptive input-poll wait's own clock (`input_poll_wait`): refreshed
+    // only on a keyboard/mouse event read from crossterm, not on pane output --
+    // a streaming response or an animated spinner must not hold the loop in
+    // the 10ms hot window indefinitely; the operator's own keystroke already
+    // opens it, which is all typing latency needs. Seeded to now, so launch
+    // itself counts as activity and the dashboard starts in the hot window
+    // rather than the flat 50ms idle wait.
+    let mut last_activity = Instant::now();
     let mut overlay = if restore_candidates.is_empty() {
         ui::Overlay::None
     } else {
@@ -3613,7 +3998,18 @@ pub fn run_dashboard(
             });
         }
         for pane in panes.iter_mut() {
-            pane.drain();
+            let (any_output, _more) = pane.drain();
+            // HIGH (review): live output rewrites this pane's grid rows in
+            // place, under a selection's stale `(row, col)` coordinates --
+            // scrollback-offset checks (`scroll_cancels_selection`) never see
+            // this, since the offset itself does not move while the pane
+            // sits at its live view. See `output_cancels_selection`.
+            if any_output
+                && let Some(sel) = selection.as_ref()
+                && output_cancels_selection(sel, pane.short())
+            {
+                selection = None;
+            }
             pane.on_turn_signal();
         }
         // R2: an exited pane leaves here -- registry record released, socket
@@ -3689,9 +4085,10 @@ pub fn run_dashboard(
         }
 
         // H3: the disk-backed sweep and the nudge-marker claim run at most
-        // once per `FACTS_THROTTLE`, not on every 50ms tick. The in-memory
-        // nudge-queue drain below stays every tick: it is cheap and delivers
-        // an operator's queued nudge the moment its pane goes idle.
+        // once per `FACTS_THROTTLE`, not on every tick (the tick rate itself
+        // is adaptive -- see `input_poll_wait`). The in-memory nudge-queue
+        // drain below stays every tick: it is cheap and delivers an
+        // operator's queued nudge the moment its pane goes idle.
         let sweep_now = Instant::now();
         if due(last_mail_sweep, sweep_now, FACTS_THROTTLE) {
             last_mail_sweep = sweep_now;
@@ -3755,21 +4152,28 @@ pub fn run_dashboard(
         let total_rows = rows.len();
         selected = selected.min(total_rows.saturating_sub(1));
 
-        // HIGH-2: block up to 50ms for the first event, then drain every
-        // event already queued behind it (bounded) before falling through to
-        // the maintenance/redraw at the bottom of the tick. A 2000-character
-        // paste is 2000 key events; handling them one-per-tick meant 2000 full
-        // maintenance passes and redraws.
+        // HIGH-2: block for the first event (`input_poll_wait`'s adaptive
+        // 10ms/50ms), then drain every event already queued behind it
+        // (bounded) before falling through to the maintenance/redraw at the
+        // bottom of the tick. A 2000-character paste is 2000 key events;
+        // handling them one-per-tick meant 2000 full maintenance passes and
+        // redraws.
         let mut drained = 0usize;
         while drained < MAX_INPUT_DRAIN_PER_TICK {
             let wait = if drained == 0 {
-                Duration::from_millis(50)
+                input_poll_wait(last_activity.elapsed())
             } else {
                 Duration::ZERO
             };
             match event::poll(wait) {
                 Ok(true) => {
                     let read = event::read();
+                    // Activity, for the adaptive poll wait above: a keyboard
+                    // or mouse event, whatever `filter_key`/the overlay below
+                    // goes on to decide it means.
+                    if matches!(read, Ok(Event::Key(_)) | Ok(Event::Mouse(_))) {
+                        last_activity = Instant::now();
+                    }
                     // Task 2: one line per event, before anything acts on it,
                     // with the arming state and overlay it is about to be
                     // decided against. Inert unless `ZIRV_CTX_DASH_KEYLOG` is
@@ -4001,6 +4405,11 @@ pub fn run_dashboard(
                                         }
                                         _ => overlay = ui::Overlay::Nudge(draft),
                                     },
+                                    // Any key closes it (tmux's own key-list
+                                    // convention): `overlay` was already reset
+                                    // to `None` by the `mem::take` above, so
+                                    // there is nothing to reassign here.
+                                    ui::Overlay::Help => {}
                                 }
                                 // Task 2: the take/assign pair. An overlay that
                                 // reopens itself (`took=X now=X`) is a key
@@ -4097,6 +4506,24 @@ pub fn run_dashboard(
                                                 _ => ("live", pane.scroll_to_live()),
                                             };
                                             let after = pane.scrollback();
+                                            // A selection's coordinates are only
+                                            // meaningful against this pane's
+                                            // scrollback offset at the moment
+                                            // they were captured; a keyboard
+                                            // scroll (`Ctrl+A PageUp`/`Home`/
+                                            // `End`) moves it exactly like the
+                                            // wheel does, so it cancels the
+                                            // same way (`scroll_cancels_selection`).
+                                            if let Some(sel) = selection.as_ref()
+                                                && scroll_cancels_selection(
+                                                    sel,
+                                                    pane.short(),
+                                                    before,
+                                                    after,
+                                                )
+                                            {
+                                                selection = None;
+                                            }
                                             if let Some(log) = keylog.as_mut() {
                                                 log.scroll(
                                                     name, alt, mouse, before, after, outcome,
@@ -4112,10 +4539,16 @@ pub fn run_dashboard(
                                     InputVerdict::Dash(DashAction::Zoom) => {
                                         zoomed = !zoomed;
                                         let m = effective_main(full, sidebar_cols, zoomed);
+                                        let new_size = (m.height.max(1), m.width.max(1));
+                                        // MEDIUM (review): the third resize path
+                                        // -- see `cancel_selection_on_resize`.
+                                        cancel_selection_on_resize(
+                                            &mut selection,
+                                            &panes,
+                                            new_size,
+                                        );
                                         for pane in panes.iter_mut() {
-                                            if let Err(e) =
-                                                pane.resize(m.height.max(1), m.width.max(1))
-                                            {
+                                            if let Err(e) = pane.resize(new_size.0, new_size.1) {
                                                 push_error(&mut errors, format!("resize: {e}"));
                                             }
                                         }
@@ -4194,6 +4627,9 @@ pub fn run_dashboard(
                                         overlay =
                                             ui::Overlay::Memory(build_memory_view(state, repo));
                                     }
+                                    InputVerdict::Dash(DashAction::Help) => {
+                                        overlay = ui::Overlay::Help;
+                                    }
                                 }
                             }
                         }
@@ -4215,6 +4651,7 @@ pub fn run_dashboard(
                                 &mut full,
                                 &mut panes,
                                 &mut errors,
+                                &mut selection,
                             );
                         }
                         // The wheel scrolls the FOCUSED pane, whatever the pointer
@@ -4254,6 +4691,25 @@ pub fn run_dashboard(
                                 match pane.scroll_wheel(delta, col, row) {
                                     Ok(outcome) => {
                                         let after = pane.scrollback();
+                                        // A wheel notch spun while the left
+                                        // button is still held arrives as its
+                                        // own `ScrollUp`/`ScrollDown` event
+                                        // here, not as a `Drag`, so this is
+                                        // the one place that observes it --
+                                        // cancel any selection on this pane
+                                        // now, mid-drag or already released
+                                        // and highlighted alike (see
+                                        // `scroll_cancels_selection`).
+                                        if let Some(sel) = selection.as_ref()
+                                            && scroll_cancels_selection(
+                                                sel,
+                                                pane.short(),
+                                                before,
+                                                after,
+                                            )
+                                        {
+                                            selection = None;
+                                        }
                                         if let Some(log) = keylog.as_mut() {
                                             log.scroll(
                                                 "wheel",
@@ -4297,6 +4753,117 @@ pub fn run_dashboard(
                                         push_error(&mut errors, format!("mouse: {e}"));
                                     }
                                 }
+                            }
+
+                            // Tmux-style in-dashboard text selection
+                            // (`Selection`'s own doc comment), driven by the
+                            // `?1002` drag events `term::dash_mouse_on_bytes`
+                            // now enables. Only ever engages for a pane that
+                            // does not itself want mouse reporting -- one
+                            // that does already got Left forwarded above,
+                            // unaffected by any of this, and a `Drag` for it
+                            // is simply left unhandled here (the same fate
+                            // every mouse kind this loop does not match has
+                            // always had).
+                            match mouse.kind {
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    // A fresh press always clears whatever was
+                                    // selected before, whether or not this one
+                                    // goes on to start a new selection -- the
+                                    // simplest rule that cannot leave a stale
+                                    // highlight on screen. Deliberately not
+                                    // also cleared by every keyboard-forwarded
+                                    // keystroke (which would mean touching
+                                    // `encode_key`'s many call sites); a click
+                                    // is already the obvious, low-traffic
+                                    // place an operator expects a previous
+                                    // selection to go away.
+                                    selection = None;
+                                    let main = effective_main(full, sidebar_cols, zoomed);
+                                    if main.contains(Position::new(mouse.column, mouse.row))
+                                        && let Some(pane) = panes.get(focused)
+                                        && !pane.wants_mouse()
+                                    {
+                                        let (rows, cols) = pane.screen().size();
+                                        if let Some(cell) = pane_local_cell(
+                                            main,
+                                            mouse.column,
+                                            mouse.row,
+                                            rows,
+                                            cols,
+                                        ) {
+                                            selection = Some(Selection {
+                                                pane_short: pane.short().to_string(),
+                                                anchor: cell,
+                                                end: cell,
+                                            });
+                                        }
+                                    }
+                                }
+                                MouseEventKind::Drag(MouseButton::Left) => {
+                                    // No scrollback check here -- a wheel
+                                    // notch spun mid-drag arrives as its own
+                                    // `ScrollUp`/`ScrollDown` event, not a
+                                    // `Drag`, and already cancelled the
+                                    // selection at the point it happened (see
+                                    // `scroll_cancels_selection`'s callers).
+                                    // If a selection is still `Some` here, its
+                                    // pane has not scrolled since.
+                                    if let Some(sel) = selection.as_mut()
+                                        && let Some(pane) = panes.get(focused)
+                                        && pane.short() == sel.pane_short
+                                        && !pane.wants_mouse()
+                                    {
+                                        let main = effective_main(full, sidebar_cols, zoomed);
+                                        let (rows, cols) = pane.screen().size();
+                                        if let Some(cell) = pane_local_cell(
+                                            main,
+                                            mouse.column,
+                                            mouse.row,
+                                            rows,
+                                            cols,
+                                        ) {
+                                            sel.end = cell;
+                                        }
+                                    }
+                                }
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    // LOW (review): `.take()` runs before the
+                                    // `pane_short` match below, so a focus
+                                    // change between `Down` and this `Up`
+                                    // deliberately drops the selection with no
+                                    // copy rather than releasing it against
+                                    // the wrong (now-focused) pane -- this is
+                                    // not a restore path, it is the same
+                                    // "cannot use stale coordinates" call
+                                    // every other `*_cancels_selection` check
+                                    // in this module makes.
+                                    if let Some(sel) = selection.take()
+                                        && let Some(pane) = panes.get(focused)
+                                        && pane.short() == sel.pane_short
+                                    {
+                                        let (kept, copy) = selection_on_release(sel);
+                                        if copy && let Some(s) = kept.as_ref() {
+                                            let (start, end) = normalize_selection(s.anchor, s.end);
+                                            let text = pane
+                                                .screen()
+                                                .contents_between(start.0, start.1, end.0, end.1);
+                                            match copy_to_host_clipboard(&text) {
+                                                Ok(()) => push_notice(
+                                                    &mut notices,
+                                                    Instant::now(),
+                                                    "copied selection to clipboard".to_string(),
+                                                ),
+                                                Err(e) => push_error(
+                                                    &mut errors,
+                                                    format!("clipboard: {e}"),
+                                                ),
+                                            }
+                                        }
+                                        selection = kept;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         Ok(_) => input_errors = 0,
@@ -4363,6 +4930,7 @@ pub fn run_dashboard(
                 &mut full,
                 &mut panes,
                 &mut errors,
+                &mut selection,
             );
         }
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
@@ -4423,7 +4991,15 @@ pub fn run_dashboard(
                 ui::render_sidebar(f, sidebar_area, &rows);
             }
             if let Some(pane) = panes.get(focused) {
-                ui::render_grid(f, main_area, pane.screen());
+                // A selection only ever names the pane it started on
+                // (`Selection::pane_short`); a focus change since then simply
+                // stops it from rendering here rather than needing an
+                // explicit clear anywhere else.
+                let selection_range = selection
+                    .as_ref()
+                    .filter(|sel| sel.pane_short == pane.short())
+                    .map(|sel| normalize_selection(sel.anchor, sel.end));
+                ui::render_grid(f, main_area, pane.screen(), selection_range);
                 // Why the grid is not moving, when it is not moving because
                 // the operator scrolled it. Drawn after the grid so it sits on
                 // top, and before any overlay so a dialog still owns the
@@ -4692,6 +5268,21 @@ mod tests {
             filter_key(true, key(KeyCode::Char('q'), KeyModifiers::NONE)).1,
             InputVerdict::Dash(DashAction::Quit)
         ));
+        for c in ['?', 'h', 'H'] {
+            assert!(matches!(
+                filter_key(true, key(KeyCode::Char(c), KeyModifiers::NONE)).1,
+                InputVerdict::Dash(DashAction::Help)
+            ));
+        }
+        // A real terminal delivers SHIFT alongside '?' and 'H' (`?` is
+        // shift-slash on most layouts, and 'H' is itself the shifted key);
+        // the match is on `key.code` alone, so the modifier must not matter.
+        for c in ['?', 'H'] {
+            assert!(matches!(
+                filter_key(true, key(KeyCode::Char(c), KeyModifiers::SHIFT)).1,
+                InputVerdict::Dash(DashAction::Help)
+            ));
+        }
     }
 
     /// The keyboard half of scrollback: a half-screen step and the two jumps,
@@ -4742,6 +5333,23 @@ mod tests {
         }
     }
 
+    /// The hot/idle poll-wait boundary: hot at zero and just under the
+    /// window, still hot exactly at the window (the check is `<=`), idle the
+    /// instant it passes.
+    #[test]
+    fn input_poll_wait_is_hot_within_the_window_and_idle_past_it() {
+        assert_eq!(input_poll_wait(Duration::ZERO), INPUT_POLL_HOT_WAIT);
+        assert_eq!(
+            input_poll_wait(INPUT_POLL_HOT_WINDOW - Duration::from_millis(1)),
+            INPUT_POLL_HOT_WAIT
+        );
+        assert_eq!(input_poll_wait(INPUT_POLL_HOT_WINDOW), INPUT_POLL_HOT_WAIT);
+        assert_eq!(
+            input_poll_wait(INPUT_POLL_HOT_WINDOW + Duration::from_millis(1)),
+            INPUT_POLL_IDLE_WAIT
+        );
+    }
+
     /// The diagnostic names whichever overlay is standing between a keystroke
     /// and `filter_key` -- the whole point of the log line, since an open
     /// overlay is one of the two ways `Ctrl+A <key>` can appear to do nothing.
@@ -4772,6 +5380,7 @@ mod tests {
             overlay_name(&ui::Overlay::Restore(ui::RestoreView::default())),
             "restore"
         );
+        assert_eq!(overlay_name(&ui::Overlay::Help), "help");
     }
 
     /// The diagnostic must be completely inert unless the env var names a
@@ -5031,15 +5640,246 @@ mod tests {
         assert_eq!(pane_local_mouse(Rect::new(0, 0, 1, 1), 9, 9), (1, 1));
     }
 
-    /// The dashboard enables `?1000h`+`?1006h` and no motion mode
-    /// (`term::dash_mouse_on_bytes`), so the only button events that can reach
-    /// a child are presses and releases -- and they carry the protocol's own
-    /// button numbers, which the wheel's 64/65 extend.
+    /// This loop never forwards a `Drag` to a child (`Pane::forward_mouse_button`
+    /// is only ever called from the `Down`/`Up` arms), so the only button
+    /// events that can reach one are still presses and releases even though
+    /// `term::dash_mouse_on_bytes` now enables `?1002` alongside `?1000h`/
+    /// `?1006h` -- and they carry the protocol's own button numbers, which
+    /// the wheel's 64/65 extend.
     #[test]
     fn mouse_buttons_use_the_protocols_own_numbering() {
         assert_eq!(mouse_button_code(MouseButton::Left), 0);
         assert_eq!(mouse_button_code(MouseButton::Middle), 1);
         assert_eq!(mouse_button_code(MouseButton::Right), 2);
+    }
+
+    #[test]
+    fn pane_local_cell_translates_and_clamps_into_the_grid_zero_based() {
+        let main = Rect::new(24, 1, 76, 29);
+        // The pane's own top-left cell is (0, 0), not the frame's, and not
+        // `pane_local_mouse`'s 1-based (1, 1).
+        assert_eq!(
+            pane_local_cell(main, 24, 1, 29, 76),
+            Some((0, 0)),
+            "top-left of the grid is (row 0, col 0)"
+        );
+        assert_eq!(pane_local_cell(main, 31, 5, 29, 76), Some((4, 7)));
+        // Past the pane clamps into its last row/col rather than wrapping or
+        // indexing out of bounds.
+        assert_eq!(
+            pane_local_cell(main, 500, 500, 29, 76),
+            Some((28, 75)),
+            "clamped to the last cell of a 29x76 grid"
+        );
+        // A grid smaller than `area` (a resize race) clamps to the grid's own
+        // size, not just the area's.
+        assert_eq!(
+            pane_local_cell(main, 500, 500, 3, 10),
+            Some((2, 9)),
+            "clamped to the smaller grid, not the larger area"
+        );
+        // Degenerate inputs never panic and never index a grid that has
+        // nothing in it.
+        assert_eq!(pane_local_cell(Rect::new(24, 1, 0, 0), 30, 5, 29, 76), None);
+        assert_eq!(pane_local_cell(main, 30, 5, 0, 76), None);
+        assert_eq!(pane_local_cell(main, 30, 5, 29, 0), None);
+    }
+
+    /// `contents_between` does not order its own arguments -- a `start_row`
+    /// past `end_row` silently returns an empty string -- so this is the one
+    /// invariant every caller depends on: whichever way the drag actually
+    /// went, the pair that comes back reads in row-major order.
+    #[test]
+    fn normalize_selection_orders_start_before_end_in_reading_order() {
+        assert_eq!(normalize_selection((1, 5), (3, 2)), ((1, 5), (3, 2)));
+        assert_eq!(
+            normalize_selection((3, 2), (1, 5)),
+            ((1, 5), (3, 2)),
+            "an upward drag is swapped back into reading order"
+        );
+        // Same row: ordered by column.
+        assert_eq!(normalize_selection((2, 7), (2, 3)), ((2, 3), (2, 7)));
+        assert_eq!(normalize_selection((2, 3), (2, 7)), ((2, 3), (2, 7)));
+        // A degenerate click (anchor == end) is its own normalized form.
+        assert_eq!(normalize_selection((4, 4), (4, 4)), ((4, 4), (4, 4)));
+    }
+
+    fn selection_at(anchor: (u16, u16), end: (u16, u16)) -> Selection {
+        Selection {
+            pane_short: "aaa11111".to_string(),
+            anchor,
+            end,
+        }
+    }
+
+    /// The invariant the scrollback gap review asked for directly: any
+    /// change to the *same* pane's scrollback offset cancels the selection,
+    /// whatever state it is in -- still being dragged, or already released
+    /// and highlighted. Covers both gaps a mouse-only cancellation check
+    /// would have missed: a wheel notch spun while the button is held
+    /// (arrives as its own `ScrollUp`/`ScrollDown`, with no intervening
+    /// `Drag` event to catch it before an `Up`), and a scroll -- wheel or
+    /// `Ctrl+A PageUp`/`Home`/`End` -- after release, while the highlight is
+    /// still shown.
+    #[test]
+    fn scroll_cancels_a_selection_on_the_same_pane_but_not_others() {
+        let sel = selection_at((1, 0), (3, 5));
+        assert!(
+            scroll_cancels_selection(&sel, "aaa11111", 0, 3),
+            "the same pane, offset actually moved"
+        );
+        assert!(
+            scroll_cancels_selection(&sel, "aaa11111", 5, 0),
+            "scrolling back to live is still a move"
+        );
+        assert!(
+            !scroll_cancels_selection(&sel, "aaa11111", 4, 4),
+            "a clamped no-op scroll (already at an edge) leaves it alone"
+        );
+        assert!(
+            !scroll_cancels_selection(&sel, "bbb22222", 0, 3),
+            "a scroll on a different pane never touches this selection"
+        );
+    }
+
+    /// HIGH (review): the gap `scroll_cancels_selection` alone cannot cover
+    /// -- live output at scrollback offset 0 rewrites the grid rows under a
+    /// selection's stale coordinates with the offset never moving at all.
+    #[test]
+    fn processed_output_cancels_a_selection_on_the_same_pane_but_not_others() {
+        let sel = selection_at((0, 0), (2, 4));
+        assert!(
+            output_cancels_selection(&sel, "aaa11111"),
+            "output on the selected pane invalidates it"
+        );
+        assert!(
+            !output_cancels_selection(&sel, "bbb22222"),
+            "output on a different pane leaves this selection alone"
+        );
+    }
+
+    /// MEDIUM (review): none of the three resize paths (`Event::Resize`, the
+    /// per-frame reconciliation, `Ctrl+A z`) used to touch a selection, so a
+    /// shrink could leave its coordinates pointing past the new grid.
+    #[test]
+    fn resize_cancels_a_selection_on_the_same_pane_but_not_others() {
+        let sel = selection_at((0, 0), (10, 20));
+        assert!(
+            resize_cancels_selection(&sel, "aaa11111", (24, 80), (20, 80)),
+            "the selected pane's grid actually changed size"
+        );
+        assert!(
+            !resize_cancels_selection(&sel, "aaa11111", (24, 80), (24, 80)),
+            "an unchanged size (e.g. re-zooming to the same geometry) is a no-op"
+        );
+        assert!(
+            !resize_cancels_selection(&sel, "bbb22222", (24, 80), (20, 80)),
+            "a resize of a different pane never touches this selection"
+        );
+    }
+
+    /// F7-a: a click -- `Down` then `Up` with no `Drag` in between, so `end`
+    /// never moved off `anchor` -- must never copy anything, and must not
+    /// leave a zero-width "selection" highlighted either.
+    #[test]
+    fn a_click_without_a_drag_copies_nothing_and_clears_the_selection() {
+        let sel = selection_at((2, 3), (2, 3));
+        let (kept, copy) = selection_on_release(sel);
+        assert_eq!(kept, None, "nothing stays highlighted after a bare click");
+        assert!(!copy, "a click must never trigger a copy");
+    }
+
+    /// A genuine drag -- `end` differs from `anchor` by the time the button
+    /// comes up -- is kept (so it stays highlighted) and is the one case that
+    /// copies.
+    #[test]
+    fn a_real_drag_is_kept_and_copied_on_release() {
+        let sel = selection_at((2, 3), (2, 9));
+        let (kept, copy) = selection_on_release(sel.clone());
+        assert_eq!(kept, Some(sel));
+        assert!(copy);
+    }
+
+    /// The extraction path end to end: a small known screen, a normalized
+    /// selection, and `vt100::Screen::contents_between` -- pinning that the
+    /// coordinates this module feeds it are in the same space `pane.screen()`
+    /// already renders from (row-major, 0-based, scrollback already applied
+    /// by `vt100` itself).
+    #[test]
+    fn extraction_reads_the_right_text_out_of_a_known_screen() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"abcdefghij\r\nKLMNOPQRST\r\nzyxwvutsrq");
+        let screen = parser.screen();
+
+        // A drag from row 0 col 3 to row 1 col 4 (dragged downward): the
+        // tail of row 0 from col 3, then the head of row 1 up to col 4.
+        let (start, end) = normalize_selection((0, 3), (1, 4));
+        let text = screen.contents_between(start.0, start.1, end.0, end.1);
+        assert_eq!(text, "defghij\nKLMN");
+
+        // A single-row drag is just that row's own half-open column range.
+        let (start, end) = normalize_selection((2, 1), (2, 5));
+        let text = screen.contents_between(start.0, start.1, end.0, end.1);
+        assert_eq!(text, "yxwv");
+
+        // An upward drag still reads correctly once normalized.
+        let (start, end) = normalize_selection((1, 2), (0, 6));
+        let text = screen.contents_between(start.0, start.1, end.0, end.1);
+        assert_eq!(text, "ghij\nKL");
+    }
+
+    #[test]
+    fn b64_encode_matches_known_vectors() {
+        // RFC 4648 test vectors.
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(b64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// The full OSC 52 wire format for a known string: `ESC ] 52 ; c ;
+    /// <base64> BEL`.
+    #[test]
+    fn osc52_copy_sequence_wraps_the_base64_payload_correctly() {
+        let seq = osc52_copy_sequence("hello");
+        assert_eq!(seq, b"\x1b]52;c;aGVsbG8=\x07".to_vec());
+    }
+
+    /// A selection is plain UTF-8 text, so the cap has to fall on a char
+    /// boundary even when that means giving up a couple of trailing bytes.
+    #[test]
+    fn cap_for_osc52_truncates_on_a_char_boundary() {
+        // 4-byte UTF-8 char right at the boundary the raw cap would otherwise
+        // land inside.
+        let max_raw = (OSC52_MAX_BASE64_BYTES / 4) * 3;
+        let mut text = "a".repeat(max_raw - 2);
+        text.push('\u{1F600}'); // a 4-byte emoji straddling the cap
+        let capped = cap_for_osc52(&text);
+        assert!(capped.len() <= max_raw);
+        assert!(text.is_char_boundary(capped.len()));
+        assert!(
+            capped.chars().all(|c| c == 'a'),
+            "the split emoji is dropped, not corrupted"
+        );
+
+        // Short text is never touched.
+        assert_eq!(cap_for_osc52("short"), "short");
+    }
+
+    /// The output cap in the brief's own terms: 64 KiB of base64, never more.
+    #[test]
+    fn osc52_copy_sequence_never_exceeds_the_base64_cap() {
+        let huge = "x".repeat(OSC52_MAX_BASE64_BYTES * 2);
+        let seq = osc52_copy_sequence(&huge);
+        // seq is "\x1b]52;c;" (7 bytes) + base64 + "\x07" (1 byte).
+        let payload_len = seq.len() - 8;
+        assert!(
+            payload_len <= OSC52_MAX_BASE64_BYTES,
+            "base64 payload was {payload_len} bytes"
+        );
     }
 
     /// One `ZIRV_CTX_DASH_KEYLOG` capture has to settle "why did nothing
@@ -6253,7 +7093,15 @@ mod tests {
         .expect("store");
 
         let mut injector = FailingInjector;
-        let result = deliver_and_consume(&mut injector, &state, slug, "label", &path, "note");
+        let result = deliver_and_consume(
+            &mut injector,
+            &state,
+            slug,
+            "pane0000",
+            "label",
+            &path,
+            "note",
+        );
 
         assert!(result.is_err());
         assert!(
@@ -6285,7 +7133,15 @@ mod tests {
         .expect("store");
 
         let mut injector = SucceedingInjector { calls: Vec::new() };
-        let result = deliver_and_consume(&mut injector, &state, slug, "label", &path, "note");
+        let result = deliver_and_consume(
+            &mut injector,
+            &state,
+            slug,
+            "pane0000",
+            "label",
+            &path,
+            "note",
+        );
 
         assert!(result.is_ok());
         assert!(!path.exists(), "consumed on a successful injection");
@@ -6293,6 +7149,14 @@ mod tests {
             injector.calls,
             vec![("label".to_string(), "note".to_string())]
         );
+
+        // Issue #30, item 3: consumption on a pane's behalf must leave a
+        // decision-log trail naming the mail file and the pane that claimed
+        // it.
+        let log = std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE))
+            .expect("decision log");
+        assert!(log.contains("\"action\":\"mail-consumed\""), "got {log}");
+        assert!(log.contains("\"session\":\"pane0000\""), "got {log}");
     }
 
     // Task B: the orchestrator mail advisory (`advise_one_pane`/
@@ -6545,6 +7409,58 @@ mod tests {
         );
     }
 
+    /// Issue #30, item 4a: a message directed at one session (`--to-session
+    /// X`) must never be delivered by a *different* pane's sweep --
+    /// `sweep_one_pane` passes its own pane `short` straight through to
+    /// `mail::list`'s own session filter, so this pins that at the sweep
+    /// seam itself, not just in `mail::list`'s own unit tests.
+    #[test]
+    fn a_sweep_never_delivers_a_message_directed_at_a_different_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        mail::store(
+            &state,
+            slug,
+            &mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "claude".to_string(),
+                to_session: Some("target01".to_string()),
+                sent: 1,
+                body: "for target01 only".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        let mut errors = Vec::new();
+        let delivered = sweep_one_pane(
+            &mut injector,
+            &state,
+            slug,
+            "claude",
+            "other999",
+            cfg.mail.max_delivered_bytes,
+            &mut errors,
+        );
+
+        assert!(
+            !delivered,
+            "a directed message must not reach a different pane's sweep"
+        );
+        assert!(injector.calls.is_empty());
+        assert_eq!(
+            mail::list(&state, slug, Some("claude"), None)
+                .expect("list")
+                .len(),
+            1,
+            "the message stays unconsumed, waiting for its real addressee"
+        );
+    }
+
     #[test]
     fn a_sweep_of_an_empty_mailbox_delivers_nothing_and_reports_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6672,6 +7588,62 @@ mod tests {
                 "claude's own worker default applies for {model:?}"
             );
         }
+    }
+
+    /// Issue #30, item 1: `codex::register_turn_signal` returns an empty
+    /// `env` (codex has no turn-signal mechanism at all --
+    /// `capabilities().turn_signal == false`), which used to mean a codex
+    /// worker pane's `ZIRV_CTX_SESSION` went entirely unset. Any `zirv ctx
+    /// send` such a pane ran then recorded `identity_or_unknown`'s
+    /// `"unknown"` as its sender and had no address of its own to be
+    /// `--to-session`-replied to. A worker pane's own session identity must
+    /// not depend on whether its adapter happens to support turn signals.
+    #[test]
+    fn build_turn_env_sets_session_identity_even_for_an_adapter_with_no_turn_signal_env() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let cfg = CtxConfig::default();
+        let session_id = "11112222-3333-4444-8555-666677778888";
+
+        let (env, err) = build_turn_env(&cfg, &state, &repo, "codex", session_id);
+
+        assert!(err.is_none(), "codex resolves fine, so no error: {err:?}");
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == adapters::SESSION_ENV && v == session_id),
+            "a worker pane must always carry its own session identity, \
+             regardless of turn-signal support: {env:?}"
+        );
+    }
+
+    /// The same guarantee for an adapter that *does* have a turn-signal
+    /// mechanism (claude): its own `register_turn_signal` already sets
+    /// `SESSION_ENV`, and this must not end up duplicated or dropped.
+    #[test]
+    fn build_turn_env_carries_exactly_one_session_identity_for_a_turn_signal_capable_adapter() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let cfg = CtxConfig::default();
+        let session_id = "22223333-4444-5555-8666-777788889999";
+
+        let (env, err) = build_turn_env(&cfg, &state, &repo, "claude", session_id);
+
+        assert!(err.is_none());
+        let matches: Vec<_> = env
+            .iter()
+            .filter(|(k, v)| k == adapters::SESSION_ENV && v == session_id)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "exactly one SESSION_ENV entry, not duplicated: {env:?}"
+        );
     }
 
     fn a_mail_message() -> mail::Message {
@@ -6863,6 +7835,62 @@ mod tests {
             composed.sources
         );
         assert!(mail_entries.is_empty(), "no mail was waiting for this pane");
+    }
+
+    /// Issue #30, item 4a: a message directed at some other session must
+    /// never be collected for a *fresh* worker pane's own prompt either --
+    /// `compose_worker_prompt` scopes its `mail::list` call to this pane's
+    /// own freshly minted `registry_short`, so a message addressed to a
+    /// different short must stay out of both `mail_entries` (what gets
+    /// consumed after spawn) and the composed prompt text itself.
+    #[test]
+    fn compose_worker_prompt_excludes_mail_directed_at_a_different_session() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "claude".to_string(),
+                to_session: Some("otherpane".to_string()),
+                sent: 1,
+                body: "meant for a different pane entirely".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let (composed, mail_entries, mail_messages) = compose_worker_prompt(
+            &spawn_request("do the work", repo),
+            &super::super::adapters::claude::ClaudeAdapter::new(None),
+            "cccc3333",
+            &cfg,
+            &state,
+            repo,
+            &slug,
+        );
+
+        assert!(
+            mail_entries.is_empty(),
+            "directed mail for another pane must not be collected: {mail_entries:?}"
+        );
+        assert!(mail_messages.is_empty());
+        let composed = composed.expect("a worker pane still composes a prompt");
+        assert!(
+            !composed
+                .text
+                .contains("meant for a different pane entirely"),
+            "the directed message must not leak into this pane's own prompt:\n{}",
+            composed.text
+        );
     }
 
     /// The other half: `agent.rs` writes `"unknown"` when it cannot identify
@@ -9036,6 +10064,32 @@ mod tests {
         assert!(!shift_enter.starts_with(b"\x1b["));
     }
 
+    /// A real-CLI probe under ConPTY established that Windows Terminal, once
+    /// an operator has run claude's own `/terminal-setup`, rewrites Shift+
+    /// Enter into `ESC CR` -- and zirv's own console layer folds that into a
+    /// single Enter keydown carrying ALT rather than SHIFT. Before this fix
+    /// `encode_key` only checked SHIFT on `KeyCode::Enter`, so that keydown
+    /// fell through to the bare-`\r` branch and silently submitted instead of
+    /// inserting a newline. Ctrl+Enter (no SHIFT, no ALT) is unaffected and
+    /// still submits.
+    #[test]
+    fn alt_enter_is_treated_the_same_as_shift_enter() {
+        let alt_enter = encode_key(key(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(
+            alt_enter, b"\x1b\r",
+            "ALT alone on Enter must degrade to newline, not submit"
+        );
+        let shift_alt_enter =
+            encode_key(key(KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT));
+        assert_eq!(shift_alt_enter, b"\x1b\r");
+        // Ctrl+Enter carries neither SHIFT nor ALT, so it is untouched by
+        // this fix and still submits.
+        assert_eq!(
+            encode_key(key(KeyCode::Enter, KeyModifiers::CONTROL)),
+            b"\r"
+        );
+    }
+
     /// M4: appending panes shifts a view-only selection down by the number
     /// appended; a selection on a pane keeps naming it.
     #[test]
@@ -9176,6 +10230,7 @@ mod tests {
             &mut full,
             &mut panes,
             &mut errors,
+            &mut None,
         );
         assert_eq!((term_cols, term_rows), (100, 40), "stored size updated");
         assert_eq!(full, Rect::new(0, 0, 100, 40));
