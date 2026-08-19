@@ -1,3 +1,34 @@
+//! `zirv ctx wrap`: the interactive supervisor. It spawns the operator's own
+//! agent command behind a pty, passes bytes through byte for byte, and never
+//! makes the session worse than an unwrapped one -- any supervision failure
+//! degrades, once and for all, to pure passthrough.
+//!
+//! **What wrap may type into the child**, in full:
+//!
+//! * a `/compact` (with `COMPACT_FOCUS`) or a restart, from the rot
+//!   escalation ladder, only at a verified-idle turn boundary (`may_inject`);
+//! * (T13) **one labelled advisory line** when new mail arrives -- the same
+//!   `[zirv ▸ mail] ...` shape `dash::pane` uses for its own visible
+//!   injections, under exactly the same idle gate.
+//!
+//! The mail contract is therefore: *an advisory line at verified idle,
+//! message bodies never, consumption never.* An earlier version of this
+//! module promised that mail and nudges were stderr-only and that wrap
+//! "never writes to the pty" for them; that is no longer true of mail, and
+//! deliberately so -- an orchestrator inside the session could otherwise only
+//! learn about mail by blind polling. What has not changed:
+//!
+//! * **bodies never travel**. `mail_facts` drops them at the seam, so nothing
+//!   downstream of it holds a body to leak. Reading mail stays a deliberate
+//!   `zirv ctx inbox`.
+//! * **wrap never consumes mail.** Consumption moves a message into `read/`,
+//!   where no other session finds it; that is the session's own call.
+//! * **a nudge is still advisory only** -- its guidance body reaches an
+//!   interactive session through no channel at all.
+//! * **mail can never degrade a session.** An unreadable mailbox, a poisoned
+//!   writer or a missing identity all no-op or fall back to the `zirv ▸`
+//!   announcement channel; none of them calls `note_failure`.
+
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -431,51 +462,285 @@ pub fn action_for(state: &InjectionState, now: Instant, debounce: Duration) -> A
     }
 }
 
-/// Whether the mailbox has grown since the last check: the only thing that
-/// should ever trigger a fresh advisory. Equal or shrinking (a message was
-/// consumed elsewhere, or the read failed and fell back to the last known
-/// count) never re-fires one.
-pub fn mail_grew(previous: usize, current: usize) -> bool {
-    current > previous
-}
-
-/// Folds one successful mailbox observation into `seen`, returning whether it
-/// is worth advising about.
+/// How often the pump looks in the mailbox for a message that arrived while
+/// the session was already running (T13).
 ///
-/// M4: `seen` used to be assigned *only* inside the "did it grow" arm, which
-/// made it an all-time high-water mark rather than a record of the last
-/// observation. Once a session had been told about 3 messages, reading and
-/// consuming all 3 left the watermark at 3, so the next two arrivals counted
-/// as a shrink and the advisory could never fire again short of exceeding the
-/// old peak. Recording every observation makes growth mean "more than last
-/// time I looked", which is what the advisory has always claimed to report.
-/// A failed read still leaves `seen` untouched (the caller only reaches here
-/// on `Some`), so an unreadable mailbox never fakes a drain.
-pub fn observe_mail(seen: &mut usize, current: usize) -> bool {
-    let grew = mail_grew(*seen, current);
-    *seen = current;
-    grew
+/// Deliberately far coarser than `PUMP_POLL`: this is the only filesystem
+/// read on the pump's own tick path (the bar's reads are throttled separately,
+/// by `BAR_THROTTLE`), and a wake-up two seconds late costs an orchestrator
+/// nothing, while a `read_dir` every 100ms would be permanent load on a
+/// session `wrap` has promised never to make worse.
+const MAIL_POLL: Duration = Duration::from_secs(2);
+
+/// The most bytes of *sender-supplied* text one advisory line may carry per
+/// identity field. `from_agent` is whatever the sending session had in
+/// `ZIRV_CTX_AGENT` -- untrusted and unbounded, and `mail::header_value` only
+/// guarantees it is *one* line, not a short one -- and the short id is derived
+/// from an equally untrusted session id. Roomy enough that no honest value
+/// reaches it; the same reasoning as `dash::pane`'s own label budget.
+const MAX_MAIL_IDENTITY_BYTES: usize = 48;
+
+/// Whether this session polls the mailbox at all. Every gate is checked
+/// before anything touches the filesystem:
+///
+/// * `mail.enabled = false` -- an operator who turned mail off must never be
+///   told mail is waiting, the same rule `mail::unread_counts` already applies
+///   to the bar and to delivery. Nothing is read, so behaviour is exactly what
+///   it was before there was a poll arm at all.
+/// * no registered identity -- `sessions::short_id` came back empty, so this
+///   session cannot be the addressee of anything and has no honest
+///   per-session view of the mailbox to read.
+/// * degraded -- `--no-supervise` (set at construction) and every later
+///   `note_failure` both promise pure passthrough, so the mailbox is not even
+///   read on such a session's behalf. The status bar's own `mail 2+1` segment
+///   is not gated on this, so an operator watching a degraded session is
+///   still told what is waiting.
+fn mail_polling_enabled(mail_enabled: bool, session_short: &str, degraded: bool) -> bool {
+    mail_enabled && !session_short.is_empty() && !degraded
 }
 
-/// A plain total over `mail::unread_counts`' `(broadcast, direct)` split, for
-/// the turn-signal arm's `observe_mail` advisory, which only ever needs a
-/// single number and has its own tests pinned to that shape. `None` under the
-/// same conditions `mail::unread_counts` returns `None` for (mail disabled,
-/// or a read error) -- an unreadable mail directory is silently ignored
-/// rather than degrading or interrupting the session: mail is advisory, and a
-/// wrapped session must never be made worse by it. Called from two throttled
-/// call sites -- the turn-signal arm, bounded by how often the agent reports
-/// a turn boundary, and (T12b) the bar's own 1s redraw throttle, never the
-/// raw byte-pump path.
-fn unread_mail_count(
+/// The unread messages this session may actually see, oldest first, or `None`
+/// under exactly the conditions `mail::unread_counts` returns `None` for
+/// (mail disabled, or a read error). An unreadable mailbox is silently
+/// ignored rather than degrading or interrupting the session.
+///
+/// Strictly read-only: `wrap` never consumes mail. Consumption moves a
+/// message into `read/`, where no other session will ever find it, and that
+/// belongs to the session's own `zirv ctx inbox`.
+fn unread_mail_for_session(
     state: &super::state::StateDir,
     repo: &Path,
     agent: &str,
     session_short: &str,
     mail_enabled: bool,
-) -> Option<usize> {
-    unread_mail_counts(state, repo, agent, session_short, mail_enabled)
-        .map(|(broadcast, direct)| broadcast + direct)
+) -> Option<Vec<(PathBuf, super::mail::Message)>> {
+    if !mail_enabled {
+        return None;
+    }
+    super::mail::list(
+        state,
+        &super::state::repo_slug(repo),
+        Some(agent),
+        Some(session_short),
+    )
+    .ok()
+}
+
+/// Everything the advisory needs out of one unread message -- the file name
+/// it is deduped on, and who sent it -- and deliberately nothing else.
+///
+/// This is the seam where bodies are dropped: nothing downstream of
+/// `mail_facts` holds a body at all, so no later mistake can type one into
+/// the child. An interactive session is *told that* mail arrived; reading it
+/// stays a deliberate `zirv ctx inbox`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailFacts {
+    /// The message's file name, which `mail::store` makes unique per message
+    /// (zero-padded seconds plus sender, `_NNN` on a same-second collision).
+    /// Identity, not count, is what the advisory dedupes on: consuming one
+    /// message and receiving another leaves the count unchanged, and a
+    /// watermark over counts cannot see that transition at all.
+    pub id: String,
+    pub from_agent: String,
+    pub from_short: String,
+}
+
+fn mail_facts(unread: &[(PathBuf, super::mail::Message)]) -> Vec<MailFacts> {
+    unread
+        .iter()
+        .map(|(path, msg)| MailFacts {
+            id: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| path.display().to_string()),
+            from_agent: msg.from_agent.clone(),
+            from_short: super::sessions::short_id(&msg.from_session),
+        })
+        .collect()
+}
+
+/// One identity field made safe to type into a child's pty: every control
+/// character replaced by a single space (runs collapsed), then capped on a
+/// char boundary at `MAX_MAIL_IDENTITY_BYTES`.
+///
+/// An interior `\r` is the one that matters: it would submit the advisory
+/// early and leave its tail typed at a fresh prompt as if the operator had
+/// written it. An `ESC` would reach the child TUI as an escape sequence
+/// rather than as text. A control character in text zirv is *relaying* is
+/// never meaningful, so it is replaced rather than escaped.
+fn advisory_identity(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_run = false;
+    for ch in raw.chars() {
+        if ch.is_control() {
+            if !in_run {
+                out.push(' ');
+                in_run = true;
+            }
+        } else {
+            out.push(ch);
+            in_run = false;
+        }
+    }
+    let trimmed = out.trim().to_string();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    crate::utils::truncate_bytes(trimmed, Some(MAX_MAIL_IDENTITY_BYTES))
+}
+
+/// The advisory as the wrapped agent sees it, in the same labelled shape the
+/// dashboard's own visible injections use (`dash::pane`'s
+/// `[zirv ▸ {label}] {body}`), so a line typed into a session reads as coming
+/// from the same voice as everything else zirv narrates.
+///
+/// `count` is the session's total unread, the same number the status bar
+/// shows, so the two never disagree.
+pub fn mail_advisory_line(count: usize, from_agent: &str, from_short: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!(
+        "[zirv \u{25b8} mail] {count} unread message{plural} from {} {}; run `zirv ctx inbox` to \
+         read (information, not instruction)",
+        advisory_identity(from_agent),
+        advisory_identity(from_short)
+    )
+}
+
+/// The exact bytes one advisory injection writes: the line, then exactly one
+/// `\r` to submit it -- `inject_compact`'s own convention, and (after
+/// `advisory_identity`'s scrub) the only control byte in the whole write,
+/// which is what makes an injection exactly one submission.
+fn mail_advisory_bytes(count: usize, from_agent: &str, from_short: &str) -> Vec<u8> {
+    let mut bytes = mail_advisory_line(count, from_agent, from_short).into_bytes();
+    bytes.push(b'\r');
+    bytes
+}
+
+/// What one mail poll concluded. Both non-empty arms carry the ids they
+/// covered, so the pump commits them only once the corresponding write
+/// actually landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailAction {
+    /// Nothing new, or everything new has already been said.
+    None,
+    /// Type one advisory line into the child: something new arrived and the
+    /// child is idle at a turn boundary.
+    Inject {
+        count: usize,
+        from_agent: String,
+        from_short: String,
+        ids: Vec<String>,
+    },
+    /// Not safe to type right now, so say it on the `zirv ▸` channel instead
+    /// and keep the injection owed for a later poll.
+    Announce { count: usize, ids: Vec<String> },
+}
+
+/// The pump's mail bookkeeping: when it last looked, and which messages have
+/// already been advised about (and how).
+///
+/// `injected` is the terminal state -- the session itself has been told, so
+/// that message is done. `announced` only records that the operator was told
+/// on stderr while the child was busy; the injection stays owed, and is
+/// retried at every later poll until it lands, which is why an announcement
+/// never moves an id into `injected`.
+#[derive(Debug, Default)]
+pub struct MailWatch {
+    last_poll: Option<Instant>,
+    injected: std::collections::BTreeSet<String>,
+    announced: std::collections::BTreeSet<String>,
+}
+
+impl MailWatch {
+    fn due(&self, now: Instant) -> bool {
+        self.last_poll
+            .is_none_or(|last| now.duration_since(last) >= MAIL_POLL)
+    }
+
+    fn polled(&mut self, now: Instant) {
+        self.last_poll = Some(now);
+    }
+
+    /// Drops bookkeeping for messages that are no longer unread -- consumed
+    /// by this session's own `zirv ctx inbox`, or pruned by `mail::store_to`.
+    /// Keeps both sets bounded by what is actually in the mailbox, and means
+    /// a file name that somehow came back is treated as the new message it
+    /// looks like rather than as one already advised.
+    fn forget_missing(&mut self, current: &[MailFacts]) {
+        let live: std::collections::BTreeSet<&str> =
+            current.iter().map(|facts| facts.id.as_str()).collect();
+        self.injected.retain(|id| live.contains(id.as_str()));
+        self.announced.retain(|id| live.contains(id.as_str()));
+    }
+
+    /// Pure: what to do about `current`, given what has already been advised
+    /// and whether the child may be typed into right now (`may_inject`).
+    /// Mutates nothing, so a write that fails commits nothing either.
+    fn decide(&self, current: &[MailFacts], may_inject: bool) -> MailAction {
+        let unadvised: Vec<&MailFacts> = current
+            .iter()
+            .filter(|facts| !self.injected.contains(&facts.id))
+            .collect();
+        // Oldest first out of `mail::list`, so the last one is the newest
+        // arrival: the sender worth naming on a line that has room for one.
+        let Some(newest) = unadvised.last() else {
+            return MailAction::None;
+        };
+        let ids: Vec<String> = unadvised.iter().map(|facts| facts.id.clone()).collect();
+        let count = current.len();
+        if may_inject {
+            return MailAction::Inject {
+                count,
+                from_agent: newest.from_agent.clone(),
+                from_short: newest.from_short.clone(),
+                ids,
+            };
+        }
+        if ids.iter().all(|id| self.announced.contains(id)) {
+            return MailAction::None;
+        }
+        MailAction::Announce { count, ids }
+    }
+
+    fn commit_injected(&mut self, ids: &[String]) {
+        for id in ids {
+            self.injected.insert(id.clone());
+            self.announced.remove(id);
+        }
+    }
+
+    /// Records an announcement **only when it actually reached the
+    /// operator** (`Announcer::try_emit`'s own answer).
+    ///
+    /// R5: this used to be an unconditional `commit_announced` right after an
+    /// `Announcer::emit` that returns `()` and quietly swallows both a
+    /// disabled channel (`--quiet`, `[chrome] events = false`) and a failed
+    /// stderr write. `announced` then said "the operator has been told" about
+    /// a line nobody ever saw, and since `announced` suppresses the next
+    /// poll's announcement, the advisory was never repeated either. For an
+    /// adapter with no turn-signal mechanism `may_inject` never becomes true
+    /// at all, so this channel is that advisory's *only* surface: one
+    /// swallowed emit meant it was never injected and never announced --
+    /// lost, permanently, on a session that had no other way to hear about
+    /// it. (The message itself was never at risk: it stays unread in the
+    /// mailbox and keeps counting in the status bar. This is about the
+    /// advisory surface, not durable state.)
+    ///
+    /// Leaving the ids unannounced on a failure is the whole fix: the next
+    /// poll simply tries again, and `injected` is untouched either way, so
+    /// the injection stays owed exactly as before.
+    fn note_announcement(&mut self, ids: &[String], landed: bool) {
+        if landed {
+            self.commit_announced(ids);
+        }
+    }
+
+    fn commit_announced(&mut self, ids: &[String]) {
+        for id in ids {
+            self.announced.insert(id.clone());
+        }
+    }
 }
 
 /// Thin delegate to `mail::unread_counts` (moved there in Task 7 so the
@@ -831,10 +1096,12 @@ fn relaunch(
 
 /// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
 /// not something a user ever types on the `wrap` command line, only something
-/// another verb (`zirv ctx chat`) decides on the caller's behalf. Every
-/// existing `wrap` caller (the `wrap` verb itself, and every relaunch inside
-/// `pump`) passes `PromptRole::Worker`; `chat` is the one caller that passes
-/// `PromptRole::Orchestrator`.
+/// another verb (`zirv ctx chat`) decides on the caller's behalf. Both callers
+/// pass `PromptRole::Orchestrator` today -- `chat`, and the bare `wrap` verb
+/// itself, whose command an operator is sitting in front of and driving
+/// interactively. A relaunch inside `pump` never re-decides: it reuses this
+/// launch's own composed prompt, so it keeps this launch's role by
+/// construction.
 /// `session` lets a caller that already generated a session id for its own
 /// purposes (`chat.rs`'s launch banner, printed before this function is ever
 /// called) hand it in rather than have two different ids exist for the same
@@ -958,8 +1225,13 @@ pub fn run_with(
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
     // silently override it with a second occurrence.
-    let (launch_command, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.command, composed, None);
+    let (launch_command, composed) = super::prompt::merge_command_line_prompt(
+        adapter.as_ref(),
+        &args.command,
+        composed,
+        None,
+        role,
+    );
     let prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),
         &launch_command,
@@ -1122,6 +1394,26 @@ pub fn run_with(
         })
         .unwrap_or_default();
     turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+    // The seat this session sits in, for the `zirv ctx hook pretool` guard
+    // running inside it. Orchestrator-only, and preferring an operator's own
+    // `--model`/`--model=` passthrough in `rest` (the same flag vector this
+    // launch actually spawns with) over `cfg.chat.model`; see
+    // `adapters::seat_model_env`. Kept in `turn_env` for the same reason
+    // `AGENT_ENV` is: a relaunch reuses this exact vector, and the fresh
+    // session sits in the same seat.
+    //
+    // Only a `chat` launch may fall back to `cfg.chat.model`: that is `chat`'s
+    // own knob, spliced into the argv it hands us (`chat::extra_with_model`),
+    // so for that caller the fallback and `rest` agree anyway. The bare `wrap`
+    // verb never applies it, and became an Orchestrator (so it reaches this at
+    // all) only once the role also picked its prompt layers -- claiming a
+    // configured model this launch did not spawn with would have the guard
+    // refuse dispatches at a tier the session is not actually on.
+    let seat_cfg_model = match verb {
+        super::sessions::Verb::Chat => cfg.chat.model.as_deref(),
+        _ => None,
+    };
+    turn_env.extend(adapters::seat_model_env(role, rest, seat_cfg_model));
     // Scrubbed before any of it is applied -- see `apply_session_env`. When
     // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
     // scrub is the only thing standing between this child and the outer
@@ -1671,9 +1963,9 @@ fn pump(
     bar: &mut BarRuntime,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
-    // Read only from the turn-signal arm below, never from a byte-pump or
-    // per-tick path: see `unread_mail_count`.
-    let mut mail_seen = 0usize;
+    // T13: the live mail wake-up. See `mail_polling_enabled` for the gates: a
+    // session that cannot receive mail at all never reads the mailbox once.
+    let mut mail_watch = MailWatch::default();
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -1715,32 +2007,15 @@ fn pump(
                 announcer.emit(&event);
             }
 
-            // Advisory only: wrap never consumes mail (it stays unread for
-            // `zirv ctx inbox`) and never writes to the pty, only to stderr.
-            // A read error (including no mailbox at all) leaves `mail_seen`
-            // where it was, so it neither advises nor errors.
-            //
-            // M4: `observe_mail` records *every* successful read, so the
-            // advisory measures growth against the previous observation
-            // rather than an all-time high that a consumed mailbox could
-            // never fall back below.
-            if let Some(count) = unread_mail_count(
-                state_dir,
-                repo,
-                adapter.name(),
-                &bar.session_short,
-                bar.mail_enabled,
-            ) && observe_mail(&mut mail_seen, count)
-            {
-                announcer.emit(&Event::MailWaiting { count });
-            }
+            // T13: mail is no longer read here. The poll arm below owns it
+            // end to end -- it runs on its own `MAIL_POLL` cadence rather
+            // than only when the agent happens to report a turn, so a
+            // message that arrives mid-turn no longer waits for one.
 
-            // N4: an interactive session is only ever advised of a nudge,
-            // never restarted and never typed into -- the same advisory-only
-            // contract the mail-waiting line above already follows. Claiming
-            // the marker here (rather than leaving it for a byte-pump or
-            // per-tick path) matches `unread_mail_count`'s own throttling:
-            // both only ever run from this turn-signal arm.
+            // N4: an interactive session is only ever *advised* of a nudge:
+            // never restarted, and never handed the nudge's own message
+            // body. Claiming the marker here (rather than on a byte-pump or
+            // per-tick path) keeps this arm as cheap as it always was.
             // C4: `from` is the *sender*, read out of the marker file, and
             // the disposition is `Advisory` -- an interactive session never
             // receives message bodies, so the line has to point the operator
@@ -2027,6 +2302,70 @@ fn pump(
             }
         }
 
+        // T13: the live mail wake-up.
+        //
+        // Deliberately *after* the escalation ladder above: a compaction or
+        // restart that just fired armed `cooldown_at_signal`, which makes
+        // `may_inject` false here, so this arm falls back to the
+        // announcement channel rather than typing a second line into a child
+        // that was just handed a `/compact`. The existing cooldown is the
+        // mutual exclusion; nothing extra is needed for it.
+        //
+        // Every failure here is a no-op by construction: an unreadable
+        // mailbox yields `None` and nothing happens, a poisoned writer
+        // degrades to the announcement channel, and neither ever calls
+        // `note_failure` -- mail is advisory, and a wrapped session must
+        // never be made worse by it.
+        let now = Instant::now();
+        if mail_polling_enabled(bar.mail_enabled, &bar.session_short, supervision.degraded)
+            && mail_watch.due(now)
+        {
+            mail_watch.polled(now);
+            if let Some(unread) = unread_mail_for_session(
+                state_dir,
+                repo,
+                adapter.name(),
+                &bar.session_short,
+                bar.mail_enabled,
+            ) {
+                let facts = mail_facts(&unread);
+                mail_watch.forget_missing(&facts);
+                match mail_watch.decide(&facts, may_inject(supervision, now, debounce)) {
+                    MailAction::None => {}
+                    MailAction::Announce { count, ids } => {
+                        // R5: `try_emit`, not `emit` -- an advisory the
+                        // channel swallowed must stay unannounced so the next
+                        // poll retries it. See `MailWatch::note_announcement`.
+                        let landed = announcer.try_emit(&Event::MailWaiting { count });
+                        mail_watch.note_announcement(&ids, landed);
+                    }
+                    MailAction::Inject {
+                        count,
+                        from_agent,
+                        from_short,
+                        ids,
+                    } => {
+                        let bytes = mail_advisory_bytes(count, &from_agent, &from_short);
+                        let wrote = match writer.lock() {
+                            Ok(mut sink) => {
+                                sink.write_all(&bytes).and_then(|()| sink.flush()).is_ok()
+                            }
+                            Err(_) => false,
+                        };
+                        if wrote {
+                            mail_watch.commit_injected(&ids);
+                        } else {
+                            // Same R5 rule on the degrade path: a poisoned
+                            // writer plus a swallowed announcement must leave
+                            // the advisory owed, not quietly discharged.
+                            let landed = announcer.try_emit(&Event::MailWaiting { count });
+                            mail_watch.note_announcement(&ids, landed);
+                        }
+                    }
+                }
+            }
+        }
+
         if let Ok(size) = window_size(STDIN_FD)
             && size != last_size
         {
@@ -2090,6 +2429,15 @@ fn pump(
     }
 }
 
+/// `Orchestrator`, not `Worker`: the operator is sitting in front of the
+/// command `wrap` supervises, driving it themselves, which is the same seat
+/// `chat` builds (CLAUDE.md classifies both as interactive Orchestrator
+/// sessions). The role now also picks the adapter's own layer and the
+/// user-layer file (`prompt::with_adapter_layer`, `prompt::
+/// WORKER_PROMPT_FILE`), so passing `Worker` here would inject
+/// worker-conventions text into an operator's own session and silently drop
+/// their `~/.zirv/system-prompt.md` -- a session made worse by being wrapped,
+/// which is the one thing `wrap` must never do.
 pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
@@ -2097,7 +2445,7 @@ pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
         args,
         &repo,
         &env,
-        PromptRole::Worker,
+        PromptRole::Orchestrator,
         None,
         super::sessions::Verb::Wrap,
     )
@@ -3533,38 +3881,392 @@ mod tests {
         assert!(!singular.contains("messages"), "got {singular}");
     }
 
+    // T13: the live mail wake-up. The pump polls the mailbox on its own
+    // cadence (`MAIL_POLL`) and, at a verified-idle moment, types **one**
+    // advisory line into the wrapped agent so the session itself learns that
+    // mail is waiting. Bodies never travel this way, and nothing here ever
+    // consumes a message: that is `zirv ctx inbox`'s job.
+
+    /// Builds the `(path, message)` shape `mail::list` returns, with a body
+    /// the advisory must never repeat.
+    fn unread_message(
+        file: &str,
+        from_agent: &str,
+        from_session: &str,
+        body: &str,
+    ) -> (PathBuf, crate::commands::ctx::mail::Message) {
+        (
+            PathBuf::from("state").join("mail").join("-repo").join(file),
+            crate::commands::ctx::mail::Message {
+                from_session: from_session.to_string(),
+                from_agent: from_agent.to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: body.to_string(),
+            },
+        )
+    }
+
+    /// The count the 5 `unread_mail_*` cases below assert on. `wrap` itself
+    /// reads the full listing now (it needs each message's identity to
+    /// dedupe on), so the count is derived from it rather than read by a
+    /// second, separate call.
+    fn unread_count(
+        state: &crate::commands::ctx::state::StateDir,
+        repo: &std::path::Path,
+        agent: &str,
+        session_short: &str,
+        mail_enabled: bool,
+    ) -> Option<usize> {
+        unread_mail_for_session(state, repo, agent, session_short, mail_enabled)
+            .map(|found| found.len())
+    }
+
     #[test]
-    fn mail_grew_only_fires_on_a_genuine_increase() {
-        assert!(mail_grew(0, 1));
-        assert!(mail_grew(2, 5));
-        assert!(!mail_grew(3, 3), "unchanged is not growth");
-        assert!(
-            !mail_grew(3, 1),
-            "a shrink (consumed elsewhere) is not growth"
+    fn a_new_message_at_an_idle_turn_boundary_is_injected_as_one_advisory_line() {
+        let watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb2222-x",
+            "the webhook route moved",
+        )]);
+
+        let action = watch.decide(&facts, true);
+
+        assert_eq!(
+            action,
+            MailAction::Inject {
+                count: 1,
+                from_agent: "codex".to_string(),
+                from_short: "bbbb2222".to_string(),
+                ids: vec!["0000000001-aaaa.md".to_string()],
+            }
         );
     }
 
-    /// M4: the watermark used to only ever ratchet upward -- it was assigned
-    /// solely inside the "did it grow" arm, so once it had seen 3 messages a
-    /// drained mailbox that filled back up to 2 could never advise again.
     #[test]
-    fn the_mail_watermark_follows_the_last_observation_not_the_high_water_mark() {
-        let mut seen = 0usize;
+    fn an_advisory_that_cannot_be_injected_falls_back_to_the_announcement_channel() {
+        let watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "body",
+        )]);
 
-        assert!(observe_mail(&mut seen, 3), "first mail advises");
+        assert_eq!(
+            watch.decide(&facts, false),
+            MailAction::Announce {
+                count: 1,
+                ids: vec!["0000000001-aaaa.md".to_string()],
+            },
+            "a busy child must never be typed into; the operator is told instead"
+        );
+    }
+
+    #[test]
+    fn an_announced_advisory_is_not_repeated_on_every_poll_while_the_child_stays_busy() {
+        let mut watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "body",
+        )]);
+
+        let MailAction::Announce { ids, .. } = watch.decide(&facts, false) else {
+            panic!("a busy child announces first");
+        };
+        watch.commit_announced(&ids);
+
+        assert_eq!(
+            watch.decide(&facts, false),
+            MailAction::None,
+            "the same message must not re-announce on every 2s poll"
+        );
+    }
+
+    /// R5: `Announcer::emit` returns `()` and swallows both a disabled
+    /// channel and a failed stderr write, so committing ids as announced
+    /// right after it recorded advisories nobody ever saw -- and `announced`
+    /// then suppressed every later announcement of them. On a signal-less
+    /// adapter `may_inject` never becomes true, so that channel is the only
+    /// surface the advisory has: it was never injected and never announced.
+    #[test]
+    fn an_announcement_that_never_surfaced_is_retried_at_the_next_poll() {
+        let mut watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "body",
+        )]);
+
+        let MailAction::Announce { ids, .. } = watch.decide(&facts, false) else {
+            panic!("a busy child announces first");
+        };
+        // The channel was quiet, or stderr was gone: nothing surfaced.
+        watch.note_announcement(&ids, false);
+
         assert!(
-            !observe_mail(&mut seen, 3),
-            "the same three do not re-advise"
+            matches!(watch.decide(&facts, false), MailAction::Announce { .. }),
+            "an advisory nobody saw must be announced again, not treated as delivered"
+        );
+    }
+
+    /// The other half of R5: a landed announcement must still dedupe exactly
+    /// as it did before, and must still leave the injection owed.
+    #[test]
+    fn an_announcement_that_landed_still_suppresses_the_next_poll_and_still_owes_an_injection() {
+        let mut watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "body",
+        )]);
+
+        let MailAction::Announce { ids, .. } = watch.decide(&facts, false) else {
+            panic!("a busy child announces first");
+        };
+        watch.note_announcement(&ids, true);
+
+        assert_eq!(
+            watch.decide(&facts, false),
+            MailAction::None,
+            "a landed announcement is not repeated on every 2s poll"
         );
         assert!(
-            !observe_mail(&mut seen, 0),
-            "draining the mailbox is not growth"
+            matches!(watch.decide(&facts, true), MailAction::Inject { .. }),
+            "announcing never discharges the injection"
         );
+    }
+
+    #[test]
+    fn an_advisory_held_back_while_the_child_was_busy_is_injected_at_a_later_poll() {
+        let mut watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "body",
+        )]);
+
+        let MailAction::Announce { ids, .. } = watch.decide(&facts, false) else {
+            panic!("a busy child announces first");
+        };
+        watch.commit_announced(&ids);
+
+        // The child goes idle: the injection is still owed, and an
+        // announcement never discharges it.
         assert!(
-            observe_mail(&mut seen, 2),
-            "two new messages after a drain must advise again"
+            matches!(
+                watch.decide(&facts, true),
+                MailAction::Inject { count: 1, .. }
+            ),
+            "the injection is retried as soon as it is safe"
         );
-        assert_eq!(seen, 2, "the watermark tracks what was last observed");
+    }
+
+    #[test]
+    fn the_same_unread_set_is_never_advised_twice() {
+        let mut watch = MailWatch::default();
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "body",
+        )]);
+
+        let MailAction::Inject { ids, .. } = watch.decide(&facts, true) else {
+            panic!("an idle child is injected into");
+        };
+        watch.commit_injected(&ids);
+
+        assert_eq!(
+            watch.decide(&facts, true),
+            MailAction::None,
+            "an unread message that has already been advised must stay quiet"
+        );
+    }
+
+    /// The dedupe is on message identity, not on a count: consuming one
+    /// message and receiving another leaves the count at 1 the whole time,
+    /// which is exactly the transition a watermark over counts cannot see.
+    #[test]
+    fn mail_that_arrives_after_the_advised_set_was_consumed_advises_again() {
+        let mut watch = MailWatch::default();
+        let first = mail_facts(&[unread_message("0000000001-aaaa.md", "codex", "bbbb", "one")]);
+        let MailAction::Inject { ids, .. } = watch.decide(&first, true) else {
+            panic!("the first message is advised");
+        };
+        watch.commit_injected(&ids);
+
+        // `zirv ctx inbox --consume` moved the first message into read/, and
+        // a new one arrived: same count, different message.
+        let second = mail_facts(&[unread_message(
+            "0000000002-cccc.md",
+            "claude",
+            "dddd",
+            "two",
+        )]);
+        watch.forget_missing(&second);
+
+        assert!(
+            matches!(
+                watch.decide(&second, true),
+                MailAction::Inject { count: 1, .. }
+            ),
+            "a genuinely new arrival must advise even when the count did not change"
+        );
+    }
+
+    #[test]
+    fn a_mail_advisory_never_carries_a_message_body() {
+        let facts = mail_facts(&[unread_message(
+            "0000000001-aaaa.md",
+            "codex",
+            "bbbb",
+            "do-not-type-this-body",
+        )]);
+        assert!(
+            !format!("{facts:?}").contains("do-not-type-this-body"),
+            "the body is dropped at the facts seam: {facts:?}"
+        );
+
+        let bytes = mail_advisory_bytes(1, &facts[0].from_agent, &facts[0].from_short);
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            !text.contains("do-not-type-this-body"),
+            "no body ever reaches the pty: {text:?}"
+        );
+        assert!(text.contains("zirv ctx inbox"), "got {text:?}");
+    }
+
+    #[test]
+    fn the_injected_advisory_is_one_line_ending_in_a_single_carriage_return() {
+        let bytes = mail_advisory_bytes(2, "claude", "aaaa1111");
+        let text = String::from_utf8(bytes).expect("utf8");
+
+        assert!(text.ends_with('\r'), "a TUI submits on carriage return");
+        assert_eq!(
+            text.matches('\r').count(),
+            1,
+            "exactly one submission: {text:?}"
+        );
+        assert!(!text.contains('\n'), "got {text:?}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "no escape sequences reach the child: {text:?}"
+        );
+        assert!(text.contains("[zirv \u{25b8} mail]"), "got {text:?}");
+        assert!(text.contains('2'), "got {text:?}");
+        assert!(text.contains("aaaa1111"), "got {text:?}");
+        assert!(text.contains("zirv ctx inbox"), "got {text:?}");
+        assert!(
+            !text.contains('\u{2014}'),
+            "no em dashes in user-facing copy: {text:?}"
+        );
+    }
+
+    /// `from_agent` is whatever the *sending* session had in
+    /// `ZIRV_CTX_AGENT`: untrusted, unbounded, and (`mail::header_value`)
+    /// only guaranteed to be one line, not a short or control-free one.
+    #[test]
+    fn a_sender_name_full_of_control_bytes_cannot_break_out_of_the_advisory_line() {
+        let hostile = "evil\r/exit\r\u{1b}[2Jmore";
+        let bytes = mail_advisory_bytes(1, hostile, &"x".repeat(500));
+        let text = String::from_utf8(bytes).expect("utf8");
+
+        assert_eq!(
+            text.matches('\r').count(),
+            1,
+            "an interior carriage return would submit the line early: {text:?}"
+        );
+        assert!(!text.contains('\u{1b}'), "got {text:?}");
+        assert!(
+            text.len() < 400,
+            "both identity fields are capped: {} bytes",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn mail_polling_is_skipped_entirely_when_mail_is_disabled() {
+        assert!(
+            !mail_polling_enabled(false, "sess0000", false),
+            "mail.enabled = false must mean no mailbox read at all"
+        );
+        assert!(mail_polling_enabled(true, "sess0000", false));
+    }
+
+    #[test]
+    fn mail_polling_is_skipped_for_a_session_with_no_registered_identity() {
+        assert!(
+            !mail_polling_enabled(true, "", false),
+            "a session with no short id cannot be anyone's addressee"
+        );
+    }
+
+    /// `--no-supervise` sets `degraded` at construction and `note_failure`
+    /// sets it later: either way the promise is pure passthrough, which has
+    /// to include not reading the mailbox on the session's behalf.
+    #[test]
+    fn a_degraded_supervisor_does_not_poll_for_mail_at_all() {
+        assert!(
+            !mail_polling_enabled(true, "sess0000", true),
+            "a degraded session is pure passthrough"
+        );
+    }
+
+    #[test]
+    fn the_mailbox_is_not_read_on_every_pump_tick() {
+        let now = Instant::now();
+        let mut watch = MailWatch::default();
+        assert!(watch.due(now), "the first tick polls");
+
+        watch.polled(now);
+        assert!(
+            !watch.due(now + PUMP_POLL),
+            "a 100ms tick must not read the filesystem"
+        );
+        assert!(watch.due(now + MAIL_POLL));
+    }
+
+    #[test]
+    fn polling_the_mailbox_never_consumes_a_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let slug = crate::commands::ctx::state::repo_slug(&repo);
+        let msg = crate::commands::ctx::mail::Message {
+            from_session: "other".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 1,
+            body: "note".to_string(),
+        };
+        crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
+            .expect("store");
+
+        let found = unread_mail_for_session(&state, &repo, "claude", "sess0000", true)
+            .expect("a readable mailbox");
+        let mut watch = MailWatch::default();
+        let facts = mail_facts(&found);
+        if let MailAction::Inject { ids, .. } = watch.decide(&facts, true) {
+            watch.commit_injected(&ids);
+        }
+
+        assert_eq!(
+            crate::commands::ctx::mail::list(&state, &slug, None, None)
+                .expect("list")
+                .len(),
+            1,
+            "the message stays unread for the session's own `zirv ctx inbox`"
+        );
     }
 
     #[test]
@@ -3573,7 +4275,7 @@ mod tests {
         let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         assert_eq!(
-            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            unread_count(&state, &repo, "claude", "sess0000", true),
             Some(0)
         );
     }
@@ -3595,7 +4297,7 @@ mod tests {
         crate::commands::ctx::mail::store(&state, &slug, &msg, &CtxConfig::default())
             .expect("store");
         assert_eq!(
-            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            unread_count(&state, &repo, "claude", "sess0000", true),
             Some(1)
         );
     }
@@ -3621,7 +4323,7 @@ mod tests {
             .expect("store");
 
         assert_eq!(
-            unread_mail_count(&state, &repo, "claude", "sess0000", false),
+            unread_count(&state, &repo, "claude", "sess0000", false),
             None,
             "mail.enabled = false must silence the advisory entirely"
         );
@@ -3648,12 +4350,12 @@ mod tests {
             .expect("store");
 
         assert_eq!(
-            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            unread_count(&state, &repo, "claude", "sess0000", true),
             Some(0),
             "addressed to codex, not this claude session"
         );
         assert_eq!(
-            unread_mail_count(&state, &repo, "codex", "sess0000", true),
+            unread_count(&state, &repo, "codex", "sess0000", true),
             Some(1)
         );
     }
@@ -3672,7 +4374,7 @@ mod tests {
         std::fs::write(state.mail().join(&slug), "not a directory").expect("write");
 
         assert_eq!(
-            unread_mail_count(&state, &repo, "claude", "sess0000", true),
+            unread_count(&state, &repo, "claude", "sess0000", true),
             Some(0)
         );
     }
@@ -3695,7 +4397,7 @@ mod tests {
         std::fs::create_dir_all(&mailbox).expect("mkdir");
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let result = unread_mail_count(&state, &repo, "claude", "sess0000", true);
+        let result = unread_count(&state, &repo, "claude", "sess0000", true);
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o700))
@@ -3858,7 +4560,9 @@ mod tests {
         let _ = h.child.wait();
     }
 
-    // T8: mail advisory driven end to end through a real wrapped session.
+    // T8/T13: the mail advisory driven end to end through a real wrapped
+    // session -- announced on stderr while there is no injection window, and
+    // typed into the child as one labelled line once there is.
 
     #[cfg(unix)]
     fn store_mail_for_cwd(state_root: &std::path::Path, body: &str) {
@@ -3881,9 +4585,13 @@ mod tests {
         .expect("store mail");
     }
 
+    /// T13: with no turn signal reported yet there is no injection window at
+    /// all (`may_inject` needs `signals_seen > 0`), so the poll arm falls back
+    /// to the announcement channel rather than typing into a child it cannot
+    /// prove is idle -- and it keeps the injection owed for a later poll.
     #[cfg(unix)]
     #[test]
-    fn a_wrapped_session_is_told_about_new_mail_on_stderr_only() {
+    fn mail_with_no_injection_window_yet_is_announced_on_stderr_instead() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = tmp.path().join("state");
         let script = fixture("stub-tui.sh").display().to_string();
@@ -3898,20 +4606,16 @@ mod tests {
 
         store_mail_for_cwd(&state, "note");
 
-        let socket =
-            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
-        crate::commands::ctx::signal::send(
-            std::path::Path::new(socket.trim()),
-            &turn_signal(3, Verdict::Healthy),
-        )
-        .expect("send turn signal");
-
         // `wrap`'s own stderr shares the outer pty in this harness (there is
         // no separate stderr stream to redirect it to), so it arrives on
         // `h.reader` exactly like the compact/restart tests' own log output
         // does; the point under test is the wording, not the transport.
         let seen = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
         assert!(seen.contains("zirv ctx inbox"), "got {seen:?}");
+        assert!(
+            !seen.contains("[zirv \u{25b8} mail]"),
+            "no turn boundary has been reported, so nothing may be typed into the child: {seen:?}"
+        );
 
         h.writer.write_all(b"/exit\r").expect("write");
         h.writer.flush().expect("flush");
@@ -3919,16 +4623,19 @@ mod tests {
         let _ = h.child.wait();
     }
 
-    /// N4: an interactive session (`wrap`/`chat`) reacts to a nudge exactly
-    /// like the T8 mail advisory it shares a turn-signal arm with -- named
-    /// on stderr, never restarted, and never typed into the wrapped agent.
-    /// Unlike `exec`'s headless worker, there is no relaunch to fold the
-    /// nudge's own message body into, so that text never has anywhere to
-    /// reach the pty at all; this pins that directly rather than only by
-    /// absence of an injection call.
+    /// N4: an interactive session (`wrap`/`chat`) is named on stderr when it
+    /// is nudged, and never restarted. Unlike `exec`'s headless worker there
+    /// is no relaunch to fold the nudge's own message body into, so that text
+    /// has nowhere to reach the pty at all; this pins that directly rather
+    /// than only by absence of an injection call.
+    ///
+    /// T13 narrowed what this promises. A nudge rides on an ordinary mail
+    /// message, so the mail poll arm may well type its own labelled advisory
+    /// line into the child -- what must never travel is the *guidance body*,
+    /// which is what is asserted below.
     #[cfg(unix)]
     #[test]
-    fn an_interactive_session_is_only_advised_and_is_never_typed_into() {
+    fn an_interactive_session_never_receives_a_nudges_own_message_body() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state_root = tmp.path().join("state");
         let script = fixture("stub-tui.sh").display().to_string();
@@ -3999,9 +4706,14 @@ mod tests {
         let _ = h.child.wait();
     }
 
+    /// T13: the whole mail contract, end to end. At a verified-idle turn
+    /// boundary the session itself is told -- one labelled advisory line,
+    /// typed into the child -- and the two things that must never happen
+    /// still never happen: the body does not travel, and the message is not
+    /// consumed.
     #[cfg(unix)]
     #[test]
-    fn wrap_never_consumes_or_injects_mail() {
+    fn a_wrapped_session_is_advised_of_mail_without_its_body_and_without_consuming_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = tmp.path().join("state");
         let script = fixture("stub-tui.sh").display().to_string();
@@ -4024,7 +4736,17 @@ mod tests {
         )
         .expect("send turn signal");
 
-        let seen = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
+        // The labelled marker only ever comes from the injected line: the
+        // announcement channel's own fallback wording does not carry it.
+        let seen = read_until(
+            &mut h.reader,
+            "[zirv \u{25b8} mail]",
+            Duration::from_secs(15),
+        );
+        assert!(
+            seen.contains("[zirv \u{25b8} mail]"),
+            "the session itself is told at an idle turn boundary: {seen:?}"
+        );
         assert!(seen.contains("zirv ctx inbox"), "advisory fired: {seen:?}");
         assert!(
             !seen.contains("do-not-type-this-body"),
@@ -4045,9 +4767,13 @@ mod tests {
         let _ = h.child.wait();
     }
 
+    /// T13: the poll arm runs every `MAIL_POLL`, so "advise once" has to hold
+    /// against a clock rather than against turn boundaries. A message already
+    /// advised into the session must stay quiet for every later poll and
+    /// every later turn.
     #[cfg(unix)]
     #[test]
-    fn the_advisory_fires_at_most_once_per_turn_boundary() {
+    fn a_message_already_advised_into_the_session_is_never_advised_again() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = tmp.path().join("state");
         let script = fixture("stub-tui.sh").display().to_string();
@@ -4068,22 +4794,62 @@ mod tests {
 
         crate::commands::ctx::signal::send(&socket, &turn_signal(3, Verdict::Healthy))
             .expect("send 1");
-        let first = read_until(&mut h.reader, "zirv ctx inbox", Duration::from_secs(10));
+        let first = read_until(
+            &mut h.reader,
+            "[zirv \u{25b8} mail]",
+            Duration::from_secs(15),
+        );
         assert!(
-            first.contains("zirv ctx inbox"),
-            "the first turn advises: {first:?}"
+            first.contains("[zirv \u{25b8} mail]"),
+            "the first idle poll advises: {first:?}"
         );
 
-        // A second turn boundary, no new mail in between.
+        // The phase boundary, and it has to be exact rather than timed. One
+        // advisory shows up on the pty *twice*: the inner pty's own echo of
+        // the injected line, and then the stub's `echo: <line>` answer to it.
+        // The read above returns at whichever chunk carried the marker -- on a
+        // slow runner that is the echo alone -- so the answer is still in
+        // flight, and phase 2's own window is where it lands. That leftover,
+        // not a second advisory, is what failed this test on CI twice.
+        //
+        // A sync line typed right after pins the boundary deterministically:
+        // the advisory's bytes are already in the child's input queue (its
+        // echo is what phase 1 just matched), the stub reads that queue in
+        // order, so its answer to the sync line cannot arrive before its
+        // answer to the advisory. Reading up to the sync answer therefore
+        // consumes every surface of the advisory, at any runner speed.
+        //
+        // Asserted, not discarded: a read that quietly timed out here would
+        // hand phase 2 exactly the leftover this exists to remove, and the
+        // failure would then be reported as a bug in the dedupe.
+        h.writer.write_all(b"sync-after-advisory\r").expect("write");
+        h.writer.flush().expect("flush");
+        let synced = read_until(
+            &mut h.reader,
+            "echo: sync-after-advisory",
+            Duration::from_secs(15),
+        );
+        assert!(
+            synced.contains("echo: sync-after-advisory"),
+            "the phase boundary must be reached before phase 2 reads: {synced:?}"
+        );
+
+        // A second turn boundary, no new mail in between. Long enough for
+        // several `MAIL_POLL` ticks to come and go.
         crate::commands::ctx::signal::send(&socket, &turn_signal(4, Verdict::Healthy))
             .expect("send 2");
+        std::thread::sleep(MAIL_POLL * 2);
         h.writer.write_all(b"still here\r").expect("write");
         h.writer.flush().expect("flush");
         let after = read_until(&mut h.reader, "echo: still here", Duration::from_secs(10));
 
         assert!(
+            !after.contains("[zirv \u{25b8} mail]"),
+            "an already-advised message must not be advised again: {after:?}"
+        );
+        assert!(
             !after.contains("zirv ctx inbox"),
-            "a second turn boundary with no new mail must not advise again: {after:?}"
+            "nor fall back to the announcement channel for it: {after:?}"
         );
 
         h.writer.write_all(b"/exit\r").expect("write");

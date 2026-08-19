@@ -43,9 +43,14 @@ pub fn short_id(session: &str) -> String {
 /// Every supervisor scrubs all three off a child command builder before
 /// setting whichever of them it actually owns, so "no socket of my own"
 /// degrades to *unsupervised*, never to *supervised by somebody else*.
-pub const SUPERVISION_ENV: [&str; 3] = [
+/// `SEAT_MODEL_ENV` rides along for the same reason: it names *this*
+/// session's seat, and a worker that inherits an orchestrator's copy would
+/// have its own subagent dispatches refused by a guard describing a seat it
+/// is not sitting in.
+pub const SUPERVISION_ENV: [&str; 4] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
+    super::adapters::SEAT_MODEL_ENV,
     super::wrap::TRANSCRIPT_ENV,
 ];
 
@@ -912,15 +917,17 @@ pub fn run_nudge_with<W: Write>(
         record.short, record.agent, record.verb, record.repo_slug
     )?;
     // N6: an interactive session is only ever *advised* of a nudge -- it is
-    // never restarted and never typed into, and it never receives message
-    // bodies. Saying so here is the difference between "nothing happened,
-    // the nudge is broken" and "the operator on the other end has to go read
-    // it", which is the actual contract.
+    // never restarted and never receives message bodies. The supervisor may
+    // type a one-line advisory into the agent at a verified-idle boundary,
+    // but the guidance body itself always waits in the inbox. Saying so here
+    // is the difference between "nothing happened, the nudge is broken" and
+    // "the agent will be pointed at its inbox", which is the actual contract.
     if matches!(record.verb, Verb::Wrap | Verb::Chat) {
         writeln!(
             w,
             "zirv ctx nudge: {} is an interactive session; the guidance is delivered as \
-             inbox mail plus an on-screen advisory, never typed into the agent",
+             inbox mail plus a one-line advisory (typed in only at a verified-idle \
+             boundary), never the message body itself",
             record.short
         )?;
     }

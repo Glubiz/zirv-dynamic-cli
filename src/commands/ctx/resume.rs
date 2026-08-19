@@ -73,6 +73,50 @@ redo work marked as done.\n\n{}",
     )
 }
 
+/// Composes the system prompt and merges the operator's own command-line
+/// prompt flag for a resumed session, as `PromptRole::Orchestrator`.
+///
+/// A resumed run is interactive: `run_with` `exec`s over itself into an agent
+/// the operator sits in front of, exactly like `chat` and the bare `wrap`
+/// verb, so it takes the same role those two do -- the harness-teaching
+/// layer, the adapter's orchestrator layer, and `~/.zirv/system-prompt.md`
+/// rather than `~/.zirv/system-prompt.worker.md`. This used to pass
+/// `PromptRole::Worker`, which silently coached an operator's own interactive
+/// session as a delegated worker and dropped their user layer.
+///
+/// Split out of `run_with` for the same reason `launch_command` is: `run_with`
+/// `exec`s over itself on unix, so composition needs its own seam a test can
+/// call without launching an agent.
+#[allow(clippy::too_many_arguments)]
+fn compose_prompt(
+    adapter: &dyn adapters::AgentAdapter,
+    home: Option<&Path>,
+    repo: &Path,
+    simple: bool,
+    cfg: &super::config::PromptConfig,
+    memory_entries: &[super::prompt::MemoryLine],
+    memory_cap: usize,
+    extra: &[String],
+) -> (Vec<String>, Option<super::prompt::ComposedPrompt>) {
+    let composed = super::prompt::compose(
+        home,
+        repo,
+        simple,
+        cfg,
+        super::prompt::PromptRole::Orchestrator,
+        memory_entries,
+        memory_cap,
+        &[],
+    );
+    super::prompt::merge_command_line_prompt(
+        adapter,
+        extra,
+        composed,
+        None,
+        super::prompt::PromptRole::Orchestrator,
+    )
+}
+
 pub fn run_with<W: Write>(
     args: &ResumeArgs,
     w: &mut W,
@@ -115,18 +159,16 @@ pub fn run_with<W: Write>(
     let memory_slug = super::state::repo_slug(repo);
     let memory_entries =
         super::memory::render_for_prompt(&state, &memory_slug, &cfg, super::state::now_secs());
-    let composed = super::prompt::compose(
+    let (user_extra, composed) = compose_prompt(
+        adapter.as_ref(),
         crate::utils::home_dir().ok().as_deref(),
         repo,
         args.simple,
         &cfg.prompt,
-        super::prompt::PromptRole::Worker,
         &memory_entries,
         cfg.memory.max_injected_bytes,
-        &[],
+        &args.extra,
     );
-    let (user_extra, composed) =
-        super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
     // M2: attribution is logged per session, not once per verb. A resumed run
     // is interactive, so the agent mints its own transcript id and this one is
     // zirv's; exporting it is what makes the two meet, because the hook inside
@@ -522,6 +564,65 @@ mod tests {
                 .any(|(k, v)| *k == crate::commands::ctx::adapters::SESSION_ENV
                     && v == "inner999-2222-4333-8444-555555555555"),
             "its own fresh session id still reaches the child: {set:?}"
+        );
+    }
+
+    /// A resumed session is interactive, so it must be composed on the
+    /// Orchestrator side of the split: it reads the operator's own
+    /// `system-prompt.md`, never `system-prompt.worker.md`, and gets claude's
+    /// orchestrator layer rather than the worker one. Pins `compose_prompt`
+    /// directly (the seam `run_with` itself cannot be called from a test,
+    /// since it `exec`s over the process on unix) so a future regression back
+    /// to `PromptRole::Worker` fails here instead of silently shipping.
+    #[test]
+    fn a_resumed_session_is_composed_for_the_orchestrator_role() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir repo");
+        std::fs::write(
+            home.join(".zirv/system-prompt.md"),
+            "orchestrator user text",
+        )
+        .expect("write");
+        std::fs::write(
+            home.join(".zirv")
+                .join(crate::commands::ctx::prompt::WORKER_PROMPT_FILE),
+            "worker user text",
+        )
+        .expect("write");
+
+        let adapter =
+            crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let cfg = crate::commands::ctx::config::PromptConfig::default();
+        let (_, composed) = compose_prompt(&adapter, Some(&home), &repo, false, &cfg, &[], 0, &[]);
+        let composed = composed.expect("composed");
+
+        assert!(
+            composed.text.contains("orchestrator user text"),
+            "reads the operator's own system-prompt.md: {}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("worker user text"),
+            "must never read the worker-only user layer file: {}",
+            composed.text
+        );
+        assert!(
+            composed.text.contains("zirv meta-harness"),
+            "an interactive resumed session gets the harness-teaching layer: {}",
+            composed.text
+        );
+        assert!(
+            composed.text.contains("zirv orchestrator conventions"),
+            "gets claude's orchestrator layer: {}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("zirv worker conventions"),
+            "a resumed session must never be coached as a delegated worker: {}",
+            composed.text
         );
     }
 

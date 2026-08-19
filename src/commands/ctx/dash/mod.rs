@@ -36,7 +36,7 @@ use ratatui::layout::{Position, Rect};
 use super::CtxResult;
 use super::adapters;
 use super::adapters::AgentAdapter;
-use super::config::{CtxConfig, EnvLookup};
+use super::config::{CtxConfig, EnvLookup, validate_model_str};
 use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
 use super::term;
@@ -1461,6 +1461,24 @@ fn apply_terminal_resize(
 /// supervised by somebody else" degrade every other supervisor in this
 /// codebase already accepts) and is reported back as an error string for the
 /// header rather than failing the spawn.
+/// Whether the adapter resolved for `agent_name` reports a real turn-signal
+/// mechanism (`AgentAdapter::capabilities().turn_signal`) -- what `Pane::spawn`
+/// needs to pick between `pane::pane_is_idle`'s two branches (Task A: a
+/// signal-less pane, codex today, is instead read by output quiescence).
+///
+/// A resolution failure -- the same failure `build_turn_env` right below
+/// already reports back as an error string, and degrades to no signal
+/// registration for -- reports `false` rather than `true`: no signal is ever
+/// going to reach such a pane either way, so `false` at least leaves it
+/// reachable once its output goes quiet, where `true` would read it as
+/// signal-capable and leave it `Working` forever with nothing that could ever
+/// clear that.
+fn turn_signal_capable_for(cfg: &CtxConfig, agent_name: &str) -> bool {
+    adapters::select(Some(agent_name), &[], cfg)
+        .map(|adapter| adapter.capabilities().turn_signal)
+        .unwrap_or(false)
+}
+
 fn build_turn_env(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -1831,6 +1849,43 @@ fn compose_worker_prompt(
     (composed, mail_entries, mail_messages)
 }
 
+/// The model flags one worker pane launches with.
+///
+/// A spawn request carries no trailing flags of the operator's own except one:
+/// the model this worker was pinned to (`zirv agent <name> "<prompt>" --
+/// --model <m>`, which `agent::try_join_dashboard` recognises; a request
+/// carrying anything else never reaches the dashboard at all). That pin wins
+/// over the operator's resolved worker default, the same precedence
+/// `agent.rs`'s own `worker_launch_flags` applies on the headless path.
+///
+/// Re-checked here rather than trusted: `req.model` becomes an argv token, so a
+/// blank or flag-shaped value falls back to the resolved default instead --
+/// the same authority-side defense in depth the request's prompt gets from
+/// `argv_unsafe_prompt`, rather than relying on the requester's own filtering.
+/// It also has to pass `validate_model_str`'s own charset/length/leading-dash
+/// guard, the same one `config.rs` applies to `worker.claude`/`worker.codex`
+/// before either ever reaches a launch argv: a request's `model` reaches this
+/// pane's argv exactly the same way, so an over-long or bad-charset value
+/// falls back to the configured default rather than reaching `model_args`.
+///
+/// Split out of `fulfill_spawn_request` for the same reason
+/// `compose_worker_prompt` is: what a worker pane actually launches with stays
+/// testable without spawning a pty.
+fn pane_model_args(
+    req: &spawnreq::SpawnRequest,
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+) -> Vec<String> {
+    match req.model.as_deref().map(str::trim).filter(|model| {
+        !model.is_empty()
+            && !argv_unsafe_prompt(model)
+            && validate_model_str("spawn_request.model", model).is_ok()
+    }) {
+        Some(model) => adapter.model_args(model),
+        None => adapters::worker_model_args(cfg, &req.agent, adapter),
+    }
+}
+
 /// Low 7: both `render_mail_block` and `render_report_back_block` open with
 /// a `"\n\n---\n\n"` separator meant to set their labeled content apart from
 /// the real task prompt text *above* it. When `req_prompt` is empty or
@@ -2048,7 +2103,12 @@ fn fulfill_spawn_request(
     let effective_prompt =
         worker_task_prompt(req, adapter.as_ref(), &mail_messages, cfg, fallback_is_safe);
 
-    let extra = pane_launch_extra(adapter.as_ref(), prompt_args, &session_id);
+    let mut extra = pane_model_args(req, cfg, adapter.as_ref());
+    extra.extend(pane_launch_extra(
+        adapter.as_ref(),
+        prompt_args,
+        &session_id,
+    ));
     let argv = flatten_command(adapter.interactive_cmd(Some(&effective_prompt), &extra));
     let spec = PaneSpec {
         agent_name: req.agent.clone(),
@@ -2070,8 +2130,16 @@ fn fulfill_spawn_request(
 
     // O2: retryable. A pty that could not be opened is an environment
     // failure, not a policy one -- the headless path has no pty to open.
-    let pane = Pane::spawn(spec, state, repo, size, &turn_env)
-        .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
+    let pane = Pane::spawn(
+        spec,
+        state,
+        repo,
+        size,
+        &turn_env,
+        adapter.capabilities().turn_signal,
+        Duration::from_millis(cfg.dash.idle_quiet_ms),
+    )
+    .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
     let short = pane.short().to_string();
     panes.push(pane);
     nudge_queues.push(VecDeque::new());
@@ -2709,7 +2777,15 @@ fn spawn_restored_pane(
         requests_dir.display().to_string(),
     ));
 
-    match Pane::spawn(spec, state, repo, size, &turn_env) {
+    match Pane::spawn(
+        spec,
+        state,
+        repo,
+        size,
+        &turn_env,
+        adapter.capabilities().turn_signal,
+        Duration::from_millis(cfg.dash.idle_quiet_ms),
+    ) {
         Ok(pane) => {
             panes.push(pane);
             nudge_queues.push(VecDeque::new());
@@ -2872,16 +2948,107 @@ fn sweep_one_pane<I: Injector>(
     }
 }
 
+/// Pure: the exact advisory body an orchestrator pane's mail advisory
+/// carries -- `"{count} unread from {agent}/{short} — zirv ctx inbox"`, wrapped
+/// by `Pane::inject_visible` into `"[zirv ▸ mail] {body}"`. Names the sender
+/// of the *newest* unread message (the one that triggered this advisory, per
+/// `advise_one_pane`'s own dedup) and the total unread count, but never a
+/// body: an orchestrator session is never handed message text directly, only
+/// pointed at `zirv ctx inbox` to read it -- the same trust split
+/// `is_delivery_eligible` already draws for a worker pane's own body
+/// delivery, and the same shape `wrap.rs`'s own stderr mail advisory
+/// (`Event::MailWaiting`) already uses for a non-dashboard interactive
+/// session, adapted to the pane-injection seam (this one is typed visibly
+/// into the pane's own pty, not emitted on stderr, since a dashboard
+/// orchestrator pane has no stderr of its own an operator is watching).
+fn orchestrator_mail_advisory_body(count: usize, from_agent: &str, from_session: &str) -> String {
+    format!(
+        "{count} unread from {}/{} \u{2014} zirv ctx inbox",
+        pane::body_for_injection(from_agent, MAX_SENDER_NAME_BYTES),
+        sessions::short_id(from_session),
+    )
+}
+
+/// One orchestrator pane's share of the mail sweep. Unlike `sweep_one_pane`:
+/// never consumes anything (an orchestrator's own `zirv ctx inbox` is the
+/// only thing that consumes for it) and never carries a message body, only
+/// the one-line [`orchestrator_mail_advisory_body`].
+///
+/// Deduplicated against `advised` (keyed by the pane's own zirv session id,
+/// valued by the newest unread message's own file name -- `mail::list`
+/// already sorts by the zero-padded-seconds prefix in that name, so it is a
+/// chronological high-water mark): re-advises only once a message whose file
+/// name sorts *past* whatever was last advised has actually arrived, so an
+/// unchanged inbox is not re-typed into the pane on every ~1s sweep tick, and
+/// an operator who has not yet run `zirv ctx inbox` still gets nudged again
+/// once something genuinely new shows up.
+///
+/// Takes an `Injector` rather than a `Pane`, the same seam `sweep_one_pane`
+/// already uses, so the dedup/formatting logic is testable without a real
+/// pty.
+#[allow(clippy::too_many_arguments)]
+fn advise_one_pane<I: Injector>(
+    injector: &mut I,
+    session_id: &str,
+    state: &StateDir,
+    slug: &str,
+    agent: &str,
+    short: &str,
+    advised: &mut HashMap<String, String>,
+    errors: &mut Vec<String>,
+) -> bool {
+    let messages = match mail::list(state, slug, Some(agent), Some(short)) {
+        Ok(m) => m,
+        Err(e) => {
+            push_error(errors, format!("mail advisory: {e}"));
+            return false;
+        }
+    };
+    let Some((newest_path, newest_msg)) = messages.last() else {
+        return false;
+    };
+    let newest_name = newest_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if advised.get(session_id).map(String::as_str) == Some(newest_name.as_str()) {
+        return false;
+    }
+    let body = orchestrator_mail_advisory_body(
+        messages.len(),
+        &newest_msg.from_agent,
+        &newest_msg.from_session,
+    );
+    match injector.try_inject("mail", &body) {
+        Ok(()) => {
+            advised.insert(session_id.to_string(), newest_name);
+            true
+        }
+        Err(e) => {
+            push_error(errors, format!("mail advisory: {e}"));
+            false
+        }
+    }
+}
+
 /// Once-per-tick mail sweep: every attached worker pane that is `Idle` gets
 /// the oldest of its own unread messages (the same per-session visibility
 /// `unread_counts` already applies: addressed to its agent, and either
 /// undirected or addressed to its own short id) injected visibly, and
 /// consumed only after that injection succeeded.
+///
+/// An attached **orchestrator** pane (`Verb::Chat`) is never eligible for
+/// that body delivery (`is_delivery_eligible`), but when idle/injectable with
+/// unread mail of its own it gets [`advise_one_pane`]'s one-line advisory
+/// instead -- deduplicated per pane across ticks via `advised`, which the
+/// caller owns for the dashboard's whole run (a pane's own session id
+/// outlives any one tick, so the map is not rebuilt here).
 fn mail_sweep(
     panes: &mut [Pane],
     cfg: &CtxConfig,
     state: &StateDir,
     repo: &Path,
+    advised: &mut HashMap<String, String>,
     errors: &mut Vec<String>,
 ) {
     if !cfg.mail.enabled {
@@ -2889,20 +3056,34 @@ fn mail_sweep(
     }
     let slug = super::state::repo_slug(repo);
     for pane in panes.iter_mut() {
-        if !is_delivery_eligible(pane.verb(), pane.injectable()) {
-            continue;
+        let injectable = pane.injectable();
+        if is_delivery_eligible(pane.verb(), injectable) {
+            let agent = pane.agent().to_string();
+            let short = pane.short().to_string();
+            sweep_one_pane(
+                pane,
+                state,
+                &slug,
+                &agent,
+                &short,
+                cfg.mail.max_delivered_bytes,
+                errors,
+            );
+        } else if pane.verb() == sessions::Verb::Chat && injectable {
+            let agent = pane.agent().to_string();
+            let short = pane.short().to_string();
+            let session_id = pane.session_id().to_string();
+            advise_one_pane(
+                pane,
+                &session_id,
+                state,
+                &slug,
+                &agent,
+                &short,
+                advised,
+                errors,
+            );
         }
-        let agent = pane.agent().to_string();
-        let short = pane.short().to_string();
-        sweep_one_pane(
-            pane,
-            state,
-            &slug,
-            &agent,
-            &short,
-            cfg.mail.max_delivered_bytes,
-            errors,
-        );
     }
 }
 
@@ -3149,6 +3330,22 @@ pub fn run_dashboard(
     if let Some(e) = turn_env_err {
         push_error(&mut errors, e);
     }
+    // The seat this pane sits in, for the `zirv ctx hook pretool` guard
+    // running inside it. This `turn_env` belongs to the first pane and only
+    // the first pane -- `fulfill_spawn_request` and the restore path each
+    // build their own from scratch -- so a worker pane never picks it up,
+    // and `Pane::spawn`'s own `scrub_supervision_env` clears any copy the
+    // dashboard process itself might have inherited. `first.argv` is the
+    // exact launch argv `build_launch`/`extra_with_model` built (config
+    // model folded in, then the operator's own trailing flags appended after
+    // it), so a passthrough `--model`/`--model=` in it is preferred over
+    // `cfg.chat.model` the same way `wrap.rs`'s own orchestrator arm prefers
+    // its own `rest`; see `adapters::seat_model_env`.
+    turn_env.extend(super::adapters::seat_model_env(
+        first.role,
+        &first.argv,
+        cfg.chat.model.as_deref(),
+    ));
 
     // Task 10: the spawn-request channel. `dashboard_short` is derivable
     // before any pane has actually spawned -- `Record::new`'s own `short`
@@ -3187,7 +3384,15 @@ pub fn run_dashboard(
     // that can still fail outright owes it the same cleanup every other exit
     // path performs. Before this, a first pane that would not spawn left
     // `<state>/dash/<short>-<token>/` behind on every attempt.
-    let first_pane = match Pane::spawn(first, state, repo, size, &turn_env) {
+    let first_pane = match Pane::spawn(
+        first,
+        state,
+        repo,
+        size,
+        &turn_env,
+        turn_signal_capable_for(cfg, &agent_name),
+        Duration::from_millis(cfg.dash.idle_quiet_ms),
+    ) {
         Ok(pane) => pane,
         Err(e) => {
             remove_request_dir(&requests_dir);
@@ -3358,6 +3563,11 @@ pub fn run_dashboard(
     let mut last_mail_sweep = Instant::now()
         .checked_sub(FACTS_THROTTLE)
         .unwrap_or_else(Instant::now);
+    // Task B: per-pane dedup for the orchestrator mail advisory
+    // (`advise_one_pane`), keyed by a pane's own zirv session id. Lives for
+    // the whole dashboard run, not just one tick, so an unchanged inbox is
+    // advised once and then left alone until genuinely new mail arrives.
+    let mut advised_mail: HashMap<String, String> = HashMap::new();
     // R8: see `input_stream_is_dead`.
     let mut input_errors: usize = 0;
     // D4: set by the "every pane ended" exit arm, so the closing line is
@@ -3485,7 +3695,7 @@ pub fn run_dashboard(
         let sweep_now = Instant::now();
         if due(last_mail_sweep, sweep_now, FACTS_THROTTLE) {
             last_mail_sweep = sweep_now;
-            mail_sweep(&mut panes, cfg, state, repo, &mut errors);
+            mail_sweep(&mut panes, cfg, state, repo, &mut advised_mail, &mut errors);
             claim_pane_nudges(&panes, state, &mut notices, sweep_now);
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
@@ -3621,6 +3831,11 @@ pub fn run_dashboard(
                                                     prompt,
                                                     cwd: repo.to_path_buf(),
                                                     requested_by: dashboard_short.clone(),
+                                                    // The overlay asks for an agent and
+                                                    // a prompt, nothing else, so this
+                                                    // spawn takes the operator's own
+                                                    // configured worker default.
+                                                    model: None,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 let fulfilled = fulfill_spawn_request(
@@ -5821,7 +6036,18 @@ mod tests {
             session_id: session_id.to_string(),
             title: "orch".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
         let (mut focused, mut selected) = (0usize, 0usize);
         let mut errors = Vec::new();
@@ -6069,6 +6295,197 @@ mod tests {
         );
     }
 
+    // Task B: the orchestrator mail advisory (`advise_one_pane`/
+    // `orchestrator_mail_advisory_body`) -- never a body, never consumed,
+    // deduplicated across ticks against an unchanged inbox.
+
+    #[test]
+    fn orchestrator_mail_advisory_body_names_the_count_and_the_newest_sender() {
+        assert_eq!(
+            orchestrator_mail_advisory_body(3, "claude", "aaaa1111-2222-4333-8444-555555555555"),
+            "3 unread from claude/aaaa1111 \u{2014} zirv ctx inbox"
+        );
+        assert_eq!(
+            orchestrator_mail_advisory_body(1, "codex", "bbbb2222"),
+            "1 unread from codex/bbbb2222 \u{2014} zirv ctx inbox"
+        );
+    }
+
+    /// R3-style trust split, mirrored for the advisory: the body carries a
+    /// count and a sender, never the message text itself.
+    #[test]
+    fn orchestrator_mail_advisory_body_never_carries_a_message_body() {
+        let body = orchestrator_mail_advisory_body(2, "claude", "aaaa1111");
+        assert!(
+            !body.contains("the build is red"),
+            "an advisory must never leak message text: {body}"
+        );
+    }
+
+    fn store_one(state: &StateDir, slug: &str, cfg: &CtxConfig, from_session: &str, body: &str) {
+        mail::store(
+            state,
+            slug,
+            &mail::Message {
+                from_session: from_session.to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: super::super::state::now_secs(),
+                body: body.to_string(),
+            },
+            cfg,
+        )
+        .expect("store");
+    }
+
+    /// A fresh pane with unread mail is advised exactly once, and the message
+    /// is left on disk -- unlike `sweep_one_pane`, `advise_one_pane` never
+    /// consumes: only an orchestrator's own `zirv ctx inbox` does.
+    #[test]
+    fn advise_one_pane_advises_once_and_never_consumes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        let mut advised = HashMap::new();
+        let delivered = advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut Vec::new(),
+        );
+
+        assert!(delivered);
+        assert_eq!(injector.calls.len(), 1);
+        assert_eq!(injector.calls[0].0, "mail");
+        assert!(
+            injector.calls[0].1.starts_with("1 unread from claude/s1"),
+            "got {}",
+            injector.calls[0].1
+        );
+        assert_eq!(
+            mail::list(&state, slug, None, None).expect("list").len(),
+            1,
+            "the advisory must never consume the message"
+        );
+    }
+
+    /// The same unread mail is not re-advised on a second, unchanged sweep --
+    /// the dedup key (the newest message's own file name) has not moved.
+    #[test]
+    fn advise_one_pane_does_not_repeat_on_an_unchanged_inbox() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+
+        let mut advised = HashMap::new();
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        assert!(advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut Vec::new(),
+        ));
+        assert!(
+            !advise_one_pane(
+                &mut injector,
+                "session-a",
+                &state,
+                slug,
+                "claude",
+                "short0000",
+                &mut advised,
+                &mut Vec::new(),
+            ),
+            "an unchanged inbox must not be re-advised"
+        );
+        assert_eq!(injector.calls.len(), 1, "only the first sweep advised");
+    }
+
+    /// New mail arriving after an advisory triggers exactly one more --
+    /// naming the updated count and the newest sender.
+    #[test]
+    fn advise_one_pane_re_advises_once_new_mail_arrives() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "first");
+
+        let mut advised = HashMap::new();
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        assert!(advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut Vec::new(),
+        ));
+
+        // A second, later message: distinct filename (a later timestamp
+        // prefix), so it must trigger a fresh advisory.
+        std::thread::sleep(Duration::from_millis(1100));
+        store_one(&state, slug, &cfg, "s2", "second");
+
+        assert!(
+            advise_one_pane(
+                &mut injector,
+                "session-a",
+                &state,
+                slug,
+                "claude",
+                "short0000",
+                &mut advised,
+                &mut Vec::new(),
+            ),
+            "new mail must trigger a fresh advisory"
+        );
+        assert_eq!(injector.calls.len(), 2);
+        assert!(
+            injector.calls[1].1.starts_with("2 unread from claude/s2"),
+            "the second advisory names the updated count and the newest sender: {}",
+            injector.calls[1].1
+        );
+    }
+
+    /// A pane with no unread mail at all is never advised.
+    #[test]
+    fn advise_one_pane_is_a_no_op_with_no_unread_mail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        let mut advised = HashMap::new();
+        let delivered = advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            "-work-repo",
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut Vec::new(),
+        );
+        assert!(!delivered);
+        assert!(injector.calls.is_empty());
+    }
+
     // F8: one mail message per pane per tick.
 
     /// The idle gate is checked once, before the first injection, and an
@@ -6199,6 +6616,61 @@ mod tests {
             prompt: prompt.to_string(),
             cwd: cwd.to_path_buf(),
             requested_by: "aaaa1111".to_string(),
+            model: None,
+        }
+    }
+
+    /// The pin an orchestrator wrote (`zirv agent claude "..." -- --model
+    /// haiku`) is what the pane launches with, ahead of the operator's own
+    /// configured worker default: a delegation that named its own model must
+    /// not be silently re-pointed at a pricier one.
+    #[test]
+    fn a_pinned_request_model_beats_the_configured_worker_default_for_a_pane() {
+        let adapter = adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: Some("opus".to_string()),
+                codex: None,
+            },
+            ..CtxConfig::default()
+        };
+        let mut req = spawn_request("go", Path::new("/repo"));
+        req.model = Some("haiku".to_string());
+
+        assert_eq!(
+            pane_model_args(&req, &cfg, &adapter),
+            vec!["--model".to_string(), "haiku".to_string()]
+        );
+    }
+
+    /// No pin, and a pin the authority side refuses to build an argv token out
+    /// of, both fall back to the resolved worker default. A request is data,
+    /// never authority: this end re-checks the value even though
+    /// `agent::try_join_dashboard` already filtered it.
+    #[test]
+    fn a_missing_or_flag_shaped_request_model_falls_back_to_the_worker_default() {
+        let adapter = adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let sonnet = vec!["--model".to_string(), "sonnet".to_string()];
+        let too_long = "a".repeat(129);
+
+        for model in [
+            None,
+            Some("  "),
+            Some("--dangerously-skip-permissions"),
+            // Bad charset: would still fail `argv_unsafe_prompt` (no leading
+            // `-`), so this is `validate_model_str`'s own guard being what
+            // catches it.
+            Some("claude; rm -rf /"),
+            Some(too_long.as_str()),
+        ] {
+            let mut req = spawn_request("go", Path::new("/repo"));
+            req.model = model.map(str::to_string);
+            assert_eq!(
+                pane_model_args(&req, &cfg, &adapter),
+                sonnet,
+                "claude's own worker default applies for {model:?}"
+            );
         }
     }
 
@@ -6928,7 +7400,18 @@ mod tests {
             session_id: "11111111-2222-4333-8444-555555555555".to_string(),
             title: "wrk test".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
 
         let requests_dir = state.dash().join("aaaa1111-token").join("requests");
         std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
@@ -7190,7 +7673,18 @@ mod tests {
                 session_id: session_id.to_string(),
                 title: format!("wrk {i}"),
             };
-            panes.push(Pane::spawn(spec, state, repo, (80, 24), &[]).expect("spawn"));
+            panes.push(
+                Pane::spawn(
+                    spec,
+                    state,
+                    repo,
+                    (80, 24),
+                    &[],
+                    true,
+                    pane::DEFAULT_IDLE_QUIET,
+                )
+                .expect("spawn"),
+            );
         }
         let a = panes[0].short().to_string();
         let b = panes[1].short().to_string();
@@ -7317,7 +7811,18 @@ mod tests {
             session_id: session_id.to_string(),
             title: "wrk mid-compose".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
         let short = panes[0].short().to_string();
 
         assert!(
@@ -7556,7 +8061,18 @@ mod tests {
             session_id: "44444444-2222-4333-8444-555555555555".to_string(),
             title: "wrk test".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
         let short = panes[0].short().to_string();
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::from(vec!["ping".to_string()])];
         assert!(
@@ -7648,7 +8164,18 @@ mod tests {
             session_id: "66666666-2222-4333-8444-555555555555".to_string(),
             title: "orch".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
         let short = panes[0].short().to_string();
         let record = state.sessions().join(format!("{short}.json"));
         assert!(record.exists(), "registered while it runs");
@@ -7721,7 +8248,18 @@ mod tests {
             session_id: session_id.to_string(),
             title: "wrk test".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
         assert!(
             signal_until_idle(&mut panes[0], &state, session_id),
             "the pane must report a turn boundary before this test can mean anything"
@@ -7751,8 +8289,9 @@ mod tests {
         .expect("store");
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::from(vec!["ping".to_string()])];
         let mut errors = Vec::new();
+        let mut advised = HashMap::new();
 
-        mail_sweep(&mut panes, &cfg, &state, &repo, &mut errors);
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
         assert_eq!(
             mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
                 .expect("list")
@@ -7773,7 +8312,7 @@ mod tests {
         // claims the tick; the nudge drain sees the pane busy again and waits
         // one more turn, exactly as it would for any other injection).
         assert!(signal_until_idle(&mut panes[0], &state, session_id));
-        mail_sweep(&mut panes, &cfg, &state, &repo, &mut errors);
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
         assert!(
             mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
                 .expect("list")
@@ -7820,7 +8359,18 @@ mod tests {
             session_id: session_id.to_string(),
             title: "wrk test".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
         assert!(
             signal_until_idle(&mut panes[0], &state, session_id),
             "the pane must report a turn boundary before the sweep can mean anything"
@@ -7843,8 +8393,9 @@ mod tests {
 
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::from(vec!["ping".to_string()])];
         let mut errors = Vec::new();
+        let mut advised = HashMap::new();
 
-        mail_sweep(&mut panes, &cfg, &state, &repo, &mut errors);
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
         assert!(
             mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
                 .expect("list")
@@ -7865,6 +8416,188 @@ mod tests {
         assert!(
             queues[0].is_empty(),
             "once the injected turn ends the queued nudge is delivered"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// A long-lived child that produces no pty output of its own at all
+    /// (unlike `pane::tests::long_lived_argv`'s `ping`, which prints a reply
+    /// line once a second): needed here because the advisory assertion below
+    /// reads `Pane::last_line`, and a periodic `ping` reply would otherwise
+    /// race the injected line out of that position.
+    #[cfg(windows)]
+    fn silent_long_lived_argv() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "ping -n 60 127.0.0.1 >nul".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn silent_long_lived_argv() -> Vec<String> {
+        vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()]
+    }
+
+    /// Task B end to end through the real `mail_sweep`, both pane kinds in the
+    /// same sweep: the orchestrator pane (`Verb::Chat`) gets the one-line
+    /// advisory typed visibly into its own pty and its mail stays on disk,
+    /// unread; the worker pane (`Verb::Dash`) alongside it gets exactly the
+    /// unchanged body-delivery-and-consume behaviour it always had. A second
+    /// sweep with nothing new must not re-advise the orchestrator.
+    #[test]
+    fn mail_sweep_advises_the_orchestrator_and_still_delivers_to_workers() {
+        use super::pane::tests::{long_lived_argv, signal_until_idle};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let slug = super::super::state::repo_slug(&repo);
+        let cfg = CtxConfig::default();
+
+        let orch_session = "99999999-2222-4333-8444-555555555555";
+        let orch_spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: silent_long_lived_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: orch_session.to_string(),
+            title: "orch".to_string(),
+        };
+        let worker_session = "aaaaaaab-2222-4333-8444-555555555555";
+        let worker_spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: worker_session.to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                orch_spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn orchestrator"),
+            Pane::spawn(
+                worker_spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn worker"),
+        ];
+        assert!(signal_until_idle(&mut panes[0], &state, orch_session));
+        assert!(signal_until_idle(&mut panes[1], &state, worker_session));
+        let orch_short = panes[0].short().to_string();
+        let worker_short = panes[1].short().to_string();
+
+        // A distinct, `to_session`-addressed message for each pane -- not one
+        // shared broadcast message -- so the worker consuming its own copy
+        // cannot be mistaken for (or mask) the orchestrator failing to
+        // consume its own.
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "aaaa1111".to_string(),
+                from_agent: "claude".to_string(),
+                to: "test-agent".to_string(),
+                to_session: Some(orch_short.clone()),
+                sent: super::super::state::now_secs(),
+                body: "the build is red".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "bbbb2222".to_string(),
+                from_agent: "claude".to_string(),
+                to: "test-agent".to_string(),
+                to_session: Some(worker_short.clone()),
+                sent: super::super::state::now_secs(),
+                body: "please rerun the flaky suite".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut advised = HashMap::new();
+        let mut errors = Vec::new();
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
+
+        assert!(
+            errors.is_empty(),
+            "the sweep must not error against two idle, injectable panes: {errors:?}"
+        );
+        // The real `Pane::inject_visible` (via `Injector for Pane`) only ever
+        // sets `injected_awaiting_turn` on a *successful* write, and
+        // `state()` surfaces that as `Working` immediately -- the same proof
+        // `an_injection_makes_a_pane_busy_until_its_next_turn_signal` already
+        // uses for a worker pane's own injection, applied here to the
+        // orchestrator's. Whether the bytes then echo back onto the child's
+        // own screen is up to that child's terminal mode (a non-interactive
+        // `cmd /c`/`sh -c` child does not reliably echo at all), so this is
+        // deliberately not asserted against `last_line` -- the exact bytes an
+        // injection writes are already pinned pure, without a real pty at
+        // all, by `pane::tests::an_injection_writes_exactly_one_control_byte`
+        // and this module's own `advise_one_pane_advises_once_and_never_
+        // consumes`.
+        panes[0].drain();
+        assert!(
+            matches!(panes[0].state(), PaneState::Working),
+            "a successful advisory injection makes the orchestrator pane busy \
+             until its next turn signal: {:?}",
+            panes[0].state()
+        );
+        assert_eq!(
+            mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
+                .expect("list")
+                .len(),
+            1,
+            "the orchestrator's own advisory never consumes the mail"
+        );
+
+        // Worker: unchanged body delivery, and consumed.
+        assert_eq!(
+            mail::list(&state, &slug, Some("test-agent"), Some(panes[1].short()))
+                .expect("list")
+                .len(),
+            0,
+            "the worker pane still gets ordinary body delivery, which consumes"
+        );
+
+        // A second sweep with nothing new must not re-advise the orchestrator
+        // (it is not idle right after its own injection, but even once it is,
+        // an unchanged inbox stays quiet -- checked directly against
+        // `advised` rather than waiting out a real turn signal here).
+        assert_eq!(
+            advised.get(panes[0].session_id()).cloned(),
+            Some(
+                mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
+                    .expect("list")[0]
+                    .0
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "the dedup map records the advised message's own file name"
         );
 
         for pane in panes.iter_mut() {
@@ -8359,7 +9092,18 @@ mod tests {
             session_id: "dddddddd-2222-4333-8444-555555555555".to_string(),
             title: "wrk nudge".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
         let short = panes[0].short().to_string();
 
         // The nudger writes `<short>.nudge` into the sessions dir; write it
@@ -8403,7 +9147,18 @@ mod tests {
             session_id: "eeeeeeee-2222-4333-8444-555555555555".to_string(),
             title: "wrk resize".to_string(),
         };
-        let mut panes = vec![Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn")];
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
 
         let mut term_cols = 80u16;
         let mut term_rows = 24u16;

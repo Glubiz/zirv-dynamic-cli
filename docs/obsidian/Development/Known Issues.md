@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-18
+last-verified: 2026-08-19
 ---
 
 # Known Issues
@@ -14,6 +14,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-19 (feat/chat-token-economy, role-gated worker prompt): recorded three gotchas -- the user-layer role split means a Worker no longer reads ~/.zirv/system-prompt.md at all (an operator with standing worker instructions must create ~/.zirv/system-prompt.worker.md), wrap's pty-harness tests wedge a spawned child in kernel exit state ?Es on this macOS machine (pre-existing on unmodified main, A/B-verified, run them on Linux CI), and five exec nudge tests time out (exit 76) intermittently in a full-suite batch while passing in isolation -->
+<!-- Updated 2026-08-18 (feat/chat-token-economy, live inter-session messaging): recorded that on a standalone-installer codex-cli 0.147.0 with [windows] sandbox = "elevated", `codex exec --sandbox read-only` fails outright with a missing-helper error, so CodexAdapter::distiller_cmd's pinned --sandbox read-only breaks optimize/handoff on such installs until the sandbox helper exists or the pin is made conditional -->
+<!-- Updated 2026-08-18 (feat/chat-token-economy, live inter-session messaging): recorded that a nudge/mail delivery queued for a live codex dashboard pane before dash.idle_quiet_ms output-quiescence existed simply waited forever, since a signal-less pane never reported Idle at all -- now resolved by pane_is_idle's signal-less branch, kept here as a historical trap for anyone reading an older build's behavior -->
+<!-- Updated 2026-08-18 (feat/chat-token-economy): recorded an operator-machine gotcha -- a ~/.codex/config.toml model pin unsupported by a ChatGPT-plan login breaks every zirv codex delegation with a 400, since zirv passes no --model by default; resolved on this machine by removing the pin -->
 <!-- Updated 2026-08-18 (feat/review-model-config): recorded the codex review-ladder model catalog as sourced from a codex-cli 0.146.0 capture, not re-verified against 0.105.0 (npm) -- the same version-split residual as the existing distiller --ignore-rules/--ignore-user-config gap -- and the equals-seat wording residual (an operator-configured review model equal in tier but spelled differently from a full-id seat keeps the strict never-clause wording, since equality is checked case-insensitively on the exact strings only) -->
 
 <!-- Updated 2026-08-18 (feat/usage-two-window-display): both usage windows now render per harness, filtered through the new window::available staleness rule, at every display surface (dash header, wrap's bar, zirv ctx status); the refresh gates were fixed to treat a display-dropped slot as stale so a rolled-over window refreshes promptly; two residuals recorded, not fixed -- pace's hard-park path deliberately admits a rolled-over-but-recently-observed reading (test-pinned, pre-existing, distinct from `available`'s own rule), and `zirv ctx usage` prints a bare unix epoch for a passed resets_at with no "already reset" wording -->
@@ -35,6 +39,12 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## A nudge/mail delivery queued for a live codex dashboard pane used to wait forever
+
+**Resolved 2026-08-18 (live inter-session messaging).** Before `pane::pane_is_idle` gained a signal-less branch, a pane's idleness was decided purely by `signal_still_stands`, which requires at least one turn-boundary signal to have been seen. Codex's adapter has no turn-signal mechanism at all (`register_turn_signal` is a no-op for it), so a codex pane's `last_signal_at` never advanced past `None` and the pane read `Working` forever — the mail sweep and the nudge drain, both gated on `Idle`/`Pane::injectable`, could queue something for such a pane and it would simply sit there, undelivered, for the pane's entire life. Fixed by branching `pane_is_idle` on `AgentAdapter::capabilities().turn_signal`: a signal-less pane is now read idle by `dash.idle_quiet_ms` of pty-output quiescence instead (further hardened the same day to measure from the *latest* of output and zirv's own local input — see the 2026-08-18 [[Decision Log]] entry).
+
+**Residual: `wrap`'s own live mail advisory (T13, above) has no equivalent for a signal-less adapter.** `wrap::may_inject` requires `InjectionState.signals_seen > 0`, sourced from the same turn-signal socket a codex session never posts to — this is a separate mechanism from `dash::pane`'s own idleness check, and only the latter gained a signal-less branch. A plain `zirv ctx wrap --agent codex` (or `chat`/bare `zirv` falling through to `wrap` on a too-small terminal) therefore never types the mail advisory line at all; `MailWatch::decide` always takes the `Announce` branch instead, which is harmless (the stderr line still fires, mail is still readable via `zirv ctx inbox`) but means live-typed delivery is a dashboard-only capability for codex today, unlike claude, which gets it in both supervisors.
 
 ## Sidebar ownership is a raw pid, so a pane child's own in-process headless fallback is invisibly unowned
 
@@ -198,6 +208,14 @@ prompt (the one residual claude's distiller has too, and cannot close either
 `--ignore-rules --ignore-user-config` to `distiller_cmd` once the
 npm-published codex-cli ships them, verified against that installed CLI the
 same way `-s, --sandbox` was.
+
+## `--sandbox read-only` fails outright on a codex-cli install with the Windows sandbox helper missing
+
+On one real machine (codex-cli 0.147.0, the standalone OpenAI installer, `[windows] sandbox = "elevated"` in `~/.codex/config.toml`), `codex exec --sandbox read-only` — the exact flag `CodexAdapter::distiller_cmd` pins for `zirv ctx optimize`/handoff's report-only guarantee (see the entry above) — fails immediately with `windows sandbox: orchestrator_helper_launch_failed ... helper=codex-windows-sandbox-setup.exe ... program not found`, rather than degrading or falling back. `codex exec` with no sandbox flag at all works on the same install. Since `distiller_cmd` always passes `--sandbox read-only` unconditionally, every `zirv ctx optimize`/handoff run that resolves to the codex distiller fails the same way on such an install until either the sandbox helper binary is present or the pin is made conditional on the installed CLI actually supporting it. Not fixed here — recorded so a codex-distiller failure that looks like a zirv bug is checked against this first.
+
+## A `~/.codex/config.toml` model pin unsupported by the operator's login breaks every zirv codex delegation with a 400
+
+zirv passes no `--model` to codex by default (`CodexAdapter::default_worker_model()` is `None`, and `worker.codex`/`review.codex` are both unset unless the operator configures them — see [[Ctx Adapters]]'s "The delegated-worker model default"), so an unconfigured codex launch runs on whatever `codex exec`'s own resolution picks. If the operator's own `~/.codex/config.toml` pins a `model` that the account's actual login (a ChatGPT-plan session, not an API key) does not support, every codex launch fails at the vendor with an HTTP 400 — indistinguishable at zirv's level from any other codex startup failure, since zirv never sees or validates the pinned name; it is entirely outside zirv's own config surface. Resolved on this machine by removing the pin from `~/.codex/config.toml` and letting codex's own default apply. If a codex delegation (`zirv ctx agent codex ...`, a dashboard codex pane, or codex code review) fails outright with a 400 and no obviously bad zirv config, check `~/.codex/config.toml` for a `model` line before looking anywhere in this codebase.
 
 ## The codex review-ladder model catalog is sourced from a 0.146.0 capture, not re-verified against npm's 0.105.0
 
@@ -587,6 +605,21 @@ fails with `prefix too short`, and — if its cleanup runs after the call —
 can leak `FAKE_AGENT_*` environment variables into every later test in the
 same process.
 
+## A delegated worker no longer reads `~/.zirv/system-prompt.md` at all
+
+The user prompt layer became role-scoped on 2026-08-19: an Orchestrator session reads
+`~/.zirv/system-prompt.md` as before, a Worker session reads the separate, optional
+`~/.zirv/system-prompt.worker.md` (`prompt::WORKER_PROMPT_FILE`) instead, and **neither role
+reads the other's file**. Before the split a Worker read `system-prompt.md` too, so an
+operator whose standing instructions there were partly aimed at delegated workers silently
+loses that half on upgrade: the fix is to copy the worker-relevant part into the new file.
+Nothing warns about this — an absent worker file is a completely normal state (it means "no
+worker user layer", exactly like an absent `system-prompt.md` means no orchestrator one), so
+there is no signal zirv could honestly distinguish from an operator who never wanted one.
+Both files live in the operator's home directory; a repo checkout has no equivalent (its own
+`.zirv/system-prompt.md` is still the single, capped, labeled Repo layer for both roles).
+See [[Utilities]] for the layer list and [[Decision Log]] for the reasoning.
+
 ## `ctx` shadows `.zirv/ctx.yaml`
 
 `zirv ctx` is a built-in resolved in `main.rs` before YAML script lookup, so a
@@ -611,6 +644,53 @@ worth knowing: a mis-cased built-in like `zirv Help` now exits 1 with
 `cargo test --verbose -- --test-threads=1` is required, not optional — tests
 share state (state dir, fixtures) and will flake or corrupt each other under
 the default parallel test runner.
+
+## `wrap`'s pty-harness tests wedge their spawned child on at least one macOS machine
+
+Every `#[cfg(unix)]` test in `wrap.rs` that goes through `spawn_wrap`/`spawn_wrap_with_flags`
+(21 as of 2026-08-19; a local skip list wants 24, adding the three that open a pty directly
+with `native_pty_system`) hangs on one reference macOS machine (Darwin 25.5.0): the spawned
+`zirv ctx wrap` child reaches kernel
+exit state `?Es` after its `/exit` and never reaps, so the test blocks forever in
+`Child::wait`. **Pre-existing and unrelated to any branch** — A/B-verified 6/6 against
+unmodified `main`, both sandboxed and unsandboxed. Killing the parent test binary's specific
+pid clears the wedge (never `pkill`/`killall` by name — other real sessions share those
+names). Linux CI runs the whole family normally, and it is the authority for them.
+
+Two traps when building that skip list, both hit on 2026-08-19: three *windows-only* tests
+inside `#[cfg(windows)] mod win` have their own `spawn_wrap` helper, so a grep for the helper
+name over the whole file returns 27 and three of those names do not exist on macOS at all
+(`--skip` on a name nothing matches is silently a no-op, and the runner's own "N filtered out"
+count is what gives it away); and `cargo test` must be run with stdin closed
+(`< /dev/null`), or `commands::ctx::tests::a_rejected_statusline_tee_still_exits_zero` — which
+exercises `zirv ctx usage tee`, and so reads stdin to EOF — blocks the whole suite
+indefinitely, roughly two thirds of the way through, with no failure output.
+
+Practical consequence: a full local suite on such a machine must skip the family, e.g. one
+`--skip commands::ctx::wrap::tests::<name>` per test, and any change to a pty test's own
+synchronisation can only be reasoned about locally, not executed — see the 2026-08-19
+[[Work Journal]] entry for a change made under exactly that constraint.
+
+## Five `exec` nudge tests time out intermittently in a full-suite batch
+
+`commands::ctx::exec::tests::a_nudge_on_a_simple_codex_run_still_delivers_its_own_guidance`,
+`…::a_nudge_on_an_explicit_command_codex_run_delivers_the_nudge_mail_on_the_relaunch`,
+`…::a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_launch_mail`,
+`…::a_nudge_restart_does_not_spend_the_rot_restart_budget`, and
+`…::a_headless_worker_stops_at_the_next_poll_and_relaunches_with_the_guidance` fail with
+exit-76 (`EXIT_TIMEOUT`) assertions, and each of them passes on its own in well under a
+second. **Pre-existing and non-deterministic, verified by A/B on 2026-08-19:** running exactly
+these five as one filtered batch fails two of them in ~61s on both `feat/chat-token-economy`
+and its own merge-base commit — and *which* two differs between runs (branch:
+`…explicit_command_codex_run…` + `…post_nudge_park…`; base: `…rot_restart_budget…` +
+`…post_nudge_park…`). Each spawns a real supervised child whose progress depends on a nudge
+landing inside a 5-second window (`nudge_live_session`'s own wait gives up silently), so on a
+loaded machine the nudge misses, the fake agent stays in `hang` mode, and the run burns its
+whole 30-second wall clock instead.
+
+Practical consequence: a red result here is only evidence when the test is run alone. Rerun
+the individual test before treating it as a regression, and report both outcomes rather than
+either one alone — a batch result on its own cannot tell a regression from this.
 
 ## `wrap`'s hot path assumes `panic = "abort"`
 

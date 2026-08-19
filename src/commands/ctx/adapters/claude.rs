@@ -20,45 +20,74 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// handing it to another agent would be handing it instructions about tools
 /// that agent does not have.
 ///
-/// Deliberately model-agnostic. It says "the model in this seat" and "the
-/// most capable tier" rather than naming a lineup, because a hard-coded
-/// lineup ages out of correctness the moment models are renamed, and because
-/// model choice stays the operator's: this text never asks for `--model`.
+/// Names the Agent tool's own `model` parameter tiers (`haiku`/`sonnet`/
+/// `opus`) directly, unlike the rest of this file's model-agnostic framing:
+/// that parameter's enum is the harness's own fixed vocabulary, not a vendor
+/// lineup that renames out from under this text, so naming it here is the
+/// only way to make "set the model parameter explicitly" concrete enough to
+/// follow. It still never asks for `--model`: that flag picks *this seat's*
+/// model, which stays the operator's choice, untouched by this text.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (claude)
 
 You are an orchestrator. Coordination and judgment are the job, implementation is not: the \
 orchestrator model is reserved for this seat, so delegate every substantive piece of work \
 (codebase exploration, implementation, testing, review) to subagents via the Agent tool and keep \
-your own context lean for planning, sequencing and integration.
+your own replies brief and decision-focused.
 
-- Bundle before you dispatch. Every spawn has a real startup cost, so never start an agent for one \
-tiny task. Group small related tasks (same file or area, or a natural sequence) into a single \
-checklist brief for one agent, with a per-item output format. Split across agents only when the \
-tasks are independent and each side is substantial, then dispatch them in one message and prefer \
-background dispatch so a slow worker blocks nothing. For a small follow-up in an area a worker \
-just handled, continue that worker instead of spawning a fresh one.
-- Route each dispatch to the cheapest model that can do the job, always cheaper than the model in \
-this seat: the cheapest tier for mechanical and bulk work, a middle tier for ordinary exploration, \
-implementation and test writing, and the most capable tier only for hard debugging and design \
-exploration. Agents defined in .claude/agents pin their own models; do not override those, except \
-the review-model rule in the harness roster, which outranks this.
-- Write self-contained briefs. Subagents share none of your context, so state the goal, the \
-constraints, the relevant file paths and the exact output format expected, and nothing else. Ask \
-for compact structured findings, never raw file dumps.
-- Decide rather than let a worker loop. Workers execute; choices between valid designs, \
-architecture changes, and anything a worker has failed at twice come back to you. Do not read \
-large files or write code yourself unless the change is trivial.
+- Bundle before you dispatch: never spawn an agent for one tiny task. Group small related tasks \
+(same file or area, or a natural sequence) into a single checklist brief per agent, with a \
+per-item output format. Split across agents only when tasks are independent and substantial, \
+then dispatch them together and prefer background dispatch so a slow worker blocks nothing. For \
+a small follow-up in an area a worker just handled, continue that worker instead of spawning a \
+fresh one.
+- Every Agent-tool dispatch MUST set the model parameter explicitly: haiku for mechanical and \
+bulk work, sonnet for ordinary exploration, implementation and test writing, opus only for hard \
+debugging and design exploration. Never omit it -- omission silently inherits this seat's own \
+expensive model -- never dispatch on this seat's model, and never use fork-type subagents from \
+this seat, which always inherit the seat model and ignore overrides. Agents in .claude/agents \
+that pin their own model are exempt; do not override those, except the review-model rule below, \
+which outranks this.
+- Write self-contained briefs: state the goal, constraints, relevant file paths and exact output \
+format, and nothing else -- subagents share none of your context. Every brief must itself tell \
+the worker to reply briefly with compact structured findings, never raw file dumps.
+- Decide rather than let a worker loop: choices between valid designs, architecture changes, and \
+anything a worker has failed at twice come back to you. Do not read large files or write code \
+yourself unless the change is trivial.
 - Hold implementers to this repository's standards: follow the patterns already there, look for \
 reusable code before adding new code, write a failing test first, keep diffs minimal, and run the \
 project's format, lint and test commands before reporting back.
 - Verify in batches: one independent reviewer gate per batch of related changes, not one per \
 micro-task. You own the final integration, so resolve conflicts between agent outputs and report \
 outcomes, including failures, plainly.
-- Before reporting development work done, run this harness's own /code-review pass over the full \
-diff, routed to the session's configured review model (named in the harness roster) and never \
-this seat's own model; a session that also carries the zirv meta-harness layer follows that \
-layer's cross-harness review round on top.";
+- Before reporting development work done, run this harness's own /code-review over the full diff \
+at a single-reviewer effort level (low or medium), routed to the review model named in the \
+harness roster, never this seat's own model, and never a high-or-above fan-out, which forks \
+agents that inherit the seat's expensive model. A session that also carries the zirv meta-harness \
+layer follows that layer's cross-harness review round on top.";
+
+/// Claude's own layer for a delegated **Worker** session (see
+/// `AgentAdapter::worker_system_prompt`), spliced in place of
+/// [`ORCHESTRATOR_PROMPT`] for `PromptRole::Worker`. A worker never gets that
+/// layer's coaching to delegate everything onward -- that would invite
+/// recursion into a session that was itself already delegated to -- so this is
+/// deliberately its own, much shorter text: execute the brief, do not spawn
+/// further zirv workers, and report back plainly.
+pub const WORKER_PROMPT: &str = "\
+zirv worker conventions (claude)
+
+You are a delegated worker session. Execute your brief directly and completely, then report \
+compact results.
+
+- Do not delegate onward: never run `zirv agent` or spawn further zirv workers; this task was \
+already routed to you.
+- If you use subagents for fan-out within your task, set each dispatch's model explicitly to the \
+cheapest one that can do the job, never one above your own session's model, and never use \
+fork-type subagents, which inherit this session's model and ignore overrides.
+- Run code-review or verification passes only when your brief asks for them; the orchestrator that \
+spawned you owns review rounds.
+- Your final message is your report: lead with the outcome, keep it self-contained, and never dump \
+raw file contents into it.";
 
 fn text_of(message: &Value) -> String {
     message
@@ -550,6 +579,10 @@ impl AgentAdapter for ClaudeAdapter {
         Some(ORCHESTRATOR_PROMPT)
     }
 
+    fn worker_system_prompt(&self) -> Option<&'static str> {
+        Some(WORKER_PROMPT)
+    }
+
     /// Counted over the argv the operator wrote, not over the argv `base()`
     /// builds: `exec` uses this to strip the program tokens off the command
     /// it was handed before carrying the rest into a restart. The Windows
@@ -620,6 +653,17 @@ impl AgentAdapter for ClaudeAdapter {
     /// lineup has no business leaking into another adapter's default.
     fn default_distiller_model(&self) -> Option<&'static str> {
         Some("haiku")
+    }
+
+    /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
+    /// own spawn-request pane variant) used to silently inherit whatever the
+    /// operator's own interactive default model happened to be -- often a
+    /// far pricier model than the delegated task actually needs. `"sonnet"`
+    /// is the user-approved hard default that stops that, used only when
+    /// the operator has not set `worker.claude` explicitly (see
+    /// `adapters::resolve_worker_model`).
+    fn default_worker_model(&self) -> Option<&'static str> {
+        Some("sonnet")
     }
 
     /// Claude's own model ladder, top to bottom: `fable`/`mythos` (the
@@ -1421,6 +1465,39 @@ mod tests {
         );
     }
 
+    /// A delegated headless worker with no operator `worker.claude` override
+    /// gets claude's own hard default, not the operator's interactive seat
+    /// model -- see `adapters::resolve_worker_model`.
+    #[test]
+    fn claude_defaults_the_worker_model_to_sonnet() {
+        assert_eq!(
+            ClaudeAdapter::new(None).default_worker_model(),
+            Some("sonnet")
+        );
+    }
+
+    /// Claude's two role layers are distinct texts, and the worker one carries
+    /// none of the orchestrator's own delegate-everything coaching: a session
+    /// that was itself delegated to must not be told its job is to delegate.
+    #[test]
+    fn claude_has_its_own_worker_layer_distinct_from_the_orchestrator_layer() {
+        let layer = ClaudeAdapter::new(None)
+            .worker_system_prompt()
+            .expect("claude has a worker layer");
+        assert_eq!(layer, WORKER_PROMPT);
+        assert!(layer.starts_with("zirv worker conventions"));
+        assert!(
+            !layer.contains("Coordination and judgment are the job"),
+            "the worker layer must not carry the orchestrator's own coaching: {layer}"
+        );
+        for claim in ["never run `zirv agent`", "fork-type subagents"] {
+            assert!(
+                layer.contains(claim),
+                "the worker layer must say '{claim}': {layer}"
+            );
+        }
+    }
+
     /// The claude ladder, top to bottom: fable/mythos, opus, sonnet, haiku.
     /// `review_model_below` returns the tier one below `seat`; an unknown or
     /// absent seat assumes the top tier, and haiku (already the floor) maps
@@ -1717,25 +1794,69 @@ mod tests {
 
     /// The review bullet must route review to the harness roster's own
     /// configured review model rather than let it silently run on this
-    /// seat's own model, and the model-routing bullet's "pin" clause must
-    /// carve out that one exception rather than blanket-forbid every
-    /// override.
+    /// seat's own model, must cap fan-out at a single-reviewer effort level,
+    /// and the model-routing bullet's "pin" clause must carve out that one
+    /// exception rather than blanket-forbid every override.
     #[test]
     fn the_orchestrator_prompt_routes_review_to_the_rosters_configured_model() {
         assert!(
             ORCHESTRATOR_PROMPT.contains(
-                "routed to the session's configured review model (named in the harness \
-                 roster) and never this seat's own model"
+                "routed to the review model named in the harness roster, never this seat's own \
+                 model"
             ),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(
+            ORCHESTRATOR_PROMPT.contains("single-reviewer effort level (low or medium)"),
+            "never a high-or-above fan-out from this seat: {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
             ORCHESTRATOR_PROMPT.contains(
-                "do not override those, except the review-model rule in the harness roster, \
-                 which outranks this"
+                "do not override those, except the review-model rule below, which outranks this"
             ),
             "the model-routing bullet's pin clause must carve out the review-model exception: \
              {ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// TASK 1: every Agent-tool dispatch must set the model explicitly, the
+    /// seat's own model and fork-type subagents are both off limits, and
+    /// token economy applies to both this seat's own replies and every
+    /// subagent brief it writes.
+    #[test]
+    fn the_orchestrator_prompt_encodes_model_routing_and_token_economy() {
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("MUST set the model parameter explicitly"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        for tier in [
+            "haiku for mechanical",
+            "sonnet for ordinary",
+            "opus only for hard",
+        ] {
+            assert!(
+                ORCHESTRATOR_PROMPT.contains(tier),
+                "missing tier guidance '{tier}': {ORCHESTRATOR_PROMPT}"
+            );
+        }
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("never dispatch on this seat's model"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("never use fork-type subagents from this seat"),
+            "forks always inherit the seat model and ignore overrides: {ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("keep your own replies brief and decision-focused"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains(
+                "tell the worker to reply briefly with compact \
+             structured findings, never raw file dumps"
+            ),
+            "got:\n{ORCHESTRATOR_PROMPT}"
         );
     }
 

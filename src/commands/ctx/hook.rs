@@ -23,6 +23,9 @@ pub enum HookEvent {
     Prompt,
     /// Claude PreCompact hook: record that a compaction is starting.
     PreCompact,
+    /// Claude PreToolUse hook: refuse a subagent dispatch that would inherit
+    /// this seat's expensive model.
+    Pretool,
     /// Codex notify program: same role as Stop.
     Notify {
         /// Payload, when the agent passes it as an argument instead of stdin.
@@ -292,6 +295,160 @@ pub fn run_pre_compact<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> 
     Ok(0)
 }
 
+// -- PreToolUse: the expensive-seat inheritance guard ----------------------
+
+/// Model-name fragments that mark a seat too expensive to inherit silently.
+/// Matched case-insensitively as substrings, so a vendor-qualified id
+/// (`us.anthropic.mythos-...`) or a suffixed one (`fable[1m]`) still lands.
+const EXPENSIVE_TIERS: [&str; 2] = ["fable", "mythos"];
+
+/// The tool names that dispatch a subagent. Both spellings are covered
+/// because the tool has been presented under either name and the guard must
+/// not turn itself off on a rename.
+const SUBAGENT_TOOLS: [&str; 2] = ["Agent", "Task"];
+
+/// Subagent types that pin no model of their own, so an omitted `model`
+/// parameter means "inherit the caller's". Matched exactly and
+/// case-sensitively: these are literal values of the tool's own
+/// `subagent_type` parameter, not free text. Any other name is a
+/// `.claude/agents/<name>.md` definition, which carries its own `model`
+/// frontmatter and is therefore none of zirv's business.
+const GENERIC_SUBAGENT_TYPES: [&str; 5] = ["fork", "claude", "general-purpose", "Explore", "Plan"];
+
+/// The PreToolUse stdin payload, narrowed to what the guard reads. Every
+/// field is optional with a zero default, the same rule the Stop payload
+/// follows: a hook that fails to parse is a hook that silently stops
+/// guarding, so nothing here may be mandatory.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PreToolPayload {
+    pub tool_name: String,
+    pub tool_input: PreToolInput,
+}
+
+/// `tool_input` is tool-specific, so only the subagent tool's own parameters
+/// are modelled and every other tool's arguments are ignored rather than
+/// rejected. `deny_unknown_fields` here would turn an ordinary `Bash` payload
+/// into a parse failure.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PreToolInput {
+    pub subagent_type: String,
+    pub model: String,
+    /// The subagent's own task text. Every real `Agent`/`Task` dispatch
+    /// carries a non-empty one; `pretool_decision` reads its absence as
+    /// schema drift -- a missing `tool_input`, an empty `{}`, or one that
+    /// simply does not name a `prompt` -- rather than an actual dispatch,
+    /// and fails open on it instead of denying on the zero values `#[serde(
+    /// default)]` invented for fields the payload never carried at all.
+    pub prompt: String,
+}
+
+impl PreToolPayload {
+    pub fn parse(raw: &str) -> CtxResult<Self> {
+        Ok(serde_json::from_str(raw)?)
+    }
+}
+
+fn names_expensive_tier(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    EXPENSIVE_TIERS.iter().any(|tier| model.contains(tier))
+}
+
+/// What the model is told when a dispatch is refused. The reason is the only
+/// thing it sees, so it has to carry the whole remedy: naming the seat, the
+/// cheaper models that are accepted, and the one option (a fork) that no
+/// model parameter can rescue.
+fn pretool_deny_reason(seat: &str) -> String {
+    format!(
+        "zirv guard: this seat runs {seat}; re-dispatch with an explicit cheaper model \
+         parameter (haiku for mechanical work, sonnet for standard work, opus for hard \
+         work), or use an agent type that pins its own model. Forks are not allowed from \
+         this seat: a fork always inherits the seat model and ignores a model override."
+    )
+}
+
+/// The whole decision, pure: `Some(reason)` denies, `None` allows.
+///
+/// `seat` is `SEAT_MODEL_ENV`'s value, absent for any session zirv did not
+/// launch as an expensive orchestrator seat. Every gate below is a reason to
+/// allow, so an unrecognised tool, an unset seat, a cheap seat, a payload
+/// with no `prompt` (see `PreToolInput::prompt`'s own doc comment -- that is
+/// schema drift, not a dispatch), or a payload this function does not
+/// understand at all fall through to allow. That is deliberate: this hook
+/// runs in front of every tool call in the session, and the cost of a wrong
+/// deny is far higher than the cost of a missed one.
+pub fn pretool_decision(seat: Option<&str>, payload: &PreToolPayload) -> Option<String> {
+    let seat = seat?;
+    if !names_expensive_tier(seat) {
+        return None;
+    }
+    if !SUBAGENT_TOOLS.contains(&payload.tool_name.as_str()) {
+        return None;
+    }
+    // A payload with no `tool_input` at all, an empty `{}`, or one that
+    // simply omits `prompt` is schema drift, not a subagent dispatch: every
+    // genuine `Agent`/`Task` call carries a non-empty `prompt` (the
+    // subagent's own task text), so this guard must not deny on `#[serde(
+    // default)]`'s own zero values for a call it never actually recognised.
+    if payload.tool_input.prompt.trim().is_empty() {
+        return None;
+    }
+
+    let subagent_type = payload.tool_input.subagent_type.trim();
+    let model = payload.tool_input.model.trim();
+
+    // A fork inherits the seat model by construction and ignores `model`
+    // outright, so naming a cheap one buys nothing and must not read as
+    // though it did.
+    let denied = if subagent_type == "fork" {
+        true
+    } else if !model.is_empty() {
+        // An explicit model is honored, unless it asks for the seat tier
+        // again by name, which is the exact spend being guarded.
+        names_expensive_tier(model)
+    } else {
+        // No model named: only a subagent type that pins its own inherits.
+        subagent_type.is_empty() || GENERIC_SUBAGENT_TYPES.contains(&subagent_type)
+    };
+
+    denied.then(|| pretool_deny_reason(seat))
+}
+
+/// The documented PreToolUse deny envelope. Printed on stdout with exit 0:
+/// exit 2 would block too, but it blocks on stderr text and cannot be
+/// overridden, and this hook must never be the reason a session cannot make
+/// progress.
+pub fn pretool_output(reason: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason
+        }
+    })
+    .to_string()
+}
+
+/// Fails open on every path: no seat env, an unparseable payload, a tool this
+/// guard knows nothing about and any internal error all exit 0 with nothing
+/// on stdout, which claude reads as "no decision, use the normal permission
+/// flow". Nothing here may `unwrap`, `expect` or return `Err` -- the release
+/// profile is `panic = "abort"`, and a hook that aborts takes the tool call
+/// with it.
+pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let Some(seat) = env(adapters::SEAT_MODEL_ENV) else {
+        return Ok(0);
+    };
+    let Ok(payload) = PreToolPayload::parse(stdin) else {
+        return Ok(0);
+    };
+    if let Some(reason) = pretool_decision(Some(&seat), &payload) {
+        let _ = writeln!(w, "{}", pretool_output(&reason));
+    }
+    Ok(0)
+}
+
 /// Field names codex uses for the rollout path, most specific first. Populate
 /// from the verified notes file during Task A9/A10; the claude spelling stays
 /// last so a hook registered on either agent keeps working.
@@ -398,6 +555,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
             Ok(0)
         }
         HookEvent::PreCompact => run_pre_compact(w, &read_stdin(), &env),
+        HookEvent::Pretool => run_pretool(w, &read_stdin(), &env),
         HookEvent::Notify { payload } => {
             let raw = match payload {
                 Some(text) => text.clone(),
@@ -1153,6 +1311,531 @@ mod tests {
         let code = run_notify(&mut out, "agent-turn-complete", &|_| None).expect("runs");
         assert_eq!(code, 0);
         assert!(out.is_empty(), "no output and no panic: {out:?}");
+    }
+
+    // -- PreToolUse: the expensive-seat inheritance guard ------------------
+
+    /// Builds the PreToolUse stdin claude actually sends, so every rule below
+    /// is exercised through the same parser the hook uses in production
+    /// rather than through a hand-built struct.
+    fn pretool_stdin(tool_name: &str, tool_input: serde_json::Value) -> String {
+        serde_json::json!({
+            "session_id": "abc123",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/work/repo",
+            "permission_mode": "default",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string()
+    }
+
+    fn decide(
+        seat: Option<&str>,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+    ) -> Option<String> {
+        let payload = PreToolPayload::parse(&pretool_stdin(tool_name, tool_input))
+            .expect("the documented payload must parse");
+        pretool_decision(seat, &payload)
+    }
+
+    const SEAT: Option<&str> = Some("fable");
+
+    #[test]
+    fn a_fork_is_denied_because_it_always_inherits_the_seat_model() {
+        let reason = decide(
+            SEAT,
+            "Agent",
+            serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"}),
+        )
+        .expect("a fork from an expensive seat must be blocked");
+        assert!(reason.contains("fable"), "name the seat: {reason}");
+        assert!(reason.contains("Fork"), "say forks are out: {reason}");
+        assert!(!reason.contains('\u{2014}'), "no em dashes in user copy");
+    }
+
+    /// A fork ignores the `model` parameter entirely, so naming a cheap one
+    /// must not buy a way past the rule.
+    #[test]
+    fn a_fork_is_denied_even_when_it_names_a_cheap_model() {
+        assert!(
+            decide(
+                SEAT,
+                "Agent",
+                serde_json::json!({"subagent_type": "fork", "model": "haiku", "prompt": "do the thing"})
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn an_explicit_seat_tier_model_is_denied() {
+        assert!(
+            decide(
+                SEAT,
+                "Agent",
+                serde_json::json!({"subagent_type": "general-purpose", "model": "fable", "prompt": "do the thing"})
+            )
+            .is_some(),
+            "re-asking for the seat tier by name is the exact spend being guarded"
+        );
+    }
+
+    #[test]
+    fn an_explicit_cheaper_model_is_allowed() {
+        for model in ["haiku", "sonnet", "opus"] {
+            assert_eq!(
+                decide(
+                    SEAT,
+                    "Agent",
+                    serde_json::json!({"subagent_type": "general-purpose", "model": model})
+                ),
+                None,
+                "{model} is the whole point of the escape hatch"
+            );
+        }
+    }
+
+    #[test]
+    fn an_omitted_model_on_a_generic_subagent_type_is_denied() {
+        for kind in ["fork", "claude", "general-purpose", "Explore", "Plan"] {
+            assert!(
+                decide(
+                    SEAT,
+                    "Agent",
+                    serde_json::json!({"subagent_type": kind, "prompt": "do the thing"})
+                )
+                .is_some(),
+                "{kind} pins no model of its own, so it inherits the seat"
+            );
+        }
+    }
+
+    /// A real dispatch (a non-empty `prompt`) with both `model` and
+    /// `subagent_type` omitted/blank is denied exactly like an explicit
+    /// generic type -- empty is the same as absent, once the payload is
+    /// recognised as a real dispatch at all.
+    #[test]
+    fn an_omitted_model_and_an_omitted_subagent_type_is_denied() {
+        assert!(
+            decide(
+                SEAT,
+                "Agent",
+                serde_json::json!({"subagent_type": "", "model": "", "prompt": "do the thing"})
+            )
+            .is_some(),
+            "empty is the same as absent"
+        );
+    }
+
+    /// A named `.claude/agents/<name>.md` definition carries its own `model`
+    /// frontmatter, so zirv has no business second-guessing it.
+    #[test]
+    fn a_named_custom_subagent_type_with_no_model_is_allowed() {
+        for kind in [
+            "vault-keeper",
+            "statusline-setup",
+            "claude-security:explore",
+        ] {
+            assert_eq!(
+                decide(SEAT, "Agent", serde_json::json!({"subagent_type": kind})),
+                None,
+                "{kind} pins its own model"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generic_type_set_is_matched_exactly_and_not_by_prefix() {
+        assert_eq!(
+            decide(
+                SEAT,
+                "Agent",
+                serde_json::json!({"subagent_type": "general-purpose-reviewer"})
+            ),
+            None,
+            "a custom type that merely starts like a generic one still pins its own model"
+        );
+    }
+
+    #[test]
+    fn both_spellings_of_the_subagent_tool_are_covered() {
+        for tool in ["Agent", "Task"] {
+            assert!(
+                decide(
+                    SEAT,
+                    tool,
+                    serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"})
+                )
+                .is_some(),
+                "{tool} dispatches subagents"
+            );
+        }
+    }
+
+    #[test]
+    fn the_seat_tier_test_is_case_insensitive_and_covers_mythos() {
+        for seat in ["fable", "Fable", "claude-fable-5", "mythos", "MYTHOS[1m]"] {
+            assert!(
+                decide(
+                    Some(seat),
+                    "Agent",
+                    serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"})
+                )
+                .is_some(),
+                "{seat} is an expensive seat"
+            );
+        }
+        for model in ["Fable", "us.anthropic.mythos-v1"] {
+            assert!(
+                decide(
+                    SEAT,
+                    "Agent",
+                    serde_json::json!({"subagent_type": "general-purpose", "model": model, "prompt": "do the thing"})
+                )
+                .is_some(),
+                "{model} names the seat tier"
+            );
+        }
+    }
+
+    // -- fail open ---------------------------------------------------------
+
+    /// A payload naming the subagent tool but carrying no `tool_input` field
+    /// at all is schema drift, not a dispatch -- `#[serde(default)]` still
+    /// fills in `PreToolInput::default()`, and with no `prompt` in it the
+    /// guard must not deny on those defaulted zero values.
+    #[test]
+    fn agent_tool_with_no_tool_input_field_at_all_is_allowed() {
+        let payload = PreToolPayload::parse(r#"{"tool_name":"Agent"}"#)
+            .expect("tool_input is optional at the top level");
+        assert_eq!(pretool_decision(SEAT, &payload), None);
+    }
+
+    /// An explicit empty `tool_input: {}` is the same case as a missing one:
+    /// no `prompt`, so nothing recognisable as a real dispatch.
+    #[test]
+    fn agent_tool_with_an_empty_tool_input_object_is_allowed() {
+        assert_eq!(decide(SEAT, "Agent", serde_json::json!({})), None);
+    }
+
+    /// `tool_input` present, with fields that would have denied under the
+    /// old rule (a fork naming the seat tier itself), but no `prompt` at
+    /// all -- still not a recognisable dispatch, so this must fail open.
+    /// This is the exact defect the `prompt` gate fixes: before it, this
+    /// payload was denied on defaulted zero values alone.
+    #[test]
+    fn agent_tool_input_lacking_a_prompt_field_is_allowed() {
+        assert_eq!(
+            decide(
+                SEAT,
+                "Agent",
+                serde_json::json!({"subagent_type": "fork", "model": "fable"})
+            ),
+            None,
+            "no prompt means this payload is not recognised as a real dispatch"
+        );
+    }
+
+    /// Regression: once a payload actually carries a `prompt`, the existing
+    /// deny rule for an omitted model on a generic subagent type still
+    /// applies exactly as it did before the `prompt` gate.
+    #[test]
+    fn a_prompt_carrying_dispatch_with_omitted_model_on_a_generic_type_is_still_denied() {
+        assert!(
+            decide(
+                SEAT,
+                "Agent",
+                serde_json::json!({"subagent_type": "general-purpose", "prompt": "do the thing"})
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn with_no_seat_env_nothing_is_ever_denied() {
+        assert_eq!(
+            decide(None, "Agent", serde_json::json!({"subagent_type": "fork"})),
+            None,
+            "the guard is scoped to an expensive orchestrator seat and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_cheap_seat_denies_nothing() {
+        for seat in ["sonnet", "opus", "haiku", ""] {
+            assert_eq!(
+                decide(
+                    Some(seat),
+                    "Agent",
+                    serde_json::json!({"subagent_type": "fork"})
+                ),
+                None,
+                "a {seat} seat costs what a fork of it costs"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_subagent_tool_is_never_touched() {
+        for tool in ["Bash", "Read", "Edit", "WebFetch", "mcp__memory__create"] {
+            assert_eq!(
+                decide(SEAT, tool, serde_json::json!({"command": "ls"})),
+                None,
+                "{tool} spawns no seat-inheriting session"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deny_output_matches_the_documented_pretooluse_shape() {
+        let out = pretool_output("because");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse",
+            "exact key casing matters: {out}"
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecision"], "deny",
+            "got {out}"
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecisionReason"], "because",
+            "got {out}"
+        );
+    }
+
+    #[test]
+    fn run_pretool_denies_a_fork_end_to_end_and_still_exits_zero() {
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
+            "fable".to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Agent",
+                serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"}),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0, "exit 2 would block on stderr text instead of json");
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+
+    #[test]
+    fn run_pretool_allows_a_cheap_dispatch_with_no_output_at_all() {
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
+            "fable".to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Agent",
+                serde_json::json!({"subagent_type": "general-purpose", "model": "sonnet", "prompt": "do the thing"}),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "no json means no decision: {out:?}");
+    }
+
+    #[test]
+    fn run_pretool_exits_zero_and_silent_without_the_seat_env() {
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin("Agent", serde_json::json!({"subagent_type": "fork"})),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "a non-zirv session is never made worse");
+    }
+
+    #[test]
+    fn run_pretool_exits_zero_and_silent_on_garbage_stdin() {
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
+            "fable".to_string(),
+        )]
+        .into();
+        for stdin in [
+            "",
+            "this is not json",
+            "{",
+            "[]",
+            "null",
+            "{\"tool_name\":\"Agent\",\"tool_input\":\"not an object\"}",
+            "{\"tool_name\":42}",
+        ] {
+            let mut out = Vec::new();
+            let code = run_pretool(&mut out, stdin, &|k| env.get(k).cloned())
+                .unwrap_or_else(|_| panic!("must never error on {stdin:?}"));
+            assert_eq!(code, 0, "must never block on {stdin:?}");
+            assert!(out.is_empty(), "must stay silent on {stdin:?}: {out:?}");
+        }
+    }
+
+    /// A `tool_input` carrying types this hook does not model (numbers,
+    /// nested objects, `run_in_background`) is the ordinary case for every
+    /// tool that is not the subagent one, and must not be a parse failure
+    /// that quietly turns the guard off for the tools it does model.
+    #[test]
+    fn an_unmodelled_tool_input_still_parses_and_allows() {
+        let payload = PreToolPayload::parse(&pretool_stdin(
+            "Bash",
+            serde_json::json!({"command": "rm -rf /tmp/build", "timeout": 120000, "run_in_background": false}),
+        ))
+        .expect("an ordinary Bash payload must parse");
+        assert_eq!(payload.tool_name, "Bash");
+        assert_eq!(pretool_decision(SEAT, &payload), None);
+    }
+
+    // -- the seat env the orchestrator exports ------------------------------
+
+    #[test]
+    fn only_an_orchestrator_launch_with_a_configured_model_exports_the_seat() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &[], Some("fable")),
+            vec![(SEAT_MODEL_ENV.to_string(), "fable".to_string())]
+        );
+        assert!(
+            seat_model_env(PromptRole::Worker, &[], Some("fable")).is_empty(),
+            "a worker is not a seat that spawns subagents"
+        );
+        assert!(
+            seat_model_env(PromptRole::Orchestrator, &[], None).is_empty(),
+            "nothing configured, nothing to inherit"
+        );
+        assert!(
+            seat_model_env(PromptRole::Orchestrator, &[], Some("   ")).is_empty(),
+            "a blank model names no tier"
+        );
+    }
+
+    /// FIX 1: an operator passthrough `--model` with no `chat.model`
+    /// configured must still disclose the seat it actually launches on --
+    /// the guard used to fail open on exactly this shape.
+    #[test]
+    fn an_operator_passed_model_flag_exports_the_seat_with_no_config_at_all() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec!["--model".to_string(), "fable".to_string()];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &flags, None),
+            vec![(SEAT_MODEL_ENV.to_string(), "fable".to_string())]
+        );
+    }
+
+    /// FIX 1: an operator passthrough overriding a configured `chat.model`
+    /// must disclose the flag's own value, not the configured one -- the
+    /// launch actually runs on the flag.
+    #[test]
+    fn an_operator_passed_model_flag_wins_over_a_configured_chat_model() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec!["--model".to_string(), "sonnet".to_string()];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &flags, Some("fable")),
+            vec![(SEAT_MODEL_ENV.to_string(), "sonnet".to_string())]
+        );
+    }
+
+    /// With no operator passthrough at all, behavior is unchanged from
+    /// before FIX 1: the configured `chat.model` alone decides.
+    #[test]
+    fn with_no_operator_flag_the_configured_model_still_decides() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &[], Some("fable")),
+            vec![(SEAT_MODEL_ENV.to_string(), "fable".to_string())]
+        );
+    }
+
+    /// The `--model=<value>` joined form is recognised too, not just the
+    /// two-token spelling.
+    #[test]
+    fn the_joined_equals_form_of_the_model_flag_is_recognised() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec!["--model=opus".to_string()];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &flags, None),
+            vec![(SEAT_MODEL_ENV.to_string(), "opus".to_string())]
+        );
+    }
+
+    /// A repeated `--model` is CLI last-wins: the later occurrence in argv
+    /// order is the one the real harness actually launches on.
+    #[test]
+    fn a_repeated_model_flag_resolves_to_the_last_occurrence() {
+        use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--model".to_string(),
+            "haiku".to_string(),
+        ];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &flags, None),
+            vec![(SEAT_MODEL_ENV.to_string(), "haiku".to_string())]
+        );
+
+        // Mixed spellings: the joined form arriving last still wins over an
+        // earlier two-token occurrence.
+        let mixed = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--model=haiku".to_string(),
+        ];
+        assert_eq!(
+            seat_model_env(PromptRole::Orchestrator, &mixed, None),
+            vec![(SEAT_MODEL_ENV.to_string(), "haiku".to_string())]
+        );
+    }
+
+    /// FIX 1 still respects the two guards `seat_model_env` already had: a
+    /// `Worker` role never exports regardless of what the flags carry, and a
+    /// blank resolved model (however it was resolved) exports nothing.
+    #[test]
+    fn fix_1_still_respects_the_role_gate_and_the_blank_model_suppression() {
+        use crate::commands::ctx::adapters::seat_model_env;
+        use crate::commands::ctx::prompt::PromptRole;
+
+        let flags = vec!["--model".to_string(), "fable".to_string()];
+        assert!(
+            seat_model_env(PromptRole::Worker, &flags, None).is_empty(),
+            "a worker pane must never export a seat, flags or not"
+        );
+        let blank = vec!["--model".to_string(), "   ".to_string()];
+        assert!(
+            seat_model_env(PromptRole::Orchestrator, &blank, None).is_empty(),
+            "a blank flag value names no tier, same as a blank configured model"
+        );
     }
 
     #[test]

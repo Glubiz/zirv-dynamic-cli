@@ -247,8 +247,13 @@ pub fn run_with<W: Write>(
         } else {
             composed
         };
-        let (user_extra, composed) =
-            super::prompt::merge_command_line_prompt(adapter.as_ref(), &args.extra, composed, None);
+        let (user_extra, composed) = super::prompt::merge_command_line_prompt(
+            adapter.as_ref(),
+            &args.extra,
+            composed,
+            None,
+            super::prompt::PromptRole::Worker,
+        );
 
         match session_guard.as_mut() {
             Some(guard) => guard.refresh_session(session.as_str()),

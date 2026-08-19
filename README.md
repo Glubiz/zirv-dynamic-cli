@@ -1230,8 +1230,14 @@ concatenate, in order:
 
 1. A shipped default baked into the binary: respect repo conventions, use tools
    deterministically, report failures honestly.
-2. `~/.zirv/system-prompt.md`, your own additions.
-3. `<repo>/.zirv/system-prompt.md`, the repository's additions.
+2. Your own additions, by session role: `~/.zirv/system-prompt.md` for an
+   interactive session you drive yourself (`chat`, `wrap`, `resume`), or
+   `~/.zirv/system-prompt.worker.md` for a delegated headless worker (`agent`,
+   `exec`, `loop`). Both are optional, and neither role reads the
+   other's file — if you had worker-facing instructions in `system-prompt.md`,
+   copy them into `system-prompt.worker.md`.
+3. `<repo>/.zirv/system-prompt.md`, the repository's additions (one file, both
+   roles).
 
 The repo layer is **untrusted input**, treated the same way `ctx.toml`'s repo
 layer is: it is capped in size, labeled in the composed prompt as coming from the

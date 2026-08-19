@@ -28,6 +28,165 @@ pub const SESSION_ENV: &str = "ZIRV_CTX_SESSION";
 /// calling session without requiring an explicit `--to`/`--agent` flag.
 pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 
+/// Tells a spawned **orchestrator** session which model its own seat runs on,
+/// so the `zirv ctx hook pretool` guard inside it can refuse a subagent
+/// dispatch that would silently inherit that seat (see `hook::pretool_
+/// decision`). Prompt-level guidance was tried first and failed: a fork
+/// fan-out inherited the seat model and spent roughly half a five-hour usage
+/// window in one run, so the gate is deterministic rather than advisory.
+///
+/// Set only by the two orchestrator launch paths (`wrap::run_with` for an
+/// `Orchestrator` role, and the dashboard's first pane), never by
+/// `exec`/`loop`/worker panes -- and listed in `sessions::SUPERVISION_ENV` so
+/// a worker spawned from inside an orchestrator session has it scrubbed
+/// rather than inherited. A seat is a property of the session that owns it,
+/// exactly like `SESSION_ENV`/`SOCKET_ENV`.
+pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
+
+/// How one argv token spells a model-selecting flag -- `--model`/`-m`, in
+/// separated (bare, value is the next token), joined-by-`=`
+/// (`--model=x`/`-m=x`), or (short form only) attached (`-mx`) form. Shared
+/// by `last_model_flag` below (which needs the value) and `agent::
+/// flags_pin_model` (which only needs to know a token pins something at
+/// all, never the value), so the two can never drift on what counts as a
+/// model flag between them.
+///
+/// `Separated` deliberately carries no value itself: `last_model_flag` reads
+/// the following token from `flags` when it wants one, and `flags_pin_model`
+/// never needs to at all -- the flag's own presence is enough to say
+/// "already pinned", matching the pre-existing bare `--model`/`-m` rule.
+pub(crate) enum ModelFlagForm<'a> {
+    Separated,
+    Joined(&'a str),
+}
+
+/// Classifies `arg`, or `None` when it is not a model flag at all.
+///
+/// The attached short form (`-mopus`) is recognised only when `arg` is not
+/// itself a `--`-prefixed long flag -- `--model-foo` starts with `-m` too,
+/// once its own leading `-` is peeled, and must not match -- and carries at
+/// least one character of value (`arg.len() > 2`, so a bare `-m` is
+/// `Separated`, not an attached value of `""`).
+pub(crate) fn classify_model_flag(arg: &str) -> Option<ModelFlagForm<'_>> {
+    if arg == "--model" || arg == "-m" {
+        return Some(ModelFlagForm::Separated);
+    }
+    if let Some(value) = arg.strip_prefix("--model=") {
+        return Some(ModelFlagForm::Joined(value));
+    }
+    if let Some(value) = arg.strip_prefix("-m=") {
+        return Some(ModelFlagForm::Joined(value));
+    }
+    if !arg.starts_with("--") && arg.starts_with("-m") && arg.len() > 2 {
+        return Some(ModelFlagForm::Joined(&arg[2..]));
+    }
+    None
+}
+
+/// The last model-flag occurrence in `flags`, in any form `classify_model_
+/// flag` recognises -- CLI last-wins semantics, the same rule a real argv
+/// parser applies when a flag is repeated, honored across mixed spellings
+/// (a later `-mhaiku` still overrides an earlier `--model opus`). `None`
+/// when `flags` names no model at all, or when a trailing bare `--model`/
+/// `-m` has nothing after it to be its value -- a dangling flag with no
+/// value contributes nothing, it does not clear an earlier match.
+///
+/// Recognises codex's `-m` short alias (all three forms) as well as
+/// claude's long `--model`, unlike the version of this function before FIX
+/// A: this feeds `seat_model_env`, and a codex-adapter launch built with a
+/// bare `-m <expensive>`/`-m=<expensive>`/`-m<expensive>` passthrough used
+/// to export no seat env at all, leaving the pretool guard blind to it.
+fn last_model_flag(flags: &[String]) -> Option<&str> {
+    let mut found = None;
+    let mut i = 0;
+    while i < flags.len() {
+        match classify_model_flag(&flags[i]) {
+            Some(ModelFlagForm::Separated) => {
+                if let Some(value) = flags.get(i + 1) {
+                    found = Some(value.as_str());
+                }
+                i += 2;
+                continue;
+            }
+            Some(ModelFlagForm::Joined(value)) => {
+                found = Some(value);
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The model `flags` pins when it pins **nothing else** -- every token in it
+/// is part of one model flag, in any form `classify_model_flag` recognises.
+/// `None` when `flags` is empty, names any other flag, leaves a bare
+/// `--model`/`-m` dangling with no value, or names a value that is itself
+/// flag-shaped (a leading `-` is never a model name, and this value becomes an
+/// argv token).
+///
+/// The one caller is `agent::try_join_dashboard`: a dashboard pane cannot
+/// honour arbitrary trailing flags (they belong to `exec::run_with`), so a
+/// request carrying any declines the pane and runs headless. A model pin is
+/// the exception the harness layer now teaches orchestrators to write on every
+/// delegation, and it is the one flag a pane *can* honour, since the pane
+/// builds its own argv from a resolved worker model anyway -- so recognising
+/// exactly that shape is what keeps "pick the cheapest model" from silently
+/// costing every dashboard delegation its pane.
+pub(crate) fn model_only_flags(flags: &[String]) -> Option<&str> {
+    let mut found = None;
+    let mut i = 0;
+    while i < flags.len() {
+        match classify_model_flag(&flags[i]) {
+            Some(ModelFlagForm::Separated) => {
+                found = Some(flags.get(i + 1)?.as_str());
+                i += 2;
+            }
+            Some(ModelFlagForm::Joined(value)) => {
+                found = Some(value);
+                i += 1;
+            }
+            None => return None,
+        }
+    }
+    found
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.starts_with('-'))
+}
+
+/// The `SEAT_MODEL_ENV` pair a launch exports, or nothing. Pure, so which
+/// launches disclose a seat is testable without a pty.
+///
+/// Only an `Orchestrator` launch with a non-blank resolved model discloses
+/// one: a `Worker` is not a seat that dispatches subagents, and with no
+/// resolved model the harness picks its own default, which zirv cannot name
+/// and therefore must not claim to.
+///
+/// The resolved model prefers an operator-passed `--model`/`--model=` in
+/// `flags` (the last occurrence, CLI last-wins) over `cfg_model`
+/// (`cfg.chat.model`): `flags` is the argv the launch actually uses, built by
+/// `extra_with_model` from `cfg_model` and then the operator's own trailing
+/// flags appended after it, so an operator passthrough like `zirv chat --
+/// --model fable` with no `chat.model` configured must still disclose the
+/// seat it actually launches on, and a configured `chat.model` that an
+/// operator's own passthrough then overrides must disclose the flag's value,
+/// not the configured one -- both directions the guard was blind to when
+/// this only ever read `cfg.chat.model`.
+pub fn seat_model_env(
+    role: super::prompt::PromptRole,
+    flags: &[String],
+    cfg_model: Option<&str>,
+) -> Vec<(String, String)> {
+    if role != super::prompt::PromptRole::Orchestrator {
+        return Vec::new();
+    }
+    let resolved = last_model_flag(flags).or(cfg_model);
+    match resolved.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(model) => vec![(SEAT_MODEL_ENV.to_string(), model.to_string())],
+        None => Vec::new(),
+    }
+}
+
 /// `Debug` is a supertrait so `Box<dyn AgentAdapter>` can appear in
 /// `Result::expect_err` (the registry tests assert on the unknown-adapter
 /// error path); every adapter already derives it.
@@ -112,6 +271,27 @@ pub trait AgentAdapter: std::fmt::Debug {
         ""
     }
 
+    /// This adapter's own hard-coded model for a delegated headless worker
+    /// (`zirv ctx agent`, and the dashboard's own spawn-request pane
+    /// variant) when the operator has not set `worker.<name>` explicitly.
+    /// Used only by `resolve_worker_model` in this module, the one place
+    /// this and the operator override are combined into the argv a
+    /// delegation spawn actually launches with.
+    ///
+    /// `None` -- the default, and codex's own answer -- means this adapter
+    /// has no verified cheap-enough default of its own to guess, the same
+    /// "nothing verified to guess" answer `default_distiller_model` gives:
+    /// the launch omits `--model` entirely and the agent's own
+    /// configuration (codex's `~/.codex/config.toml`) picks instead.
+    /// Claude's own default is `"sonnet"`, a real hard-coded value specific
+    /// to claude's lineup: a delegated worker used to silently inherit
+    /// whatever the operator's own interactive default happened to be
+    /// (often a far pricier model than the work actually needs), which is
+    /// exactly the spend this default exists to stop.
+    fn default_worker_model(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Arguments that add `prompt` to this agent's system prompt for one run.
     /// Empty when the agent has no verified mechanism, which is how an
     /// unsupported agent ships without injection rather than with a guess.
@@ -127,6 +307,22 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// which is what an agent whose tool vocabulary zirv has not verified
     /// must do rather than be handed another agent's instructions.
     fn base_system_prompt(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// This agent's own layer for a delegated **Worker** session -- the
+    /// role-scoped counterpart to [`base_system_prompt`](Self::
+    /// base_system_prompt), which is spliced in for an **Orchestrator**
+    /// session only. Exactly one of the two ever reaches a launch, so a
+    /// worker never receives the orchestrator layer's own delegate-and-review
+    /// coaching: telling a session that was itself delegated to that its job
+    /// is to delegate is what invites the recursion `zirv agent`'s workers
+    /// must not do.
+    ///
+    /// `None` (the default) means this agent contributes no worker-specific
+    /// layer of its own, the same "no verified mechanism" shape every other
+    /// optional layer on this trait uses.
+    fn worker_system_prompt(&self) -> Option<&'static str> {
         None
     }
 
@@ -867,11 +1063,24 @@ pub fn harness_prompt_lines(cfg: &CtxConfig, current_adapter: &str) -> Vec<Strin
                     } else {
                         format!(" (degraded: no {})", join_with_or(&missing))
                     };
+                    // Repo `.settings.toml` (or the operator, or the
+                    // environment) may mark a harness capacity-limited; the
+                    // roster line carries that forward so an orchestrator
+                    // routes only small, bounded briefs its way -- both for
+                    // reviews and for `zirv agent` delegations (see
+                    // `HARNESS_PROMPT`'s final paragraph).
+                    let capacity_note = if cfg.agents.is_capacity_small(name) {
+                        " -- small tasks only"
+                    } else {
+                        ""
+                    };
                     if is_self {
-                        format!("- {name}: enabled, ready (this session's harness){degraded}")
+                        format!(
+                            "- {name}: enabled, ready{capacity_note} (this session's harness){degraded}"
+                        )
                     } else {
                         format!(
-                            "- {name}: enabled, ready -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
+                            "- {name}: enabled, ready{capacity_note} -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
                         )
                     }
                 }
@@ -921,6 +1130,42 @@ fn resolve_review_model(
             .review_model_below(cfg.chat.model.as_deref())
             .to_string(),
         configured: false,
+    }
+}
+
+/// The resolved `worker.<name>` model for a delegated headless worker: the
+/// operator's own `cfg.worker.<name>` value if set, else `adapter`'s own
+/// `AgentAdapter::default_worker_model`. `None` means neither exists, so a
+/// delegation spawn adds no `--model` flag at all and the agent's own
+/// configuration picks (codex, with no `worker.codex` set). Unlike
+/// `resolve_review_model` above, there is no ladder to fall back to: a
+/// delegated worker has no orchestrator seat of its own to be "one tier
+/// below", so the adapter-owned default is a fixed model name, not a
+/// function of `cfg.chat.model`.
+fn resolve_worker_model<'a>(
+    cfg: &'a CtxConfig,
+    name: &str,
+    adapter: &'a dyn AgentAdapter,
+) -> Option<&'a str> {
+    let configured = match name {
+        "claude" => cfg.worker.claude.as_deref(),
+        "codex" => cfg.worker.codex.as_deref(),
+        _ => None,
+    };
+    configured.or_else(|| adapter.default_worker_model())
+}
+
+/// Argv tokens (`AgentAdapter::model_args`) for the resolved worker model, or
+/// empty when `resolve_worker_model` resolves nothing. The one place a
+/// delegation spawn (`zirv ctx agent`'s own headless path in `agent.rs`, and
+/// the dashboard's own spawn-request pane variant in `dash/mod.rs`) turns the
+/// resolved model into a flag; neither caller applies this when the
+/// operator's own trailing flags already pin a model explicitly (see each
+/// caller's own doc comment for why that check lives there and not here).
+pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter) -> Vec<String> {
+    match resolve_worker_model(cfg, name, adapter) {
+        Some(model) => adapter.model_args(model),
+        None => Vec::new(),
     }
 }
 
@@ -1749,6 +1994,58 @@ mod tests {
         );
     }
 
+    /// A capacity-limited harness's roster line gets the `-- small tasks
+    /// only` suffix; an unmarked harness's line does not. This is the
+    /// signal `HARNESS_PROMPT`'s final paragraph tells an orchestrator to
+    /// route only small, bounded briefs by, for both reviews and `zirv
+    /// agent` delegations.
+    #[test]
+    fn harness_prompt_lines_marks_a_capacity_limited_harness_small_tasks_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["claude", "codex"] {
+            std::fs::write(dir.path().join(name), "").expect("write stub");
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.codex]\ncapacity = \"small\"\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let cfg = CtxConfig {
+            agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load"),
+            ..CtxConfig::default()
+        };
+
+        let lines = harness_prompt_lines(&cfg, "claude");
+        let codex_line = lines
+            .iter()
+            .find(|l| l.starts_with("- codex:"))
+            .expect("codex line present");
+        assert!(
+            codex_line.contains("ready -- small tasks only"),
+            "got {codex_line}"
+        );
+
+        let claude_line = lines
+            .iter()
+            .find(|l| l.starts_with("- claude:"))
+            .expect("claude line present");
+        assert!(
+            !claude_line.contains("small tasks only"),
+            "claude was never marked capacity-small: {claude_line}"
+        );
+    }
+
     /// M7 probed the adapter's own program while `wrap` spawned the user's
     /// argv, so the file flag could be handed to a binary that never
     /// advertised it -- failing the launch outright, which is the one thing
@@ -2532,5 +2829,184 @@ mod tests {
         let adapter = claude::ClaudeAdapter::new(None);
         let command = vec!["/opt/homebrew/bin/claude".to_string()];
         assert!(command_matches_adapter(&adapter, false, &command));
+    }
+
+    // Worker model resolution (`resolve_worker_model`/`worker_model_args`):
+    // the delegated-headless-worker analogue of `resolve_review_model`
+    // above, but with a fixed adapter-owned default instead of a ladder.
+
+    #[test]
+    fn worker_model_args_uses_the_configured_value_over_the_adapter_default() {
+        let adapter = claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: Some("opus".to_string()),
+                codex: None,
+            },
+            ..permissive_cfg()
+        };
+        assert_eq!(
+            worker_model_args(&cfg, "claude", &adapter),
+            vec!["--model".to_string(), "opus".to_string()],
+            "the operator's own worker.claude wins over the hard default"
+        );
+    }
+
+    #[test]
+    fn worker_model_args_falls_back_to_claudes_hard_sonnet_default() {
+        let adapter = claude::ClaudeAdapter::new(None);
+        let cfg = permissive_cfg();
+        assert_eq!(cfg.worker.claude, None, "nothing configured");
+        assert_eq!(
+            worker_model_args(&cfg, "claude", &adapter),
+            vec!["--model".to_string(), "sonnet".to_string()],
+            "claude's own hard default stops a worker inheriting the operator's seat model"
+        );
+    }
+
+    #[test]
+    fn worker_model_args_adds_nothing_for_codex_with_no_configured_default() {
+        let adapter = codex::CodexAdapter::new(None);
+        let cfg = permissive_cfg();
+        assert_eq!(cfg.worker.codex, None, "nothing configured");
+        assert!(
+            worker_model_args(&cfg, "codex", &adapter).is_empty(),
+            "codex has no adapter-owned default, so its own CLI/config default applies untouched"
+        );
+    }
+
+    #[test]
+    fn worker_model_args_uses_the_configured_codex_value_when_set() {
+        let adapter = codex::CodexAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: None,
+                codex: Some("gpt-5.6-terra".to_string()),
+            },
+            ..permissive_cfg()
+        };
+        assert_eq!(
+            worker_model_args(&cfg, "codex", &adapter),
+            vec!["--model".to_string(), "gpt-5.6-terra".to_string()],
+        );
+    }
+
+    // FIX A: `last_model_flag` recognises codex's `-m` short alias in every
+    // form, not just claude's long `--model`.
+
+    fn flags(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn last_model_flag_reads_the_separated_short_form() {
+        assert_eq!(last_model_flag(&flags(&["-m", "opus"])), Some("opus"));
+    }
+
+    #[test]
+    fn last_model_flag_reads_the_joined_equals_short_form() {
+        assert_eq!(last_model_flag(&flags(&["-m=opus"])), Some("opus"));
+    }
+
+    #[test]
+    fn last_model_flag_reads_the_attached_short_form() {
+        assert_eq!(last_model_flag(&flags(&["-mopus"])), Some("opus"));
+    }
+
+    /// Last occurrence wins across every mixed spelling -- long, short
+    /// separated, short joined, short attached -- in argv order.
+    #[test]
+    fn last_model_flag_last_wins_across_mixed_forms() {
+        assert_eq!(
+            last_model_flag(&flags(&["--model", "opus", "-mhaiku"])),
+            Some("haiku"),
+            "a later attached -m overrides an earlier long --model"
+        );
+        assert_eq!(
+            last_model_flag(&flags(&["-mopus", "--model=sonnet"])),
+            Some("sonnet"),
+            "a later joined --model= overrides an earlier attached -m"
+        );
+        assert_eq!(
+            last_model_flag(&flags(&["-m", "opus", "-m=haiku", "-msonnet"])),
+            Some("sonnet"),
+            "every short form in argv order, last wins"
+        );
+    }
+
+    /// `--model-foo` starts with `-m` once its own leading `-` is peeled,
+    /// but it is a `--`-prefixed long flag, not codex's short alias, and
+    /// must never be misread as `-m` with an attached value of `odel-foo`.
+    #[test]
+    fn a_long_flag_that_merely_starts_with_m_does_not_match() {
+        assert_eq!(last_model_flag(&flags(&["--model-foo", "opus"])), None);
+    }
+
+    /// A bare `-m` with nothing after it (end of args) has no value to
+    /// contribute -- it must not be read as naming an empty/wrong model, and
+    /// must not clear an earlier real match either.
+    #[test]
+    fn a_trailing_bare_short_flag_with_no_value_contributes_nothing() {
+        assert_eq!(last_model_flag(&flags(&["-m"])), None);
+        assert_eq!(
+            last_model_flag(&flags(&["-m", "opus", "-m"])),
+            Some("opus"),
+            "a later dangling -m must not erase the earlier real match"
+        );
+    }
+
+    #[test]
+    fn last_model_flag_returns_none_with_no_model_flag_at_all() {
+        assert_eq!(last_model_flag(&flags(&["--verbose", "-x"])), None);
+    }
+
+    // `model_only_flags`: the one trailing-flag shape a dashboard pane can
+    // honour, in every spelling `classify_model_flag` reads.
+
+    #[test]
+    fn model_only_flags_reads_every_spelling_of_a_lone_model_pin() {
+        for spelling in [
+            vec!["--model", "haiku"],
+            vec!["--model=haiku"],
+            vec!["-m", "haiku"],
+            vec!["-m=haiku"],
+            vec!["-mhaiku"],
+        ] {
+            assert_eq!(
+                model_only_flags(&flags(&spelling)),
+                Some("haiku"),
+                "{spelling:?} pins a model and nothing else"
+            );
+        }
+    }
+
+    /// Anything beyond a model pin means the pane cannot honour what the
+    /// operator typed, so the delegation goes headless instead of silently
+    /// dropping the rest.
+    #[test]
+    fn model_only_flags_rejects_flags_a_pane_cannot_honour() {
+        for other in [
+            vec![],
+            vec!["--verbose"],
+            vec!["--model", "haiku", "--verbose"],
+            vec!["--dangerously-skip-permissions", "--model=haiku"],
+        ] {
+            assert_eq!(
+                model_only_flags(&flags(&other)),
+                None,
+                "{other:?} is not a lone model pin"
+            );
+        }
+    }
+
+    /// A pin with no usable value is not a pin: a dangling bare flag, a blank
+    /// value, and a flag-shaped value all decline the pane rather than build a
+    /// `--model` argv token out of nonsense.
+    #[test]
+    fn model_only_flags_rejects_a_pin_with_no_usable_value() {
+        assert_eq!(model_only_flags(&flags(&["--model"])), None);
+        assert_eq!(model_only_flags(&flags(&["--model", "  "])), None);
+        assert_eq!(model_only_flags(&flags(&["--model="])), None);
+        assert_eq!(model_only_flags(&flags(&["--model", "--verbose"])), None);
     }
 }

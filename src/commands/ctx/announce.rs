@@ -149,7 +149,8 @@ pub enum NudgeDisposition {
     /// running, so the next cycle's own listing picks it up.
     NextCycle,
     /// `wrap`/`chat`: an interactive session is never restarted and never
-    /// typed into, and never receives bodies -- a human has to go read it.
+    /// receives bodies -- at most a one-line advisory is typed in at a
+    /// verified-idle boundary; the body waits in the inbox.
     Advisory,
 }
 
@@ -306,16 +307,38 @@ impl Announcer {
         line.replacen(marker, &styled, 1)
     }
 
+    /// `emit_to`, but reporting whether the line actually reached `w`:
+    /// `false` when the channel is disabled (`--quiet`, `ZIRV_CTX_QUIET`,
+    /// `[chrome] events = false`) or when the write itself failed.
+    ///
+    /// Almost every caller wants `emit`/`emit_to`: a narration line that does
+    /// not land is not worth a single branch at the call site, and swallowing
+    /// it is the whole point of the shared opt-out. The exception is a caller
+    /// that *records having said something* -- `wrap`'s mail watch marks a
+    /// message as announced so it does not re-announce on every poll. For an
+    /// adapter with no turn-signal mechanism `may_inject` never becomes true,
+    /// so this channel is the only surface that advisory has: a swallowed
+    /// emit recorded as an announcement means the operator is never told at
+    /// all, by either route. Such a caller has to know, so it can leave the
+    /// message unannounced and retry at the next poll.
+    pub fn try_emit_to<W: Write>(&self, w: &mut W, event: &Event) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        writeln!(w, "\r\n{}\r", self.render(event)).is_ok()
+    }
+
+    pub fn try_emit(&self, event: &Event) -> bool {
+        self.try_emit_to(&mut std::io::stderr(), event)
+    }
+
     /// Framed exactly like the advisories this channel replaces (`\r\n{line}\r`,
     /// via `writeln!`'s own trailing newline), so it interleaves safely with a
     /// raw-mode child's own cursor movement. A no-op when disabled: callers
     /// call this unconditionally on every event, and quiet is enforced here
     /// once rather than at every call site.
     pub fn emit_to<W: Write>(&self, w: &mut W, event: &Event) {
-        if !self.enabled {
-            return;
-        }
-        let _ = writeln!(w, "\r\n{}\r", self.render(event));
+        let _ = self.try_emit_to(w, event);
     }
 
     pub fn emit(&self, event: &Event) {
@@ -714,6 +737,68 @@ mod tests {
                 "an event's own line must carry no escape sequences at all: {line:?}"
             );
         }
+    }
+
+    /// A writer that always fails, standing in for a stderr that has gone
+    /// away (a closed pipe, a full device).
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stderr is gone"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("stderr is gone"))
+        }
+    }
+
+    /// The reason `try_emit_to` exists: a caller that *records having said
+    /// something* (wrap's mail watch) must be able to tell a line that landed
+    /// from one this channel swallowed, or it marks an advisory as delivered
+    /// that nobody ever saw.
+    #[test]
+    fn an_announcement_that_never_surfaced_is_reported_rather_than_swallowed() {
+        let event = Event::MailWaiting { count: 1 };
+
+        let mut buf = Vec::new();
+        assert!(
+            !Announcer::new(false, false).try_emit_to(&mut buf, &event),
+            "a disabled channel surfaced nothing"
+        );
+        assert!(buf.is_empty());
+
+        assert!(
+            !Announcer::silent().try_emit_to(&mut BrokenWriter, &event),
+            "silent is disabled too"
+        );
+        assert!(
+            !Announcer::new(true, false).try_emit_to(&mut BrokenWriter, &event),
+            "an enabled channel whose write failed surfaced nothing either"
+        );
+
+        let mut buf = Vec::new();
+        assert!(
+            Announcer::new(true, false).try_emit_to(&mut buf, &event),
+            "an enabled channel with a working writer reports success"
+        );
+        assert!(!buf.is_empty());
+    }
+
+    /// `emit_to` keeps its infallible shape for every other call site, and
+    /// still writes exactly what `try_emit_to` does.
+    #[test]
+    fn the_infallible_emit_still_writes_the_same_bytes() {
+        let event = Event::MailWaiting { count: 2 };
+        let announcer = Announcer::new(true, false);
+
+        let mut infallible = Vec::new();
+        announcer.emit_to(&mut infallible, &event);
+        let mut reporting = Vec::new();
+        assert!(announcer.try_emit_to(&mut reporting, &event));
+
+        assert_eq!(infallible, reporting);
+        // And a broken writer is still not a panic on the infallible path.
+        announcer.emit_to(&mut BrokenWriter, &event);
     }
 
     #[test]

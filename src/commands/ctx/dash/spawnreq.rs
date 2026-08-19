@@ -49,12 +49,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// the operator never opened is not something a request gets to ask for, and
 /// silently ignoring the field would let a request from another repo run
 /// here without either side noticing.
+///
+/// `model` is the one trailing flag a pane can honour: the model the requester
+/// pinned for this worker (`zirv agent <name> "<prompt>" -- --model <m>`, in
+/// any spelling `adapters::model_only_flags` recognises). `None` -- also what
+/// a request written by an older build deserialises to -- means the fulfilment
+/// side resolves the operator's own worker default instead, exactly as before
+/// this field existed. It reaches the pane's argv as a `--model` token, so
+/// `dash::fulfill_spawn_request` re-checks it rather than trusting the
+/// requester's own filtering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub agent: String,
     pub prompt: String,
     pub cwd: PathBuf,
     pub requested_by: String,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// The dashboard's answer to one [`SpawnRequest`]. `ok: false` always
@@ -328,6 +339,7 @@ mod tests {
             prompt: "fix the failing tests".to_string(),
             cwd: PathBuf::from("/repo"),
             requested_by: "abcd1234".to_string(),
+            model: None,
         }
     }
 

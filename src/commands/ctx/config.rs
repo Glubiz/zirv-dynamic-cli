@@ -393,6 +393,25 @@ pub struct DashConfig {
     /// more discoverable of the two, so it wins the default, and anyone who
     /// disagrees sets `mouse = false` and still has `Ctrl+A PageUp`/`Home`.
     pub mouse: bool,
+    /// How long, in milliseconds, a pane's pty output must have been quiet
+    /// before a pane whose adapter has no turn-signal mechanism
+    /// (`AgentAdapter::capabilities().turn_signal == false`, codex today) is
+    /// treated as `Idle`. Such a pane never reports a turn boundary at all
+    /// (`register_turn_signal` is a no-op for it), so `Pane::state`'s usual
+    /// `signal_still_stands` gate -- which requires a signal to have been seen
+    /// even once -- would leave it `Working` forever, and the mail sweep/nudge
+    /// drain, both gated on `Idle`, would never fire into it. This is the
+    /// output-quiescence fallback for that case only: a signal-carrying
+    /// adapter's pane is untouched by this key, unchanged from before.
+    ///
+    /// Deliberately **not** `REPO_FORBIDDEN`, unlike every other key in this
+    /// table: it is a pure timing/tuning knob over a session the operator
+    /// already chose to run interactively in the dashboard, the same class of
+    /// decision `pace.soft_percent` is (see that field's own doc comment) --
+    /// not a cap standing between an untrusted layer and something it must not
+    /// raise for itself (`dash.max_panes`), and not a switch over the
+    /// operator's own terminal/machine (`dash.mouse`/`dash.sidebar_cols`).
+    pub idle_quiet_ms: u64,
 }
 
 impl Default for DashConfig {
@@ -403,6 +422,7 @@ impl Default for DashConfig {
             roster_max_age_secs: 604_800,
             max_panes: 9,
             mouse: true,
+            idle_quiet_ms: 10_000,
         }
     }
 }
@@ -459,6 +479,35 @@ pub struct ReviewConfig {
     pub codex: Option<String>,
 }
 
+/// Per-agent override for which model a delegated headless worker
+/// (`zirv ctx agent <name> "<prompt>"`, and the dashboard's own
+/// spawn-request pane variant) launches on. Named `worker`, not `agent`,
+/// because a top-level `agent` key already exists (default-agent
+/// selection) -- this section is not that.
+///
+/// `None` -- the default for both -- defers to that adapter's own hard
+/// default (`AgentAdapter::default_worker_model`: `"sonnet"` for claude,
+/// none for codex, whose own CLI/config default applies untouched). See
+/// `adapters::worker_model_args`, the one place both halves (operator
+/// override, adapter-owned default) are combined into the argv a
+/// delegation spawn actually launches with.
+///
+/// `REPO_FORBIDDEN` as a whole table, the same trust asymmetry as
+/// `review.claude`/`review.codex` right above: a repo checkout must not be
+/// able to choose which model -- and so which vendor account -- spends the
+/// operator's tokens running a delegated worker. Unlike `review.*`, which
+/// only lands in injected prompt *text*, these keys reach a real launch
+/// argv directly (`AgentAdapter::model_args`), so the same charset/length/
+/// leading-dash guard `validate_model_str` applies to `chat.model`/
+/// `review.*` applies to both keys here too -- see the call sites in
+/// `CtxConfig::load`.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerConfig {
+    pub claude: Option<String>,
+    pub codex: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -477,6 +526,7 @@ pub struct CtxConfig {
     pub dash: DashConfig,
     pub chat: ChatConfig,
     pub review: ReviewConfig,
+    pub worker: WorkerConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -713,6 +763,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     ("ZIRV_CTX_DASH_MOUSE", &["dash", "mouse"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_DASH_IDLE_QUIET_MS",
+        &["dash", "idle_quiet_ms"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_REVIEW_MODEL_CLAUDE",
@@ -722,6 +777,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_REVIEW_MODEL_CODEX",
         &["review", "codex"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_WORKER_MODEL_CLAUDE",
+        &["worker", "claude"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_WORKER_MODEL_CODEX",
+        &["worker", "codex"],
         EnvKind::Str,
     ),
 ];
@@ -912,6 +977,16 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // leaf (see `pace.use_credits` above), so this one entry blocks both
     // `review.claude` and `review.codex` together.
     (&["review"], "ZIRV_CTX_REVIEW_MODEL_CLAUDE"),
+    // `worker.claude`/`worker.codex` are the same call as `review.*` right
+    // above, for the same reason: a repo checkout must not be able to pick
+    // which model -- and so which vendor account -- spends the operator's
+    // tokens running a delegated headless worker (`zirv ctx agent`, and the
+    // dashboard's own spawn-request pane variant), which is background spend
+    // an operator never explicitly launched an interactive session for. See
+    // `WorkerConfig`'s own doc comment. `value_at` matches a table node the
+    // same way it matches a leaf (see `pace.use_credits`/`review` above), so
+    // this one entry blocks both `worker.claude` and `worker.codex` together.
+    (&["worker"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -1027,6 +1102,17 @@ impl CtxConfig {
             validate_model_str("review.codex", model)?;
         }
 
+        // `worker.claude`/`worker.codex` reach a real launch argv directly
+        // (`adapters::worker_model_args` -> `AgentAdapter::model_args`), an
+        // even more direct path than `review.*`'s own prompt-text injection
+        // above, so the same guard applies.
+        if let Some(model) = cfg.worker.claude.as_deref() {
+            validate_model_str("worker.claude", model)?;
+        }
+        if let Some(model) = cfg.worker.codex.as_deref() {
+            validate_model_str("worker.codex", model)?;
+        }
+
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
         Ok(cfg)
     }
@@ -1034,11 +1120,18 @@ impl CtxConfig {
 
 /// SECURITY (command-injection defense): shared charset/length/leading-dash
 /// guard for every argv-bound model string this config exposes (`chat.model`,
-/// `review.claude`, `review.codex`) -- see the call site above `chat.model`'s
-/// own doc comment for the full Windows cmd.exe-reparse threat model this
-/// defends against. `key` is the dotted config path named in the returned
-/// error, so a caller can tell which of several model fields failed.
-fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
+/// `review.claude`, `review.codex`, `worker.claude`, `worker.codex`) -- see
+/// the call site above `chat.model`'s own doc comment for the full Windows
+/// cmd.exe-reparse threat model this defends against. `key` is the dotted
+/// config path named in the returned error, so a caller can tell which of
+/// several model fields failed.
+///
+/// `pub(crate)`: `dash/mod.rs`'s `pane_model_args` also needs this exact
+/// guard, for the same reason -- a dashboard spawn request's `model` reaches
+/// a launch argv just like `worker.claude`/`worker.codex` do, so it gets the
+/// same charset/length/leading-dash check rather than a second, possibly
+/// drifting copy of it.
+pub(crate) fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
     if model.is_empty()
         || model.len() > 128
         // A leading `-` would let the value pose as its own flag on the
@@ -1488,6 +1581,103 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.review.claude.as_deref(), Some("opus"));
         assert_eq!(cfg.review.codex.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn worker_config_defaults_to_unset_for_both_agents() {
+        let worker = WorkerConfig::default();
+        assert_eq!(worker.claude, None);
+        assert_eq!(worker.codex, None);
+    }
+
+    #[test]
+    fn the_operator_may_set_worker_models_from_home_config_and_env() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[worker]\nclaude = \"opus\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worker.claude.as_deref(), Some("opus"));
+        assert_eq!(cfg.worker.codex, None);
+
+        let env = env_map(&[("ZIRV_CTX_WORKER_MODEL_CODEX", "gpt-5.6-terra")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.worker.claude.as_deref(),
+            Some("opus"),
+            "the home layer still applies under the env layer"
+        );
+        assert_eq!(cfg.worker.codex.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    /// Same trust boundary as `review.claude`/`review.codex`: a repo checkout
+    /// must not be able to pick which model spends the operator's vendor
+    /// account running a delegated headless worker.
+    #[test]
+    fn a_repo_layer_may_not_touch_worker_model_keys() {
+        for toml in [
+            "[worker]\nclaude = \"opus\"\n",
+            "[worker]\ncodex = \"gpt-5.6-terra\"\n",
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains("worker"), "names the offending key: {err}");
+            assert!(
+                err.contains("ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+                "names the operator escape hatch: {err}"
+            );
+        }
+
+        // The rejection is real, not decorative: a clean repo layer still
+        // loads and keeps both worker keys unset.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worker.claude, None);
+        assert_eq!(cfg.worker.codex, None);
+    }
+
+    /// FIX 1's charset guard applies identically to `worker.claude`/
+    /// `worker.codex`: both reach a delegation spawn's own launch argv
+    /// directly (`adapters::worker_model_args`).
+    #[test]
+    fn worker_model_charset_is_validated_like_chat_model() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let env = env_map(&[("ZIRV_CTX_WORKER_MODEL_CLAUDE", "opus&calc")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a metacharacter worker model must fail the load");
+        assert!(err.to_string().contains("worker.claude"), "got {err}");
+
+        let env = env_map(&[("ZIRV_CTX_WORKER_MODEL_CODEX", "--dangerously-bypass")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("a leading-dash worker model must fail the load");
+        assert!(err.to_string().contains("worker.codex"), "got {err}");
+
+        let env = env_map(&[
+            ("ZIRV_CTX_WORKER_MODEL_CLAUDE", "opus"),
+            ("ZIRV_CTX_WORKER_MODEL_CODEX", "gpt-5.6-terra"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worker.claude.as_deref(), Some("opus"));
+        assert_eq!(cfg.worker.codex.as_deref(), Some("gpt-5.6-terra"));
     }
 
     #[test]
@@ -1959,6 +2149,36 @@ mod tests {
             cfg.dash.mouse,
             "the wheel scrolls a pane's scrollback out of the box"
         );
+        assert_eq!(cfg.dash.idle_quiet_ms, 10_000);
+    }
+
+    /// Unlike every other `dash.*` key, `idle_quiet_ms` is a pure timing knob
+    /// over a session the operator already chose to run in the dashboard --
+    /// the same class of decision `pace.soft_percent` is -- so a repo checkout
+    /// may set it, same as `chat.model`.
+    #[test]
+    fn a_repository_config_may_set_dash_idle_quiet_ms() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[dash]\nidle_quiet_ms = 5000\n",
+        )
+        .expect("write");
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.dash.idle_quiet_ms, 5000);
+    }
+
+    #[test]
+    fn env_overrides_dash_idle_quiet_ms() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_DASH_IDLE_QUIET_MS", "2500")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.dash.idle_quiet_ms, 2500);
     }
 
     #[test]
@@ -2263,6 +2483,7 @@ mod tests {
         ("dash", "roster_max_age_secs"),
         ("dash", "max_panes"),
         ("dash", "mouse"),
+        ("dash", "idle_quiet_ms"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like

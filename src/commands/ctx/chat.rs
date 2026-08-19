@@ -438,8 +438,13 @@ pub(crate) fn dash_orchestrator_pane(
         cfg.memory.max_injected_bytes,
         &harness_lines,
     );
-    let (mut argv, composed) =
-        super::prompt::merge_command_line_prompt(adapter, &launch.argv, composed, None);
+    let (mut argv, composed) = super::prompt::merge_command_line_prompt(
+        adapter,
+        &launch.argv,
+        composed,
+        None,
+        launch.role,
+    );
     let prompt_args = super::prompt::injection_args_for_session(
         adapter,
         &argv,

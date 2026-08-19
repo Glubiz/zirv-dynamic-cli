@@ -115,8 +115,10 @@ cargo clippy --all-targets -- -D warnings
   headless **Worker** session's prompt (`exec`/`loop`, gated by
   `cfg.mail.enabled`, consumed via `mail::consume` right after so a later
   launch/cycle does not see the same message again); an interactive
-  **Orchestrator** session (`chat`/`wrap`) gets a one-line unread-count
-  advisory instead, never the message bodies. Mail filenames
+  **Orchestrator** session (`chat`/`wrap`) still never gets bodies, but now
+  gets a live one-line advisory typed in at a verified-idle turn boundary
+  (`wrap`'s own `MAIL_POLL`-cadence poll, or the dashboard's mail sweep for
+  an attached pane) rather than only a stderr unread count. Mail filenames
   (`mail::store`) get a collision-free `_NNN` suffix on a same-second
   collision, since `now_secs()` has one-second granularity and two real
   sends that close together is common, not a rare edge case. For an adapter
@@ -127,7 +129,11 @@ cargo clippy --all-targets -- -D warnings
   empty argv for it), so `task_prompt_with_mail_fallback` instead appends the
   same mail block onto the task prompt text itself — the one channel such an
   adapter has (argv, or stdin on a Windows shim launch). Mail is consumed
-  only once it has actually reached one of these two channels.
+  only once it has actually reached one of these two channels. `zirv ctx
+  inbox` itself now consumes the caller-visible mail it displays by
+  default; `--peek` keeps the old broad, idempotent read (including mail
+  addressed to other sessions), and `--consume` is a no-op alias kept only
+  for backward compatibility.
 - `ctx/mod.rs`'s `CtxCli` `about` text calls `adapters::readiness_note()`,
   which calls `ready()` on every registered adapter; this is cached in a
   process-wide `OnceLock` (`ctx_about()`) since it otherwise re-runs on every

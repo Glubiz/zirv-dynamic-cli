@@ -84,6 +84,12 @@ pub struct PaneSpec {
 /// idea, applied to the pane's *state* rather than to one injection decision.
 pub(crate) const IDLE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Compiled-in fallback for [`Pane::idle_quiet`] when a caller has no
+/// `CtxConfig` to read `dash.idle_quiet_ms` from (every test call site in
+/// this module). Matches `DashConfig::default`'s own `idle_quiet_ms` so a
+/// test that does not care about this knob still exercises the real default.
+pub(crate) const DEFAULT_IDLE_QUIET: Duration = Duration::from_millis(10_000);
+
 /// Pure: whether the turn signal at `signal_at` still stands as of `now`,
 /// given the child's most recent output at `output_at` -- that is, whether a
 /// turn boundary has been reported and the child has since been quiet for
@@ -127,6 +133,106 @@ pub(crate) fn signal_still_stands(
     // Output from *before* the signal is what the signal already accounted
     // for, and measuring from it only makes the pane idle sooner, never later.
     now.duration_since(output_at.unwrap_or(signal)) >= debounce
+}
+
+/// Pure: whether `output_at` is old enough, as of `now`, to count as quiet.
+/// The signal-less half of [`pane_is_idle`] -- mirrors `signal_still_stands`'s
+/// own "no signal ever seen -- not idle" rule: no output ever recorded is not
+/// quiet either, whatever else has happened. A pane still starting up (its
+/// harness has not drawn its first frame yet) is not the same thing as one
+/// sitting quietly at its prompt, and the two must not be confused just
+/// because both currently read `None`/old.
+pub(crate) fn output_quiescent(output_at: Option<Instant>, now: Instant, quiet: Duration) -> bool {
+    let Some(output) = output_at else {
+        return false;
+    };
+    now.duration_since(output) >= quiet
+}
+
+/// Pure: the more recent of two optional instants, the one present when only
+/// one is, or `None` when neither is. Used to fold "last child output" and
+/// "last thing *zirv itself* typed into this pane" into one "last activity"
+/// instant for the signal-less quiescence check below -- an injection or an
+/// operator keystroke is exactly as much "not quiet yet" as a byte the child
+/// printed, and whichever happened later is what the quiet window has to run
+/// from.
+fn latest_of(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// Pure: the signal-less half of [`pane_is_idle`], and what `Pane::drain`
+/// uses to decide whether to retire a pending injection/operator-typing flag
+/// for a signal-less pane. Quiet is measured from the *later* of the child's
+/// last output and zirv's own last local input into the pane
+/// ([`latest_of`]), not from output alone.
+///
+/// H1 (review): `output_at` alone used to be the whole story, but
+/// `inject_visible`/`write_operator_input` only ever run once a pane is
+/// already idle/injectable -- so on the very next `drain()` tick (tens of
+/// milliseconds later), `output_at` had not moved yet (the child has not had
+/// time to respond), the pane still read as "quiet", and the guard that is
+/// supposed to hold `injected_awaiting_turn`/`user_typed_since_turn` for a
+/// full `idle_quiet` window instead cleared it almost immediately. Two
+/// concrete failures that produced: a mail-sweep injection followed within
+/// one tick by an unthrottled second injection from the nudge drain landing
+/// on top of it; and a swept mail line typed straight into an operator's own
+/// unsubmitted, mid-composition prompt, in direct violation of G1's own
+/// contract (`injectable_from`'s whole reason to exist). Folding local input
+/// into the same clock the child's output already uses fixes both: an
+/// injection now starts a fresh quiet window (the child genuinely gets
+/// `idle_quiet` to begin responding before anything else may land), and an
+/// operator's own keystroke holds the pane non-idle for `idle_quiet` after
+/// their *last* one, exactly as intended.
+fn signal_less_quiescent(
+    output_at: Option<Instant>,
+    local_input_at: Option<Instant>,
+    now: Instant,
+    quiet: Duration,
+) -> bool {
+    output_quiescent(latest_of(output_at, local_input_at), now, quiet)
+}
+
+/// Pure: whether a pane counts as idle right now, branching on whether its
+/// adapter actually has a turn-signal mechanism
+/// (`AgentAdapter::capabilities().turn_signal`).
+///
+/// * `turn_signal_capable`: unchanged from before this branch existed --
+///   [`signal_still_stands`], gated on having seen at least one turn
+///   boundary. A claude-shaped adapter reports one on every turn, so this is
+///   the precise, low-latency signal and stays the only thing consulted for
+///   it. `local_input_at` is not consulted on this branch at all: a
+///   signal-carrying pane's idleness is decided by the signal, exactly as
+///   before this parameter existed.
+/// * signal-less (codex today): `register_turn_signal` is a no-op for it, so
+///   `last_signal_at` never advances past `None` and gating on a signal would
+///   leave such a pane `Working` forever -- the mail sweep and nudge drain,
+///   both gated on `Idle`
+///   (`Pane::injectable`/`dash::mod::is_delivery_eligible`), would then never
+///   reach it at all. Its own pty *output*, and zirv's own last local input
+///   into it, stand in for the signal instead: [`signal_less_quiescent`]
+///   against `dash.idle_quiet_ms` (`Pane::idle_quiet`), independent of
+///   `signal_at` entirely -- a signal-less pane is never consulted on that
+///   axis, so nothing sent to its (unreachable) turn-signal socket could ever
+///   matter to it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pane_is_idle(
+    turn_signal_capable: bool,
+    signal_at: Option<Instant>,
+    output_at: Option<Instant>,
+    local_input_at: Option<Instant>,
+    now: Instant,
+    debounce: Duration,
+    idle_quiet: Duration,
+) -> bool {
+    if turn_signal_capable {
+        signal_still_stands(signal_at, output_at, now, debounce)
+    } else {
+        signal_less_quiescent(output_at, local_input_at, now, idle_quiet)
+    }
 }
 
 /// Pure: a pane's `PaneState` from whether its last turn-boundary signal still
@@ -537,6 +643,28 @@ pub struct Pane {
     /// boolean (O1).
     last_signal_at: Option<Instant>,
     last_output_at: Option<Instant>,
+    /// Whether this pane's adapter has a real turn-signal mechanism
+    /// (`AgentAdapter::capabilities().turn_signal`), captured once at spawn
+    /// time from the adapter the caller resolved for `spec.agent_name`. Drives
+    /// which branch of [`pane_is_idle`] `state()` uses, and whether `drain()`
+    /// clears a pending injection/operator-typing flag on quiescence rather
+    /// than waiting for a turn signal that will never come for this pane.
+    turn_signal_capable: bool,
+    /// `dash.idle_quiet_ms`, resolved to a `Duration` once at spawn time --
+    /// the quiet window [`output_quiescent`] measures a signal-less pane's
+    /// idleness against. Unread by a signal-carrying pane.
+    idle_quiet: Duration,
+    /// When zirv itself last typed into this pane -- a successful
+    /// `inject_visible`, or `write_operator_input` (any keystroke the
+    /// dashboard forwarded). Folded together with `last_output_at` by
+    /// [`signal_less_quiescent`] (via [`latest_of`]) for a signal-less pane's
+    /// idleness and for `drain()`'s flag-clearing: without this, an injection
+    /// or a keystroke -- both of which only ever happen once the pane already
+    /// reads quiet -- left `last_output_at` untouched, so the very next
+    /// `drain()` tick still saw the pane as quiet and immediately cleared the
+    /// flag it had just set (review-caught H1). Unread by a signal-carrying
+    /// pane, same as `idle_quiet`.
+    last_local_input_at: Option<Instant>,
     /// Set by a successful `inject_visible`, cleared by the next turn signal
     /// (`on_turn_signal`): "this pane was handed something to do and has not
     /// reported finishing it yet." See `state_from`'s own doc comment -- this
@@ -571,12 +699,20 @@ impl Pane {
     /// dashboard pane that cannot act on a wake-up is still a legitimate,
     /// visible session, the same call `wrap` makes for `--no-supervise`/a
     /// failed bind.
+    ///
+    /// `turn_signal_capable`/`idle_quiet` seed [`Pane::turn_signal_capable`]/
+    /// [`Pane::idle_quiet`]: the caller resolves the adapter for
+    /// `spec.agent_name` anyway (to build `argv`/`turn_env`), so it passes
+    /// `adapter.capabilities().turn_signal` and `dash.idle_quiet_ms` straight
+    /// through rather than this module re-resolving the adapter itself.
     pub fn spawn(
         spec: PaneSpec,
         state: &StateDir,
         repo: &Path,
         size: (u16, u16),
         turn_env: &[(String, String)],
+        turn_signal_capable: bool,
+        idle_quiet: Duration,
     ) -> CtxResult<Pane> {
         let PaneSpec {
             agent_name,
@@ -701,6 +837,9 @@ impl Pane {
             state_dir: state.clone(),
             last_signal_at: None,
             last_output_at: None,
+            turn_signal_capable,
+            idle_quiet,
+            last_local_input_at: None,
             injected_awaiting_turn: false,
             user_typed_since_turn: false,
             exit_code: None,
@@ -729,6 +868,39 @@ impl Pane {
             // `signal_still_stands`' decision, and it needs the timestamp to
             // make it.
             self.last_output_at = Some(Instant::now());
+        }
+        // A signal-less pane's `on_turn_signal` never fires (its socket is
+        // never written to -- `register_turn_signal` is a no-op for it), so
+        // it is the only place besides a turn signal that clears
+        // `injected_awaiting_turn`/`user_typed_since_turn`. Without this, the
+        // very first `inject_visible` (or the very first forwarded keystroke)
+        // into such a pane would latch it `Working` forever -- exactly the O1
+        // bug this module already fixed once for the signal-carrying case,
+        // recurring on the one axis that case never had to consider.
+        // Quiescence is this pane's only stand-in for a turn boundary, so it
+        // is what retires both flags here, the same job a fresh signal does
+        // in `on_turn_signal`. Runs every tick (not just when `any`), since a
+        // pane that produced nothing at all this tick can still be the tick
+        // its quiet window finally closes.
+        //
+        // H1 (review): checked against `signal_less_quiescent`, not
+        // `output_quiescent(self.last_output_at, ...)` alone -- an injection
+        // or a forwarded keystroke only ever happens while the pane already
+        // reads quiet, so measuring from output alone let the very next
+        // `drain()` tick (tens of milliseconds later, well under `idle_quiet`)
+        // clear the flag it had just set, before the child had any real
+        // chance to respond. Folding `last_local_input_at` in makes the
+        // injection/keystroke itself restart the quiet window.
+        if !self.turn_signal_capable
+            && signal_less_quiescent(
+                self.last_output_at,
+                self.last_local_input_at,
+                Instant::now(),
+                self.idle_quiet,
+            )
+        {
+            self.injected_awaiting_turn = false;
+            self.user_typed_since_turn = false;
         }
         more
     }
@@ -929,8 +1101,17 @@ impl Pane {
     /// out from under someone reading history -- and, for the same reason, new
     /// output from the child does not either (vt100 keeps a non-zero offset
     /// pinned to its row as rows retire past it).
+    ///
+    /// H1 (review): also stamps `last_local_input_at`, on the same
+    /// before-the-write terms as `user_typed_since_turn` right above -- a
+    /// signal-less pane's quiescence check folds this in
+    /// ([`signal_less_quiescent`]), so a keystroke now holds such a pane
+    /// non-idle for a full `idle_quiet` window measured from the operator's
+    /// own *last* key, not merely until the next `drain()` tick happens to
+    /// run.
     pub fn write_operator_input(&mut self, bytes: &[u8]) -> CtxResult<()> {
         self.user_typed_since_turn = true;
+        self.last_local_input_at = Some(Instant::now());
         self.scroll_to_live();
         self.write_input(bytes)
     }
@@ -965,11 +1146,14 @@ impl Pane {
     /// cheap enough to call every frame.
     pub fn state(&self) -> PaneState {
         state_from(
-            signal_still_stands(
+            pane_is_idle(
+                self.turn_signal_capable,
                 self.last_signal_at,
                 self.last_output_at,
+                self.last_local_input_at,
                 Instant::now(),
                 IDLE_DEBOUNCE,
+                self.idle_quiet,
             ),
             self.exit_code,
             self.injected_awaiting_turn,
@@ -1059,11 +1243,25 @@ impl Pane {
     /// same tick sees a busy pane rather than the stale `Idle` this one just
     /// acted on. A failed write leaves the flag alone: nothing was typed, so
     /// nothing is pending.
+    ///
+    /// H1 (review): the injection also stamps `last_local_input_at`, and it
+    /// stamps *before* the write, on the same "bytes may already have
+    /// reached the cursor" rationale as `write_operator_input`: `write_all`/
+    /// `flush` can fail after delivering part of the line, and an unstamped
+    /// early return would leave a signal-less pane reading as quiet again on
+    /// the very next tick, letting a retry (or the unthrottled nudge drain
+    /// following the mail sweep in the same tick) type on top of the partial
+    /// delivery. A wasted quiet window on a fully-failed write is the safe
+    /// direction; a double-typed line is not. `injected_awaiting_turn` stays
+    /// successful-write-only: a failed write has no turn to await, and for a
+    /// signal-less pane the freshly stamped clock alone holds the pane
+    /// non-idle for a full `idle_quiet` window either way.
     pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
         // One write, not two (line then `\r`): a single `write_all` cannot
         // leave a half-typed line behind if the second write fails. The
         // control-character scrub is applied inside `injection_bytes` for
         // every caller, mail sweep and operator nudge alike (R3).
+        self.last_local_input_at = Some(Instant::now());
         self.write_input(&injection_bytes(label, body))?;
         self.injected_awaiting_turn = true;
         Ok(())
@@ -1303,6 +1501,216 @@ pub(crate) mod tests {
         assert!(
             signal_still_stands(Some(now), Some(now - Duration::from_secs(5)), now, debounce),
             "output from before the signal is what the signal already accounted for"
+        );
+    }
+
+    // Task A: the signal-less idleness path (`output_quiescent`/
+    // `pane_is_idle`). A codex-shaped adapter never reports a turn boundary at
+    // all, so gating idleness on one leaves such a pane `Working` forever;
+    // these cover the output-quiescence stand-in on its own terms, pure and
+    // without a real child.
+
+    /// No output ever recorded is not quiet, whatever else has happened --
+    /// the signal-less mirror of `signal_still_stands`' own "no signal ever
+    /// seen -- not idle" rule. A pane still starting up (its harness has not
+    /// drawn a first frame yet) must not read the same as one sitting quietly
+    /// at its prompt just because both currently have no timestamp.
+    #[test]
+    fn output_quiescent_is_false_with_no_output_ever_recorded() {
+        let quiet = Duration::from_millis(200);
+        let now = Instant::now();
+        assert!(!output_quiescent(None, now, quiet));
+        assert!(
+            !output_quiescent(None, now + Duration::from_secs(30), quiet),
+            "no amount of elapsed time substitutes for output that never happened"
+        );
+    }
+
+    /// Once there is a last-output timestamp, quiet is a plain elapsed-time
+    /// check against it -- false inside the window, true once it closes, and
+    /// it does not decay back to working with nothing further happening.
+    #[test]
+    fn output_quiescent_flips_once_the_quiet_window_elapses_since_the_last_output() {
+        let quiet = Duration::from_millis(200);
+        let output = Instant::now();
+        assert!(
+            !output_quiescent(Some(output), output + Duration::from_millis(50), quiet),
+            "still inside the quiet window"
+        );
+        assert!(
+            !output_quiescent(Some(output), output + Duration::from_millis(199), quiet),
+            "one tick short of the window is still not quiet"
+        );
+        assert!(
+            output_quiescent(Some(output), output + Duration::from_millis(200), quiet),
+            "exactly at the window is quiet"
+        );
+        assert!(
+            output_quiescent(Some(output), output + Duration::from_secs(30), quiet),
+            "and it does not decay back once quiet"
+        );
+    }
+
+    /// `pane_is_idle`'s branch selection: a signal-capable pane is exactly
+    /// `signal_still_stands` -- quiet output alone, with no signal ever seen,
+    /// is not enough -- while a signal-less pane is exactly
+    /// `signal_less_quiescent`, and `signal_at` is never consulted for it at
+    /// all (matching reality: nothing ever writes to a signal-less pane's own
+    /// turn-signal socket, so a `Some` there could not honestly arise, but
+    /// the branch must not depend on that being true to behave correctly).
+    /// `local_input_at` is likewise never consulted on the signal-capable
+    /// branch.
+    #[test]
+    fn pane_is_idle_branches_on_turn_signal_capability() {
+        let debounce = Duration::from_millis(500);
+        let idle_quiet = Duration::from_millis(200);
+        let output = Instant::now();
+
+        assert!(
+            !pane_is_idle(
+                true,
+                None,
+                Some(output),
+                None,
+                output + Duration::from_secs(30),
+                debounce,
+                idle_quiet
+            ),
+            "signal-capable: no signal ever seen stays working, however long the output has been quiet"
+        );
+        assert!(
+            !pane_is_idle(
+                true,
+                None,
+                Some(output),
+                Some(output + Duration::from_secs(29)),
+                output + Duration::from_secs(30),
+                debounce,
+                idle_quiet
+            ),
+            "signal-capable: local_input_at is never consulted on this branch either"
+        );
+
+        assert!(
+            !pane_is_idle(
+                false,
+                Some(output),
+                Some(output),
+                None,
+                output + Duration::from_millis(50),
+                debounce,
+                idle_quiet
+            ),
+            "signal-less: still inside its own quiet window"
+        );
+        assert!(
+            pane_is_idle(
+                false,
+                Some(output),
+                Some(output),
+                None,
+                output + Duration::from_millis(200),
+                debounce,
+                idle_quiet
+            ),
+            "signal-less: quiet window elapsed, idle with a signal present"
+        );
+        assert!(
+            pane_is_idle(
+                false,
+                None,
+                Some(output),
+                None,
+                output + Duration::from_millis(200),
+                debounce,
+                idle_quiet
+            ),
+            "signal-less: same outcome with no signal_at at all -- it is never consulted"
+        );
+    }
+
+    /// H1 (review): local input holds a signal-less pane non-idle for a full
+    /// `idle_quiet` window measured from *itself*, even with no child output
+    /// at all recorded since -- the fix for the bug where an injection or a
+    /// keystroke, which only ever happen while the pane already reads quiet,
+    /// left `output_at` untouched and so read as still-quiet on the very next
+    /// tick.
+    #[test]
+    fn pane_is_idle_measures_signal_less_quiet_from_the_latest_of_output_and_local_input() {
+        let debounce = Duration::from_millis(500);
+        let idle_quiet = Duration::from_millis(200);
+        let output = Instant::now();
+
+        // No output at all, only local input: not idle until idle_quiet has
+        // elapsed since that input, and idle after.
+        assert!(
+            !pane_is_idle(
+                false,
+                None,
+                None,
+                Some(output),
+                output + Duration::from_millis(50),
+                debounce,
+                idle_quiet
+            ),
+            "a fresh local input alone must hold the pane non-idle"
+        );
+        assert!(
+            pane_is_idle(
+                false,
+                None,
+                None,
+                Some(output),
+                output + Duration::from_millis(200),
+                debounce,
+                idle_quiet
+            ),
+            "and release it once idle_quiet has elapsed since that input"
+        );
+
+        // Output happened first and is already quiet, but local input landed
+        // later: the later timestamp governs, not the older output.
+        let later_input = output + Duration::from_millis(150);
+        assert!(
+            !pane_is_idle(
+                false,
+                None,
+                Some(output),
+                Some(later_input),
+                later_input + Duration::from_millis(50),
+                debounce,
+                idle_quiet
+            ),
+            "output alone looks quiet (150ms+50ms=200ms old) but the later local \
+             input must be what quiescence is measured from"
+        );
+        assert!(
+            pane_is_idle(
+                false,
+                None,
+                Some(output),
+                Some(later_input),
+                later_input + Duration::from_millis(200),
+                debounce,
+                idle_quiet
+            ),
+            "idle once idle_quiet has elapsed since the later of the two"
+        );
+
+        // And symmetrically, output arriving after an old local input is what
+        // governs.
+        let later_output = output + Duration::from_millis(150);
+        assert!(
+            !pane_is_idle(
+                false,
+                None,
+                Some(later_output),
+                Some(output),
+                later_output + Duration::from_millis(50),
+                debounce,
+                idle_quiet
+            ),
+            "fresh output after old local input must also restart the window"
         );
     }
 
@@ -1890,6 +2298,30 @@ pub(crate) mod tests {
         vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()]
     }
 
+    /// Task A: a child that prints exactly one line at startup -- standing in
+    /// for a real harness drawing its first frame -- and then produces
+    /// nothing further for the rest of its (long) life. Lets a test observe a
+    /// signal-less pane's quiet window closing against a real, deterministic
+    /// last-output timestamp rather than racing a harness that might repaint
+    /// on its own.
+    #[cfg(windows)]
+    fn silent_after_first_line_argv() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "echo hello & ping -n 60 127.0.0.1 >nul".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn silent_after_first_line_argv() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo hello; sleep 60".to_string(),
+        ]
+    }
+
     /// Drives one turn signal into `pane`'s own socket and waits, bounded, for
     /// the pane to report `Idle`. Returns whether it got there. Gives up
     /// immediately if the child exited (`Ended` outranks every other state, so
@@ -1958,7 +2390,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
         let spec = test_spec("11111111-2222-4333-8444-555555555555");
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
 
         assert_eq!(pane.agent(), "test-agent");
         assert_eq!(pane.title(), "wrk test");
@@ -2004,7 +2437,8 @@ pub(crate) mod tests {
         let session_id = "33333333-2222-4333-8444-555555555555";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
@@ -2043,7 +2477,8 @@ pub(crate) mod tests {
         let session_id = "44444444-2222-4333-8444-555555555555";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
@@ -2076,6 +2511,281 @@ pub(crate) mod tests {
         pane.shutdown("").expect("shutdown");
     }
 
+    /// Task A end to end: a signal-less pane's real supervised child prints
+    /// once at startup and then goes quiet for the rest of its life. The pane
+    /// must read `Working` while still inside the quiet window and
+    /// `Idle`/`injectable` once the window closes -- with no turn signal ever
+    /// sent to it (a codex-shaped adapter never sends one; nothing in this
+    /// test's own child does either).
+    #[test]
+    fn a_signal_less_pane_becomes_idle_after_the_quiet_period_and_not_before() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "77777777-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = silent_after_first_line_argv();
+        let idle_quiet = Duration::from_millis(1000);
+        let mut pane =
+            Pane::spawn(spec, &state, &repo, (80, 24), &[], false, idle_quiet).expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if pane.last_line().contains("hello") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pane.last_line().contains("hello"),
+            "the startup line must have landed before the rest of this test can mean anything: {:?}",
+            pane.last_line()
+        );
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "still inside the quiet window right after the startup line: {:?}",
+            pane.state()
+        );
+        assert!(!pane.injectable(), "not yet reachable while still working");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut became_idle = false;
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if matches!(pane.state(), PaneState::Idle) {
+                became_idle = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            became_idle,
+            "must become idle once the quiet window closes, with no turn signal ever sent"
+        );
+        assert!(
+            pane.injectable(),
+            "and therefore reachable by the mail sweep/nudge drain"
+        );
+
+        pane.shutdown("").expect("shutdown");
+    }
+
+    /// Task A regression guard: a signal-carrying pane must ignore output
+    /// quiescence entirely, exactly as before this feature existed -- it
+    /// stays `Working` well past the quiet window with no turn signal ever
+    /// sent, so the two branches of `pane_is_idle` provably do not bleed into
+    /// each other.
+    #[test]
+    fn a_signal_carrying_pane_ignores_output_quiescence_entirely() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "88888888-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = silent_after_first_line_argv();
+        let idle_quiet = Duration::from_millis(200);
+        let mut pane =
+            Pane::spawn(spec, &state, &repo, (80, 24), &[], true, idle_quiet).expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if pane.last_line().contains("hello") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.last_line().contains("hello"), "sanity: the child ran");
+
+        std::thread::sleep(idle_quiet * 10);
+        pane.drain();
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "a signal-carrying pane stays working through a long quiet period with no \
+             signal sent: {:?}",
+            pane.state()
+        );
+        assert!(!pane.injectable());
+
+        pane.shutdown("").expect("shutdown");
+    }
+
+    /// H1 (review): the bug this test pins -- a signal-less pane's own
+    /// `inject_visible` must hold it uninjectable for a full `idle_quiet`
+    /// window measured from the injection itself, not from the child's
+    /// (already-old) last output. Before the fix, an injection never moved
+    /// `last_output_at`, so the very next `drain()` tick -- tens of
+    /// milliseconds later, nowhere near a full `idle_quiet` -- still read the
+    /// pane as quiet and immediately cleared `injected_awaiting_turn`,
+    /// letting a second injector (the nudge drain running right after the
+    /// mail sweep in the same tick) land straight on top of the first.
+    #[test]
+    fn a_signal_less_pane_stays_uninjectable_for_a_full_window_after_its_own_injection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "aaaaaaaa-3333-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = silent_after_first_line_argv();
+        let idle_quiet = Duration::from_millis(500);
+        let mut pane =
+            Pane::spawn(spec, &state, &repo, (80, 24), &[], false, idle_quiet).expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if pane.last_line().contains("hello") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.last_line().contains("hello"), "sanity: the child ran");
+
+        // Wait out the quiet window from the startup line so the pane is
+        // genuinely idle before this test's own injection.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            pane.drain();
+            if pane.injectable() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "must become injectable before this test can mean anything"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        pane.inject_visible("test", "one").expect("first injection");
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "immediately busy after a successful injection"
+        );
+
+        // The very next tick, well under idle_quiet later: must NOT have been
+        // cleared by the stale (already-old) output timestamp.
+        std::thread::sleep(Duration::from_millis(50));
+        pane.drain();
+        assert!(
+            !pane.injectable(),
+            "H1: a signal-less pane must not go back to injectable within one \
+             tick of its own injection"
+        );
+        assert!(matches!(pane.state(), PaneState::Working));
+
+        // Still not injectable only partway through the window.
+        std::thread::sleep(idle_quiet / 2);
+        pane.drain();
+        assert!(
+            !pane.injectable(),
+            "still short of a full idle_quiet window since the injection"
+        );
+
+        // And injectable again once a full idle_quiet has elapsed since the
+        // injection itself.
+        std::thread::sleep(idle_quiet);
+        pane.drain();
+        assert!(
+            pane.injectable(),
+            "reachable again once idle_quiet has elapsed since the injection"
+        );
+
+        pane.shutdown("").expect("shutdown");
+    }
+
+    /// H1 (review): a signal-less pane has no turn signal to tell "the
+    /// operator is still typing" from "the child finished", so -- unlike a
+    /// signal-carrying pane, where G1 deliberately keeps typing off the
+    /// *displayed* state and only gates `injectable()` -- a signal-less
+    /// pane's own idleness clock blends local input in on the same axis
+    /// (`pane_is_idle`'s signal-less branch, via `signal_less_quiescent`):
+    /// a keystroke holds it `Working`, not merely uninjectable, for a full
+    /// `idle_quiet` window measured from that keystroke, even with no child
+    /// output at all following it. Also pins that the flag is not cleared by
+    /// stale quiescence on the very next tick.
+    #[test]
+    fn operator_typing_holds_a_signal_less_pane_working_for_a_full_quiet_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "bbbbbbbb-3333-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = silent_after_first_line_argv();
+        let idle_quiet = Duration::from_millis(500);
+        let mut pane =
+            Pane::spawn(spec, &state, &repo, (80, 24), &[], false, idle_quiet).expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if pane.last_line().contains("hello") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.last_line().contains("hello"), "sanity: the child ran");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            pane.drain();
+            if pane.injectable() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "must become idle before this test can mean anything"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        pane.write_operator_input(b"half a thought")
+            .expect("forwarding a keystroke must succeed while the child is alive");
+
+        // The very next tick, well under idle_quiet later: must still read
+        // as busy -- not cleared by the stale (already-old) output
+        // timestamp.
+        std::thread::sleep(Duration::from_millis(50));
+        pane.drain();
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "H1: a keystroke into a signal-less pane must hold it non-idle for \
+             a full quiet window, not just until the next drain tick: {:?}",
+            pane.state()
+        );
+        assert!(!pane.injectable());
+
+        // Still working only partway through the window.
+        std::thread::sleep(idle_quiet / 2);
+        pane.drain();
+        assert!(
+            matches!(pane.state(), PaneState::Working),
+            "still short of a full idle_quiet window since the keystroke: {:?}",
+            pane.state()
+        );
+
+        // And idle again once a full idle_quiet has elapsed since the last
+        // keystroke.
+        std::thread::sleep(idle_quiet);
+        pane.drain();
+        assert!(
+            matches!(pane.state(), PaneState::Idle),
+            "idle again once idle_quiet has elapsed since the last keystroke: {:?}",
+            pane.state()
+        );
+        assert!(pane.injectable());
+
+        pane.shutdown("").expect("shutdown");
+    }
+
     #[test]
     fn shutdown_is_idempotent() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2084,7 +2794,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
         let spec = test_spec("22222222-2222-4333-8444-555555555555");
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
 
         pane.shutdown("")
             .expect("first shutdown releases the guard");
@@ -2152,7 +2863,8 @@ pub(crate) mod tests {
 
         let mut spec = test_spec("66666666-2222-4333-8444-555555555555");
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[]).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
         let short = pane.short().to_string();
         let record_path = state.sessions().join(format!("{short}.json"));
         assert!(

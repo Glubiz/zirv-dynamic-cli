@@ -17,6 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::CtxResult;
+use super::adapters::{self, AgentAdapter};
 use super::announce::{Announcer, Event};
 use super::chat::quiet_env;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
@@ -62,6 +63,63 @@ pub fn validate_flags(flags: &[String]) -> CtxResult<()> {
         .into());
     }
     Ok(())
+}
+
+/// Whether `flags` already pins an explicit model choice -- any form
+/// `adapters::classify_model_flag` recognises: `--model`/`-m` bare, the
+/// `--model=value`/`-m=value` joined form, or the attached `-mvalue` short
+/// form. The operator's own choice always wins, so `worker_launch_flags`
+/// below never overrides it.
+///
+/// `-m` is codex's own verified short alias for `--model` (`CodexAdapter`'s
+/// doc comments around `distiller_cmd`/`model_args` in `adapters/codex.rs`,
+/// citing `codex exec --help`/top-level `codex --help`), so without it
+/// `zirv ctx agent codex "<prompt>" -- -m opus` (or the attached
+/// `-mopus`) with `worker.codex` configured got a conflicting `--model`
+/// prepended ahead of the operator's own flag. Recognising `-m` is harmless
+/// for claude, which has no such alias: treating it as pinning there only
+/// ever skips a prepend that would otherwise have happened, never breaks a
+/// launch. Shared with `adapters::last_model_flag` via `classify_model_flag`
+/// so the two can never drift on what counts as a model flag.
+fn flags_pin_model(flags: &[String]) -> bool {
+    flags
+        .iter()
+        .any(|f| adapters::classify_model_flag(f).is_some())
+}
+
+/// The effective trailing flags a delegated headless spawn launches with.
+///
+/// Unchanged when the operator's own `flags` already pin `--model`
+/// themselves -- the operator's own choice always wins. Otherwise
+/// `worker.<name>`'s configured model, or `adapter`'s own hard default
+/// (`AgentAdapter::default_worker_model`), is prepended ahead of `flags` via
+/// `adapters::worker_model_args`, so a delegated headless worker stops
+/// silently inheriting the operator's own (often far pricier) interactive
+/// default model.
+///
+/// Mirrors `chat.rs`'s own `extra_with_model`: the model flags are prepended
+/// as trailing extras rather than spliced into an already-built argv, which
+/// is what keeps them from ever landing inside a launcher prefix.
+///
+/// This resolution runs only on the delegation spawn path -- `zirv ctx
+/// agent`'s own headless fallback (this function's caller, `run_with`,
+/// below) and the dashboard's own spawn-request pane variant
+/// (`dash::mod::fulfill_spawn_request`). It deliberately never touches `zirv
+/// ctx exec`/`zirv ctx loop`, whose trailing command the operator typed
+/// verbatim, nor `chat`/`wrap`, whose model comes from the orchestrator seat
+/// (`chat.model`) instead.
+fn worker_launch_flags(
+    cfg: &CtxConfig,
+    name: &str,
+    adapter: &dyn AgentAdapter,
+    flags: &[String],
+) -> Vec<String> {
+    if flags_pin_model(flags) {
+        return flags.to_vec();
+    }
+    let mut out = adapters::worker_model_args(cfg, name, adapter);
+    out.extend_from_slice(flags);
+    out
 }
 
 /// `"-"` reads the whole of `stdin` (trimmed); anything else is the prompt
@@ -181,9 +239,10 @@ const EXIT_DASH_UNCONFIRMED: i32 = 1;
 /// `None` means the caller falls through to today's headless behavior
 /// unchanged, which covers: no dashboard to ask (env unset, or the directory
 /// is gone -- both silent, byte-for-byte the pre-Task-11 behavior); options a
-/// pane cannot honour (`--max-restarts`/`--timeout-secs`/`-- flags`, notice
-/// printed); a prompt that would be misread as a flag (notice printed); a
-/// request that could not even be written (notice printed); an unclaimed ack
+/// pane cannot honour (`--max-restarts`/`--timeout-secs`/`-- flags` other than
+/// a lone `--model` pin, notice printed); a prompt that would be misread as a
+/// flag (notice printed); a request that could not even be written (notice
+/// printed); an unclaimed ack
 /// timeout (notice printed, since that is a live channel that simply did not
 /// respond); and a `retryable` refusal, where the dashboard has answered that
 /// it spawned nothing for a reason that says nothing about whether the task
@@ -209,10 +268,21 @@ fn try_join_dashboard<W: Write>(
     // `--quiet` is deliberately still allowed: it only shapes the
     // announcement channel of a run that is not happening in this process
     // anyway.
-    if args.max_restarts.is_some() || args.timeout_secs.is_some() || !args.flags.is_empty() {
+    // A model pin is the one trailing flag a pane *can* honour -- it travels
+    // in the request and the pane builds it into its own argv -- and the
+    // harness layer now teaches orchestrators to write one on every
+    // delegation, so declining the pane for it would cost a dashboard session
+    // a visible pane per delegated task. Anything else in `flags` still
+    // declines: honouring some of what the operator typed and dropping the
+    // rest would be worse than not using the dashboard at all.
+    let pinned_model = super::adapters::model_only_flags(&args.flags);
+    if args.max_restarts.is_some()
+        || args.timeout_secs.is_some()
+        || (!args.flags.is_empty() && pinned_model.is_none())
+    {
         eprintln!(
-            "zirv ctx agent: dashboard panes don't support --max-restarts/--timeout-secs/-- flags; \
-             running headless"
+            "zirv ctx agent: dashboard panes don't support --max-restarts/--timeout-secs/-- flags \
+             other than a --model pin; running headless"
         );
         return None;
     }
@@ -238,6 +308,7 @@ fn try_join_dashboard<W: Write>(
         prompt: prompt.to_string(),
         cwd: repo.to_path_buf(),
         requested_by,
+        model: pinned_model.map(str::to_string),
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -318,6 +389,14 @@ pub fn run_with<W: Write>(
     );
     let env = quiet_env(env, args.quiet);
 
+    // Resolved here, ahead of `exec::run_with`'s own (identical) selection
+    // further down, purely to compute the default worker model this spawn
+    // launches with -- see `worker_launch_flags`. `&[]` for the command: it
+    // only matters to `select` when `name` is `None`, and this call always
+    // passes the delegation target explicitly.
+    let adapter = adapters::select(Some(&args.name), &[], &cfg)?;
+    let command = worker_launch_flags(&cfg, &args.name, adapter.as_ref(), &args.flags);
+
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
         session_id: Some(SessionId::new_v4().to_string()),
@@ -330,7 +409,7 @@ pub fn run_with<W: Write>(
         prompt: Some(prompt),
         max_restarts: args.max_restarts,
         timeout_secs: args.timeout_secs,
-        command: args.flags.clone(),
+        command,
         simple: false,
     };
 
@@ -359,6 +438,137 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    // `worker_launch_flags`/`flags_pin_model`: pure, so these are testable
+    // against a plain adapter without spawning anything.
+
+    #[test]
+    fn flag_passthrough_wins_over_the_configured_or_default_worker_model() {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let flags = vec!["--model".to_string(), "opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &adapter, &flags),
+            flags,
+            "the operator's own --model must reach argv unchanged"
+        );
+
+        let joined = vec!["--model=opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &adapter, &joined),
+            joined,
+            "the --model=value joined form must also be recognised as already pinned"
+        );
+    }
+
+    /// FIX 2: codex's own `-m` short alias must pin exactly like `--model`,
+    /// or a configured `worker.codex` gets a conflicting `--model` prepended
+    /// ahead of an operator's own `-m <value>`.
+    #[test]
+    fn codexs_short_m_alias_also_pins_the_model_for_worker_launches() {
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: None,
+                codex: Some("gpt-5.6-terra".to_string()),
+            },
+            ..CtxConfig::default()
+        };
+
+        let bare = vec!["-m".to_string(), "opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &adapter, &bare),
+            bare,
+            "the operator's own -m must reach argv unchanged, not gain a conflicting --model"
+        );
+
+        let joined = vec!["-m=opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &adapter, &joined),
+            joined,
+            "the -m=value joined form must also be recognised as already pinned"
+        );
+
+        // FIX 2 (round 2): the attached short form, `-mopus` with no
+        // separator at all, must be recognised too, or `zirv ctx agent
+        // codex "p" -- -mopus` with `worker.codex` configured gets a
+        // conflicting `--model` prepended ahead of the operator's own flag.
+        let attached = vec!["-mopus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &adapter, &attached),
+            attached,
+            "the attached -mvalue short form must also be recognised as already pinned"
+        );
+    }
+
+    /// A long flag that merely starts with `-m` once its leading `-` is
+    /// peeled (`--model-foo`) must not be misread as the attached short
+    /// form: `worker.codex`'s configured model still gets prepended ahead
+    /// of it, exactly as for any other unrelated flag.
+    #[test]
+    fn a_long_flag_starting_with_m_does_not_false_positive_as_pinning() {
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: None,
+                codex: Some("gpt-5.6-terra".to_string()),
+            },
+            ..CtxConfig::default()
+        };
+        let flags = vec!["--model-foo".to_string(), "opus".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &adapter, &flags),
+            vec![
+                "--model".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "--model-foo".to_string(),
+                "opus".to_string(),
+            ],
+            "an unrelated flag must not suppress the configured-model prepend"
+        );
+    }
+
+    #[test]
+    fn a_configured_worker_model_is_prepended_ahead_of_the_operators_own_flags() {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig {
+            worker: crate::commands::ctx::config::WorkerConfig {
+                claude: Some("opus".to_string()),
+                codex: None,
+            },
+            ..CtxConfig::default()
+        };
+        let flags = vec!["--allowedTools".to_string(), "Bash".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &adapter, &flags),
+            vec![
+                "--model".to_string(),
+                "opus".to_string(),
+                "--allowedTools".to_string(),
+                "Bash".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_gets_the_sonnet_default_when_nothing_is_configured_or_passed() {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &adapter, &[]),
+            vec!["--model".to_string(), "sonnet".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_gets_no_model_flag_when_nothing_is_configured_or_passed() {
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let cfg = CtxConfig::default();
+        assert!(
+            worker_launch_flags(&cfg, "codex", &adapter, &[]).is_empty(),
+            "codex has no adapter-owned default, so its own config default applies untouched"
+        );
+    }
 
     fn fixture(name: &str) -> PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -765,6 +975,41 @@ mod tests {
         );
     }
 
+    /// A lone `--model` pin is the one trailing flag a pane can honour, so it
+    /// joins the dashboard instead of declining to the headless path -- the
+    /// harness layer now teaches orchestrators to write one on every
+    /// delegation, and declining would cost a dashboard session its pane every
+    /// time. The pinned model travels in the request, for the fulfilment side
+    /// to build into the pane's own argv.
+    #[test]
+    fn a_lone_model_pin_still_joins_the_dashboard_and_travels_in_the_request() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
+        });
+
+        let mut args = joinable_args("claude", "go");
+        args.flags = vec!["--model".to_string(), "haiku".to_string()];
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let req: spawnreq::SpawnRequest =
+            serde_json::from_str(&request_body).expect("the request parses");
+        assert_eq!(
+            req.model.as_deref(),
+            Some("haiku"),
+            "the pinned model reaches the fulfilment side: {request_body}"
+        );
+    }
+
     /// A refusal ack (the dashboard's own `cfg.agents.refusal` gate, or an
     /// unknown/unready adapter) prints the reason and returns `Ok(1)` --
     /// still short-circuiting the headless path, since the dashboard already
@@ -873,7 +1118,17 @@ mod tests {
         for mutate in [
             (|a: &mut AgentArgs| a.max_restarts = Some(2)) as fn(&mut AgentArgs),
             |a: &mut AgentArgs| a.timeout_secs = Some(90),
-            |a: &mut AgentArgs| a.flags = vec!["--model".to_string(), "opus".to_string()],
+            |a: &mut AgentArgs| a.flags = vec!["--verbose".to_string()],
+            // A model pin plus anything else is still a decline: honouring
+            // half of what the operator typed is worse than not using the
+            // dashboard at all.
+            |a: &mut AgentArgs| {
+                a.flags = vec![
+                    "--model".to_string(),
+                    "haiku".to_string(),
+                    "--verbose".to_string(),
+                ]
+            },
         ] {
             let mut args = joinable_args("claude", "go");
             mutate(&mut args);
