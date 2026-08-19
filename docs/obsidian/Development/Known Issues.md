@@ -648,8 +648,9 @@ the default parallel test runner.
 ## `wrap`'s pty-harness tests wedge their spawned child on at least one macOS machine
 
 Every `#[cfg(unix)]` test in `wrap.rs` that goes through `spawn_wrap`/`spawn_wrap_with_flags`
-(27 of them as of 2026-08-19, including the four `native_pty_system`-direct ones) hangs on
-one reference macOS machine (Darwin 25.5.0): the spawned `zirv ctx wrap` child reaches kernel
+(24 as of 2026-08-19; a local run skips 27, adding the three that open a pty directly with
+`native_pty_system`) hangs on one reference macOS machine (Darwin 25.5.0): the spawned
+`zirv ctx wrap` child reaches kernel
 exit state `?Es` after its `/exit` and never reaps, so the test blocks forever in
 `Child::wait`. **Pre-existing and unrelated to any branch** — A/B-verified 6/6 against
 unmodified `main`, both sandboxed and unsandboxed. Killing the parent test binary's specific
