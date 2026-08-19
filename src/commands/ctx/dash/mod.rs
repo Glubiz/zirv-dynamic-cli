@@ -73,6 +73,9 @@ pub enum DashAction {
     Memory,
     Zoom,
     Quit,
+    /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
+    /// binding below.
+    Help,
     /// Scroll the focused pane a half-screen back into its history
     /// (`Ctrl+A PageUp`) or toward the live view (`Ctrl+A PageDown`).
     ScrollPageUp,
@@ -139,6 +142,7 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Char('M') => Some(DashAction::Memory),
         KeyCode::Char('z') => Some(DashAction::Zoom),
         KeyCode::Char('q') => Some(DashAction::Quit),
+        KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Some(DashAction::Help),
         _ => None,
     };
 
@@ -320,6 +324,7 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::Mail(_) => "mail",
         ui::Overlay::Memory(_) => "memory",
         ui::Overlay::Restore(_) => "restore",
+        ui::Overlay::Help => "help",
     }
 }
 
@@ -3229,6 +3234,39 @@ fn input_stream_is_dead(consecutive_errors: usize) -> bool {
     consecutive_errors >= MAX_CONSECUTIVE_INPUT_ERRORS
 }
 
+/// The first `event::poll` wait of a tick once no activity (a keyboard or
+/// mouse event read from crossterm) has happened recently -- the old flat
+/// behaviour, cheap on CPU while the operator is idle. Deliberately NOT
+/// refreshed by pane output: a streaming response or an animated spinner is
+/// the normal state of an active dashboard, and holding the loop in the hot
+/// window for that would multiply its wakeup rate for no benefit -- the
+/// operator's own keystroke already opens the window, which is all typing
+/// latency needs.
+const INPUT_POLL_IDLE_WAIT: Duration = Duration::from_millis(50);
+/// The first `event::poll` wait right after activity: short enough that the
+/// repaint showing a child's echo of a keystroke does not lag behind typing.
+const INPUT_POLL_HOT_WAIT: Duration = Duration::from_millis(10);
+/// How long after the last activity the loop stays in the hot-poll window
+/// before falling back to [`INPUT_POLL_IDLE_WAIT`]. For that whole window the
+/// entire tick -- not just the poll -- runs at up to ~100/s: every per-pane
+/// drain, the spawn-request `read_dir`, the mail sweep gate check, the sidebar
+/// rebuild, the draw. Bounded and deliberate: 300ms of a busier tick during
+/// active typing is the trade for the fast repaint, and the window closes
+/// back to the cheap 50ms cadence the instant activity stops.
+const INPUT_POLL_HOT_WINDOW: Duration = Duration::from_millis(300);
+
+/// Pure: the poll wait for this tick's first `event::poll`, given how long ago
+/// the loop last saw activity. Hot (short) inside the window so a burst of
+/// typing keeps getting fast repaints; idle (long, cheap) once it has passed --
+/// see `INPUT_POLL_HOT_WAIT`/`INPUT_POLL_IDLE_WAIT`.
+fn input_poll_wait(since_activity: Duration) -> Duration {
+    if since_activity <= INPUT_POLL_HOT_WINDOW {
+        INPUT_POLL_HOT_WAIT
+    } else {
+        INPUT_POLL_IDLE_WAIT
+    }
+}
+
 /// Pure: whether this tick's reap left the dashboard with nothing to
 /// supervise, which is a quit (D4).
 ///
@@ -3531,6 +3569,14 @@ pub fn run_dashboard(
     let mut focused: usize = 0;
     let mut zoomed = false;
     let mut prefix_armed = false;
+    // The adaptive input-poll wait's own clock (`input_poll_wait`): refreshed
+    // only on a keyboard/mouse event read from crossterm, not on pane output --
+    // a streaming response or an animated spinner must not hold the loop in
+    // the 10ms hot window indefinitely; the operator's own keystroke already
+    // opens it, which is all typing latency needs. Seeded to now, so launch
+    // itself counts as activity and the dashboard starts in the hot window
+    // rather than the flat 50ms idle wait.
+    let mut last_activity = Instant::now();
     let mut overlay = if restore_candidates.is_empty() {
         ui::Overlay::None
     } else {
@@ -3689,9 +3735,10 @@ pub fn run_dashboard(
         }
 
         // H3: the disk-backed sweep and the nudge-marker claim run at most
-        // once per `FACTS_THROTTLE`, not on every 50ms tick. The in-memory
-        // nudge-queue drain below stays every tick: it is cheap and delivers
-        // an operator's queued nudge the moment its pane goes idle.
+        // once per `FACTS_THROTTLE`, not on every tick (the tick rate itself
+        // is adaptive -- see `input_poll_wait`). The in-memory nudge-queue
+        // drain below stays every tick: it is cheap and delivers an
+        // operator's queued nudge the moment its pane goes idle.
         let sweep_now = Instant::now();
         if due(last_mail_sweep, sweep_now, FACTS_THROTTLE) {
             last_mail_sweep = sweep_now;
@@ -3755,21 +3802,28 @@ pub fn run_dashboard(
         let total_rows = rows.len();
         selected = selected.min(total_rows.saturating_sub(1));
 
-        // HIGH-2: block up to 50ms for the first event, then drain every
-        // event already queued behind it (bounded) before falling through to
-        // the maintenance/redraw at the bottom of the tick. A 2000-character
-        // paste is 2000 key events; handling them one-per-tick meant 2000 full
-        // maintenance passes and redraws.
+        // HIGH-2: block for the first event (`input_poll_wait`'s adaptive
+        // 10ms/50ms), then drain every event already queued behind it
+        // (bounded) before falling through to the maintenance/redraw at the
+        // bottom of the tick. A 2000-character paste is 2000 key events;
+        // handling them one-per-tick meant 2000 full maintenance passes and
+        // redraws.
         let mut drained = 0usize;
         while drained < MAX_INPUT_DRAIN_PER_TICK {
             let wait = if drained == 0 {
-                Duration::from_millis(50)
+                input_poll_wait(last_activity.elapsed())
             } else {
                 Duration::ZERO
             };
             match event::poll(wait) {
                 Ok(true) => {
                     let read = event::read();
+                    // Activity, for the adaptive poll wait above: a keyboard
+                    // or mouse event, whatever `filter_key`/the overlay below
+                    // goes on to decide it means.
+                    if matches!(read, Ok(Event::Key(_)) | Ok(Event::Mouse(_))) {
+                        last_activity = Instant::now();
+                    }
                     // Task 2: one line per event, before anything acts on it,
                     // with the arming state and overlay it is about to be
                     // decided against. Inert unless `ZIRV_CTX_DASH_KEYLOG` is
@@ -4001,6 +4055,11 @@ pub fn run_dashboard(
                                         }
                                         _ => overlay = ui::Overlay::Nudge(draft),
                                     },
+                                    // Any key closes it (tmux's own key-list
+                                    // convention): `overlay` was already reset
+                                    // to `None` by the `mem::take` above, so
+                                    // there is nothing to reassign here.
+                                    ui::Overlay::Help => {}
                                 }
                                 // Task 2: the take/assign pair. An overlay that
                                 // reopens itself (`took=X now=X`) is a key
@@ -4193,6 +4252,9 @@ pub fn run_dashboard(
                                     InputVerdict::Dash(DashAction::Memory) => {
                                         overlay =
                                             ui::Overlay::Memory(build_memory_view(state, repo));
+                                    }
+                                    InputVerdict::Dash(DashAction::Help) => {
+                                        overlay = ui::Overlay::Help;
                                     }
                                 }
                             }
@@ -4692,6 +4754,21 @@ mod tests {
             filter_key(true, key(KeyCode::Char('q'), KeyModifiers::NONE)).1,
             InputVerdict::Dash(DashAction::Quit)
         ));
+        for c in ['?', 'h', 'H'] {
+            assert!(matches!(
+                filter_key(true, key(KeyCode::Char(c), KeyModifiers::NONE)).1,
+                InputVerdict::Dash(DashAction::Help)
+            ));
+        }
+        // A real terminal delivers SHIFT alongside '?' and 'H' (`?` is
+        // shift-slash on most layouts, and 'H' is itself the shifted key);
+        // the match is on `key.code` alone, so the modifier must not matter.
+        for c in ['?', 'H'] {
+            assert!(matches!(
+                filter_key(true, key(KeyCode::Char(c), KeyModifiers::SHIFT)).1,
+                InputVerdict::Dash(DashAction::Help)
+            ));
+        }
     }
 
     /// The keyboard half of scrollback: a half-screen step and the two jumps,
@@ -4742,6 +4819,23 @@ mod tests {
         }
     }
 
+    /// The hot/idle poll-wait boundary: hot at zero and just under the
+    /// window, still hot exactly at the window (the check is `<=`), idle the
+    /// instant it passes.
+    #[test]
+    fn input_poll_wait_is_hot_within_the_window_and_idle_past_it() {
+        assert_eq!(input_poll_wait(Duration::ZERO), INPUT_POLL_HOT_WAIT);
+        assert_eq!(
+            input_poll_wait(INPUT_POLL_HOT_WINDOW - Duration::from_millis(1)),
+            INPUT_POLL_HOT_WAIT
+        );
+        assert_eq!(input_poll_wait(INPUT_POLL_HOT_WINDOW), INPUT_POLL_HOT_WAIT);
+        assert_eq!(
+            input_poll_wait(INPUT_POLL_HOT_WINDOW + Duration::from_millis(1)),
+            INPUT_POLL_IDLE_WAIT
+        );
+    }
+
     /// The diagnostic names whichever overlay is standing between a keystroke
     /// and `filter_key` -- the whole point of the log line, since an open
     /// overlay is one of the two ways `Ctrl+A <key>` can appear to do nothing.
@@ -4772,6 +4866,7 @@ mod tests {
             overlay_name(&ui::Overlay::Restore(ui::RestoreView::default())),
             "restore"
         );
+        assert_eq!(overlay_name(&ui::Overlay::Help), "help");
     }
 
     /// The diagnostic must be completely inert unless the env var names a

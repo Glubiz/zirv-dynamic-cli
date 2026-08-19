@@ -384,6 +384,19 @@ terminal-input feature must check both failure modes — a missing modifier
 parameter, and a control combination crossterm already collapsed to a bare
 character — not just the common `Char` + `CONTROL` shape.
 
+## The `Ctrl+A ?` help overlay clips its tail on a terminal shorter than ~22 rows
+
+`render_dialog`'s height is `lines.len() + 2` (top/bottom border), clamped to
+the available area — on a standard 80x24 terminal that area is `24 - 1 = 23`
+rows after the header, and the help table's own content (19 lines) fits
+exactly. A terminal shorter than that clips the dialog's bottom rows with no
+scrolling and no visible truncation marker. Known and accepted, not fixed:
+the dashboard's own eligibility floor is 80x20 (`MIN_DASH_COLS`/`MIN_DASH_ROWS`),
+so this can only happen on a terminal resized smaller after the dashboard is
+already running. A future addition to `HELP_BINDINGS` should re-run
+`the_help_overlay_fits_a_standard_24_row_terminal` (`dash/ui.rs`) before
+assuming there's still room.
+
 ## `PaneState::WaitingInput` and its `⏸` glyph do not exist
 
 Removed 2026-08-14 (round-9 review): the variant had no producer and never
