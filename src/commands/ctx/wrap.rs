@@ -4796,18 +4796,34 @@ mod tests {
             "the first idle poll advises: {first:?}"
         );
 
-        // Drain the stub's own `echo:` response to the injected advisory
-        // before phase 2: `read_until` above stops at the typed line's pty
-        // echo, so the stub's echo of that same line may still be in flight,
-        // and a later read would mistake that leftover for a second
-        // advisory. The stub answers lines in order, so once the sync
-        // sentinel's echo is back, the advisory's echo is fully consumed.
+        // The phase boundary, and it has to be exact rather than timed. One
+        // advisory shows up on the pty *twice*: the inner pty's own echo of
+        // the injected line, and then the stub's `echo: <line>` answer to it.
+        // The read above returns at whichever chunk carried the marker -- on a
+        // slow runner that is the echo alone -- so the answer is still in
+        // flight, and phase 2's own window is where it lands. That leftover,
+        // not a second advisory, is what failed this test on CI twice.
+        //
+        // A sync line typed right after pins the boundary deterministically:
+        // the advisory's bytes are already in the child's input queue (its
+        // echo is what phase 1 just matched), the stub reads that queue in
+        // order, so its answer to the sync line cannot arrive before its
+        // answer to the advisory. Reading up to the sync answer therefore
+        // consumes every surface of the advisory, at any runner speed.
+        //
+        // Asserted, not discarded: a read that quietly timed out here would
+        // hand phase 2 exactly the leftover this exists to remove, and the
+        // failure would then be reported as a bug in the dedupe.
         h.writer.write_all(b"sync-after-advisory\r").expect("write");
         h.writer.flush().expect("flush");
-        let _ = read_until(
+        let synced = read_until(
             &mut h.reader,
             "echo: sync-after-advisory",
-            Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+        assert!(
+            synced.contains("echo: sync-after-advisory"),
+            "the phase boundary must be reached before phase 2 reads: {synced:?}"
         );
 
         // A second turn boundary, no new mail in between. Long enough for
