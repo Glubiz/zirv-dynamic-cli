@@ -119,6 +119,7 @@ model = "fable"
 # max_entries = 50                   # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_ENTRIES): entries kept before the oldest (by Written) are pruned. Default: 50.
 # max_entry_bytes = 512              # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES): cap on a single entry's body. Default: 512.
 # max_injected_bytes = 2048          # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES): cap on the bank surfaced to a session at once. Default: 2048.
+# shared_enabled = true              # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_SHARED): whether the repo-owned shared bank (<repo>/.zirv/memory/) is read at all. Default: true.
 
 # [chrome]
 # banner = true                      # the launch banner naming the resolved harness, the rule that chose it, and the session id

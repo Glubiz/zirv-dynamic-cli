@@ -194,20 +194,91 @@ fn slug_key(key: &str) -> String {
     }
 }
 
-/// Lists every entry stored for `slug`, oldest-written-first by filename
-/// order (the zero-padded seconds prefix each file name carries). Files that
-/// cannot be read are skipped rather than failing the whole listing. Reads
-/// only `state.memory().join(slug)` -- no repository path is ever consulted,
-/// so nothing checked into a repo can seed, alter, or hide what this
-/// returns.
-pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
-    let dir = state.memory().join(slug);
+/// Which memory bank an operation targets. `Private` is this operator's
+/// pre-existing machine-local bank -- `<state>/memory/<repo_slug>/`,
+/// unchanged by the introduction of scopes. `Shared` is a second,
+/// independent bank meant to be committed with the repository itself:
+/// `<repo>/.zirv/memory/`. Both scopes store the same `Entry` markdown
+/// format through the same parser; only the storage root and trust level
+/// differ. Shared content is repository-owned and therefore UNTRUSTED,
+/// exactly like `.zirv/ctx.toml`'s repo layer: a checkout can fill it with
+/// any text it likes, but nothing here ever reads that text back as
+/// configuration (see `shared_scope_content_is_never_read_back_as_
+/// configuration` below), and `CtxConfig`'s `REPO_FORBIDDEN` list keeps a
+/// repo from even switching the scope on for itself (`MemoryConfig::
+/// shared_enabled`).
+// Consumed by the shared-store, `zirv memory` CLI, and injection work later
+// tasks build on top of it; this task's own tests are its only caller so far.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryScope {
+    Shared,
+    Private,
+}
+
+#[allow(dead_code)]
+impl MemoryScope {
+    /// Whether this scope may be used at all. Each scope has its own
+    /// independent gate under `cfg.memory`, both `REPO_FORBIDDEN`: `Private`
+    /// keeps the pre-existing `enabled`; `Shared` is the new
+    /// `shared_enabled`.
+    pub fn enabled(self, cfg: &CtxConfig) -> bool {
+        match self {
+            MemoryScope::Private => cfg.memory.enabled,
+            MemoryScope::Shared => cfg.memory.shared_enabled,
+        }
+    }
+
+    /// This scope's canonical storage directory, or `None` when the location
+    /// cannot be trusted (`Shared` only -- see `safe_shared_dir`). `Private`
+    /// always resolves; the directory may simply not exist yet, same as
+    /// before scopes existed.
+    pub fn dir(self, repo: &Path, state: &StateDir, slug: &str) -> Option<PathBuf> {
+        match self {
+            MemoryScope::Private => Some(state.memory().join(slug)),
+            MemoryScope::Shared => safe_shared_dir(repo),
+        }
+    }
+}
+
+/// `<repo>/.zirv/memory/`, refused (returned as `None`) if either it or
+/// `<repo>/.zirv` itself is a symlink. A repository checkout can commit a
+/// symlink at either level pointing anywhere on the filesystem; following it
+/// would read (and, once a later task adds writes, write) outside the
+/// repository the operator thinks they are trusting -- the same escape
+/// `optimize.rs`'s `nested_claude_files` refuses for `CLAUDE.md` discovery.
+/// `None` reads the same as "does not exist" to every caller here
+/// (`read_entries`'s own `!dir.is_dir()` short circuit), so an unsafe
+/// location is silently treated as an empty bank rather than an error.
+#[allow(dead_code)]
+fn safe_shared_dir(repo: &Path) -> Option<PathBuf> {
+    let zirv_dir = repo.join(crate::utils::SCRIPT_DIR_NAME);
+    let dir = zirv_dir.join("memory");
+    let is_symlink = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+    };
+    if is_symlink(&zirv_dir) || is_symlink(&dir) {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Core directory scan shared by both scopes: reads every `.md` file in
+/// `dir`, parses it, and skips anything that fails to read -- the same
+/// tolerance every caller of `list` has always had. `skip_symlinks`
+/// additionally refuses to follow a symlinked entry file: irrelevant for the
+/// private scope's own 0700 directory (nothing legitimate ever puts a
+/// symlink there), but load-bearing for the shared scope, where a committed
+/// symlink could otherwise make an arbitrary file on this machine read back
+/// as if it were a memory entry.
+fn read_entries(dir: &Path, skip_symlinks: bool) -> CtxResult<Vec<(PathBuf, Entry)>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
 
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
         .flatten()
+        .filter(|entry| !skip_symlinks || !entry.file_type().is_ok_and(|kind| kind.is_symlink()))
         .map(|entry| entry.path())
         .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md"))
         .collect();
@@ -221,6 +292,44 @@ pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
         out.push((path, parse_markdown(&text)));
     }
     Ok(out)
+}
+
+/// Lists every entry stored for `slug`, oldest-written-first by filename
+/// order (the zero-padded seconds prefix each file name carries). Files that
+/// cannot be read are skipped rather than failing the whole listing. Reads
+/// only `state.memory().join(slug)` -- no repository path is ever consulted,
+/// so nothing checked into a repo can seed, alter, or hide what this
+/// returns.
+pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
+    read_entries(&state.memory().join(slug), false)
+}
+
+/// Lists every entry in `scope`'s bank for this repository, gated on that
+/// scope's own `cfg.memory` switch (see `MemoryScope::enabled`) and, for
+/// `Shared`, on the directory's own safety (`safe_shared_dir`). Both
+/// conditions read the same as an absent bank -- an empty vector, never an
+/// error -- the same "disabled/missing means nothing" contract `list` and
+/// `render_for_prompt` already follow.
+///
+/// This is the one new read seam this task adds. It is not yet wired into
+/// any prompt or CLI verb: ranking, budgeting, a key-addressed write path,
+/// and a `zirv memory` surface for it are later tasks (see issue #31's
+/// non-goals).
+#[allow(dead_code)]
+pub fn list_scoped(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> CtxResult<Vec<(PathBuf, Entry)>> {
+    if !scope.enabled(cfg) {
+        return Ok(Vec::new());
+    }
+    let Some(dir) = scope.dir(repo, state, slug) else {
+        return Ok(Vec::new());
+    };
+    read_entries(&dir, matches!(scope, MemoryScope::Shared))
 }
 
 /// Removes every file whose parsed `Written` timestamp is not among the
@@ -1096,8 +1205,19 @@ This should not appear in the body.\n";
         assert_eq!(listed_b[0].1.key, "only-in-b");
     }
 
+    // N8: this test used to be named `nothing_in_the_repository_checkout_
+    // can_seed_the_bank`, back when there was only one bank. `MemoryScope`
+    // below makes that no longer true system-wide: the whole point of
+    // `Shared` is that a checkout DOES seed a bank. The invariant this test
+    // actually guards -- narrowed, not weakened -- is that the *private*
+    // scope specifically still never reads anything a repo checkout wrote;
+    // see `shared_scope_reads_memory_committed_in_the_repository_checkout`
+    // just below for the shared scope's deliberately opposite behavior, and
+    // `shared_scope_content_is_never_read_back_as_configuration` for the
+    // boundary that still holds for both: repo-owned memory content can
+    // never reach `CtxConfig`.
     #[test]
-    fn nothing_in_the_repository_checkout_can_seed_the_bank() {
+    fn nothing_in_the_repository_checkout_can_seed_the_private_bank() {
         let repo = tempfile::tempdir().expect("tempdir");
         let slug = repo_slug(repo.path());
         let decoy_dir = repo.path().join(".zirv").join("memory").join(&slug);
@@ -1114,7 +1234,238 @@ This should not appear in the body.\n";
         let listed = list(&state, &slug).expect("list");
         assert!(
             listed.is_empty(),
-            "a repo-side memory tree must never be consulted: {listed:?}"
+            "a repo-side memory tree must never seed the private scope: {listed:?}"
+        );
+    }
+
+    // MemoryScope: `Shared` (repo-owned, untrusted, `<repo>/.zirv/memory/`)
+    // vs. `Private` (machine-local, unchanged by this task).
+
+    #[test]
+    fn memory_scope_enabled_reads_its_own_independent_gate() {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.enabled = false;
+        cfg.memory.shared_enabled = true;
+        assert!(!MemoryScope::Private.enabled(&cfg));
+        assert!(MemoryScope::Shared.enabled(&cfg));
+
+        cfg.memory.enabled = true;
+        cfg.memory.shared_enabled = false;
+        assert!(MemoryScope::Private.enabled(&cfg));
+        assert!(!MemoryScope::Shared.enabled(&cfg));
+    }
+
+    #[test]
+    fn shared_scope_resolves_to_a_deterministic_repo_relative_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            Some(repo.path().join(".zirv").join("memory"))
+        );
+    }
+
+    #[test]
+    fn private_scope_dir_is_unchanged_from_before_scopes_existed() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = repo_slug(repo.path());
+        assert_eq!(
+            MemoryScope::Private.dir(repo.path(), &state, &slug),
+            Some(state.memory().join(&slug))
+        );
+    }
+
+    /// A repository checkout can commit a symlink at `.zirv` pointing
+    /// anywhere on the filesystem. Following it would treat an arbitrary
+    /// directory elsewhere on this machine as this repo's shared memory --
+    /// the same escape `optimize.rs`'s `nested_claude_files` refuses for
+    /// `CLAUDE.md` discovery.
+    #[cfg(unix)]
+    #[test]
+    fn shared_scope_refuses_a_symlinked_zirv_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(outside.path().join("memory")).expect("mkdir");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".zirv")).expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            None,
+            "a symlinked .zirv must never be followed"
+        );
+    }
+
+    /// Same escape one level deeper: `.zirv` itself is real, but
+    /// `.zirv/memory` is the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn shared_scope_refuses_a_symlinked_memory_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("secret.md"), "leak").expect("write");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".zirv").join("memory"))
+            .expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            None,
+            "a symlinked .zirv/memory must never be followed"
+        );
+    }
+
+    /// The deliberate counterpart of `nothing_in_the_repository_checkout_
+    /// can_seed_the_private_bank` above: the whole point of the shared scope
+    /// is that a checkout's own committed content is read.
+    #[test]
+    fn shared_scope_reads_memory_committed_in_the_repository_checkout() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("0000000001-shared-fact.md"),
+            sample("shared-fact", 1).to_markdown(),
+        )
+        .expect("write");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.key, "shared-fact");
+    }
+
+    #[test]
+    fn list_scoped_is_empty_when_the_shared_scope_is_disabled() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("0000000001-shared-fact.md"),
+            sample("shared-fact", 1).to_markdown(),
+        )
+        .expect("write");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.shared_enabled = false;
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+        assert!(
+            listed.is_empty(),
+            "a disabled shared scope must report empty even with entries on disk: {listed:?}"
+        );
+    }
+
+    /// A committed symlink inside an otherwise-legitimate shared memory
+    /// directory (rather than at the directory itself) is a narrower version
+    /// of the same escape: `foo.md -> /etc/passwd` would read an arbitrary
+    /// file on this machine back as if it were an innocuous memory entry.
+    #[cfg(unix)]
+    #[test]
+    fn list_scoped_skips_a_symlinked_entry_file_in_the_shared_bank() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("0000000001-real.md"),
+            sample("real", 1).to_markdown(),
+        )
+        .expect("write real entry");
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let leaked = outside.path().join("leaked.md");
+        std::fs::write(&leaked, sample("leaked", 2).to_markdown()).expect("write outside file");
+        std::os::unix::fs::symlink(&leaked, dir.join("0000000002-linked.md")).expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "the symlinked entry is skipped: {listed:?}"
+        );
+        assert_eq!(listed[0].1.key, "real");
+    }
+
+    /// The acceptance-criterion test for issue #31: shared memory is
+    /// repo-owned but must never be able to alter agent binary/model/
+    /// security settings. Reading it back only ever produces `Entry`
+    /// markdown (key/body text) -- `CtxConfig::load` never looks inside
+    /// `.zirv/memory/` at all, so a body engineered to look like forbidden
+    /// `ctx.toml` keys still round-trips as inert text, and loading config
+    /// from the same repository is unaffected.
+    #[test]
+    fn shared_scope_content_is_never_read_back_as_configuration() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let malicious = Entry {
+            key: "sneaky".to_string(),
+            written_by: "attacker".to_string(),
+            written: 1,
+            verified: 1,
+            source: "explicit".to_string(),
+            body:
+                "agent_bin = \"/malicious\"\nagent = \"codex\"\nworker.claude = \"attacker-model\""
+                    .to_string(),
+        };
+        std::fs::write(dir.join("0000000001-sneaky.md"), malicious.to_markdown()).expect("write");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].1.body.contains("agent_bin"),
+            "planted content survives only as inert text: {:?}",
+            listed[0].1.body
+        );
+
+        let empty = env_map(&[]);
+        let loaded = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load config");
+        assert_eq!(
+            loaded.agent, None,
+            "no agent was chosen by planted shared-memory content"
+        );
+        assert_eq!(
+            loaded.agent_bin, None,
+            "no binary was chosen by planted shared-memory content"
         );
     }
 

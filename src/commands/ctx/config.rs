@@ -314,6 +314,10 @@ impl Default for MailConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
+    /// Gate for the **private** (machine-local) memory bank -- the only
+    /// scope that existed before `memory::MemoryScope` -- kept under its
+    /// original name for backward compatibility. `shared_enabled` below is
+    /// the same kind of switch for the newer repo-owned shared scope.
     pub enabled: bool,
     /// Whether facts may be harvested automatically from distilled handoffs.
     /// Off by default: an entry worth keeping across sessions is, for now, a
@@ -327,6 +331,13 @@ pub struct MemoryConfig {
     pub max_entry_bytes: usize,
     /// Cap on how much of the bank is surfaced to a session at once.
     pub max_injected_bytes: usize,
+    /// Gate for the **shared** (repo-owned) memory bank under
+    /// `<repo>/.zirv/memory/` (`memory::MemoryScope::Shared`). Independent of
+    /// `enabled` above, so an operator can turn either scope off without
+    /// touching the other. On by default like every other memory switch;
+    /// nothing yet reads through this gate outside `memory::list_scoped`
+    /// (no prompt-injection or CLI surface consumes it in this change).
+    pub shared_enabled: bool,
 }
 
 impl Default for MemoryConfig {
@@ -337,6 +348,7 @@ impl Default for MemoryConfig {
             max_entries: 50,
             max_entry_bytes: 512,
             max_injected_bytes: 2048,
+            shared_enabled: true,
         }
     }
 }
@@ -734,6 +746,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_MEMORY_SHARED",
+        &["memory", "shared_enabled"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_CHROME_BANNER",
         &["chrome", "banner"],
         EnvKind::Bool,
@@ -916,6 +933,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["memory", "max_injected_bytes"],
         "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
     ),
+    // `shared_enabled` is the same class of decision as `enabled` right
+    // above, for the newer repo-owned scope (`memory::MemoryScope::Shared`):
+    // a checkout must not be able to switch its own shared bank back on for
+    // an operator who disabled it. A separate entry, not folded into
+    // `enabled` above: each memory switch is forbidden individually, the
+    // same granularity `harvest`/`max_entries`/etc. already get.
+    (&["memory", "shared_enabled"], "ZIRV_CTX_MEMORY_SHARED"),
     // A repo checkout must not be able to switch its own dashboard on or off,
     // resize the sidebar, change how long a quit-time roster is offered for
     // restore, or raise its own pane cap -- the operator's terminal, the
@@ -2029,7 +2053,7 @@ mod tests {
     #[test]
     fn memory_defaults_are_enabled_off_harvest_with_sane_caps() {
         let memory = MemoryConfig::default();
-        assert!(memory.enabled, "the memory bank is on by default");
+        assert!(memory.enabled, "the private memory bank is on by default");
         assert!(
             !memory.harvest,
             "automatic harvesting is off by default: remembering is a deliberate act"
@@ -2037,6 +2061,10 @@ mod tests {
         assert_eq!(memory.max_entries, 50);
         assert_eq!(memory.max_entry_bytes, 512);
         assert_eq!(memory.max_injected_bytes, 2048);
+        assert!(
+            memory.shared_enabled,
+            "the shared (repo-owned) scope is on by default too"
+        );
     }
 
     #[test]
@@ -2048,6 +2076,7 @@ mod tests {
             ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "9"),
             ("ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES", "128"),
             ("ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES", "999"),
+            ("ZIRV_CTX_MEMORY_SHARED", "false"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled);
@@ -2055,6 +2084,7 @@ mod tests {
         assert_eq!(cfg.memory.max_entries, 9);
         assert_eq!(cfg.memory.max_entry_bytes, 128);
         assert_eq!(cfg.memory.max_injected_bytes, 999);
+        assert!(!cfg.memory.shared_enabled);
     }
 
     /// N4: `supervise.max_nudges` reads from its own env var like every
@@ -2089,8 +2119,8 @@ mod tests {
 
     /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and
     /// `mail.max_delivered_bytes`: a repo checkout must not be able to seed
-    /// the bank, grow its own cap, or switch automatic harvesting on for
-    /// anyone who runs zirv there.
+    /// the bank, grow its own cap, switch automatic harvesting on, or switch
+    /// its own shared scope back on for anyone who runs zirv there.
     #[test]
     fn a_repository_config_may_not_raise_a_memory_cap_or_enable_harvesting() {
         for (key, value) in [
@@ -2099,6 +2129,7 @@ mod tests {
             ("max_entries", "100000"),
             ("max_entry_bytes", "100000"),
             ("max_injected_bytes", "100000"),
+            ("shared_enabled", "true"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -2129,9 +2160,14 @@ mod tests {
         let env = env_map(&[
             ("ZIRV_CTX_MEMORY", "false"),
             ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "5"),
+            ("ZIRV_CTX_MEMORY_SHARED", "false"),
         ]);
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled, "the environment is the operator");
+        assert!(
+            !cfg.memory.shared_enabled,
+            "including the shared-scope gate"
+        );
         assert_eq!(cfg.memory.max_entries, 5);
     }
 
@@ -2475,6 +2511,7 @@ mod tests {
         ("memory", "max_entries"),
         ("memory", "max_entry_bytes"),
         ("memory", "max_injected_bytes"),
+        ("memory", "shared_enabled"),
         ("chrome", "banner"),
         ("chrome", "bar"),
         ("chrome", "events"),
