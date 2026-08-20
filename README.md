@@ -1258,9 +1258,8 @@ a Git-friendly shared memory bank. What stays forbidden either way is the
 *configuration*, not the content: every `[memory]` key, including
 `shared_enabled`, is repo-forbidden outright -- a checkout may not set any of
 them to any value at all, so it can neither switch either scope's own gate on
-or off for itself, raise its own caps, nor turn on automatic harvesting.
-Only `~/.zirv/ctx.toml`,
-`ZIRV_CTX_*`, or flags (the operator) may. See
+or off for itself, raise its own caps, nor turn on automatic harvesting. Only
+`~/.zirv/ctx.toml`, `ZIRV_CTX_*`, or flags (the operator) may. See
 [Trust boundary](#trust-boundary) above.
 
 ### Consistent sessions
