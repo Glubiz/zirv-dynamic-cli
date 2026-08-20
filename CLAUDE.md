@@ -17,6 +17,11 @@ cargo clippy --all-targets -- -D warnings
 
 - `src/main.rs` — CLI entry point, arg parsing, built-in command dispatch
 - `src/commands/` — Built-in commands (create, init, help, version)
+- `src/commands/workflow/` — Provider-neutral engineering workflows
+  - `skill.rs` / `capability.rs` — versioned skills, layered registry, logical capabilities
+  - `engine.rs` / `classify.rs` — durable phases and deterministic intent/complexity/risk
+  - `verification.rs` / `review.rs` — targeted checks, evidence, review packages/findings
+  - `artifact.rs` / `telemetry.rs` — static-first outputs and privacy-conscious statistics
 - `src/script_runner/` — Script execution engine
   - `script.rs` — Script data model and execution loop
   - `command.rs` — Single command execution with parameter substitution (`${var}`)
@@ -54,6 +59,12 @@ cargo clippy --all-targets -- -D warnings
 - `zirv ctx` is a built-in resolved in `main.rs` before YAML script lookup, so a
   `.zirv/ctx.yaml` script named `ctx` is shadowed. `.zirv/ctx.toml` is the ctx
   config file and is excluded from script listing in `help.rs`.
+- `skill`, `workflow`, `test`, `verify`, and `artifact` are also raw-argv
+  built-ins with an independent clap tree. `.zirv/verify.toml` is reserved
+  from script lookup.
+- Workflow state is Zirv-owned and durable; only the current step's selected
+  skill context is injected. Repository skills are untrusted requests and can
+  never widen operator policy/capabilities.
 - The rot engine is pure: no clock, no filesystem, no environment reads inside
   `rot.rs`, so the same events always produce the same verdict.
 - `wrap` must never make a session worse. No `unwrap`/`expect` on its hot path,

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-19
+last-verified: 2026-08-20
 ---
 
 # Active Work
@@ -16,9 +16,13 @@ Entries use the format:
 
 ## In Progress
 
-_None right now — see Recently Completed below for the latest landed work._
+_None right now — see Recently Completed below for the latest completed implementation._
 
 ## Recently Completed
+
+### Provider-neutral workflow system (`feat/workflow-system`, 2026-08-20, v2.14.0, PR #59)
+**Status (2026-08-20):** Implementation and full-diff acceptance review complete. Issues #47–#56 are covered by the skill/capability registry, built-in skills, durable engine, deterministic classification, verification evidence, review packages/findings, artifacts, custom-skill boundaries, and telemetry. Context/policy/memory dependencies use narrow seams for #43–#46; final CI and external reviewer state are tracked on PR #59.
+**Evidence:** deterministic risk floors and gates, fresh verification/review fingerprints, bounded retry/output/context inputs, custom-skill trust-root tests, 1,675+ unit tests, formatting, Linux/Windows clippy, version-bump check, and documentation coverage/staleness checks are the merge gates on PR #59.
 
 <!-- Cap at ~10 entries; drop the oldest when adding a new one. -->
 

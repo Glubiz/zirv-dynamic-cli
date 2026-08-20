@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-19
+last-verified: 2026-08-20
 ---
 
 # Decision Log
@@ -23,6 +23,20 @@ last-verified: 2026-08-19
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-20 — Workflow history is durable state; only the current skill is prompt context
+**Context:** A methodology implemented as an always-loaded handbook consumes tokens every turn, and conversation-only progress repeats completed work after compaction/resume. The pending shared Context Compiler must not own workflow state itself.
+**Decision:** Persist schema-versioned workflow steps/status/attempts/approvals/findings under Zirv's private state directory. `engine::active_skill_context` renders only the current step's dependency-resolved skill stack; prompt v6 adds that one replaceable layer. Skills name logical Zirv capabilities and never provider tools.
+**Rejected:** Append every skill/workflow instruction to the base prompt — permanent token cost and contradictory phase guidance. Store progress in chat/handoff — compaction can redispatch completed work. Store execution state in committed repo files — creates noisy cross-user conflicts for machine/session progress.
+**Consequences:** The future Context Compiler consumes one narrow renderer and can preserve provenance/budgets without redesigning workflow execution. Repository skills remain untrusted and can request but never grant capabilities. Completion/failure clears the active pointer.
+**Spec / link:** [[Workflows]], issues #43–#56, PR #59.
+
+### 2026-08-20 — Deterministic mechanics live in Zirv; model judgment is bounded to selected skills
+**Context:** Repeatedly asking models to rediscover test commands, choose review depth, carry raw logs, and run open-ended fix loops caused latency and token overhead. Those decisions have stable repository signals and safety limits.
+**Decision:** Zirv classifies path/line/sensitive-surface risk deterministically, selects workflow steps, maps changed paths to configured/discovered checks with full fallback, fingerprints verification, caps review diff/log payloads and retries, and retains only structured telemetry. Models receive concise judgment instructions for the active phase.
+**Rejected:** Always run the full design/test/review ceremony — wastes time on trivial changes. Let the model silently skip gates — completion becomes non-reproducible. Optimize policy autonomously from telemetry — early data cannot safely justify weakening gates.
+**Consequences:** Low-risk work has a fast path; auth/schema surfaces keep a High floor; final claims require fresh evidence; telemetry reports but does not mutate policy. Artifact presentation is static-first because current CLI adapters have no verified native artifact API.
+**Spec / link:** [[Workflows]], issues #51–#56, PR #59.
 
 ### 2026-08-19 — Dashboard click-drag text selection copies via OSC 52, scoped to panes that don't want the mouse themselves (uncommitted, extends PR #29)
 **Context:** Enabling any mouse reporting at all (`?1000`/`?1006`) already displaced the terminal's own native click-drag text selection, and nothing in the dashboard offered a replacement — selecting text out of a pane was simply impossible, a real regression against a plain terminal.

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-13
+last-verified: 2026-08-20
 ---
 
 # Home
@@ -10,11 +10,14 @@ last-verified: 2026-08-13
 graph TB
     CLI[zirv CLI: main.rs] --> DISPATCH{argv dispatch}
     DISPATCH -->|"ctx"| CTX[commands/ctx: verb tree]
+    DISPATCH -->|"skill / workflow / test / verify / artifact"| WF[commands/workflow: development lifecycle]
     DISPATCH -->|help/version/init/create| BUILTINS[commands/: built-ins]
     DISPATCH -->|other| SCRIPTS[script_runner: execute .zirv/ scripts]
 
     SCRIPTS --> STEPS[Command / Commands / Agent steps]
     STEPS -->|Agent step| CTX
+
+    WF --> WFS[skills / state / risk / verification / review / artifacts / telemetry]
 
     CTX --> VERBS[score / handoff / resume / hook / status]
     CTX --> SUPERVISORS[loop / exec / wrap]
@@ -43,6 +46,7 @@ graph TB
 - [[Rot Engine]] — the pure, deterministic transcript-scoring core that produces a `Verdict`.
 - [[Usage and Pacing]] — rolling rate-limit windows, the pacing gate, and the statusline tee.
 - [[Utilities]] — shared file-parsing/name-matching helpers, plus `zirv ctx optimize` and the injected session prompt.
+- [[Workflows]] — model-agnostic skills, durable lifecycle state, risk classification, verification, review packages, artifacts, and telemetry.
 
 ### Concepts
 

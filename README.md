@@ -26,7 +26,8 @@
   - [Directory Structure](#directory-structure)
   - [Schema Examples](#schema-examples)
 - [Shortcuts](#shortcuts)
-- [Reserved Command Names](#reserved-command-names)
+  - [Reserved Command Names](#reserved-command-names)
+- [Development Workflows](#development-workflows)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
 - [Supported Platforms](#supported-platforms)
 - [Contribution](#contribution)
@@ -236,6 +237,7 @@ disabling the harnesses themselves (claude, codex) — a separate file from
 - **Multi-Format**: Supports YAML, JSON, and TOML, extendable.  
 - **Cross-Platform**: Compatible with Windows, macOS, and Linux.
 - **Helpful Errors**: A mistyped script or shortcut name gets up to 3 "did you mean" suggestions instead of a bare failure.
+- **Model-Agnostic Workflows**: Compact skills, durable phase state, risk-based lifecycle selection, targeted verification, independent review packages, artifacts, and local telemetry work across supported agent adapters.
 
 ---
 
@@ -660,7 +662,8 @@ marks it as shadowed in the listing.
 
 ## Reserved Command Names
 
-`help`, `version`, `init`, `create`, `ctx`, `chat`, `agent`, and their short
+`help`, `version`, `init`, `create`, `ctx`, `chat`, `agent`, `skill`,
+`workflow`, `test`, `verify`, `artifact`, and their short
 aliases `h`, `v`, `i`, `c`, are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
 just as much as `chat`, matching how NTFS/APFS resolve script filenames), so
@@ -675,6 +678,43 @@ be invoked:
   creating it anyway; in non-interactive mode (see
   [Creating a New Script](#creating-a-new-script)) the collision is an error
   instead.
+
+## Development Workflows
+
+Zirv owns the high-level development lifecycle outside model conversation
+memory. Only the current phase's selected skill instructions are injected;
+completed phases remain durable private state and are not repeated after a
+session restart or compaction.
+
+```bash
+zirv skill list
+zirv skill show systematic-debugging --agent codex
+zirv workflow classify --task "fix authentication race"
+zirv workflow start bugfix --task "fix authentication race" --agent codex
+zirv workflow start feature --task "use only shipped methodology" --built-in-only
+zirv workflow status
+zirv test changed
+zirv verify
+zirv workflow stats
+```
+
+Built-in workflows cover `feature`, `bugfix`, `refactor`, `spike`, and
+`review`. Deterministic intent/complexity/risk classification selects
+proportional design, approval, test, and review depth; sensitive auth/security
+and database/schema changes cannot be downgraded below High risk.
+
+Optional repository checks live in `.zirv/verify.toml`. Custom skills may be
+shared under `.zirv/skills/` or kept operator-global under
+`~/.zirv/skills/`; `zirv skill list/show` reports the winning source and
+`--built-in-only` disables custom layers. The same flag on `workflow start`
+persists that choice across resume and prompt composition. Repository skills are untrusted:
+they can request logical capabilities but never grant themselves filesystem,
+shell, network, or other permissions.
+
+Use `zirv workflow review package <id>` for a compact diff/test review input,
+`zirv artifact render <path>` for stable static artifact references, and
+`zirv workflow stats` for local bounded telemetry. Telemetry excludes prompts,
+source code, diffs, command output, and model responses by construction.
 
 ## Context Management (zirv ctx)
 

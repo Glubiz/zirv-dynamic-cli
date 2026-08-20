@@ -1,10 +1,11 @@
 ---
-last-verified: 2026-08-19
+last-verified: 2026-08-20
 ---
 
 # Untrusted Configuration
 
 > [!tip] Quick Reference
+> - Repository skills under `.zirv/skills/` are untrusted methodology. They may request logical capabilities but cannot grant permissions or widen an operator policy; symlinked manifests/parents, path escapes, oversized manifests/resolved stacks, unknown schema, and dependency cycles fail safely. `zirv skill list/show --built-in-only` disables custom layers for inspection, while `zirv workflow start --built-in-only` persists the same choice for execution and resume.
 > - A repo checkout is not a trusted operator: `.zirv/ctx.toml`'s repo layer, `.zirv/.settings.toml`'s repo layer, and `<repo>/.zirv/system-prompt.md`'s repo layer are all untrusted input, and `zirv ctx optimize` reads (never writes) the repo's own CLAUDE.md text.
 > - A fourth surface, different in kind: mail (`zirv ctx send`/`inbox`) is text written by another *agent session* on the same machine, not by a repo checkout — capped in size and folded into a headless **Worker** session's prompt (`exec`/`loop`, gated by `cfg.mail.enabled`) as its own labeled layer, never concatenated in unmarked. For an adapter with real system-prompt injection (claude) that means the composed prompt; for one without any injection mechanism at all (codex, `capabilities().system_prompt == false`) the composed prompt never reaches the agent, so the same labeled block is appended directly onto the task prompt text instead (`task_prompt_with_mail_fallback`) — still capped, still labeled, just delivered through the one channel that adapter actually has. An interactive **Orchestrator** session (`chat`) gets only a one-line unread-count advisory, never the message bodies.
 > - A fifth surface, different again: the memory bank (`zirv ctx remember`/`recall`/`forget`) is repository-scoped facts, not repo-checkout config or another session's text — every `memory.*` config key is repo-forbidden (a checkout must not seed the bank, raise its own caps, or switch on automatic harvesting), and harvesting itself (extracting facts from a distilled handoff automatically) defaults **off** because a cheap model's guess can be confidently wrong.
