@@ -157,11 +157,18 @@ pub enum PromptSource {
     /// Sits after the harness layer and before the user layer, and unlike
     /// `Harness` goes to *both* roles; see `with_memory_layer`.
     Memory,
-    /// Canonical repository instructions compiled from `.zirv/context/` for
-    /// the selected harness. Repository-owned and explicitly untrusted.
-    Context,
     User,
     Repo,
+    /// The canonical `.zirv/context/{common,claude,codex}.md` layer (issue
+    /// #44's context compiler, `compile.rs`): zirv-owned, repo-untrusted
+    /// canonical instructions, common content first and a harness-specific
+    /// addition layered on top of it (`context::PrecedenceTier`). Sits after
+    /// `Repo` and before `Mail`/`ReportBack`/`CommandLine`. Folded in by
+    /// `compile::compile` after `compose` returns, not by `compose` itself
+    /// -- the same "a caller adds this layer, but it still gets a
+    /// `PromptSource` variant so `describe()` can name it" shape `Mail` and
+    /// `ReportBack` already have.
+    Context,
     /// Unread mail delivered from `mail::list`. Sits after the repo layer
     /// and before the command-line layer; see `with_mail_layer`.
     Mail,
@@ -358,7 +365,10 @@ const SHARED_BLOCK_END_MARKER: &str = "[end of untrusted repository content]";
 /// off whatever text follows its own copy -- inside the still-untrusted
 /// shared block -- as content beyond it. Both suppressions land in the same
 /// shared-omitted count `with_memory_layer` already reports.
-fn select_memory_within_cap(entries: &[MemoryLine], cap: usize) -> (Vec<&MemoryLine>, usize) {
+pub(crate) fn select_memory_within_cap(
+    entries: &[MemoryLine],
+    cap: usize,
+) -> (Vec<&MemoryLine>, usize) {
     let private: Vec<&MemoryLine> = entries.iter().filter(|e| !e.shared).collect();
     let private_keys: HashSet<String> = private.iter().map(|e| e.key.to_lowercase()).collect();
     let marker_lower = SHARED_BLOCK_END_MARKER.to_lowercase();

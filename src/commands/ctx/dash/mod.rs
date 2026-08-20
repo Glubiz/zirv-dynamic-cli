@@ -1964,9 +1964,11 @@ fn pane_launch_extra(
 /// first (a request is data, never authority -- the same checks an
 /// operator-issued `zirv ctx agent` invocation goes through), then builds
 /// a Worker pane's composed prompt and argv following `exec::run_with`'s own
-/// recipe (`memory::render_for_prompt` -> `prompt::compose` -> mail listing
-/// scoped to this fresh session's own short id -> `prompt::with_mail_layer`
-/// -> `prompt::injection_args_for_session`), and spawns it. `Ok(short)` is
+/// recipe (`compile::compile` -- issue #44, memory, the canonical `.zirv/
+/// context/` layer and the policy report all in one call -- then mail
+/// listing scoped to this fresh session's own short id ->
+/// `prompt::with_mail_layer` -> `prompt::injection_args_for_session`), and
+/// spawns it. `Ok(short)` is
 /// the freshly spawned pane's own registry short id; `Err(reason)` is
 /// exactly the text `spawnreq::SpawnAck::reason` carries back to the
 /// requester.
@@ -2052,9 +2054,9 @@ fn task_prompt_fallback_is_safe(adapter: &dyn AgentAdapter) -> bool {
 /// only once the pane has actually spawned -- `exec::run_with`'s own
 /// discipline).
 ///
-/// Follows `exec::run_with`'s recipe exactly (`memory::render_for_prompt` ->
-/// `prompt::compose` -> mail listing scoped to this fresh session's own short
-/// id -> `prompt::with_mail_layer`), then adds the one layer that is the
+/// Follows `exec::run_with`'s recipe exactly (`compile::compile` -- issue
+/// #44 -- then mail listing scoped to this fresh session's own short id ->
+/// `prompt::with_mail_layer`), then adds the one layer that is the
 /// dashboard's alone: `prompt::with_report_back_layer`, which tells the worker
 /// how to mail its outcome back to the session that requested it (F3).
 ///
@@ -2106,19 +2108,24 @@ fn compose_worker_prompt(
     repo: &Path,
     slug: &str,
 ) -> ComposedWorkerPrompt {
-    let memory_entries = memory::render_for_prompt(state, repo, slug, cfg);
-    let composed = prompt::compose(
+    // Issue #44: gathers memory, the canonical `.zirv/context/` layer, and
+    // attaches the policy report -- see `compile::compile`'s own doc
+    // comment. `slug` is still taken as a parameter (unlike every other
+    // launch path's own `compile` call) because the caller
+    // (`fulfill_spawn_request`) already computed it for its own mail
+    // listing and this function reuses that exact value rather than letting
+    // `compile` recompute an identical one from `repo`.
+    let composed = super::compile::compile(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         false,
-        &cfg.prompt,
+        cfg,
+        adapter,
         prompt::PromptRole::Worker,
-        &memory_entries,
-        cfg.memory.core_max_bytes,
-        &[],
-    );
-    let composed =
-        prompt::with_context_layer(composed, repo, adapter.name(), cfg.prompt.max_repo_bytes);
+        state,
+        super::state::now_secs(),
+    )
+    .composed;
     let system_prompt_supported = adapter.system_prompt_supported(&[]);
     let should_list_mail = cfg.mail.enabled && (composed.is_some() || !system_prompt_supported);
     let mail_entries: Vec<(PathBuf, mail::Message)> = if should_list_mail {

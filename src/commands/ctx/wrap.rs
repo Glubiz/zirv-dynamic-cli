@@ -1228,28 +1228,22 @@ pub fn run_with(
             agent_name.is_some(),
             &args.command,
         );
+    // Still needed standalone below: `pump`'s own best-effort memory-harvest
+    // call on a restart (unrelated to prompt composition, which `compile`
+    // now owns) reads this same slug.
     let memory_slug = super::state::repo_slug(repo);
-    let memory_entries = super::memory::render_for_prompt(&state_dir, repo, &memory_slug, &cfg);
-    // Only an Orchestrator session hears about other harnesses at all: see
-    // `prompt::PromptSource::Harnesses`.
-    let harness_lines = if role == PromptRole::Orchestrator {
-        adapters::harness_prompt_lines(&cfg, adapter.name())
-    } else {
-        Vec::new()
-    };
-    let composed = compose_launch_prompt(
-        &memory_entries,
-        &harness_lines,
+    // Issue #44: gathers memory, the derived harness roster and the
+    // canonical `.zirv/context/` layer, and attaches the policy report --
+    // see `compile::compile`'s own doc comment.
+    let compiled = super::compile::compile(
+        crate::utils::home_dir().ok().as_deref(),
         repo,
-        &cfg,
-        role,
         skip_injection,
-    );
-    let composed = super::prompt::with_context_layer(
-        composed,
-        repo,
-        adapter.name(),
-        cfg.prompt.max_repo_bytes,
+        &cfg,
+        adapter.as_ref(),
+        role,
+        &state_dir,
+        super::state::now_secs(),
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -1257,7 +1251,7 @@ pub fn run_with(
     let (launch_command, composed) = super::prompt::merge_command_line_prompt(
         adapter.as_ref(),
         &args.command,
-        composed,
+        compiled.composed,
         None,
         role,
     );

@@ -311,18 +311,11 @@ pub fn run_with<W: Write>(
     let distiller_model =
         handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
     let state = StateDir::resolve(env)?;
-    // Computed early (`mail_slug` further down reuses this exact value)
-    // because both the memory layer below and the mail layer need a slug,
-    // and the memory layer's own read has to happen before the first
-    // `compose` call.
+    // Still needed standalone: the mail layer below needs a slug, and issue
+    // #44's `compile::compile` (which now owns reading the memory bank; see
+    // its own call below) computes this same slug internally but callers
+    // still need their own copy for mail listing.
     let mail_slug = super::state::repo_slug(repo);
-    // N5: this run's memory bank, already rendered (age included) so
-    // `prompt::compose` itself never has to read a clock. Loaded once, here,
-    // and reused verbatim by the nudge-restart recompose below -- unlike
-    // mail, which is deliberately re-listed narrowly by session on that
-    // path, the memory bank is repo-wide and does not go stale within one
-    // `run_with` call the way a specific session's mailbox does.
-    let memory_entries = super::memory::render_for_prompt(&state, repo, &mail_slug, &cfg);
 
     // A wrapped command that matches no adapter (no explicit `--agent`,
     // detection came up empty) is not actually the agent whose flags we would
@@ -333,15 +326,21 @@ pub fn run_with<W: Write>(
             agent_name.is_some(),
             &args.command,
         );
-    // A Worker session never hears about other harnesses; see
-    // `prompt::PromptSource::Harnesses`.
-    let composed = compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
-    let composed = super::prompt::with_context_layer(
-        composed,
+    // Issue #44: gathers memory, the canonical `.zirv/context/` layer, and
+    // attaches the policy report -- see `compile::compile`'s own doc
+    // comment. A Worker session never hears about the derived harness
+    // roster either way; see `prompt::PromptSource::Harnesses`.
+    let composed = super::compile::compile(
+        crate::utils::home_dir().ok().as_deref(),
         repo,
-        adapter.name(),
-        cfg.prompt.max_repo_bytes,
-    );
+        skip_injection,
+        &cfg,
+        adapter.as_ref(),
+        super::prompt::PromptRole::Worker,
+        &state,
+        now_secs(),
+    )
+    .composed;
     // Known before argv is touched, because it decides how argv is read: the
     // token holding this exact text is the prompt, whatever it looks like.
     let prompt = args
@@ -933,13 +932,29 @@ pub fn run_with<W: Write>(
             // re-listing mail for the session that was just nudged and
             // folding it in through `with_mail_layer` delivers it with zero
             // new injection machinery.
-            let fresh = compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
-            let mut fresh = super::prompt::with_context_layer(
-                fresh,
+            //
+            // Issue #44: goes through `compile::compile` a second time here,
+            // same as the launch-time call above. One small, deliberate
+            // behavior refinement over the pre-compiler code this replaces:
+            // `compile` re-reads the memory bank fresh (it is a pure function
+            // of `state` at call time) rather than reusing the launch-time
+            // `memory_entries` snapshot the old duplicated call passed in
+            // verbatim. The bank is repo-wide and does not go stale *within*
+            // one `run_with` call either way (see the removed comment this
+            // replaced), so this is not a correctness change -- a nudge that
+            // lands after something new was remembered now picks it up
+            // instead of seeing the launch-time snapshot.
+            let mut fresh = super::compile::compile(
+                crate::utils::home_dir().ok().as_deref(),
                 repo,
-                adapter.name(),
-                cfg.prompt.max_repo_bytes,
-            );
+                skip_injection,
+                &cfg,
+                adapter.as_ref(),
+                super::prompt::PromptRole::Worker,
+                &state,
+                now_secs(),
+            )
+            .composed;
             // C7: `registry_short`, not `short_id(session)` -- `session`
             // has just been rotated above, and the nudge's own payload was
             // addressed to the stable registry address the sender resolved.

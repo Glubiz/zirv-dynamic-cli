@@ -188,23 +188,25 @@ pub fn run_with<W: Write>(
         );
 
         let mail_slug = super::state::repo_slug(repo);
-        // N5: re-read every cycle, same as mail below -- each cycle is a
-        // fresh, stateless session, so a fact remembered or verified since
-        // the previous cycle must be picked up too, not a snapshot taken
-        // once before the loop started.
-        let memory_entries = super::memory::render_for_prompt(&state, repo, &mail_slug, &cfg);
         // Recomposed every cycle -- the same seam as `injection_args_for_
         // session` a few lines down -- because each cycle is a fresh,
         // stateless session: it must pick up whatever mail has arrived since
         // the previous cycle, not a snapshot taken once before the loop
-        // started.
-        let composed = compose_cycle_prompt(&memory_entries, repo, &cfg, args.simple);
-        let composed = super::prompt::with_context_layer(
-            composed,
+        // started. Issue #44: `compile::compile` also re-reads the memory
+        // bank fresh every call (N5's own reasoning -- a fact remembered or
+        // verified since the previous cycle must be picked up too), adds the
+        // canonical `.zirv/context/` layer, and attaches the policy report.
+        let composed = super::compile::compile(
+            crate::utils::home_dir().ok().as_deref(),
             repo,
-            adapter.name(),
-            cfg.prompt.max_repo_bytes,
-        );
+            args.simple,
+            &cfg,
+            adapter.as_ref(),
+            super::prompt::PromptRole::Worker,
+            &state,
+            now_fn(),
+        )
+        .composed;
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles. Minted here, ahead of
         // mail listing and the nudge-marker check below, both of which need

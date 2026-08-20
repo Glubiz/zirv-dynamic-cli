@@ -1679,12 +1679,14 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     // A findings run must never fail on a bad config: a malformed ctx.toml or
     // a forbidden key degrades to defaults instead, same spirit as the model
-    // call below. The gate is the one exception: it does not fall back to
-    // `CtxConfig::default()`'s permissive `AgentGate`, because that would let
-    // a malformed *repo* `.settings.toml` silently void an *operator*
-    // disable and launch the agent the operator turned off. Falling back to
-    // `AgentGate::load_operator_only` keeps the operator's policy in force
-    // even when the rest of the config could not be read.
+    // call below. The gate and the policy are the two exceptions: they do not
+    // fall back to `CtxConfig::default()`'s permissive `AgentGate`/
+    // `EffectivePolicy`, because that would let a malformed *repo*
+    // `.settings.toml` silently void an *operator* disable (review finding 1)
+    // or hand the widest possible policy to a config that could not even be
+    // read (issue #44, once policy became load-bearing). `config::degrade_to_
+    // operator_only` substitutes `AgentGate::load_operator_only`/
+    // `EffectivePolicy::fail_closed` for those two fields alone.
     let cfg = match CtxConfig::load(repo, env) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -1692,10 +1694,7 @@ pub fn run_with<W: Write>(
                 w,
                 "zirv ctx optimize: config load failed, using defaults ({e})"
             )?;
-            CtxConfig {
-                agents: crate::settings::AgentGate::load_operator_only(env),
-                ..CtxConfig::default()
-            }
+            super::config::degrade_to_operator_only(env)
         }
     };
     let home = crate::utils::home_dir().ok();

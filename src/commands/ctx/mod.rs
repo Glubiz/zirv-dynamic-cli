@@ -5,6 +5,7 @@ pub mod agent;
 pub mod announce;
 pub mod chat;
 pub mod chrome;
+pub mod compile;
 pub mod config;
 pub mod context;
 pub mod dash;

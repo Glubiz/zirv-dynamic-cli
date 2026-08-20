@@ -254,9 +254,10 @@ impl ContextSurface {
         }
     }
 
-    // No production caller yet for any of the five accessors below --
+    // No production caller yet for the four accessors below --
     // `optimize::Surface::context_surface()` constructs a `ContextSurface`
-    // for future tasks (issue #39) but nothing reads one back yet; the
+    // for future tasks (issue #39) but nothing reads one back yet, except
+    // `trust()` right below (`compile.rs`'s context compiler, issue #44); the
     // module's own tests exercise every accessor in the meantime.
     #[allow(dead_code)]
     pub fn provider(&self) -> Provider {
@@ -281,7 +282,6 @@ impl ContextSurface {
     /// Derived from `scope` alone, never stored independently -- see
     /// `Scope::trust`. There is no way to construct a `ContextSurface` that
     /// names `Trust::Operator` for a repo-owned `scope`.
-    #[allow(dead_code)]
     pub fn trust(&self) -> Trust {
         self.scope.trust()
     }

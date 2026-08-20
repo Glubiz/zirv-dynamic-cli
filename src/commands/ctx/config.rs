@@ -288,6 +288,31 @@ impl Default for PromptConfig {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct ContextConfig {
+    /// Cap on the canonical `.zirv/context/common.md` layer (issue #44's
+    /// context compiler, `compile.rs`). Same rationale as `prompt.max_repo_
+    /// bytes`: untrusted repo text does not get to be long, and the cap
+    /// would be decorative if a repo checkout could simply raise its own
+    /// limit -- see `REPO_FORBIDDEN`.
+    pub max_common_bytes: usize,
+    /// Cap on the canonical harness-specific addition
+    /// (`.zirv/context/claude.md` / `.zirv/context/codex.md`), applied
+    /// independently of `max_common_bytes` since the two files are read and
+    /// truncated separately.
+    pub max_harness_bytes: usize,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            max_common_bytes: 4096,
+            max_harness_bytes: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MailConfig {
     pub enabled: bool,
     /// Cap on a stored message's body. Enforced by `mail::store`, which
@@ -615,6 +640,7 @@ pub struct CtxConfig {
     pub pace: PaceConfig,
     pub optimize: OptimizeConfig,
     pub prompt: PromptConfig,
+    pub context: ContextConfig,
     pub mail: MailConfig,
     pub workflow: WorkflowConfig,
     pub memory: MemoryConfig,
@@ -804,6 +830,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_PROMPT_HARNESSES",
         &["prompt", "harnesses"],
         EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES",
+        &["context", "max_common_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES",
+        &["context", "max_harness_bytes"],
+        EnvKind::Int,
     ),
     ("ZIRV_CTX_MAIL", &["mail", "enabled"], EnvKind::Bool),
     (
@@ -1048,6 +1084,19 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // who turned it off, the same trust asymmetry as `prompt.enabled` and
     // `prompt.repo_layer` right above.
     (&["prompt", "harnesses"], "ZIRV_CTX_PROMPT_HARNESSES"),
+    // The canonical `.zirv/context/{common,claude,codex}.md` layer (issue
+    // #44's compiler) is repo-owned, untrusted content injected into the
+    // composed prompt the same way the repo `system-prompt.md` layer is --
+    // without this a repo checkout could simply raise its own cap, making it
+    // decorative, the same reasoning as `prompt.max_repo_bytes` above.
+    (
+        &["context", "max_common_bytes"],
+        "ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES",
+    ),
+    (
+        &["context", "max_harness_bytes"],
+        "ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES",
+    ),
     // Same rationale as prompt.max_repo_bytes above: mail is folded into the
     // composed prompt as its own layer (`with_mail_layer`), and without this
     // a repo could simply raise its own delivered-mail cap, making it
@@ -1361,6 +1410,28 @@ impl CtxConfig {
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
         cfg.policy = super::policy::resolve(home_policy, repo_policy, env)?;
         Ok(cfg)
+    }
+}
+
+/// The shared "config failed to load" fallback `optimize.rs` (report-only)
+/// and `hook.rs` (the `Stop` hook) both need: neither may hard-fail a run
+/// over a bad config, but degrading all the way to `CtxConfig::default()`
+/// hands back a fully permissive `AgentGate` (review finding 1, see
+/// `hook.rs`'s own `cfg_or_operator_only_gate` doc) and, since issue #44
+/// made `cfg.policy` load-bearing (the context compiler attaches it to every
+/// `CompiledContext`), a fully permissive `EffectivePolicy` too -- `Allow`
+/// on every capability, the widest policy zirv can state, minted from a
+/// config that could not even be parsed. That is a fail-open on the one
+/// surface this module exists to keep narrowing-only. `AgentGate::load_
+/// operator_only` and `EffectivePolicy::fail_closed` are substituted for
+/// those two fields; every other field keeps its ordinary default, since
+/// nothing else in `CtxConfig` is a security boundary the way the gate and
+/// the policy are.
+pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
+    CtxConfig {
+        agents: crate::settings::AgentGate::load_operator_only(env),
+        policy: super::policy::EffectivePolicy::fail_closed(),
+        ..CtxConfig::default()
     }
 }
 
@@ -2030,6 +2101,73 @@ mod tests {
         assert!(
             !cfg.prompt.harnesses,
             "the environment is the operator, not the checkout"
+        );
+    }
+
+    #[test]
+    fn context_defaults_match_prompt_max_repo_bytes() {
+        let context = ContextConfig::default();
+        assert_eq!(context.max_common_bytes, 4096);
+        assert_eq!(context.max_harness_bytes, 4096);
+    }
+
+    #[test]
+    fn a_repo_may_not_raise_its_own_context_budget() {
+        // Same trust boundary as prompt.max_repo_bytes: a repo checkout must
+        // not be able to raise the cap on its own untrusted content.
+        for (key, value) in [
+            ("max_common_bytes", "1000000"),
+            ("max_harness_bytes", "1000000"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[context]\n{key} = {value}\n"),
+            )
+            .expect("write");
+
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(&format!("context.{key}")), "got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_CONTEXT"),
+                "the error names where the operator may set it: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operator_may_still_raise_the_context_budget() {
+        let home_only = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES", "9000"),
+            ("ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES", "8000"),
+        ]);
+        let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.context.max_common_bytes, 9000);
+        assert_eq!(cfg.context.max_harness_bytes, 8000);
+    }
+
+    /// The follow-up PR #67 assigned to issue #44: once `cfg.policy` is
+    /// load-bearing (the context compiler attaches it to every session), the
+    /// shared config-load-failure fallback must not hand back the widest
+    /// possible policy.
+    #[test]
+    fn degrade_to_operator_only_fails_closed_on_policy_not_open() {
+        let empty = env_map(&[]);
+        let degraded = degrade_to_operator_only(&|k| empty.get(k).cloned());
+        assert_eq!(
+            degraded.policy,
+            super::super::policy::EffectivePolicy::fail_closed(),
+            "a failed config load must not silently become the widest (default/Allow) policy"
+        );
+        assert_ne!(
+            degraded.policy,
+            super::super::policy::EffectivePolicy::default(),
+            "fail_closed must differ from the permissive default, or this test proves nothing"
         );
     }
 
@@ -2757,6 +2895,8 @@ mod tests {
         ("prompt", "repo_layer"),
         ("prompt", "max_repo_bytes"),
         ("prompt", "harnesses"),
+        ("context", "max_common_bytes"),
+        ("context", "max_harness_bytes"),
         ("mail", "enabled"),
         ("mail", "max_message_bytes"),
         ("mail", "max_delivered_bytes"),

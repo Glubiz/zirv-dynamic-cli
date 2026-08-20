@@ -141,16 +141,17 @@ fn corrections_in(transcript: &Path, cfg: &CtxConfig) -> usize {
 /// `corrections_in` a fully permissive `AgentGate`, which is exactly the
 /// same trust hole `optimize.rs`'s config-load fallback had (review finding
 /// 1): a malformed *repo* `.settings.toml` would silently revive an agent
-/// the *operator* disabled. Falling back to `AgentGate::load_operator_only`
-/// keeps the operator's policy in force even when the rest of the config
-/// (or the repo settings layer specifically) cannot be read.
+/// the *operator* disabled. It would also, since issue #44 made `cfg.policy`
+/// load-bearing, hand back the widest possible policy from a config that
+/// could not even be read. `config::degrade_to_operator_only` substitutes
+/// `AgentGate::load_operator_only`/`EffectivePolicy::fail_closed` for those
+/// two fields, keeping both the operator's disable and the operator's policy
+/// in force even when the rest of the config (or the repo settings layer
+/// specifically) cannot be read.
 fn cfg_or_operator_only_gate(repo: &Path, env: EnvLookup<'_>) -> CtxConfig {
     match CtxConfig::load(repo, env) {
         Ok(cfg) => cfg,
-        Err(_) => CtxConfig {
-            agents: crate::settings::AgentGate::load_operator_only(env),
-            ..CtxConfig::default()
-        },
+        Err(_) => super::config::degrade_to_operator_only(env),
     }
 }
 
@@ -1073,6 +1074,11 @@ mod tests {
         assert!(
             !cfg.agents.is_enabled("claude"),
             "the operator's disable must survive a repo layer that could not be read"
+        );
+        assert_eq!(
+            cfg.policy,
+            super::super::policy::EffectivePolicy::fail_closed(),
+            "issue #44: a failed config load must fail closed on policy too, not default to Allow"
         );
     }
 

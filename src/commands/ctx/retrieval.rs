@@ -452,13 +452,8 @@ pub fn candidates_for_scope(
 /// to empty rather than erroring (`list_scoped`'s existing contract), so a
 /// disabled scope simply contributes nothing.
 ///
-/// Dormant: not yet wired into any live launch seam. Wiring session
-/// startup itself into a composed prompt is a later task's job (the
-/// context compiler, issue #44) -- this function is the ready-to-use
-/// primitive it should call, the same "dormant read primitive, wired in
-/// later" pattern `memory::list_scoped` followed before issue #33 gave it
-/// a consumer.
-#[allow(dead_code)]
+/// Used by the launch-time context compiler to build the independent
+/// context-ranked retrieval layer on top of core memory.
 pub fn candidates_for_repo(
     state: &StateDir,
     repo: &Path,
