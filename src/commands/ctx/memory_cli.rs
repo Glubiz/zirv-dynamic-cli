@@ -7,13 +7,16 @@
 //! `zirv ctx` -- see `dispatch` below.
 //!
 //! This wraps the scope-generic store `super::memory` already exposes
-//! (`list_scoped`/`get_scoped`/`upsert_scoped`/`forget_scoped`/
-//! `verify_scoped`, `MemoryScope`, `duplicate_keys`) rather than duplicating
-//! any of its logic. The private-scope arm of `remember` reuses
-//! `super::memory::run_remember_with` directly -- the exact code path `zirv
-//! ctx remember` itself calls -- so the two surfaces can never silently drift
-//! apart for that scope; `zirv ctx remember`/`recall`/`forget` are otherwise
-//! untouched by this module and keep working exactly as before.
+//! (`list_scoped`/`upsert_scoped`/`forget_scoped`/`verify_scoped`,
+//! `MemoryScope`, `duplicate_keys`) rather than duplicating any of its
+//! logic. The private-scope arm of `remember` reuses `super::memory::
+//! run_remember_with` directly -- the exact code path `zirv ctx remember`
+//! itself calls -- so the two surfaces can never silently drift apart for
+//! that scope; `zirv ctx remember`/`recall`/`forget` are otherwise untouched
+//! by this module and keep working exactly as before. `recall` (issue #35)
+//! routes through `super::retrieval`'s deterministic ranking engine instead
+//! of the store's own `get_scoped` lookup -- see `run_recall_with`'s own
+//! doc comment for the resulting behavior change.
 //!
 //! Gating: `status`/`list`/`recall` are reads and respect each scope's own
 //! gate (`memory.enabled`/`memory.shared_enabled`) -- a disabled scope
@@ -33,6 +36,7 @@ use super::CtxResult;
 use super::adapters::AGENT_ENV;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::memory::{self, Entry, MemoryScope};
+use super::retrieval::{self, Ranked, RetrievalContext};
 use super::state::{StateDir, now_secs, repo_slug};
 
 #[derive(Debug, Parser)]
@@ -55,8 +59,11 @@ pub enum MemoryVerb {
     Status,
     /// List every entry in one scope (private by default).
     List(ListArgs),
-    /// Find a fact whose key matches `query` exactly, or (failing that)
-    /// whose key or body contains `query` (case-insensitive).
+    /// Rank this scope's entries by relevance to `query` (issue #35): key,
+    /// keyword and tag matches, plus importance/confidence/staleness,
+    /// budgeted by `memory.retrieval_max_bytes`/`retrieval_max_entries`.
+    /// An empty or weak query (no matching signal) returns nothing rather
+    /// than the whole bank.
     Recall(RecallArgs),
     /// Store a durable fact.
     Remember(RememberArgs),
@@ -257,6 +264,63 @@ fn render_entries<W: Write>(
     Ok(0)
 }
 
+/// A ranked `Entry` plus its scope, score, and selection reasons -- the
+/// JSON shape `zirv memory recall --json` emits (issue #35). `scope`
+/// follows `ScopedEntry`'s own rule: derived from which directory was
+/// read, never from the entry's own header.
+#[derive(Serialize)]
+struct RankedEntry<'a> {
+    #[serde(flatten)]
+    entry: &'a Entry,
+    scope: &'static str,
+    score: i64,
+    reasons: &'a [String],
+}
+
+/// Renders a ranking's selected entries. Reuses `ScopedEntry`'s scope-
+/// labeling and the shared-scope trust note from `render_entries`, adding
+/// `score`/`reasons` -- the selection diagnostics issue #35 asks for -- to
+/// both the JSON and human-readable forms.
+fn render_ranked<W: Write>(
+    w: &mut W,
+    ranked: &[Ranked<'_>],
+    scope: MemoryScope,
+    json: bool,
+) -> CtxResult<i32> {
+    let now = now_secs();
+    let label = scope_label(scope);
+    for r in ranked {
+        let entry = &r.candidate.entry;
+        if json {
+            let ranked_entry = RankedEntry {
+                entry,
+                scope: label,
+                score: r.score,
+                reasons: &r.reasons,
+            };
+            writeln!(w, "{}", serde_json::to_string(&ranked_entry)?)?;
+            continue;
+        }
+        let written_days = now.saturating_sub(entry.written) / 86_400;
+        let verified_days = now.saturating_sub(entry.verified) / 86_400;
+        let trust_note = match scope {
+            MemoryScope::Shared => " -- shared: repository-owned content, not operator-verified",
+            MemoryScope::Private => "",
+        };
+        let reasons = if r.reasons.is_empty() {
+            "no signal matched".to_string()
+        } else {
+            r.reasons.join(", ")
+        };
+        writeln!(
+            w,
+            "{} [{label}{trust_note}] (written {written_days}d ago, verified {verified_days}d ago) -- {reasons}\n{}\n",
+            entry.key, entry.body
+        )?;
+    }
+    Ok(0)
+}
+
 pub fn run_list_with<W: Write>(
     args: &ListArgs,
     w: &mut W,
@@ -280,6 +344,15 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W) -> CtxResult<i32> {
     run_list_with(args, w, &repo, &env)
 }
 
+/// Issue #35: routes through the deterministic ranking engine
+/// (`retrieval::rank`/`select`) instead of the old "exact key match, else
+/// substring over key/body" pair. Deliberate behavior change: an exact key
+/// match now ranks first rather than suppressing every other hit -- a
+/// query that also matches other entries by keyword/tag/path can still
+/// surface them, budgeted by `cfg.memory.retrieval_max_bytes`/
+/// `retrieval_max_entries` and never exceeding either. An empty or weak
+/// query (no signal clears the relevance floor) returns nothing, per
+/// issue #35's "never inject the whole bank" requirement.
 pub fn run_recall_with<W: Write>(
     args: &RecallArgs,
     w: &mut W,
@@ -291,20 +364,18 @@ pub fn run_recall_with<W: Write>(
     let slug = repo_slug(repo);
     let scope = scope_of(args.shared);
 
-    if let Some(entry) = memory::get_scoped(scope, repo, &state, &slug, &cfg, &args.query)? {
-        return render_entries(w, std::slice::from_ref(&entry), scope, args.json);
-    }
-
-    let query = args.query.to_ascii_lowercase();
-    let entries: Vec<Entry> = memory::list_scoped(scope, repo, &state, &slug, &cfg)?
-        .into_iter()
-        .map(|(_, e)| e)
-        .filter(|e| {
-            e.key.to_ascii_lowercase().contains(&query)
-                || e.body.to_ascii_lowercase().contains(&query)
-        })
-        .collect();
-    render_entries(w, &entries, scope, args.json)
+    let candidates = retrieval::candidates_for_scope(scope, repo, &state, &slug, &cfg, now_secs())?;
+    let ctx = RetrievalContext {
+        query: args.query.clone(),
+        ..Default::default()
+    };
+    let selection = retrieval::select(
+        &candidates,
+        &ctx,
+        cfg.memory.retrieval_max_bytes,
+        cfg.memory.retrieval_max_entries,
+    );
+    render_ranked(w, &selection.selected, scope, args.json)
 }
 
 pub fn run_recall<W: Write>(args: &RecallArgs, w: &mut W) -> CtxResult<i32> {
@@ -833,8 +904,14 @@ mod tests {
         );
     }
 
+    /// Issue #35 deliberately changed this test's asserted behavior: recall
+    /// now ranks a whole list rather than returning a single dominant
+    /// match, so an exact key match ranking FIRST (not ALONE) is the new
+    /// contract -- a query that also has real signal elsewhere (here, a
+    /// keyword hit in another entry's body) can still surface it, just
+    /// ranked below the exact match.
     #[test]
-    fn recall_prefers_an_exact_key_match_over_a_substring_hit_elsewhere() {
+    fn recall_ranks_an_exact_key_match_ahead_of_a_substring_hit_elsewhere() {
         let repo = crate::commands::ctx::testenv::repo();
         let home = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(home.path());
@@ -880,10 +957,107 @@ mod tests {
         )
         .expect("recall");
         let text = String::from_utf8(out).expect("utf8");
-        assert!(text.contains("\"key\":\"db\""), "got {text}");
+        let db_at = text.find("\"key\":\"db\"").expect("exact match present");
+        let substring_at = text
+            .find("\"key\":\"staging-db-creds\"")
+            .expect("the other entry still has real signal (a keyword hit) and is not suppressed");
         assert!(
-            !text.contains("staging-db-creds"),
-            "an exact key match must not also list a substring hit: {text}"
+            db_at < substring_at,
+            "the exact key match must rank first: {text}"
+        );
+    }
+
+    /// Issue #35's acceptance criterion at the CLI seam: an empty query
+    /// (no signal to rank by) must return nothing, not the whole bank.
+    #[test]
+    fn recall_with_an_empty_query_returns_nothing() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        for key in ["build-cmd", "staging-db-creds", "deploy-notes"] {
+            run_remember_with(
+                &RememberArgs {
+                    key: key.to_string(),
+                    text: format!("body for {key}"),
+                    shared: false,
+                },
+                &mut Vec::new(),
+                repo.path(),
+                &|k| env.get(k).cloned(),
+                &mut stdin,
+            )
+            .expect("remember");
+        }
+
+        let mut out = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                query: String::new(),
+                shared: false,
+                json: true,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("recall");
+        assert!(
+            out.is_empty(),
+            "an empty query must never inject the whole bank: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Issue #35: `zirv memory recall` respects `retrieval_max_entries`,
+    /// not just the pure engine's own unit tests.
+    #[test]
+    fn recall_respects_the_configured_retrieval_entry_cap() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "2"),
+        ]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        for i in 0..5 {
+            run_remember_with(
+                &RememberArgs {
+                    key: format!("release-note-{i}"),
+                    text: "mentions the release process".to_string(),
+                    shared: false,
+                },
+                &mut Vec::new(),
+                repo.path(),
+                &|k| env.get(k).cloned(),
+                &mut stdin,
+            )
+            .expect("remember");
+        }
+
+        let mut out = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                query: "release".to_string(),
+                shared: false,
+                json: true,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("recall");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "the configured entry cap must be respected: {text}"
         );
     }
 

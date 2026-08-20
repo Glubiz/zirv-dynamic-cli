@@ -20,6 +20,7 @@ pub mod pace;
 pub mod poll;
 pub mod prompt;
 pub mod resume;
+pub mod retrieval;
 pub mod rot;
 pub mod run_loop;
 pub mod score;

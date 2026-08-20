@@ -469,6 +469,15 @@ pub fn list_scoped(
 /// silently returning a phantom entry. The parsed key is never overwritten
 /// to paper over the disagreement -- masking a repo-committed inconsistency
 /// would be worse than refusing it outright.
+///
+/// Dormant again as of issue #35: `zirv memory recall`'s exact-match fast
+/// path (its one production caller since issue #33) was replaced by the
+/// ranking engine (`retrieval::select`), which scores every candidate
+/// itself rather than checking for an exact key first. Kept as public
+/// store API -- a future task may still want a direct single-key lookup --
+/// same "dormant read primitive" pattern `MemoryScope`/`list_scoped`
+/// followed before issue #33 gave them a consumer.
+#[allow(dead_code)]
 pub fn get_scoped(
     scope: MemoryScope,
     repo: &Path,
