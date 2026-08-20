@@ -357,7 +357,7 @@ pub fn advance_with_evidence(
                     .into());
                 }
             }
-            state.completed_steps.push(current.id);
+            state.completed_steps.push(current.id.clone());
             state.current_step += 1;
             state.status = match state.current() {
                 None => WorkflowStatus::Completed,
@@ -366,7 +366,7 @@ pub fn advance_with_evidence(
             };
         }
         StepOutcome::Failure => {
-            let attempts = state.attempts.entry(current.id).or_default();
+            let attempts = state.attempts.entry(current.id.clone()).or_default();
             *attempts = attempts.saturating_add(1);
             if *attempts >= current.max_attempts {
                 state.status = WorkflowStatus::Failed;

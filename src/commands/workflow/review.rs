@@ -79,10 +79,11 @@ pub struct VerificationEvidence {
 
 impl From<VerificationReport> for VerificationEvidence {
     fn from(report: VerificationReport) -> Self {
+        let passed = report.passed();
         Self {
             report_id: report.id,
             mode: report.mode,
-            passed: report.passed(),
+            passed,
             fingerprint: report.change_fingerprint,
             checks: report
                 .checks

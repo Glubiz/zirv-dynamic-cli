@@ -279,6 +279,7 @@ fn shell(command: &str, repo: &Path) -> Command {
         value.args(["-c", command]);
         value
     };
+    super::isolate_process_tree(&mut value);
     value.current_dir(repo);
     value
 }
@@ -312,10 +313,7 @@ fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
         .spawn()?;
     std::thread::sleep(Duration::from_millis(300));
     if let Err(error) = open_url(&args.url) {
-        if !crate::commands::ctx::supervise::kill_tree(child.id()) {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
+        super::terminate_process_tree(&mut child)?;
         return Err(error);
     }
     let deadline = Instant::now() + Duration::from_secs(args.lifetime_secs);
@@ -325,10 +323,7 @@ fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if !crate::commands::ctx::supervise::kill_tree(child.id()) {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
+    super::terminate_process_tree(&mut child)?;
     Ok(())
 }
 

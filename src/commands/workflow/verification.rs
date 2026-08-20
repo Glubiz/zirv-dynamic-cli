@@ -205,7 +205,7 @@ pub fn load_or_discover(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
         schema_version: VERIFY_SCHEMA_VERSION,
         checks,
     };
-    config.validate().map_err(|_| {
+    config.validate().map_err(|_| -> Box<dyn std::error::Error> {
         "no verification checks configured or safely discoverable; add .zirv/verify.toml".into()
     })?;
     Ok((config, "discovered"))
@@ -217,7 +217,7 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     if pattern.ends_with('/') {
         return path.starts_with(&pattern);
     }
-    if !pattern.contains(['*', '?']) {
+    if !pattern.contains('*') && !pattern.contains('?') {
         return path == pattern || path.starts_with(&format!("{pattern}/"));
     }
     wildcard_match(pattern.as_bytes(), path.as_bytes())
@@ -299,7 +299,7 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     Ok(input_hash(&input))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VerificationMode {
     Changed,
@@ -307,7 +307,7 @@ pub enum VerificationMode {
     Final,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CheckStatus {
     Passed,
@@ -316,7 +316,7 @@ pub enum CheckStatus {
     DryRun,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckResult {
     pub id: String,
     pub kind: CheckKind,
@@ -328,7 +328,7 @@ pub struct CheckResult {
     pub failure_output: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationReport {
     pub schema_version: u32,
     pub id: String,
@@ -382,6 +382,7 @@ fn run_check(repo: &Path, check: &CheckSpec, dry_run: bool) -> CheckResult {
     }
     let started = Instant::now();
     let mut command = command_for_shell(&check.command);
+    super::isolate_process_tree(&mut command);
     command
         .current_dir(repo)
         .stdin(Stdio::null())
@@ -419,10 +420,7 @@ fn run_check(repo: &Path, check: &CheckSpec, dry_run: bool) -> CheckResult {
                 );
             }
             if started.elapsed() >= timeout {
-                if !crate::commands::ctx::supervise::kill_tree(child.id()) {
-                    let _ = child.kill();
-                }
-                let _ = child.wait();
+                super::terminate_process_tree(&mut child)?;
                 break (CheckStatus::TimedOut, None);
             }
             std::thread::sleep(Duration::from_millis(25));
