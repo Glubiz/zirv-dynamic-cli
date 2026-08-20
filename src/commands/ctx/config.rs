@@ -404,6 +404,18 @@ pub struct MemoryConfig {
     /// independent of `retrieval_max_bytes`'s byte budget -- a ranking that
     /// matches many small entries must not still return dozens of them.
     pub retrieval_max_entries: usize,
+    /// Issue #37: the most durable entries one session's own harvest
+    /// (`memory::harvest_durable`, called at a rot/timeout restart or a
+    /// clean session end) will store, regardless of how many candidates the
+    /// model proposes -- a conservative per-session cap, independent of
+    /// `init_max_entries`, which caps a whole-repository bootstrap batch
+    /// instead of one session's own contribution.
+    pub harvest_max_entries: usize,
+    /// Issue #37: the cumulative byte budget for one session's own harvest,
+    /// summed over every entry it stores -- independent of `max_entry_bytes`
+    /// (which caps a single entry) and of `init_max_bytes` (which caps the
+    /// bootstrap corpus sent to the model, not what gets written back).
+    pub harvest_max_bytes: usize,
 }
 
 impl Default for MemoryConfig {
@@ -418,6 +430,8 @@ impl Default for MemoryConfig {
             core_max_bytes: 2048,
             retrieval_max_bytes: 2048,
             retrieval_max_entries: 6,
+            harvest_max_entries: 5,
+            harvest_max_bytes: 2048,
         }
     }
 }
@@ -870,6 +884,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES",
+        &["memory", "harvest_max_entries"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES",
+        &["memory", "harvest_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_CHROME_BANNER",
         &["chrome", "banner"],
         EnvKind::Bool,
@@ -1114,6 +1138,18 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["memory", "retrieval_max_entries"],
         "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES",
+    ),
+    // Issue #37: a repo checkout must not be able to raise how many entries
+    // or bytes one session's own automatic harvest may store, the same
+    // trust asymmetry as every other memory.* cap above, applied to the new
+    // per-session harvest pair.
+    (
+        &["memory", "harvest_max_entries"],
+        "ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES",
+    ),
+    (
+        &["memory", "harvest_max_bytes"],
+        "ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES",
     ),
     // A repo checkout must not be able to switch its own dashboard on or off,
     // resize the sidebar, change how long a quit-time roster is offered for
@@ -2254,6 +2290,11 @@ mod tests {
         assert_eq!(memory.core_max_bytes, 2048);
         assert_eq!(memory.retrieval_max_bytes, 2048);
         assert_eq!(memory.retrieval_max_entries, 6);
+        assert_eq!(
+            memory.harvest_max_entries, 5,
+            "one session's own harvest stays conservative by default"
+        );
+        assert_eq!(memory.harvest_max_bytes, 2048);
     }
 
     #[test]
@@ -2269,6 +2310,8 @@ mod tests {
             ("ZIRV_CTX_MEMORY_CORE_MAX_BYTES", "1024"),
             ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES", "4096"),
             ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "3"),
+            ("ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES", "2"),
+            ("ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES", "256"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled);
@@ -2280,6 +2323,8 @@ mod tests {
         assert_eq!(cfg.memory.core_max_bytes, 1024);
         assert_eq!(cfg.memory.retrieval_max_bytes, 4096);
         assert_eq!(cfg.memory.retrieval_max_entries, 3);
+        assert_eq!(cfg.memory.harvest_max_entries, 2);
+        assert_eq!(cfg.memory.harvest_max_bytes, 256);
     }
 
     /// N4: `supervise.max_nudges` reads from its own env var like every
@@ -2328,6 +2373,8 @@ mod tests {
             ("core_max_bytes", "100000"),
             ("retrieval_max_bytes", "100000"),
             ("retrieval_max_entries", "100000"),
+            ("harvest_max_entries", "100000"),
+            ("harvest_max_bytes", "100000"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -2362,6 +2409,8 @@ mod tests {
             ("ZIRV_CTX_MEMORY_CORE_MAX_BYTES", "512"),
             ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES", "1024"),
             ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "2"),
+            ("ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES", "3"),
+            ("ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES", "512"),
         ]);
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled, "the environment is the operator");
@@ -2373,6 +2422,8 @@ mod tests {
         assert_eq!(cfg.memory.core_max_bytes, 512);
         assert_eq!(cfg.memory.retrieval_max_bytes, 1024);
         assert_eq!(cfg.memory.retrieval_max_entries, 2);
+        assert_eq!(cfg.memory.harvest_max_entries, 3);
+        assert_eq!(cfg.memory.harvest_max_bytes, 512);
     }
 
     #[test]
@@ -2719,6 +2770,8 @@ mod tests {
         ("memory", "core_max_bytes"),
         ("memory", "retrieval_max_bytes"),
         ("memory", "retrieval_max_entries"),
+        ("memory", "harvest_max_entries"),
+        ("memory", "harvest_max_bytes"),
         ("chrome", "banner"),
         ("chrome", "bar"),
         ("chrome", "events"),

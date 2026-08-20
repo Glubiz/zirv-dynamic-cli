@@ -1954,6 +1954,50 @@ fn redraw_bar_if_due(
     }
 }
 
+/// Issue #37: the clean-session-end companion to the pre-existing rot/
+/// timeout-restart harvest call in the `Action::Restart` arm inside `pump`
+/// below. Called from both places `pump` reports a genuinely clean
+/// `SessionEnded` (a `try_wait` exit and a `PtyClosed` event) -- never from
+/// the relaunch-failed exit further down, which already ran a harvest as
+/// part of its own `Action::Restart` handling just above it: two harvest
+/// model calls at the same boundary is exactly what issue #37's "one entry
+/// point" rule forbids. Gated on `cfg.memory.harvest` here too, before the
+/// transcript is even read, so an operator who left harvesting off never
+/// pays for the read or either model call `memory::harvest_at_session_end`
+/// can make. Best-effort: any failure is discarded, never surfaced to the
+/// caller, so it can never turn a clean exit into a failed one.
+#[allow(clippy::too_many_arguments)]
+fn harvest_at_clean_exit(
+    adapter: &dyn AgentAdapter,
+    transcript: &TranscriptSource,
+    tail_items: usize,
+    distiller_model: &str,
+    distiller_timeout: Duration,
+    repo: &Path,
+    state_dir: &super::state::StateDir,
+    memory_slug: &str,
+    cfg: &CtxConfig,
+) {
+    if !cfg.memory.enabled || !cfg.memory.harvest {
+        return;
+    }
+    let jsonl = transcript
+        .path()
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .unwrap_or_default();
+    let ctx = adapter.structural_context(&jsonl, tail_items);
+    let _ = super::memory::harvest_at_session_end(
+        adapter,
+        distiller_model,
+        &ctx,
+        distiller_timeout,
+        repo,
+        state_dir,
+        memory_slug,
+        cfg,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pump(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -2008,6 +2052,17 @@ fn pump(
                 agent: adapter.name().to_string(),
                 code,
             });
+            harvest_at_clean_exit(
+                adapter,
+                transcript,
+                tail_items,
+                distiller_model,
+                distiller_timeout,
+                repo,
+                state_dir,
+                memory_slug,
+                cfg,
+            );
             return Ok(code);
         }
 
@@ -2019,6 +2074,17 @@ fn pump(
                     agent: adapter.name().to_string(),
                     code,
                 });
+                harvest_at_clean_exit(
+                    adapter,
+                    transcript,
+                    tail_items,
+                    distiller_model,
+                    distiller_timeout,
+                    repo,
+                    state_dir,
+                    memory_slug,
+                    cfg,
+                );
                 return Ok(code);
             }
             supervision.on_event(event, Instant::now());
@@ -2173,10 +2239,11 @@ fn pump(
                 // structural fallback. Best-effort: a harvest failure must
                 // never turn a successful restart into a failed one.
                 if source == "distilled" {
-                    let _ = super::memory::harvest_from_handoff(
+                    let _ = super::memory::harvest_durable(
                         adapter,
                         distiller_model,
                         &note,
+                        repo,
                         state_dir,
                         memory_slug,
                         cfg,

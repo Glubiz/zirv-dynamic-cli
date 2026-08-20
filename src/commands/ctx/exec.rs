@@ -872,6 +872,28 @@ pub fn run_with<W: Write>(
 
         match outcome {
             Outcome::Exited(code) if !limit_hit => {
+                // Issue #37: a clean session end -- no rot, no timeout, no
+                // restart -- previously never harvested at all. Gated on
+                // `cfg.memory.harvest` here too, before the transcript is
+                // even read, so an operator who left harvesting off never
+                // pays for the read or the distiller call this seam can
+                // make. Best-effort, discarded via `let _ =`: a harvest
+                // failure must never turn a successful exit into a failed
+                // one.
+                if cfg.memory.enabled && cfg.memory.harvest {
+                    let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
+                    let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+                    let _ = super::memory::harvest_at_session_end(
+                        adapter.as_ref(),
+                        &distiller_model,
+                        &ctx,
+                        Duration::from_secs(cfg.handoff.timeout_secs),
+                        repo,
+                        &state,
+                        &mail_slug,
+                        &cfg,
+                    );
+                }
                 session_guard.release();
                 return Ok(code);
             }
@@ -1273,10 +1295,11 @@ pub fn run_with<W: Write>(
         // harvest failure must never turn a successful restart into a
         // failed one.
         if source == "distilled" {
-            let _ = super::memory::harvest_from_handoff(
+            let _ = super::memory::harvest_durable(
                 adapter.as_ref(),
                 &distiller_model,
                 &note,
+                repo,
                 &state,
                 &mail_slug,
                 &cfg,

@@ -275,9 +275,13 @@ fn slug_key(key: &str) -> String {
 /// shared_enabled`). A shared `Entry`'s header fields (`Written`, `Verified`,
 /// `Written-By`, `Source`) are themselves attacker-supplied repo content, the
 /// same as the body -- a later task wiring this scope into ranking, recency,
-/// or overwrite-protection decisions (the way `write_harvested` trusts
-/// `Source == "explicit"` for the private scope today) must not treat any of
-/// them as trustworthy signal without its own independent check.
+/// or overwrite-protection decisions must not treat any of them as
+/// trustworthy signal without its own independent check. Issue #37's
+/// `write_durable` deliberately makes no such decision at all: a durable
+/// harvest upserts by key unconditionally, regardless of an existing shared
+/// entry's own `Source`, precisely so it never has to trust this field for
+/// that purpose (the git-diff review before a commit is the actual safety
+/// net for an unwanted overwrite, not a `Source` check here).
 // Consumed by the `zirv memory` CLI (`memory_cli.rs`, issue #33) and any
 // later injection work built on top of this store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1252,16 +1256,54 @@ fn render_prompt_line(entry: Entry, shared: bool) -> super::prompt::MemoryLine {
     }
 }
 
-// N6: harvesting durable repository facts out of a *distilled* handoff
-// (never the mechanical structural fallback -- see the `source == "distilled"`
-// gate at both call sites in exec.rs/wrap.rs), opt-in via `cfg.memory.harvest`
-// (default false: an entry worth keeping across sessions is a deliberate act,
-// not an inferred one). Reuses `handoff::run_model` -- the same one fresh,
-// cheap-model call handoff distillation itself makes, with the same
-// timeout/kill-deadline shape -- rather than inventing a second call
-// mechanism.
+// Issue #37: harvesting durable, repository-wide facts at the end of a
+// session's useful life -- not just a *distilled* mid-session restart (the
+// pre-existing N6 seam) but a genuinely completed session too. Two distinct
+// paths now feed the same one entry point (`harvest_durable`), so a session
+// never makes two competing harvest model calls at the same boundary:
+//   - the pre-existing rot/timeout-restart seams in exec.rs/wrap.rs already
+//     have a freshly *distilled* handoff (`source == "distilled"`, never the
+//     mechanical structural fallback -- see the gate at both call sites) and
+//     hand it straight to `harvest_durable`;
+//   - the new clean-session-end seams (also exec.rs/wrap.rs) have no handoff
+//     yet, so `harvest_at_session_end` distills the transcript itself first,
+//     under the exact same "distilled only" rule, then calls the same
+//     `harvest_durable`.
+// A nudge relaunch deliberately gets neither: it is not rot and not a real
+// session end, just an interruption.
+//
+// Opt-in via `cfg.memory.harvest` (default false: an entry worth keeping
+// across sessions is a deliberate act, not an inferred one). Unlike the
+// pre-issue-#37 harvest, this writes into the SHARED (repo-owned,
+// git-diff-reviewable) bank rather than the private one -- the issue's own
+// acceptance criterion ("shared-memory changes are reviewable with `git
+// diff`") only holds for that scope -- so every harvest call additionally
+// requires `cfg.memory.shared_enabled`, and never writes anywhere but
+// through the ordinary `upsert_scoped(Shared, ...)` path: no `git add`, no
+// commit, ever (see `a_harvest_never_invokes_git` below).
+//
+// Every harvest call is best-effort at every one of its four call sites: the
+// result is discarded with `let _ =`, so a failed or timed-out distiller
+// call, or a write refused by `upsert_shared`, can never turn a successful
+// restart or a clean exit into a failed one.
+//
+// Reuses `handoff::run_model` -- the same one fresh, cheap-model call
+// handoff distillation itself makes, with the same timeout/kill-deadline
+// shape -- rather than inventing a second call mechanism, and reuses the
+// same strict `key: body` line parser (`parse_harvest`) `zirv memory init`
+// already established. What issue #37 actually adds is
+// `filter_durable_candidates`: a PURE, deterministic function -- no model,
+// no filesystem, no clock -- applied to the model's raw candidates before
+// anything is written. The model's own prompt (`durable_harvest_prompt`)
+// already asks for durable facts only and names issue #37's reject
+// categories explicitly, but a cheap distiller model can be confidently
+// wrong: the filter is the deterministic backstop that actually enforces
+// "task progress and temporary TODOs, debugging narration, speculative
+// ideas, generic summaries, and cheaply discoverable facts never reach the
+// bank" -- the model proposes, the filter disposes -- and it is directly
+// testable with no model involved at all.
 
-pub const HARVEST_PROMPT_VERSION: &str = "v1";
+pub const HARVEST_PROMPT_VERSION: &str = "v2";
 
 /// Same shape as `handoff::bullets`, duplicated locally for the same reason
 /// `strip_bullet` above is: this file's edits stay isolated from a module
@@ -1273,21 +1315,31 @@ fn harvest_bullets(items: &[String]) -> String {
     items.iter().map(|i| format!("- {i}\n")).collect()
 }
 
-/// The harvest prompt: durable repository facts only, drawn from `Gotchas
+/// The durable-harvest prompt: repository facts only, drawn from `Gotchas
 /// learned` and `Files touched` -- never `Task`, `Done`, `Remaining` or `Next
-/// step`, which describe *this* task rather than the repository itself.
-/// Explicitly told to answer with nothing when nothing below is durable:
-/// task state slipping into a cross-session bank is worse than an empty
-/// answer, and a cheap model can be confidently wrong, so the instruction
-/// errs toward silence.
-pub fn harvest_prompt(handoff: &super::handoff::Handoff) -> String {
+/// step`, which describe *this* task rather than the repository itself. This
+/// is the handoff-vs-memory separation issue #37 requires: the prompt is its
+/// own extraction over a narrow slice of the handoff, never a request to
+/// store the handoff note itself (see `a_handoff_shaped_note_yields_no_
+/// durable_candidates` below for the parser-level guarantee that backs this
+/// even if a future edit here got it wrong). Names issue #37's reject list
+/// verbatim, and explicitly told to answer with nothing when nothing below
+/// is durable: task state slipping into a cross-session bank is worse than
+/// an empty answer, and a cheap model can be confidently wrong, so the
+/// instruction errs toward silence -- `filter_durable_candidates` is the
+/// deterministic backstop for whenever it doesn't.
+pub fn durable_harvest_prompt(handoff: &super::handoff::Handoff) -> String {
     format!(
         "You are extracting durable REPOSITORY FACTS ({HARVEST_PROMPT_VERSION}) from a handoff \
-note, for a long-lived memory bank that outlives any single task. A durable fact is true about \
-this repository regardless of which task is in progress: a build or test command, where a \
-credential or secret lives, a project convention, a gotcha about how a tool, API or dependency \
-behaves. Task state is NOT durable -- what was done, what remains, or what to do next for the \
-current task must not appear in your answer, even though it is shown below for context.\n\n\
+note, for a long-lived SHARED memory bank that outlives any single task or session. A durable \
+fact is true about this repository regardless of which task is in progress: an architectural \
+decision, a convention, an important constraint or invariant, non-obvious discovered behavior, a \
+durable project preference, or a rejected approach and the reason it was rejected.\n\n\
+Exclude: task progress and temporary TODOs, debugging narration, speculative ideas, generic \
+summaries of what happened this session, and facts cheaply or obviously discoverable from the \
+source itself. Task state -- what was done, what remains, or what to do next for the current \
+task -- is NOT durable and must not appear in your answer, even though it is shown below for \
+context.\n\n\
 Answer with zero or more lines, each exactly `key: body`, one fact per line: key a short, \
 lowercase, kebab-case slug (letters, digits, hyphens only), body one plain sentence. If nothing \
 below is a durable repository fact, answer with nothing at all -- an empty answer is correct and \
@@ -1327,66 +1379,631 @@ pub fn parse_harvest(answer: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Runs one extra distiller call over an already-distilled handoff and
-/// stores whatever durable facts it returns, each through `remember` (so an
-/// existing key is refreshed, not duplicated) with `source = "handoff"`.
-///
-/// Gated on `cfg.memory.harvest` *first*, before anything about the model is
-/// touched, so a disabled operator never pays for a spawn. Any failure or
-/// timeout from the model call propagates as an `Err` and nothing is
-/// written: the answer is parsed and stored only after the whole call has
-/// already succeeded.
-pub fn harvest_from_handoff(
-    adapter: &dyn super::adapters::AgentAdapter,
-    model: &str,
-    handoff: &super::handoff::Handoff,
-    state: &StateDir,
-    slug: &str,
-    cfg: &CtxConfig,
-) -> CtxResult<usize> {
-    // N4: `harvest` is the opt-in for *this* behavior, but `enabled` is the
-    // switch for the bank as a whole -- an operator who turned the bank off
-    // was still having entries written into it, which then simply never got
-    // read back (`render_for_prompt` gates on `enabled` too). Writing to a
-    // store nobody reads is the worst of both: invisible growth, and a
-    // surprise the day the bank is switched back on.
-    if !cfg.memory.enabled || !cfg.memory.harvest {
-        return Ok(0);
-    }
-    let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
-    let answer = super::handoff::run_model(adapter, model, &harvest_prompt(handoff), timeout)?;
-    write_harvested(state, slug, &parse_harvest(&answer), cfg, now_secs())
+/// Pattern-based rejection signals for `filter_durable_candidates`, grouped
+/// by issue #37's own reject-list categories (checked case-insensitively as
+/// a plain substring of a candidate's body). A blunt, deliberately
+/// conservative instrument, not a semantic classifier: the model's own
+/// prompt (`durable_harvest_prompt`) already asks for durable facts only, so
+/// this is the deterministic backstop for whenever a cheap distiller model
+/// answers with task narration anyway. A false positive here (rejecting a
+/// genuinely durable fact that happens to use one of these words) costs
+/// only that one candidate for this one session; a false negative pollutes
+/// the shared bank forever -- ties go to rejecting.
+const REJECT_PATTERNS: &[&str] = &[
+    // Task progress and temporary TODOs.
+    "todo",
+    "to-do",
+    "next step",
+    "still need",
+    "still needs",
+    "still needed",
+    "remains to be",
+    "remaining:",
+    "in progress",
+    "work in progress",
+    " wip ",
+    "left to do",
+    "not yet done",
+    "not done yet",
+    // Debugging narration.
+    "i debugged",
+    "after debugging",
+    "while debugging",
+    "turns out",
+    "stack trace",
+    "traceback",
+    "the error was",
+    "the bug was",
+    "fixed a bug",
+    "debugging session",
+    "root cause was",
+    // Speculative ideas.
+    "might want",
+    "could try",
+    "could consider",
+    "maybe we",
+    "perhaps we",
+    "possibly should",
+    "we could",
+    "it would be nice",
+    "consider switching",
+    "consider trying",
+    // Generic "what happened" summaries.
+    "this session",
+    "in this session",
+    "during this session",
+    "the session",
+    "we implemented",
+    "we added",
+    "we changed",
+    "we ran",
+    "changes were made",
+    "was updated to",
+    // Facts cheaply or obviously discoverable from the source itself.
+    "as seen in the source",
+    "as shown in the code",
+    "you can see in",
+    "the source code shows",
+    "is written in rust",
+    "is a rust project",
+];
+
+/// Whether `body` reads as temporary session state or generic, cheaply
+/// discoverable narration rather than a durable repository fact -- a plain
+/// case-insensitive substring match against `REJECT_PATTERNS`.
+fn is_temporary_or_generic(body: &str) -> bool {
+    let lower = format!(" {} ", body.to_lowercase());
+    REJECT_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
 }
 
-/// Writes the facts a harvest produced, returning how many actually landed.
+/// The durability filter (issue #37): a PURE, deterministic function over
+/// already-parsed `(key, body)` candidates -- no model, no filesystem, no
+/// clock -- so it is directly testable against every reject-list category
+/// with no model involved. This is where "reject temporary/session state"
+/// is actually enforced: the model proposes, this disposes.
 ///
-/// Split out of `harvest_from_handoff` so the rule below is testable without
-/// spawning a model: everything above this point is one `run_model` call, and
-/// everything worth asserting about harvesting is here.
-///
-/// N4: an explicit entry is something a human or a session deliberately asked
-/// to remember; a harvested one is *inferred* from a distilled handoff.
-/// `remember` replaces by key, so an inferred fact could silently overwrite a
-/// deliberate one -- and the deliberate one has by far the stronger claim to
-/// be right. Skipped instead, and logged by key so the skip is visible rather
-/// than silent.
-fn write_harvested(
+/// Applied in order, each check independent of the others: a malformed key
+/// (`validate_shared_key` -- not lowercase kebab-case, too long, all-hyphen,
+/// or a reserved Windows device name) is dropped; a body matching
+/// `is_temporary_or_generic` is dropped; the body is then truncated to
+/// `cfg.memory.max_entry_bytes` (the same per-entry cap every other entry in
+/// this store gets) and dropped entirely if truncation leaves nothing but
+/// whitespace. Only survivors count against the two NEW per-session caps
+/// issue #37 asks for: `cfg.memory.harvest_max_entries` (stops accepting
+/// once reached, keeping the model's own answer order as a priority order,
+/// the same convention `parse_and_validate_init_proposals` already
+/// established) and `cfg.memory.harvest_max_bytes` (a cumulative budget over
+/// every accepted body; a single candidate that alone would blow the
+/// remaining budget is skipped rather than truncated further, so a later,
+/// smaller candidate still gets its chance).
+pub fn filter_durable_candidates(
+    candidates: &[(String, String)],
+    cfg: &CtxConfig,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for (key, body) in candidates {
+        if validate_shared_key(key).is_err() {
+            continue;
+        }
+        if is_temporary_or_generic(body) {
+            continue;
+        }
+        let body = crate::utils::truncate_bytes(body.clone(), Some(cfg.memory.max_entry_bytes));
+        if body.trim().is_empty() {
+            continue;
+        }
+        if bytes + body.len() > cfg.memory.harvest_max_bytes {
+            continue;
+        }
+        bytes += body.len();
+        out.push((key.clone(), body));
+        if out.len() >= cfg.memory.harvest_max_entries {
+            break;
+        }
+    }
+    out
+}
+
+/// Writes an already-filtered batch to the SHARED bank, each entry through
+/// `upsert_scoped(Shared, ...)` -- an existing key (harvested before, or from
+/// `zirv memory init`, or hand-curated) is updated in place rather than
+/// duplicated, exactly the "stable keys, upsert, never append-only" rule
+/// issue #37 asks for. Never touches git: `upsert_shared` (via `state::
+/// write_shared`) only ever writes an ordinary file with a temp-sibling
+/// rename, so a harvest leaves nothing but visible, unstaged working-tree
+/// changes for the operator's own `git add`/`git diff`/commit (see
+/// `a_harvest_never_invokes_git` below). Returns how many entries actually
+/// landed; a write refused partway through (a canonical-key collision from a
+/// hand-edited file, for instance) propagates as `Err`, same as every other
+/// scoped write in this module.
+fn write_durable(
+    repo: &Path,
     state: &StateDir,
     slug: &str,
-    facts: &[(String, String)],
+    accepted: &[(String, String)],
     cfg: &CtxConfig,
     now: u64,
 ) -> CtxResult<usize> {
-    let existing_explicit: std::collections::HashSet<String> = list(state, slug)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, entry)| entry.source == "explicit")
-        .map(|(_, entry)| entry.key)
-        .collect();
-
     let mut written = 0usize;
-    for (key, body) in facts {
-        if existing_explicit.contains(key) {
+    for (key, body) in accepted {
+        let entry = Entry {
+            key: key.clone(),
+            written_by: "harvest".to_string(),
+            written: now,
+            verified: now,
+            source: "harvest".to_string(),
+            body: body.clone(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        upsert_scoped(MemoryScope::Shared, repo, state, slug, cfg, &entry)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// THE single durable-harvest entry point (issue #37): every one of the four
+/// call sites (exec.rs/wrap.rs, each with a restart seam and a
+/// clean-session-end seam) funnels through this one function, so a session
+/// never makes two competing harvest model calls at the same boundary.
+///
+/// Gated on `cfg.memory.enabled && cfg.memory.harvest && cfg.memory.
+/// shared_enabled` *first*, before anything about the model is touched, so a
+/// disabled operator (or one who left harvest on but the shared scope off)
+/// never pays for a spawn -- the same "checked before anything about the
+/// model is touched" ordering `run_memory_init`'s own refusal follows. Any
+/// failure or timeout from the model call propagates as an `Err` and nothing
+/// is written: the answer is parsed, filtered, and stored only after the
+/// whole call has already succeeded.
+pub fn harvest_durable(
+    adapter: &dyn super::adapters::AgentAdapter,
+    model: &str,
+    handoff: &super::handoff::Handoff,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> CtxResult<usize> {
+    if !cfg.memory.enabled || !cfg.memory.harvest || !cfg.memory.shared_enabled {
+        return Ok(0);
+    }
+    let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
+    let answer =
+        super::handoff::run_model(adapter, model, &durable_harvest_prompt(handoff), timeout)?;
+    let candidates = parse_harvest(&answer);
+    let accepted = filter_durable_candidates(&candidates, cfg);
+    write_durable(repo, state, slug, &accepted, cfg, now_secs())
+}
+
+/// The clean-session-end companion to `harvest_durable` (issue #37): a
+/// session that simply ends -- no rot, no timeout, no restart -- previously
+/// never harvested at all. This is the seam `exec.rs`'s and `wrap.rs`'s
+/// clean-exit arms call: it distills the just-ended transcript itself (there
+/// is no already-distilled handoff lying around at a clean exit the way
+/// there is at a restart) and, only when that distillation genuinely
+/// succeeded (`source == "distilled"` -- never the mechanical structural
+/// fallback, which has nothing durable to offer, the exact same rule the
+/// restart seams already apply), hands the result to `harvest_durable`.
+///
+/// Gated on `cfg.memory.enabled && cfg.memory.harvest` first, before the
+/// distiller is even touched, so a disabled operator never pays for either
+/// model call this function can make.
+#[allow(clippy::too_many_arguments)]
+pub fn harvest_at_session_end(
+    adapter: &dyn super::adapters::AgentAdapter,
+    model: &str,
+    ctx: &super::event::StructuralContext,
+    handoff_timeout: std::time::Duration,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> CtxResult<usize> {
+    if !cfg.memory.enabled || !cfg.memory.harvest {
+        return Ok(0);
+    }
+    let (note, source) =
+        super::handoff::distill_or_structural(adapter, model, ctx, handoff_timeout);
+    if source != "distilled" {
+        return Ok(0);
+    }
+    harvest_durable(adapter, model, &note, repo, state, slug, cfg)
+}
+
+// Issue #36: `zirv memory init` bootstraps the SHARED bank for an existing
+// repository, so a team does not have to hand-populate it. Split into the
+// same two halves `harvest_durable`/`write_durable` already
+// established, for the same reason: everything that can be pure and
+// unit-tested without spawning a model IS pure -- corpus collection
+// (`collect_init_corpus`), the prompt (`init_prompt`), parsing plus
+// post-validation (`parse_and_validate_init_proposals`), and applying an
+// already-validated batch to the store (`apply_init_proposals`) -- and only
+// the one judgment call in `run_memory_init` itself touches a model, reusing
+// `handoff::run_model` exactly the way harvesting does.
+
+/// Options threaded through from the `zirv memory init` CLI verb
+/// (`memory_cli::InitArgs`), kept independent of clap here the same way
+/// `harvest_durable` takes plain parameters rather than a clap struct.
+#[derive(Debug, Clone, Default)]
+pub struct InitOptions {
+    /// Print the proposed entries and size report; write nothing.
+    pub dry_run: bool,
+    /// Upsert proposed entries into whatever the shared bank already holds
+    /// (an existing key is updated, a new key is added) instead of
+    /// refusing when the bank is non-empty. Every existing entry the
+    /// proposal doesn't name is left untouched.
+    pub merge: bool,
+    /// Bypass the already-initialized refusal and replace the ENTIRE
+    /// existing shared bank with the freshly proposed one: every
+    /// currently-stored shared entry is removed before the proposal is
+    /// written, unlike `merge`, which only ever adds or updates.
+    pub force: bool,
+    /// Fold plain markdown files read from this path -- an existing docs
+    /// or Obsidian vault -- into the source corpus. Read with the standard
+    /// filesystem only: no Obsidian install or external tool involved.
+    pub from: Option<PathBuf>,
+    /// Include a short, recent `git log` in the source corpus.
+    pub history: bool,
+}
+
+pub const INIT_PROMPT_VERSION: &str = "v1";
+
+/// Root files read verbatim, in this fixed order, when present. Order is
+/// hand-listed rather than derived from a directory scan, so two runs over
+/// an unchanged repository produce byte-identical corpus text -- the
+/// "collection must be deterministic" half of issue #36's contract.
+const INIT_ROOT_DOCS: &[&str] = &[
+    "README.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "ARCHITECTURE.md",
+];
+
+/// Manifest file names checked for, in this fixed order, across the common
+/// ecosystems -- Rust, Node, Python, Go, Ruby, PHP, Java/Gradle, C/CMake,
+/// and a plain Makefile. Not exhaustive; a repository using something else
+/// simply contributes nothing here, the same "absent means skipped, not an
+/// error" tolerance every other corpus section follows.
+const INIT_MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "Gemfile",
+    "composer.json",
+    "requirements.txt",
+    "setup.py",
+    "pom.xml",
+    "build.gradle",
+    "CMakeLists.txt",
+    "Makefile",
+];
+
+/// `.zirv` configuration files read verbatim, in this fixed order. Only
+/// configuration, never the memory bank itself: reading `.zirv/memory/`
+/// back into its own bootstrap corpus would be circular, and the shared
+/// scope's own directory is excluded wholesale from the generic top-level
+/// scans below for the same reason.
+const INIT_ZIRV_CONFIG_FILES: &[&str] = &[".zirv/ctx.toml", ".zirv/.settings.toml"];
+
+/// Directories a repository-structure listing or a docs scan must never
+/// read into: build output, dependency caches, VCS internals, and zirv's
+/// own machine-local/repo-local state. None of this is a durable, committed
+/// project fact -- `.git` and `.zirv` specifically can carry session or task
+/// history, the same class of non-durable content `durable_harvest_prompt`'s own
+/// "task state is NOT durable" rule excludes on the handoff-harvest side.
+/// This is the "temporary/session-state candidates are excluded" half of
+/// issue #36's contract, enforced at collection time rather than left to
+/// the model's own judgment.
+const INIT_EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    ".zirv",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+];
+
+/// Reads `repo.join(rel)` and, if it exists, appends it to `out` under a
+/// `--- <rel> ---` marker naming the file the model is reading. Missing
+/// files are silently skipped -- the same "absent means nothing" tolerance
+/// every other read in this collector follows.
+fn append_file_if_present(out: &mut String, repo: &Path, rel: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(repo.join(rel)) else {
+        return false;
+    };
+    out.push_str(&format!("--- {rel} ---\n{text}\n"));
+    true
+}
+
+/// Plain markdown files under `root`, read with the standard filesystem
+/// only -- no Obsidian dependency, no external tool (issue #36's import
+/// mode). Recurses up to a shallow, fixed depth, skipping Obsidian's own
+/// `.obsidian` config directory and `.git`. Sorted by directory-entry name
+/// at each level for a deterministic, repeatable order.
+///
+/// Follows the same symlink-refusal posture `safe_shared_dir`/`read_entries`
+/// already apply to the shared memory bank itself: neither the root nor any
+/// entry found while walking is ever followed if it is a symlink, so an
+/// imported vault cannot be used to pull arbitrary content from elsewhere on
+/// the machine into the corpus.
+fn markdown_files(root: &Path) -> Vec<PathBuf> {
+    fn is_symlink(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+    }
+
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut items: Vec<_> = entries.flatten().collect();
+        items.sort_by_key(|e| e.file_name());
+        for entry in items {
+            let path = entry.path();
+            if is_symlink(&path) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                if name == ".obsidian" || name == ".git" {
+                    continue;
+                }
+                walk(&path, depth - 1, out);
+            } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md")
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    if root.is_dir() && !is_symlink(root) {
+        walk(root, 6, &mut out);
+    }
+    out
+}
+
+/// Deterministically collects the source corpus `zirv memory init` hands to
+/// its one distiller judgment call: root documentation, manifests, `.zirv`
+/// configuration, a top-level repository-structure listing, a shallow scan
+/// of `docs/`, an optional imported vault (`from`), and an optional recent
+/// git log (`include_history`) -- exactly the surface list issue #36 names.
+/// Nothing here calls a model; every section is a plain, repeatable
+/// filesystem (or, for history, `git log`) read, so the same repository
+/// state always produces the same corpus text. The whole assembled string
+/// is truncated to `cfg.memory.init_max_bytes` as the final step, so a
+/// tight budget always keeps the EARLIEST sections (documentation and
+/// manifests first) rather than whatever happened to be read last.
+pub fn collect_init_corpus(
+    repo: &Path,
+    cfg: &CtxConfig,
+    from: Option<&Path>,
+    include_history: bool,
+) -> String {
+    let mut out = String::new();
+
+    out.push_str("### Project documentation\n");
+    let mut any = false;
+    for name in INIT_ROOT_DOCS {
+        any |= append_file_if_present(&mut out, repo, name);
+    }
+    if !any {
+        out.push_str("(none found)\n");
+    }
+
+    out.push_str("\n### Manifests\n");
+    let mut any = false;
+    for name in INIT_MANIFESTS {
+        any |= append_file_if_present(&mut out, repo, name);
+    }
+    if !any {
+        out.push_str("(none found)\n");
+    }
+
+    out.push_str("\n### .zirv configuration\n");
+    let mut any = false;
+    for rel in INIT_ZIRV_CONFIG_FILES {
+        any |= append_file_if_present(&mut out, repo, rel);
+    }
+    if !any {
+        out.push_str("(none found)\n");
+    }
+
+    out.push_str("\n### Repository structure (top level)\n");
+    if let Ok(entries) = std::fs::read_dir(repo) {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if INIT_EXCLUDED_DIRS.contains(&name.as_str()) {
+                    return None;
+                }
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                Some(if is_dir { format!("{name}/") } else { name })
+            })
+            .collect();
+        names.sort();
+        for name in names {
+            out.push_str(&format!("- {name}\n"));
+        }
+    }
+
+    out.push_str("\n### Selected docs\n");
+    let docs_dir = repo.join("docs");
+    if docs_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&docs_dir)
+    {
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                out.push_str(&format!("--- docs/{name} ---\n{text}\n"));
+            }
+        }
+    }
+
+    if let Some(vault) = from {
+        out.push_str("\n### Imported vault\n");
+        for path in markdown_files(vault) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let rel = path.strip_prefix(vault).unwrap_or(&path).display();
+                out.push_str(&format!("--- {rel} ---\n{text}\n"));
+            }
+        }
+    }
+
+    if include_history {
+        out.push_str("\n### Recent history\n");
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "--oneline", "-n", "20"])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                out.push_str(&String::from_utf8_lossy(&output.stdout));
+            }
+            _ => out.push_str("(unavailable)\n"),
+        }
+    }
+
+    crate::utils::truncate_bytes(out, Some(cfg.memory.init_max_bytes))
+}
+
+/// The bootstrap prompt: asks for the SAME `key: body` line shape
+/// `durable_harvest_prompt` does (so `parse_harvest` can be reused unchanged), but
+/// over a whole-repository corpus rather than one distilled handoff, and
+/// explicitly told to extract durable, decided project knowledge rather
+/// than summarize the repository -- the exact "extract, don't summarize"
+/// distinction issue #36 draws.
+pub fn init_prompt(corpus: &str) -> String {
+    format!(
+        "You are bootstrapping a compact shared MEMORY BANK ({INIT_PROMPT_VERSION}) for a \
+repository, from the project surfaces below, for a long-lived memory bank that outlives any \
+single task or session. Extract DURABLE knowledge a future session would otherwise have to \
+rediscover: architectural decisions, conventions, constraints, non-obvious behavior, important \
+rejected approaches, and durable project preferences.\n\n\
+Do NOT summarize the repository. Exclude: directory listings, obvious facts already stated \
+plainly in the source (a fact worth keeping explains *why*, not *what*), temporary TODOs, \
+session or task history, and speculative ideas that are not decided project reality.\n\n\
+Answer with zero or more lines, each exactly `key: body`, one fact per line: key a short, \
+lowercase, kebab-case slug (letters, digits, hyphens only), body one plain sentence. Prefer a \
+small, high-value set (tens of entries, not hundreds) over an exhaustive one. If nothing below \
+is a durable fact worth keeping, answer with nothing at all -- an empty answer is correct and \
+expected far more often than not. Do not invent a fact that is not evidenced below, and do not \
+answer in markdown, headings, or prose.\n\n\
+{corpus}"
+    )
+}
+
+/// Turns a raw model answer into a validated, storable batch: reuses
+/// `parse_harvest`'s strict `key: body` line parser unchanged (issue #36
+/// asks for the same distiller mechanism the harvest path already uses),
+/// then applies the mandatory post-validation issue #36 requires on top --
+/// every candidate is dropped (never causes the whole batch to fail) rather
+/// than stored malformed:
+///
+/// - a key that fails `validate_shared_key` (not lowercase kebab-case, too
+///   long, all-hyphen, or a reserved Windows device name) is dropped;
+/// - a body is truncated to `cfg.memory.max_entry_bytes`, the same cap
+///   `remember`/`upsert_shared` enforce for every other entry, and dropped
+///   entirely if truncation leaves nothing but whitespace;
+/// - the survivors are capped to `cfg.memory.init_max_entries`, keeping the
+///   model's own answer order as a priority order -- the model's OWN
+///   ordering is treated as this run's priority order, so a batch over the
+///   cap keeps the facts it offered first rather than a random subset.
+fn parse_and_validate_init_proposals(answer: &str, cfg: &CtxConfig) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (key, body) in parse_harvest(answer) {
+        if validate_shared_key(&key).is_err() {
+            continue;
+        }
+        let body = crate::utils::truncate_bytes(body, Some(cfg.memory.max_entry_bytes));
+        if body.trim().is_empty() {
+            continue;
+        }
+        out.push((key, body));
+        if out.len() >= cfg.memory.init_max_entries {
+            break;
+        }
+    }
+    out
+}
+
+/// Outcome of `apply_init_proposals`: how many proposed entries actually
+/// landed, and how many were refused by the N4 guard below because they
+/// would have overwritten an existing explicit entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InitApplyReport {
+    pub written: usize,
+    pub skipped_explicit: usize,
+}
+
+/// Applies an already-validated proposal batch to the shared bank. Never
+/// touches a model -- pure store manipulation over parameters the caller
+/// already computed, exactly like `write_durable` is to `harvest_durable`.
+/// `opts.force` clears every currently-stored shared entry first,
+/// so init behaves like starting over; otherwise (the ordinary case, and
+/// `opts.merge`) each proposed entry is upserted by key -- an existing key
+/// is updated in place, a new key is added, and every entry the proposal
+/// doesn't name is left untouched. The caller is responsible for never
+/// calling this under `opts.dry_run`.
+///
+/// N4 (round-2 finding, mirrors `write_harvested`'s guard exactly): in the
+/// merge path, a model proposal -- steered by untrusted repository content,
+/// same as the harvest distiller's input -- must never silently replace an
+/// existing shared entry a human deliberately wrote (`source == "explicit"`,
+/// e.g. via `zirv memory remember --shared`). Before upserting a key, the
+/// existing shared entry (if any) is read via `get_scoped`; if it exists and
+/// is explicit, the proposal for that key is skipped and logged as
+/// `init-skipped` (same shape as `write_harvested`'s `harvest-skipped`),
+/// rather than silently overwritten. `--force` is exempt and unaffected: it
+/// already cleared every existing shared entry, explicit or not, above --
+/// this remains the documented explicit-overwrite escape hatch, so the guard
+/// is skipped there rather than being a no-op that still pays for a read per
+/// key.
+fn apply_init_proposals(
+    proposals: &[(String, String)],
+    opts: &InitOptions,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> CtxResult<InitApplyReport> {
+    if opts.force {
+        for (path, _) in list_scoped(MemoryScope::Shared, repo, state, slug, cfg)? {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    let now = now_secs();
+    let mut report = InitApplyReport::default();
+    for (key, body) in proposals {
+        if !opts.force
+            && let Some(existing) = get_scoped(MemoryScope::Shared, repo, state, slug, cfg, key)?
+            && existing.source == "explicit"
+        {
+            report.skipped_explicit += 1;
             let _ = super::log::append(
                 state,
                 &super::log::Decision {
@@ -1395,7 +2012,7 @@ fn write_harvested(
                     verb: "memory",
                     verdict: "n/a",
                     score: 0,
-                    action: "harvest-skipped",
+                    action: "init-skipped",
                     detail: &format!("'{key}' is already an explicit entry"),
                 },
             );
@@ -1403,20 +2020,107 @@ fn write_harvested(
         }
         let entry = Entry {
             key: key.clone(),
-            written_by: "harvest".to_string(),
+            written_by: "init".to_string(),
             written: now,
             verified: now,
-            source: "handoff".to_string(),
+            source: "init".to_string(),
             body: body.clone(),
             importance: None,
             confidence: None,
             tags: Vec::new(),
             paths: Vec::new(),
         };
-        remember(state, slug, &entry, cfg)?;
-        written += 1;
+        upsert_scoped(MemoryScope::Shared, repo, state, slug, cfg, &entry)?;
+        report.written += 1;
     }
-    Ok(written)
+    Ok(report)
+}
+
+/// The full `zirv memory init` run: refuse-if-already-initialized, collect
+/// the corpus, make the one model call, validate, report, and (unless
+/// `opts.dry_run`) store. Mirrors `harvest_durable`'s shape -- an
+/// explicit adapter and model, one `handoff::run_model` call -- so this
+/// reuses the exact distiller mechanism the harvest path already
+/// established rather than inventing a second one.
+///
+/// The already-initialized refusal (`!existing.is_empty() && !opts.merge &&
+/// !opts.force`) is checked FIRST, before the corpus is even collected or
+/// the model touched -- the same "checked before anything about the model
+/// is touched" ordering `harvest_durable`'s own gate follows -- so a
+/// plain re-run over a curated bank never spends a model call it is about
+/// to refuse to use. `opts.dry_run` does NOT bypass this refusal: a dry run
+/// previews what a real run would do, including a real run's own refusal.
+#[allow(clippy::too_many_arguments)]
+pub fn run_memory_init<W: Write>(
+    adapter: &dyn super::adapters::AgentAdapter,
+    model: &str,
+    opts: &InitOptions,
+    w: &mut W,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> CtxResult<i32> {
+    let existing = list_scoped(MemoryScope::Shared, repo, state, slug, cfg)?;
+    if !existing.is_empty() && !opts.merge && !opts.force {
+        return Err(format!(
+            "zirv memory init: the shared memory bank already has {} entr{} in {}/memory; \
+             rerun with --merge to add to it or --force to replace it entirely",
+            existing.len(),
+            if existing.len() == 1 { "y" } else { "ies" },
+            crate::utils::SCRIPT_DIR_NAME,
+        )
+        .into());
+    }
+
+    let corpus = collect_init_corpus(repo, cfg, opts.from.as_deref(), opts.history);
+    let prompt = init_prompt(&corpus);
+    let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
+    let answer = super::handoff::run_model(adapter, model, &prompt, timeout)?;
+    let proposals = parse_and_validate_init_proposals(&answer, cfg);
+
+    let stored_bytes: usize = proposals.iter().map(|(_, body)| body.len()).sum();
+    let injected_estimate = stored_bytes.min(cfg.memory.core_max_bytes);
+    writeln!(
+        w,
+        "zirv memory init: {} proposed entr{} (~{stored_bytes} bytes stored, ~{injected_estimate} \
+         bytes estimated injected){}",
+        proposals.len(),
+        if proposals.len() == 1 { "y" } else { "ies" },
+        if opts.dry_run {
+            " -- dry run, nothing written"
+        } else {
+            ""
+        },
+    )?;
+    for (key, body) in &proposals {
+        writeln!(w, "  {key}: {body}")?;
+    }
+
+    if opts.dry_run || proposals.is_empty() {
+        return Ok(0);
+    }
+
+    let report = apply_init_proposals(&proposals, opts, repo, state, slug, cfg)?;
+    writeln!(
+        w,
+        "zirv memory init: stored {} entries in the shared bank{}",
+        report.written,
+        if report.skipped_explicit > 0 {
+            format!(
+                ", skipped {} (already explicit entr{})",
+                report.skipped_explicit,
+                if report.skipped_explicit == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            )
+        } else {
+            String::new()
+        }
+    )?;
+    Ok(0)
 }
 
 #[derive(Debug, clap::Args)]
@@ -2712,7 +3416,7 @@ This should not appear in the body.\n";
         );
     }
 
-    // N6: handoff -> memory harvest.
+    // Issue #37: durable shared-memory harvest at session end.
 
     fn fixture(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2742,6 +3446,7 @@ This should not appear in the body.\n";
     /// would fail to spawn at all is enough to prove nothing was spawned.
     #[test]
     fn harvesting_is_off_unless_the_operator_turns_it_on() {
+        let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let cfg = CtxConfig::default();
@@ -2750,23 +3455,28 @@ This should not appear in the body.\n";
             "/nonexistent/model-binary",
         ));
 
-        let count = harvest_from_handoff(
+        let count = harvest_durable(
             &adapter,
             "haiku",
             &sample_handoff(),
+            repo.path(),
             &state,
             "-work-repo",
             &cfg,
         )
         .expect("a disabled harvest is not an error, just a no-op");
         assert_eq!(count, 0);
-        assert!(list(&state, "-work-repo").expect("list").is_empty());
+        assert!(
+            list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+                .expect("list")
+                .is_empty()
+        );
     }
 
     #[test]
-    fn a_harvest_records_only_durable_repository_facts_not_task_state() {
+    fn a_harvest_names_the_issue_37_reject_list_and_excludes_task_state() {
         let handoff = sample_handoff();
-        let prompt = harvest_prompt(&handoff);
+        let prompt = durable_harvest_prompt(&handoff);
         assert!(prompt.contains("Gotchas learned"), "got {prompt}");
         assert!(prompt.contains("Files touched"), "got {prompt}");
         assert!(
@@ -2786,6 +3496,18 @@ This should not appear in the body.\n";
             !prompt.contains("## Task"),
             "no handoff task section leaks in"
         );
+        for needle in [
+            "temporary todo",
+            "debugging narration",
+            "speculative ideas",
+            "generic",
+            "cheaply or obviously discoverable",
+        ] {
+            assert!(
+                prompt.to_lowercase().contains(needle),
+                "the prompt must name issue #37's own reject category '{needle}': {prompt}"
+            );
+        }
 
         // Strict parse: only well-formed `key: body` lines with a lowercase
         // kebab-case key survive; everything else -- prose, a capitalized
@@ -2805,15 +3527,216 @@ This should not appear in the body.\n";
         );
     }
 
-    /// N4: `harvest` is the opt-in for harvesting, but `enabled` governs the
-    /// bank as a whole. With the bank off, `render_for_prompt` returns
-    /// nothing -- so harvesting into it was writing to a store nobody reads.
+    /// Issue #37, design decision 6: the durable pass is its own extraction,
+    /// never a dump of the handoff note itself. Proven at the parser
+    /// boundary: a handoff's own `to_markdown()` output -- `## Task`, `##
+    /// Done`, bulleted lists, no `key: body` lines anywhere in it -- must
+    /// parse to zero durable candidates. No model involved: if a distiller
+    /// ever answered with the handoff note verbatim instead of extracting
+    /// from it, this is the deterministic reason nothing would land in the
+    /// bank anyway.
+    #[test]
+    fn a_handoff_shaped_note_yields_no_durable_candidates() {
+        let note = sample_handoff();
+        let markdown = note.to_markdown();
+        let candidates = parse_harvest(&markdown);
+        assert!(
+            candidates.is_empty(),
+            "a handoff's own markdown must never parse as durable key:body facts: {candidates:?}"
+        );
+    }
+
+    // Pure filter tests (`filter_durable_candidates`): no model, no
+    // filesystem, no clock -- these are the real local signal for issue
+    // #37's "reject temporary/session state" requirement.
+
+    #[test]
+    fn filter_rejects_task_progress_and_temporary_todos() {
+        let cfg = CtxConfig::default();
+        let candidates = vec![(
+            "auth-rate-limit".to_string(),
+            "TODO: still need to add rate limiting before merging".to_string(),
+        )];
+        assert!(filter_durable_candidates(&candidates, &cfg).is_empty());
+    }
+
+    #[test]
+    fn filter_rejects_debugging_narration() {
+        let cfg = CtxConfig::default();
+        let candidates = vec![(
+            "webhook-bug".to_string(),
+            "After debugging for a while, turns out the root cause was a race condition."
+                .to_string(),
+        )];
+        assert!(filter_durable_candidates(&candidates, &cfg).is_empty());
+    }
+
+    #[test]
+    fn filter_rejects_speculative_ideas() {
+        let cfg = CtxConfig::default();
+        let candidates = vec![(
+            "db-choice".to_string(),
+            "We might want to consider switching to postgres eventually.".to_string(),
+        )];
+        assert!(filter_durable_candidates(&candidates, &cfg).is_empty());
+    }
+
+    #[test]
+    fn filter_rejects_generic_what_happened_summaries() {
+        let cfg = CtxConfig::default();
+        let candidates = vec![(
+            "session-recap".to_string(),
+            "In this session we implemented the payments webhook and ran the tests.".to_string(),
+        )];
+        assert!(filter_durable_candidates(&candidates, &cfg).is_empty());
+    }
+
+    #[test]
+    fn filter_rejects_facts_cheaply_discoverable_from_source() {
+        let cfg = CtxConfig::default();
+        let candidates = vec![(
+            "project-language".to_string(),
+            "This is a Rust project, as seen in the source code.".to_string(),
+        )];
+        assert!(filter_durable_candidates(&candidates, &cfg).is_empty());
+    }
+
+    #[test]
+    fn filter_accepts_a_genuinely_durable_fact() {
+        let cfg = CtxConfig::default();
+        let candidates = vec![(
+            "staging-db-creds".to_string(),
+            "The staging DB creds live in 1Password under staging-db.".to_string(),
+        )];
+        let accepted = filter_durable_candidates(&candidates, &cfg);
+        assert_eq!(accepted.len(), 1, "a real fact must survive: {accepted:?}");
+    }
+
+    #[test]
+    fn filter_drops_a_malformed_key() {
+        let cfg = CtxConfig::default();
+        let candidates = vec![("Not Kebab Case".to_string(), "a real fact".to_string())];
+        assert!(filter_durable_candidates(&candidates, &cfg).is_empty());
+    }
+
+    #[test]
+    fn filter_enforces_the_per_session_entry_cap_in_priority_order() {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest_max_entries = 2;
+        let candidates: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("fact-{i}"), "a genuinely durable fact".to_string()))
+            .collect();
+        let accepted = filter_durable_candidates(&candidates, &cfg);
+        assert_eq!(
+            accepted,
+            vec![
+                ("fact-0".to_string(), "a genuinely durable fact".to_string()),
+                ("fact-1".to_string(), "a genuinely durable fact".to_string()),
+            ],
+            "capped to harvest_max_entries, keeping the model's own priority order: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn filter_enforces_the_per_session_byte_cap() {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest_max_bytes = 10;
+        let candidates = vec![
+            ("fact-a".to_string(), "0123456789".to_string()),
+            ("fact-b".to_string(), "more text".to_string()),
+        ];
+        let accepted = filter_durable_candidates(&candidates, &cfg);
+        assert_eq!(
+            accepted,
+            vec![("fact-a".to_string(), "0123456789".to_string())],
+            "the second candidate would blow the total budget: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn filter_skips_an_oversized_candidate_rather_than_blocking_smaller_ones_after_it() {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest_max_bytes = 10;
+        let candidates = vec![
+            (
+                "fact-big".to_string(),
+                "this body alone is already too long".to_string(),
+            ),
+            ("fact-small".to_string(), "tiny".to_string()),
+        ];
+        let accepted = filter_durable_candidates(&candidates, &cfg);
+        assert_eq!(
+            accepted,
+            vec![("fact-small".to_string(), "tiny".to_string())],
+            "an oversized candidate is skipped, not a hard stop: {accepted:?}"
+        );
+    }
+
+    /// Issue #37: shared writes must remain ordinary visible working-tree
+    /// changes -- Zirv must never auto-commit them. No model involved: this
+    /// exercises the write path directly against a real `git init`-ed
+    /// repository and asserts no commit was ever created.
+    #[test]
+    fn a_harvest_never_invokes_git() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .arg("init")
+            .arg("--quiet")
+            .status();
+        if !matches!(init, Ok(status) if status.success()) {
+            eprintln!("skipping a_harvest_never_invokes_git: no usable git binary");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let accepted = vec![("build-cmd".to_string(), "cargo build --release".to_string())];
+        write_durable(repo.path(), &state, "-work-repo", &accepted, &cfg, 1_000)
+            .expect("write_durable");
+
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert!(
+            !log.status.success() || log.stdout.is_empty(),
+            "a harvest must never create a commit: {}",
+            String::from_utf8_lossy(&log.stdout)
+        );
+
+        // `--untracked-files=all` (not the default `normal`, which collapses
+        // a wholly-untracked directory to one `?? .zirv/` line) so the
+        // harvested file itself shows up in the listing, not just its parent
+        // directory.
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("git status");
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status_text.contains("build-cmd.md"),
+            "the write must land as an ordinary, unstaged working-tree change: {status_text}"
+        );
+    }
+
+    /// N4: `harvest` is the opt-in for harvesting, but `enabled`/
+    /// `shared_enabled` govern the bank as a whole. With either off,
+    /// `render_for_prompt`/`list_scoped` return nothing for the shared scope
+    /// -- so harvesting into it was writing to a store nobody reads.
     ///
     /// Runs everywhere: the gate short-circuits before `run_model`, so no
     /// model is ever spawned (which is also why the fake-model adapter is
     /// deliberately left unarmed here).
     #[test]
     fn harvest_is_inert_when_the_bank_is_disabled() {
+        let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut cfg = CtxConfig::default();
@@ -2821,10 +3744,11 @@ This should not appear in the body.\n";
         cfg.memory.harvest = true;
         let adapter = fake_model_adapter();
 
-        let count = harvest_from_handoff(
+        let count = harvest_durable(
             &adapter,
             "haiku",
             &sample_handoff(),
+            repo.path(),
             &state,
             "-work-repo",
             &cfg,
@@ -2833,42 +3757,48 @@ This should not appear in the body.\n";
 
         assert_eq!(count, 0);
         assert!(
-            list(&state, "-work-repo").expect("list").is_empty(),
+            list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+                .expect("list")
+                .is_empty(),
             "nothing may be written into a bank the operator turned off"
         );
 
-        // And the other half of the gate still holds on its own.
-        let mut harvest_off = CtxConfig::default();
-        harvest_off.memory.enabled = true;
-        harvest_off.memory.harvest = false;
-        assert_eq!(
-            harvest_from_handoff(
-                &adapter,
-                "haiku",
-                &sample_handoff(),
-                &state,
-                "-work-repo",
-                &harvest_off
-            )
-            .expect("no-op"),
-            0
-        );
+        // The other two halves of the gate hold on their own too.
+        for (enabled, harvest, shared_enabled) in [(true, false, true), (true, true, false)] {
+            let mut variant = CtxConfig::default();
+            variant.memory.enabled = enabled;
+            variant.memory.harvest = harvest;
+            variant.memory.shared_enabled = shared_enabled;
+            assert_eq!(
+                harvest_durable(
+                    &adapter,
+                    "haiku",
+                    &sample_handoff(),
+                    repo.path(),
+                    &state,
+                    "-work-repo",
+                    &variant,
+                )
+                .expect("no-op"),
+                0
+            );
+        }
     }
 
-    /// N4: `remember` replaces by key, so an inferred fact could silently
-    /// overwrite one a human or a session deliberately asked to remember --
-    /// and the deliberate entry has by far the stronger claim to be right.
-    ///
-    /// Exercises `write_harvested` directly rather than through
-    /// `harvest_from_handoff`, so the rule is covered without spawning a
-    /// model (the spawn path is `sh`-based and unavailable on this platform).
+    /// Issue #37, design decision 3: re-harvesting an existing key upserts
+    /// it, regardless of who or what wrote the existing entry -- there is no
+    /// "protect explicit/init entries" special case the way the pre-#37
+    /// private-scope harvest had. The shared scope's own git-diff review is
+    /// the safety net for an unwanted overwrite, not a `Source` check here
+    /// (see the doc comment on `MemoryScope::Shared` and on `write_durable`).
     #[test]
-    fn a_harvested_fact_never_overwrites_an_explicit_entry() {
+    fn a_durable_harvest_updates_any_existing_key_rather_than_duplicating_it() {
+        let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let cfg = CtxConfig::default();
 
-        let explicit = Entry {
+        let existing = Entry {
             key: "build-cmd".to_string(),
             written_by: "claude".to_string(),
             written: 1_000,
@@ -2880,81 +3810,41 @@ This should not appear in the body.\n";
             tags: Vec::new(),
             paths: Vec::new(),
         };
-        remember(&state, "-work-repo", &explicit, &cfg).expect("remember");
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            &existing,
+        )
+        .expect("seed");
 
-        let facts = vec![
+        let accepted = vec![
             (
                 "build-cmd".to_string(),
-                "cargo build (inferred)".to_string(),
+                "cargo build (harvested)".to_string(),
             ),
-            ("test-cmd".to_string(), "cargo test (inferred)".to_string()),
+            ("test-cmd".to_string(), "cargo test (harvested)".to_string()),
         ];
-        let written =
-            write_harvested(&state, "-work-repo", &facts, &cfg, 2_000).expect("harvest writes");
+        let written = write_durable(repo.path(), &state, "-work-repo", &accepted, &cfg, 2_000)
+            .expect("harvest writes");
+        assert_eq!(written, 2, "both candidates land: {accepted:?}");
 
-        assert_eq!(
-            written, 1,
-            "only the fact with no explicit entry is written"
-        );
-
-        let kept = get(&state, "-work-repo", "build-cmd")
-            .expect("find")
-            .expect("the explicit entry is still there");
-        assert_eq!(
-            kept.body, explicit.body,
-            "the deliberate entry survives untouched"
-        );
-        assert_eq!(kept.source, "explicit");
-        assert_eq!(kept.written, 1_000, "not even its timestamps are disturbed");
-
-        let added = get(&state, "-work-repo", "test-cmd")
-            .expect("find")
-            .expect("the un-contested fact is written");
-        assert_eq!(added.source, "handoff");
-
-        // The skip is visible rather than silent.
-        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
-        assert!(
-            log.contains("harvest-skipped") && log.contains("build-cmd"),
-            "the skipped key must be named in the decision log: {log}"
-        );
-    }
-
-    /// A harvested fact may still refresh an earlier *harvested* one -- the
-    /// protection is for deliberate entries only, not a freeze on the bank.
-    #[test]
-    fn a_harvested_fact_still_refreshes_an_earlier_harvested_one() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
-        let cfg = CtxConfig::default();
-
-        let earlier = Entry {
-            key: "build-cmd".to_string(),
-            written_by: "harvest".to_string(),
-            written: 1_000,
-            verified: 1_000,
-            source: "handoff".to_string(),
-            body: "old inference".to_string(),
-            importance: None,
-            confidence: None,
-            tags: Vec::new(),
-            paths: Vec::new(),
-        };
-        remember(&state, "-work-repo", &earlier, &cfg).expect("remember");
-
-        let facts = vec![("build-cmd".to_string(), "new inference".to_string())];
-        assert_eq!(
-            write_harvested(&state, "-work-repo", &facts, &cfg, 2_000).expect("harvest"),
-            1
-        );
-        let refreshed = get(&state, "-work-repo", "build-cmd")
-            .expect("find")
-            .expect("still there");
-        assert_eq!(refreshed.body, "new inference");
+        let listed = list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+            .expect("list");
+        let build_cmd: Vec<_> = listed
+            .iter()
+            .filter(|(_, e)| e.key == "build-cmd")
+            .collect();
+        assert_eq!(build_cmd.len(), 1, "updated, not duplicated: {listed:?}");
+        assert_eq!(build_cmd[0].1.body, "cargo build (harvested)");
+        assert_eq!(build_cmd[0].1.source, "harvest");
     }
 
     #[test]
     fn a_harvest_that_returns_nothing_writes_nothing() {
+        let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut cfg = CtxConfig::default();
@@ -2966,10 +3856,11 @@ This should not appear in the body.\n";
         // later test in this process.
         let _mode =
             crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("garbage"))]);
-        let result = harvest_from_handoff(
+        let result = harvest_durable(
             &adapter,
             "haiku",
             &sample_handoff(),
+            repo.path(),
             &state,
             "-work-repo",
             &cfg,
@@ -2978,11 +3869,16 @@ This should not appear in the body.\n";
             result.expect("prose with no colon still succeeds, just empty"),
             0
         );
-        assert!(list(&state, "-work-repo").expect("list").is_empty());
+        assert!(
+            list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+                .expect("list")
+                .is_empty()
+        );
     }
 
     #[test]
     fn a_distiller_failure_or_timeout_leaves_the_bank_untouched() {
+        let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut cfg = CtxConfig::default();
@@ -2991,10 +3887,11 @@ This should not appear in the body.\n";
 
         let _mode =
             crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("fail"))]);
-        let result = harvest_from_handoff(
+        let result = harvest_durable(
             &adapter,
             "haiku",
             &sample_handoff(),
+            repo.path(),
             &state,
             "-work-repo",
             &cfg,
@@ -3004,11 +3901,16 @@ This should not appear in the body.\n";
             result.is_err(),
             "a failing distiller call must surface as an error"
         );
-        assert!(list(&state, "-work-repo").expect("list").is_empty());
+        assert!(
+            list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+                .expect("list")
+                .is_empty()
+        );
     }
 
     #[test]
-    fn a_harvested_entry_is_marked_as_coming_from_a_handoff() {
+    fn a_harvested_entry_is_marked_as_coming_from_a_harvest_and_lands_in_the_shared_bank() {
+        let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut cfg = CtxConfig::default();
@@ -3017,10 +3919,11 @@ This should not appear in the body.\n";
 
         let _mode =
             crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
-        let count = harvest_from_handoff(
+        let count = harvest_durable(
             &adapter,
             "haiku",
             &sample_handoff(),
+            repo.path(),
             &state,
             "-work-repo",
             &cfg,
@@ -3028,57 +3931,682 @@ This should not appear in the body.\n";
         .expect("harvests");
 
         assert!(count > 0, "the fixture answers with well-formed facts");
-        let listed = list(&state, "-work-repo").expect("list");
+        let listed = list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+            .expect("list");
         assert!(!listed.is_empty());
         assert!(
-            listed.iter().all(|(_, e)| e.source == "handoff"),
-            "every harvested entry is marked as coming from a handoff: {listed:?}"
+            listed.iter().all(|(_, e)| e.source == "harvest"),
+            "every harvested entry is marked as coming from a harvest: {listed:?}"
+        );
+        // And it is the SHARED bank, not the private one -- the private
+        // bank must stay untouched by a durable harvest.
+        assert!(
+            list(&state, "-work-repo").expect("list").is_empty(),
+            "a durable harvest must never write into the private scope"
         );
     }
 
     #[test]
     fn harvesting_an_existing_key_refreshes_it_rather_than_duplicating_it() {
+        let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut cfg = CtxConfig::default();
         cfg.memory.harvest = true;
 
-        // N4 (see `write_harvested`, and `a_harvested_fact_never_overwrites_
-        // an_explicit_entry` below): a harvest only ever refreshes an
-        // earlier *harvested* entry, never a deliberate `explicit` one --
-        // seeding with `explicit` here would make the refresh this test
-        // checks for illegal, not merely untested.
         let mut existing = sample("build-cmd", 1_700_000_000);
         existing.body = "cargo build".to_string();
-        existing.source = "handoff".to_string();
-        remember(&state, "-work-repo", &existing, &cfg).expect("seed");
+        existing.source = "harvest".to_string();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            &existing,
+        )
+        .expect("seed");
 
         let adapter = fake_model_adapter();
         let _mode =
             crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
-        harvest_from_handoff(
+        harvest_durable(
             &adapter,
             "haiku",
             &sample_handoff(),
+            repo.path(),
             &state,
             "-work-repo",
             &cfg,
         )
         .expect("harvests");
 
-        let listed = list(&state, "-work-repo").expect("list");
+        let listed = list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+            .expect("list");
         let build_cmd: Vec<_> = listed
             .iter()
             .filter(|(_, e)| e.key == "build-cmd")
             .collect();
         assert_eq!(build_cmd.len(), 1, "refreshed, not duplicated: {listed:?}");
         assert_eq!(
-            build_cmd[0].1.source, "handoff",
-            "the refreshed entry is now marked as harvested"
+            build_cmd[0].1.source, "harvest",
+            "the refreshed entry is still marked as harvested"
         );
         assert_ne!(
             build_cmd[0].1.body, "cargo build",
             "the body was refreshed too"
+        );
+    }
+
+    /// Issue #37's clean-session-end seam: `harvest_at_session_end` is
+    /// gated exactly like `harvest_durable` itself, before either model call
+    /// it can make is ever touched.
+    #[test]
+    fn harvest_at_session_end_is_a_no_op_when_harvest_is_disabled() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        assert!(!cfg.memory.harvest, "sanity: harvest defaults to off");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some(
+            "/nonexistent/model-binary",
+        ));
+        let ctx = super::super::event::StructuralContext::default();
+
+        let count = harvest_at_session_end(
+            &adapter,
+            "haiku",
+            &ctx,
+            std::time::Duration::from_secs(5),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("a disabled harvest is not an error, just a no-op");
+        assert_eq!(count, 0);
+        assert!(
+            list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    // Issue #36: `zirv memory init` repository bootstrap.
+    //
+    // Deterministic pieces (corpus collection, parsing/validation, applying
+    // an already-validated batch, and the already-initialized refusal) are
+    // covered with plain fixtures and never touch a model -- these give
+    // real local signal on every platform. The end-to-end tests at the
+    // bottom of this section drive the real model call through `fake-model.
+    // sh`, the same way `a_harvest_that_returns_nothing_writes_nothing`/
+    // `a_harvested_entry_is_marked_as_coming_from_a_handoff`/`harvesting_an_
+    // existing_key_refreshes_it_rather_than_duplicating_it` already do, and
+    // inherit that fixture's platform limitation (a `.sh` script cannot run
+    // directly on Windows -- CI, which is Linux, is where they actually run).
+
+    #[test]
+    fn collect_init_corpus_reads_readme_manifest_and_zirv_config() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::write(
+            repo.path().join("README.md"),
+            "# demo\nalways run migrations first",
+        )
+        .expect("write readme");
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"demo\"")
+            .expect("write manifest");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir .zirv");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[memory]\nenabled = true",
+        )
+        .expect("write ctx.toml");
+
+        let cfg = CtxConfig::default();
+        let corpus = collect_init_corpus(repo.path(), &cfg, None, false);
+        assert!(
+            corpus.contains("always run migrations first"),
+            "got {corpus}"
+        );
+        assert!(corpus.contains("name = \"demo\""), "got {corpus}");
+        assert!(corpus.contains("[memory]"), "got {corpus}");
+        assert!(corpus.contains("### Project documentation"), "got {corpus}");
+        assert!(corpus.contains("### Manifests"), "got {corpus}");
+        assert!(corpus.contains("### .zirv configuration"), "got {corpus}");
+    }
+
+    /// Issue #36's "collection must be deterministic" and "temporary/
+    /// session-state candidates are excluded" requirements, both at once:
+    /// a `.zirv/state`-style directory and VCS internals must never appear
+    /// in the repository-structure listing or be read into the corpus,
+    /// while an ordinary top-level source directory still shows up.
+    #[test]
+    fn collect_init_corpus_excludes_vcs_and_zirv_state_from_the_structure_listing() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".git")).expect("mkdir .git");
+        std::fs::write(
+            repo.path().join(".git/COMMIT_EDITMSG"),
+            "session-secret-wip-notes",
+        )
+        .expect("write");
+        std::fs::create_dir_all(repo.path().join(".zirv/state/sessions")).expect("mkdir state");
+        std::fs::write(
+            repo.path().join(".zirv/state/sessions/abcd1234.json"),
+            "{\"transcript\":\"do not leak this session state\"}",
+        )
+        .expect("write session state");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
+
+        let cfg = CtxConfig::default();
+        let corpus = collect_init_corpus(repo.path(), &cfg, None, false);
+        assert!(
+            !corpus.contains("session-secret-wip-notes"),
+            "VCS internals must never reach the corpus: {corpus}"
+        );
+        assert!(
+            !corpus.contains("do not leak this session state"),
+            "zirv's own repo-local state must never reach the corpus: {corpus}"
+        );
+        assert!(
+            corpus.contains("- src/"),
+            "an ordinary top-level directory still shows up: {corpus}"
+        );
+        assert!(!corpus.contains("- .git"), "got {corpus}");
+        assert!(!corpus.contains("- .zirv"), "got {corpus}");
+    }
+
+    #[test]
+    fn collect_init_corpus_respects_the_configured_byte_budget() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::write(repo.path().join("README.md"), "x".repeat(500)).expect("write");
+
+        let mut cfg = CtxConfig::default();
+        cfg.memory.init_max_bytes = 32;
+        let corpus = collect_init_corpus(repo.path(), &cfg, None, false);
+        assert!(
+            corpus.len() <= 32,
+            "the corpus must never exceed init_max_bytes: {} bytes",
+            corpus.len()
+        );
+    }
+
+    /// Issue #36's optional vault import: plain markdown files read with the
+    /// standard filesystem, no Obsidian install or external tool.
+    #[test]
+    fn collect_init_corpus_imports_plain_markdown_from_a_vault_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let vault = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(vault.path().join("notes")).expect("mkdir");
+        std::fs::write(
+            vault.path().join("notes/decision.md"),
+            "we chose postgres over sqlite for concurrent writes",
+        )
+        .expect("write vault note");
+        // Obsidian's own config directory must never be read as content.
+        std::fs::create_dir_all(vault.path().join(".obsidian")).expect("mkdir");
+        std::fs::write(vault.path().join(".obsidian/workspace.json"), "{}").expect("write");
+
+        let cfg = CtxConfig::default();
+        let corpus = collect_init_corpus(repo.path(), &cfg, Some(vault.path()), false);
+        assert!(
+            corpus.contains("we chose postgres over sqlite for concurrent writes"),
+            "got {corpus}"
+        );
+        assert!(corpus.contains("### Imported vault"), "got {corpus}");
+        assert!(
+            !corpus.contains("workspace.json") && !corpus.contains(".obsidian"),
+            "Obsidian's own config directory must never be read: {corpus}"
+        );
+    }
+
+    /// Same symlink-refusal posture `safe_shared_dir`/`read_entries` already
+    /// apply to the shared bank itself, applied to an imported vault: a
+    /// symlinked entry inside the vault must never be followed.
+    #[cfg(unix)]
+    #[test]
+    fn collect_init_corpus_skips_a_symlinked_vault_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let vault = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("secret.md"), "leak-me-not").expect("write secret");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.md"),
+            vault.path().join("linked.md"),
+        )
+        .expect("symlink");
+        std::fs::write(vault.path().join("real.md"), "a genuine vault note").expect("write");
+
+        let cfg = CtxConfig::default();
+        let corpus = collect_init_corpus(repo.path(), &cfg, Some(vault.path()), false);
+        assert!(corpus.contains("a genuine vault note"), "got {corpus}");
+        assert!(
+            !corpus.contains("leak-me-not"),
+            "a symlinked vault entry must never be followed: {corpus}"
+        );
+    }
+
+    #[test]
+    fn collect_init_corpus_includes_a_recent_history_section_only_when_requested() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let cfg = CtxConfig::default();
+        let with_history = collect_init_corpus(repo.path(), &cfg, None, true);
+        assert!(
+            with_history.contains("### Recent history"),
+            "got {with_history}"
+        );
+        let without_history = collect_init_corpus(repo.path(), &cfg, None, false);
+        assert!(
+            !without_history.contains("### Recent history"),
+            "got {without_history}"
+        );
+    }
+
+    /// A pure-dash key (`---`) clears `parse_harvest`'s own charset filter
+    /// (every character is a hyphen, which the harvest line-parser already
+    /// allows) but fails `validate_shared_key`'s "at least one letter or
+    /// digit" rule -- proving `parse_and_validate_init_proposals` applies
+    /// its OWN validation layer, not just `parse_harvest`'s.
+    #[test]
+    fn parse_and_validate_rejects_a_malformed_key() {
+        let cfg = CtxConfig::default();
+        let proposals = parse_and_validate_init_proposals(
+            "---: not a real key\nbuild-cmd: cargo build --release\n",
+            &cfg,
+        );
+        assert_eq!(
+            proposals,
+            vec![("build-cmd".to_string(), "cargo build --release".to_string())],
+            "the malformed key is dropped, the well-formed one survives: {proposals:?}"
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_truncates_an_oversized_body_to_max_entry_bytes() {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.max_entry_bytes = 16;
+        let answer = format!("long-fact: {}\n", "x".repeat(200));
+        let proposals = parse_and_validate_init_proposals(&answer, &cfg);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].0, "long-fact");
+        assert!(
+            proposals[0].1.len() <= 16,
+            "the body must be truncated to max_entry_bytes: {} bytes",
+            proposals[0].1.len()
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_enforces_the_init_entry_cap() {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.init_max_entries = 2;
+        let answer = "fact-a: one\nfact-b: two\nfact-c: three\nfact-d: four\n";
+        let proposals = parse_and_validate_init_proposals(answer, &cfg);
+        assert_eq!(
+            proposals,
+            vec![
+                ("fact-a".to_string(), "one".to_string()),
+                ("fact-b".to_string(), "two".to_string()),
+            ],
+            "capped to init_max_entries, keeping the model's own priority order: {proposals:?}"
+        );
+    }
+
+    #[test]
+    fn apply_init_proposals_merge_updates_an_existing_key_instead_of_duplicating() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        // Sourced "init" (an earlier init run), not "explicit": this test is
+        // about ordinary in-place updates, not the N4 explicit-entry guard
+        // (covered separately by
+        // `apply_init_proposals_merge_never_overwrites_an_explicit_entry`).
+        let seed = Entry {
+            key: "build-cmd".to_string(),
+            written_by: "init".to_string(),
+            written: 1,
+            verified: 1,
+            source: "init".to_string(),
+            body: "cargo build".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            &seed,
+        )
+        .expect("seed");
+
+        let opts = InitOptions {
+            merge: true,
+            ..InitOptions::default()
+        };
+        let proposals = vec![
+            ("build-cmd".to_string(), "cargo build --release".to_string()),
+            ("test-cmd".to_string(), "cargo test".to_string()),
+        ];
+        let report =
+            apply_init_proposals(&proposals, &opts, repo.path(), &state, "-work-repo", &cfg)
+                .expect("apply");
+        assert_eq!(report.written, 2);
+        assert_eq!(report.skipped_explicit, 0);
+
+        let listed = list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+            .expect("list");
+        let build_cmd: Vec<_> = listed
+            .iter()
+            .filter(|(_, e)| e.key == "build-cmd")
+            .collect();
+        assert_eq!(
+            build_cmd.len(),
+            1,
+            "updated in place, not duplicated: {listed:?}"
+        );
+        assert_eq!(build_cmd[0].1.body, "cargo build --release");
+        assert_eq!(
+            listed.len(),
+            2,
+            "the new key was added alongside the updated one"
+        );
+    }
+
+    /// N4 (round-2 finding): a model-proposed `--merge` init must never
+    /// silently overwrite an existing shared entry a human deliberately
+    /// wrote (`source == "explicit"`, the same protection `write_harvested`
+    /// gives the harvest path). Mirrors
+    /// `a_harvested_fact_never_overwrites_an_explicit_entry`'s shape.
+    #[test]
+    fn apply_init_proposals_merge_never_overwrites_an_explicit_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let explicit = Entry {
+            key: "build-cmd".to_string(),
+            written_by: "human".to_string(),
+            written: 1,
+            verified: 1,
+            source: "explicit".to_string(),
+            body: "cargo build --release   # the operator said so".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            &explicit,
+        )
+        .expect("seed");
+
+        let opts = InitOptions {
+            merge: true,
+            ..InitOptions::default()
+        };
+        let proposals = vec![
+            (
+                "build-cmd".to_string(),
+                "cargo build (inferred)".to_string(),
+            ),
+            ("test-cmd".to_string(), "cargo test (inferred)".to_string()),
+        ];
+        let report =
+            apply_init_proposals(&proposals, &opts, repo.path(), &state, "-work-repo", &cfg)
+                .expect("apply");
+
+        assert_eq!(
+            report.written, 1,
+            "only the fact with no explicit entry is written"
+        );
+        assert_eq!(
+            report.skipped_explicit, 1,
+            "the explicit-entry skip is counted for the operator"
+        );
+
+        let listed = list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+            .expect("list");
+        let kept = listed
+            .iter()
+            .find(|(_, e)| e.key == "build-cmd")
+            .map(|(_, e)| e)
+            .expect("the explicit entry is still there");
+        assert_eq!(
+            kept, &explicit,
+            "the deliberate entry survives byte-identical"
+        );
+
+        let added = listed
+            .iter()
+            .find(|(_, e)| e.key == "test-cmd")
+            .map(|(_, e)| e)
+            .expect("the un-contested fact is written");
+        assert_eq!(added.source, "init");
+
+        // The skip is visible rather than silent.
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("init-skipped") && log.contains("build-cmd"),
+            "the skipped key must be named in the decision log: {log}"
+        );
+    }
+
+    #[test]
+    fn apply_init_proposals_force_clears_existing_entries_before_writing() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let stale = Entry {
+            key: "stale-fact".to_string(),
+            written_by: "human".to_string(),
+            written: 1,
+            verified: 1,
+            source: "explicit".to_string(),
+            body: "no longer true".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            &stale,
+        )
+        .expect("seed");
+
+        let opts = InitOptions {
+            force: true,
+            ..InitOptions::default()
+        };
+        let proposals = vec![("fresh-fact".to_string(), "the current reality".to_string())];
+        apply_init_proposals(&proposals, &opts, repo.path(), &state, "-work-repo", &cfg)
+            .expect("apply");
+
+        let listed = list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+            .expect("list");
+        assert_eq!(listed.len(), 1, "the stale entry was cleared: {listed:?}");
+        assert_eq!(listed[0].1.key, "fresh-fact");
+    }
+
+    /// The already-initialized refusal is checked BEFORE anything about the
+    /// model is touched -- an adapter that would fail to spawn at all is
+    /// enough to prove nothing was spawned, the same proof style
+    /// `harvesting_is_off_unless_the_operator_turns_it_on` uses.
+    #[test]
+    fn run_memory_init_refuses_when_the_shared_bank_is_already_non_empty() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            &sample("existing-fact", 1),
+        )
+        .expect("seed");
+
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some(
+            "/nonexistent/model-binary",
+        ));
+        let opts = InitOptions::default();
+        let mut out = Vec::new();
+        let err = run_memory_init(
+            &adapter,
+            "haiku",
+            &opts,
+            &mut out,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect_err("a plain re-run over a non-empty shared bank must refuse");
+        assert!(err.to_string().contains("already has"), "got {err}");
+        assert!(out.is_empty(), "nothing is printed once refused");
+    }
+
+    /// `--merge`/`--force` bypass the refusal and proceed to the model call
+    /// -- proven by the failure changing from "already initialized" to the
+    /// broken adapter's own spawn error, without ever running the real
+    /// `fake-model.sh` fixture (so this passes on every platform).
+    #[test]
+    fn merge_and_force_bypass_the_already_initialized_refusal() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            &sample("existing-fact", 1),
+        )
+        .expect("seed");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some(
+            "/nonexistent/model-binary",
+        ));
+
+        for opts in [
+            InitOptions {
+                merge: true,
+                ..InitOptions::default()
+            },
+            InitOptions {
+                force: true,
+                ..InitOptions::default()
+            },
+        ] {
+            let mut out = Vec::new();
+            let err = run_memory_init(
+                &adapter,
+                "haiku",
+                &opts,
+                &mut out,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+            )
+            .expect_err("the broken adapter still fails, just later");
+            assert!(
+                !err.to_string().contains("already has"),
+                "the refusal must be bypassed: {err}"
+            );
+        }
+    }
+
+    /// End-to-end through the real distiller mechanism (`handoff::
+    /// run_model`), the same way the harvest tests at the top of this
+    /// section do. Drives `tests/fixtures/fake-model.sh` in a new `init`
+    /// mode; inherits that fixture's Windows limitation (a `.sh` script
+    /// cannot execute directly there) -- this test genuinely runs in CI
+    /// (Linux), not on a Windows workstation.
+    #[test]
+    fn run_memory_init_end_to_end_stores_valid_proposals_and_reports_size() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        std::fs::write(repo.path().join("README.md"), "# demo project").expect("write readme");
+
+        let adapter = fake_model_adapter();
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("init"))]);
+        let opts = InitOptions::default();
+        let mut out = Vec::new();
+        let code = run_memory_init(
+            &adapter,
+            "haiku",
+            &opts,
+            &mut out,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("init runs");
+        assert_eq!(code, 0);
+
+        let listed = list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+            .expect("list");
+        assert_eq!(listed.len(), 2, "got {listed:?}");
+        assert!(listed.iter().any(|(_, e)| e.key == "build-cmd"));
+        assert!(listed.iter().all(|(_, e)| e.source == "init"));
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("2 proposed entries"), "got {text}");
+        assert!(text.contains("bytes stored"), "got {text}");
+        assert!(text.contains("bytes estimated injected"), "got {text}");
+    }
+
+    #[test]
+    fn run_memory_init_dry_run_writes_nothing_end_to_end() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        std::fs::write(repo.path().join("README.md"), "# demo project").expect("write readme");
+
+        let adapter = fake_model_adapter();
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("init"))]);
+        let opts = InitOptions {
+            dry_run: true,
+            ..InitOptions::default()
+        };
+        let mut out = Vec::new();
+        run_memory_init(
+            &adapter,
+            "haiku",
+            &opts,
+            &mut out,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("dry run still succeeds");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("dry run, nothing written"), "got {text}");
+        assert!(
+            !repo.path().join(".zirv/memory").exists(),
+            "a dry run must create no directory, let alone a file"
         );
     }
 
