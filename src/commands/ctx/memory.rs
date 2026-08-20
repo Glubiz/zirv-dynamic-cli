@@ -438,6 +438,19 @@ pub fn list_scoped(
 /// rather than erroring -- consistent with `forget`/`verify`'s existing "an
 /// absent key is not a failure" contract for the private scope.
 ///
+/// Two more rules on the READ side specifically (`get_scoped`/`verify_scoped`,
+/// fix round 2): the canonical path is refused outright if it is a symlink
+/// rather than a regular file (`is_regular_file`) -- unlike a directory scan
+/// through `read_entries`, a single-path `read_to_string` does not filter
+/// symlinks out on its own, and following one here would read (`get_scoped`)
+/// or read-then-rewrite (`verify_scoped`) an arbitrary file elsewhere on the
+/// machine as if it were this repository's own committed content. And
+/// `get_scoped` additionally requires the parsed entry's OWN `key` to equal
+/// the key requested -- a mismatch (a hand-edited file whose header
+/// disagrees with its file name, or any readable non-entry file, which
+/// parses to `key == ""`) is refused and logged as `get-key-mismatch` rather
+/// than trusted or silently returned as a phantom entry.
+///
 /// `Private` is unaffected by any of this: it has no canonical per-key file
 /// name at all (a key's file name always carries its `Written` timestamp
 /// too), so it keeps routing through its own pre-existing, unchanged
@@ -450,6 +463,19 @@ pub fn list_scoped(
 /// their own doc comments): `None` (never an error) when the scope is
 /// disabled, the key's canonical file does not exist, or (for `Shared`) the
 /// key or directory is unsafe.
+///
+/// Two more `Shared`-only refusals, both fix round 2: the canonical path is
+/// refused if it is a symlink rather than a regular file (`is_regular_file`
+/// -- see its own doc comment for why `read_to_string` alone is not enough
+/// here, unlike a `read_entries`-based scan, which already filters symlinks
+/// out); and the parsed entry's OWN `key` must equal the `key` requested --
+/// a mismatch (a file whose header disagrees with its file name, or any
+/// readable non-entry file, which parses to `key == ""`) is refused too,
+/// logged as `get-key-mismatch` (naming both the requested key and the
+/// header's actual key) rather than silently trusting the file name or
+/// silently returning a phantom entry. The parsed key is never overwritten
+/// to paper over the disagreement -- masking a repo-committed inconsistency
+/// would be worse than refusing it outright.
 #[allow(dead_code)]
 pub fn get_scoped(
     scope: MemoryScope,
@@ -468,10 +494,32 @@ pub fn get_scoped(
             let Some(path) = shared_canonical_path(repo, key) else {
                 return Ok(None);
             };
+            if !is_regular_file(&path) {
+                return Ok(None);
+            }
             let Ok(text) = std::fs::read_to_string(&path) else {
                 return Ok(None);
             };
-            Ok(Some(parse_markdown(&text)))
+            let parsed = parse_markdown(&text);
+            if parsed.key != key {
+                let _ = super::log::append(
+                    state,
+                    &super::log::Decision {
+                        ts: now_secs(),
+                        session: "n/a",
+                        verb: "memory",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "get-key-mismatch",
+                        detail: &format!(
+                            "canonical file for '{key}' has header Key '{}': refusing to return it",
+                            parsed.key
+                        ),
+                    },
+                );
+                return Ok(None);
+            }
+            Ok(Some(parsed))
         }
     }
 }
@@ -619,6 +667,22 @@ fn shared_canonical_path(repo: &Path, key: &str) -> Option<PathBuf> {
     Some(dir.join(format!("{key}.md")))
 }
 
+/// Whether `path` is an ordinary regular file, not a symlink -- the
+/// single-path analogue of `read_entries`'s own symlink skip (fix round 2).
+/// `get_scoped`/`verify_scoped`'s canonical-file reads bypass `read_entries`
+/// entirely (each reads exactly one known path, not a directory listing), so
+/// neither inherited that skip on its own. A symlinked canonical file (a
+/// repo-committed `some-key.md -> /etc/passwd`) must never be followed:
+/// `get_scoped` would read an arbitrary local file back as if it were a
+/// memory entry, and `verify_scoped` would then write that file's own
+/// content back into the repository as ordinary, committable text --
+/// `read_to_string` follows a symlink transparently, unlike `write_shared`'s
+/// `rename`, which replaces one without ever reading through it.
+#[allow(dead_code)]
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
 /// Writes `entry` to the shared bank's canonical, key-addressed file
 /// (`<repo>/.zirv/memory/<key>.md`) -- stable rather than timestamp-addressed
 /// (issue #32): updating a key rewrites this same file, so `git diff` shows
@@ -745,7 +809,12 @@ pub fn forget_scoped(
             };
 
             if let Some(dir) = safe_shared_dir(repo) {
-                let stray: Vec<String> = read_entries(&dir)?
+                // Best-effort (fix round 2): this is an ADVISORY scan after
+                // the canonical delete already succeeded -- a scan failure
+                // (e.g. the directory becomes unreadable mid-call) must not
+                // turn an already-completed forget into an `Err`.
+                let stray: Vec<String> = read_entries(&dir)
+                    .unwrap_or_default()
                     .into_iter()
                     .filter(|(other_path, other)| other.key == key && *other_path != path)
                     .map(|(other_path, _)| other_path.display().to_string())
@@ -778,7 +847,12 @@ pub fn forget_scoped(
 /// `duplicate_keys` would report it) -- refreshes only the `Verified` stamp
 /// in place, leaving `Written`/body untouched, same contract as private
 /// `verify`. Ungated on `shared_enabled` for the same "must not trap data"
-/// reason `forget_scoped` is.
+/// reason `forget_scoped` is. Refuses (reports `false`, touches nothing) if
+/// the canonical path is a symlink rather than a regular file (fix round 2,
+/// `is_regular_file`) -- otherwise `read_to_string` would follow it and this
+/// function would then write the linked file's own content back into the
+/// repository as ordinary, committable text, the same class of escape
+/// `get_scoped`'s doc comment describes.
 #[allow(dead_code)]
 pub fn verify_scoped(
     scope: MemoryScope,
@@ -793,6 +867,9 @@ pub fn verify_scoped(
             let Some(path) = shared_canonical_path(repo, key) else {
                 return Ok(false);
             };
+            if !is_regular_file(&path) {
+                return Ok(false);
+            }
             let Ok(text) = std::fs::read_to_string(&path) else {
                 return Ok(false);
             };
@@ -3659,6 +3736,166 @@ This should not appear in the body.\n";
             .expect("get")
             .is_none(),
             "only the canonical file is ever consulted for a per-key lookup"
+        );
+    }
+
+    /// IMPORTANT fix (review round 2): `get_scoped` used to read the
+    /// canonical path with a plain `std::fs::read_to_string`, which follows
+    /// a symlink transparently -- bypassing the symlink skip `read_entries`
+    /// gives every directory scan. A repo-committed `build-cmd.md ->
+    /// /etc/passwd` must be refused, not read back as an entry.
+    #[cfg(unix)]
+    #[test]
+    fn get_scoped_shared_refuses_a_symlinked_canonical_file() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Deliberately a WELL-FORMED entry for the requested key, not
+        // garbage: this isolates the symlink defense from the separate
+        // key-agreement check below -- content that fails to parse as
+        // "build-cmd" would be refused by that other check regardless of
+        // whether the symlink is followed, which would make this test pass
+        // for the wrong reason.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, sample("build-cmd", 1).to_markdown()).expect("write secret");
+        std::os::unix::fs::symlink(&secret, dir.join("build-cmd.md")).expect("symlink");
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_none(),
+            "a symlinked canonical file must never be read back as an entry, even one that would otherwise match"
+        );
+    }
+
+    /// IMPORTANT fix (review round 2), the write-side counterpart:
+    /// `verify_scoped` used to read the canonical path the same unguarded
+    /// way, and would then WRITE the linked file's own content back into the
+    /// repository via `write_shared` -- reading a symlink's target and then
+    /// materializing it as ordinary, committable content. Must refuse
+    /// instead, touching neither the link nor its target.
+    #[cfg(unix)]
+    #[test]
+    fn verify_scoped_shared_refuses_a_symlinked_canonical_file_and_never_materializes_its_target() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "leak-me").expect("write secret");
+        std::os::unix::fs::symlink(&secret, dir.join("build-cmd.md")).expect("symlink");
+
+        assert!(
+            !verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify"),
+            "a symlinked canonical file must never be verified"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&secret).expect("read secret"),
+            "leak-me",
+            "the symlink target must never be read-then-rewritten"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.join("build-cmd.md"))
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be left completely untouched, not replaced"
+        );
+    }
+
+    /// IMPORTANT fix (review round 2): `get_scoped` used to return
+    /// `Some(parse_markdown(&text))` unconditionally. A hand-edited or
+    /// merged file whose header `Key:` disagrees with its own file name must
+    /// be refused, not returned as if it were an honest entry for the
+    /// requested key -- and the mismatch is logged, not silently masked by
+    /// overwriting the parsed key.
+    #[test]
+    fn get_scoped_shared_refuses_a_canonical_file_whose_header_key_disagrees_with_its_name() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // The file named build-cmd.md, but its own header claims a
+        // different key -- a hand edit or a merge, not something
+        // upsert_shared itself can produce.
+        std::fs::write(
+            dir.join("build-cmd.md"),
+            sample("something-else", 1).to_markdown(),
+        )
+        .expect("write mismatched");
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_none(),
+            "a canonical file whose header key disagrees with its file name must be refused"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("get-key-mismatch")
+                && log.contains("build-cmd")
+                && log.contains("something-else"),
+            "the mismatch is logged, naming both keys: {log}"
+        );
+    }
+
+    /// The phantom-entry case falls out of the same key-agreement check: any
+    /// readable file with no `## Memory` header at all parses to
+    /// `key == ""`, which can never equal a real requested key.
+    #[test]
+    fn get_scoped_shared_refuses_a_non_entry_file_at_the_canonical_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        std::fs::write(dir.join("build-cmd.md"), "not a memory entry at all\n")
+            .expect("write garbage");
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_none(),
+            "a readable non-entry file must never surface as a phantom entry"
         );
     }
 
