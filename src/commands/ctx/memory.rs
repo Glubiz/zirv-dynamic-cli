@@ -206,7 +206,12 @@ fn slug_key(key: &str) -> String {
 /// configuration (see `shared_scope_content_is_never_read_back_as_
 /// configuration` below), and `CtxConfig`'s `REPO_FORBIDDEN` list keeps a
 /// repo from even switching the scope on for itself (`MemoryConfig::
-/// shared_enabled`).
+/// shared_enabled`). A shared `Entry`'s header fields (`Written`, `Verified`,
+/// `Written-By`, `Source`) are themselves attacker-supplied repo content, the
+/// same as the body -- a later task wiring this scope into ranking, recency,
+/// or overwrite-protection decisions (the way `write_harvested` trusts
+/// `Source == "explicit"` for the private scope today) must not treat any of
+/// them as trustworthy signal without its own independent check.
 // Consumed by the shared-store, `zirv memory` CLI, and injection work later
 // tasks build on top of it; this task's own tests are its only caller so far.
 #[allow(dead_code)]
@@ -315,6 +320,14 @@ pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
 /// any prompt or CLI verb: ranking, budgeting, a key-addressed write path,
 /// and a `zirv memory` surface for it are later tasks (see issue #31's
 /// non-goals).
+///
+/// NOT a drop-in replacement for `list`: `list` ignores `cfg` entirely and
+/// always reads the private directory regardless of `memory.enabled`, which
+/// is why callers like `forget`/`forget_all` and `prune_to_cap` can still
+/// operate on a disabled bank. `list_scoped` is gated on `scope.enabled(cfg)`
+/// and returns empty when the scope is off -- swapping one call for the
+/// other silently changes that "disabling reads must never trap data"
+/// behavior.
 #[allow(dead_code)]
 pub fn list_scoped(
     scope: MemoryScope,

@@ -805,6 +805,7 @@ harvest = false                # opt-in; see "Memory bank" below
 max_entries = 50               # entries kept per repo before the oldest (by Written) are pruned
 max_entry_bytes = 512          # per-entry body cap
 max_injected_bytes = 2048      # cap on the whole bank folded into one launch prompt
+shared_enabled = true          # whether the repo-owned shared bank (<repo>/.zirv/memory/) is read at all
 
 [chrome]
 banner = true   # the one-time launch banner
@@ -853,6 +854,7 @@ variable below, which comes from the operator rather than the checkout:
 | `memory.max_entries` | `ZIRV_CTX_MEMORY_MAX_ENTRIES` |
 | `memory.max_entry_bytes` | `ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES` |
 | `memory.max_injected_bytes` | `ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES` |
+| `memory.shared_enabled` | `ZIRV_CTX_MEMORY_SHARED` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
@@ -1214,6 +1216,7 @@ harvest = false          # off by default; see above
 max_entries = 50
 max_entry_bytes = 512
 max_injected_bytes = 2048
+shared_enabled = true
 ```
 
 The memory bank lives under the state dir, never in the repo (the same
