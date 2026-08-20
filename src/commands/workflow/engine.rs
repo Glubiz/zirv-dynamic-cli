@@ -15,6 +15,10 @@ use crate::commands::ctx::state::{StateDir, create_private_dir_all, now_secs, re
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
 const MAX_STEP_ATTEMPTS: u8 = 3;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkflowKind {
@@ -201,6 +205,11 @@ pub struct WorkflowState {
     pub kind: WorkflowKind,
     #[serde(default)]
     pub adapter: Option<String>,
+    /// Whether operator-global and repository skills may override built-ins.
+    /// Persisted so resume/prompt composition cannot silently change the
+    /// trust mode selected at workflow start.
+    #[serde(default = "default_true")]
+    pub include_custom_skills: bool,
     pub classification: Classification,
     pub steps: Vec<WorkflowStep>,
     pub current_step: usize,
@@ -223,6 +232,7 @@ impl WorkflowState {
         task: String,
         kind: WorkflowKind,
         adapter: Option<String>,
+        include_custom_skills: bool,
         classification: Classification,
     ) -> Self {
         let steps = definition(kind).materialize(&classification);
@@ -239,6 +249,7 @@ impl WorkflowState {
             task,
             kind,
             adapter,
+            include_custom_skills,
             classification,
             steps,
             current_step: 0,
@@ -308,14 +319,6 @@ pub enum StepOutcome {
     Failure,
 }
 
-pub fn advance(
-    state_dir: &StateDir,
-    state: WorkflowState,
-    outcome: StepOutcome,
-) -> CtxResult<WorkflowState> {
-    advance_with_evidence(state_dir, state, outcome, None)
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct TransitionEvidence {
     pub duration_ms: Option<u64>,
@@ -342,6 +345,17 @@ pub fn advance_with_evidence(
     let current = state.current().cloned().ok_or("workflow has no current step")?;
     match outcome {
         StepOutcome::Success => {
+            if current.phase == WorkflowPhase::Review
+                && state
+                    .review_findings
+                    .iter()
+                    .any(|finding| finding.disposition == super::review::FindingDisposition::Open)
+            {
+                return Err(
+                    "review findings must have a final disposition before the review step can pass"
+                        .into(),
+                );
+            }
             if matches!(current.phase, WorkflowPhase::Test | WorkflowPhase::Verify) {
                 let final_only = current.phase == WorkflowPhase::Verify;
                 if !super::verification::latest_is_fresh_and_passing(
@@ -418,6 +432,9 @@ pub fn advance_with_evidence(
         completed.complexity = Some(state.classification.complexity);
         completed.risk = Some(state.classification.risk);
         completed.succeeded = Some(true);
+        completed.findings_total = findings_total;
+        completed.findings_meaningful = findings_meaningful;
+        completed.findings_dismissed = findings_dismissed;
         let _ = super::telemetry::record(
             state_dir,
             &state.repo,
@@ -455,7 +472,7 @@ pub fn render_current_context(
     ) {
         return Ok(None);
     }
-    let registry = SkillRegistry::load(repo, home, true)?;
+    let registry = SkillRegistry::load(repo, home, state.include_custom_skills)?;
     let stack = registry.resolve_stack(&step.skill)?;
     let mut rendered = format!(
         "zirv workflow step\nworkflow: {}\nstep: {}\nphase: {}\nstate: {:?}\n",
@@ -536,6 +553,9 @@ pub struct StartArgs {
     /// Validate every selected skill against this adapter before starting.
     #[arg(long)]
     pub agent: Option<String>,
+    /// Ignore operator-global and repository-provided skill overrides.
+    #[arg(long)]
+    pub built_in_only: bool,
     #[arg(long)]
     pub repo: Option<PathBuf>,
     #[arg(long = "path")]
@@ -691,7 +711,11 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let classification = classify::from_args(&classify_args)?;
             let definition = definition(args.kind);
             if let Some(agent) = &args.agent {
-                let registry = SkillRegistry::load(&repo, dirs::home_dir().as_deref(), true)?;
+                let registry = SkillRegistry::load(
+                    &repo,
+                    dirs::home_dir().as_deref(),
+                    !args.built_in_only,
+                )?;
                 let report = super::capability::CapabilityReport::for_adapter(agent);
                 for step in definition.materialize(&classification) {
                     registry.ensure_supported(&step.skill, &report)?;
@@ -702,6 +726,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 args.task.clone(),
                 args.kind,
                 args.agent.clone(),
+                !args.built_in_only,
                 classification,
             );
             let state_dir = resolve_state()?;
@@ -828,6 +853,31 @@ mod tests {
     }
 
     #[test]
+    fn approval_gate_must_be_explicitly_released() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::High;
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "substantial feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
+        assert!(
+            advance_with_evidence(&state_dir, state.clone(), StepOutcome::Success, None).is_err()
+        );
+        let approved = approve(&state_dir, state).unwrap();
+        assert_eq!(approved.status, WorkflowStatus::Running);
+        assert_eq!(approved.current().unwrap().id, "design");
+    }
+
+    #[test]
     fn resume_does_not_redispatch_completed_steps() {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
@@ -837,10 +887,11 @@ mod tests {
             "small feature".into(),
             WorkflowKind::Feature,
             None,
+            true,
             low_classification(),
         );
         save(&state_dir, &state, true).unwrap();
-        state = advance(&state_dir, state, StepOutcome::Success).unwrap();
+        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap();
         let resumed = load(&state_dir, repo.path(), &state.id).unwrap();
         assert_eq!(resumed.completed_steps, vec!["implement"]);
         assert_eq!(resumed.current().unwrap().id, "test");
@@ -856,11 +907,12 @@ mod tests {
             "small feature".into(),
             WorkflowKind::Feature,
             None,
+            true,
             low_classification(),
         );
         save(&state_dir, &state, true).unwrap();
         for _ in 0..MAX_STEP_ATTEMPTS {
-            state = advance(&state_dir, state, StepOutcome::Failure).unwrap();
+            state = advance_with_evidence(&state_dir, state, StepOutcome::Failure, None).unwrap();
         }
         assert_eq!(state.status, WorkflowStatus::Failed);
         assert!(load_active(&state_dir, repo.path()).unwrap().is_none());
@@ -874,6 +926,7 @@ mod tests {
             "small feature".into(),
             WorkflowKind::Feature,
             None,
+            true,
             low_classification(),
         );
         let implement = render_current_context(&state, repo.path(), None)
@@ -887,5 +940,57 @@ mod tests {
         assert!(implement.contains("[skill implement@1"));
         assert!(!testing.contains("[skill implement@1"));
         assert!(testing.contains("[skill testing@1"));
+    }
+
+    #[test]
+    fn built_in_only_state_survives_prompt_rendering() {
+        let repo = tempdir().unwrap();
+        let skills = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("implement.yaml"),
+            "schema_version: 1\nid: implement\nversion: 2\nname: Override\ndescription: untrusted override\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: repository override\n",
+        )
+        .unwrap();
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            false,
+            low_classification(),
+        );
+        let context = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert!(context.contains("[skill implement@1; source=built-in]"));
+        assert!(!context.contains("repository override"));
+    }
+
+    #[test]
+    fn review_step_cannot_pass_with_open_findings() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review change".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            low_classification(),
+        );
+        state.review_findings.push(super::super::review::ReviewFinding {
+            id: "finding-1".into(),
+            severity: super::super::review::FindingSeverity::Major,
+            summary: "concrete defect".into(),
+            path: None,
+            line: None,
+            disposition: super::super::review::FindingDisposition::Open,
+            created_at: now_secs(),
+        });
+        let error =
+            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
+        assert!(error.to_string().contains("final disposition"));
     }
 }

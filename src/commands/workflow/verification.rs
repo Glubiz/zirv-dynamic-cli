@@ -274,26 +274,46 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
 }
 
 pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    if !head.status.success() {
+        return Err("cannot fingerprint repository HEAD".into());
+    }
     let diff = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["diff", "--binary", "HEAD"])
+        .args(["diff", "--raw", "HEAD"])
         .output()?;
     if !diff.status.success() {
         return Err("cannot fingerprint repository diff".into());
     }
-    let mut input = String::from_utf8_lossy(&diff.stdout).into_owned();
+    let mut input = String::from_utf8_lossy(&head.stdout).into_owned();
+    input.push_str(&String::from_utf8_lossy(&diff.stdout));
     for path in changed_paths(repo)? {
-        let absolute = repo.join(&path);
-        if absolute.is_file()
-            && let Ok(metadata) = std::fs::metadata(&absolute)
-            && metadata.len() <= 1024 * 1024
-        {
-            input.push_str("\nuntracked-or-changed:");
-            input.push_str(&path.to_string_lossy());
-            if let Ok(bytes) = std::fs::read(&absolute) {
-                input.push_str(&String::from_utf8_lossy(&bytes));
+        input.push_str("\npath:");
+        input.push_str(&path.to_string_lossy());
+        if std::fs::symlink_metadata(repo.join(&path)).is_ok() {
+            let hashed = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["hash-object", "--no-filters", "--"])
+                .arg(&path)
+                .output()?;
+            if !hashed.status.success() {
+                return Err(format!(
+                    "cannot fingerprint '{}': {}",
+                    path.display(),
+                    String::from_utf8_lossy(&hashed.stderr).trim()
+                )
+                .into());
             }
+            input.push_str("\nhash:");
+            input.push_str(String::from_utf8_lossy(&hashed.stdout).trim());
+        } else {
+            input.push_str("\ndeleted");
         }
     }
     Ok(input_hash(&input))
@@ -368,6 +388,28 @@ fn command_for_shell(command: &str) -> Command {
     }
 }
 
+fn read_capped_tail(mut reader: impl Read, cap: usize) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(cap);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        if count >= cap {
+            kept.clear();
+            kept.extend_from_slice(&chunk[count - cap..count]);
+            continue;
+        }
+        let overflow = kept.len().saturating_add(count).saturating_sub(cap);
+        if overflow > 0 {
+            kept.drain(..overflow);
+        }
+        kept.extend_from_slice(&chunk[..count]);
+    }
+    kept
+}
+
 fn run_check(repo: &Path, check: &CheckSpec, dry_run: bool) -> CheckResult {
     if dry_run {
         return CheckResult {
@@ -390,26 +432,25 @@ fn run_check(repo: &Path, check: &CheckSpec, dry_run: bool) -> CheckResult {
         .stderr(Stdio::piped());
     let result = (|| -> CtxResult<(CheckStatus, Option<i32>, Vec<u8>)> {
         let mut child = command.spawn()?;
+        let mut job = crate::commands::ctx::supervise::JobGuard::adopt(child.id());
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_thread = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut stdout) = stdout {
-                let _ = stdout.read_to_end(&mut bytes);
-            }
-            bytes
+            stdout
+                .map(|stdout| read_capped_tail(stdout, MAX_FAILURE_OUTPUT_BYTES))
+                .unwrap_or_default()
         });
         let stderr_thread = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut stderr) = stderr {
-                let _ = stderr.read_to_end(&mut bytes);
-            }
-            bytes
+            stderr
+                .map(|stderr| read_capped_tail(stderr, MAX_FAILURE_OUTPUT_BYTES))
+                .unwrap_or_default()
         });
 
         let timeout = Duration::from_secs(check.timeout_secs);
         let (status, code) = loop {
             if let Some(status) = child.try_wait()? {
+                super::terminate_process_tree(&mut child)?;
+                job.close();
                 break (
                     if status.success() {
                         CheckStatus::Passed
@@ -421,12 +462,16 @@ fn run_check(repo: &Path, check: &CheckSpec, dry_run: bool) -> CheckResult {
             }
             if started.elapsed() >= timeout {
                 super::terminate_process_tree(&mut child)?;
+                job.close();
                 break (CheckStatus::TimedOut, None);
             }
             std::thread::sleep(Duration::from_millis(25));
         };
         let mut output = stdout_thread.join().unwrap_or_default();
         output.extend(stderr_thread.join().unwrap_or_default());
+        if output.len() > MAX_FAILURE_OUTPUT_BYTES {
+            output.drain(..output.len() - MAX_FAILURE_OUTPUT_BYTES);
+        }
         Ok((status, code, output))
     })();
 
@@ -471,7 +516,15 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<Verificati
     }
     let id = std::fs::read_to_string(latest)?;
     let path = dir.join(format!("{}.json", id.trim()));
-    Ok(Some(serde_json::from_str(&std::fs::read_to_string(path)?)?))
+    let report: VerificationReport = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    if report.schema_version != VERIFY_SCHEMA_VERSION {
+        return Err(format!(
+            "verification report '{}': unsupported schema_version {}",
+            report.id, report.schema_version
+        )
+        .into());
+    }
+    Ok(Some(report))
 }
 
 pub fn latest_is_fresh_and_passing(state: &StateDir, repo: &Path, final_only: bool) -> CtxResult<bool> {
@@ -707,6 +760,16 @@ mod tests {
         assert!(path_matches("src/", "src/lib.rs"));
         assert!(path_matches("*.rs", "src/lib.rs"));
         assert!(!path_matches("docs/", "src/lib.rs"));
+    }
+
+    #[test]
+    fn verbose_output_is_drained_but_only_a_bounded_tail_is_retained() {
+        let input: Vec<u8> = (0..MAX_FAILURE_OUTPUT_BYTES + 4096)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let retained = read_capped_tail(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
+        assert_eq!(retained.len(), MAX_FAILURE_OUTPUT_BYTES);
+        assert_eq!(retained, input[input.len() - MAX_FAILURE_OUTPUT_BYTES..]);
     }
 
     #[test]

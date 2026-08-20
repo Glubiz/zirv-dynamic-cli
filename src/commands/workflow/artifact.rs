@@ -39,6 +39,7 @@ pub struct ArtifactRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PresentationMethod {
+    #[allow(dead_code)] // No current CLI harness exposes a verified native artifact API.
     HarnessNative,
     StaticFile,
     InteractiveServer,
@@ -311,19 +312,24 @@ fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+    let mut job = crate::commands::ctx::supervise::JobGuard::adopt(child.id());
     std::thread::sleep(Duration::from_millis(300));
     if let Err(error) = open_url(&args.url) {
         super::terminate_process_tree(&mut child)?;
+        job.close();
         return Err(error);
     }
     let deadline = Instant::now() + Duration::from_secs(args.lifetime_secs);
     while Instant::now() < deadline {
         if child.try_wait()?.is_some() {
+            super::terminate_process_tree(&mut child)?;
+            job.close();
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     super::terminate_process_tree(&mut child)?;
+    job.close();
     Ok(())
 }
 

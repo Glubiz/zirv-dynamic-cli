@@ -13,6 +13,8 @@ use crate::commands::ctx::CtxResult;
 pub const SKILL_SCHEMA_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: usize = 32 * 1024;
 pub const MAX_INSTRUCTION_BUDGET: usize = 8 * 1024;
+const MAX_SKILL_DIRECTORY_ENTRIES: usize = 512;
+const MAX_RESOLVED_CONTEXT_BYTES: usize = 32 * 1024;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -185,12 +187,14 @@ impl SkillRegistry {
             if let Some(home) = home {
                 load_dir(
                     &home.join(".zirv").join("skills"),
+                    home,
                     SkillSource::OperatorGlobal,
                     &mut skills,
                 )?;
             }
             load_dir(
                 &repo.join(".zirv").join("skills"),
+                repo,
                 SkillSource::Repository,
                 &mut skills,
             )?;
@@ -234,6 +238,17 @@ impl SkillRegistry {
         let mut resolved = Vec::new();
         let mut seen = BTreeSet::new();
         self.resolve_dependencies(&root.manifest.id, &mut seen, &mut resolved)?;
+        let context_bytes = resolved
+            .iter()
+            .map(|skill| skill.manifest.instructions.len())
+            .sum::<usize>();
+        if context_bytes > MAX_RESOLVED_CONTEXT_BYTES {
+            return Err(format!(
+                "skill '{}' resolves to {context_bytes} instruction bytes; limit is {MAX_RESOLVED_CONTEXT_BYTES}",
+                root.manifest.id
+            )
+            .into());
+        }
         Ok(resolved)
     }
 
@@ -319,21 +334,49 @@ impl SkillRegistry {
 
 fn load_dir(
     root: &Path,
+    allowed_root: &Path,
     source: SkillSource,
     skills: &mut BTreeMap<String, RegisteredSkill>,
 ) -> CtxResult<()> {
     if !root.exists() {
         return Ok(());
     }
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() {
+        return Err(format!("refusing symlinked skill directory '{}'", root.display()).into());
+    }
     let canonical_root = root
         .canonicalize()
         .map_err(|err| format!("cannot resolve skill directory '{}': {err}", root.display()))?;
+    let canonical_allowed_root = allowed_root.canonicalize().map_err(|err| {
+        format!(
+            "cannot resolve skill trust root '{}': {err}",
+            allowed_root.display()
+        )
+    })?;
+    if !canonical_root.starts_with(&canonical_allowed_root) {
+        return Err(format!(
+            "skill directory '{}' escapes trust root '{}'",
+            root.display(),
+            allowed_root.display()
+        )
+        .into());
+    }
     if !canonical_root.is_dir() {
         return Err(format!("skill path '{}' is not a directory", root.display()).into());
     }
 
-    let mut entries = std::fs::read_dir(&canonical_root)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&canonical_root)? {
+        if entries.len() == MAX_SKILL_DIRECTORY_ENTRIES {
+            return Err(format!(
+                "skill directory '{}' has more than {MAX_SKILL_DIRECTORY_ENTRIES} entries",
+                root.display()
+            )
+            .into());
+        }
+        entries.push(entry?);
+    }
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
@@ -802,5 +845,22 @@ mod tests {
         symlink(outside.path().join("outside.yaml"), dir.join("outside.yaml")).unwrap();
         let error = SkillRegistry::load(repo.path(), None, true).unwrap_err();
         assert!(error.to_string().contains("symlinked"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_cannot_move_repository_skills_outside_the_repo() {
+        use std::os::unix::fs::symlink;
+        let repo = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let skills = outside.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write(
+            &skills.join("outside.yaml"),
+            "schema_version: 1\nid: outside\nversion: 1\nname: Outside\ndescription: test\ncontext_budget_bytes: 16\ninstructions: test\n",
+        );
+        symlink(outside.path(), repo.path().join(".zirv")).unwrap();
+        let error = SkillRegistry::load(repo.path(), None, true).unwrap_err();
+        assert!(error.to_string().contains("escapes trust root"));
     }
 }

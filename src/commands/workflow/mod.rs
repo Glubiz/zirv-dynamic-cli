@@ -38,12 +38,20 @@ pub(crate) fn isolate_process_tree(command: &mut Command) {
 
 /// Terminate a child and every process it spawned, then reap the direct child.
 pub(crate) fn terminate_process_tree(child: &mut Child) -> CtxResult<()> {
-    if child.try_wait()?.is_some() {
+    let direct_child_exited = child.try_wait()?.is_some();
+    #[cfg(not(unix))]
+    if direct_child_exited {
         return Ok(());
     }
 
     #[cfg(unix)]
     let process_group = child.id() as libc::pid_t;
+    #[cfg(unix)]
+    let tree_exited = unsafe { libc::kill(-process_group, 0) != 0 };
+    #[cfg(unix)]
+    if direct_child_exited && tree_exited {
+        return Ok(());
+    }
     #[cfg(unix)]
     unsafe {
         // The child was spawned with `process_group(0)`, so its pid is also

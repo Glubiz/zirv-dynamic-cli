@@ -158,10 +158,14 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
     if let Some(floor) = sensitive_floor
         && risk < floor
     {
-        return Err(format!(
-            "risk override '{risk:?}' is below the required High floor for a sensitive surface"
-        )
-        .into());
+        if input.risk_override.is_some() {
+            return Err(format!(
+                "risk override '{risk:?}' is below the required High floor for a sensitive surface"
+            )
+            .into());
+        }
+        risk = floor;
+        reasons.push("sensitive-surface risk floor: High".to_string());
     }
     if let Some(override_band) = input.risk_override {
         reasons.push(format!("operator risk override: {override_band:?}"));

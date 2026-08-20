@@ -90,6 +90,7 @@ impl std::fmt::Display for SupportLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Integration seam for the canonical policy work in issue #43.
 pub enum PolicyDecision {
     Allow,
     Ask,
@@ -197,6 +198,7 @@ impl CapabilityReport {
 
     /// Policy may narrow support, never widen it. `Ask` remains explicitly
     /// operator-controlled; `Deny` is unsupported for this run.
+    #[allow(dead_code)] // Called by EffectivePolicy once issue #43 lands; tests pin narrowing now.
     pub fn with_policy(mut self, policy: impl Fn(CapabilityId) -> PolicyDecision) -> Self {
         for status in &mut self.statuses {
             status.support = match policy(status.capability) {

@@ -32,8 +32,8 @@ pub fn is_reserved_command(name: &str) -> bool {
 }
 
 /// File names inside a `.zirv` directory that are zirv's own configuration
-/// rather than an invocable script: the shortcuts map and the two config
-/// files (`ctx.toml`, `.settings.toml`). Shared by script listing
+/// rather than an invocable script: the shortcuts map plus `ctx.toml`,
+/// `.settings.toml`, and workflow verification config. Shared by script listing
 /// (`candidate_names_in_dir`, `help.rs`) and script lookup (`input.rs`'s
 /// `find_script_in_dir`), so a name like `.settings` can never resolve to
 /// `.settings.toml` by way of the usual `{name}.{ext}` search.
@@ -41,7 +41,6 @@ pub const RESERVED_ZIRV_FILES: &[&str] = &[
     ".shortcuts.yaml",
     "ctx.toml",
     ".settings.toml",
-    "workflow.toml",
     "verify.toml",
 ];
 
@@ -442,6 +441,7 @@ mod tests {
         assert!(is_reserved_zirv_file(".Settings.toml"));
         assert!(is_reserved_zirv_file(".SETTINGS.TOML"));
         assert!(is_reserved_zirv_file("CTX.toml"));
+        assert!(is_reserved_zirv_file("VERIFY.toml"));
         assert!(is_reserved_zirv_file(".Shortcuts.YAML"));
         assert!(!is_reserved_zirv_file("build.yaml"));
     }

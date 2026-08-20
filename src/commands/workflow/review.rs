@@ -1,6 +1,7 @@
 //! Compact independent-review packages and inspectable finding disposition.
 
-use std::io::Write;
+use std::collections::BTreeSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -73,17 +74,20 @@ pub struct VerificationEvidence {
     pub report_id: String,
     pub mode: super::verification::VerificationMode,
     pub passed: bool,
+    pub fresh: bool,
     pub fingerprint: u64,
     pub checks: Vec<(String, super::verification::CheckStatus, u64)>,
 }
 
-impl From<VerificationReport> for VerificationEvidence {
-    fn from(report: VerificationReport) -> Self {
+impl VerificationEvidence {
+    fn from_report(report: VerificationReport, current_fingerprint: u64) -> Self {
         let passed = report.passed();
+        let fresh = report.change_fingerprint == current_fingerprint;
         Self {
             report_id: report.id,
             mode: report.mode,
             passed,
+            fresh,
             fingerprint: report.change_fingerprint,
             checks: report
                 .checks
@@ -135,6 +139,95 @@ fn default_base(repo: &Path) -> CtxResult<String> {
     git(repo, &["rev-parse", "HEAD"])
 }
 
+fn read_capped_head(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
+    let mut kept = Vec::with_capacity(cap);
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        let remaining = cap.saturating_sub(kept.len());
+        let take = count.min(remaining);
+        kept.extend_from_slice(&chunk[..take]);
+        truncated |= take < count;
+    }
+    (kept, truncated)
+}
+
+fn git_diff_capped(repo: &Path, base_sha: &str) -> CtxResult<(String, bool)> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--no-ext-diff", "--unified=3", base_sha])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or("git diff stdout was not captured")?;
+    let stderr = child.stderr.take().ok_or("git diff stderr was not captured")?;
+    let stderr_thread = std::thread::spawn(move || read_capped_head(stderr, 16 * 1024).0);
+    let (stdout, truncated) = read_capped_head(stdout, MAX_REVIEW_DIFF_BYTES);
+    let status = child.wait()?;
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("git diff failed: {}", String::from_utf8_lossy(&stderr).trim()).into());
+    }
+    Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
+}
+
+fn append_capped(target: &mut String, text: &str, cap: usize, truncated: &mut bool) {
+    let remaining = cap.saturating_sub(target.len());
+    if text.len() <= remaining {
+        target.push_str(text);
+    } else {
+        target.push_str(&crate::utils::truncate_bytes(text.to_string(), Some(remaining)));
+        *truncated = true;
+    }
+}
+
+fn append_untracked(
+    diff: &mut String,
+    truncated: &mut bool,
+    repo: &Path,
+    paths: &[PathBuf],
+) -> CtxResult<()> {
+    for path in paths {
+        let header = format!(
+            "\n\ndiff --zirv-untracked a/{0} b/{0}\n--- /dev/null\n+++ b/{0}\n",
+            path.display()
+        );
+        append_capped(diff, &header, MAX_REVIEW_DIFF_BYTES, truncated);
+        if diff.len() == MAX_REVIEW_DIFF_BYTES {
+            *truncated = true;
+            break;
+        }
+        let absolute = repo.join(path);
+        let metadata = std::fs::symlink_metadata(&absolute)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            append_capped(
+                diff,
+                "[untracked non-regular file omitted]\n",
+                MAX_REVIEW_DIFF_BYTES,
+                truncated,
+            );
+            continue;
+        }
+        let remaining = MAX_REVIEW_DIFF_BYTES.saturating_sub(diff.len());
+        let mut bytes = Vec::new();
+        std::fs::File::open(&absolute)?
+            .take(u64::try_from(remaining.saturating_add(1)).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > remaining {
+            bytes.truncate(remaining);
+            *truncated = true;
+        }
+        let body = String::from_utf8_lossy(&bytes);
+        append_capped(diff, &body, MAX_REVIEW_DIFF_BYTES, truncated);
+    }
+    Ok(())
+}
+
 pub fn package(
     state_dir: &StateDir,
     state: &WorkflowState,
@@ -146,16 +239,31 @@ pub fn package(
     };
     let head_sha = git(&state.repo, &["rev-parse", "HEAD"])?;
     // `git diff <base>` includes committed branch changes plus current staged
-    // and unstaged edits, so the reviewer sees the actual final surface.
-    let raw_diff = git(&state.repo, &["diff", "--no-ext-diff", "--unified=3", &base_sha])?;
-    let diff = crate::utils::truncate_bytes(raw_diff.clone(), Some(MAX_REVIEW_DIFF_BYTES));
-    let diff_truncated = diff.len() < raw_diff.len();
-    let changed_paths = git(&state.repo, &["diff", "--name-only", &base_sha])?
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect();
-    let verification = verification::load_latest(state_dir, &state.repo)?.map(Into::into);
+    // and unstaged edits. Git omits untracked files, so include bounded file
+    // bodies for those explicitly and union them into the changed path list.
+    let (mut diff, mut diff_truncated) = git_diff_capped(&state.repo, &base_sha)?;
+    let untracked: Vec<PathBuf> = git(
+        &state.repo,
+        &["ls-files", "--others", "--exclude-standard"],
+    )?
+    .lines()
+    .filter(|line| !line.is_empty())
+    .map(PathBuf::from)
+    .collect();
+    append_untracked(&mut diff, &mut diff_truncated, &state.repo, &untracked)?;
+    let mut changed_paths: BTreeSet<PathBuf> = git(
+        &state.repo,
+        &["diff", "--name-only", &base_sha],
+    )?
+    .lines()
+    .filter(|line| !line.is_empty())
+    .map(PathBuf::from)
+    .collect();
+    changed_paths.extend(untracked);
+    let changed_paths = changed_paths.into_iter().collect();
+    let current_fingerprint = verification::change_fingerprint(&state.repo)?;
+    let verification = verification::load_latest(state_dir, &state.repo)?
+        .map(|report| VerificationEvidence::from_report(report, current_fingerprint));
     let review_round = state
         .attempts
         .get("review")
@@ -271,6 +379,28 @@ fn save_state(state_dir: &StateDir, state: &WorkflowState) -> CtxResult<()> {
     engine::save(state_dir, state, active)
 }
 
+fn record_finding_update(state_dir: &StateDir, state: &WorkflowState) {
+    let (total, meaningful, dismissed) =
+        super::telemetry::finding_counts(&state.review_findings);
+    let mut event = super::telemetry::TelemetryEvent::new(
+        super::telemetry::TelemetryKind::FindingUpdated,
+    );
+    event.workflow_id = Some(state.id.clone());
+    event.phase = Some(super::skill::WorkflowPhase::Review);
+    event.intent = Some(state.classification.intent);
+    event.complexity = Some(state.classification.complexity);
+    event.risk = Some(state.classification.risk);
+    event.findings_total = total;
+    event.findings_meaningful = meaningful;
+    event.findings_dismissed = dismissed;
+    let _ = super::telemetry::record(
+        state_dir,
+        &state.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::from_env(),
+    );
+}
+
 fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<i32> {
     if !agent
         .chars()
@@ -367,6 +497,7 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             state.review_findings.push(finding.clone());
             state.updated_at = now_secs();
             save_state(&state_dir, &state)?;
+            record_finding_update(&state_dir, &state);
             writeln!(writer, "{}", finding.id)?;
         }
         ReviewCommand::Dispose(args) => {
@@ -379,6 +510,7 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             finding.disposition = args.disposition;
             state.updated_at = now_secs();
             save_state(&state_dir, &state)?;
+            record_finding_update(&state_dir, &state);
             writeln!(writer, "{}: {:?}", args.finding_id, args.disposition)?;
         }
         ReviewCommand::List(args) => {
