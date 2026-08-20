@@ -27,10 +27,12 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
     /// zirv's own `ctx.toml`, `.settings.toml`, memory bank, mail, session
-    /// state. No production surface names this yet -- `optimize.rs` only
-    /// collects Claude surfaces today (issue #39); a later task wires
-    /// zirv's own surfaces through the same model.
-    #[allow(dead_code)]
+    /// state -- and, since issue #41, the canonical `.zirv/context/common.md`
+    /// layer (`optimize.rs`'s `Layer::ContextCommon`): meant for every
+    /// harness alike, so it names the system that owns it (zirv), not one
+    /// it targets. `optimize.rs` collects both Claude's and Codex's own
+    /// surfaces (issues #39/#40) plus this one; memory/mail/session state
+    /// still have no surface naming this variant.
     Zirv,
     Claude,
     /// Codex's own AGENTS.md and `config.toml` analogues (issue #40) --
@@ -152,7 +154,12 @@ impl ContextSurface {
     /// among the repo-owned variants -- never back to `Global`, and never set
     /// independently of this classification. This is what makes a
     /// repo-owned path minting `Trust::Operator` unreachable through the
-    /// public API, not merely discouraged by convention.
+    /// public API, not merely discouraged by convention. The same now holds
+    /// for a path that is neither repo-owned nor verifiably under the given
+    /// `home`: `Global` is minted only on a positive match against `home`,
+    /// never merely because `path` failed the repo check (see this
+    /// function's own fix note -- an earlier version defaulted every such
+    /// path straight to `Global`).
     pub fn for_path(
         provider: Provider,
         kind: Kind,
@@ -160,10 +167,23 @@ impl ContextSurface {
         repo: &Path,
         home: Option<&Path>,
     ) -> Self {
+        // `Global` is only ever minted when it can be positively verified --
+        // `home` given, and `path` actually under it. A path this function
+        // cannot place under either the repo or a known home (including
+        // every call where the caller does not know `home` at all, `home:
+        // None`) falls back to `Repo`/`RepoUntrusted` rather than `Global`:
+        // erring toward untrusted is safe (analysis still reads the file),
+        // erring toward `Operator` is not. An earlier version of this
+        // function defaulted anything outside the repo straight to
+        // `Global`, which minted `Trust::Operator` for a path it had no
+        // actual evidence was the operator's home -- fail-open on the one
+        // axis this module exists to protect.
         let scope = if path.starts_with(repo) {
             Scope::Repo
-        } else {
+        } else if home.is_some_and(|home| path.starts_with(home)) {
             Scope::Global
+        } else {
+            Scope::Repo
         };
         // The load-bearing check: a path inside the repo checkout must never
         // classify as `Global`. Tautological given the `if`/`else` above --
@@ -175,7 +195,8 @@ impl ContextSurface {
         );
         // A secondary, non-load-bearing sanity check: when the caller does
         // know the operator's home directory, a genuinely global surface
-        // should actually live under it.
+        // should actually live under it. Now tautological too (the branch
+        // above requires it), kept as the same regression guard.
         if let Some(home) = home {
             debug_assert!(
                 scope != Scope::Global || path.starts_with(home),
@@ -403,6 +424,58 @@ mod tests {
         );
         assert_eq!(surface.scope(), Scope::Global);
         assert_eq!(surface.trust(), Trust::Operator);
+    }
+
+    /// A repo nested inside the operator's home directory (a common real
+    /// layout: `~/work/repo`) must still classify as repo-owned. `path`
+    /// satisfies `starts_with(repo)` here, so it takes the first branch and
+    /// never even reaches the `home` check -- proving the repo check is
+    /// tried first, the way the fail-open fix below depends on.
+    #[test]
+    fn a_repo_nested_inside_home_still_classifies_as_repo_owned() {
+        let home = Path::new("/home/operator");
+        let repo = home.join("work/repo");
+        let surface = ContextSurface::for_path(
+            Provider::Claude,
+            Kind::Instructions,
+            repo.join("CLAUDE.md"),
+            &repo,
+            Some(home),
+        );
+        assert_eq!(surface.scope(), Scope::Repo);
+        assert_eq!(surface.trust(), Trust::RepoUntrusted);
+    }
+
+    /// The fail-open bug this fix closes: a path that is neither under the
+    /// repo nor (verifiably) under the operator's home must never mint
+    /// `Trust::Operator` by default. Covers both an unclassifiable path with
+    /// `home` given and the harder case, `home: None`, where an earlier
+    /// version had nothing at all to check against and defaulted straight to
+    /// `Global`.
+    #[test]
+    fn an_unclassifiable_path_never_defaults_to_operator_trust() {
+        let repo = Path::new("/repo");
+        let home = Path::new("/home/operator");
+
+        let with_home = ContextSurface::for_path(
+            Provider::Claude,
+            Kind::Instructions,
+            PathBuf::from("/etc/some-other-config.md"),
+            repo,
+            Some(home),
+        );
+        assert_ne!(with_home.scope(), Scope::Global);
+        assert_eq!(with_home.trust(), Trust::RepoUntrusted);
+
+        let without_home = ContextSurface::for_path(
+            Provider::Claude,
+            Kind::Instructions,
+            PathBuf::from("/etc/some-other-config.md"),
+            repo,
+            None,
+        );
+        assert_ne!(without_home.scope(), Scope::Global);
+        assert_eq!(without_home.trust(), Trust::RepoUntrusted);
     }
 
     /// `into_nested`/`into_local_private` only ever narrow an already repo-owned
