@@ -57,18 +57,24 @@ pub fn codex_path(repo: &Path) -> PathBuf {
 /// order a future compiler (issue #44) composes layers in: canonical common
 /// content applies first, a harness-specific canonical addition layers on
 /// top of it, and a harness's own native instruction file (CLAUDE.md /
-/// AGENTS.md, at any scope) composes last -- closest to the session, so a
-/// conflicting instruction there is read as refining or overriding the
-/// canonical layer rather than the other way around. `PartialOrd`/`Ord` are
-/// derived from declaration order, the same technique `Severity` (above)
-/// uses for its own three-value ranking. Consumed by `drift.rs`'s
-/// precedence/shadowing findings (issue #42); Task 14's compiler is the
-/// second real consumer, for actual layer ordering.
+/// AGENTS.md) composes last -- closest to the session. Within the native
+/// tier, scope narrows the same way both harnesses' own documented override
+/// order does: a nested file overrides its repo root, which overrides the
+/// operator's global file (fix round 1, review finding 12-2 -- collapsing
+/// every scope into one `Native` value hid this real, common shadowing case
+/// entirely: a nested CLAUDE.md is *supposed* to win over the repo root one,
+/// not tie with it). `PartialOrd`/`Ord` are derived from declaration order,
+/// the same technique `Severity` (above) uses for its own ranking.
+/// Consumed by `drift.rs`'s precedence/shadowing findings (issue #42);
+/// Task 14's compiler is the second real consumer, for actual layer
+/// ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PrecedenceTier {
     CanonicalCommon,
     CanonicalHarnessSpecific,
-    Native,
+    NativeGlobal,
+    NativeRepo,
+    NativeNested,
 }
 
 impl PrecedenceTier {
@@ -76,7 +82,9 @@ impl PrecedenceTier {
         match self {
             PrecedenceTier::CanonicalCommon => "canonical common",
             PrecedenceTier::CanonicalHarnessSpecific => "canonical harness-specific",
-            PrecedenceTier::Native => "native",
+            PrecedenceTier::NativeGlobal => "native (global)",
+            PrecedenceTier::NativeRepo => "native (repo)",
+            PrecedenceTier::NativeNested => "native (nested)",
         }
     }
 }
@@ -84,20 +92,19 @@ impl PrecedenceTier {
 /// `None` for anything that is not an `Instructions`-kind layer (settings/
 /// policy surfaces are a different dimension entirely -- see `Layer::kind`
 /// and `Layer::is_settings`). Every `Instructions` layer has an opinion here;
-/// `every_instructions_layer_has_a_defined_tier` (below) keeps a future
-/// variant from being added to one enum without the other.
+/// `every_instructions_layer_has_a_defined_tier` (below) iterates
+/// `optimize::ALL_LAYERS` rather than a hand-picked subset, so a future
+/// `Instructions`-kind variant added here without a matching arm fails that
+/// test instead of silently falling through the wildcard below.
 pub fn precedence_tier(layer: Layer) -> Option<PrecedenceTier> {
     match layer {
         Layer::ContextCommon => Some(PrecedenceTier::CanonicalCommon),
         Layer::ContextClaude | Layer::ContextCodex => {
             Some(PrecedenceTier::CanonicalHarnessSpecific)
         }
-        Layer::GlobalClaudeMd
-        | Layer::RepoClaudeMd
-        | Layer::NestedClaudeMd
-        | Layer::GlobalAgentsMd
-        | Layer::RepoAgentsMd
-        | Layer::NestedAgentsMd => Some(PrecedenceTier::Native),
+        Layer::GlobalClaudeMd | Layer::GlobalAgentsMd => Some(PrecedenceTier::NativeGlobal),
+        Layer::RepoClaudeMd | Layer::RepoAgentsMd => Some(PrecedenceTier::NativeRepo),
+        Layer::NestedClaudeMd | Layer::NestedAgentsMd => Some(PrecedenceTier::NativeNested),
         _ => None,
     }
 }
@@ -105,28 +112,36 @@ pub fn precedence_tier(layer: Layer) -> Option<PrecedenceTier> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::ctx::surface::Trust;
+    use crate::commands::ctx::optimize::ALL_LAYERS;
+    use crate::commands::ctx::surface::{Kind, Trust};
 
     #[test]
     fn precedence_ranks_canonical_common_below_harness_specific_below_native() {
         assert!(PrecedenceTier::CanonicalCommon < PrecedenceTier::CanonicalHarnessSpecific);
-        assert!(PrecedenceTier::CanonicalHarnessSpecific < PrecedenceTier::Native);
+        assert!(PrecedenceTier::CanonicalHarnessSpecific < PrecedenceTier::NativeGlobal);
     }
 
+    /// Within the native tier, the more specific scope wins: nested
+    /// overrides repo, repo overrides global -- the real shadowing case a
+    /// single collapsed `Native` value hid (fix round 1, review finding
+    /// 12-2).
+    #[test]
+    fn native_precedence_narrows_global_below_repo_below_nested() {
+        assert!(PrecedenceTier::NativeGlobal < PrecedenceTier::NativeRepo);
+        assert!(PrecedenceTier::NativeRepo < PrecedenceTier::NativeNested);
+    }
+
+    /// Iterates every `Layer` variant (`optimize::ALL_LAYERS`) rather than a
+    /// hand-picked subset, so a future `Instructions`-kind variant added
+    /// without a matching `precedence_tier` arm fails this test instead of
+    /// silently falling through that function's wildcard arm (fix round 1,
+    /// review finding 12-2).
     #[test]
     fn every_instructions_layer_has_a_defined_tier() {
-        for layer in [
-            Layer::ContextCommon,
-            Layer::ContextClaude,
-            Layer::ContextCodex,
-            Layer::GlobalClaudeMd,
-            Layer::RepoClaudeMd,
-            Layer::NestedClaudeMd,
-            Layer::GlobalAgentsMd,
-            Layer::RepoAgentsMd,
-            Layer::NestedAgentsMd,
-        ] {
-            assert!(precedence_tier(layer).is_some(), "{layer:?} has no tier");
+        for layer in ALL_LAYERS.iter().copied() {
+            if layer.kind() == Kind::Instructions {
+                assert!(precedence_tier(layer).is_some(), "{layer:?} has no tier");
+            }
         }
     }
 

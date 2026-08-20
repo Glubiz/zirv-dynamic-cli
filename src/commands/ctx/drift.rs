@@ -19,20 +19,34 @@
 //! changes nothing about what a session actually does -- except
 //! `"contradiction"` (`Severity::Warning`), the one kind where two surfaces
 //! disagree about the same rule and which one a session follows depends on
-//! precedence that may not have been intended.
+//! precedence that may not have been intended. Opposite-polarity wording
+//! across *different* harnesses (fix round 1, review finding 12-1) is a
+//! separate, deliberately `Info`-severity kind, `"differs-per-harness"`: a
+//! Claude-specific and a Codex-specific file disagreeing is the intended
+//! per-harness customization issue #41 exists to allow, not a bug -- only a
+//! same-provider pair, or a pair where either side is the harness-neutral
+//! canonical layer (`Provider::Zirv`), can actually contradict itself.
 //!
 //! **Scope note.** The near-duplicate/contradiction pass compares every pair
-//! of cross-surface instructions (`O(n^2)` in the total bullet count across
-//! every collected surface) using fixed Jaccard/negation-token heuristics --
-//! lexical overlap, not semantic understanding, and not profiled against a
-//! deliberately adversarial input. `optimize.rs` already bounds the input
-//! (`MAX_SURFACES`, `cfg.optimize.max_surface_bytes`), which is the scope
-//! this module inherits rather than adding its own cap.
+//! of cross-surface instructions using fixed Jaccard/negation-token
+//! heuristics -- lexical overlap, not semantic understanding, and not
+//! profiled against a deliberately adversarial input. Nominally `O(n^2)` in
+//! the total bullet count, but each pair is pruned by a cheap token-count
+//! ratio check (a necessary condition for the Jaccard threshold: Jaccard
+//! similarity is always `<= min(|A|,|B|) / max(|A|,|B|)`, so the ratio check
+//! can only reject pairs the full Jaccard computation would have rejected
+//! too) before either side's token set is built or intersected, and total
+//! emitted pair-findings are capped (`MAX_PAIR_FINDINGS`) with an explicit
+//! truncation note rather than growing unbounded or truncating silently.
+//! `optimize.rs` already bounds the input (`MAX_SURFACES`,
+//! `cfg.optimize.max_surface_bytes`), which is the scope this module
+//! inherits rather than adding its own surface-count cap.
 
 use std::collections::BTreeSet;
 
 use super::context;
 use super::optimize::{self, Finding, Instruction, Layer, Severity, Surface};
+use super::surface::Provider;
 
 /// Above this Jaccard token-overlap ratio, two cross-surface instructions are
 /// treated as the same rule in different words. A deliberately conservative
@@ -87,8 +101,28 @@ fn negation_tokens(normalized: &str) -> BTreeSet<&'static str> {
         .collect()
 }
 
+/// Hard cap on how many near-duplicate/contradiction findings one `analyze`
+/// call will emit. A capped run says so explicitly (a
+/// `"near-duplicate-scan-truncated"` finding naming the omitted count)
+/// rather than growing unbounded or truncating silently.
+const MAX_PAIR_FINDINGS: usize = 200;
+
 fn layer_of(surfaces: &[Surface], instruction: &Instruction) -> Layer {
     surfaces[instruction.surface].layer
+}
+
+/// Whether an opposite-polarity pair is eligible to be reported as an actual
+/// `"contradiction"` rather than downgraded to `"differs-per-harness"`: both
+/// sides target the same harness, or either side is the harness-neutral
+/// canonical layer (`Provider::Zirv`) -- a canonical rule disagreeing with a
+/// harness-specific one is still a real conflict, since the canonical layer
+/// is supposed to apply to every harness alike.
+fn shares_provider_or_canonical(surfaces: &[Surface], a: &Instruction, b: &Instruction) -> bool {
+    let (provider_a, provider_b) = (
+        layer_of(surfaces, a).provider(),
+        layer_of(surfaces, b).provider(),
+    );
+    provider_a == provider_b || provider_a == Provider::Zirv || provider_b == Provider::Zirv
 }
 
 /// Every finding this module can produce, over already-collected surfaces.
@@ -200,35 +234,93 @@ fn duplicate_findings(surfaces: &[Surface]) -> Vec<Finding> {
     findings
 }
 
+/// A single instruction's precomputed comparison data, built once per
+/// instruction rather than once per pair (fix round 1, review finding 12-3
+/// -- the original pairwise loop rebuilt both `BTreeSet`s on every
+/// comparison).
+struct Profile<'a> {
+    instruction: &'a Instruction,
+    tokens: BTreeSet<&'a str>,
+    negation: BTreeSet<&'static str>,
+}
+
 /// Cross-surface pairs whose normalized text is similar but not identical
-/// (exact duplicates are `duplicate_findings`'s job). A `contradiction` is a
-/// near-duplicate pair whose negation-token sets differ -- the same rule
-/// stated with opposite polarity.
+/// (exact duplicates are `duplicate_findings`'s job). An opposite-polarity
+/// pair is a `contradiction` when eligible (`shares_provider_or_canonical`),
+/// otherwise a same-meaning-different-harness pair is expected divergence,
+/// not a bug (`"differs-per-harness"`) -- see the module doc.
 fn near_duplicate_and_contradiction_findings(surfaces: &[Surface]) -> Vec<Finding> {
     let all = optimize::all_instructions(surfaces);
-    let mut findings = Vec::new();
+    let profiles: Vec<Profile> = all
+        .iter()
+        .map(|instruction| Profile {
+            instruction,
+            tokens: token_set(&instruction.normalized),
+            negation: negation_tokens(&instruction.normalized),
+        })
+        .collect();
 
-    for i in 0..all.len() {
-        for j in (i + 1)..all.len() {
-            let (a, b) = (&all[i], &all[j]);
-            if a.surface == b.surface || a.normalized == b.normalized {
+    let mut findings = Vec::new();
+    let mut omitted = 0usize;
+
+    for i in 0..profiles.len() {
+        for j in (i + 1)..profiles.len() {
+            let (a, b) = (&profiles[i], &profiles[j]);
+            if a.instruction.surface == b.instruction.surface
+                || a.instruction.normalized == b.instruction.normalized
+            {
                 continue;
             }
-            let (set_a, set_b) = (token_set(&a.normalized), token_set(&b.normalized));
-            if jaccard(&set_a, &set_b) < NEAR_DUPLICATE_JACCARD {
+
+            // Cheap necessary condition, checked before either token set is
+            // intersected/unioned: Jaccard similarity is always
+            // `<= min(|A|,|B|) / max(|A|,|B|)`, so a pair whose token-count
+            // ratio already falls short of the threshold can never pass the
+            // full Jaccard check either.
+            let (len_a, len_b) = (a.tokens.len(), b.tokens.len());
+            if len_a == 0 || len_b == 0 {
+                continue;
+            }
+            let (shorter, longer) = if len_a <= len_b {
+                (len_a, len_b)
+            } else {
+                (len_b, len_a)
+            };
+            if (shorter as f64) / (longer as f64) < NEAR_DUPLICATE_JACCARD {
+                continue;
+            }
+            if jaccard(&a.tokens, &b.tokens) < NEAR_DUPLICATE_JACCARD {
+                continue;
+            }
+
+            if findings.len() >= MAX_PAIR_FINDINGS {
+                omitted += 1;
                 continue;
             }
 
             let evidence = vec![
-                optimize::evidence_ref(&surfaces[a.surface], a.line),
-                optimize::evidence_ref(&surfaces[b.surface], b.line),
+                optimize::evidence_ref(&surfaces[a.instruction.surface], a.instruction.line),
+                optimize::evidence_ref(&surfaces[b.instruction.surface], b.instruction.line),
             ];
-            let is_contradiction = negation_tokens(&a.normalized) != negation_tokens(&b.normalized);
-            findings.push(if is_contradiction {
+            let is_contradiction = a.negation != b.negation;
+            let (a_text, b_text) = (&a.instruction.text, &b.instruction.text);
+
+            findings.push(if !is_contradiction {
+                Finding {
+                    kind: "near-duplicate",
+                    severity: Severity::Info,
+                    title: format!("Near-duplicate wording: \"{a_text}\" vs \"{b_text}\""),
+                    evidence,
+                    detail: "These two instructions say close to the same thing in different \
+                             wording; consider consolidating into one copy."
+                        .to_string(),
+                    proposed_diff: None,
+                }
+            } else if shares_provider_or_canonical(surfaces, a.instruction, b.instruction) {
                 Finding {
                     kind: "contradiction",
                     severity: Severity::Warning,
-                    title: format!("Possible contradiction: \"{}\" vs \"{}\"", a.text, b.text),
+                    title: format!("Possible contradiction: \"{a_text}\" vs \"{b_text}\""),
                     evidence,
                     detail: "These two instructions read as the same rule stated with opposite \
                              polarity. Which one a session actually follows depends on \
@@ -238,17 +330,34 @@ fn near_duplicate_and_contradiction_findings(surfaces: &[Surface]) -> Vec<Findin
                 }
             } else {
                 Finding {
-                    kind: "near-duplicate",
+                    kind: "differs-per-harness",
                     severity: Severity::Info,
-                    title: format!("Near-duplicate wording: \"{}\" vs \"{}\"", a.text, b.text),
+                    title: format!("Differs per harness: \"{a_text}\" vs \"{b_text}\""),
                     evidence,
-                    detail: "These two instructions say close to the same thing in different \
-                             wording; consider consolidating into one copy."
+                    detail: "These two instructions read as the same rule stated with opposite \
+                             polarity, but target different harnesses -- likely intended \
+                             per-harness customization rather than a real conflict."
                         .to_string(),
                     proposed_diff: None,
                 }
             });
         }
+    }
+
+    if omitted > 0 {
+        findings.push(Finding {
+            kind: "near-duplicate-scan-truncated",
+            severity: Severity::Info,
+            title: format!(
+                "Near-duplicate/contradiction scan capped at {MAX_PAIR_FINDINGS} findings"
+            ),
+            evidence: Vec::new(),
+            detail: format!(
+                "{omitted} additional qualifying pair(s) were found but not reported. Narrow \
+                 the surface set (fewer nested files, a smaller repo subtree) to see them."
+            ),
+            proposed_diff: None,
+        });
     }
 
     findings
@@ -423,9 +532,45 @@ mod tests {
     }
 
     /// The one behavior-changing kind: opposite polarity over otherwise
-    /// near-identical wording.
+    /// near-identical wording, within the same provider (two Claude
+    /// surfaces) -- a real conflict, since both are read by the same
+    /// harness.
     #[test]
-    fn opposite_polarity_over_similar_wording_is_a_contradiction() {
+    fn opposite_polarity_within_the_same_provider_is_a_contradiction() {
+        let surfaces = vec![
+            surface(
+                Layer::RepoClaudeMd,
+                "/repo/CLAUDE.md",
+                "- always commit with a descriptive message explaining the change\n",
+            ),
+            surface(
+                Layer::NestedClaudeMd,
+                "/repo/crates/inner/CLAUDE.md",
+                "- never commit with a descriptive message explaining the change\n",
+            ),
+        ];
+
+        let findings = analyze(&surfaces);
+        let finding = findings
+            .iter()
+            .find(|f| f.kind == "contradiction")
+            .unwrap_or_else(|| panic!("no contradiction finding: {findings:#?}"));
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.kind != "near-duplicate" && f.kind != "differs-per-harness"),
+            "opposite polarity within one provider must be a contradiction: {findings:#?}"
+        );
+    }
+
+    /// Fix round 1, review finding 12-1: a Claude-specific file and a
+    /// Codex-specific file disagreeing is the intended per-harness
+    /// customization issue #41 exists to allow, not a bug -- this must
+    /// downgrade to the informational `"differs-per-harness"` kind, never
+    /// the behavior-changing `"contradiction"`.
+    #[test]
+    fn opposite_polarity_across_harnesses_differs_per_harness_not_a_contradiction() {
         let surfaces = vec![
             surface(
                 Layer::RepoClaudeMd,
@@ -442,13 +587,42 @@ mod tests {
         let findings = analyze(&surfaces);
         let finding = findings
             .iter()
+            .find(|f| f.kind == "differs-per-harness")
+            .unwrap_or_else(|| panic!("no differs-per-harness finding: {findings:#?}"));
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(
+            findings.iter().all(|f| f.kind != "contradiction"),
+            "cross-harness divergence must not count as a behavior-changing conflict: {findings:#?}"
+        );
+    }
+
+    /// The canonical common layer (`Provider::Zirv`) disagreeing with a
+    /// harness-specific file is still a real contradiction: the canonical
+    /// layer is supposed to apply to every harness alike, so a
+    /// Codex-specific override contradicting it is not "expected
+    /// divergence" the way two harness-specific files diverging is.
+    #[test]
+    fn opposite_polarity_against_the_canonical_common_layer_is_still_a_contradiction() {
+        let surfaces = vec![
+            surface(
+                Layer::ContextCommon,
+                "/repo/.zirv/context/common.md",
+                "- always commit with a descriptive message explaining the change\n",
+            ),
+            surface(
+                Layer::RepoAgentsMd,
+                "/repo/AGENTS.md",
+                "- never commit with a descriptive message explaining the change\n",
+            ),
+        ];
+
+        let findings = analyze(&surfaces);
+        let finding = findings
+            .iter()
             .find(|f| f.kind == "contradiction")
             .unwrap_or_else(|| panic!("no contradiction finding: {findings:#?}"));
         assert_eq!(finding.severity, Severity::Warning);
-        assert!(
-            findings.iter().all(|f| f.kind != "near-duplicate"),
-            "opposite polarity must be reported as contradiction, not near-duplicate: {findings:#?}"
-        );
+        assert!(findings.iter().all(|f| f.kind != "differs-per-harness"));
     }
 
     #[test]

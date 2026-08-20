@@ -46,6 +46,30 @@ pub enum Layer {
     ContextCodex,
 }
 
+/// Every `Layer` variant, in declaration order. Test-only: exists so a test
+/// that needs to check a property against "every layer" doesn't hand-
+/// maintain a second, easily out-of-sync copy of the variant list (fix
+/// round 1, review finding 12-2 -- `context::tests::
+/// every_instructions_layer_has_a_defined_tier` is the cross-module
+/// consumer this replaced a hardcoded 9-layer list with).
+#[cfg(test)]
+pub const ALL_LAYERS: &[Layer] = &[
+    Layer::GlobalClaudeMd,
+    Layer::RepoClaudeMd,
+    Layer::NestedClaudeMd,
+    Layer::UserSettings,
+    Layer::ProjectSettings,
+    Layer::LocalSettings,
+    Layer::GlobalAgentsMd,
+    Layer::RepoAgentsMd,
+    Layer::NestedAgentsMd,
+    Layer::CodexUserSettings,
+    Layer::CodexProjectSettings,
+    Layer::ContextCommon,
+    Layer::ContextClaude,
+    Layer::ContextCodex,
+];
+
 impl Layer {
     pub fn label(&self) -> &'static str {
         match self {
@@ -309,22 +333,15 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
         );
     }
 
-    push_surface(
-        &mut surfaces,
-        Layer::RepoClaudeMd,
-        repo.join("CLAUDE.md"),
-        max_bytes,
-    );
-    push_surface(
-        &mut surfaces,
-        Layer::RepoAgentsMd,
-        repo.join("AGENTS.md"),
-        max_bytes,
-    );
-
-    // Issue #41: zirv's own canonical instruction layer. Repo-owned and
-    // entirely optional in every part, read the same capped/absent-is-fine
-    // way as every other fixed-path surface above.
+    // Issue #41: zirv's own canonical instruction layer, pushed before every
+    // native repo instruction file (fix round 1, review finding 11-1): both
+    // `lint_redundancy` and `drift.rs` treat the first occurrence in
+    // collection order as an exact-duplicate group's "home", so the
+    // canonical copy must be seen first -- otherwise `lint_redundancy`'s own
+    // proposed diff would delete the canonical line and keep the native one,
+    // directly contradicting `drift.rs`'s "the native copy is the redundant
+    // one" finding. Repo-owned and entirely optional in every part, read the
+    // same capped/absent-is-fine way as every other fixed-path surface here.
     push_surface(
         &mut surfaces,
         Layer::ContextCommon,
@@ -341,6 +358,19 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
         &mut surfaces,
         Layer::ContextCodex,
         context::codex_path(repo),
+        max_bytes,
+    );
+
+    push_surface(
+        &mut surfaces,
+        Layer::RepoClaudeMd,
+        repo.join("CLAUDE.md"),
+        max_bytes,
+    );
+    push_surface(
+        &mut surfaces,
+        Layer::RepoAgentsMd,
+        repo.join("AGENTS.md"),
         max_bytes,
     );
 
@@ -2302,6 +2332,86 @@ mod tests {
         assert!(
             finding.evidence.iter().any(|e| e.contains("CLAUDE.md")),
             "{finding:?}"
+        );
+    }
+
+    /// Fix round 1, review finding 11-1: `collect_surfaces` pushes the
+    /// canonical `.zirv/context/` layer before any native repo instruction
+    /// file, so a caller walking the surface list in order sees the
+    /// canonical copy first. This is what makes `lint_redundancy`'s
+    /// first-occurrence-is-home rule agree with `drift.rs`'s own
+    /// "the native copy is redundant" reading of the same duplicate, instead
+    /// of the two contradicting each other.
+    #[test]
+    fn context_surfaces_are_collected_before_repo_native_instructions() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::create_dir_all(repo.join(".zirv/context")).expect("mkdir");
+        std::fs::write(repo.join(".zirv/context/common.md"), "# common\n").expect("write");
+        std::fs::write(repo.join(".zirv/context/claude.md"), "# claude\n").expect("write");
+        std::fs::write(repo.join(".zirv/context/codex.md"), "# codex\n").expect("write");
+        add_codex_surfaces(&home, &repo);
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let index_of = |layer: Layer| {
+            surfaces
+                .iter()
+                .position(|s| s.layer == layer)
+                .unwrap_or_else(|| panic!("{layer:?} not collected: {surfaces:#?}"))
+        };
+
+        let common = index_of(Layer::ContextCommon);
+        let claude = index_of(Layer::ContextClaude);
+        let codex = index_of(Layer::ContextCodex);
+        let repo_claude_md = index_of(Layer::RepoClaudeMd);
+        let repo_agents_md = index_of(Layer::RepoAgentsMd);
+
+        assert!(common < repo_claude_md, "{surfaces:#?}");
+        assert!(claude < repo_claude_md, "{surfaces:#?}");
+        assert!(codex < repo_agents_md, "{surfaces:#?}");
+        assert!(common < repo_agents_md, "{surfaces:#?}");
+    }
+
+    /// The proposed-diff half of the same fix: `lint_redundancy`'s
+    /// `deletion_diff` must remove the line from the native `CLAUDE.md`
+    /// copy, never from the canonical `common.md` copy -- deleting the
+    /// canonical line would be exactly backwards, since `common.md` is the
+    /// one place this rule is meant to live. Constructs the two surfaces
+    /// directly (in `collect_surfaces`'s own order, canonical first) rather
+    /// than going through `fixture_tree()`, whose own global CLAUDE.md
+    /// already restates "always run tests" and would otherwise become a
+    /// third, earlier-collected copy of the same group -- a real instance
+    /// of the same ordering question, but not the specific canonical-vs-
+    /// repo-native relationship this test pins.
+    #[test]
+    fn the_proposed_deletion_for_a_canonical_duplicate_targets_the_native_copy_not_the_canonical_one()
+     {
+        let repo = Path::new("/repo");
+        let surfaces = vec![
+            Surface {
+                layer: Layer::ContextCommon,
+                path: repo.join(".zirv/context/common.md"),
+                text: "# common\n- always run tests\n".to_string(),
+            },
+            Surface {
+                layer: Layer::RepoClaudeMd,
+                path: repo.join("CLAUDE.md"),
+                text: "# repo\n- always run tests\n".to_string(),
+            },
+        ];
+
+        let findings = lint_redundancy(&surfaces, repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        let diff = finding
+            .proposed_diff
+            .as_ref()
+            .expect("a repo-owned duplicate gets a proposed diff");
+
+        assert!(
+            diff.contains("CLAUDE.md") && !diff.contains("common.md"),
+            "the diff must remove the native copy, not the canonical one: {diff}"
         );
     }
 
