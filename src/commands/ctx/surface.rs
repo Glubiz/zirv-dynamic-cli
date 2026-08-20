@@ -3,12 +3,13 @@
 //! relative to the repository checkout, and whether zirv may ever treat its
 //! content as operator-authoritative.
 //!
-//! `optimize.rs`'s `Layer` enum (CLAUDE.md layers, `.claude/settings*.json`)
-//! is the first consumer: each of its variants maps onto one `(Provider,
-//! Kind, Scope)` triple, and its `is_settings()`/`is_repo_owned()` helpers are
-//! now derived from that mapping rather than hand-rolled per variant. Tasks
-//! 10-16 build new surfaces (AGENTS.md, harness-native settings, memory,
-//! session/handoff/mail) on the same vocabulary.
+//! `optimize.rs`'s `Layer` enum is the first consumer: each of its variants
+//! maps onto one `(Provider, Kind, Scope)` triple, and its `is_settings()`/
+//! `is_repo_owned()` helpers are derived from that mapping rather than
+//! hand-rolled per variant. As of issue #40, `Layer` maps both Claude's
+//! CLAUDE.md/`settings.json` and Codex's own AGENTS.md/`config.toml` through
+//! it; Tasks 11-16 build the remaining surfaces (memory, session/handoff/
+//! mail) on the same vocabulary.
 //!
 //! The load-bearing property is `Scope::trust`: `Trust` is never a field a
 //! caller sets independently, only a value derived from `Scope`. That alone
@@ -32,10 +33,13 @@ pub enum Provider {
     #[allow(dead_code)]
     Zirv,
     Claude,
-    /// No production surface names this yet either -- `optimize.rs`'s
-    /// `Layer` only maps to `Claude` today; a follow-up task (issue #40)
-    /// adds Codex's own CLAUDE.md/settings.json analogues.
-    #[allow(dead_code)]
+    /// Codex's own AGENTS.md and `config.toml` analogues (issue #40) --
+    /// `optimize.rs`'s `Layer::GlobalAgentsMd`/`RepoAgentsMd`/
+    /// `NestedAgentsMd`/`CodexUserSettings`/`CodexProjectSettings` all map
+    /// here. Claude contributes a `LocalPrivate`-scoped surface
+    /// (`settings.local.json`); Codex does not have an equivalent yet --
+    /// see `Layer::scope`'s own doc and the Handoff API note in issue #40's
+    /// report before comparing the two providers' surface counts directly.
     Codex,
 }
 

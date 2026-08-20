@@ -53,11 +53,10 @@ impl Layer {
         }
     }
 
-    // No production caller yet: exposed for Tasks 10-16 (issue #39) to reason
-    // about which harness a surface belongs to; `context_surface()`'s own
-    // test and `new_codex_layers_have_the_expected_labels_and_provider`
-    // exercise it today.
-    #[allow(dead_code)]
+    /// Which harness this layer belongs to. Consumed by
+    /// `lint_dead_references`'s hook-command check (Claude-only: Codex's
+    /// `config.toml` has no equivalent JSON hook schema this lint knows how
+    /// to parse) and by `context_surface()` below.
     pub fn provider(&self) -> surface::Provider {
         match self {
             Layer::GlobalAgentsMd
@@ -112,9 +111,9 @@ impl Layer {
         self.scope().trust()
     }
 
-    /// Whether this layer is a settings file (JSON today; a future harness
-    /// may use another structured format) rather than prose. Their values
-    /// are secrets often enough -- an `env` block with an API key is
+    /// Whether this layer is a settings file (JSON for Claude, TOML for
+    /// Codex -- see `redact_settings_strings`) rather than prose. Their
+    /// values are secrets often enough -- an `env` block with an API key is
     /// ordinary -- that they are never sent to a model verbatim.
     pub fn is_settings(&self) -> bool {
         self.kind() == surface::Kind::PolicySettings
@@ -191,13 +190,15 @@ fn push_surface(into: &mut Vec<Surface>, layer: Layer, path: PathBuf, max_bytes:
     }
 }
 
-/// Every `filename` found in a subdirectory of `repo`, up to
-/// `MAX_NESTED_DEPTH`. Shared by nested `CLAUDE.md` and nested `AGENTS.md`
-/// discovery (issue #40) -- same depth cap, same symlink-escape posture,
-/// same skipped directories, so a second instruction-file convention gets no
-/// weaker a boundary than the first.
-fn nested_named_files(repo: &Path, filename: &str) -> Vec<PathBuf> {
-    let mut found = Vec::new();
+/// Every nested `CLAUDE.md` and every nested `AGENTS.md` found in a
+/// subdirectory of `repo`, up to `MAX_NESTED_DEPTH`, collected in one tree
+/// walk rather than two -- issue #40's review flagged the doubled directory
+/// walk once a second instruction-file convention started sharing this
+/// cap-sensitive path with the first. Same depth cap, same symlink-escape
+/// posture, same skipped directories as the original single-filename walk.
+fn nested_instruction_files(repo: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut claude = Vec::new();
+    let mut agents = Vec::new();
     let mut stack = vec![(repo.to_path_buf(), 0usize)];
 
     while let Some((dir, depth)) = stack.pop() {
@@ -225,21 +226,38 @@ fn nested_named_files(repo: &Path, filename: &str) -> Vec<PathBuf> {
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            let candidate = path.join(filename);
-            if candidate.is_file() {
-                found.push(candidate);
+            let claude_candidate = path.join("CLAUDE.md");
+            if claude_candidate.is_file() {
+                claude.push(claude_candidate);
+            }
+            let agents_candidate = path.join("AGENTS.md");
+            if agents_candidate.is_file() {
+                agents.push(agents_candidate);
             }
             stack.push((path, depth + 1));
         }
     }
 
     // Sorted so two runs over the same tree report in the same order.
-    found.sort();
-    found
+    claude.sort();
+    agents.sort();
+    (claude, agents)
 }
 
 /// Every configuration surface that steers a session in this repo, in a fixed
-/// order. Missing files are simply absent: most repos have only some of these.
+/// order. Missing files are simply absent: most repos have only some of
+/// these.
+///
+/// Every fixed-path surface (both providers' global/repo instructions, both
+/// providers' settings) is pushed before either nested walk runs. Nested
+/// discovery is open-ended -- a large enough monorepo can genuinely produce
+/// more nested `CLAUDE.md`/`AGENTS.md` files than `MAX_SURFACES` -- and
+/// `push_surface` silently stops once the cap is hit. Pushing the nested
+/// walks last means an oversized nested count can only crowd out further
+/// nested surfaces, never the fixed settings surfaces the dead-reference
+/// lint depends on (a prior ordering pushed the nested walk before settings,
+/// so a large monorepo could silently lose every settings surface instead;
+/// see `settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap`).
 pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> Vec<Surface> {
     let mut surfaces = Vec::new();
 
@@ -276,12 +294,6 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
         repo.join("AGENTS.md"),
         max_bytes,
     );
-    for path in nested_named_files(repo, "CLAUDE.md") {
-        push_surface(&mut surfaces, Layer::NestedClaudeMd, path, max_bytes);
-    }
-    for path in nested_named_files(repo, "AGENTS.md") {
-        push_surface(&mut surfaces, Layer::NestedAgentsMd, path, max_bytes);
-    }
 
     if let Some(home) = home {
         push_surface(
@@ -315,6 +327,14 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
         repo.join(".claude").join("settings.local.json"),
         max_bytes,
     );
+
+    let (nested_claude, nested_agents) = nested_instruction_files(repo);
+    for path in nested_claude {
+        push_surface(&mut surfaces, Layer::NestedClaudeMd, path, max_bytes);
+    }
+    for path in nested_agents {
+        push_surface(&mut surfaces, Layer::NestedAgentsMd, path, max_bytes);
+    }
 
     surfaces
 }
@@ -478,9 +498,16 @@ fn deletion_diff(surface: &Surface, line: usize, repo: &Path) -> Option<String> 
 /// first occurrence is treated as the home of the rule and every later copy is
 /// what the proposed diff removes.
 pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
+    // A settings surface (JSON or TOML) is structured config, not prose: a
+    // multi-line TOML basic string value can contain a line that happens to
+    // look like a bullet, and without this guard it would be picked up as an
+    // "instruction" and quoted verbatim in a finding's title/evidence/
+    // proposed_diff -- a report-level leak `judgment_prompt`'s own
+    // redaction never covers, since it only guards the model-prompt path.
     let all: Vec<Instruction> = surfaces
         .iter()
         .enumerate()
+        .filter(|(_, surface)| !surface.layer.is_settings())
         .flat_map(|(index, surface)| statements(index, surface))
         .collect();
 
@@ -664,10 +691,11 @@ pub fn lint_dead_references(
     let mut findings = Vec::new();
 
     for surface in surfaces {
-        if matches!(
-            surface.layer,
-            Layer::UserSettings | Layer::ProjectSettings | Layer::LocalSettings
-        ) {
+        // Claude's own settings schema (JSON `hooks` block); derived from the
+        // generic model rather than a hand-rolled variant list a future
+        // Claude settings layer could be added to without also updating this
+        // match -- see `Layer::provider`/`Layer::is_settings`.
+        if surface.layer.provider() == surface::Provider::Claude && surface.layer.is_settings() {
             for command in hook_commands(&surface.text) {
                 let Some(program) = command.split_whitespace().next() else {
                     continue;
@@ -1975,6 +2003,12 @@ mod tests {
         let (_tmp, home, repo) = fixture_tree();
         let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
 
+        // Order changed (issue #40 review, IMPORTANT 2): `nested CLAUDE.md`
+        // used to come before the settings surfaces; it now comes after
+        // them, so an oversized nested-file count can only crowd out
+        // further nested surfaces against `MAX_SURFACES`, never the fixed
+        // settings surfaces the dead-reference lint depends on. See
+        // `settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap`.
         let layers: Vec<&'static str> = surfaces.iter().map(|s| s.layer.label()).collect();
         assert_eq!(
             layers,
@@ -1982,10 +2016,10 @@ mod tests {
                 "global CLAUDE.md",
                 "global CLAUDE.md",
                 "repo CLAUDE.md",
-                "nested CLAUDE.md",
                 "user settings.json",
                 "project settings.json",
                 "local settings.json",
+                "nested CLAUDE.md",
             ],
             "collection order must be deterministic so reports are comparable"
         );
@@ -1993,6 +2027,35 @@ mod tests {
         // Same inputs, same output, every time.
         let again = collect_surfaces(Some(&home), &repo, 1_000_000);
         assert_eq!(surfaces, again);
+    }
+
+    /// The regression IMPORTANT 2 (issue #40 review) guards against: with
+    /// the old ordering, pushing the nested walk before the settings
+    /// surfaces meant a monorepo with `MAX_SURFACES` or more nested
+    /// instruction files silently starved every settings surface out of the
+    /// collection -- killing `lint_dead_references`' hook-command check
+    /// (`UserSettings`/`ProjectSettings`/`LocalSettings`) in exactly the
+    /// large-tree shape `MAX_NESTED_DEPTH` exists to bound, not prevent.
+    #[test]
+    fn settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap() {
+        let (_tmp, home, repo) = fixture_tree();
+        for i in 0..MAX_SURFACES + 10 {
+            let dir = repo.join(format!("crates/gen{i}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("CLAUDE.md"), format!("# gen {i}\n- rule\n")).expect("write");
+        }
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert_eq!(
+            surfaces.len(),
+            MAX_SURFACES,
+            "still capped at MAX_SURFACES overall"
+        );
+
+        let labels: Vec<&'static str> = surfaces.iter().map(|s| s.layer.label()).collect();
+        assert!(labels.contains(&"user settings.json"), "{labels:?}");
+        assert!(labels.contains(&"project settings.json"), "{labels:?}");
+        assert!(labels.contains(&"local settings.json"), "{labels:?}");
     }
 
     /// Adds every Codex-flavored surface `fixture_tree`'s Claude-only tree is
@@ -2545,6 +2608,26 @@ mod tests {
             "- run fmt before pushing\n- run clippy before pushing\n",
         )];
         assert!(lint_redundancy(&surfaces, Path::new("/repo")).is_empty());
+    }
+
+    /// A TOML multi-line basic string value can contain a line shaped like a
+    /// bullet; without filtering settings surfaces out, `statements()` would
+    /// read it as an instruction and this lint would quote it verbatim in a
+    /// finding -- a report-level leak `judgment_prompt`'s own redaction does
+    /// not cover, since that only guards the model-prompt path.
+    #[test]
+    fn lint_redundancy_never_quotes_a_settings_surfaces_own_values() {
+        let surfaces = vec![Surface {
+            layer: Layer::CodexProjectSettings,
+            path: PathBuf::from("/repo/.codex/config.toml"),
+            text: "notes = \"\"\"\n- always run tests\n- always run tests\n\"\"\"\n".to_string(),
+        }];
+
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
+        assert!(
+            findings.is_empty(),
+            "a settings surface's own value lines must never be treated as instructions: {findings:?}"
+        );
     }
 
     #[test]
