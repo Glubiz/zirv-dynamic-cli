@@ -2637,6 +2637,13 @@ mod tests {
     /// both tables); this test exists so a NEW `REPO_FORBIDDEN` entry can
     /// never repeat it silently. Only presence is checked, not wording: each
     /// table's own prose explains the rationale in its own voice.
+    ///
+    /// The needle is anchored to the actual table-row shape
+    /// (`` | `key` ``, a markdown table cell), not a bare backtick-wrapped
+    /// mention anywhere in the file: a prose sentence merely naming the key
+    /// (as this file's own trust-boundary intro paragraphs do) must not
+    /// count as "documented in the table" -- a fix-round review caught this
+    /// weaker check passing on prose alone.
     #[test]
     fn every_repo_forbidden_key_has_a_row_in_both_trust_boundary_tables() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2651,7 +2658,7 @@ mod tests {
 
         for (path, _env_var) in REPO_FORBIDDEN {
             let canonical = path.join(".");
-            let needle = format!("`{canonical}`");
+            let needle = format!("| `{canonical}`");
             assert!(
                 readme.contains(&needle),
                 "README.md's trust-boundary table is missing a row for `{canonical}`"
