@@ -13,6 +13,9 @@
 #           caller has finished sending the prompt looks from the outside
 #   harvest a well-formed set of `key: body` durable-fact lines, for
 #           memory::harvest_from_handoff tests
+#   consolidate  echoes back exactly one `key: body` line, using the
+#           survivor key named in the prompt's "(KEEP THIS KEY)" marker,
+#           for memory_optimize::apply_consolidation tests (issue #38)
 set -eu
 
 case "${FAKE_MODEL_MODE:-good}" in
@@ -37,6 +40,10 @@ case "${FAKE_MODEL_MODE:-good}" in
   harvest)
     printf 'build-cmd: cargo build --release\n'
     printf 'staging-db-creds: staging DB creds live in 1Password under staging-db\n'
+    ;;
+  consolidate)
+    key=$(printf '%s\n' "$prompt" | sed -n 's/^- \(.*\) (KEEP THIS KEY):.*/\1/p' | head -n1)
+    printf '%s: merged body from the fake consolidation model\n' "$key"
     ;;
   partial)
     printf '## Task\nShip the webhook\n\n## Done\n- wrote the route\n'

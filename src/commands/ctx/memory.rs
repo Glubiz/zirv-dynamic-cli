@@ -1467,7 +1467,14 @@ const REJECT_PATTERNS: &[&str] = &[
 /// Whether `body` reads as temporary session state or generic, cheaply
 /// discoverable narration rather than a durable repository fact -- a plain
 /// case-insensitive substring match against `REJECT_PATTERNS`.
-fn is_temporary_or_generic(body: &str) -> bool {
+///
+/// `pub(super)`, not private: `memory_optimize`'s low-value-entry finding
+/// (issue #38) reuses this exact heuristic rather than duplicating a second
+/// copy of `REJECT_PATTERNS`'s judgment calls -- an entry that reads like
+/// task narration is exactly the kind of low-value content issue #38 asks
+/// `zirv memory optimize` to flag, whether it slipped in through a harvest
+/// or was typed by hand.
+pub(super) fn is_temporary_or_generic(body: &str) -> bool {
     let lower = format!(" {} ", body.to_lowercase());
     REJECT_PATTERNS
         .iter()

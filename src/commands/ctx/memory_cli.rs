@@ -36,9 +36,11 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use super::CtxResult;
-use super::adapters::AGENT_ENV;
+use super::adapters::{self, AGENT_ENV};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::handoff;
 use super::memory::{self, Entry, MemoryScope};
+use super::memory_optimize;
 use super::retrieval::{self, Ranked, RetrievalContext};
 use super::state::{StateDir, now_secs, repo_slug};
 
@@ -79,6 +81,18 @@ pub enum MemoryVerb {
     /// `Written` timestamp untouched. Works even when the target scope is
     /// disabled, same as `forget`.
     Verify(VerifyArgs),
+    /// Analyze the shared memory bank for duplicates, near-duplicates,
+    /// contradictions, stale/archived entries, obsolete paths, oversized or
+    /// low-value entries, and core-regeneration opportunities (issue #38).
+    /// REPORT-FIRST by default: prints findings and changes nothing.
+    /// `--apply` (and not `--dry-run`, which always wins) additionally
+    /// consolidates already-detected duplicate/near-duplicate groups: a
+    /// merged body is proposed by a model, deterministically validated, and
+    /// upserted onto the group's survivor entry -- every OTHER member of a
+    /// group is left untouched, and a group containing a deliberate
+    /// `Source: explicit` entry is never auto-applied. Never deletes or
+    /// forgets anything, and never touches git.
+    Optimize(OptimizeArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -121,6 +135,11 @@ pub struct RecallArgs {
     /// Emit one JSON object per line instead of human-readable text.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// Issue #38: also consider `Archived` entries, which a normal recall
+    /// excludes outright regardless of how strongly they match. Explicit
+    /// recall is the one way an archived entry stays reachable at all.
+    #[arg(long, default_value_t = false)]
+    pub include_archived: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -191,6 +210,27 @@ pub struct VerifyArgs {
     pub shared: bool,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct OptimizeArgs {
+    /// Apply consolidation for already-detected duplicate/near-duplicate
+    /// groups that contain no deliberate `Source: explicit` entry. Without
+    /// this flag (the default), `zirv memory optimize` only prints a
+    /// report and changes nothing.
+    #[arg(long, default_value_t = false)]
+    pub apply: bool,
+    /// Explicit report-only run: already the default, but always wins over
+    /// `--apply` given on the same command line.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    /// Skip the consolidation model call: report findings only, even under
+    /// `--apply`.
+    #[arg(long, default_value_t = false)]
+    pub no_model: bool,
+    /// Adapter name for the consolidation model call: claude or codex.
+    /// Defaults to config, then claude.
+    #[arg(long)]
+    pub agent: Option<String>,
+}
 fn scope_of(shared: bool) -> MemoryScope {
     if shared {
         MemoryScope::Shared
@@ -475,6 +515,7 @@ pub fn run_recall_with<W: Write>(
     let candidates = retrieval::candidates_for_scope(scope, repo, &state, &slug, &cfg, now_secs())?;
     let ctx = RetrievalContext {
         query: args.query.clone(),
+        include_archived: args.include_archived,
         ..Default::default()
     };
     let selection = retrieval::select(
@@ -629,6 +670,88 @@ pub fn run_verify<W: Write>(args: &VerifyArgs, w: &mut W) -> CtxResult<i32> {
     run_verify_with(args, w, &repo, &env)
 }
 
+/// Issue #38. REPORT-FIRST: `analyze`/`gather_candidates` (both read-only)
+/// run and print unconditionally; the model-driven consolidation pass only
+/// runs when `args.apply && !args.dry_run` -- `--dry-run` always overrides
+/// `--apply`, the same "safety wins" rule `memory::InitOptions::dry_run`
+/// already follows for `zirv memory init`. Resolving an adapter is deferred
+/// until a consolidation pass is actually about to run, so a plain report
+/// (the common case) never fails just because no agent is configured or
+/// available -- mirrors `optimize::run_with`'s own graceful degradation
+/// when an adapter cannot be resolved.
+pub fn run_optimize_with<W: Write>(
+    args: &OptimizeArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let state = StateDir::resolve(env)?;
+    let slug = repo_slug(repo);
+
+    let candidates = memory_optimize::gather_candidates(repo, &state, &slug, &cfg, now_secs())?;
+    let findings = memory_optimize::analyze(&candidates, &cfg);
+    let report = memory_optimize::render_report(&findings);
+    write!(w, "{report}")?;
+
+    if !args.apply || args.dry_run {
+        writeln!(w, "-- report only, nothing written")?;
+        return Ok(0);
+    }
+
+    let groups = memory_optimize::consolidation_groups(&candidates, &findings);
+    if args.no_model || groups.is_empty() {
+        writeln!(
+            w,
+            "-- --apply: no consolidation pass run ({})",
+            if args.no_model {
+                "--no-model"
+            } else {
+                "no duplicate/near-duplicate groups found"
+            }
+        )?;
+        return Ok(0);
+    }
+
+    let adapter = match adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)
+    {
+        Ok(adapter) => adapter,
+        Err(e) => {
+            writeln!(
+                w,
+                "-- --apply: consolidation skipped, no adapter available ({e})"
+            )?;
+            return Ok(0);
+        }
+    };
+    let model = handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
+    let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
+    let applied = memory_optimize::apply_consolidation(
+        adapter.as_ref(),
+        &model,
+        timeout,
+        &groups,
+        &candidates,
+        repo,
+        &state,
+        &slug,
+        &cfg,
+    );
+    writeln!(
+        w,
+        "-- applied consolidation to {} survivor entr{}: {}",
+        applied.len(),
+        if applied.len() == 1 { "y" } else { "ies" },
+        applied.join(", ")
+    )?;
+    Ok(0)
+}
+
+pub fn run_optimize<W: Write>(args: &OptimizeArgs, w: &mut W) -> CtxResult<i32> {
+    let repo = std::env::current_dir()?;
+    let env = env_from_process();
+    run_optimize_with(args, w, &repo, &env)
+}
 /// `args[0]` is the literal "memory" as it appeared in argv (discarded below,
 /// same as `ctx::dispatch`'s own `args[0]`: clap gets a synthetic program
 /// name instead, so the case the user actually typed never matters here).
@@ -654,6 +777,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         MemoryVerb::Remember(a) => run_remember(a, &mut out),
         MemoryVerb::Forget(a) => run_forget(a, &mut out),
         MemoryVerb::Verify(a) => run_verify(a, &mut out),
+        MemoryVerb::Optimize(a) => run_optimize(a, &mut out),
     };
 
     match result {
@@ -734,6 +858,24 @@ mod tests {
             }
             other => panic!("expected Verify, got {other:?}"),
         }
+        let cli = MemoryCli::try_parse_from([
+            "zirv memory",
+            "optimize",
+            "--apply",
+            "--no-model",
+            "--agent",
+            "claude",
+        ])
+        .expect("optimize");
+        match cli.verb {
+            MemoryVerb::Optimize(a) => {
+                assert!(a.apply);
+                assert!(!a.dry_run);
+                assert!(a.no_model);
+                assert_eq!(a.agent, Some("claude".to_string()));
+            }
+            other => panic!("expected Optimize, got {other:?}"),
+        }
     }
 
     #[test]
@@ -747,6 +889,7 @@ mod tests {
             vec!["memory", "remember", "--help"],
             vec!["memory", "forget", "--help"],
             vec!["memory", "verify", "-h"],
+            vec!["memory", "optimize", "--help"],
         ] {
             let args: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
             assert_eq!(dispatch(&args), 0, "--help must exit 0: {argv:?}");
@@ -1197,6 +1340,7 @@ mod tests {
                 query: "db".to_string(),
                 shared: false,
                 json: true,
+                include_archived: false,
             },
             &mut out,
             repo.path(),
@@ -1249,6 +1393,7 @@ mod tests {
                 query: String::new(),
                 shared: false,
                 json: true,
+                include_archived: false,
             },
             &mut out,
             repo.path(),
@@ -1300,6 +1445,7 @@ mod tests {
                 query: "release".to_string(),
                 shared: false,
                 json: true,
+                include_archived: false,
             },
             &mut out,
             repo.path(),
@@ -1345,6 +1491,7 @@ mod tests {
                 query: "1password".to_string(),
                 shared: false,
                 json: true,
+                include_archived: false,
             },
             &mut out,
             repo.path(),
@@ -1685,5 +1832,380 @@ mod tests {
         )
         .expect_err("verifying an absent key is an error");
         assert!(err.to_string().contains("no entry"), "got {err}");
+    }
+
+    // Issue #38: `zirv memory optimize`.
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    /// Every readable file under `root`, sorted, for a before/after
+    /// unchanged-tree assertion -- mirrors `optimize.rs`'s own private
+    /// `tree_snapshot` test helper (design decision 2's own precedent).
+    fn tree_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    found.push((path, text));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn remember_shared(
+        repo: &std::path::Path,
+        env: &std::collections::HashMap<String, String>,
+        key: &str,
+        text: &str,
+    ) {
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_remember_with(
+            &RememberArgs {
+                key: key.to_string(),
+                text: text.to_string(),
+                shared: true,
+            },
+            &mut Vec::new(),
+            repo,
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember shared");
+    }
+
+    #[test]
+    fn optimize_report_only_run_never_modifies_the_shared_bank() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+
+        remember_shared(
+            repo.path(),
+            &env,
+            "db-a",
+            "the project uses postgres for the database",
+        );
+        remember_shared(
+            repo.path(),
+            &env,
+            "db-b",
+            "the project uses postgres for the database",
+        );
+
+        let before = tree_snapshot(repo.path());
+        let mut out = Vec::new();
+        let code = run_optimize_with(
+            &OptimizeArgs {
+                apply: false,
+                dry_run: false,
+                no_model: true,
+                agent: None,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("optimize report");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("duplicate"), "got {text}");
+        assert_eq!(
+            before,
+            tree_snapshot(repo.path()),
+            "a report-only run must change nothing on disk"
+        );
+    }
+
+    #[test]
+    fn dry_run_overrides_apply_and_still_changes_nothing() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            (
+                "ZIRV_CTX_AGENT_BIN",
+                fixture("fake-model.sh").to_str().expect("utf8"),
+            ),
+        ]);
+        remember_shared(
+            repo.path(),
+            &env,
+            "db-a",
+            "the project uses postgres for the database",
+        );
+        remember_shared(
+            repo.path(),
+            &env,
+            "db-b",
+            "the project uses postgres for the database",
+        );
+
+        let before = tree_snapshot(repo.path());
+        run_optimize_with(
+            &OptimizeArgs {
+                apply: true,
+                dry_run: true,
+                no_model: false,
+                agent: Some("claude".to_string()),
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("optimize dry-run");
+        assert_eq!(
+            before,
+            tree_snapshot(repo.path()),
+            "--dry-run must override --apply and change nothing"
+        );
+    }
+
+    #[test]
+    fn apply_never_touches_a_group_with_an_explicit_member() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        // A nonexistent binary: if consolidation ever tried to spawn a
+        // model for this group, the whole call would fail loudly rather
+        // than silently -- this proves the group was skipped before any
+        // model was ever touched, not just that its output happened to be
+        // rejected.
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            ("ZIRV_CTX_AGENT_BIN", "/nonexistent/model-binary"),
+        ]);
+
+        // `remember` (private-scope helper reused by the shared arm) sets
+        // `Source: explicit` for every shared write through this CLI.
+        remember_shared(
+            repo.path(),
+            &env,
+            "db-a",
+            "the project uses postgres for the database",
+        );
+        remember_shared(
+            repo.path(),
+            &env,
+            "db-b",
+            "the project uses postgres for the database",
+        );
+
+        let before = tree_snapshot(repo.path());
+        let mut out = Vec::new();
+        run_optimize_with(
+            &OptimizeArgs {
+                apply: true,
+                dry_run: false,
+                no_model: false,
+                agent: Some("claude".to_string()),
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("optimize apply");
+        assert_eq!(
+            before,
+            tree_snapshot(repo.path()),
+            "a group with an explicit member must never be auto-consolidated"
+        );
+    }
+
+    /// Model-driven: exercises the real consolidation write path end to end
+    /// against `tests/fixtures/fake-model.sh`'s `consolidate` mode. This
+    /// cannot execute on Windows (`fake-model.sh` needs a POSIX shell,
+    /// `os error 193` here) -- it is the CI-only counterpart to the
+    /// model-free tests above, the same split `memory.rs`'s own harvest/init
+    /// model tests already accept.
+    #[test]
+    fn apply_consolidates_a_duplicate_group_as_an_ordinary_working_tree_change() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .arg("init")
+            .arg("--quiet")
+            .status();
+        if !matches!(init, Ok(status) if status.success()) {
+            eprintln!(
+                "skipping apply_consolidates_a_duplicate_group_as_an_ordinary_working_tree_change: \
+                 no usable git binary"
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            (
+                "ZIRV_CTX_AGENT_BIN",
+                fixture("fake-model.sh").to_str().expect("utf8"),
+            ),
+            ("FAKE_MODEL_MODE", "consolidate"),
+        ]);
+        remember_shared(
+            repo.path(),
+            &env,
+            "db-a",
+            "the project uses postgres for the database",
+        );
+        remember_shared(
+            repo.path(),
+            &env,
+            "db-b",
+            "the project uses postgres for the database",
+        );
+
+        let mut out = Vec::new();
+        run_optimize_with(
+            &OptimizeArgs {
+                apply: true,
+                dry_run: false,
+                no_model: false,
+                agent: Some("claude".to_string()),
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("optimize apply");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("applied consolidation to 1"), "got {text}");
+
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert!(
+            !log.status.success() || log.stdout.is_empty(),
+            "consolidation must never create a commit: {}",
+            String::from_utf8_lossy(&log.stdout)
+        );
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("git status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).contains(".zirv/memory/"),
+            "the consolidated survivor must land as an ordinary, unstaged working-tree change"
+        );
+
+        // The losing entry is untouched, still present -- consolidation
+        // never deletes.
+        let mut recall_out = Vec::new();
+        run_list_with(
+            &ListArgs {
+                shared: true,
+                json: true,
+            },
+            &mut recall_out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("list shared");
+        let recall_text = String::from_utf8(recall_out).expect("utf8");
+        assert!(
+            recall_text.contains("\"key\":\"db-a\""),
+            "got {recall_text}"
+        );
+        assert!(
+            recall_text.contains("\"key\":\"db-b\""),
+            "got {recall_text}"
+        );
+    }
+
+    #[test]
+    fn recall_include_archived_surfaces_an_otherwise_excluded_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Old enough and low-value enough to classify as `Archived`
+        // (`retrieval::ARCHIVE_AFTER_DAYS` past `Verified`, `Importance:
+        // low`, `Source` not `explicit`).
+        let verified = now_secs().saturating_sub((retrieval::ARCHIVE_AFTER_DAYS + 10) * 86_400);
+        std::fs::write(
+            dir.join("old-note.md"),
+            format!(
+                "## Memory\n- Key: old-note\n- Written-by: claude\n- Written: {verified}\n- \
+                 Verified: {verified}\n- Source: harvest\n- Importance: low\n\nmentions the release \
+                 process\n"
+            ),
+        )
+        .expect("write");
+
+        // An exact key match (not just a keyword hit): a candidate this old
+        // also takes retrieval's own large gradual staleness penalty (one
+        // point per week, ~53 points at this age), so the query needs a
+        // strong enough base signal to still clear `MIN_RELEVANCE_SCORE`
+        // once explicitly included -- the same way a real, deliberate
+        // `--include-archived` recall would need to.
+        let mut out = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                query: "old-note".to_string(),
+                shared: true,
+                json: true,
+                include_archived: false,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("recall");
+        assert!(
+            out.is_empty(),
+            "an archived entry must not surface in a normal recall: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let mut out = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                query: "old-note".to_string(),
+                shared: true,
+                json: true,
+                include_archived: true,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("recall --include-archived");
+        assert!(
+            String::from_utf8(out)
+                .expect("utf8")
+                .contains("\"key\":\"old-note\""),
+            "--include-archived must surface it"
+        );
     }
 }
