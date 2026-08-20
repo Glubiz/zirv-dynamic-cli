@@ -269,6 +269,8 @@ Issue #37 adds opt-in durable harvesting at clean-session and distilled-handoff 
 
 Issue #45 adds the sibling top-level `zirv context sync` family in `src/commands/ctx/context_cli.rs`. It reports native/canonical drift without writing by default, imports native files only under an explicit mode, and generates managed compatibility files without overwriting unmanaged content unless forced.
 
+Issue #46 adds `zirv context status` in `src/commands/ctx/context_status.rs`: a session-free report of every compiler contribution, raw and delivered byte counts, estimated tokens, truncation, oversize findings, configured limits, and per-harness policy support without overstating provider enforcement.
+
 - [[Ctx Supervisors]] — `run_loop`/`exec`/`wrap` process supervision, plus `signal`/`supervise`/`term` primitives
 - [[Ctx Adapters]] — the `AgentAdapter` trait and the claude/codex implementations these verbs dispatch through
 - [[Rot Engine]] — `event.rs`/`rot.rs` scoring internals that `score` and `hook Stop` call into

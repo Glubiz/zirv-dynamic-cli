@@ -61,6 +61,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use super::CtxResult;
+use super::context_status::{self, StatusArgs};
 use super::{context, drift, optimize};
 
 /// A generated compatibility file's first line: stable across every
@@ -469,6 +470,13 @@ pub enum ContextVerb {
     /// Inspect, import, or generate CLAUDE.md/AGENTS.md compatibility with
     /// canonical `.zirv/context/`.
     Sync(SyncArgs),
+    /// Report exactly what Zirv-managed context a session would receive:
+    /// discovered instruction surfaces, canonical vs native/harness-specific
+    /// split, memory/mail/handoff contribution, the harness/orchestration
+    /// roster, per-harness policy alignment, every configured budget, and
+    /// duplicate/conflict counts -- all without starting a session (issue
+    /// #46, "Context 8/8"). See `context_status.rs`.
+    Status(StatusArgs),
 }
 
 /// `args[0]` is the literal "context" as it appeared in argv, mirroring
@@ -494,6 +502,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     let mut out = std::io::stdout();
     let result = match &cli.verb {
         ContextVerb::Sync(a) => run(a, &mut out),
+        ContextVerb::Status(a) => context_status::run(a, &mut out),
     };
 
     match result {
@@ -850,6 +859,7 @@ mod tests {
                 assert!(!args.generate);
                 assert!(matches!(mode(&args), SyncMode::Report));
             }
+            ContextVerb::Status(_) => panic!("expected the sync verb"),
         }
     }
 
@@ -869,6 +879,14 @@ mod tests {
             dispatch(&[
                 "context".to_string(),
                 "sync".to_string(),
+                "--help".to_string()
+            ]),
+            0
+        );
+        assert_eq!(
+            dispatch(&[
+                "context".to_string(),
+                "status".to_string(),
                 "--help".to_string()
             ]),
             0

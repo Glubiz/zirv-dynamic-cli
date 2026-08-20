@@ -110,6 +110,7 @@ model = "fable"
 # [context]                          # every key below is REPO-FORBIDDEN -- the canonical .zirv/context/ layer the context compiler (issue #44) injects.
 # max_common_bytes = 4096            # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES): cap on .zirv/context/common.md. Default: 4096.
 # max_harness_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES): cap on .zirv/context/claude.md or codex.md. Default: 4096.
+# max_harness_roster_bytes = 4096    # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES): budget `zirv context status` measures the derived harness roster against. Default: 4096.
 
 # [mail]
 # enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_MAIL): whether the mailbox is on at all. Default: true.

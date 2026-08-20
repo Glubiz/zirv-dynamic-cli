@@ -77,7 +77,7 @@ Lifecycle (issue #38, `retrieval::Lifecycle`/`classify_lifecycle`) is a derived-
 
 ### `zirv context sync`
 
-`zirv context sync` manages compatibility between canonical `.zirv/context/{common,claude,codex}.md` instructions and native `CLAUDE.md`/`AGENTS.md` files. Report mode is read-only; `--import` and `--generate` are explicit write modes, refuse unmanaged files unless the requested force/import behavior is explicit, and remain idempotent after a successful sync.
+`zirv context sync` manages compatibility between canonical `.zirv/context/{common,claude,codex}.md` instructions and native `CLAUDE.md`/`AGENTS.md` files. Report mode is read-only; `--import` and `--generate` are explicit write modes, refuse unmanaged files unless the requested force/import behavior is explicit, and remain idempotent after a successful sync. `zirv context status` reports compiler provenance, raw/delivered bytes, estimated tokens, truncation, configured budgets, drift findings, and honest per-harness policy alignment without starting a session.
 
 ### `zirv chat`/bare `zirv` default to the dashboard on a capable terminal
 

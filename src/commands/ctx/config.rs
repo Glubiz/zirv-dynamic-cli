@@ -300,6 +300,16 @@ pub struct ContextConfig {
     /// independently of `max_common_bytes` since the two files are read and
     /// truncated separately.
     pub max_harness_bytes: usize,
+    /// Issue #46 ("Context 8/8"): the one layer `compile.rs`'s composed
+    /// prompt injects with no budget at all before this -- an Orchestrator
+    /// session's derived harness roster (`adapters::harness_prompt_lines`,
+    /// folded in as `PromptSource::Harnesses`). Every other layer already had
+    /// a configured cap (`prompt.max_repo_bytes`, `context.max_common_bytes`/
+    /// `max_harness_bytes`, `mail.max_delivered_bytes`, `memory.max_injected_
+    /// bytes`); this is the missing one `zirv context status` reports
+    /// against. Same trust rationale as `max_common_bytes`/`max_harness_
+    /// bytes` above -- see `REPO_FORBIDDEN`.
+    pub max_harness_roster_bytes: usize,
 }
 
 impl Default for ContextConfig {
@@ -307,6 +317,7 @@ impl Default for ContextConfig {
         Self {
             max_common_bytes: 4096,
             max_harness_bytes: 4096,
+            max_harness_roster_bytes: 4096,
         }
     }
 }
@@ -841,6 +852,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["context", "max_harness_bytes"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES",
+        &["context", "max_harness_roster_bytes"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MAIL", &["mail", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_MAIL_MAX_MESSAGE_BYTES",
@@ -1096,6 +1112,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["context", "max_harness_bytes"],
         "ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES",
+    ),
+    // Issue #46: the derived harness roster is folded into an Orchestrator
+    // session's composed prompt the same way (`PromptSource::Harnesses`) --
+    // without this a repo checkout could raise its own budget for the one
+    // layer that had none until this key, making it decorative like every
+    // other entry in this list.
+    (
+        &["context", "max_harness_roster_bytes"],
+        "ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES",
     ),
     // Same rationale as prompt.max_repo_bytes above: mail is folded into the
     // composed prompt as its own layer (`with_mail_layer`), and without this
@@ -2109,6 +2134,7 @@ mod tests {
         let context = ContextConfig::default();
         assert_eq!(context.max_common_bytes, 4096);
         assert_eq!(context.max_harness_bytes, 4096);
+        assert_eq!(context.max_harness_roster_bytes, 4096);
     }
 
     #[test]
@@ -2118,6 +2144,7 @@ mod tests {
         for (key, value) in [
             ("max_common_bytes", "1000000"),
             ("max_harness_bytes", "1000000"),
+            ("max_harness_roster_bytes", "1000000"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -2145,10 +2172,12 @@ mod tests {
         let env = env_map(&[
             ("ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES", "9000"),
             ("ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES", "8000"),
+            ("ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES", "7000"),
         ]);
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.context.max_common_bytes, 9000);
         assert_eq!(cfg.context.max_harness_bytes, 8000);
+        assert_eq!(cfg.context.max_harness_roster_bytes, 7000);
     }
 
     /// The follow-up PR #67 assigned to issue #44: once `cfg.policy` is
@@ -2897,6 +2926,7 @@ mod tests {
         ("prompt", "harnesses"),
         ("context", "max_common_bytes"),
         ("context", "max_harness_bytes"),
+        ("context", "max_harness_roster_bytes"),
         ("mail", "enabled"),
         ("mail", "max_message_bytes"),
         ("mail", "max_delivered_bytes"),

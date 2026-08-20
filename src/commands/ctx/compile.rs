@@ -575,6 +575,7 @@ mod tests {
             context: crate::commands::ctx::config::ContextConfig {
                 max_common_bytes: 10,
                 max_harness_bytes: 20,
+                ..Default::default()
             },
             ..CtxConfig::default()
         };

@@ -401,6 +401,55 @@ pub(crate) fn select_memory_within_cap(
     (selected, omitted)
 }
 
+/// Non-destructive summary of what [`with_memory_layer`] would inject for
+/// `entries`/`cap`, computed without composing a prompt: how many entries
+/// were available, how many were selected, how many bytes were actually
+/// delivered (after `cap` truncates the rendered selection, mirroring
+/// `with_memory_layer`'s own final `truncate_bytes` step), and how many
+/// entries were left out entirely by [`select_memory_within_cap`].
+///
+/// Issue #46 ("Context 8/8", `zirv context status`): the report needs
+/// memory's own contribution -- selected entry count and injected byte size
+/// -- without starting a session. Reuses the exact selection/rendering logic
+/// `with_memory_layer` already uses rather than re-deriving it a second way,
+/// so the report and an actual launch can never disagree about what memory
+/// would contribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryInjectionSummary {
+    pub total_entries: usize,
+    pub selected_entries: usize,
+    pub injected_bytes: usize,
+    pub omitted_entries: usize,
+}
+
+pub fn memory_injection_summary(entries: &[MemoryLine], cap: usize) -> MemoryInjectionSummary {
+    if entries.is_empty() {
+        return MemoryInjectionSummary {
+            total_entries: 0,
+            selected_entries: 0,
+            injected_bytes: 0,
+            omitted_entries: 0,
+        };
+    }
+
+    let (selected, omitted) = select_memory_within_cap(entries, cap);
+    let mut body = String::new();
+    for entry in &selected {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&render_memory_entry(entry));
+    }
+    let delivered = crate::utils::truncate_bytes(body, Some(cap));
+
+    MemoryInjectionSummary {
+        total_entries: entries.len(),
+        selected_entries: selected.len(),
+        injected_bytes: delivered.len(),
+        omitted_entries: omitted,
+    }
+}
+
 /// Adds a memory layer sourced from `entries`, between the harness layer and
 /// the user layer: called from inside `compose`, right after the harness
 /// block, so both an orchestrator and a worker session get it (unlike
@@ -4185,6 +4234,75 @@ mod tests {
         let unchanged =
             with_memory_layer(Some(composed.clone()), &[], 4096).expect("still composed");
         assert_eq!(unchanged, composed);
+    }
+
+    // -- memory_injection_summary: issue #46's non-destructive read of what
+    // `with_memory_layer` would have injected -----------------------------
+
+    #[test]
+    fn memory_injection_summary_of_an_empty_bank_is_all_zeros() {
+        let summary = memory_injection_summary(&[], 4096);
+        assert_eq!(
+            summary,
+            MemoryInjectionSummary {
+                total_entries: 0,
+                selected_entries: 0,
+                injected_bytes: 0,
+                omitted_entries: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn memory_injection_summary_counts_every_entry_when_everything_fits() {
+        let entries = [
+            memory_line("a", "short body one"),
+            memory_line("b", "short body two"),
+        ];
+        let summary = memory_injection_summary(&entries, 4096);
+        assert_eq!(summary.total_entries, 2);
+        assert_eq!(summary.selected_entries, 2);
+        assert_eq!(summary.omitted_entries, 0);
+        assert!(summary.injected_bytes > 0);
+        assert!(
+            summary.injected_bytes <= 4096,
+            "must not exceed the cap: {}",
+            summary.injected_bytes
+        );
+    }
+
+    /// The summary must agree with what `with_memory_layer` actually
+    /// delivers -- it reuses the exact same selection logic rather than
+    /// re-deriving it, so a report built from this function can never
+    /// disagree with a real launch about which entries are selected.
+    #[test]
+    fn memory_injection_summary_agrees_with_what_with_memory_layer_actually_delivers() {
+        let entries = [
+            stamped_line("newest", &"n".repeat(40), 300),
+            stamped_line("older", &"o".repeat(40), 100),
+        ];
+        let cap = 60; // Small enough that only one entry fits.
+        let summary = memory_injection_summary(&entries, cap);
+
+        let composed = ComposedPrompt {
+            text: String::new(),
+            sources: vec![PromptSource::Default],
+            version: DEFAULT_PROMPT_VERSION,
+        };
+        let with_layer = with_memory_layer(Some(composed), &entries, cap).expect("composed");
+
+        assert_eq!(summary.selected_entries, 1);
+        assert_eq!(summary.omitted_entries, 1);
+        assert!(
+            with_layer.text.contains("newest"),
+            "the newest entry should win selection: {}",
+            with_layer.text
+        );
+        // Checks for the omitted entry's own rendered key line, not the bare
+        // substring "older": `with_memory_layer`'s own omission note reads
+        // "N older entries omitted", which legitimately contains "older".
+        assert!(!with_layer.text.contains("older (written"));
+        assert!(summary.injected_bytes > 0 && summary.injected_bytes <= cap);
     }
 
     #[test]

@@ -8,7 +8,7 @@ last-verified: 2026-08-20
 > - `zirv ctx` exists because long-running AI-agent sessions rot: as the context window fills, instruction-following slips, tools get called in loops, hallucinations appear — and built-in auto-compaction fires only after degradation has already started.
 > - A pure, deterministic **rot engine** scores a normalized event stream and hands a verdict (`healthy`/`advise`/`compact`/`restart`) to one of three **supervisors** (`loop`, `exec`, `wrap`), which act on it — compacting, restarting with a distilled handoff, or leaving the session alone.
 > - **Usage pacing** keeps autonomous work from dying mid-run when a subscription usage window runs dry.
-> - `.zirv/context/` is the canonical instruction source for every Zirv-launched session; `zirv context sync` is the explicit, opt-in bridge to native `CLAUDE.md`/`AGENTS.md` for direct (non-zirv) launches.
+> - `.zirv/context/` is the canonical instruction source for every Zirv-launched session; `zirv context sync` is the explicit, opt-in bridge to native `CLAUDE.md`/`AGENTS.md` for direct (non-zirv) launches; `zirv context status` reports exactly what Zirv-managed context a session would receive, without starting one.
 > - This page is the *why*; for the *how* see [[Ctx Subsystem]] (verb tree/dispatch), [[Rot Engine]] (scoring internals), [[Ctx Supervisors]] (loop/exec/wrap mechanics), [[Ctx Adapters]] (agent-specific plumbing), and [[Usage and Pacing]].
 
 > [!warning] If changed
@@ -85,6 +85,22 @@ Content routing follows the same common/harness-specific split the canonical lay
 **A generated file is prose, nothing else.** It never states or implies a permission, sandbox, or enforcement claim, and never serializes `policy::EffectivePolicy`/`Support` state — the moment a harness is launched outside zirv, there is no zirv process left to enforce anything it might have claimed. This is the same "Markdown instructions are advisory context, never enforcement" line `policy.rs` draws for the canonical layer's own injected prose, extended to what compatibility mode writes to disk.
 
 See [[Ctx Subsystem]]'s "`zirv context sync`" section for the exact flags, the managed-marker mechanics, and file references.
+
+## Making context measurable: `zirv context status`
+
+Everything above — the canonical layer, the compiler, memory, mail, the harness roster, the honest per-harness policy report — is invisible to a team unless someone reads source or launches a real session and inspects its prompt. `zirv context status` (issue #46, "Context 8/8", the second verb on the same `zirv context` tree as `sync`) closes that gap: a compact, read-only report of exactly what Zirv-managed context a session would receive, built entirely from machinery issues #42-#45 already produced (`compile::compile`, `drift::analyze`, `policy::evaluate`) rather than a second collection pass. It never starts a session, spawns the agent binary, or makes a network call — so it is useful in CI, in a PR review, or on a machine with no agent installed at all.
+
+Three design commitments run through the whole report:
+
+- **Bytes are measured, tokens are estimated, and the two are never conflated.** Every byte figure comes from an actual `.len()` on text read from disk or state; every token figure is a fixed, documented divisor (`bytes / 4.0`, rounded up) labeled `(est.)` everywhere it appears, with the method and its limits (not a real tokenizer; vendor/model/language/content-type all move the real number) stated in the rendered output itself — not just in a doc page. No tokenizer crate was added to `Cargo.toml`.
+- **Zirv only knows what it injects.** The report's closing section states plainly that each harness's own hidden system prompt and built-in tool scaffolding are unknown to zirv and never folded into any figure above. The bare phrase "total context" never appears anywhere in the output — only "total zirv-managed context estimate", always qualified, and a test (`unknown_vendor_context_is_disclosed_and_no_total_context_claim_is_made`) pins both halves of that promise.
+- **No false equivalence between harnesses.** The per-harness section prints each adapter's own `PolicyReport::render()` (see [[Ctx Subsystem]]'s "Canonical policy" section) verbatim: claude reports `Enforced`/`Unsupported` where codex reports `Degraded`/`Unsupported` for the identical capability and stance, and the report does nothing to paper over that difference.
+
+**Oversized surfaces are flagged, not buried.** Every discovered instruction surface (canonical `.zirv/context/*.md`, native `CLAUDE.md`/`AGENTS.md`, nested or global) is measured against the applicable budget — the canonical layer's own real, enforced caps (`context.max_common_bytes`/`max_harness_bytes`) for canonical files, and `context.max_harness_bytes` reused as a reference size for native files that have no budget of their own, since zirv never injects those directly. A surface over its threshold is marked `[OVERSIZED]` inline, before it silently eats budget rather than after.
+
+**The one genuinely new budget.** Every other layer already had a configured cap (`prompt.max_repo_bytes`, `context.max_common_bytes`/`max_harness_bytes`, `mail.max_delivered_bytes`, `memory.max_injected_bytes`) before this issue; the derived harness roster (`PromptSource::Harnesses`) did not. `context.max_harness_roster_bytes` (default 4096) fills that gap, wired exactly like `context.max_common_bytes` (`REPO_FORBIDDEN`, its own env override, the exhaustive key test, a line in the sample `.zirv/ctx.toml`) — but it is measured-only today: `prompt::compose` does not yet truncate the roster the way it truncates memory/mail/canonical context, and the report is explicit about that rather than implying an enforcement that doesn't exist.
+
+See [[Ctx Subsystem]]'s "`zirv context status`" section for the exact report sections and the file/function references.
 
 ## zirv as a meta-harness: chat, delegation, and a mailbox
 
