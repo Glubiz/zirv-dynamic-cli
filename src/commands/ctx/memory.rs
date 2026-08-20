@@ -1646,9 +1646,14 @@ pub fn harvest_durable(
 /// fallback, which has nothing durable to offer, the exact same rule the
 /// restart seams already apply), hands the result to `harvest_durable`.
 ///
-/// Gated on `cfg.memory.enabled && cfg.memory.harvest` first, before the
-/// distiller is even touched, so a disabled operator never pays for either
-/// model call this function can make.
+/// Gated on `cfg.memory.enabled && cfg.memory.harvest && cfg.memory.
+/// shared_enabled` first, before the distiller is even touched -- the same
+/// three-way gate `harvest_durable` itself checks, matched here rather than
+/// left to that inner call alone (round-2 finding). Without this, a session
+/// with `harvest = true` but `shared_enabled = false` still paid for a real
+/// distiller spawn (up to `handoff_timeout`) on every clean exit, only for
+/// `harvest_durable`'s own gate to discard the result. So a disabled
+/// operator never pays for either model call this function can make.
 #[allow(clippy::too_many_arguments)]
 pub fn harvest_at_session_end(
     adapter: &dyn super::adapters::AgentAdapter,
@@ -1660,7 +1665,7 @@ pub fn harvest_at_session_end(
     slug: &str,
     cfg: &CtxConfig,
 ) -> CtxResult<usize> {
-    if !cfg.memory.enabled || !cfg.memory.harvest {
+    if !cfg.memory.enabled || !cfg.memory.harvest || !cfg.memory.shared_enabled {
         return Ok(0);
     }
     let (note, source) =
@@ -4205,6 +4210,151 @@ This should not appear in the body.\n";
             &cfg,
         )
         .expect("a disabled harvest is not an error, just a no-op");
+        assert_eq!(count, 0);
+        assert!(
+            list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    /// A mock adapter whose `distiller_cmd` panics if it is ever called --
+    /// used by the `shared_enabled` gating test below in place of the
+    /// `/nonexistent/model-binary` pattern the sibling test above uses.
+    /// That pattern doesn't work here: `distill_or_structural` swallows a
+    /// spawn failure into a silent `"structural"` fallback (see its own doc
+    /// comment), so `harvest_at_session_end` would return `Ok(0)` either
+    /// way, whether or not it actually tried to spawn the distiller first --
+    /// which is exactly the gap the round-2 finding this test covers is
+    /// about. `capabilities().events = true` so a caller that reaches
+    /// `distill_or_structural` proceeds past its own capability check
+    /// straight into the call this must never make.
+    #[derive(Debug)]
+    struct PanicOnDistillAdapter;
+
+    impl super::super::adapters::AgentAdapter for PanicOnDistillAdapter {
+        fn name(&self) -> &'static str {
+            "panic-on-distill"
+        }
+
+        fn program(&self) -> &str {
+            "panic-on-distill"
+        }
+
+        fn provider(&self) -> &'static str {
+            "panic-on-distill"
+        }
+
+        fn ready(&self) -> CtxResult<()> {
+            Ok(())
+        }
+
+        fn detect(&self, _command: &[String]) -> bool {
+            false
+        }
+
+        fn headless_cmd(
+            &self,
+            _prompt: &str,
+            _session: &super::super::event::SessionId,
+            _extra: &[String],
+        ) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn interactive_cmd(
+            &self,
+            _initial_prompt: Option<&str>,
+            _extra: &[String],
+        ) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn distiller_cmd(&self, _model: &str) -> std::process::Command {
+            panic!(
+                "distiller_cmd must never be called when memory.shared_enabled is false: \
+                 harvest_at_session_end must gate before touching the model"
+            );
+        }
+
+        fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn transcript_path(&self, _session: &super::super::event::SessionRef) -> PathBuf {
+            PathBuf::new()
+        }
+
+        fn parse_events(&self, _jsonl: &str) -> Vec<super::super::event::NormalizedEvent> {
+            Vec::new()
+        }
+
+        fn structural_context(
+            &self,
+            _jsonl: &str,
+            _last_n: usize,
+        ) -> super::super::event::StructuralContext {
+            super::super::event::StructuralContext::default()
+        }
+
+        fn compact_command(&self) -> Option<&'static str> {
+            None
+        }
+
+        fn quit_sequence(&self) -> &'static str {
+            ""
+        }
+
+        fn capabilities(&self) -> super::super::event::Capabilities {
+            super::super::event::Capabilities {
+                events: true,
+                ..Default::default()
+            }
+        }
+
+        fn register_turn_signal(
+            &self,
+            _session: &super::super::event::SessionRef,
+            _socket: &Path,
+        ) -> super::super::adapters::TurnSignalSetup {
+            super::super::adapters::TurnSignalSetup {
+                env: Vec::new(),
+                instructions: String::new(),
+            }
+        }
+    }
+
+    /// Round-2 finding: `harvest_at_session_end` gated on `cfg.memory.
+    /// enabled && cfg.memory.harvest` but NOT `cfg.memory.shared_enabled`,
+    /// unlike `harvest_durable` itself (see that function's own three-way
+    /// gate). With `harvest = true, shared_enabled = false`, every clean
+    /// session exit paid for a real distiller spawn whose result `harvest_
+    /// durable`'s own gate then discarded. Fixed by matching `harvest_
+    /// durable`'s gate exactly, checked before the distiller is ever
+    /// touched.
+    #[test]
+    fn harvest_at_session_end_is_a_no_op_when_shared_is_disabled_even_with_harvest_on() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+        cfg.memory.shared_enabled = false;
+
+        let adapter = PanicOnDistillAdapter;
+        let ctx = super::super::event::StructuralContext::default();
+
+        let count = harvest_at_session_end(
+            &adapter,
+            "haiku",
+            &ctx,
+            std::time::Duration::from_secs(5),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("gated before the model is ever touched, so this is not an error either");
         assert_eq!(count, 0);
         assert!(
             list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
