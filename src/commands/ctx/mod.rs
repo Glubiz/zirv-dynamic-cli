@@ -27,6 +27,7 @@ pub mod signal;
 pub mod state;
 pub mod status;
 pub mod supervise;
+pub mod surface;
 pub mod term;
 pub mod usage;
 pub mod window;

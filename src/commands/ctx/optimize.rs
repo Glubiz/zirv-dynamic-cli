@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use super::surface;
+
 /// Deep enough for a workspace's crate directories, shallow enough that a
 /// monorepo scan stays instant.
 pub const MAX_NESTED_DEPTH: usize = 4;
@@ -7,6 +9,11 @@ pub const MAX_SURFACES: usize = 40;
 
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "vendor", "dist", "build"];
 
+/// One of the surfaces `collect_surfaces` reads. Each variant maps onto a
+/// `(surface::Provider, surface::Kind, surface::Scope)` triple (`provider`/
+/// `kind`/`scope`); `is_settings`/`is_repo_owned`/`trust` are derived from
+/// that mapping rather than tracked independently, so a new variant cannot
+/// get them out of sync with each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     GlobalClaudeMd,
@@ -29,14 +36,52 @@ impl Layer {
         }
     }
 
-    /// Whether this layer is a JSON settings file rather than prose. Their
-    /// values are secrets often enough -- an `env` block with an API key is
+    // No production caller yet: exposed for Tasks 10-16 (issue #39) to reason
+    // about which harness a surface belongs to; `context_surface()`'s own
+    // test exercises it today.
+    #[allow(dead_code)]
+    pub fn provider(&self) -> surface::Provider {
+        surface::Provider::Claude
+    }
+
+    pub fn kind(&self) -> surface::Kind {
+        match self {
+            Layer::GlobalClaudeMd | Layer::RepoClaudeMd | Layer::NestedClaudeMd => {
+                surface::Kind::Instructions
+            }
+            Layer::UserSettings | Layer::ProjectSettings | Layer::LocalSettings => {
+                surface::Kind::PolicySettings
+            }
+        }
+    }
+
+    pub fn scope(&self) -> surface::Scope {
+        match self {
+            Layer::GlobalClaudeMd | Layer::UserSettings => surface::Scope::Global,
+            Layer::RepoClaudeMd | Layer::ProjectSettings => surface::Scope::Repo,
+            Layer::NestedClaudeMd => surface::Scope::Nested,
+            Layer::LocalSettings => surface::Scope::LocalPrivate,
+        }
+    }
+
+    /// Derived from `scope()` alone (`surface::Scope::trust`) -- see that
+    /// method's doc for why this is the property that makes a repo-owned
+    /// layer's promotion to operator authority impossible by construction.
+    // No production caller yet, same as `provider()` above -- enforced by
+    // `repo_owned_layers_can_never_carry_operator_trust` until a later task
+    // consumes it directly (issue #39's "impossible by construction, or
+    // tested against").
+    #[allow(dead_code)]
+    pub fn trust(&self) -> surface::Trust {
+        self.scope().trust()
+    }
+
+    /// Whether this layer is a settings file (JSON today; a future harness
+    /// may use another structured format) rather than prose. Their values
+    /// are secrets often enough -- an `env` block with an API key is
     /// ordinary -- that they are never sent to a model verbatim.
     pub fn is_settings(&self) -> bool {
-        matches!(
-            self,
-            Layer::UserSettings | Layer::ProjectSettings | Layer::LocalSettings
-        )
+        self.kind() == surface::Kind::PolicySettings
     }
 
     /// Whether cloning the repository is enough to change this layer. Decides
@@ -45,13 +90,7 @@ impl Layer {
     /// against the repo root (see `resolve_candidates`): a layer this returns
     /// false for has no fixed repo to be relative to.
     pub fn is_repo_owned(&self) -> bool {
-        matches!(
-            self,
-            Layer::RepoClaudeMd
-                | Layer::NestedClaudeMd
-                | Layer::ProjectSettings
-                | Layer::LocalSettings
-        )
+        self.scope().is_repo_owned()
     }
 }
 
@@ -60,6 +99,22 @@ pub struct Surface {
     pub layer: Layer,
     pub path: PathBuf,
     pub text: String,
+}
+
+impl Surface {
+    /// This surface's provenance in the harness-neutral vocabulary
+    /// (`surface::ContextSurface`), for callers that reason about trust or
+    /// provider rather than this module's own `Layer` variants.
+    // No production caller yet -- Tasks 10-16's handoff API (issue #39).
+    #[allow(dead_code)]
+    pub fn context_surface(&self) -> surface::ContextSurface {
+        surface::ContextSurface::new(
+            self.layer.provider(),
+            self.layer.kind(),
+            self.layer.scope(),
+            self.path.clone(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1882,6 +1937,66 @@ mod tests {
         assert!(Layer::NestedClaudeMd.is_repo_owned());
         assert!(Layer::ProjectSettings.is_repo_owned());
         assert!(Layer::LocalSettings.is_repo_owned());
+    }
+
+    /// Every layer maps onto the generic surface vocabulary (`surface::`),
+    /// and `is_repo_owned`/`is_settings` are derived from that mapping, not
+    /// hand-rolled independently -- so a new `Layer` variant cannot get the
+    /// two answers out of sync with its own `scope`/`kind`.
+    #[test]
+    fn every_layer_carries_generic_provenance_consistent_with_its_own_helpers() {
+        let layers = [
+            Layer::GlobalClaudeMd,
+            Layer::RepoClaudeMd,
+            Layer::NestedClaudeMd,
+            Layer::UserSettings,
+            Layer::ProjectSettings,
+            Layer::LocalSettings,
+        ];
+        for layer in layers {
+            assert_eq!(layer.is_repo_owned(), layer.scope().is_repo_owned());
+            assert_eq!(
+                layer.is_settings(),
+                layer.kind() == surface::Kind::PolicySettings
+            );
+        }
+    }
+
+    /// The load-bearing property (issue #39): a repo-owned layer's trust is
+    /// always `RepoUntrusted`, and only a `Global`-scoped layer is
+    /// `Operator`-trusted -- derived from `scope()`, not an independent flag
+    /// a new variant could set wrong.
+    #[test]
+    fn repo_owned_layers_can_never_carry_operator_trust() {
+        assert_eq!(Layer::GlobalClaudeMd.trust(), surface::Trust::Operator);
+        assert_eq!(Layer::UserSettings.trust(), surface::Trust::Operator);
+        for layer in [
+            Layer::RepoClaudeMd,
+            Layer::NestedClaudeMd,
+            Layer::ProjectSettings,
+            Layer::LocalSettings,
+        ] {
+            assert_eq!(
+                layer.trust(),
+                surface::Trust::RepoUntrusted,
+                "{layer:?} is inside the repo checkout and must never be operator-trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_surface_produces_the_matching_generic_context_surface() {
+        let surface = Surface {
+            layer: Layer::RepoClaudeMd,
+            path: PathBuf::from("/repo/CLAUDE.md"),
+            text: "- always run tests".to_string(),
+        };
+        let generic = surface.context_surface();
+        assert_eq!(generic.provider(), surface::Provider::Claude);
+        assert_eq!(generic.kind(), surface::Kind::Instructions);
+        assert_eq!(generic.scope(), surface::Scope::Repo);
+        assert_eq!(generic.trust(), surface::Trust::RepoUntrusted);
+        assert_eq!(generic.path(), Path::new("/repo/CLAUDE.md"));
     }
 
     #[test]
