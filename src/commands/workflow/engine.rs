@@ -59,6 +59,10 @@ pub enum StepCondition {
     Always,
     ComplexityAtLeast(Complexity),
     RiskAtLeast(RiskBand),
+    ComplexityOrRisk {
+        complexity: Complexity,
+        risk: RiskBand,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +81,9 @@ impl WorkflowStep {
             StepCondition::Always => true,
             StepCondition::ComplexityAtLeast(minimum) => classification.complexity >= minimum,
             StepCondition::RiskAtLeast(minimum) => classification.risk >= minimum,
+            StepCondition::ComplexityOrRisk { complexity, risk } => {
+                classification.complexity >= complexity || classification.risk >= risk
+            }
         }
     }
 }
@@ -131,7 +138,10 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
                     "design",
                     Phase::Design,
                     "design",
-                    When::ComplexityAtLeast(C::Substantial),
+                    When::ComplexityOrRisk {
+                        complexity: C::Substantial,
+                        risk: R::High,
+                    },
                     true,
                 ),
                 step(
@@ -198,7 +208,10 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
                     "design",
                     Phase::Design,
                     "design",
-                    When::ComplexityAtLeast(C::Substantial),
+                    When::ComplexityOrRisk {
+                        complexity: C::Substantial,
+                        risk: R::High,
+                    },
                     true,
                 ),
                 step(
@@ -980,6 +993,19 @@ mod tests {
         let steps = definition(WorkflowKind::Feature).materialize(&classification);
         assert!(steps.first().unwrap().approval);
         assert!(steps.iter().any(|step| step.id == "review"));
+    }
+
+    #[test]
+    fn high_risk_bounded_feature_keeps_design_gate() {
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
+        classification.risk = RiskBand::High;
+        let steps = definition(WorkflowKind::Feature).materialize(&classification);
+        assert!(
+            steps
+                .first()
+                .is_some_and(|step| step.id == "design" && step.approval)
+        );
     }
 
     #[test]
