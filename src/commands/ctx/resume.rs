@@ -157,8 +157,7 @@ pub fn run_with<W: Write>(
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
 
     let memory_slug = super::state::repo_slug(repo);
-    let memory_entries =
-        super::memory::render_for_prompt(&state, &memory_slug, &cfg, super::state::now_secs());
+    let memory_entries = super::memory::render_for_prompt(&state, repo, &memory_slug, &cfg);
     let (user_extra, composed) = compose_prompt(
         adapter.as_ref(),
         crate::utils::home_dir().ok().as_deref(),
@@ -166,7 +165,7 @@ pub fn run_with<W: Write>(
         args.simple,
         &cfg.prompt,
         &memory_entries,
-        cfg.memory.max_injected_bytes,
+        cfg.memory.core_max_bytes,
         &args.extra,
     );
     // M2: attribution is logged per session, not once per verb. A resumed run

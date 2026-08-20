@@ -419,8 +419,7 @@ pub(crate) fn dash_orchestrator_pane(
     simple: bool,
 ) -> CtxResult<PaneSpec> {
     let slug = super::state::repo_slug(repo);
-    let memory_entries =
-        super::memory::render_for_prompt(state, &slug, cfg, super::state::now_secs());
+    let memory_entries = super::memory::render_for_prompt(state, repo, &slug, cfg);
     // Only an Orchestrator session hears about other harnesses at all; see
     // `prompt::PromptSource::Harnesses`.
     let harness_lines = if launch.role == PromptRole::Orchestrator {
@@ -435,7 +434,7 @@ pub(crate) fn dash_orchestrator_pane(
         &cfg.prompt,
         launch.role,
         &memory_entries,
-        cfg.memory.max_injected_bytes,
+        cfg.memory.core_max_bytes,
         &harness_lines,
     );
     let (mut argv, composed) = super::prompt::merge_command_line_prompt(

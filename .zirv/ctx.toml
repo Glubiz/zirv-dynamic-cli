@@ -118,8 +118,11 @@ model = "fable"
 # harvest = false                    # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_HARVEST): whether facts are auto-harvested from distilled handoffs. Default: false.
 # max_entries = 50                   # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_ENTRIES): entries kept before the oldest (by Written) are pruned. Default: 50.
 # max_entry_bytes = 512              # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES): cap on a single entry's body. Default: 512.
-# max_injected_bytes = 2048          # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES): cap on the bank surfaced to a session at once. Default: 2048.
+# max_injected_bytes = 2048          # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES): superseded by core_max_bytes; kept only so an old config does not hard-error. Default: 2048.
 # shared_enabled = true              # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_SHARED): whether the repo-owned shared bank (<repo>/.zirv/memory/) is read at all. Default: true.
+# core_max_bytes = 2048              # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_CORE_MAX_BYTES): cap on the merged private+shared core layer surfaced to every session. Default: 2048.
+# retrieval_max_bytes = 2048         # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES): cap on context-ranked retrieved entries, on top of core. Default: 2048.
+# retrieval_max_entries = 6          # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES): max number of retrieved entries, independent of bytes. Default: 6.
 
 # [chrome]
 # banner = true                      # the launch banner naming the resolved harness, the rule that chose it, and the session id

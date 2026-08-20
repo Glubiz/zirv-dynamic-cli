@@ -297,7 +297,7 @@ pub fn run_with<W: Write>(
     // mail, which is deliberately re-listed narrowly by session on that
     // path, the memory bank is repo-wide and does not go stale within one
     // `run_with` call the way a specific session's mailbox does.
-    let memory_entries = super::memory::render_for_prompt(&state, &mail_slug, &cfg, now_secs());
+    let memory_entries = super::memory::render_for_prompt(&state, repo, &mail_slug, &cfg);
 
     // A wrapped command that matches no adapter (no explicit `--agent`,
     // detection came up empty) is not actually the agent whose flags we would
@@ -315,7 +315,7 @@ pub fn run_with<W: Write>(
         &cfg.prompt,
         super::prompt::PromptRole::Worker,
         &memory_entries,
-        cfg.memory.max_injected_bytes,
+        cfg.memory.core_max_bytes,
         // A Worker session never hears about other harnesses; see
         // `prompt::PromptSource::Harnesses`.
         &[],
@@ -897,7 +897,7 @@ pub fn run_with<W: Write>(
                 &cfg.prompt,
                 super::prompt::PromptRole::Worker,
                 &memory_entries,
-                cfg.memory.max_injected_bytes,
+                cfg.memory.core_max_bytes,
                 &[],
             );
             // C7: `registry_short`, not `short_id(session)` -- `session`

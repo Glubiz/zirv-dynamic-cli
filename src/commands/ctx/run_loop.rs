@@ -167,7 +167,7 @@ pub fn run_with<W: Write>(
         // fresh, stateless session, so a fact remembered or verified since
         // the previous cycle must be picked up too, not a snapshot taken
         // once before the loop started.
-        let memory_entries = super::memory::render_for_prompt(&state, &mail_slug, &cfg, now_fn());
+        let memory_entries = super::memory::render_for_prompt(&state, repo, &mail_slug, &cfg);
         // Recomposed every cycle -- the same seam as `injection_args_for_
         // session` a few lines down -- because each cycle is a fresh,
         // stateless session: it must pick up whatever mail has arrived since
@@ -180,7 +180,7 @@ pub fn run_with<W: Write>(
             &cfg.prompt,
             super::prompt::PromptRole::Worker,
             &memory_entries,
-            cfg.memory.max_injected_bytes,
+            cfg.memory.core_max_bytes,
             &[],
         );
         // A fresh session id per cycle is the whole point: the orchestrator

@@ -832,8 +832,11 @@ enabled = true
 harvest = false                # opt-in; see "Memory bank" below
 max_entries = 50               # entries kept per repo before the oldest (by Written) are pruned
 max_entry_bytes = 512          # per-entry body cap
-max_injected_bytes = 2048      # cap on the whole bank folded into one launch prompt
+max_injected_bytes = 2048      # superseded by core_max_bytes; kept only so an old config does not error
 shared_enabled = true          # whether the repo-owned shared bank (<repo>/.zirv/memory/) is read at all
+core_max_bytes = 2048          # cap on the merged private+shared core layer folded into every session
+retrieval_max_bytes = 2048     # cap on context-ranked retrieved entries, on top of core
+retrieval_max_entries = 6      # max number of retrieved entries, independent of bytes
 
 [chrome]
 banner = true   # the one-time launch banner
@@ -886,6 +889,9 @@ checkout:
 | `memory.max_entry_bytes` | `ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES` |
 | `memory.max_injected_bytes` | `ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES` |
 | `memory.shared_enabled` | `ZIRV_CTX_MEMORY_SHARED` |
+| `memory.core_max_bytes` | `ZIRV_CTX_MEMORY_CORE_MAX_BYTES` |
+| `memory.retrieval_max_bytes` | `ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES` |
+| `memory.retrieval_max_entries` | `ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES` |
 | `dash.enabled` | `ZIRV_CTX_DASH` |
 | `dash.sidebar_cols` | `ZIRV_CTX_DASH_SIDEBAR_COLS` |
 | `dash.roster_max_age_secs` | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS` |
@@ -1278,8 +1284,11 @@ enabled = true
 harvest = false          # off by default; see above
 max_entries = 50
 max_entry_bytes = 512
-max_injected_bytes = 2048
+max_injected_bytes = 2048       # superseded by core_max_bytes; kept only so an old config does not error
 shared_enabled = true
+core_max_bytes = 2048           # cap on the merged private+shared core layer folded into every session
+retrieval_max_bytes = 2048      # cap on context-ranked retrieved entries, on top of core
+retrieval_max_entries = 6       # max number of retrieved entries, independent of bytes
 ```
 
 There are two independent memory scopes. The **private** bank still lives

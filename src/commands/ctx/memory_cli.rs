@@ -190,8 +190,13 @@ pub fn run_status_with<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> 
     write_scope_status(w, MemoryScope::Shared, repo, &state, &slug, &cfg)?;
     writeln!(
         w,
-        "injection budget: {} bytes (the private scope's prompt injection only; the shared scope is not yet injected into any prompt)",
-        cfg.memory.max_injected_bytes
+        "core injection budget: {} bytes (private + shared, merged private-first; issue #34)",
+        cfg.memory.core_max_bytes
+    )?;
+    writeln!(
+        w,
+        "retrieval injection budget: {} bytes, {} entries max (context-ranked, on top of core; issue #35)",
+        cfg.memory.retrieval_max_bytes, cfg.memory.retrieval_max_entries
     )?;
     Ok(0)
 }
@@ -638,6 +643,35 @@ mod tests {
         assert!(
             !text.contains("this body must never appear verbatim"),
             "status must never dump a body: {text}"
+        );
+    }
+
+    /// Issue #34: `zirv memory status` reports the core budget (which now
+    /// covers both scopes, private-first) and the retrieval budget (#35),
+    /// not just the old single "injection budget" line.
+    #[test]
+    fn status_reports_the_core_and_retrieval_budgets() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            ("ZIRV_CTX_MEMORY_CORE_MAX_BYTES", "1024"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES", "4096"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "3"),
+        ]);
+
+        let mut out = Vec::new();
+        run_status_with(&mut out, repo.path(), &|k| env.get(k).cloned()).expect("status");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("core injection budget: 1024 bytes"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("retrieval injection budget: 4096 bytes, 3 entries max"),
+            "got {text}"
         );
     }
 

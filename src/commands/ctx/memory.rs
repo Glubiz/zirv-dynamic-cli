@@ -1144,43 +1144,57 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
 }
 
 /// Loads this repo's memory bank as already-rendered prompt lines
-/// (`prompt::MemoryLine`), gated on `cfg.memory.enabled` -- an empty vec
-/// when disabled, the same "disabled means nothing delivered" contract
-/// every mail delivery seam already follows for `cfg.mail.enabled`. `now` is
-/// a plain `u64` (`state::now_secs()`, read by the caller) rather than read
-/// in here: `prompt.rs` stays clock-free like `rot.rs`, so the one clock
-/// read for "how old is this entry" happens at this call, the last point
-/// before the rendered text crosses into that module.
+/// (`prompt::MemoryLine`) for the **core** layer (issue #34): both the
+/// private and shared scopes, merged, each gated on its own switch --
+/// `cfg.memory.enabled` for private (via `list`, unchanged), `list_scoped`'s
+/// own `scope.enabled(cfg)` check for shared (`cfg.memory.shared_enabled`,
+/// already returns an empty vec rather than an error when disabled or
+/// unsafe, never a hard failure).
 ///
-/// The wording ("written Nd ago, verified Nd ago") matches `run_recall_
-/// with`'s own human-readable branch, so "how old" reads the same everywhere
-/// it appears.
+/// Renders compact key/body pairs only -- no `Written`/`Verified` storage
+/// metadata is spent into the prompt by default (issue #34) -- but keeps the
+/// raw timestamps on `MemoryLine` for `prompt::select_memory_within_cap`'s
+/// ranking and for Task 5's retrieval ranking to reuse.
+///
+/// Precedence between the two scopes is NOT decided here: this is a plain
+/// "list everything eligible" read that tags each line with which scope it
+/// came from (`MemoryLine::shared`). `prompt::with_memory_layer`/
+/// `select_memory_within_cap` is what enforces "private outranks shared"
+/// structurally, using that tag -- see its own doc comment for why a shared
+/// entry's own `verified`/`written` fields must never be trusted to compete
+/// with a private one directly.
 pub fn render_for_prompt(
     state: &StateDir,
+    repo: &Path,
     slug: &str,
     cfg: &CtxConfig,
-    now: u64,
 ) -> Vec<super::prompt::MemoryLine> {
-    if !cfg.memory.enabled {
-        return Vec::new();
+    let mut lines: Vec<super::prompt::MemoryLine> = if cfg.memory.enabled {
+        list(state, slug)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, entry)| render_prompt_line(entry, false))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    lines.extend(
+        list_scoped(MemoryScope::Shared, repo, state, slug, cfg)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, entry)| render_prompt_line(entry, true)),
+    );
+    lines
+}
+
+fn render_prompt_line(entry: Entry, shared: bool) -> super::prompt::MemoryLine {
+    super::prompt::MemoryLine {
+        key: entry.key,
+        body: entry.body,
+        verified: entry.verified,
+        written: entry.written,
+        shared,
     }
-    list(state, slug)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, entry)| {
-            let written_days = now.saturating_sub(entry.written) / 86_400;
-            let verified_days = now.saturating_sub(entry.verified) / 86_400;
-            super::prompt::MemoryLine {
-                key: entry.key,
-                age: format!("written {written_days}d ago, verified {verified_days}d ago"),
-                body: entry.body,
-                // N3: carried through raw so the injection cap can rank
-                // entries newest-first; `prompt` itself stays clock-free.
-                verified: entry.verified,
-                written: entry.written,
-            }
-        })
-        .collect()
 }
 
 // N6: harvesting durable repository facts out of a *distilled* handoff
@@ -2457,31 +2471,30 @@ This should not appear in the body.\n";
         assert!(err.to_string().contains("--all"), "got {err}");
     }
 
-    // N5: the memory prompt layer's own source, `render_for_prompt`.
+    // N5/issue #34: the memory prompt layer's own source, `render_for_prompt`
+    // -- now the merged **core** layer (private + shared).
 
     #[test]
-    fn render_for_prompt_renders_the_key_and_age_of_every_entry() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
+    fn render_for_prompt_renders_the_key_and_body_of_every_private_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
         let cfg = CtxConfig::default();
-        let now = 1_700_000_000u64;
 
-        let mut fresh = sample("build-cmd", now.saturating_sub(3 * 86_400));
-        fresh.verified = now.saturating_sub(86_400);
+        let mut fresh = sample("build-cmd", 1_700_000_000);
         fresh.body = "cargo build --release".to_string();
         remember(&state, "-work-repo", &fresh, &cfg).expect("remember");
 
-        let rendered = render_for_prompt(&state, "-work-repo", &cfg, now);
+        let rendered = render_for_prompt(&state, repo.path(), "-work-repo", &cfg);
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].key, "build-cmd");
         assert_eq!(rendered[0].body, "cargo build --release");
-        assert_eq!(rendered[0].age, "written 3d ago, verified 1d ago");
+        assert!(!rendered[0].shared, "a private entry is tagged as such");
     }
 
     #[test]
-    fn render_for_prompt_is_empty_when_memory_is_disabled_even_with_entries_stored() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
+    fn render_for_prompt_is_empty_when_both_scopes_are_disabled_even_with_entries_stored() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
         remember(
             &state,
             "-work-repo",
@@ -2493,14 +2506,82 @@ This should not appear in the body.\n";
         let disabled = CtxConfig {
             memory: super::super::config::MemoryConfig {
                 enabled: false,
+                shared_enabled: false,
                 ..super::super::config::MemoryConfig::default()
             },
             ..CtxConfig::default()
         };
         assert!(
-            render_for_prompt(&state, "-work-repo", &disabled, 1_700_000_000).is_empty(),
-            "a disabled bank must render nothing, however much is stored"
+            render_for_prompt(&state, repo.path(), "-work-repo", &disabled).is_empty(),
+            "a fully disabled bank must render nothing, however much is stored"
         );
+    }
+
+    /// Issue #34: the core layer merges both scopes, tagging each line with
+    /// where it came from.
+    #[test]
+    fn render_for_prompt_merges_private_and_shared_entries_with_provenance() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        remember(
+            &state,
+            "-work-repo",
+            &sample("private-fact", 1_700_000_000),
+            &cfg,
+        )
+        .expect("remember private");
+
+        let shared_dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&shared_dir).expect("mkdir");
+        std::fs::write(
+            shared_dir.join("shared-fact.md"),
+            sample("shared-fact", 1_700_000_000).to_markdown(),
+        )
+        .expect("write shared");
+
+        let rendered = render_for_prompt(&state, repo.path(), "-work-repo", &cfg);
+        assert_eq!(rendered.len(), 2, "both scopes are merged: {rendered:?}");
+        let private_line = rendered
+            .iter()
+            .find(|l| l.key == "private-fact")
+            .expect("private entry present");
+        assert!(!private_line.shared);
+        let shared_line = rendered
+            .iter()
+            .find(|l| l.key == "shared-fact")
+            .expect("shared entry present");
+        assert!(shared_line.shared);
+    }
+
+    /// Each scope is gated independently: disabling private must not hide
+    /// shared entries, and vice versa (the two `render_for_prompt_is_empty_
+    /// when_both_scopes_are_disabled...`/this test pair covers both
+    /// directions).
+    #[test]
+    fn render_for_prompt_still_renders_shared_entries_when_private_is_disabled() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let shared_dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&shared_dir).expect("mkdir");
+        std::fs::write(
+            shared_dir.join("shared-fact.md"),
+            sample("shared-fact", 1_700_000_000).to_markdown(),
+        )
+        .expect("write shared");
+
+        let cfg = CtxConfig {
+            memory: super::super::config::MemoryConfig {
+                enabled: false,
+                ..super::super::config::MemoryConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        let rendered = render_for_prompt(&state, repo.path(), "-work-repo", &cfg);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].key, "shared-fact");
+        assert!(rendered[0].shared);
     }
 
     // N6: handoff -> memory harvest.

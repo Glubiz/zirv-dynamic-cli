@@ -329,15 +329,36 @@ pub struct MemoryConfig {
     /// Cap on a single entry's body. Enforced by `memory::remember`, which
     /// truncates rather than fails an oversize entry.
     pub max_entry_bytes: usize,
-    /// Cap on how much of the bank is surfaced to a session at once.
+    /// Superseded by `core_max_bytes` (issue #34): every prompt-injection
+    /// call site now caps the merged private+shared core layer with that key
+    /// instead. Kept, parsed, and still `REPO_FORBIDDEN`, purely so an
+    /// existing `ctx.toml`/env setting this key does not hard-error on load
+    /// (this struct is `deny_unknown_fields`) -- the same "kept under its
+    /// original name" reasoning `enabled`'s own doc comment gives for a
+    /// different field.
     pub max_injected_bytes: usize,
     /// Gate for the **shared** (repo-owned) memory bank under
     /// `<repo>/.zirv/memory/` (`memory::MemoryScope::Shared`). Independent of
     /// `enabled` above, so an operator can turn either scope off without
-    /// touching the other. On by default like every other memory switch;
-    /// nothing yet reads through this gate outside `memory::list_scoped`
-    /// (no prompt-injection or CLI surface consumes it in this change).
+    /// touching the other. On by default like every other memory switch.
     pub shared_enabled: bool,
+    /// Hard byte budget for the **core** memory layer (issue #34): private
+    /// and shared entries merged with private-first precedence (see
+    /// `prompt::select_memory_within_cap`), always eligible for injection
+    /// into every zirv-started session regardless of query or context.
+    /// Independent of `max_entries`/`max_entry_bytes` (which cap what the
+    /// bank *stores*) and of the bank's total size -- a strict ceiling on
+    /// what a session actually *receives*.
+    pub core_max_bytes: usize,
+    /// Hard byte budget for the **retrieved** memory layer (issue #35):
+    /// entries selected by context-aware ranking, added on top of the core
+    /// layer for a query or session context. Independent of
+    /// `core_max_bytes`.
+    pub retrieval_max_bytes: usize,
+    /// Hard cap on the *number* of entries the retrieval layer may select,
+    /// independent of `retrieval_max_bytes`'s byte budget -- a ranking that
+    /// matches many small entries must not still return dozens of them.
+    pub retrieval_max_entries: usize,
 }
 
 impl Default for MemoryConfig {
@@ -349,6 +370,9 @@ impl Default for MemoryConfig {
             max_entry_bytes: 512,
             max_injected_bytes: 2048,
             shared_enabled: true,
+            core_max_bytes: 2048,
+            retrieval_max_bytes: 2048,
+            retrieval_max_entries: 6,
         }
     }
 }
@@ -751,6 +775,21 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_MEMORY_CORE_MAX_BYTES",
+        &["memory", "core_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES",
+        &["memory", "retrieval_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES",
+        &["memory", "retrieval_max_entries"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_CHROME_BANNER",
         &["chrome", "banner"],
         EnvKind::Bool,
@@ -943,6 +982,25 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // `enabled` above: each memory switch is forbidden individually, the
     // same granularity `harvest`/`max_entries`/etc. already get.
     (&["memory", "shared_enabled"], "ZIRV_CTX_MEMORY_SHARED"),
+    // Same class of decision as `max_injected_bytes` right above (which this
+    // key supersedes for actual injection sizing): a repo checkout must not
+    // be able to grow the merged core layer's own delivered-bytes cap, the
+    // same trust asymmetry `prompt.max_repo_bytes`/`mail.max_delivered_bytes`
+    // already enforce.
+    (
+        &["memory", "core_max_bytes"],
+        "ZIRV_CTX_MEMORY_CORE_MAX_BYTES",
+    ),
+    // Same reasoning, for the retrieval layer's byte budget (issue #35).
+    (
+        &["memory", "retrieval_max_bytes"],
+        "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES",
+    ),
+    // Same reasoning, for the retrieval layer's entry-count cap.
+    (
+        &["memory", "retrieval_max_entries"],
+        "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES",
+    ),
     // A repo checkout must not be able to switch its own dashboard on or off,
     // resize the sidebar, change how long a quit-time roster is offered for
     // restore, or raise its own pane cap -- the operator's terminal, the
@@ -2068,6 +2126,9 @@ mod tests {
             memory.shared_enabled,
             "the shared (repo-owned) scope is on by default too"
         );
+        assert_eq!(memory.core_max_bytes, 2048);
+        assert_eq!(memory.retrieval_max_bytes, 2048);
+        assert_eq!(memory.retrieval_max_entries, 6);
     }
 
     #[test]
@@ -2080,6 +2141,9 @@ mod tests {
             ("ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES", "128"),
             ("ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES", "999"),
             ("ZIRV_CTX_MEMORY_SHARED", "false"),
+            ("ZIRV_CTX_MEMORY_CORE_MAX_BYTES", "1024"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES", "4096"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "3"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled);
@@ -2088,6 +2152,9 @@ mod tests {
         assert_eq!(cfg.memory.max_entry_bytes, 128);
         assert_eq!(cfg.memory.max_injected_bytes, 999);
         assert!(!cfg.memory.shared_enabled);
+        assert_eq!(cfg.memory.core_max_bytes, 1024);
+        assert_eq!(cfg.memory.retrieval_max_bytes, 4096);
+        assert_eq!(cfg.memory.retrieval_max_entries, 3);
     }
 
     /// N4: `supervise.max_nudges` reads from its own env var like every
@@ -2133,6 +2200,9 @@ mod tests {
             ("max_entry_bytes", "100000"),
             ("max_injected_bytes", "100000"),
             ("shared_enabled", "true"),
+            ("core_max_bytes", "100000"),
+            ("retrieval_max_bytes", "100000"),
+            ("retrieval_max_entries", "100000"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -2164,6 +2234,9 @@ mod tests {
             ("ZIRV_CTX_MEMORY", "false"),
             ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "5"),
             ("ZIRV_CTX_MEMORY_SHARED", "false"),
+            ("ZIRV_CTX_MEMORY_CORE_MAX_BYTES", "512"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES", "1024"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "2"),
         ]);
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled, "the environment is the operator");
@@ -2172,6 +2245,9 @@ mod tests {
             "including the shared-scope gate"
         );
         assert_eq!(cfg.memory.max_entries, 5);
+        assert_eq!(cfg.memory.core_max_bytes, 512);
+        assert_eq!(cfg.memory.retrieval_max_bytes, 1024);
+        assert_eq!(cfg.memory.retrieval_max_entries, 2);
     }
 
     #[test]
@@ -2515,6 +2591,9 @@ mod tests {
         ("memory", "max_entry_bytes"),
         ("memory", "max_injected_bytes"),
         ("memory", "shared_enabled"),
+        ("memory", "core_max_bytes"),
+        ("memory", "retrieval_max_bytes"),
+        ("memory", "retrieval_max_entries"),
         ("chrome", "banner"),
         ("chrome", "bar"),
         ("chrome", "events"),

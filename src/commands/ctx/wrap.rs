@@ -1203,8 +1203,7 @@ pub fn run_with(
             &args.command,
         );
     let memory_slug = super::state::repo_slug(repo);
-    let memory_entries =
-        super::memory::render_for_prompt(&state_dir, &memory_slug, &cfg, super::state::now_secs());
+    let memory_entries = super::memory::render_for_prompt(&state_dir, repo, &memory_slug, &cfg);
     // Only an Orchestrator session hears about other harnesses at all: see
     // `prompt::PromptSource::Harnesses`.
     let harness_lines = if role == PromptRole::Orchestrator {
@@ -1219,7 +1218,7 @@ pub fn run_with(
         &cfg.prompt,
         role,
         &memory_entries,
-        cfg.memory.max_injected_bytes,
+        cfg.memory.core_max_bytes,
         &harness_lines,
     );
     // The wrapped command's own argv may already carry the adapter's

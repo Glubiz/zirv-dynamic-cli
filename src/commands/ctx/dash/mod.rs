@@ -2106,7 +2106,7 @@ fn compose_worker_prompt(
     repo: &Path,
     slug: &str,
 ) -> ComposedWorkerPrompt {
-    let memory_entries = memory::render_for_prompt(state, slug, cfg, super::state::now_secs());
+    let memory_entries = memory::render_for_prompt(state, repo, slug, cfg);
     let composed = prompt::compose(
         crate::utils::home_dir().ok().as_deref(),
         repo,
@@ -2114,7 +2114,7 @@ fn compose_worker_prompt(
         &cfg.prompt,
         prompt::PromptRole::Worker,
         &memory_entries,
-        cfg.memory.max_injected_bytes,
+        cfg.memory.core_max_bytes,
         &[],
     );
     let system_prompt_supported = adapter.capabilities().system_prompt;
