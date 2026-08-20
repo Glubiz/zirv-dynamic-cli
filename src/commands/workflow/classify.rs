@@ -460,6 +460,11 @@ mod tests {
     fn classification_task_is_bounded() {
         let mut value = input(&["README.md"], 5);
         value.task = "x".repeat(MAX_TASK_BYTES + 1);
-        assert!(classify(&value).unwrap_err().to_string().contains("exceeds"));
+        assert!(
+            classify(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
     }
 }

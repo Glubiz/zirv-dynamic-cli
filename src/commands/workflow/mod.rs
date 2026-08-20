@@ -119,8 +119,20 @@ fn run(cli: &WorkflowCli, writer: &mut impl std::io::Write) -> CtxResult<i32> {
     }
 }
 
+fn normalized_args(args: &[String]) -> Vec<String> {
+    let mut args = args.to_vec();
+    if let Some(command) = args.get_mut(1)
+        && TOP_LEVEL_COMMANDS
+            .iter()
+            .any(|candidate| command.eq_ignore_ascii_case(candidate))
+    {
+        command.make_ascii_lowercase();
+    }
+    args
+}
+
 pub fn dispatch(args: &[String]) -> i32 {
-    let cli = match WorkflowCli::try_parse_from(args) {
+    let cli = match WorkflowCli::try_parse_from(normalized_args(args)) {
         Ok(cli) => cli,
         Err(err) => {
             let code = if matches!(
@@ -153,6 +165,17 @@ mod tests {
     fn skill_command_parses_in_its_own_tree() {
         let cli = WorkflowCli::try_parse_from(["zirv", "skill", "list"])
             .expect("skill list should parse");
+        assert!(matches!(cli.command, WorkflowCommand::Skill(_)));
+    }
+
+    #[test]
+    fn top_level_workflow_command_is_case_insensitive() {
+        let args = ["zirv", "SKILL", "list"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let cli = WorkflowCli::try_parse_from(normalized_args(&args))
+            .expect("uppercase reserved workflow command should parse");
         assert!(matches!(cli.command, WorkflowCommand::Skill(_)));
     }
 }

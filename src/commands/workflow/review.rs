@@ -280,9 +280,10 @@ pub fn package(
     }
     if state.review_findings.iter().any(|finding| {
         finding.summary.len() > MAX_FINDING_SUMMARY_BYTES
-            || finding.path.as_ref().is_some_and(|path| {
-                path.to_string_lossy().len() > MAX_FINDING_PATH_BYTES
-            })
+            || finding
+                .path
+                .as_ref()
+                .is_some_and(|path| path.to_string_lossy().len() > MAX_FINDING_PATH_BYTES)
     }) {
         return Err("workflow contains an oversized review finding".into());
     }
@@ -589,14 +590,15 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 return Err("finding summary must not be empty".into());
             }
             if summary.len() > MAX_FINDING_SUMMARY_BYTES {
-                return Err(format!(
-                    "finding summary exceeds {MAX_FINDING_SUMMARY_BYTES} bytes"
-                )
-                .into());
+                return Err(
+                    format!("finding summary exceeds {MAX_FINDING_SUMMARY_BYTES} bytes").into(),
+                );
             }
-            if args.path.as_ref().is_some_and(|path| {
-                path.to_string_lossy().len() > MAX_FINDING_PATH_BYTES
-            }) {
+            if args
+                .path
+                .as_ref()
+                .is_some_and(|path| path.to_string_lossy().len() > MAX_FINDING_PATH_BYTES)
+            {
                 return Err(format!("finding path exceeds {MAX_FINDING_PATH_BYTES} bytes").into());
             }
             let finding = ReviewFinding {
