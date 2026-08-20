@@ -111,19 +111,24 @@ fn temp_sibling(target: &Path) -> PathBuf {
     }
 }
 
-/// Writes `contents` to `path` atomically: a temp sibling is written in full
-/// and then `rename`d over the target (atomic on the same filesystem, on both
-/// Windows and Unix), so a concurrent reader ever sees either the whole old
-/// file or the whole new one -- never the zero-length truncation window a
+/// Shared machinery behind `write_private`/`write_shared`: write to a temp
+/// sibling, then `rename` it over `path` (atomic on the same filesystem, on
+/// both Windows and Unix), so a concurrent reader ever sees either the whole
+/// old file or the whole new one -- never the zero-length truncation window a
 /// plain create-truncate-write leaves. That window was a real hazard: a
 /// session refreshing its registry record while a dashboard `sessions::list`
 /// read it could have the record read as absent (and its pending nudge
-/// swept).
+/// swept). `rename` replaces the directory entry itself rather than writing
+/// through it, so this is also safe when `path` already exists as a symlink:
+/// the link is replaced by a regular file, never dereferenced and written
+/// through to wherever it pointed.
 ///
-/// On Unix the file is 0600, forced on the fresh temp regardless of umask,
-/// so writing over an operator's pre-existing world-readable file still
-/// yields a private one.
-pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+/// `force_owner_only` applies `write_private`'s 0600-regardless-of-umask
+/// hardening; `write_shared` leaves it off, since that content lives in a
+/// normal repository checkout and should get ordinary, umask-respecting
+/// permissions like any other file zirv writes into a checkout, not the
+/// machine-local-secret treatment state-dir content gets.
+fn write_atomic(path: &Path, contents: &str, force_owner_only: bool) -> std::io::Result<()> {
     use std::io::Write;
 
     let tmp = temp_sibling(path);
@@ -134,13 +139,13 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
         #[cfg(unix)]
-        {
+        if force_owner_only {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
         let mut file = opts.open(&tmp)?;
         #[cfg(unix)]
-        {
+        if force_owner_only {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
@@ -159,6 +164,29 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// Writes `contents` to `path` atomically. On Unix the file is 0600, forced
+/// on the fresh temp regardless of umask, so writing over an operator's
+/// pre-existing world-readable file still yields a private one.
+pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_atomic(path, contents, true)
+}
+
+/// Same atomic temp-sibling-then-`rename` guarantee as `write_private`, for
+/// content meant to live in the repository checkout itself
+/// (`<repo>/.zirv/memory/`, the shared memory scope) rather than the
+/// machine-local state dir. Deliberately does NOT force 0600: a shared-scope
+/// file is ordinary, human-editable repository content and should get
+/// whatever permissions the process umask would give any other file zirv
+/// writes into a checkout (the same convention `zirv init` already uses for
+/// `.zirv/` itself), not `write_private`'s "private machine secret"
+/// treatment. Not yet called from any non-test code -- `memory::upsert_shared`
+/// is its first consumer, itself dormant until `zirv memory` (Task 3) wires a
+/// CLI verb on top of it.
+#[allow(dead_code)]
+pub fn write_shared(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_atomic(path, contents, false)
 }
 
 /// How many files the per-session directories keep. High enough that no live
@@ -527,6 +555,83 @@ mod tests {
         reader
             .join()
             .expect("reader thread panicked on a partial read");
+    }
+
+    /// `write_shared` gets the same atomic temp-sibling-then-`rename`
+    /// guarantee as `write_private` -- required for the memory shared
+    /// scope's key-addressed files, where a concurrent reader/writer race on
+    /// the very same path is the expected case, not an edge case.
+    #[test]
+    fn write_shared_is_atomic_via_temp_sibling_and_rename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("shared-entry.md");
+        write_shared(&path, "first").expect("write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "first");
+        write_shared(&path, "second").expect("rewrite");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "second");
+    }
+
+    /// Unlike `write_private`, `write_shared` must not force 0600: it writes
+    /// ordinary repository content, so it should get whatever permissions a
+    /// plain file write in the same directory would (whatever the process
+    /// umask says), not the "machine-local secret" treatment.
+    #[cfg(unix)]
+    #[test]
+    fn write_shared_uses_ordinary_permissions_not_write_privates_forced_0600() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let shared_path = tmp.path().join("shared.md");
+        write_shared(&shared_path, "hello").expect("write_shared");
+        let control_path = tmp.path().join("control.md");
+        std::fs::write(&control_path, "hello").expect("control write");
+        assert_eq!(
+            mode_of(&shared_path),
+            mode_of(&control_path),
+            "write_shared must use the same ordinary, umask-respecting permissions as a plain file write, not write_private's forced 0600"
+        );
+
+        let private_path = tmp.path().join("private.md");
+        write_private(&private_path, "hello").expect("write_private");
+        assert_eq!(
+            mode_of(&private_path),
+            0o600,
+            "sanity: write_private is still forced 0600 regardless of umask"
+        );
+    }
+
+    /// `rename` replaces the directory entry itself rather than following
+    /// it, so writing over a path that is currently a symlink must replace
+    /// the link with a regular file -- never dereference it and write
+    /// through to wherever it pointed. Load-bearing for the memory shared
+    /// scope: a repo could otherwise commit `.zirv/memory/some-key.md` as a
+    /// symlink to an arbitrary file on the machine.
+    #[cfg(unix)]
+    #[test]
+    fn write_shared_replaces_a_symlinked_target_rather_than_writing_through_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "secret").expect("write outside");
+        let linked = tmp.path().join("linked.md");
+        std::os::unix::fs::symlink(&outside, &linked).expect("symlink");
+
+        write_shared(&linked, "new content").expect("write over symlink");
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside"),
+            "secret",
+            "the symlink target must never be written through"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&linked)
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&linked).expect("read linked"),
+            "new content"
+        );
     }
 
     #[test]

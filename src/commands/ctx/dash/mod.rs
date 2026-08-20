@@ -2848,6 +2848,10 @@ fn apply_memory_effect(
                 verified: now,
                 source: "explicit".to_string(),
                 body,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
             };
             if let Err(e) = memory::remember(state, &slug, &entry, cfg) {
                 push_error(errors, format!("memory remember: {e}"));
@@ -6795,6 +6799,10 @@ mod tests {
                 verified: now,
                 source: "explicit".to_string(),
                 body: "cargo build".to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
             },
             &cfg,
         )
