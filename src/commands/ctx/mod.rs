@@ -6,6 +6,7 @@ pub mod announce;
 pub mod chat;
 pub mod chrome;
 pub mod config;
+pub mod context;
 pub mod dash;
 pub mod event;
 pub mod exec;

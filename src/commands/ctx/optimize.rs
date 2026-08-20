@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use super::context;
 use super::surface;
 
 /// Deep enough for a workspace's crate directories, shallow enough that a
@@ -34,6 +35,15 @@ pub enum Layer {
     /// JSON -- see `redact_settings_strings`.
     CodexUserSettings,
     CodexProjectSettings,
+    /// The canonical, repo-owned `.zirv/context/` layer (issue #41): one
+    /// place project instructions live once for every Zirv-launched
+    /// harness, with optional harness-specific additions layered on top.
+    /// See `super::context` for the precedence rules between these three
+    /// and the native instruction files above, and for the context-vs-memory
+    /// distinction this layer is not a substitute for.
+    ContextCommon,
+    ContextClaude,
+    ContextCodex,
 }
 
 impl Layer {
@@ -50,6 +60,9 @@ impl Layer {
             Layer::NestedAgentsMd => "nested AGENTS.md",
             Layer::CodexUserSettings => "user config.toml",
             Layer::CodexProjectSettings => "project config.toml",
+            Layer::ContextCommon => "zirv context common.md",
+            Layer::ContextClaude => "zirv context claude.md",
+            Layer::ContextCodex => "zirv context codex.md",
         }
     }
 
@@ -57,13 +70,21 @@ impl Layer {
     /// `lint_dead_references`'s hook-command check (Claude-only: Codex's
     /// `config.toml` has no equivalent JSON hook schema this lint knows how
     /// to parse) and by `context_surface()` below.
+    ///
+    /// `ContextCommon` names `Provider::Zirv`: it is zirv's own canonical
+    /// layer, meant for every harness alike, not authored by or specific to
+    /// one of them (see `super::context`'s module doc). `ContextClaude`
+    /// names the harness it targets explicitly; `ContextCodex` falls
+    /// through the wildcard arm below like every other Codex-provider layer.
     pub fn provider(&self) -> surface::Provider {
         match self {
             Layer::GlobalAgentsMd
             | Layer::RepoAgentsMd
             | Layer::NestedAgentsMd
             | Layer::CodexUserSettings
-            | Layer::CodexProjectSettings => surface::Provider::Codex,
+            | Layer::CodexProjectSettings
+            | Layer::ContextCodex => surface::Provider::Codex,
+            Layer::ContextCommon => surface::Provider::Zirv,
             _ => surface::Provider::Claude,
         }
     }
@@ -75,7 +96,10 @@ impl Layer {
             | Layer::NestedClaudeMd
             | Layer::GlobalAgentsMd
             | Layer::RepoAgentsMd
-            | Layer::NestedAgentsMd => surface::Kind::Instructions,
+            | Layer::NestedAgentsMd
+            | Layer::ContextCommon
+            | Layer::ContextClaude
+            | Layer::ContextCodex => surface::Kind::Instructions,
             Layer::UserSettings
             | Layer::ProjectSettings
             | Layer::LocalSettings
@@ -93,7 +117,10 @@ impl Layer {
             Layer::RepoClaudeMd
             | Layer::ProjectSettings
             | Layer::RepoAgentsMd
-            | Layer::CodexProjectSettings => surface::Scope::Repo,
+            | Layer::CodexProjectSettings
+            | Layer::ContextCommon
+            | Layer::ContextClaude
+            | Layer::ContextCodex => surface::Scope::Repo,
             Layer::NestedClaudeMd | Layer::NestedAgentsMd => surface::Scope::Nested,
             Layer::LocalSettings => surface::Scope::LocalPrivate,
         }
@@ -292,6 +319,28 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
         &mut surfaces,
         Layer::RepoAgentsMd,
         repo.join("AGENTS.md"),
+        max_bytes,
+    );
+
+    // Issue #41: zirv's own canonical instruction layer. Repo-owned and
+    // entirely optional in every part, read the same capped/absent-is-fine
+    // way as every other fixed-path surface above.
+    push_surface(
+        &mut surfaces,
+        Layer::ContextCommon,
+        context::common_path(repo),
+        max_bytes,
+    );
+    push_surface(
+        &mut surfaces,
+        Layer::ContextClaude,
+        context::claude_path(repo),
+        max_bytes,
+    );
+    push_surface(
+        &mut surfaces,
+        Layer::ContextCodex,
+        context::codex_path(repo),
         max_bytes,
     );
 
@@ -2039,6 +2088,7 @@ mod tests {
     #[test]
     fn settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap() {
         let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
         for i in 0..MAX_SURFACES + 10 {
             let dir = repo.join(format!("crates/gen{i}"));
             std::fs::create_dir_all(&dir).expect("mkdir");
@@ -2056,6 +2106,8 @@ mod tests {
         assert!(labels.contains(&"user settings.json"), "{labels:?}");
         assert!(labels.contains(&"project settings.json"), "{labels:?}");
         assert!(labels.contains(&"local settings.json"), "{labels:?}");
+        assert!(labels.contains(&"user config.toml"), "{labels:?}");
+        assert!(labels.contains(&"project config.toml"), "{labels:?}");
     }
 
     /// Adds every Codex-flavored surface `fixture_tree`'s Claude-only tree is
@@ -2147,6 +2199,96 @@ mod tests {
         // add_codex_surfaces: global + repo + nested AGENTS.md, 2 config.toml.
         assert_eq!(codex_count, 5, "{surfaces:#?}");
         assert_eq!(surfaces.len(), claude_count + codex_count);
+    }
+
+    /// Issue #41: the canonical `.zirv/context/` layer is optional in every
+    /// part -- a repo with none of the three files analyses to nothing extra,
+    /// exactly like a repo with no CLAUDE.md today.
+    #[test]
+    fn zirv_context_files_are_absent_when_the_directory_does_not_exist() {
+        let (_tmp, home, repo) = fixture_tree();
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert!(
+            surfaces.iter().all(|s| !matches!(
+                s.layer,
+                Layer::ContextCommon | Layer::ContextClaude | Layer::ContextCodex
+            )),
+            "{surfaces:#?}"
+        );
+    }
+
+    #[test]
+    fn zirv_context_files_are_collected_when_present() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::create_dir_all(repo.join(".zirv/context")).expect("mkdir");
+        std::fs::write(
+            repo.join(".zirv/context/common.md"),
+            "# common\n- write tests first\n",
+        )
+        .expect("write common.md");
+        std::fs::write(
+            repo.join(".zirv/context/claude.md"),
+            "# claude\n- prefer the Task tool for subagents\n",
+        )
+        .expect("write claude.md");
+        std::fs::write(
+            repo.join(".zirv/context/codex.md"),
+            "# codex\n- use apply_patch for edits\n",
+        )
+        .expect("write codex.md");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+
+        let common = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::ContextCommon)
+            .expect("common.md collected");
+        assert!(common.text.contains("write tests first"));
+
+        let claude = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::ContextClaude)
+            .expect("claude.md collected");
+        assert!(claude.text.contains("Task tool"));
+
+        let codex = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::ContextCodex)
+            .expect("codex.md collected");
+        assert!(codex.text.contains("apply_patch"));
+    }
+
+    /// Provenance survives into the same redundancy lint every other
+    /// instruction surface goes through: a rule stated once in the canonical
+    /// common layer and restated in a native CLAUDE.md is flagged with both
+    /// paths as evidence, the same way two native surfaces would be.
+    #[test]
+    fn a_rule_duplicated_between_canonical_common_and_a_native_claude_md_is_flagged() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::create_dir_all(repo.join(".zirv/context")).expect("mkdir");
+        std::fs::write(
+            repo.join(".zirv/context/common.md"),
+            "# common\n- always run tests\n",
+        )
+        .expect("write");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let findings = lint_redundancy(&surfaces, &repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|e| e.contains(".zirv/context/common.md")),
+            "{finding:?}"
+        );
+        assert!(
+            finding.evidence.iter().any(|e| e.contains("CLAUDE.md")),
+            "{finding:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -2266,6 +2408,9 @@ mod tests {
         assert!(Layer::NestedClaudeMd.is_repo_owned());
         assert!(Layer::ProjectSettings.is_repo_owned());
         assert!(Layer::LocalSettings.is_repo_owned());
+        assert!(Layer::ContextCommon.is_repo_owned());
+        assert!(Layer::ContextClaude.is_repo_owned());
+        assert!(Layer::ContextCodex.is_repo_owned());
     }
 
     /// Every layer maps onto the generic surface vocabulary (`surface::`),
@@ -2286,6 +2431,9 @@ mod tests {
             Layer::NestedAgentsMd,
             Layer::CodexUserSettings,
             Layer::CodexProjectSettings,
+            Layer::ContextCommon,
+            Layer::ContextClaude,
+            Layer::ContextCodex,
         ];
         for layer in layers {
             assert_eq!(layer.is_repo_owned(), layer.scope().is_repo_owned());
@@ -2342,12 +2490,35 @@ mod tests {
             Layer::RepoAgentsMd,
             Layer::NestedAgentsMd,
             Layer::CodexProjectSettings,
+            Layer::ContextCommon,
+            Layer::ContextClaude,
+            Layer::ContextCodex,
         ] {
             assert_eq!(
                 layer.trust(),
                 surface::Trust::RepoUntrusted,
                 "{layer:?} is inside the repo checkout and must never be operator-trusted"
             );
+        }
+    }
+
+    /// Issue #41: naming choice for the canonical layer's providers.
+    /// `ContextCommon` targets every harness alike, so it names
+    /// `Provider::Zirv` (zirv's own layer, not one harness's); the
+    /// harness-specific additions name the harness they are written for.
+    #[test]
+    fn zirv_context_layers_have_the_expected_provider_kind_and_scope() {
+        assert_eq!(Layer::ContextCommon.provider(), surface::Provider::Zirv);
+        assert_eq!(Layer::ContextClaude.provider(), surface::Provider::Claude);
+        assert_eq!(Layer::ContextCodex.provider(), surface::Provider::Codex);
+        for layer in [
+            Layer::ContextCommon,
+            Layer::ContextClaude,
+            Layer::ContextCodex,
+        ] {
+            assert_eq!(layer.kind(), surface::Kind::Instructions);
+            assert_eq!(layer.scope(), surface::Scope::Repo);
+            assert!(!layer.is_settings());
         }
     }
 
