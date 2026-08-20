@@ -29,20 +29,15 @@ pub enum FindingSeverity {
     Critical,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum FindingDisposition {
+    #[default]
     Open,
     Accepted,
     Dismissed,
     Fixed,
     Residual,
-}
-
-impl Default for FindingDisposition {
-    fn default() -> Self {
-        Self::Open
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

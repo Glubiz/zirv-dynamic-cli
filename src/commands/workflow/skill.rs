@@ -421,6 +421,7 @@ fn load_dir(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the small, fixed SkillManifest schema at call sites.
 fn manifest(
     id: &str,
     name: &str,

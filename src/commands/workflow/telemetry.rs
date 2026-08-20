@@ -142,10 +142,11 @@ pub fn record(
         &mut event.adapter,
         &mut event.model,
         &mut event.role,
-    ] {
-        if let Some(value) = value {
-            *value = crate::utils::truncate_bytes(value.clone(), Some(MAX_LABEL_BYTES));
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *value = crate::utils::truncate_bytes(value.clone(), Some(MAX_LABEL_BYTES));
     }
     let body = serde_json::to_string(&event)?;
     if body.len() > MAX_EVENT_BYTES {
