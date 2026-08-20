@@ -8,6 +8,7 @@ last-verified: 2026-08-20
 > - `zirv ctx` exists because long-running AI-agent sessions rot: as the context window fills, instruction-following slips, tools get called in loops, hallucinations appear — and built-in auto-compaction fires only after degradation has already started.
 > - A pure, deterministic **rot engine** scores a normalized event stream and hands a verdict (`healthy`/`advise`/`compact`/`restart`) to one of three **supervisors** (`loop`, `exec`, `wrap`), which act on it — compacting, restarting with a distilled handoff, or leaving the session alone.
 > - **Usage pacing** keeps autonomous work from dying mid-run when a subscription usage window runs dry.
+> - `.zirv/context/` is the canonical instruction source for every Zirv-launched session; `zirv context sync` is the explicit, opt-in bridge to native `CLAUDE.md`/`AGENTS.md` for direct (non-zirv) launches.
 > - This page is the *why*; for the *how* see [[Ctx Subsystem]] (verb tree/dispatch), [[Rot Engine]] (scoring internals), [[Ctx Supervisors]] (loop/exec/wrap mechanics), [[Ctx Adapters]] (agent-specific plumbing), and [[Usage and Pacing]].
 
 > [!warning] If changed
@@ -66,6 +67,24 @@ Autonomous loops must not die mid-run because a subscription usage window (a rol
 Every session zirv starts (`wrap`, `exec`, `loop`, `resume`) gets a small injected system prompt so behavior is consistent run to run: a shipped default floor, optionally extended by a user layer and a repo layer. `--simple` skips all of it. The repo layer crosses a trust boundary worth its own page — see [[Untrusted Configuration]].
 
 **The context compiler (`compile.rs`, issue #44)** is what actually assembles that prompt for every one of the six session launch paths (`chat`'s dashboard orchestrator pane, `wrap`, `exec`, `loop`, the dashboard's own worker panes, and `resume`) — one deterministic call in place of six independent hand-rolled recipes. It wraps `prompt.rs`'s own layering (`compose`, mail, report-back, command-line merge, injection) rather than replacing it, and adds two things no launch path assembled before: the canonical `.zirv/context/{common,claude,codex}.md` layer (repo-owned, untrusted, ordered common-then-harness-specific by `context::PrecedenceTier` — see [[Untrusted Configuration]]) and zirv's own honest policy report (`policy::evaluate`, [[Ctx Subsystem]]'s "Canonical policy" section) as structured data alongside the composed text. Two things this deliberately keeps separate: the canonical layer's prose can steer a session but can never touch the policy report, and the policy report is never rendered as prose telling the model it is "sandboxed" — an adapter that cannot actually enforce a stance says so (`Support::Unsupported`), rather than the compiler inventing false reassurance. `resume` is the one path that calls `compile::compile_with_harness_roster` instead of `compile::compile` directly, to keep its pre-existing no-harness-roster behavior. See [[Ctx Subsystem]]'s "The Context Compiler" section for the mechanics.
+
+## Compatibility outside zirv: `zirv context sync`
+
+The canonical `.zirv/context/` layer only ever reaches a session through the compiler above — and the compiler only ever runs when zirv itself launches the session. Claude Code and Codex can both be started **directly**, bypassing zirv entirely, in which case the only instructions they ever see are their own native files: `CLAUDE.md` for Claude, `AGENTS.md` for Codex. Left alone, that's a real gap — canonical content a project spent effort authoring simply would not exist for a developer (or another tool) that launches the harness natively.
+
+`zirv context sync` (a **top-level command family**, `zirv context <verb>`, not a `zirv ctx` verb — see [[Ctx Subsystem]]'s own section on it) is the explicit, opt-in bridge, issue #45 ("Context 7/8"). It never runs implicitly — no autogeneration at launch, no side effect on `compile::compile` — and offers three separately-named modes rather than one command that tries to guess what the user wants:
+
+- **Report** (the default) inspects both sides and prints what's there and where they disagree, reusing `drift.rs`'s existing duplicate/contradiction/precedence-shadowing analysis rather than a second comparison engine. Read-only.
+- **Import** brings a hand-maintained native file's content into canonical `.zirv/context/`, for a project that already has a `CLAUDE.md`/`AGENTS.md` and wants to make it the seed of its canonical layer instead of starting over.
+- **Generate** renders canonical content back out into native `CLAUDE.md`/`AGENTS.md`, for a project that wants direct-launch compatibility once canonical content exists.
+
+The one safety property that matters most: **generation must never silently destroy a hand-maintained native file.** Every file `zirv context sync --generate` writes carries a stable, deterministic marker as its first line; a native file that exists without that marker is refused, not overwritten, and only an explicit `--force` lifts the refusal — the same "an explicit human choice, never a default" posture the rest of this project takes toward anything destructive. Generation is otherwise pure and idempotent: the same canonical content always renders the same bytes, so regenerating with nothing changed writes nothing.
+
+Content routing follows the same common/harness-specific split the canonical layer itself already has: common content reaches both generated files, but a Claude-specific canonical addition can only ever land in the generated `CLAUDE.md`, and a Codex-specific one only in the generated `AGENTS.md` — there is no code path for one to leak into the other's output.
+
+**A generated file is prose, nothing else.** It never states or implies a permission, sandbox, or enforcement claim, and never serializes `policy::EffectivePolicy`/`Support` state — the moment a harness is launched outside zirv, there is no zirv process left to enforce anything it might have claimed. This is the same "Markdown instructions are advisory context, never enforcement" line `policy.rs` draws for the canonical layer's own injected prose, extended to what compatibility mode writes to disk.
+
+See [[Ctx Subsystem]]'s "`zirv context sync`" section for the exact flags, the managed-marker mechanics, and file references.
 
 ## zirv as a meta-harness: chat, delegation, and a mailbox
 

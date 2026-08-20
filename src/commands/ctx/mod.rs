@@ -8,6 +8,7 @@ pub mod chrome;
 pub mod compile;
 pub mod config;
 pub mod context;
+pub mod context_cli;
 pub mod dash;
 pub mod drift;
 pub mod event;

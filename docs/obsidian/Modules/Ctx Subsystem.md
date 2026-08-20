@@ -267,6 +267,8 @@ Two more modules round out the coordination surface: a live registry of every su
 
 Issue #37 adds opt-in durable harvesting at clean-session and distilled-handoff boundaries. The shared-bank write is capped, rejects temporary/task narration, preserves explicit entries, and never invokes git. Issue #38 adds lifecycle-aware retrieval plus `zirv memory optimize`: stale entries are down-ranked, archived entries require explicit recall, and optimization reports evidence before any bounded consolidation is allowed.
 
+Issue #45 adds the sibling top-level `zirv context sync` family in `src/commands/ctx/context_cli.rs`. It reports native/canonical drift without writing by default, imports native files only under an explicit mode, and generates managed compatibility files without overwriting unmanaged content unless forced.
+
 - [[Ctx Supervisors]] — `run_loop`/`exec`/`wrap` process supervision, plus `signal`/`supervise`/`term` primitives
 - [[Ctx Adapters]] — the `AgentAdapter` trait and the claude/codex implementations these verbs dispatch through
 - [[Rot Engine]] — `event.rs`/`rot.rs` scoring internals that `score` and `hook Stop` call into
