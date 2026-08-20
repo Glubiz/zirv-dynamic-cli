@@ -127,7 +127,11 @@ fn temp_sibling(target: &Path) -> PathBuf {
 /// hardening; `write_shared` leaves it off, since that content lives in a
 /// normal repository checkout and should get ordinary, umask-respecting
 /// permissions like any other file zirv writes into a checkout, not the
-/// machine-local-secret treatment state-dir content gets.
+/// machine-local-secret treatment state-dir content gets. Unix-only in
+/// effect: the permission bits it gates don't exist on Windows, so the
+/// parameter is genuinely unused on that target, not merely unread by
+/// omission.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn write_atomic(path: &Path, contents: &str, force_owner_only: bool) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -560,15 +564,47 @@ mod tests {
     /// `write_shared` gets the same atomic temp-sibling-then-`rename`
     /// guarantee as `write_private` -- required for the memory shared
     /// scope's key-addressed files, where a concurrent reader/writer race on
-    /// the very same path is the expected case, not an edge case.
+    /// the very same path is the expected case, not an edge case. Same
+    /// pattern as `concurrent_reads_of_a_rewritten_file_never_see_a_partial_
+    /// write` above, using `write_shared` instead of `write_private`: a
+    /// sequential write-then-read only proves two full writes each
+    /// round-trip, not that a reader racing a rewrite never sees a partial
+    /// one.
     #[test]
-    fn write_shared_is_atomic_via_temp_sibling_and_rename() {
+    fn concurrent_reads_of_a_rewritten_shared_file_never_see_a_partial_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("shared-entry.md");
-        write_shared(&path, "first").expect("write");
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), "first");
-        write_shared(&path, "second").expect("rewrite");
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), "second");
+        let a = "A".repeat(64 * 1024);
+        let b = "B".repeat(64 * 1024);
+        let (a_len, b_len) = (a.len(), b.len());
+        write_shared(&path, &a).expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            while !reader_stop.load(Ordering::Relaxed) {
+                if let Ok(contents) = std::fs::read_to_string(&reader_path) {
+                    assert!(
+                        contents.len() == a_len || contents.len() == b_len,
+                        "a reader must never observe a partial/empty shared file: saw {} bytes",
+                        contents.len()
+                    );
+                }
+            }
+        });
+
+        for i in 0..1000 {
+            let contents = if i % 2 == 0 { &a } else { &b };
+            write_shared(&path, contents).expect("write");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader
+            .join()
+            .expect("reader thread panicked on a partial read");
     }
 
     /// Unlike `write_private`, `write_shared` must not force 0600: it writes
