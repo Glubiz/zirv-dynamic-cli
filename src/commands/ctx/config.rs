@@ -6,6 +6,9 @@ use super::CtxResult;
 
 pub const DEFAULT_MARKER: &str = "[zirv]";
 pub const CTX_CONFIG_FILE: &str = "ctx.toml";
+/// The one `ctx.toml` table `CtxConfig` never deep-merges -- see the `policy`
+/// field's own doc and `super::policy`'s module doc.
+const POLICY_SECTION: &str = "policy";
 
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
@@ -534,6 +537,15 @@ pub struct CtxConfig {
     /// distinct.
     #[serde(skip)]
     pub agents: crate::settings::AgentGate,
+    /// zirv's canonical permissions policy, from `ctx.toml`'s `[policy]`
+    /// table. `skip`ped for the same reason `agents` is: it does **not** go
+    /// through this type's deep merge. `[policy]` is lifted out of each layer
+    /// before the merge and folded asymmetrically by `policy::resolve`
+    /// instead, so a repo checkout can only ever ratchet a stance stricter --
+    /// see that function and `policy`'s module doc for why `REPO_FORBIDDEN`
+    /// (all-or-nothing per key) cannot express "may narrow, never widen".
+    #[serde(skip)]
+    pub policy: super::policy::EffectivePolicy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1044,6 +1056,13 @@ impl CtxConfig {
                 &mut merged,
             )?;
         }
+        // `[policy]` is lifted out of every layer before the deep merge: a
+        // merge would let the repo layer's stance simply replace the
+        // operator's, which is the one thing a permissions surface must never
+        // allow. `policy::resolve` folds the same three layers with `max`
+        // instead, so the repo half can only narrow.
+        let home_policy = merged.remove(POLICY_SECTION);
+
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
         let repo_path = repo
@@ -1051,7 +1070,10 @@ impl CtxConfig {
             .join(CTX_CONFIG_FILE);
         let mut repo_layer = toml::Table::new();
         read_layer(&repo_path, &mut repo_layer)?;
+        // Before the lift, so a future `policy.*` entry in `REPO_FORBIDDEN`
+        // still gets its loud rejection rather than being quietly folded.
         reject_untrusted_keys(&repo_layer, &repo_path)?;
+        let repo_policy = repo_layer.remove(POLICY_SECTION);
         merge(&mut merged, repo_layer);
 
         for (var, path, kind) in ENV_MAP {
@@ -1114,6 +1136,7 @@ impl CtxConfig {
         }
 
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
+        cfg.policy = super::policy::resolve(home_policy, repo_policy, env)?;
         Ok(cfg)
     }
 }
@@ -2484,6 +2507,13 @@ mod tests {
         ("dash", "max_panes"),
         ("dash", "mouse"),
         ("dash", "idle_quiet_ms"),
+        ("policy", "repo_fs_write"),
+        ("policy", "outside_repo_fs_write"),
+        ("policy", "shell_exec"),
+        ("policy", "network"),
+        ("policy", "approval"),
+        ("policy", "git_push_destructive"),
+        ("policy", "tool_access"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like
@@ -2606,5 +2636,144 @@ mod tests {
 
         assert!(gate.is_enabled("claude"));
         assert!(gate.is_enabled("codex"));
+    }
+
+    #[test]
+    fn a_config_with_no_policy_table_declares_no_restriction() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.policy, super::super::policy::EffectivePolicy::default());
+    }
+
+    #[test]
+    fn the_operator_may_set_policy_stances_from_home_config_and_env() {
+        use super::super::policy::Stance;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"ask\"\nnetwork = \"deny\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.policy.shell_exec, Stance::Ask);
+        assert_eq!(cfg.policy.network, Stance::Deny);
+        assert_eq!(cfg.policy.repo_fs_write, Stance::Allow);
+
+        let env = env_map(&[("ZIRV_CTX_POLICY_SHELL_EXEC", "deny")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.policy.shell_exec, Stance::Deny);
+        assert_eq!(
+            cfg.policy.network,
+            Stance::Deny,
+            "the home layer still applies under the env layer"
+        );
+    }
+
+    /// SECURITY: the cloned-repository privilege-widening case, end to end
+    /// through `CtxConfig::load` rather than through `policy::resolve` alone.
+    /// `[policy]` is the one table a repo checkout may write to at all, so the
+    /// clamp is what stands in for a `REPO_FORBIDDEN` entry here -- see the
+    /// `policy` field's own doc comment.
+    #[test]
+    fn a_repo_policy_table_cannot_widen_the_operators_own_stances() {
+        use super::super::policy::Stance;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"deny\"\nnetwork = \"deny\"\napproval = \"ask\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"allow\"\nnetwork = \"ask\"\napproval = \"allow\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.policy.shell_exec, Stance::Deny);
+        assert_eq!(cfg.policy.network, Stance::Deny);
+        assert_eq!(cfg.policy.approval, Stance::Ask);
+    }
+
+    /// The other direction: narrowing from a checkout is honored, because a
+    /// stricter stance can never be a privilege escalation.
+    #[test]
+    fn a_repo_policy_table_may_narrow_a_stance_the_operator_left_loose() {
+        use super::super::policy::Stance;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[policy]\ngit_push_destructive = \"deny\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.policy.git_push_destructive, Stance::Deny);
+    }
+
+    /// The operator's escape hatch above the fold: a repo that narrowed a
+    /// stance the operator needs loose is overridable by environment, exactly
+    /// like `ZIRV_AGENT_<NAME>_ENABLED` re-enables a repo-disabled agent.
+    #[test]
+    fn the_environment_can_loosen_a_stance_a_repo_narrowed() {
+        use super::super::policy::Stance;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"deny\"\n",
+        )
+        .expect("write");
+
+        let env = env_map(&[("ZIRV_CTX_POLICY_SHELL_EXEC", "allow")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.policy.shell_exec, Stance::Allow);
+    }
+
+    /// A malformed `[policy]` table fails the load loudly rather than
+    /// defaulting the whole section to `allow` -- the same "loud rather than
+    /// silent" rule `reject_untrusted_keys` follows, applied to a section
+    /// where a silent default is a permission grant.
+    #[test]
+    fn a_malformed_repo_policy_table_fails_the_load() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"nope\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        assert!(CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).is_err());
     }
 }

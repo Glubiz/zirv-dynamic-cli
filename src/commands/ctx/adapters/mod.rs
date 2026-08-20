@@ -407,6 +407,39 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn compact_command(&self) -> Option<&'static str>;
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
+
+    /// What this harness can actually deliver for one of zirv's own policy
+    /// capabilities at one requested stance -- the per-adapter half of
+    /// `policy::evaluate`, which is the only caller.
+    ///
+    /// Answer with a `CapabilityDescriptor` naming the **verified per-run
+    /// mechanism** this adapter would pin on the launch, or with
+    /// `CapabilityDescriptor::advisory_only()` -- the default -- when there is
+    /// none. That default is the same "no verified mechanism" shape every
+    /// other optional method on this trait uses, and here it carries the
+    /// load-bearing honesty rule: prompt text asking a session to respect a
+    /// stance is advisory context, never enforcement, so a harness with only
+    /// that to offer must report `Support::Unsupported` rather than claim a
+    /// guarantee zirv cannot keep.
+    ///
+    /// `stance` is never `Stance::Allow`: `policy::evaluate` answers that case
+    /// itself (zirv is imposing nothing, so there is no mechanism to name), so
+    /// an implementation may leave it to a catch-all arm.
+    ///
+    /// `allow(dead_code)` for the same reason `model_args` below carries one:
+    /// the only caller, `policy::evaluate`, has no production caller of its own
+    /// until issues #44/#46 wire it in. Both adapters override it already, and
+    /// `policy.rs`'s own tests exercise every arm.
+    #[allow(dead_code)]
+    fn policy_support(
+        &self,
+        capability: super::policy::Capability,
+        stance: super::policy::Stance,
+    ) -> super::policy::CapabilityDescriptor {
+        let _ = (capability, stance);
+        super::policy::CapabilityDescriptor::advisory_only()
+    }
+
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup;
 
     /// Argv tokens that select `model` for one interactive launch (the

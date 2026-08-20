@@ -655,6 +655,59 @@ impl AgentAdapter for ClaudeAdapter {
         Some("haiku")
     }
 
+    /// Claude's one verified per-run enforcement mechanism is the same
+    /// `--disallowedTools=...` pin `distiller_cmd` above already relies on,
+    /// probed against the real CLI (docs/superpowers/notes/2026-08-01-system-
+    /// prompt-injection-facts.md). It names *tools*, so it answers exactly the
+    /// capabilities that are tools -- writes, shell, tool access, and by
+    /// extension "attempt nothing needing approval", which is what denying all
+    /// four amounts to.
+    ///
+    /// It answers nothing else, and this method says so rather than rounding
+    /// up. In particular:
+    ///
+    /// - **Network** has no verified per-run flag at all.
+    /// - **git push / destructive git** is reachable only through `Bash`, so
+    ///   the only pin available denies *every* shell command, not git's --
+    ///   over-broad enforcement that would break an ordinary session while
+    ///   claiming to implement a git policy. Reported unsupported rather than
+    ///   degraded so Task 14 cannot read this as "pin `--disallowedTools`".
+    /// - **Writes outside the repo** are the same shape: no verified flag
+    ///   scopes writes by path, and the available pin denies writes
+    ///   everywhere, in-repo included.
+    ///
+    /// No stance reports as `Enforced` at `Ask`: `--permission-mode plan` was
+    /// probed and does not resolve in headless `-p` mode, and claude's
+    /// interactive ask-by-default comes from the operator's own settings, not
+    /// from anything zirv pins.
+    fn policy_support(
+        &self,
+        capability: crate::commands::ctx::policy::Capability,
+        stance: crate::commands::ctx::policy::Stance,
+    ) -> crate::commands::ctx::policy::CapabilityDescriptor {
+        use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
+
+        const TOOL_PIN: &str = "--disallowedTools=Write,Edit,Bash,NotebookEdit";
+        const SETTINGS: &str = "claude's own permission prompts and `.claude/settings.json` permissions, which zirv \
+             reads and never rewrites";
+
+        match capability {
+            Capability::RepoFsWrite
+            | Capability::ShellExec
+            | Capability::ToolAccess
+            | Capability::Approval => match stance {
+                Stance::Deny => CapabilityDescriptor::enforced(TOOL_PIN),
+                Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
+            },
+            // Network, git push/destructive git, and path-scoped writes --
+            // see this method's own doc for why each is advisory rather than
+            // carried by the pin above.
+            Capability::Network
+            | Capability::GitPushDestructive
+            | Capability::OutsideRepoFsWrite => CapabilityDescriptor::advisory_only(),
+        }
+    }
+
     /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
     /// own spawn-request pane variant) used to silently inherit whatever the
     /// operator's own interactive default model happened to be -- often a

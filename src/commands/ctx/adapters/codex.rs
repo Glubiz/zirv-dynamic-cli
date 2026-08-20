@@ -287,6 +287,61 @@ impl AgentAdapter for CodexAdapter {
         }
     }
 
+    /// Codex's descriptors come from the repo's **recorded** facts
+    /// (docs/superpowers/notes/2026-07-31-codex-cli-facts.md, and the
+    /// `distiller_cmd` notes above), not from a live CLI: codex is not
+    /// runnable on the machine this was written on, so anything not in those
+    /// notes is reported unsupported rather than guessed at.
+    ///
+    /// `-s, --sandbox <read-only|workspace-write|danger-full-access>` is the
+    /// one verified enforcement flag. It never reports `Enforced`, because the
+    /// repo's own recorded reading of it (see `docs/obsidian/Concepts/
+    /// Untrusted Configuration.md`) is that it scopes what a codex-*executed
+    /// shell command* may touch, not which of codex's own tools may run --
+    /// close to several of these capabilities, exactly equal to none of them.
+    /// So writes and shell execution are `Degraded`, and:
+    ///
+    /// - **Network** and **MCP/tool access** have no verified per-run flag.
+    ///   `--disable <FEATURE>` is a feature-flag switch, not a tool deny-list.
+    /// - **git push / destructive git** has none either, same as claude.
+    /// - **Approval** is codex's own `approval` setting, read from
+    ///   `~/.codex/config.toml` (it appears in `codex exec`'s stdout preamble
+    ///   as `approval: never`). zirv reads that file and never rewrites it, so
+    ///   an `Ask` stance is operator-controlled; the only approval-related
+    ///   flag verified on the CLI, `--dangerously-bypass-approvals-and-
+    ///   sandbox`, only ever *widens* and is therefore never used here.
+    fn policy_support(
+        &self,
+        capability: crate::commands::ctx::policy::Capability,
+        stance: crate::commands::ctx::policy::Stance,
+    ) -> crate::commands::ctx::policy::CapabilityDescriptor {
+        use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
+
+        const SANDBOX: &str = "--sandbox read-only, which scopes what an executed shell command may touch rather \
+             than which of codex's own tools may run (recorded facts only -- not verified against \
+             a live codex CLI)";
+        const WORKSPACE: &str = "--sandbox workspace-write, which keeps writes inside the workspace (documented, not \
+             verified against a live codex CLI)";
+        const CONFIG: &str = "codex's own `approval` setting in ~/.codex/config.toml, which zirv reads and never \
+             rewrites";
+
+        match (capability, stance) {
+            (
+                Capability::RepoFsWrite | Capability::ShellExec | Capability::Approval,
+                Stance::Deny,
+            ) => CapabilityDescriptor::degraded(SANDBOX),
+            (Capability::OutsideRepoFsWrite, Stance::Deny) => {
+                CapabilityDescriptor::degraded(WORKSPACE)
+            }
+            (Capability::ShellExec | Capability::Approval, Stance::Ask) => {
+                CapabilityDescriptor::operator_controlled(CONFIG)
+            }
+            // Network, MCP/tool access, git operations, and every `Ask` stance
+            // codex has no verified mechanism for -- see this method's own doc.
+            _ => CapabilityDescriptor::advisory_only(),
+        }
+    }
+
     fn launch_prefix_len(&self) -> usize {
         1 + self.bin_args.len()
     }

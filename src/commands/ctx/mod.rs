@@ -16,6 +16,7 @@ pub mod mail;
 pub mod memory;
 pub mod optimize;
 pub mod pace;
+pub mod policy;
 pub mod poll;
 pub mod prompt;
 pub mod resume;
