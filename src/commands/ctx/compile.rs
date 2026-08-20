@@ -12,16 +12,19 @@
 //! about, attaching the honest policy report (`policy::evaluate`), and
 //! recording structured provenance for what it read.
 //!
-//! Every one of the five Zirv session launch paths (`chat`'s dashboard
-//! orchestrator pane, `wrap`, `exec`, `loop`, and the dashboard's own worker
-//! panes) calls [`compile`] once in place of calling `prompt::compose`
-//! directly, then continues through its own existing mail/report-back/merge/
-//! injection sequence exactly as before, now operating on
-//! [`CompiledContext::composed`] instead of a freshly composed prompt. Each
-//! path's own recompose semantics (wrap: once per launch; exec: once, plus a
-//! second `compile` call on a nudge relaunch; loop: once per cycle; the
-//! dashboard worker pane: once per spawn) are unchanged -- see each call
-//! site's own comment for why.
+//! Every one of the six Zirv session launch paths (`chat`'s dashboard
+//! orchestrator pane, `wrap`, `exec`, `loop`, the dashboard's own worker
+//! panes, and `resume`) calls [`compile`] (five of them) or
+//! [`compile_with_harness_roster`] (`resume`, which needs one knob `compile`
+//! does not expose -- see that function's own doc comment) once in place of
+//! calling `prompt::compose` directly, then continues through its own
+//! existing mail/report-back/merge/injection sequence exactly as before, now
+//! operating on [`CompiledContext::composed`] instead of a freshly composed
+//! prompt. Each path's own recompose semantics (wrap: once per launch; exec:
+//! once, plus a second `compile` call on a nudge relaunch; loop: once per
+//! cycle; the dashboard worker pane: once per spawn; resume: once, since a
+//! resumed session hands the terminal over and never restarts itself) are
+//! unchanged -- see each call site's own comment for why.
 //!
 //! **Determinism.** Like `rot.rs`, this module reads no clock and no
 //! environment variable, and never iterates a `HashMap` into output order:
@@ -82,7 +85,7 @@ pub struct ContextProvenance {
 /// context surfaces this compile actually read.
 ///
 /// `policy`/`provenance` have no production reader yet: `composed` is what
-/// every one of the five launch paths needs today (issue #44, this module).
+/// every one of the six launch paths needs today (issue #44, this module).
 /// Rendering the other two is issue #46 ("Context 7/8")'s own job -- the
 /// same split `policy.rs`'s own module doc describes for `evaluate`/
 /// `PolicyReport` itself. Exercised by this module's own tests in the
@@ -300,15 +303,24 @@ fn with_canonical_context_layer(
 /// adds the canonical `.zirv/context/` layer on top of it, and attaches the
 /// honest policy report for `adapter` (`policy::evaluate`).
 ///
-/// Every one of the five Zirv session launch paths calls this once in place
-/// of calling `prompt::compose` directly, then continues through its own
+/// Five of the six Zirv session launch paths call this once in place of
+/// calling `prompt::compose` directly, then continue through their own
 /// existing mail/report-back/merge/injection sequence unchanged, operating
-/// on `CompiledContext::composed`.
+/// on `CompiledContext::composed`. The sixth, `resume`, calls
+/// [`compile_with_harness_roster`] instead -- see that function's own doc
+/// comment for why.
 ///
 /// `now` is a plain `u64` the caller supplies (`state::now_secs()`, or a
 /// verb's own injected `now_fn()` for testability, e.g. `run_loop.rs`'s
 /// pacing loop) -- this function itself reads no clock, the same discipline
 /// `memory::render_for_prompt` already holds `prompt.rs` to.
+///
+/// Thin wrapper over [`compile_with_harness_roster`]: only an Orchestrator
+/// session hears about other harnesses at all (see
+/// `prompt::PromptSource::Harnesses`), mirroring every pre-issue-#44 call
+/// site's own `if role == Orchestrator { .. } else { Vec::new() }` gate, so
+/// `role == PromptRole::Orchestrator` is exactly the roster decision every
+/// caller but `resume` wants.
 #[allow(clippy::too_many_arguments)]
 pub fn compile(
     home: Option<&Path>,
@@ -320,13 +332,50 @@ pub fn compile(
     state: &StateDir,
     now: u64,
 ) -> CompiledContext {
+    compile_with_harness_roster(
+        home,
+        repo,
+        simple,
+        cfg,
+        adapter,
+        role,
+        state,
+        now,
+        role == PromptRole::Orchestrator,
+    )
+}
+
+/// As [`compile`], but with the derived-harness-roster decision passed in
+/// explicitly (`include_harness_roster`) instead of derived from `role`.
+///
+/// `resume` is the one launch path that needs this: it composes as
+/// `PromptRole::Orchestrator` (the operator's own `system-prompt.md` and the
+/// adapter's orchestrator layer -- never `PromptRole::Worker`, which would
+/// silently coach an operator's own interactive session as a delegated
+/// worker; see `resume::compose_prompt`'s own doc comment), but has never
+/// composed a harness roster: a resumed session is picking up one specific
+/// piece of handoff work, not opening a fresh orchestrator seat that might
+/// go spawn other harnesses. `compile`'s own `role == Orchestrator` shortcut
+/// would hand it a roster it has never shown before, so `resume` calls this
+/// function directly with `include_harness_roster: false` instead -- the
+/// smallest knob that lets it share `compile`'s memory-gathering and
+/// canonical `.zirv/context/` layer with every other launch path while
+/// keeping that one piece of pre-existing behavior byte-for-byte unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_harness_roster(
+    home: Option<&Path>,
+    repo: &Path,
+    simple: bool,
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+    role: PromptRole,
+    state: &StateDir,
+    now: u64,
+    include_harness_roster: bool,
+) -> CompiledContext {
     let slug = super::state::repo_slug(repo);
     let (memory_entries, retrieved_memory) = gather_memory(state, repo, &slug, cfg, now);
-    // Only an Orchestrator session hears about other harnesses at all; see
-    // `prompt::PromptSource::Harnesses`. A Worker call site always resolves
-    // this to an empty roster, mirroring every existing call site's own
-    // `if role == Orchestrator { .. } else { Vec::new() }` gate.
-    let harness_lines = if role == PromptRole::Orchestrator {
+    let harness_lines = if include_harness_roster {
         super::adapters::harness_prompt_lines(cfg, adapter.name())
     } else {
         Vec::new()
