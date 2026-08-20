@@ -278,18 +278,14 @@ fn slug_key(key: &str) -> String {
 /// or overwrite-protection decisions (the way `write_harvested` trusts
 /// `Source == "explicit"` for the private scope today) must not treat any of
 /// them as trustworthy signal without its own independent check.
-// Consumed by the `zirv memory` CLI and injection work Task 3 onward builds
-// on top of this store; this task's own tests (plus the store functions
-// below, which are themselves not yet wired into any CLI verb -- that is
-// Task 3's job) are the only callers so far.
-#[allow(dead_code)]
+// Consumed by the `zirv memory` CLI (`memory_cli.rs`, issue #33) and any
+// later injection work built on top of this store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryScope {
     Shared,
     Private,
 }
 
-#[allow(dead_code)]
 impl MemoryScope {
     /// Whether this scope may be used at all. Each scope has its own
     /// independent gate under `cfg.memory`, both `REPO_FORBIDDEN`: `Private`
@@ -326,7 +322,6 @@ impl MemoryScope {
 /// is also the write path's traversal defense at the directory level;
 /// `upsert_shared`'s own `validate_shared_key` is the matching defense at the
 /// file-name level, since a shared entry's file name is its key.
-#[allow(dead_code)]
 fn safe_shared_dir(repo: &Path) -> Option<PathBuf> {
     let zirv_dir = repo.join(crate::utils::SCRIPT_DIR_NAME);
     let dir = zirv_dir.join("memory");
@@ -389,10 +384,9 @@ pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
 /// error -- the same "disabled/missing means nothing" contract `list` and
 /// `render_for_prompt` already follow.
 ///
-/// This is the one new read seam this task adds. It is not yet wired into
-/// any prompt or CLI verb: ranking, budgeting, a key-addressed write path,
-/// and a `zirv memory` surface for it are later tasks (see issue #31's
-/// non-goals).
+/// Consumed by the `zirv memory status`/`list`/`recall` verbs
+/// (`memory_cli.rs`, issue #33). Not yet wired into any prompt: ranking,
+/// budgeting, and prompt injection for the shared scope are later tasks.
 ///
 /// NOT a drop-in replacement for `list`: `list` ignores `cfg` entirely and
 /// always reads the private directory regardless of `memory.enabled`, which
@@ -402,7 +396,6 @@ pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
 /// `scope.enabled(cfg)` and returns empty when the scope is off -- swapping
 /// one call for the other silently changes that "disabling reads must never
 /// trap data" behavior.
-#[allow(dead_code)]
 pub fn list_scoped(
     scope: MemoryScope,
     repo: &Path,
@@ -476,7 +469,6 @@ pub fn list_scoped(
 /// silently returning a phantom entry. The parsed key is never overwritten
 /// to paper over the disagreement -- masking a repo-committed inconsistency
 /// would be worse than refusing it outright.
-#[allow(dead_code)]
 pub fn get_scoped(
     scope: MemoryScope,
     repo: &Path,
@@ -531,7 +523,6 @@ pub fn get_scoped(
 /// (see below). Exposed so a caller (a future `zirv memory status`/`optimize`
 /// surface) can report an existing collision rather than the read path
 /// picking one silently.
-#[allow(dead_code)]
 pub fn duplicate_keys(entries: &[(PathBuf, Entry)]) -> Vec<String> {
     let mut counts = std::collections::HashMap::<&str, usize>::new();
     for (_, entry) in entries {
@@ -548,7 +539,6 @@ pub fn duplicate_keys(entries: &[(PathBuf, Entry)]) -> Vec<String> {
 
 /// Cap on a shared entry's key: generous for a descriptive slug, short enough
 /// that `<key>.md` is always a reasonable file name.
-#[allow(dead_code)]
 const MAX_SHARED_KEY_LEN: usize = 80;
 
 /// Windows reserved device names: forbidden as a base file name regardless
@@ -577,7 +567,6 @@ const WINDOWS_RESERVED_NAMES: &[&str] = &[
 /// level: a key restricted to `[a-z0-9-]` can never contain `/`, `\`, `..`,
 /// or a null byte, so `dir.join(format!("{key}.md"))` can never resolve
 /// outside `dir` no matter what `dir` is.
-#[allow(dead_code)]
 fn validate_shared_key(key: &str) -> CtxResult<()> {
     if key.is_empty() {
         return Err("a memory key must not be empty".into());
@@ -625,7 +614,6 @@ fn validate_shared_key(key: &str) -> CtxResult<()> {
 /// N2's header-terminates-at-the-first-blank-line rule already means
 /// anything after the header, including a body that itself contains
 /// newlines, can never be read back as a header line.
-#[allow(dead_code)]
 fn validate_shared_entry_fields(entry: &Entry) -> CtxResult<()> {
     let no_newline = |value: &str, field: &str| -> CtxResult<()> {
         if value.contains(['\n', '\r']) {
@@ -660,7 +648,6 @@ fn validate_shared_entry_fields(entry: &Entry) -> CtxResult<()> {
 /// `forget_scoped`, `verify_scoped`) builds its path through this helper
 /// rather than by hand, so none of them can ever construct a path from
 /// caller-controlled input that resolves outside `.zirv/memory/`.
-#[allow(dead_code)]
 fn shared_canonical_path(repo: &Path, key: &str) -> Option<PathBuf> {
     validate_shared_key(key).ok()?;
     let dir = safe_shared_dir(repo)?;
@@ -684,7 +671,6 @@ fn shared_canonical_path(repo: &Path, key: &str) -> Option<PathBuf> {
 /// `read_to_string` handed it). `read_to_string` follows a symlink
 /// transparently, unlike `write_shared`'s `rename`, which replaces one
 /// without ever reading through it.
-#[allow(dead_code)]
 fn is_regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
 }
@@ -708,7 +694,6 @@ fn is_regular_file(path: &Path) -> bool {
 /// never observes a partial file, and two concurrent upserts of the same key
 /// each write in full before either `rename` lands -- the result is always
 /// one of the two complete entries, never a mix of both.
-#[allow(dead_code)]
 fn upsert_shared(
     repo: &Path,
     state: &StateDir,
@@ -763,7 +748,6 @@ fn upsert_shared(
 /// (`upsert_scoped_private_writes_even_when_memory_enabled_is_false_
 /// unlike_shared`) precisely so it is never "discovered" as a surprise by a
 /// later CLI verb.
-#[allow(dead_code)]
 pub fn upsert_scoped(
     scope: MemoryScope,
     repo: &Path,
@@ -793,7 +777,6 @@ pub fn upsert_scoped(
 /// shared_enabled` either, the same "disabling a feature must never trap
 /// data" contract the private scope's own `forget` already follows --
 /// forgetting must still work while the scope is switched off.
-#[allow(dead_code)]
 pub fn forget_scoped(
     scope: MemoryScope,
     repo: &Path,
@@ -882,7 +865,6 @@ pub fn forget_scoped(
 /// and editable without Zirv" -- a hand-edited file must survive a `verify`
 /// call with everything it wasn't asked to change intact, so the write path
 /// edits the raw text directly instead.
-#[allow(dead_code)]
 pub fn verify_scoped(
     scope: MemoryScope,
     repo: &Path,
@@ -948,7 +930,6 @@ pub fn verify_scoped(
 /// itself, since a file with no such heading parses to `key == ""`, which
 /// the key-agreement check above already refuses before this is called; kept
 /// as a safe no-op for any other caller).
-#[allow(dead_code)]
 fn stamp_verified_in_place(text: &str, verified: u64) -> String {
     let had_trailing_newline = text.ends_with('\n');
     let lines: Vec<&str> = text.lines().collect();
@@ -1119,7 +1100,6 @@ pub fn remember(
 /// The single entry for `key`, if any.
 // Consumed by the memory prompt layer and harvest (next waves); recall's own
 // key filter goes through `list` so its output ordering matches the bank.
-#[allow(dead_code)]
 pub fn get(state: &StateDir, slug: &str, key: &str) -> CtxResult<Option<Entry>> {
     Ok(list(state, slug)?
         .into_iter()

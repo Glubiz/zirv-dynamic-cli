@@ -14,6 +14,7 @@ pub mod hook;
 pub mod log;
 pub mod mail;
 pub mod memory;
+pub mod memory_cli;
 pub mod optimize;
 pub mod pace;
 pub mod poll;

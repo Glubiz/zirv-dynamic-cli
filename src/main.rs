@@ -41,6 +41,18 @@ fn is_top_level_ctx(argv: &[String]) -> bool {
     argv.get(1).is_some_and(|s| s.eq_ignore_ascii_case("ctx"))
 }
 
+/// True when argv[1] names the `memory` built-in, compared case-insensitively
+/// like the `ctx` check above, so a repo `.zirv/Memory.yaml` (or any
+/// differently-cased script) can never shadow it. Unlike `chat`/`agent`
+/// below, `memory` is not a 1:1 alias into a single `ctx` verb: it has its
+/// own verb tree (`status`/`list`/`recall`/`remember`/`forget`/`verify`),
+/// dispatched by `commands::ctx::memory_cli::dispatch` directly rather than
+/// through `ctx::dispatch`.
+fn is_top_level_memory(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|s| s.eq_ignore_ascii_case("memory"))
+}
+
 /// `zirv chat` and `zirv agent` are top-level aliases for `zirv ctx chat`
 /// and `zirv ctx agent`, checked against raw argv (like the `ctx`
 /// interception above) so they run before clap ever sees `Input`. Returns
@@ -121,6 +133,10 @@ async fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if is_top_level_ctx(&argv) {
         std::process::exit(ctx::dispatch(&argv[1..]));
+    }
+
+    if is_top_level_memory(&argv) {
+        std::process::exit(ctx::memory_cli::dispatch(&argv[1..]));
     }
 
     if let Some(verb) = top_level_ctx_alias(&argv) {
@@ -401,5 +417,50 @@ mod tests {
     fn chat_and_agent_are_reserved_so_a_script_can_never_shadow_them() {
         assert!(utils::is_reserved_command("chat"));
         assert!(utils::is_reserved_command("agent"));
+    }
+
+    #[test]
+    fn memory_is_intercepted_case_insensitively_and_reserved() {
+        assert!(is_top_level_memory(&argv(&["zirv", "memory", "status"])));
+        assert!(is_top_level_memory(&argv(&["zirv", "Memory"])));
+        assert!(is_top_level_memory(&argv(&["zirv", "MEMORY", "list"])));
+        assert!(!is_top_level_memory(&argv(&["zirv", "memories"])));
+        assert!(!is_top_level_memory(&argv(&["zirv"])));
+        assert!(utils::is_reserved_command("memory"));
+        assert!(utils::is_reserved_command("Memory"));
+    }
+
+    /// A repo `.zirv/Memory.yaml` (any casing) must never be reachable as a
+    /// script -- `memory` is intercepted against raw argv before clap runs,
+    /// the same guarantee `ctx_is_intercepted_before_script_lookup` pins for
+    /// `ctx`.
+    #[test]
+    fn memory_is_intercepted_before_script_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            dir.path().join(".zirv/Memory.yaml"),
+            "commands:\n  - command: echo not-a-built-in\n",
+        )
+        .expect("write");
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let bin = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("target/debug")
+            .join("zirv");
+
+        let out = std::process::Command::new(&bin)
+            .args(["memory", "--help"])
+            .current_dir(dir.path())
+            .output()
+            .expect("run zirv");
+
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("status") && text.contains("remember"),
+            "built-in memory help expected, got: {text}"
+        );
     }
 }
