@@ -28,11 +28,11 @@ pub const TOP_LEVEL_COMMANDS: &[&str] = &["skill", "workflow", "test", "verify",
 /// Put a shell-backed workflow command in its own process group on Unix so a
 /// timeout can stop descendants as well as the shell. Windows uses
 /// `taskkill /T` in [`terminate_process_tree`] instead.
-pub(crate) fn isolate_process_tree(command: &mut Command) {
+pub(crate) fn isolate_process_tree(_command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        _command.process_group(0);
     }
 }
 
