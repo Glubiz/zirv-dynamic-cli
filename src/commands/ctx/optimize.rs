@@ -22,6 +22,18 @@ pub enum Layer {
     UserSettings,
     ProjectSettings,
     LocalSettings,
+    /// Codex's own analogue of `GlobalClaudeMd`/`RepoClaudeMd`/
+    /// `NestedClaudeMd`: `~/.codex/AGENTS.md`, `<repo>/AGENTS.md`, and every
+    /// nested `AGENTS.md` up to `MAX_NESTED_DEPTH`, read the same way and by
+    /// the same walk (issue #40).
+    GlobalAgentsMd,
+    RepoAgentsMd,
+    NestedAgentsMd,
+    /// Codex's own analogue of `UserSettings`/`ProjectSettings`:
+    /// `~/.codex/config.toml` and `<repo>/.codex/config.toml`. TOML, not
+    /// JSON -- see `redact_settings_strings`.
+    CodexUserSettings,
+    CodexProjectSettings,
 }
 
 impl Layer {
@@ -33,33 +45,57 @@ impl Layer {
             Layer::UserSettings => "user settings.json",
             Layer::ProjectSettings => "project settings.json",
             Layer::LocalSettings => "local settings.json",
+            Layer::GlobalAgentsMd => "global AGENTS.md",
+            Layer::RepoAgentsMd => "repo AGENTS.md",
+            Layer::NestedAgentsMd => "nested AGENTS.md",
+            Layer::CodexUserSettings => "user config.toml",
+            Layer::CodexProjectSettings => "project config.toml",
         }
     }
 
     // No production caller yet: exposed for Tasks 10-16 (issue #39) to reason
     // about which harness a surface belongs to; `context_surface()`'s own
-    // test exercises it today.
+    // test and `new_codex_layers_have_the_expected_labels_and_provider`
+    // exercise it today.
     #[allow(dead_code)]
     pub fn provider(&self) -> surface::Provider {
-        surface::Provider::Claude
+        match self {
+            Layer::GlobalAgentsMd
+            | Layer::RepoAgentsMd
+            | Layer::NestedAgentsMd
+            | Layer::CodexUserSettings
+            | Layer::CodexProjectSettings => surface::Provider::Codex,
+            _ => surface::Provider::Claude,
+        }
     }
 
     pub fn kind(&self) -> surface::Kind {
         match self {
-            Layer::GlobalClaudeMd | Layer::RepoClaudeMd | Layer::NestedClaudeMd => {
-                surface::Kind::Instructions
-            }
-            Layer::UserSettings | Layer::ProjectSettings | Layer::LocalSettings => {
-                surface::Kind::PolicySettings
-            }
+            Layer::GlobalClaudeMd
+            | Layer::RepoClaudeMd
+            | Layer::NestedClaudeMd
+            | Layer::GlobalAgentsMd
+            | Layer::RepoAgentsMd
+            | Layer::NestedAgentsMd => surface::Kind::Instructions,
+            Layer::UserSettings
+            | Layer::ProjectSettings
+            | Layer::LocalSettings
+            | Layer::CodexUserSettings
+            | Layer::CodexProjectSettings => surface::Kind::PolicySettings,
         }
     }
 
     pub fn scope(&self) -> surface::Scope {
         match self {
-            Layer::GlobalClaudeMd | Layer::UserSettings => surface::Scope::Global,
-            Layer::RepoClaudeMd | Layer::ProjectSettings => surface::Scope::Repo,
-            Layer::NestedClaudeMd => surface::Scope::Nested,
+            Layer::GlobalClaudeMd
+            | Layer::UserSettings
+            | Layer::GlobalAgentsMd
+            | Layer::CodexUserSettings => surface::Scope::Global,
+            Layer::RepoClaudeMd
+            | Layer::ProjectSettings
+            | Layer::RepoAgentsMd
+            | Layer::CodexProjectSettings => surface::Scope::Repo,
+            Layer::NestedClaudeMd | Layer::NestedAgentsMd => surface::Scope::Nested,
             Layer::LocalSettings => surface::Scope::LocalPrivate,
         }
     }
@@ -155,7 +191,12 @@ fn push_surface(into: &mut Vec<Surface>, layer: Layer, path: PathBuf, max_bytes:
     }
 }
 
-fn nested_claude_files(repo: &Path) -> Vec<PathBuf> {
+/// Every `filename` found in a subdirectory of `repo`, up to
+/// `MAX_NESTED_DEPTH`. Shared by nested `CLAUDE.md` and nested `AGENTS.md`
+/// discovery (issue #40) -- same depth cap, same symlink-escape posture,
+/// same skipped directories, so a second instruction-file convention gets no
+/// weaker a boundary than the first.
+fn nested_named_files(repo: &Path, filename: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![(repo.to_path_buf(), 0usize)];
 
@@ -184,7 +225,7 @@ fn nested_claude_files(repo: &Path) -> Vec<PathBuf> {
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            let candidate = path.join("CLAUDE.md");
+            let candidate = path.join(filename);
             if candidate.is_file() {
                 found.push(candidate);
             }
@@ -215,6 +256,12 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
             home.join(".claude").join("CLAUDE.md"),
             max_bytes,
         );
+        push_surface(
+            &mut surfaces,
+            Layer::GlobalAgentsMd,
+            home.join(".codex").join("AGENTS.md"),
+            max_bytes,
+        );
     }
 
     push_surface(
@@ -223,8 +270,17 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
         repo.join("CLAUDE.md"),
         max_bytes,
     );
-    for path in nested_claude_files(repo) {
+    push_surface(
+        &mut surfaces,
+        Layer::RepoAgentsMd,
+        repo.join("AGENTS.md"),
+        max_bytes,
+    );
+    for path in nested_named_files(repo, "CLAUDE.md") {
         push_surface(&mut surfaces, Layer::NestedClaudeMd, path, max_bytes);
+    }
+    for path in nested_named_files(repo, "AGENTS.md") {
+        push_surface(&mut surfaces, Layer::NestedAgentsMd, path, max_bytes);
     }
 
     if let Some(home) = home {
@@ -234,11 +290,23 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
             home.join(".claude").join("settings.json"),
             max_bytes,
         );
+        push_surface(
+            &mut surfaces,
+            Layer::CodexUserSettings,
+            home.join(".codex").join("config.toml"),
+            max_bytes,
+        );
     }
     push_surface(
         &mut surfaces,
         Layer::ProjectSettings,
         repo.join(".claude").join("settings.json"),
+        max_bytes,
+    );
+    push_surface(
+        &mut surfaces,
+        Layer::CodexProjectSettings,
+        repo.join(".codex").join("config.toml"),
         max_bytes,
     );
     push_surface(
@@ -564,7 +632,7 @@ fn resolve_candidates(
     repo: &Path,
     home: Option<&Path>,
 ) -> Vec<PathBuf> {
-    if surface.layer == Layer::NestedClaudeMd {
+    if matches!(surface.layer, Layer::NestedClaudeMd | Layer::NestedAgentsMd) {
         let mut candidates = Vec::new();
         if let Some(dir) = surface.path.parent() {
             candidates.push(dir.join(token));
@@ -619,6 +687,11 @@ pub fn lint_dead_references(
                     proposed_diff: None,
                 });
             }
+            continue;
+        }
+        if surface.layer.is_settings() {
+            // Codex's `config.toml` is not JSON-hook-shaped like the three
+            // layers above; nothing here knows how to check it yet.
             continue;
         }
 
@@ -1105,28 +1178,48 @@ pub const OPTIMIZE_PROMPT_VERSION: &str = "v1";
 /// so one enormous CLAUDE.md cannot crowd out the others.
 const DEFAULT_EXCERPT_LINES: usize = 40;
 
-/// Keys and structure survive; every string value becomes `<redacted>`. The
-/// contradiction check reads the shape of a settings file -- which hooks are
-/// registered, what is permitted -- and never needs the values, which
-/// routinely include an `env` block holding an API key. Unparseable input is
-/// withheld rather than passed through: a settings file truncated by the byte
-/// cap must not fall back to raw bytes.
-fn redact_json_strings(text: &str) -> String {
-    fn walk(value: &mut serde_json::Value) {
+/// Keys and structure survive; every string value becomes `<redacted>`,
+/// whether the settings file is JSON (Claude's `settings.json`) or TOML
+/// (Codex's `config.toml`, issue #40). The contradiction check reads the
+/// shape of a settings file -- which hooks are registered, what is
+/// permitted -- and never needs the values, which routinely include an
+/// `env` block or a token holding a secret. Unparseable input is withheld
+/// rather than passed through: a settings file truncated by the byte cap
+/// must not fall back to raw bytes, in either format.
+fn redact_settings_strings(text: &str) -> String {
+    fn walk_json(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::String(text) => *text = "<redacted>".to_string(),
-            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
-            serde_json::Value::Object(map) => map.values_mut().for_each(walk),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk_json),
+            serde_json::Value::Object(map) => map.values_mut().for_each(walk_json),
+            _ => {}
+        }
+    }
+    fn walk_toml(value: &mut toml::Value) {
+        match value {
+            toml::Value::String(text) => *text = "<redacted>".to_string(),
+            toml::Value::Array(items) => items.iter_mut().for_each(walk_toml),
+            toml::Value::Table(map) => map.iter_mut().for_each(|(_, v)| walk_toml(v)),
             _ => {}
         }
     }
 
-    let withheld = "(not valid JSON on its own; contents withheld)".to_string();
-    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text) else {
-        return withheld;
-    };
-    walk(&mut parsed);
-    serde_json::to_string_pretty(&parsed).unwrap_or(withheld)
+    let withheld = "(not valid JSON or TOML on its own; contents withheld)".to_string();
+    if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text) {
+        walk_json(&mut parsed);
+        return serde_json::to_string_pretty(&parsed).unwrap_or(withheld);
+    }
+    // A bare `str::parse::<toml::Value>()` parses one TOML *value*, not a
+    // document -- the same idiom `config.rs`'s own layer loader uses
+    // (`toml::from_str::<toml::Table>`) is what actually parses a whole
+    // `config.toml` file.
+    if let Ok(mut parsed) = toml::from_str::<toml::Table>(text) {
+        for value in parsed.iter_mut().map(|(_, v)| v) {
+            walk_toml(value);
+        }
+        return toml::to_string(&parsed).unwrap_or(withheld);
+    }
+    withheld
 }
 
 pub fn judgment_prompt(surfaces: &[Surface], evidence: &Evidence, excerpt_lines: usize) -> String {
@@ -1161,7 +1254,7 @@ nothing rather than guessing.\n\n"
                 .push_str("(string values redacted; this file's structure is what matters here)\n");
         }
         let body = if surface.layer.is_settings() {
-            redact_json_strings(&surface.text)
+            redact_settings_strings(&surface.text)
         } else {
             surface.text.clone()
         };
@@ -1902,6 +1995,164 @@ mod tests {
         assert_eq!(surfaces, again);
     }
 
+    /// Adds every Codex-flavored surface `fixture_tree`'s Claude-only tree is
+    /// missing, so a test can exercise one repo with both providers rather
+    /// than two trees that never coexist in a real collection.
+    fn add_codex_surfaces(home: &Path, repo: &Path) {
+        std::fs::create_dir_all(home.join(".codex")).expect("mkdir home/.codex");
+        std::fs::write(
+            home.join(".codex/AGENTS.md"),
+            "# global agents\n- prefer rg over grep\n",
+        )
+        .expect("write");
+        std::fs::write(home.join(".codex/config.toml"), "model = \"gpt-5.6-sol\"\n")
+            .expect("write");
+
+        std::fs::create_dir_all(repo.join(".codex")).expect("mkdir repo/.codex");
+        std::fs::write(
+            repo.join("AGENTS.md"),
+            "# repo agents\n- always run tests\n",
+        )
+        .expect("write");
+        std::fs::write(
+            repo.join("crates/inner/AGENTS.md"),
+            "# nested agents\n- inner agents rule\n",
+        )
+        .expect("write");
+        std::fs::write(
+            repo.join(".codex/config.toml"),
+            "sandbox_mode = \"read-only\"\n",
+        )
+        .expect("write");
+    }
+
+    #[test]
+    fn agents_md_is_collected_at_global_repo_and_nested_scope_alongside_claude_md() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let labels: Vec<&'static str> = surfaces.iter().map(|s| s.layer.label()).collect();
+
+        assert!(labels.contains(&"global AGENTS.md"), "{labels:?}");
+        assert!(labels.contains(&"repo AGENTS.md"), "{labels:?}");
+        assert!(labels.contains(&"nested AGENTS.md"), "{labels:?}");
+
+        let nested = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::NestedAgentsMd)
+            .expect("nested AGENTS.md present");
+        assert!(nested.text.contains("inner agents rule"));
+    }
+
+    #[test]
+    fn codex_config_toml_is_collected_at_global_and_project_scope() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let user = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::CodexUserSettings)
+            .expect("codex user config.toml present");
+        assert!(user.text.contains("gpt-5.6-sol"));
+
+        let project = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::CodexProjectSettings)
+            .expect("codex project config.toml present");
+        assert!(project.text.contains("read-only"));
+    }
+
+    #[test]
+    fn a_mixed_claude_and_codex_repo_collects_both_providers_without_cross_contamination() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let claude_count = surfaces
+            .iter()
+            .filter(|s| s.layer.provider() == surface::Provider::Claude)
+            .count();
+        let codex_count = surfaces
+            .iter()
+            .filter(|s| s.layer.provider() == surface::Provider::Codex)
+            .count();
+
+        // fixture_tree(): 2 global + 1 repo + 1 nested CLAUDE.md, 3 claude settings.
+        assert_eq!(claude_count, 7, "{surfaces:#?}");
+        // add_codex_surfaces: global + repo + nested AGENTS.md, 2 config.toml.
+        assert_eq!(codex_count, 5, "{surfaces:#?}");
+        assert_eq!(surfaces.len(), claude_count + codex_count);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_nested_agents_md_scan_does_not_follow_a_symlink_out_of_the_repo_either() {
+        let (tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+        let outside = tmp.path().join("outside-agents");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::fs::write(outside.join("AGENTS.md"), "# private codex notes\n").expect("write");
+        std::os::unix::fs::symlink(&outside, repo.join("linked-agents")).expect("symlink");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert!(
+            surfaces
+                .iter()
+                .all(|s| !s.text.contains("private codex notes")),
+            "a symlinked directory is not this repository's configuration"
+        );
+    }
+
+    #[test]
+    fn a_nested_agents_md_reference_is_checked_against_its_own_directory_first() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+        std::fs::write(repo.join("crates/inner/helper.rs"), "// helper\n").expect("write");
+        std::fs::write(
+            repo.join("crates/inner/AGENTS.md"),
+            "# nested agents\n- see `helper.rs`\n",
+        )
+        .expect("write");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let findings = lint_dead_references(&surfaces, &repo, Some(&home), &|_| false);
+        assert!(
+            findings.iter().all(|f| !f.title.contains("helper.rs")),
+            "helper.rs exists next to the nested AGENTS.md that names it: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn codex_settings_toml_values_are_redacted_before_reaching_the_model() {
+        let surfaces = vec![
+            Surface {
+                layer: Layer::CodexProjectSettings,
+                path: PathBuf::from("/repo/.codex/config.toml"),
+                text: "model = \"gpt-5.6-sol\"\n\n[shell_environment_policy]\ntoken = \"sk-codex-secret\"\n"
+                    .to_string(),
+            },
+            Surface {
+                layer: Layer::RepoAgentsMd,
+                path: PathBuf::from("/repo/AGENTS.md"),
+                text: "- always run tests".to_string(),
+            },
+        ];
+
+        let prompt = judgment_prompt(&surfaces, &Evidence::default(), 40);
+
+        assert!(
+            !prompt.contains("sk-codex-secret"),
+            "a codex settings value must never reach the model: {prompt}"
+        );
+        assert!(
+            prompt.contains("token") && prompt.contains("<redacted>"),
+            "the structure is what the contradiction check needs: {prompt}"
+        );
+        assert!(prompt.contains("- always run tests"));
+    }
+
     #[test]
     fn build_and_vendor_directories_are_skipped() {
         let (_tmp, home, repo) = fixture_tree();
@@ -1967,6 +2218,11 @@ mod tests {
             Layer::UserSettings,
             Layer::ProjectSettings,
             Layer::LocalSettings,
+            Layer::GlobalAgentsMd,
+            Layer::RepoAgentsMd,
+            Layer::NestedAgentsMd,
+            Layer::CodexUserSettings,
+            Layer::CodexProjectSettings,
         ];
         for layer in layers {
             assert_eq!(layer.is_repo_owned(), layer.scope().is_repo_owned());
@@ -1974,6 +2230,34 @@ mod tests {
                 layer.is_settings(),
                 layer.kind() == surface::Kind::PolicySettings
             );
+        }
+    }
+
+    #[test]
+    fn new_codex_layers_have_the_expected_labels_and_provider() {
+        assert_eq!(Layer::GlobalAgentsMd.label(), "global AGENTS.md");
+        assert_eq!(Layer::RepoAgentsMd.label(), "repo AGENTS.md");
+        assert_eq!(Layer::NestedAgentsMd.label(), "nested AGENTS.md");
+        assert_eq!(Layer::CodexUserSettings.label(), "user config.toml");
+        assert_eq!(Layer::CodexProjectSettings.label(), "project config.toml");
+        for layer in [
+            Layer::GlobalAgentsMd,
+            Layer::RepoAgentsMd,
+            Layer::NestedAgentsMd,
+            Layer::CodexUserSettings,
+            Layer::CodexProjectSettings,
+        ] {
+            assert_eq!(layer.provider(), surface::Provider::Codex);
+        }
+        for layer in [
+            Layer::GlobalClaudeMd,
+            Layer::RepoClaudeMd,
+            Layer::NestedClaudeMd,
+            Layer::UserSettings,
+            Layer::ProjectSettings,
+            Layer::LocalSettings,
+        ] {
+            assert_eq!(layer.provider(), surface::Provider::Claude);
         }
     }
 
@@ -1985,11 +2269,16 @@ mod tests {
     fn repo_owned_layers_can_never_carry_operator_trust() {
         assert_eq!(Layer::GlobalClaudeMd.trust(), surface::Trust::Operator);
         assert_eq!(Layer::UserSettings.trust(), surface::Trust::Operator);
+        assert_eq!(Layer::GlobalAgentsMd.trust(), surface::Trust::Operator);
+        assert_eq!(Layer::CodexUserSettings.trust(), surface::Trust::Operator);
         for layer in [
             Layer::RepoClaudeMd,
             Layer::NestedClaudeMd,
             Layer::ProjectSettings,
             Layer::LocalSettings,
+            Layer::RepoAgentsMd,
+            Layer::NestedAgentsMd,
+            Layer::CodexProjectSettings,
         ] {
             assert_eq!(
                 layer.trust(),
