@@ -673,11 +673,17 @@ fn shared_canonical_path(repo: &Path, key: &str) -> Option<PathBuf> {
 /// entirely (each reads exactly one known path, not a directory listing), so
 /// neither inherited that skip on its own. A symlinked canonical file (a
 /// repo-committed `some-key.md -> /etc/passwd`) must never be followed:
-/// `get_scoped` would read an arbitrary local file back as if it were a
-/// memory entry, and `verify_scoped` would then write that file's own
-/// content back into the repository as ordinary, committable text --
-/// `read_to_string` follows a symlink transparently, unlike `write_shared`'s
-/// `rename`, which replaces one without ever reading through it.
+/// `parse_markdown` only ever recognizes text between a `## Memory` heading
+/// and the next one, so an arbitrary target with no such heading (a literal
+/// `/etc/passwd`) parses to an empty phantom entry, not its actual bytes --
+/// but a target an attacker specifically crafts to look like a well-formed,
+/// key-matching entry is not so limited: `get_scoped` would read it back as
+/// if it were a genuine memory entry, and `verify_scoped` would go further
+/// and rewrite that crafted content into the repository as ordinary,
+/// committable text (`stamp_verified_in_place` still operates on whatever
+/// `read_to_string` handed it). `read_to_string` follows a symlink
+/// transparently, unlike `write_shared`'s `rename`, which replaces one
+/// without ever reading through it.
 #[allow(dead_code)]
 fn is_regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
@@ -840,19 +846,42 @@ pub fn forget_scoped(
     }
 }
 
-/// Scope-aware verify: `Private` delegates unchanged to `verify` above.
-/// `Shared` reads and rewrites only the canonical file (same "canonical
-/// claimant only" policy as `get_scoped`/`forget_scoped` above; a
-/// pre-existing collision from some other file is left untouched, exactly as
-/// `duplicate_keys` would report it) -- refreshes only the `Verified` stamp
-/// in place, leaving `Written`/body untouched, same contract as private
-/// `verify`. Ungated on `shared_enabled` for the same "must not trap data"
+/// Scope-aware verify: `Private` delegates unchanged to `verify` above,
+/// which still refreshes via a parse-then-`to_markdown` re-render (unchanged
+/// contract: refreshes only the `Verified` stamp, leaving `Written`/body
+/// untouched).
+///
+/// `Shared` touches only the canonical file (same "canonical claimant only"
+/// policy as `get_scoped`/`forget_scoped` above; a pre-existing collision
+/// from some other file is left untouched, exactly as `duplicate_keys` would
+/// report it). Ungated on `shared_enabled` for the same "must not trap data"
 /// reason `forget_scoped` is. Refuses (reports `false`, touches nothing) if
 /// the canonical path is a symlink rather than a regular file (fix round 2,
-/// `is_regular_file`) -- otherwise `read_to_string` would follow it and this
-/// function would then write the linked file's own content back into the
-/// repository as ordinary, committable text, the same class of escape
-/// `get_scoped`'s doc comment describes.
+/// `is_regular_file`) -- see that function's doc comment for exactly what
+/// following one could and couldn't expose.
+///
+/// **Key agreement (fix round 3: extended from `get_scoped` -- the round-2
+/// ruling that scoped this check to `get_scoped` alone was an
+/// under-scoping, corrected here):** after parsing, if the entry's own `key`
+/// disagrees with the requested `key`, this logs a `verify-key-mismatch`
+/// decision (same shape as `get_scoped`'s `get-key-mismatch`) and returns
+/// `Ok(false)` WITHOUT writing anything. Before this fix, `verify_scoped`
+/// would stamp false freshness onto a mismatched file, answer `true` for a
+/// key `get_scoped` already refuses to return, and (see the next point)
+/// destroy a readable non-entry file by overwriting it with an empty
+/// phantom stub.
+///
+/// **In-place stamping (fix round 3, data-loss fix):** once the key is
+/// confirmed to agree, the `Verified` bullet is refreshed via
+/// `stamp_verified_in_place` -- NOT a parse-then-`to_markdown` re-render
+/// (what this used to do, and what `Private`'s `verify` still does for the
+/// machine-local bank). A re-render silently drops anything `parse_markdown`
+/// doesn't recognize into its own fixed field set: an unknown header bullet
+/// (`- Priority: urgent`) or a trailing `## Notes` section a human added
+/// would both vanish. Issue #32 requires shared entries to stay "readable
+/// and editable without Zirv" -- a hand-edited file must survive a `verify`
+/// call with everything it wasn't asked to change intact, so the write path
+/// edits the raw text directly instead.
 #[allow(dead_code)]
 pub fn verify_scoped(
     scope: MemoryScope,
@@ -873,12 +902,121 @@ pub fn verify_scoped(
             let Ok(text) = std::fs::read_to_string(&path) else {
                 return Ok(false);
             };
-            let mut entry = parse_markdown(&text);
-            entry.verified = now_secs();
-            super::state::write_shared(&path, &entry.to_markdown())?;
+            let parsed = parse_markdown(&text);
+            if parsed.key != key {
+                let _ = super::log::append(
+                    state,
+                    &super::log::Decision {
+                        ts: now_secs(),
+                        session: "n/a",
+                        verb: "memory",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "verify-key-mismatch",
+                        detail: &format!(
+                            "canonical file for '{key}' has header Key '{}': refusing to verify it",
+                            parsed.key
+                        ),
+                    },
+                );
+                return Ok(false);
+            }
+            let stamped = stamp_verified_in_place(&text, now_secs());
+            super::state::write_shared(&path, &stamped)?;
             Ok(true)
         }
     }
+}
+
+/// Refreshes the `## Memory` header's `Verified` bullet IN PLACE, leaving
+/// every other byte of `text` untouched -- the write-time half of
+/// `verify_scoped`'s "hand-edited files must survive a verify call" contract
+/// (see that function's own doc comment for the full reasoning).
+///
+/// Mirrors `parse_markdown`'s own header-boundary rule exactly (the header
+/// block runs from the line after `## Memory` up to the first blank line, or
+/// the first line that is neither blank nor a well-formed `key: value`
+/// bullet, if there is no blank separator) so the two can never disagree
+/// about where the header ends. If an existing bullet whose key is
+/// `Verified` (case-insensitive, matching `parse_markdown`'s own lookup) is
+/// found in that range, its WHOLE line is replaced with a canonical
+/// `- Verified: {verified}`; otherwise a new such line is appended at the
+/// end of the header block. Every other line -- every other header bullet
+/// (recognized or not), the body, and any later `## ` section -- is copied
+/// through unchanged. Falls back to returning `text` unchanged if no
+/// `## Memory` heading is found at all (unreachable through `verify_scoped`
+/// itself, since a file with no such heading parses to `key == ""`, which
+/// the key-agreement check above already refuses before this is called; kept
+/// as a safe no-op for any other caller).
+#[allow(dead_code)]
+fn stamp_verified_in_place(text: &str, verified: u64) -> String {
+    let had_trailing_newline = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+
+    let Some(memory_idx) = lines.iter().position(|line| {
+        line.trim()
+            .strip_prefix("## ")
+            .is_some_and(|rest| rest.trim().eq_ignore_ascii_case("Memory"))
+    }) else {
+        return text.to_string();
+    };
+
+    let mut header_end = memory_idx + 1;
+    let mut verified_idx = None;
+    for (offset, line) in lines[memory_idx + 1..].iter().enumerate() {
+        let idx = memory_idx + 1 + offset;
+        if line.trim().is_empty() {
+            header_end = idx;
+            break;
+        }
+        match strip_bullet(line).and_then(|bullet| {
+            bullet
+                .split_once(':')
+                .map(|(key, _)| key.trim().to_string())
+        }) {
+            Some(bullet_key) => {
+                if bullet_key.eq_ignore_ascii_case("verified") {
+                    verified_idx = Some(idx);
+                }
+                header_end = idx + 1;
+            }
+            None => {
+                header_end = idx;
+                break;
+            }
+        }
+    }
+
+    let new_line = format!("- Verified: {verified}");
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 1);
+    match verified_idx {
+        Some(idx) => {
+            for (i, line) in lines.iter().enumerate() {
+                out.push(if i == idx {
+                    new_line.clone()
+                } else {
+                    (*line).to_string()
+                });
+            }
+        }
+        None => {
+            for (i, line) in lines.iter().enumerate() {
+                if i == header_end {
+                    out.push(new_line.clone());
+                }
+                out.push((*line).to_string());
+            }
+            if header_end == lines.len() {
+                out.push(new_line.clone());
+            }
+        }
+    }
+
+    let mut result = out.join("\n");
+    if had_trailing_newline {
+        result.push('\n');
+    }
+    result
 }
 
 /// Removes every file whose parsed `Written` timestamp is not among the
@@ -3785,6 +3923,14 @@ This should not appear in the body.\n";
     /// repository via `write_shared` -- reading a symlink's target and then
     /// materializing it as ordinary, committable content. Must refuse
     /// instead, touching neither the link nor its target.
+    ///
+    /// Deliberately a WELL-FORMED entry for the requested key at the symlink
+    /// target (not garbage), same reasoning as `get_scoped`'s analogous test:
+    /// this isolates the symlink defense from the separate key-agreement
+    /// check (fix round 3) -- content that fails to parse as "build-cmd"
+    /// would be refused by that other check regardless of whether the
+    /// symlink is followed, which would make this test pass for the wrong
+    /// reason.
     #[cfg(unix)]
     #[test]
     fn verify_scoped_shared_refuses_a_symlinked_canonical_file_and_never_materializes_its_target() {
@@ -3795,7 +3941,8 @@ This should not appear in the body.\n";
 
         let outside = tempfile::tempdir().expect("tempdir");
         let secret = outside.path().join("secret.txt");
-        std::fs::write(&secret, "leak-me").expect("write secret");
+        let secret_contents = sample("build-cmd", 1).to_markdown();
+        std::fs::write(&secret, &secret_contents).expect("write secret");
         std::os::unix::fs::symlink(&secret, dir.join("build-cmd.md")).expect("symlink");
 
         assert!(
@@ -3807,12 +3954,12 @@ This should not appear in the body.\n";
                 "build-cmd"
             )
             .expect("verify"),
-            "a symlinked canonical file must never be verified"
+            "a symlinked canonical file must never be verified, even one that would otherwise match"
         );
 
         assert_eq!(
             std::fs::read_to_string(&secret).expect("read secret"),
-            "leak-me",
+            secret_contents,
             "the symlink target must never be read-then-rewritten"
         );
         assert!(
@@ -3896,6 +4043,194 @@ This should not appear in the body.\n";
             .expect("get")
             .is_none(),
             "a readable non-entry file must never surface as a phantom entry"
+        );
+    }
+
+    /// IMPORTANT fix (review round 3): `verify_scoped` gets the same
+    /// key-agreement rule as `get_scoped` (the round-2 ruling scoping it to
+    /// `get_scoped` alone was an under-scoping). A canonical file whose
+    /// header key disagrees with its file name must be refused -- not
+    /// stamped with false freshness -- and the mismatch is logged. The file
+    /// on disk is byte-identical afterward: nothing was written.
+    #[test]
+    fn verify_scoped_shared_refuses_a_canonical_file_whose_header_key_disagrees_with_its_name() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mismatched = sample("something-else", 1).to_markdown();
+        std::fs::write(dir.join("build-cmd.md"), &mismatched).expect("write mismatched");
+
+        assert!(
+            !verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify"),
+            "a canonical file whose header key disagrees with its file name must be refused"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("build-cmd.md")).expect("read"),
+            mismatched,
+            "nothing is written when the key disagrees"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("verify-key-mismatch")
+                && log.contains("build-cmd")
+                && log.contains("something-else"),
+            "the mismatch is logged, naming both keys: {log}"
+        );
+    }
+
+    /// The phantom-entry case, same key-agreement check: a readable
+    /// non-entry file must never be "verified" -- doing so used to destroy
+    /// it by overwriting it with an empty phantom stub via the old
+    /// parse-then-`to_markdown` re-render.
+    #[test]
+    fn verify_scoped_shared_refuses_a_non_entry_file_and_leaves_it_byte_identical() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let garbage = "not a memory entry at all\n";
+        std::fs::write(dir.join("build-cmd.md"), garbage).expect("write garbage");
+
+        assert!(
+            !verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify"),
+            "a readable non-entry file must never be verified"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("build-cmd.md")).expect("read"),
+            garbage,
+            "the file must be left byte-identical, not overwritten with an empty phantom stub"
+        );
+    }
+
+    /// FOLDED fix (review round 3, data-loss hazard): a hand-edited shared
+    /// entry with an unknown header bullet and a trailing `## Notes` section
+    /// must survive `verify_scoped` byte-identical except for the `Verified`
+    /// line -- the old parse-then-`to_markdown` re-render would have
+    /// silently dropped both, violating issue #32's "readable and editable
+    /// without Zirv" contract.
+    #[test]
+    fn verify_scoped_shared_preserves_unknown_header_lines_and_trailing_sections() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let original = concat!(
+            "## Memory\n",
+            "- Key: build-cmd\n",
+            "- Written-by: claude\n",
+            "- Written: 1700000000\n",
+            "- Verified: 1700000000\n",
+            "- Source: explicit\n",
+            "- Priority: urgent\n",
+            "\n",
+            "cargo build --release\n",
+            "\n",
+            "## Notes\n",
+            "A human wrote this section; Zirv has never read it.\n",
+        );
+        std::fs::write(dir.join("build-cmd.md"), original).expect("write hand-edited entry");
+
+        let before = now_secs();
+        assert!(
+            verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify")
+        );
+        let after_call = now_secs();
+
+        let after = std::fs::read_to_string(dir.join("build-cmd.md")).expect("read");
+        // Read the actual stamped value back rather than assuming a second
+        // `now_secs()` call matches the one `verify_scoped` itself made --
+        // avoids a test that flakes if the clock ticks over between calls.
+        let new_verified = parse_markdown(&after).verified;
+        assert!(
+            (before..=after_call).contains(&new_verified),
+            "the Verified stamp was refreshed to roughly now: {new_verified}"
+        );
+
+        let expected = original.replace(
+            "- Verified: 1700000000",
+            &format!("- Verified: {new_verified}"),
+        );
+        assert_eq!(
+            after, expected,
+            "only the Verified line may change; every other byte, including the \
+             unknown Priority bullet and the trailing Notes section, must survive: {after:?}"
+        );
+    }
+
+    /// The same in-place stamping also handles the common case: no
+    /// pre-existing `Verified` bullet at all (e.g. a hand-written file that
+    /// never had one) gets one appended at the end of the header, rather
+    /// than failing or fabricating the rest of the entry.
+    #[test]
+    fn verify_scoped_shared_appends_a_verified_bullet_when_none_exists() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let original = concat!(
+            "## Memory\n",
+            "- Key: build-cmd\n",
+            "- Source: explicit\n",
+            "\n",
+            "cargo build\n",
+        );
+        std::fs::write(dir.join("build-cmd.md"), original).expect("write");
+
+        let before = now_secs();
+        assert!(
+            verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify")
+        );
+        let after_call = now_secs();
+
+        let after = std::fs::read_to_string(dir.join("build-cmd.md")).expect("read");
+        let new_verified = parse_markdown(&after).verified;
+        assert!(
+            (before..=after_call).contains(&new_verified),
+            "a Verified bullet is appended and refreshed to roughly now: {after:?}"
+        );
+        assert!(
+            after.contains("- Key: build-cmd"),
+            "existing lines survive: {after:?}"
+        );
+        assert!(
+            after.contains("cargo build"),
+            "the body survives: {after:?}"
         );
     }
 
