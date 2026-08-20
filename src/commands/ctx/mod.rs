@@ -8,6 +8,7 @@ pub mod chrome;
 pub mod config;
 pub mod context;
 pub mod dash;
+pub mod drift;
 pub mod event;
 pub mod exec;
 pub mod handoff;

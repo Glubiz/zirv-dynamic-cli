@@ -61,12 +61,9 @@ pub fn codex_path(repo: &Path) -> PathBuf {
 /// conflicting instruction there is read as refining or overriding the
 /// canonical layer rather than the other way around. `PartialOrd`/`Ord` are
 /// derived from declaration order, the same technique `Severity` (above)
-/// uses for its own three-value ranking.
-// No production caller yet -- Task 12's drift detection is the first
-// (precedence/shadowing findings), Task 14's compiler the second (actual
-// layer ordering). Same dormancy pattern as `optimize.rs`'s own
-// `Layer::trust`/`Surface::context_surface`; this module's own tests
-// exercise every item in the meantime.
+/// uses for its own three-value ranking. Consumed by `drift.rs`'s
+/// precedence/shadowing findings (issue #42); Task 14's compiler is the
+/// second real consumer, for actual layer ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PrecedenceTier {
     CanonicalCommon,
@@ -75,7 +72,6 @@ pub enum PrecedenceTier {
 }
 
 impl PrecedenceTier {
-    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             PrecedenceTier::CanonicalCommon => "canonical common",
@@ -90,7 +86,6 @@ impl PrecedenceTier {
 /// and `Layer::is_settings`). Every `Instructions` layer has an opinion here;
 /// `every_instructions_layer_has_a_defined_tier` (below) keeps a future
 /// variant from being added to one enum without the other.
-#[allow(dead_code)]
 pub fn precedence_tier(layer: Layer) -> Option<PrecedenceTier> {
     match layer {
         Layer::ContextCommon => Some(PrecedenceTier::CanonicalCommon),

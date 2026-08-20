@@ -543,34 +543,48 @@ fn deletion_diff(surface: &Surface, line: usize, repo: &Path) -> Option<String> 
     ))
 }
 
-/// Rules stated more than once, whether across layers or inside one file. The
-/// first occurrence is treated as the home of the rule and every later copy is
-/// what the proposed diff removes.
-pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
-    // A settings surface (JSON or TOML) is structured config, not prose: a
-    // multi-line TOML basic string value can contain a line that happens to
-    // look like a bullet, and without this guard it would be picked up as an
-    // "instruction" and quoted verbatim in a finding's title/evidence/
-    // proposed_diff -- a report-level leak `judgment_prompt`'s own
-    // redaction never covers, since it only guards the model-prompt path.
-    let all: Vec<Instruction> = surfaces
+/// Every bullet-line instruction across every non-settings surface. A
+/// settings surface (JSON or TOML) is structured config, not prose: a
+/// multi-line TOML basic string value can contain a line that happens to
+/// look like a bullet, and without this guard it would be picked up as an
+/// "instruction" and quoted verbatim in a finding's title/evidence/
+/// proposed_diff -- a report-level leak `judgment_prompt`'s own redaction
+/// never covers, since it only guards the model-prompt path. Shared by
+/// `lint_redundancy` and `drift.rs`'s duplicate/contradiction detection:
+/// both start from the same "every instruction, everywhere" list.
+pub fn all_instructions(surfaces: &[Surface]) -> Vec<Instruction> {
+    surfaces
         .iter()
         .enumerate()
         .filter(|(_, surface)| !surface.layer.is_settings())
         .flat_map(|(index, surface)| statements(index, surface))
-        .collect();
+        .collect()
+}
 
-    // Grouped by normalized text, keyed in first-seen order so the report does
-    // not depend on hash iteration order.
+/// Groups `instructions` by normalized text, in first-seen order so a report
+/// built by walking `order` does not depend on hash iteration order. Shared
+/// by `lint_redundancy` and `drift.rs`.
+pub fn group_by_normalized(
+    instructions: &[Instruction],
+) -> (Vec<String>, hashbrown::HashMap<String, Vec<&Instruction>>) {
     let mut order: Vec<String> = Vec::new();
     let mut groups: hashbrown::HashMap<String, Vec<&Instruction>> = hashbrown::HashMap::new();
-    for instruction in &all {
+    for instruction in instructions {
         let bucket = groups.entry(instruction.normalized.clone()).or_default();
         if bucket.is_empty() {
             order.push(instruction.normalized.clone());
         }
         bucket.push(instruction);
     }
+    (order, groups)
+}
+
+/// Rules stated more than once, whether across layers or inside one file. The
+/// first occurrence is treated as the home of the rule and every later copy is
+/// what the proposed diff removes.
+pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
+    let all = all_instructions(surfaces);
+    let (order, groups) = group_by_normalized(&all);
 
     let mut findings = Vec::new();
     for key in order {
