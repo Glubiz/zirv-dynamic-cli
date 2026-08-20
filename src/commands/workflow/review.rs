@@ -15,6 +15,7 @@ use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{StateDir, now_secs};
 
 const MAX_REVIEW_DIFF_BYTES: usize = 96 * 1024;
+const MAX_REVIEW_EVIDENCE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -59,6 +60,23 @@ pub enum ReviewDepth {
     SelfVerification,
     OneIndependentReviewer,
     StrongIndependentReview,
+}
+
+pub fn required_independent_reviews(risk: RiskBand) -> usize {
+    match depth_for_risk(risk) {
+        ReviewDepth::SelfVerification => 0,
+        ReviewDepth::OneIndependentReviewer => 1,
+        ReviewDepth::StrongIndependentReview => 2,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRunEvidence {
+    pub id: String,
+    pub change_fingerprint: u64,
+    pub adapter: String,
+    pub review_round: u8,
+    pub completed_at: u64,
 }
 
 pub fn depth_for_risk(risk: RiskBand) -> ReviewDepth {
@@ -107,6 +125,7 @@ pub struct ReviewPackage {
     pub review_depth: ReviewDepth,
     pub base_sha: String,
     pub head_sha: String,
+    pub change_fingerprint: u64,
     pub changed_paths: Vec<PathBuf>,
     pub diff: String,
     pub diff_truncated: bool,
@@ -278,6 +297,7 @@ pub fn package(
         review_depth: depth_for_risk(state.classification.risk),
         base_sha,
         head_sha,
+        change_fingerprint: current_fingerprint,
         changed_paths,
         diff,
         diff_truncated,
@@ -402,7 +422,9 @@ fn record_finding_update(state_dir: &StateDir, state: &WorkflowState) {
 }
 
 fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<i32> {
-    if !agent
+    if agent.is_empty()
+        || agent.len() > 64
+        || !agent
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
@@ -445,13 +467,35 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
         }
         ReviewCommand::Run(args) => {
-            let (state_dir, state) = state_and_repo(args.repo.as_deref(), &args.id)?;
+            let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.id)?;
             if depth_for_risk(state.classification.risk) == ReviewDepth::SelfVerification {
                 return Err("risk policy selects self-verification; an independent reviewer is not required".into());
+            }
+            if state.status != WorkflowStatus::Running
+                || state.current().map(|step| step.phase) != Some(super::skill::WorkflowPhase::Review)
+            {
+                return Err("independent review can only run during an active review step".into());
             }
             let package = package(&state_dir, &state, args.base.as_deref())?;
             let started = std::time::Instant::now();
             let code = launch_reviewer(&args.agent, &package)?;
+            let fingerprint_unchanged = verification::change_fingerprint(&state.repo)?
+                == package.change_fingerprint;
+            if code == 0 && fingerprint_unchanged {
+                state.review_evidence.push(ReviewRunEvidence {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    change_fingerprint: package.change_fingerprint,
+                    adapter: args.agent.clone(),
+                    review_round: package.review_round,
+                    completed_at: now_secs(),
+                });
+                let overflow = state.review_evidence.len().saturating_sub(MAX_REVIEW_EVIDENCE);
+                if overflow > 0 {
+                    state.review_evidence.drain(..overflow);
+                }
+                state.updated_at = now_secs();
+                save_state(&state_dir, &state)?;
+            }
             let (total, meaningful, dismissed) =
                 super::telemetry::finding_counts(&state.review_findings);
             let mut event = super::telemetry::TelemetryEvent::new(
@@ -466,7 +510,7 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
             event.adapter = Some(args.agent.clone());
-            event.succeeded = Some(code == 0);
+            event.succeeded = Some(code == 0 && fingerprint_unchanged);
             event.findings_total = total;
             event.findings_meaningful = meaningful;
             event.findings_dismissed = dismissed;
@@ -478,6 +522,11 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 &event,
                 &super::telemetry::TelemetryConfig::from_env(),
             );
+            if code == 0 && !fingerprint_unchanged {
+                return Err(
+                    "the change set changed during review; review evidence was not recorded".into(),
+                );
+            }
             return Ok(code);
         }
         ReviewCommand::Add(args) => {
@@ -549,5 +598,9 @@ mod tests {
             depth_for_risk(RiskBand::Critical),
             ReviewDepth::StrongIndependentReview
         );
+        assert_eq!(required_independent_reviews(RiskBand::Low), 0);
+        assert_eq!(required_independent_reviews(RiskBand::Medium), 1);
+        assert_eq!(required_independent_reviews(RiskBand::High), 1);
+        assert_eq!(required_independent_reviews(RiskBand::Critical), 2);
     }
 }

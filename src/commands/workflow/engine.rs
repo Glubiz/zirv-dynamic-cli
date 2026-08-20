@@ -217,6 +217,8 @@ pub struct WorkflowState {
     pub attempts: BTreeMap<String, u8>,
     #[serde(default)]
     pub review_findings: Vec<super::review::ReviewFinding>,
+    #[serde(default)]
+    pub review_evidence: Vec<super::review::ReviewRunEvidence>,
     pub status: WorkflowStatus,
     pub created_at: u64,
     pub updated_at: u64,
@@ -256,6 +258,7 @@ impl WorkflowState {
             completed_steps: Vec::new(),
             attempts: BTreeMap::new(),
             review_findings: Vec::new(),
+            review_evidence: Vec::new(),
             status,
             created_at: now,
             updated_at: now,
@@ -345,16 +348,39 @@ pub fn advance_with_evidence(
     let current = state.current().cloned().ok_or("workflow has no current step")?;
     match outcome {
         StepOutcome::Success => {
-            if current.phase == WorkflowPhase::Review
-                && state
+            if current.phase == WorkflowPhase::Review {
+                if state
                     .review_findings
                     .iter()
                     .any(|finding| finding.disposition == super::review::FindingDisposition::Open)
-            {
-                return Err(
-                    "review findings must have a final disposition before the review step can pass"
-                        .into(),
-                );
+                {
+                    return Err(
+                        "review findings must have a final disposition before the review step can pass"
+                            .into(),
+                    );
+                }
+                let required =
+                    super::review::required_independent_reviews(state.classification.risk);
+                if required > 0 {
+                    if state.review_evidence.is_empty() {
+                        return Err(format!(
+                            "review step requires {required} fresh independent review run(s); found 0"
+                        )
+                        .into());
+                    }
+                    let fingerprint = super::verification::change_fingerprint(&state.repo)?;
+                    let completed = state
+                        .review_evidence
+                        .iter()
+                        .filter(|evidence| evidence.change_fingerprint == fingerprint)
+                        .count();
+                    if completed < required {
+                        return Err(format!(
+                            "review step requires {required} fresh independent review run(s); found {completed}"
+                        )
+                        .into());
+                    }
+                }
             }
             if matches!(current.phase, WorkflowPhase::Test | WorkflowPhase::Verify) {
                 let final_only = current.phase == WorkflowPhase::Verify;
@@ -992,5 +1018,25 @@ mod tests {
         let error =
             advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
         assert!(error.to_string().contains("final disposition"));
+    }
+
+    #[test]
+    fn medium_risk_review_requires_independent_evidence() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review change".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        let error =
+            advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
+        assert!(error.to_string().contains("independent review"));
     }
 }

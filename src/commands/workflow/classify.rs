@@ -1,6 +1,7 @@
 //! Deterministic intent, complexity, and risk classification.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -280,6 +281,43 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
         lines = lines.saturating_add(added).saturating_add(removed);
         paths.push(PathBuf::from(path));
     }
+    let untracked = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()?;
+    if !untracked.status.success() {
+        return Err(format!(
+            "cannot inspect untracked paths: {}",
+            String::from_utf8_lossy(&untracked.stderr).trim()
+        )
+        .into());
+    }
+    for path in String::from_utf8_lossy(&untracked.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+    {
+        let absolute = repo.join(&path);
+        if let Ok(metadata) = std::fs::symlink_metadata(&absolute)
+            && metadata.is_file()
+            && !metadata.file_type().is_symlink()
+        {
+            let mut sample = Vec::new();
+            std::fs::File::open(&absolute)?
+                .take(1024 * 1024)
+                .read_to_end(&mut sample)?;
+            let sampled_lines = sample.iter().filter(|byte| **byte == b'\n').count()
+                + usize::from(!sample.is_empty() && sample.last() != Some(&b'\n'));
+            let size_estimate = usize::try_from(metadata.len() / 80)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+            lines = lines.saturating_add(sampled_lines.max(size_estimate).min(10_000));
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
     let tests_changed = paths.iter().any(|path| {
         let value = path.to_string_lossy().to_ascii_lowercase();
         value.contains("test") || value.contains("spec")
