@@ -11,9 +11,14 @@
 //! session/handoff/mail) on the same vocabulary.
 //!
 //! The load-bearing property is `Scope::trust`: `Trust` is never a field a
-//! caller sets independently, only a value derived from `Scope`. A repo-owned
-//! surface cannot be promoted to operator authority because there is no
-//! constructor that lets it name `Trust::Operator` directly -- see its doc.
+//! caller sets independently, only a value derived from `Scope`. That alone
+//! is not enough, though, if `Scope` itself can be set independently of the
+//! `path` it is supposed to describe -- `ContextSurface`'s only public
+//! constructor, `for_path`, closes that gap by deriving `Global` vs.
+//! repo-owned from the path itself, so a repo-owned surface cannot be
+//! promoted to operator authority even by a caller trying to do so on
+//! purpose. See `ContextSurface`'s own doc for why an earlier, more
+//! permissive constructor shape was not enough.
 
 use std::path::{Path, PathBuf};
 
@@ -92,9 +97,13 @@ impl Scope {
     }
 }
 
-/// Authority a surface's content may carry. `RepoUntrusted` content may
-/// steer or inform a session but must never enable or widen zirv's own
-/// behavior -- the same asymmetry `REPO_FORBIDDEN` enforces for `ctx.toml`.
+/// Authority a surface's content may carry. Answers one question only --
+/// "may this content grant authority (change what zirv itself runs, or
+/// widen a security setting)?" -- never "who wrote this?" or "is this
+/// prose trustworthy to read?" (untrusted content is still read and shown;
+/// it just cannot act). `RepoUntrusted` content may steer or inform a
+/// session but must never enable or widen zirv's own behavior -- the same
+/// asymmetry `REPO_FORBIDDEN` enforces for `ctx.toml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trust {
     Operator,
@@ -107,6 +116,18 @@ pub enum Trust {
 /// Deliberately holds no content: `path` plus `provider`/`kind`/`scope` is
 /// provenance, not the surface's text, which callers already have from their
 /// own read (`optimize::Surface::text`, for instance) and cap independently.
+///
+/// Constructed only through `for_path` (which derives `Global` vs. repo-owned
+/// from the path itself, not from a caller-supplied flag) and the two
+/// refinement methods below, which can only move `scope` among the
+/// repo-owned variants. There is deliberately no general constructor that
+/// takes a free-standing `Scope` alongside an unrelated `path`: a prior
+/// version of this type did, and `ContextSurface::new(Provider::Claude,
+/// Kind::Instructions, Scope::Global, repo.join("CLAUDE.md"))` would have
+/// minted `Trust::Operator` for a repo-controlled path despite this module's
+/// own claim that such a promotion is impossible by construction. Closing
+/// that required removing the free parameter, not just documenting against
+/// using it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextSurface {
     provider: Provider,
@@ -116,7 +137,90 @@ pub struct ContextSurface {
 }
 
 impl ContextSurface {
-    pub fn new(provider: Provider, kind: Kind, scope: Scope, path: PathBuf) -> Self {
+    /// The classifier every real collector should use. `scope` starts as
+    /// `Global` or `Repo` purely from whether `path` sits inside `repo` --
+    /// the one distinction that is actually trust-relevant (`Scope::trust`
+    /// only distinguishes `Global` from everything else). A caller with more
+    /// specific provenance than "this path is inside the repo checkout"
+    /// (found via nested/bounded discovery, or known to be a
+    /// personal/uncommitted override) refines the result with
+    /// `into_nested()`/`into_local_private()` below, which can only move `scope`
+    /// among the repo-owned variants -- never back to `Global`, and never set
+    /// independently of this classification. This is what makes a
+    /// repo-owned path minting `Trust::Operator` unreachable through the
+    /// public API, not merely discouraged by convention.
+    pub fn for_path(
+        provider: Provider,
+        kind: Kind,
+        path: PathBuf,
+        repo: &Path,
+        home: Option<&Path>,
+    ) -> Self {
+        let scope = if path.starts_with(repo) {
+            Scope::Repo
+        } else {
+            Scope::Global
+        };
+        // The load-bearing check: a path inside the repo checkout must never
+        // classify as `Global`. Tautological given the `if`/`else` above --
+        // a regression guard against a future refactor of this function
+        // breaking that invariant, not a runtime discovery.
+        debug_assert!(
+            !(scope == Scope::Global && path.starts_with(repo)),
+            "a path under the repo checkout classified as Global: {path:?} is under {repo:?}"
+        );
+        // A secondary, non-load-bearing sanity check: when the caller does
+        // know the operator's home directory, a genuinely global surface
+        // should actually live under it.
+        if let Some(home) = home {
+            debug_assert!(
+                scope != Scope::Global || path.starts_with(home),
+                "a Global-scoped path is not under the given home directory: {path:?}"
+            );
+        }
+        Self::new(provider, kind, scope, path)
+    }
+
+    /// Refines an already repo-owned `for_path` result to `Nested` (found via
+    /// bounded directory-walk discovery, not a fixed repo-relative path).
+    /// Debug-asserts the surface was already repo-owned: this can only move
+    /// `scope` among `Repo`/`Nested`/`LocalPrivate`, never touch `Global`.
+    pub fn into_nested(mut self) -> Self {
+        debug_assert!(
+            self.scope.is_repo_owned(),
+            "into_nested called on a non-repo-owned surface: {:?}",
+            self.scope
+        );
+        self.scope = Scope::Nested;
+        self
+    }
+
+    /// Refines an already repo-owned `for_path` result to `LocalPrivate`
+    /// (e.g. `.claude/settings.local.json`): personal/uncommitted by
+    /// convention, but zirv cannot verify that, so trust is unaffected -- see
+    /// `Scope::trust`. Downstream reporting must phrase a `LocalPrivate`
+    /// surface by what `Scope` says it is ("an uncommitted local file, not
+    /// operator-authoritative"), never describe it as ordinary repository
+    /// content -- it is still physically inside the checkout and still
+    /// `RepoUntrusted`, but it is not the same thing as a committed,
+    /// team-shared file either. Same non-`Global` guarantee as `into_nested`.
+    pub fn into_local_private(mut self) -> Self {
+        debug_assert!(
+            self.scope.is_repo_owned(),
+            "into_local_private called on a non-repo-owned surface: {:?}",
+            self.scope
+        );
+        self.scope = Scope::LocalPrivate;
+        self
+    }
+
+    /// Not `pub`: the only way to reach this from outside the module is
+    /// through `for_path` (which derives `scope` from `path`) and the two
+    /// refinement methods above (which only narrow an already repo-owned
+    /// `scope`). Kept private rather than removed so this module's own tests
+    /// can still construct a bare `ContextSurface` to test `trust`/accessor
+    /// behavior directly, independent of path classification.
+    fn new(provider: Provider, kind: Kind, scope: Scope, path: PathBuf) -> Self {
         Self {
             provider,
             kind,
@@ -248,5 +352,90 @@ mod tests {
         assert_eq!(surface.kind(), Kind::PolicySettings);
         assert_eq!(surface.scope(), Scope::LocalPrivate);
         assert_eq!(surface.path(), Path::new("/repo/.codex/config.toml"));
+    }
+
+    /// The load-bearing property this task's review found missing: `for_path`
+    /// takes no `Scope` parameter at all, so there is nothing for a caller to
+    /// set wrong -- a path physically inside the repo checkout can never
+    /// classify as `Global`/`Trust::Operator`, no matter what provider/kind
+    /// is attached to it.
+    #[test]
+    fn for_path_can_never_promote_a_repo_owned_path_to_operator_trust() {
+        let repo = Path::new("/repo");
+        let surface = ContextSurface::for_path(
+            Provider::Claude,
+            Kind::Instructions,
+            repo.join("CLAUDE.md"),
+            repo,
+            None,
+        );
+        assert_ne!(surface.scope(), Scope::Global);
+        assert_eq!(surface.trust(), Trust::RepoUntrusted);
+
+        // Even a nested path, or one belonging to a provider/kind that has
+        // nothing to do with CLAUDE.md, still classifies purely from its
+        // relationship to `repo`.
+        let nested = ContextSurface::for_path(
+            Provider::Codex,
+            Kind::PolicySettings,
+            repo.join("crates/inner/config.toml"),
+            repo,
+            None,
+        );
+        assert_ne!(nested.scope(), Scope::Global);
+        assert_eq!(nested.trust(), Trust::RepoUntrusted);
+    }
+
+    #[test]
+    fn for_path_classifies_a_path_outside_the_repo_as_global() {
+        let repo = Path::new("/repo");
+        let home = Path::new("/home/operator");
+        let surface = ContextSurface::for_path(
+            Provider::Claude,
+            Kind::Instructions,
+            home.join("CLAUDE.md"),
+            repo,
+            Some(home),
+        );
+        assert_eq!(surface.scope(), Scope::Global);
+        assert_eq!(surface.trust(), Trust::Operator);
+    }
+
+    /// `into_nested`/`into_local_private` only ever narrow an already repo-owned
+    /// surface -- calling either on a `Global` one is a caller bug, and must
+    /// panic in a debug build rather than silently mint a mislabeled
+    /// surface. Neither call could produce `Trust::Operator` even if it
+    /// didn't panic (both target scopes are `RepoUntrusted`), so this test
+    /// is about correctness, not the trust boundary itself.
+    #[test]
+    fn into_nested_and_into_local_private_refuse_a_global_surface() {
+        let repo = Path::new("/repo");
+        let home = Path::new("/home/operator");
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let global = || {
+            ContextSurface::for_path(
+                Provider::Claude,
+                Kind::Instructions,
+                home.join("CLAUDE.md"),
+                repo,
+                Some(home),
+            )
+        };
+        let nested_result = std::panic::catch_unwind(|| global().into_nested());
+        let local_private_result = std::panic::catch_unwind(|| global().into_local_private());
+
+        std::panic::set_hook(previous_hook);
+
+        assert!(
+            nested_result.is_err(),
+            "into_nested must refuse a Global-scoped surface"
+        );
+        assert!(
+            local_private_result.is_err(),
+            "into_local_private must refuse a Global-scoped surface"
+        );
     }
 }

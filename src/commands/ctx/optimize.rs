@@ -105,15 +105,30 @@ impl Surface {
     /// This surface's provenance in the harness-neutral vocabulary
     /// (`surface::ContextSurface`), for callers that reason about trust or
     /// provider rather than this module's own `Layer` variants.
+    ///
+    /// `repo`/`home` are the same values `collect_surfaces` was given: the
+    /// `Global`-vs-repo-owned split is derived fresh from `self.path`'s
+    /// relationship to `repo` (`surface::ContextSurface::for_path`), not
+    /// copied from `self.layer.scope()` -- if a `Layer`'s own `scope()` were
+    /// ever wrong for the path it was actually collected from, this
+    /// conversion would not blindly repeat the mistake. `self.layer.scope()`
+    /// is still consulted, but only to choose which repo-owned refinement
+    /// (`into_nested`/`into_local_private`) to apply, never to decide `Global`.
     // No production caller yet -- Tasks 10-16's handoff API (issue #39).
     #[allow(dead_code)]
-    pub fn context_surface(&self) -> surface::ContextSurface {
-        surface::ContextSurface::new(
+    pub fn context_surface(&self, repo: &Path, home: Option<&Path>) -> surface::ContextSurface {
+        let generic = surface::ContextSurface::for_path(
             self.layer.provider(),
             self.layer.kind(),
-            self.layer.scope(),
             self.path.clone(),
-        )
+            repo,
+            home,
+        );
+        match self.layer.scope() {
+            surface::Scope::Nested => generic.into_nested(),
+            surface::Scope::LocalPrivate => generic.into_local_private(),
+            surface::Scope::Global | surface::Scope::Repo => generic,
+        }
     }
 }
 
@@ -1986,17 +2001,56 @@ mod tests {
 
     #[test]
     fn a_surface_produces_the_matching_generic_context_surface() {
+        let repo = Path::new("/repo");
         let surface = Surface {
             layer: Layer::RepoClaudeMd,
             path: PathBuf::from("/repo/CLAUDE.md"),
             text: "- always run tests".to_string(),
         };
-        let generic = surface.context_surface();
+        let generic = surface.context_surface(repo, None);
         assert_eq!(generic.provider(), surface::Provider::Claude);
         assert_eq!(generic.kind(), surface::Kind::Instructions);
         assert_eq!(generic.scope(), surface::Scope::Repo);
         assert_eq!(generic.trust(), surface::Trust::RepoUntrusted);
         assert_eq!(generic.path(), Path::new("/repo/CLAUDE.md"));
+    }
+
+    #[test]
+    fn a_global_surfaces_generic_scope_is_derived_from_its_path_not_copied() {
+        let repo = Path::new("/repo");
+        let home = Path::new("/home/operator");
+        let surface = Surface {
+            layer: Layer::GlobalClaudeMd,
+            path: home.join("CLAUDE.md"),
+            text: "- prefer rg over grep".to_string(),
+        };
+        let generic = surface.context_surface(repo, Some(home));
+        assert_eq!(generic.scope(), surface::Scope::Global);
+        assert_eq!(generic.trust(), surface::Trust::Operator);
+    }
+
+    #[test]
+    fn nested_and_local_layers_carry_their_refined_scope_through_context_surface() {
+        let repo = Path::new("/repo");
+        let nested = Surface {
+            layer: Layer::NestedClaudeMd,
+            path: repo.join("crates/inner/CLAUDE.md"),
+            text: "- inner rule".to_string(),
+        };
+        assert_eq!(
+            nested.context_surface(repo, None).scope(),
+            surface::Scope::Nested
+        );
+
+        let local = Surface {
+            layer: Layer::LocalSettings,
+            path: repo.join(".claude/settings.local.json"),
+            text: "{}".to_string(),
+        };
+        assert_eq!(
+            local.context_surface(repo, None).scope(),
+            surface::Scope::LocalPrivate
+        );
     }
 
     #[test]
