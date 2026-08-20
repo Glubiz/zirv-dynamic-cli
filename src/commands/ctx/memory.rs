@@ -274,14 +274,19 @@ fn slug_key(key: &str) -> String {
 /// repo from even switching the scope on for itself (`MemoryConfig::
 /// shared_enabled`). A shared `Entry`'s header fields (`Written`, `Verified`,
 /// `Written-By`, `Source`) are themselves attacker-supplied repo content, the
-/// same as the body -- a later task wiring this scope into ranking, recency,
-/// or overwrite-protection decisions must not treat any of them as
-/// trustworthy signal without its own independent check. Issue #37's
-/// `write_durable` deliberately makes no such decision at all: a durable
-/// harvest upserts by key unconditionally, regardless of an existing shared
-/// entry's own `Source`, precisely so it never has to trust this field for
-/// that purpose (the git-diff review before a commit is the actual safety
-/// net for an unwanted overwrite, not a `Source` check here).
+/// same as the body -- a later task wiring this scope into ranking or
+/// recency decisions must not treat any of them as trustworthy signal
+/// without its own independent check. Issue #37's `write_durable` is a
+/// deliberate, narrow exception for overwrite protection specifically: it
+/// DOES treat an existing shared entry's own `Source == "explicit"` as the
+/// signal that a harvest must never silently overwrite it (see
+/// `write_durable`'s own doc comment, "N4, restored for the shared scope") --
+/// the same trust the pre-#37 private-scope guard already placed in this
+/// exact field, and the one the project's coordinator explicitly re-asserted
+/// over "git-diff review is a sufficient safety net" for this decision. A
+/// hostile commit could in principle mark its own entry `Source: explicit`
+/// to make it harvest-immune; the operator's own git-diff review remains the
+/// backstop for *that* residual risk, on top of (not instead of) this check.
 // Consumed by the `zirv memory` CLI (`memory_cli.rs`, issue #33) and any
 // later injection work built on top of this store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,15 +521,19 @@ pub fn list_scoped_unchecked(
 /// to paper over the disagreement -- masking a repo-committed inconsistency
 /// would be worse than refusing it outright.
 ///
-/// Dormant again as of issue #35: `zirv memory recall`'s exact-match fast
-/// path (its one production caller since issue #33) was replaced by the
-/// ranking engine (`retrieval::select`), which scores every candidate
-/// itself rather than checking for an exact key first. Kept as public
-/// store API -- a future task may still want a direct single-key lookup --
-/// same "dormant read primitive" pattern `MemoryScope`/`list_scoped`
-/// followed before issue #33 gave them a consumer. Tracked as issue #68
-/// so this dormancy is not "discovered" as dead code by a later cleanup.
-#[allow(dead_code)]
+/// Was dormant between issues #35 and #37: `zirv memory recall`'s
+/// exact-match fast path (its one production caller since issue #33) was
+/// replaced by the ranking engine (`retrieval::select`), which scores every
+/// candidate itself rather than checking for an exact key first. Live again
+/// as of issue #37, and now with two callers, both applying the same
+/// "explicit beats inferred" N4 rule at a different write path: `write_
+/// durable` calls this before every upsert to check whether the key it is
+/// about to write already belongs to a deliberate, human-authored entry
+/// (`Source == "explicit"`) that a harvest must never silently overwrite --
+/// see `write_durable`'s own doc comment for the full N4-for-the-shared-scope
+/// rule this backs. `apply_init_proposals`'s own N4 guard (round-2 finding)
+/// uses this the same way, to look up a proposed key's existing shared entry
+/// before deciding whether a model-proposed init may overwrite it.
 pub fn get_scoped(
     scope: MemoryScope,
     repo: &Path,
@@ -1282,6 +1291,13 @@ fn render_prompt_line(entry: Entry, shared: bool) -> super::prompt::MemoryLine {
 // through the ordinary `upsert_scoped(Shared, ...)` path: no `git add`, no
 // commit, ever (see `a_harvest_never_invokes_git` below).
 //
+// N4 carries over unchanged in spirit, restored for the shared scope: a
+// harvested fact never overwrites an entry whose `Source` is `"explicit"`
+// (`write_durable`'s `get_scoped` check) -- model-proposed output silently
+// clobbering deliberate human knowledge is exactly the failure this project
+// guards against everywhere else, and git-diff reviewability is a second,
+// independent safety net on top of this check, never a substitute for it.
+//
 // Every harvest call is best-effort at every one of its four call sites: the
 // result is discarded with `let _ =`, so a failed or timed-out distiller
 // call, or a write refused by `upsert_shared`, can never turn a successful
@@ -1509,14 +1525,37 @@ pub fn filter_durable_candidates(
 
 /// Writes an already-filtered batch to the SHARED bank, each entry through
 /// `upsert_scoped(Shared, ...)` -- an existing key (harvested before, or from
-/// `zirv memory init`, or hand-curated) is updated in place rather than
-/// duplicated, exactly the "stable keys, upsert, never append-only" rule
-/// issue #37 asks for. Never touches git: `upsert_shared` (via `state::
-/// write_shared`) only ever writes an ordinary file with a temp-sibling
-/// rename, so a harvest leaves nothing but visible, unstaged working-tree
-/// changes for the operator's own `git add`/`git diff`/commit (see
-/// `a_harvest_never_invokes_git` below). Returns how many entries actually
-/// landed; a write refused partway through (a canonical-key collision from a
+/// `zirv memory init`) is updated in place rather than duplicated, exactly
+/// the "stable keys, upsert, never append-only" rule issue #37 asks for.
+/// Never touches git: `upsert_shared` (via `state::write_shared`) only ever
+/// writes an ordinary file with a temp-sibling rename, so a harvest leaves
+/// nothing but visible, unstaged working-tree changes for the operator's own
+/// `git add`/`git diff`/commit (see `a_harvest_never_invokes_git` below).
+///
+/// **N4, restored for the shared scope:** a harvested fact never overwrites
+/// an entry whose `Source` is `"explicit"` -- something a human or a session
+/// deliberately asked to remember, via `zirv ctx remember` or a hand-committed
+/// shared entry. `Source == "explicit"` marks a DELIBERATE act; a harvest is
+/// an INFERRED one, and the deliberate entry has by far the stronger claim to
+/// be right -- model-proposed output silently overwriting human-curated
+/// knowledge is exactly the failure this project guards against everywhere
+/// else (`REPO_FORBIDDEN` keys, fail-closed policy, `zirv memory init`'s own
+/// refusal to overwrite a populated bank without `--merge`/`--force`). Git-diff
+/// reviewability is a second, independent safety net on top of this one, not
+/// a replacement for it: an invariant enforced in code does not depend on an
+/// operator reading every diff carefully before committing. Checked with a
+/// fresh `get_scoped` read right before each write (not a single batch read
+/// up front), so a harvest never has to worry about acting on stale
+/// knowledge of what the bank looked like when the batch started. A skip is
+/// logged by key (`harvest-skipped`), the same as the pre-#37 private-scope
+/// guard did, so the behavior is observable rather than silent. Re-harvesting
+/// an entry that is itself already `source == "harvest"` (or `"init"`) is
+/// NOT protected this way -- only a deliberate `"explicit"` entry is -- so a
+/// previously-harvested key still refreshes normally when project truth
+/// changes, exactly as issue #37 asks.
+///
+/// Returns how many entries actually landed (skipped keys do not count); a
+/// write refused partway through (a canonical-key collision from a
 /// hand-edited file, for instance) propagates as `Err`, same as every other
 /// scoped write in this module.
 fn write_durable(
@@ -1529,6 +1568,23 @@ fn write_durable(
 ) -> CtxResult<usize> {
     let mut written = 0usize;
     for (key, body) in accepted {
+        if let Some(existing) = get_scoped(MemoryScope::Shared, repo, state, slug, cfg, key)?
+            && existing.source == "explicit"
+        {
+            let _ = super::log::append(
+                state,
+                &super::log::Decision {
+                    ts: now,
+                    session: "n/a",
+                    verb: "memory",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "harvest-skipped",
+                    detail: &format!("'{key}' is already an explicit entry"),
+                },
+            );
+            continue;
+        }
         let entry = Entry {
             key: key.clone(),
             written_by: "harvest".to_string(),
@@ -3785,20 +3841,21 @@ This should not appear in the body.\n";
         }
     }
 
-    /// Issue #37, design decision 3: re-harvesting an existing key upserts
-    /// it, regardless of who or what wrote the existing entry -- there is no
-    /// "protect explicit/init entries" special case the way the pre-#37
-    /// private-scope harvest had. The shared scope's own git-diff review is
-    /// the safety net for an unwanted overwrite, not a `Source` check here
-    /// (see the doc comment on `MemoryScope::Shared` and on `write_durable`).
+    /// **N4, restored for the shared scope (issue #37 fix round):** a
+    /// harvested fact must never overwrite an entry whose `Source` is
+    /// `"explicit"` -- the same invariant the pre-#37 private-scope harvest
+    /// enforced (`write_harvested`'s own `existing_explicit` guard), restored
+    /// here as `write_durable`'s `get_scoped` check. Pure: exercises
+    /// `write_durable` directly, no model involved, so it is real local
+    /// signal on every platform including this Windows workstation.
     #[test]
-    fn a_durable_harvest_updates_any_existing_key_rather_than_duplicating_it() {
+    fn a_harvested_fact_never_overwrites_an_explicit_entry() {
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let cfg = CtxConfig::default();
 
-        let existing = Entry {
+        let explicit = Entry {
             key: "build-cmd".to_string(),
             written_by: "claude".to_string(),
             written: 1_000,
@@ -3816,30 +3873,154 @@ This should not appear in the body.\n";
             &state,
             "-work-repo",
             &cfg,
-            &existing,
+            &explicit,
         )
         .expect("seed");
 
         let accepted = vec![
             (
                 "build-cmd".to_string(),
-                "cargo build (harvested)".to_string(),
+                "cargo build (inferred)".to_string(),
             ),
-            ("test-cmd".to_string(), "cargo test (harvested)".to_string()),
+            ("test-cmd".to_string(), "cargo test (inferred)".to_string()),
         ];
         let written = write_durable(repo.path(), &state, "-work-repo", &accepted, &cfg, 2_000)
             .expect("harvest writes");
-        assert_eq!(written, 2, "both candidates land: {accepted:?}");
+        assert_eq!(
+            written, 1,
+            "only the fact with no explicit entry is written"
+        );
 
-        let listed = list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
-            .expect("list");
-        let build_cmd: Vec<_> = listed
-            .iter()
-            .filter(|(_, e)| e.key == "build-cmd")
-            .collect();
-        assert_eq!(build_cmd.len(), 1, "updated, not duplicated: {listed:?}");
-        assert_eq!(build_cmd[0].1.body, "cargo build (harvested)");
-        assert_eq!(build_cmd[0].1.source, "harvest");
+        let kept = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            "build-cmd",
+        )
+        .expect("read")
+        .expect("the explicit entry is still there");
+        assert_eq!(
+            kept.body, explicit.body,
+            "the deliberate entry survives completely unchanged"
+        );
+        assert_eq!(kept.source, "explicit");
+        assert_eq!(kept.written, 1_000, "not even its timestamps are disturbed");
+        assert_eq!(kept.verified, 1_000);
+
+        let added = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            "test-cmd",
+        )
+        .expect("read")
+        .expect("the un-contested fact is written");
+        assert_eq!(added.source, "harvest");
+
+        // The skip is visible rather than silent, the same as the pre-#37
+        // private-scope guard.
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("harvest-skipped") && log.contains("build-cmd"),
+            "the skipped key must be named in the decision log: {log}"
+        );
+    }
+
+    /// Both halves of the restored N4 rule in one pass, so neither can
+    /// regress unnoticed by "fixing" the other: a key that already belongs
+    /// to a previously-*harvested* entry still gets refreshed when project
+    /// truth changes (issue #37's own "existing keys updated, not
+    /// duplicated" requirement), while a key that belongs to a deliberate
+    /// `"explicit"` entry is left completely untouched in the very same
+    /// batch. Pure: exercises `write_durable` directly, no model involved.
+    #[test]
+    fn a_harvest_updates_a_previously_harvested_key_but_never_an_explicit_one() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let explicit = Entry {
+            key: "staging-db-creds".to_string(),
+            written_by: "claude".to_string(),
+            written: 1_000,
+            verified: 1_000,
+            source: "explicit".to_string(),
+            body: "the staging DB creds live in 1Password.".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        let previously_harvested = Entry {
+            key: "build-cmd".to_string(),
+            written_by: "harvest".to_string(),
+            written: 1_000,
+            verified: 1_000,
+            source: "harvest".to_string(),
+            body: "cargo build".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        for entry in [&explicit, &previously_harvested] {
+            upsert_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                entry,
+            )
+            .expect("seed");
+        }
+
+        let accepted = vec![
+            (
+                "staging-db-creds".to_string(),
+                "creds moved to Vault under staging-db (inferred)".to_string(),
+            ),
+            ("build-cmd".to_string(), "cargo build --release".to_string()),
+        ];
+        let written = write_durable(repo.path(), &state, "-work-repo", &accepted, &cfg, 2_000)
+            .expect("harvest writes");
+        assert_eq!(written, 1, "only the previously-harvested key lands");
+
+        let still_explicit = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            "staging-db-creds",
+        )
+        .expect("read")
+        .expect("still there");
+        assert_eq!(
+            still_explicit.body, explicit.body,
+            "the explicit entry is never overwritten"
+        );
+
+        let refreshed = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+            "build-cmd",
+        )
+        .expect("read")
+        .expect("still there");
+        assert_eq!(
+            refreshed.body, "cargo build --release",
+            "the previously-harvested entry IS refreshed"
+        );
+        assert_eq!(refreshed.source, "harvest");
     }
 
     #[test]
