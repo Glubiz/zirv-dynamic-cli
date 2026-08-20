@@ -423,11 +423,7 @@ pub fn compose(
         }),
         workflow_context.as_deref(),
     );
-    let composed = with_memory_layer(
-        base,
-        memory,
-        memory_cap,
-    );
+    let composed = with_memory_layer(base, memory, memory_cap);
     // `with_memory_layer` only ever returns `None` when handed `None`, and
     // `composed` above is always `Some`.
     let mut composed = composed.expect("with_memory_layer never drops a Some it was given");

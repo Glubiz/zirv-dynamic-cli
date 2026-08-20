@@ -116,10 +116,18 @@ pub fn load_or_discover(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
     if path.exists() {
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(format!("verification config '{}' must be a regular file", path.display()).into());
+            return Err(format!(
+                "verification config '{}' must be a regular file",
+                path.display()
+            )
+            .into());
         }
         if usize::try_from(metadata.len()).unwrap_or(usize::MAX) > MAX_CONFIG_BYTES {
-            return Err(format!("verification config '{}' exceeds {MAX_CONFIG_BYTES} bytes", path.display()).into());
+            return Err(format!(
+                "verification config '{}' exceeds {MAX_CONFIG_BYTES} bytes",
+                path.display()
+            )
+            .into());
         }
         let config: VerificationConfig = toml::from_str(&std::fs::read_to_string(&path)?)?;
         config.validate()?;
@@ -205,9 +213,11 @@ pub fn load_or_discover(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
         schema_version: VERIFY_SCHEMA_VERSION,
         checks,
     };
-    config.validate().map_err(|_| -> Box<dyn std::error::Error> {
-        "no verification checks configured or safely discoverable; add .zirv/verify.toml".into()
-    })?;
+    config
+        .validate()
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            "no verification checks configured or safely discoverable; add .zirv/verify.toml".into()
+        })?;
     Ok((config, "discovered"))
 }
 
@@ -253,7 +263,11 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
         &["diff", "--name-only", "HEAD"][..],
         &["ls-files", "--others", "--exclude-standard"][..],
     ] {
-        let output = Command::new("git").arg("-C").arg(repo).args(args).output()?;
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()?;
         if !output.status.success() {
             return Err(format!(
                 "cannot inspect changed paths: {}",
@@ -475,9 +489,8 @@ fn run_check(repo: &Path, check: &CheckSpec, dry_run: bool) -> CheckResult {
         Ok((status, code, output))
     })();
 
-    let (status, exit_code, output) = result.unwrap_or_else(|err| {
-        (CheckStatus::Failed, None, err.to_string().into_bytes())
-    });
+    let (status, exit_code, output) =
+        result.unwrap_or_else(|err| (CheckStatus::Failed, None, err.to_string().into_bytes()));
     let failure_output = (status != CheckStatus::Passed).then(|| {
         crate::utils::truncate_bytes(
             String::from_utf8_lossy(&output).into_owned(),
@@ -527,7 +540,11 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<Verificati
     Ok(Some(report))
 }
 
-pub fn latest_is_fresh_and_passing(state: &StateDir, repo: &Path, final_only: bool) -> CtxResult<bool> {
+pub fn latest_is_fresh_and_passing(
+    state: &StateDir,
+    repo: &Path,
+    final_only: bool,
+) -> CtxResult<bool> {
     let Some(report) = load_latest(state, repo)? else {
         return Ok(false);
     };
@@ -564,7 +581,10 @@ fn run_mode(
                 check.paths.is_empty()
                     || paths.iter().any(|path| {
                         let path = path.to_string_lossy();
-                        check.paths.iter().any(|pattern| path_matches(pattern, &path))
+                        check
+                            .paths
+                            .iter()
+                            .any(|pattern| path_matches(pattern, &path))
                     })
             })
             .collect();
@@ -599,14 +619,11 @@ fn run_mode(
     if !dry_run {
         let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
         save_report(&state, &report)?;
-        let mut event = super::telemetry::TelemetryEvent::new(
-            super::telemetry::TelemetryKind::VerificationRun,
-        );
+        let mut event =
+            super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::VerificationRun);
         event.phase = Some(match mode {
             VerificationMode::Final => super::skill::WorkflowPhase::Verify,
-            VerificationMode::Changed | VerificationMode::All => {
-                super::skill::WorkflowPhase::Test
-            }
+            VerificationMode::Changed | VerificationMode::All => super::skill::WorkflowPhase::Test,
         });
         event.duration_ms = Some(
             report
@@ -686,10 +703,7 @@ fn write_report(writer: &mut impl Write, report: &VerificationReport, json: bool
             writeln!(
                 writer,
                 "{}\t{:?}\t{} ms\t{}",
-                check.id,
-                check.status,
-                check.duration_ms,
-                check.command
+                check.id, check.status, check.duration_ms, check.command
             )?;
             if let Some(output) = &check.failure_output {
                 writeln!(writer, "{output}")?;
@@ -711,7 +725,11 @@ pub fn run_test(args: &TestArgs, writer: &mut impl Write) -> CtxResult<i32> {
         args.dry_run,
     )?;
     write_report(writer, &report, args.json)?;
-    Ok(if args.dry_run || report.passed() { 0 } else { 1 })
+    Ok(if args.dry_run || report.passed() {
+        0
+    } else {
+        1
+    })
 }
 
 pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> {
@@ -722,7 +740,11 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
         args.run.dry_run,
     )?;
     write_report(writer, &report, args.run.json)?;
-    Ok(if args.run.dry_run || report.passed() { 0 } else { 1 })
+    Ok(if args.run.dry_run || report.passed() {
+        0
+    } else {
+        1
+    })
 }
 
 #[cfg(test)]
@@ -733,12 +755,19 @@ mod tests {
     #[test]
     fn discovers_rust_checks_without_external_services() {
         let repo = tempdir().unwrap();
-        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname='x'\nversion='0.1.0'\n")
-            .unwrap();
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .unwrap();
         let (config, source) = load_or_discover(repo.path()).unwrap();
         assert_eq!(source, "discovered");
         assert_eq!(
-            config.checks.iter().map(|check| check.id.as_str()).collect::<Vec<_>>(),
+            config
+                .checks
+                .iter()
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>(),
             ["format", "clippy", "test"]
         );
     }
@@ -780,7 +809,11 @@ mod tests {
             &CheckSpec {
                 id: "ok".into(),
                 kind: CheckKind::Custom,
-                command: if cfg!(windows) { "echo ok".into() } else { "printf ok".into() },
+                command: if cfg!(windows) {
+                    "echo ok".into()
+                } else {
+                    "printf ok".into()
+                },
                 paths: vec![],
                 changed: true,
                 final_check: true,

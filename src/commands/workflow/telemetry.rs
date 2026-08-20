@@ -192,7 +192,8 @@ pub fn list(state: &StateDir, repo: &Path) -> CtxResult<Vec<TelemetryEvent>> {
         if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(event) = serde_json::from_str::<TelemetryEvent>(&std::fs::read_to_string(entry.path())?)
+        if let Ok(event) =
+            serde_json::from_str::<TelemetryEvent>(&std::fs::read_to_string(entry.path())?)
             && event.schema_version == TELEMETRY_SCHEMA_VERSION
         {
             events.push(event);
@@ -258,15 +259,20 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut adapters: BTreeMap<String, AdapterStats> = BTreeMap::new();
     let mut verification_runs = 0usize;
     let mut verification_failures = 0usize;
-    let mut finding_snapshots: BTreeMap<String, (u64, String, u32, u32, u32)> =
-        BTreeMap::new();
+    let mut finding_snapshots: BTreeMap<String, (u64, String, u32, u32, u32)> = BTreeMap::new();
     for event in events {
         if let Some(phase) = event.phase {
             let entry = phases.entry(phase.to_string()).or_default();
             entry.events += 1;
-            entry.duration_ms = entry.duration_ms.saturating_add(event.duration_ms.unwrap_or(0));
-            entry.input_tokens = entry.input_tokens.saturating_add(event.input_tokens.unwrap_or(0));
-            entry.output_tokens = entry.output_tokens.saturating_add(event.output_tokens.unwrap_or(0));
+            entry.duration_ms = entry
+                .duration_ms
+                .saturating_add(event.duration_ms.unwrap_or(0));
+            entry.input_tokens = entry
+                .input_tokens
+                .saturating_add(event.input_tokens.unwrap_or(0));
+            entry.output_tokens = entry
+                .output_tokens
+                .saturating_add(event.output_tokens.unwrap_or(0));
             if event.succeeded == Some(false) {
                 entry.failures += 1;
             }
@@ -274,9 +280,15 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         if let Some(adapter) = &event.adapter {
             let entry = adapters.entry(adapter.clone()).or_default();
             entry.events += 1;
-            entry.duration_ms = entry.duration_ms.saturating_add(event.duration_ms.unwrap_or(0));
-            entry.input_tokens = entry.input_tokens.saturating_add(event.input_tokens.unwrap_or(0));
-            entry.output_tokens = entry.output_tokens.saturating_add(event.output_tokens.unwrap_or(0));
+            entry.duration_ms = entry
+                .duration_ms
+                .saturating_add(event.duration_ms.unwrap_or(0));
+            entry.input_tokens = entry
+                .input_tokens
+                .saturating_add(event.input_tokens.unwrap_or(0));
+            entry.output_tokens = entry
+                .output_tokens
+                .saturating_add(event.output_tokens.unwrap_or(0));
             if event.succeeded == Some(false) {
                 entry.failures += 1;
             }
@@ -347,9 +359,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     }
 }
 
-pub fn finding_counts(
-    findings: &[super::review::ReviewFinding],
-) -> (u32, u32, u32) {
+pub fn finding_counts(findings: &[super::review::ReviewFinding]) -> (u32, u32, u32) {
     let total = u32::try_from(findings.len()).unwrap_or(u32::MAX);
     let meaningful = findings
         .iter()
@@ -419,10 +429,29 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 stats.failures
             )?;
         }
-        writeln!(writer, "slowest phase: {}", report.slowest_phase.as_deref().unwrap_or("unknown"))?;
-        writeln!(writer, "most token-expensive phase: {}", report.most_token_expensive_phase.as_deref().unwrap_or("unknown"))?;
-        writeln!(writer, "verification: {} runs, {} failures", report.verification_runs, report.verification_failures)?;
-        writeln!(writer, "findings: {} total, {} meaningful, {} dismissed", report.findings_total, report.findings_meaningful, report.findings_dismissed)?;
+        writeln!(
+            writer,
+            "slowest phase: {}",
+            report.slowest_phase.as_deref().unwrap_or("unknown")
+        )?;
+        writeln!(
+            writer,
+            "most token-expensive phase: {}",
+            report
+                .most_token_expensive_phase
+                .as_deref()
+                .unwrap_or("unknown")
+        )?;
+        writeln!(
+            writer,
+            "verification: {} runs, {} failures",
+            report.verification_runs, report.verification_failures
+        )?;
+        writeln!(
+            writer,
+            "findings: {} total, {} meaningful, {} dismissed",
+            report.findings_total, report.findings_meaningful, report.findings_dismissed
+        )?;
     }
     Ok(0)
 }
@@ -434,7 +463,8 @@ mod tests {
 
     #[test]
     fn telemetry_schema_has_no_prompt_source_or_response_fields() {
-        let json = serde_json::to_value(TelemetryEvent::new(TelemetryKind::PhaseCompleted)).unwrap();
+        let json =
+            serde_json::to_value(TelemetryEvent::new(TelemetryKind::PhaseCompleted)).unwrap();
         let object = json.as_object().unwrap();
         for forbidden in ["prompt", "source_code", "response", "diff", "output"] {
             assert!(!object.contains_key(forbidden));

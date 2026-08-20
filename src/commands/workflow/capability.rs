@@ -238,18 +238,17 @@ mod tests {
 
     #[test]
     fn policy_can_narrow_but_not_promote_unsupported_adapter_support() {
-        let denied = CapabilityReport::for_adapter("claude")
-            .with_policy(|cap| match cap {
-                CapabilityId::RepoWrite => PolicyDecision::Deny,
-                _ => PolicyDecision::Allow,
-            });
+        let denied = CapabilityReport::for_adapter("claude").with_policy(|cap| match cap {
+            CapabilityId::RepoWrite => PolicyDecision::Deny,
+            _ => PolicyDecision::Allow,
+        });
         assert_eq!(
             denied.support(CapabilityId::RepoWrite),
             SupportLevel::Unsupported
         );
 
-        let unknown = CapabilityReport::for_adapter("future")
-            .with_policy(|_| PolicyDecision::Allow);
+        let unknown =
+            CapabilityReport::for_adapter("future").with_policy(|_| PolicyDecision::Allow);
         assert_eq!(
             unknown.support(CapabilityId::RepoRead),
             SupportLevel::Unsupported

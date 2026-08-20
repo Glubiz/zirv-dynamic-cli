@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use super::classify::{self, Classification, Complexity, Intent, RiskBand};
 use super::skill::{SkillRegistry, WorkflowPhase};
 use crate::commands::ctx::CtxResult;
-use crate::commands::ctx::state::{StateDir, create_private_dir_all, now_secs, repo_slug, write_private};
+use crate::commands::ctx::state::{
+    StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
+};
 
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
 const MAX_STEP_ATTEMPTS: u8 = 3;
@@ -125,11 +127,35 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
             kind: WorkflowKind::Feature,
             description: "Design, implement, test and proportionally review a feature.".into(),
             steps: vec![
-                step("design", Phase::Design, "design", When::ComplexityAtLeast(C::Substantial), true),
-                step("plan", Phase::Plan, "plan", When::ComplexityAtLeast(C::Substantial), false),
-                step("implement", Phase::Implement, "implement", When::Always, false),
+                step(
+                    "design",
+                    Phase::Design,
+                    "design",
+                    When::ComplexityAtLeast(C::Substantial),
+                    true,
+                ),
+                step(
+                    "plan",
+                    Phase::Plan,
+                    "plan",
+                    When::ComplexityAtLeast(C::Substantial),
+                    false,
+                ),
+                step(
+                    "implement",
+                    Phase::Implement,
+                    "implement",
+                    When::Always,
+                    false,
+                ),
                 step("test", Phase::Test, "testing", When::Always, false),
-                step("review", Phase::Review, "review", When::RiskAtLeast(R::Medium), false),
+                step(
+                    "review",
+                    Phase::Review,
+                    "review",
+                    When::RiskAtLeast(R::Medium),
+                    false,
+                ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
             ],
         },
@@ -138,10 +164,28 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
             kind: WorkflowKind::Bugfix,
             description: "Reproduce, fix, test and verify a defect.".into(),
             steps: vec![
-                step("debug", Phase::Debug, "systematic-debugging", When::Always, false),
-                step("implement", Phase::Implement, "implement", When::Always, false),
+                step(
+                    "debug",
+                    Phase::Debug,
+                    "systematic-debugging",
+                    When::Always,
+                    false,
+                ),
+                step(
+                    "implement",
+                    Phase::Implement,
+                    "implement",
+                    When::Always,
+                    false,
+                ),
                 step("test", Phase::Test, "testing", When::Always, false),
-                step("review", Phase::Review, "review", When::RiskAtLeast(R::Medium), false),
+                step(
+                    "review",
+                    Phase::Review,
+                    "review",
+                    When::RiskAtLeast(R::Medium),
+                    false,
+                ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
             ],
         },
@@ -150,10 +194,28 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
             kind: WorkflowKind::Refactor,
             description: "Refactor with behavior-preserving tests and proportional review.".into(),
             steps: vec![
-                step("design", Phase::Design, "design", When::ComplexityAtLeast(C::Substantial), true),
-                step("implement", Phase::Implement, "implement", When::Always, false),
+                step(
+                    "design",
+                    Phase::Design,
+                    "design",
+                    When::ComplexityAtLeast(C::Substantial),
+                    true,
+                ),
+                step(
+                    "implement",
+                    Phase::Implement,
+                    "implement",
+                    When::Always,
+                    false,
+                ),
                 step("test", Phase::Test, "testing", When::Always, false),
-                step("review", Phase::Review, "review", When::RiskAtLeast(R::Medium), false),
+                step(
+                    "review",
+                    Phase::Review,
+                    "review",
+                    When::RiskAtLeast(R::Medium),
+                    false,
+                ),
                 step("verify", Phase::Verify, "verify", When::Always, false),
             ],
         },
@@ -163,8 +225,20 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
             description: "Time-bounded exploration with explicit findings.".into(),
             steps: vec![
                 step("design", Phase::Design, "design", When::Always, false),
-                step("implement", Phase::Implement, "implement", When::Always, false),
-                step("verify", Phase::Verify, "verify", When::RiskAtLeast(R::Medium), false),
+                step(
+                    "implement",
+                    Phase::Implement,
+                    "implement",
+                    When::Always,
+                    false,
+                ),
+                step(
+                    "verify",
+                    Phase::Verify,
+                    "verify",
+                    When::RiskAtLeast(R::Medium),
+                    false,
+                ),
             ],
         },
         WorkflowDefinition {
@@ -173,7 +247,13 @@ pub fn definitions() -> Vec<WorkflowDefinition> {
             description: "Independent review with inspectable disposition.".into(),
             steps: vec![
                 step("review", Phase::Review, "review", When::Always, false),
-                step("verify", Phase::Verify, "verify", When::RiskAtLeast(R::High), false),
+                step(
+                    "verify",
+                    Phase::Verify,
+                    "verify",
+                    When::RiskAtLeast(R::High),
+                    false,
+                ),
             ],
         },
     ]
@@ -345,7 +425,10 @@ pub fn advance_with_evidence(
     if state.status != WorkflowStatus::Running {
         return Err(format!("workflow is {:?}, not running", state.status).into());
     }
-    let current = state.current().cloned().ok_or("workflow has no current step")?;
+    let current = state
+        .current()
+        .cloned()
+        .ok_or("workflow has no current step")?;
     match outcome {
         StepOutcome::Success => {
             if current.phase == WorkflowPhase::Review {
@@ -389,7 +472,11 @@ pub fn advance_with_evidence(
                     &state.repo,
                     final_only,
                 )? {
-                    let command = if final_only { "zirv verify" } else { "zirv test changed" };
+                    let command = if final_only {
+                        "zirv verify"
+                    } else {
+                        "zirv test changed"
+                    };
                     return Err(format!(
                         "step '{}' requires fresh passing evidence for the current change set; run `{command}`",
                         current.id
@@ -502,7 +589,10 @@ pub fn render_current_context(
     let stack = registry.resolve_stack(&step.skill)?;
     let mut rendered = format!(
         "zirv workflow step\nworkflow: {}\nstep: {}\nphase: {}\nstate: {:?}\n",
-        state.kind.as_str(), step.id, step.phase, state.status
+        state.kind.as_str(),
+        step.id,
+        step.phase,
+        state.status
     );
     for skill in stack {
         rendered.push_str(&format!(
@@ -667,7 +757,11 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
             state.classification.risk
         )?;
         if let Some(step) = state.current() {
-            writeln!(writer, "current: {} ({}, skill {})", step.id, step.phase, step.skill)?;
+            writeln!(
+                writer,
+                "current: {} ({}, skill {})",
+                step.id, step.phase, step.skill
+            )?;
         } else {
             writeln!(writer, "current: none")?;
         }
@@ -685,7 +779,12 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 writeln!(writer)?;
             } else {
                 for definition in definitions {
-                    writeln!(writer, "{}\t{}", definition.kind.as_str(), definition.description)?;
+                    writeln!(
+                        writer,
+                        "{}\t{}",
+                        definition.kind.as_str(),
+                        definition.description
+                    )?;
                 }
             }
         }
@@ -695,7 +794,12 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 serde_json::to_writer_pretty(&mut *writer, &definition)?;
                 writeln!(writer)?;
             } else {
-                writeln!(writer, "{}: {}", definition.kind.as_str(), definition.description)?;
+                writeln!(
+                    writer,
+                    "{}: {}",
+                    definition.kind.as_str(),
+                    definition.description
+                )?;
                 for step in definition.steps {
                     writeln!(
                         writer,
@@ -737,11 +841,8 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let classification = classify::from_args(&classify_args)?;
             let definition = definition(args.kind);
             if let Some(agent) = &args.agent {
-                let registry = SkillRegistry::load(
-                    &repo,
-                    dirs::home_dir().as_deref(),
-                    !args.built_in_only,
-                )?;
+                let registry =
+                    SkillRegistry::load(&repo, dirs::home_dir().as_deref(), !args.built_in_only)?;
                 let report = super::capability::CapabilityReport::for_adapter(agent);
                 for step in definition.materialize(&classification) {
                     registry.ensure_supported(&step.skill, &report)?;
@@ -863,7 +964,10 @@ mod tests {
     fn low_risk_feature_uses_fast_path_without_design_or_review() {
         let steps = definition(WorkflowKind::Feature).materialize(&low_classification());
         assert_eq!(
-            steps.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(),
+            steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
             ["implement", "test", "verify"]
         );
     }
@@ -1006,15 +1110,17 @@ mod tests {
             true,
             low_classification(),
         );
-        state.review_findings.push(super::super::review::ReviewFinding {
-            id: "finding-1".into(),
-            severity: super::super::review::FindingSeverity::Major,
-            summary: "concrete defect".into(),
-            path: None,
-            line: None,
-            disposition: super::super::review::FindingDisposition::Open,
-            created_at: now_secs(),
-        });
+        state
+            .review_findings
+            .push(super::super::review::ReviewFinding {
+                id: "finding-1".into(),
+                severity: super::super::review::FindingSeverity::Major,
+                summary: "concrete defect".into(),
+                path: None,
+                line: None,
+                disposition: super::super::review::FindingDisposition::Open,
+                created_at: now_secs(),
+            });
         let error =
             advance_with_evidence(&state_dir, state, StepOutcome::Success, None).unwrap_err();
         assert!(error.to_string().contains("final disposition"));

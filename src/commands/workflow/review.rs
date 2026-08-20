@@ -16,6 +16,9 @@ use crate::commands::ctx::state::{StateDir, now_secs};
 
 const MAX_REVIEW_DIFF_BYTES: usize = 96 * 1024;
 const MAX_REVIEW_EVIDENCE: usize = 16;
+const MAX_REVIEW_FINDINGS: usize = 256;
+const MAX_FINDING_SUMMARY_BYTES: usize = 4 * 1024;
+const MAX_FINDING_PATH_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -135,7 +138,11 @@ pub struct ReviewPackage {
 }
 
 fn git(repo: &Path, args: &[&str]) -> CtxResult<String> {
-    let output = Command::new("git").arg("-C").arg(repo).args(args).output()?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?;
     if !output.status.success() {
         return Err(format!(
             "git {} failed: {}",
@@ -183,14 +190,24 @@ fn git_diff_capped(repo: &Path, base_sha: &str) -> CtxResult<(String, bool)> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stdout = child.stdout.take().ok_or("git diff stdout was not captured")?;
-    let stderr = child.stderr.take().ok_or("git diff stderr was not captured")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("git diff stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("git diff stderr was not captured")?;
     let stderr_thread = std::thread::spawn(move || read_capped_head(stderr, 16 * 1024).0);
     let (stdout, truncated) = read_capped_head(stdout, MAX_REVIEW_DIFF_BYTES);
     let status = child.wait()?;
     let stderr = stderr_thread.join().unwrap_or_default();
     if !status.success() {
-        return Err(format!("git diff failed: {}", String::from_utf8_lossy(&stderr).trim()).into());
+        return Err(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )
+        .into());
     }
     Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
 }
@@ -200,7 +217,10 @@ fn append_capped(target: &mut String, text: &str, cap: usize, truncated: &mut bo
     if text.len() <= remaining {
         target.push_str(text);
     } else {
-        target.push_str(&crate::utils::truncate_bytes(text.to_string(), Some(remaining)));
+        target.push_str(&crate::utils::truncate_bytes(
+            text.to_string(),
+            Some(remaining),
+        ));
         *truncated = true;
     }
 }
@@ -252,6 +272,20 @@ pub fn package(
     state: &WorkflowState,
     base: Option<&str>,
 ) -> CtxResult<ReviewPackage> {
+    if state.review_findings.len() > MAX_REVIEW_FINDINGS {
+        return Err(format!(
+            "workflow has more than {MAX_REVIEW_FINDINGS} review findings; dispose or consolidate findings before packaging"
+        )
+        .into());
+    }
+    if state.review_findings.iter().any(|finding| {
+        finding.summary.len() > MAX_FINDING_SUMMARY_BYTES
+            || finding.path.as_ref().is_some_and(|path| {
+                path.to_string_lossy().len() > MAX_FINDING_PATH_BYTES
+            })
+    }) {
+        return Err("workflow contains an oversized review finding".into());
+    }
     let base_sha = match base {
         Some(base) => git(&state.repo, &["rev-parse", base])?,
         None => default_base(&state.repo)?,
@@ -261,23 +295,19 @@ pub fn package(
     // and unstaged edits. Git omits untracked files, so include bounded file
     // bodies for those explicitly and union them into the changed path list.
     let (mut diff, mut diff_truncated) = git_diff_capped(&state.repo, &base_sha)?;
-    let untracked: Vec<PathBuf> = git(
-        &state.repo,
-        &["ls-files", "--others", "--exclude-standard"],
-    )?
-    .lines()
-    .filter(|line| !line.is_empty())
-    .map(PathBuf::from)
-    .collect();
+    let untracked: Vec<PathBuf> =
+        git(&state.repo, &["ls-files", "--others", "--exclude-standard"])?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
     append_untracked(&mut diff, &mut diff_truncated, &state.repo, &untracked)?;
-    let mut changed_paths: BTreeSet<PathBuf> = git(
-        &state.repo,
-        &["diff", "--name-only", &base_sha],
-    )?
-    .lines()
-    .filter(|line| !line.is_empty())
-    .map(PathBuf::from)
-    .collect();
+    let mut changed_paths: BTreeSet<PathBuf> =
+        git(&state.repo, &["diff", "--name-only", &base_sha])?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
     changed_paths.extend(untracked);
     let changed_paths = changed_paths.into_iter().collect();
     let current_fingerprint = verification::change_fingerprint(&state.repo)?;
@@ -400,11 +430,9 @@ fn save_state(state_dir: &StateDir, state: &WorkflowState) -> CtxResult<()> {
 }
 
 fn record_finding_update(state_dir: &StateDir, state: &WorkflowState) {
-    let (total, meaningful, dismissed) =
-        super::telemetry::finding_counts(&state.review_findings);
-    let mut event = super::telemetry::TelemetryEvent::new(
-        super::telemetry::TelemetryKind::FindingUpdated,
-    );
+    let (total, meaningful, dismissed) = super::telemetry::finding_counts(&state.review_findings);
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::FindingUpdated);
     event.workflow_id = Some(state.id.clone());
     event.phase = Some(super::skill::WorkflowPhase::Review);
     event.intent = Some(state.classification.intent);
@@ -425,8 +453,8 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<i32> {
     if agent.is_empty()
         || agent.len() > 64
         || !agent
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Err(format!("invalid adapter name '{agent}'").into());
     }
@@ -455,12 +483,29 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 serde_json::to_writer_pretty(&mut *writer, &package)?;
                 writeln!(writer)?;
             } else {
-                writeln!(writer, "review package {}..{}", package.base_sha, package.head_sha)?;
+                writeln!(
+                    writer,
+                    "review package {}..{}",
+                    package.base_sha, package.head_sha
+                )?;
                 writeln!(writer, "depth: {:?}", package.review_depth)?;
                 writeln!(writer, "changed paths: {}", package.changed_paths.len())?;
-                writeln!(writer, "diff bytes: {}{}", package.diff.len(), if package.diff_truncated { " (truncated)" } else { "" })?;
+                writeln!(
+                    writer,
+                    "diff bytes: {}{}",
+                    package.diff.len(),
+                    if package.diff_truncated {
+                        " (truncated)"
+                    } else {
+                        ""
+                    }
+                )?;
                 if let Some(evidence) = &package.verification {
-                    writeln!(writer, "verification: {} passed={}", evidence.report_id, evidence.passed)?;
+                    writeln!(
+                        writer,
+                        "verification: {} passed={}",
+                        evidence.report_id, evidence.passed
+                    )?;
                 } else {
                     writeln!(writer, "verification: none")?;
                 }
@@ -472,15 +517,16 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 return Err("risk policy selects self-verification; an independent reviewer is not required".into());
             }
             if state.status != WorkflowStatus::Running
-                || state.current().map(|step| step.phase) != Some(super::skill::WorkflowPhase::Review)
+                || state.current().map(|step| step.phase)
+                    != Some(super::skill::WorkflowPhase::Review)
             {
                 return Err("independent review can only run during an active review step".into());
             }
             let package = package(&state_dir, &state, args.base.as_deref())?;
             let started = std::time::Instant::now();
             let code = launch_reviewer(&args.agent, &package)?;
-            let fingerprint_unchanged = verification::change_fingerprint(&state.repo)?
-                == package.change_fingerprint;
+            let fingerprint_unchanged =
+                verification::change_fingerprint(&state.repo)? == package.change_fingerprint;
             if code == 0 && fingerprint_unchanged {
                 state.review_evidence.push(ReviewRunEvidence {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -489,7 +535,10 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     review_round: package.review_round,
                     completed_at: now_secs(),
                 });
-                let overflow = state.review_evidence.len().saturating_sub(MAX_REVIEW_EVIDENCE);
+                let overflow = state
+                    .review_evidence
+                    .len()
+                    .saturating_sub(MAX_REVIEW_EVIDENCE);
                 if overflow > 0 {
                     state.review_evidence.drain(..overflow);
                 }
@@ -498,17 +547,15 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
             let (total, meaningful, dismissed) =
                 super::telemetry::finding_counts(&state.review_findings);
-            let mut event = super::telemetry::TelemetryEvent::new(
-                super::telemetry::TelemetryKind::ReviewRun,
-            );
+            let mut event =
+                super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::ReviewRun);
             event.workflow_id = Some(state.id.clone());
             event.phase = Some(super::skill::WorkflowPhase::Review);
             event.intent = Some(state.classification.intent);
             event.complexity = Some(state.classification.complexity);
             event.risk = Some(state.classification.risk);
-            event.duration_ms = Some(
-                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            );
+            event.duration_ms =
+                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
             event.adapter = Some(args.agent.clone());
             event.succeeded = Some(code == 0 && fingerprint_unchanged);
             event.findings_total = total;
@@ -531,18 +578,36 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         ReviewCommand::Add(args) => {
             let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
+            if state.review_findings.len() >= MAX_REVIEW_FINDINGS {
+                return Err(format!(
+                    "workflow already has the maximum of {MAX_REVIEW_FINDINGS} review findings"
+                )
+                .into());
+            }
+            let summary = args.summary.trim();
+            if summary.is_empty() {
+                return Err("finding summary must not be empty".into());
+            }
+            if summary.len() > MAX_FINDING_SUMMARY_BYTES {
+                return Err(format!(
+                    "finding summary exceeds {MAX_FINDING_SUMMARY_BYTES} bytes"
+                )
+                .into());
+            }
+            if args.path.as_ref().is_some_and(|path| {
+                path.to_string_lossy().len() > MAX_FINDING_PATH_BYTES
+            }) {
+                return Err(format!("finding path exceeds {MAX_FINDING_PATH_BYTES} bytes").into());
+            }
             let finding = ReviewFinding {
                 id: uuid::Uuid::new_v4().to_string(),
                 severity: args.severity,
-                summary: args.summary.trim().to_string(),
+                summary: summary.to_string(),
                 path: args.path.clone(),
                 line: args.line,
                 disposition: FindingDisposition::Open,
                 created_at: now_secs(),
             };
-            if finding.summary.is_empty() {
-                return Err("finding summary must not be empty".into());
-            }
             state.review_findings.push(finding.clone());
             state.updated_at = now_secs();
             save_state(&state_dir, &state)?;

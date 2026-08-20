@@ -56,10 +56,7 @@ pub struct PresentationPlan {
 /// Current CLI adapters have no verified native artifact API. Static files
 /// are therefore the honest default. The Context Compiler/provider adapter
 /// work can flip this without changing skill instructions.
-pub fn presentation_plan(
-    adapter: &str,
-    interactive_required: bool,
-) -> CtxResult<PresentationPlan> {
+pub fn presentation_plan(adapter: &str, interactive_required: bool) -> CtxResult<PresentationPlan> {
     let capabilities = CapabilityReport::for_adapter(adapter);
     if capabilities.support(CapabilityId::ArtifactRender) == SupportLevel::Unsupported {
         return Err(format!("adapter '{adapter}' cannot render artifacts").into());
@@ -146,9 +143,8 @@ pub fn register(
         &record_path(state, &repo, &record.id)?,
         &serde_json::to_string_pretty(&record)?,
     )?;
-    let mut event = super::telemetry::TelemetryEvent::new(
-        super::telemetry::TelemetryKind::ArtifactProduced,
-    );
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::ArtifactProduced);
     event.workflow_id = record.workflow_id.clone();
     event.phase = Some(super::skill::WorkflowPhase::Present);
     event.artifact_count = 1;
@@ -162,9 +158,9 @@ pub fn register(
 }
 
 pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<ArtifactRecord> {
-    Ok(serde_json::from_str(&std::fs::read_to_string(record_path(
-        state, repo, id,
-    )?)?)?)
+    Ok(serde_json::from_str(&std::fs::read_to_string(
+        record_path(state, repo, id)?,
+    )?)?)
 }
 
 pub fn list(state: &StateDir, repo: &Path) -> CtxResult<Vec<ArtifactRecord>> {
@@ -347,7 +343,13 @@ pub fn run(args: &ArtifactArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 serde_json::to_writer_pretty(&mut *writer, &record)?;
                 writeln!(writer)?;
             } else {
-                writeln!(writer, "{}\t{:?}\t{}", record.id, record.kind, record.path.display())?;
+                writeln!(
+                    writer,
+                    "{}\t{:?}\t{}",
+                    record.id,
+                    record.kind,
+                    record.path.display()
+                )?;
             }
         }
         ArtifactCommand::List(args) => {
@@ -357,7 +359,13 @@ pub fn run(args: &ArtifactArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 writeln!(writer)?;
             } else {
                 for record in records {
-                    writeln!(writer, "{}\t{:?}\t{}", record.id, record.kind, record.path.display())?;
+                    writeln!(
+                        writer,
+                        "{}\t{:?}\t{}",
+                        record.id,
+                        record.kind,
+                        record.path.display()
+                    )?;
                 }
             }
         }
@@ -367,7 +375,14 @@ pub fn run(args: &ArtifactArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 serde_json::to_writer_pretty(&mut *writer, &record)?;
                 writeln!(writer)?;
             } else {
-                writeln!(writer, "{}\nkind: {:?}\npath: {}\nsize: {} B", record.id, record.kind, record.path.display(), record.size_bytes)?;
+                writeln!(
+                    writer,
+                    "{}\nkind: {:?}\npath: {}\nsize: {} B",
+                    record.id,
+                    record.kind,
+                    record.path.display(),
+                    record.size_bytes
+                )?;
             }
         }
         ArtifactCommand::Present(args) => {
@@ -378,7 +393,12 @@ pub fn run(args: &ArtifactArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 serde_json::to_writer_pretty(&mut *writer, &plan)?;
                 writeln!(writer)?;
             } else {
-                writeln!(writer, "method: {:?}\nartifact: {}", plan.method, record.path.display())?;
+                writeln!(
+                    writer,
+                    "method: {:?}\nartifact: {}",
+                    plan.method,
+                    record.path.display()
+                )?;
             }
             if plan.method == PresentationMethod::InteractiveServer {
                 run_interactive(args, &repo)?;

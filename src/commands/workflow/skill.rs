@@ -16,9 +16,7 @@ pub const MAX_INSTRUCTION_BUDGET: usize = 8 * 1024;
 const MAX_SKILL_DIRECTORY_ENTRIES: usize = 512;
 const MAX_RESOLVED_CONTEXT_BYTES: usize = 32 * 1024;
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkflowPhase {
     Design,
@@ -71,11 +69,7 @@ impl SkillManifest {
             .into());
         }
         if !valid_id(&self.id) {
-            return Err(format!(
-                "skill id '{}' must match [a-z0-9][a-z0-9._-]*",
-                self.id
-            )
-            .into());
+            return Err(format!("skill id '{}' must match [a-z0-9][a-z0-9._-]*", self.id).into());
         }
         if self.version == 0 {
             return Err(format!("skill '{}': version must be at least 1", self.id).into());
@@ -119,11 +113,9 @@ impl SkillManifest {
         }
         for dependency in &self.dependencies {
             if !valid_id(dependency) || dependency == &self.id {
-                return Err(format!(
-                    "skill '{}': invalid dependency '{}'",
-                    self.id, dependency
-                )
-                .into());
+                return Err(
+                    format!("skill '{}': invalid dependency '{}'", self.id, dependency).into(),
+                );
             }
         }
         Ok(())
@@ -132,10 +124,11 @@ impl SkillManifest {
 
 fn valid_id(id: &str) -> bool {
     let mut chars = id.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars.all(|c| {
-            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
-        })
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -393,7 +386,12 @@ fn load_dir(
         }
         let canonical = path.canonicalize()?;
         if !canonical.starts_with(&canonical_root) {
-            return Err(format!("skill manifest escapes '{}': {}", root.display(), path.display()).into());
+            return Err(format!(
+                "skill manifest escapes '{}': {}",
+                root.display(),
+                path.display()
+            )
+            .into());
         }
         let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
         if size > MAX_MANIFEST_BYTES {
@@ -445,7 +443,10 @@ fn manifest(
         optional_capabilities: optional_capabilities.to_vec(),
         context_budget_bytes: instructions.len().max(1),
         phases: phases.to_vec(),
-        dependencies: dependencies.iter().map(|value| (*value).to_string()).collect(),
+        dependencies: dependencies
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
         instructions: instructions.to_string(),
     }
 }
@@ -662,10 +663,7 @@ pub fn run(args: &SkillArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 .into_iter()
                 .map(|skill| skill.manifest.id.as_str())
                 .collect();
-            let capability_report = args
-                .agent
-                .as_deref()
-                .map(CapabilityReport::for_adapter);
+            let capability_report = args.agent.as_deref().map(CapabilityReport::for_adapter);
             if let Some(report) = &capability_report {
                 registry.ensure_supported(&args.id, report)?;
             }
@@ -685,7 +683,11 @@ pub fn run(args: &SkillArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 if let Some(path) = &skill.source_path {
                     writeln!(writer, "path: {}", path.display())?;
                 }
-                writeln!(writer, "budget: {} bytes", skill.manifest.context_budget_bytes)?;
+                writeln!(
+                    writer,
+                    "budget: {} bytes",
+                    skill.manifest.context_budget_bytes
+                )?;
                 if !dependency_order.is_empty() {
                     writeln!(writer, "resolution: {}", dependency_order.join(" -> "))?;
                 }
@@ -842,7 +844,11 @@ mod tests {
             &outside.path().join("outside.yaml"),
             "schema_version: 1\nid: outside\nversion: 1\nname: Outside\ndescription: test\ncontext_budget_bytes: 16\ninstructions: test\n",
         );
-        symlink(outside.path().join("outside.yaml"), dir.join("outside.yaml")).unwrap();
+        symlink(
+            outside.path().join("outside.yaml"),
+            dir.join("outside.yaml"),
+        )
+        .unwrap();
         let error = SkillRegistry::load(repo.path(), None, true).unwrap_err();
         assert!(error.to_string().contains("symlinked"));
     }

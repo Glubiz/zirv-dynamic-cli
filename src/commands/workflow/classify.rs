@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::ctx::CtxResult;
 
+const MAX_TASK_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Intent {
@@ -21,9 +23,7 @@ pub enum Intent {
     Other,
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Complexity {
     Trivial,
@@ -32,9 +32,7 @@ pub enum Complexity {
     Architectural,
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum RiskBand {
     Low,
@@ -66,6 +64,9 @@ pub struct ClassificationInput {
 }
 
 pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
+    if input.task.len() > MAX_TASK_BYTES {
+        return Err(format!("task summary exceeds {MAX_TASK_BYTES} bytes").into());
+    }
     let task = input.task.to_ascii_lowercase();
     let intent = input.intent_override.unwrap_or_else(|| infer_intent(&task));
     let changed_files = input.paths.len();
@@ -77,7 +78,11 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
     let lowered_paths: Vec<String> = input
         .paths
         .iter()
-        .map(|path| path.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+        .map(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+        })
         .collect();
     let mut sensitive_floor = None;
     add_path_signal(
@@ -88,7 +93,10 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         &mut score,
         &mut reasons,
     );
-    if reasons.iter().any(|reason| reason == "authentication/security surface") {
+    if reasons
+        .iter()
+        .any(|reason| reason == "authentication/security surface")
+    {
         sensitive_floor = Some(RiskBand::High);
     }
     add_path_signal(
@@ -99,12 +107,21 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         &mut score,
         &mut reasons,
     );
-    if reasons.iter().any(|reason| reason == "database/schema surface") {
+    if reasons
+        .iter()
+        .any(|reason| reason == "database/schema surface")
+    {
         sensitive_floor = Some(RiskBand::High);
     }
     add_path_signal(
         &lowered_paths,
-        &["deploy", "docker", ".github/workflows", "terraform", "config"],
+        &[
+            "deploy",
+            "docker",
+            ".github/workflows",
+            "terraform",
+            "config",
+        ],
         20,
         "deployment/configuration surface",
         &mut score,
@@ -135,7 +152,10 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
     };
     if line_points > 0 {
         score += line_points;
-        reasons.push(format!("{} changed lines (+{line_points})", input.changed_lines));
+        reasons.push(format!(
+            "{} changed lines (+{line_points})",
+            input.changed_lines
+        ));
     }
     if changed_files > 8 {
         score += 15;
@@ -147,7 +167,10 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         .collect();
     if modules.len() > 2 {
         score += 10;
-        reasons.push(format!("cross-module impact: {} roots (+10)", modules.len()));
+        reasons.push(format!(
+            "cross-module impact: {} roots (+10)",
+            modules.len()
+        ));
     }
     if !input.tests_changed && !matches!(intent, Intent::Spike | Intent::Review) {
         score += 10;
@@ -173,7 +196,9 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         risk = override_band;
     }
     if let Some(override_complexity) = input.complexity_override {
-        reasons.push(format!("operator complexity override: {override_complexity:?}"));
+        reasons.push(format!(
+            "operator complexity override: {override_complexity:?}"
+        ));
     }
     if reasons.is_empty() {
         reasons.push("small, isolated deterministic change".to_string());
@@ -275,8 +300,14 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
     let mut lines = 0usize;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.splitn(3, '\t');
-        let added = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
-        let removed = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+        let added = fields
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let removed = fields
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
         let Some(path) = fields.next() else { continue };
         lines = lines.saturating_add(added).saturating_add(removed);
         paths.push(PathBuf::from(path));
@@ -360,10 +391,7 @@ pub struct ClassifyArgs {
 }
 
 pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
-    let repo = args
-        .repo
-        .clone()
-        .unwrap_or(std::env::current_dir()?);
+    let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
     let mut input = if args.paths.is_empty() && args.changed_lines.is_none() {
         git_change_input(&repo, args.task.clone())?
     } else {
@@ -411,7 +439,12 @@ mod tests {
         let classification = classify(&value).unwrap();
         assert!(classification.risk >= RiskBand::High);
         value.risk_override = Some(RiskBand::Low);
-        assert!(classify(&value).unwrap_err().to_string().contains("High floor"));
+        assert!(
+            classify(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("High floor")
+        );
     }
 
     #[test]
@@ -421,5 +454,12 @@ mod tests {
         let classification = classify(&value).unwrap();
         assert_eq!(classification.complexity, Complexity::Trivial);
         assert_eq!(classification.risk, RiskBand::Low);
+    }
+
+    #[test]
+    fn classification_task_is_bounded() {
+        let mut value = input(&["README.md"], 5);
+        value.task = "x".repeat(MAX_TASK_BYTES + 1);
+        assert!(classify(&value).unwrap_err().to_string().contains("exceeds"));
     }
 }

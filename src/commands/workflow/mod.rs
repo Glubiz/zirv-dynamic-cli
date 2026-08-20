@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use super::ctx::CtxResult;
 
-pub mod capability;
 pub mod artifact;
+pub mod capability;
 pub mod classify;
 pub mod engine;
 pub mod review;
