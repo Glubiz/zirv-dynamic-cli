@@ -831,10 +831,12 @@ A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `prompt.enabled`, `prompt.repo_layer`,
-`prompt.max_repo_bytes`, `mail.enabled`, `mail.max_delivered_bytes`,
-`chrome.events`, or any `memory.*` key; doing so is an error that names the
-key. Set those in `~/.zirv/ctx.toml`, or with the matching `ZIRV_CTX_*`
-variable below, which comes from the operator rather than the checkout:
+`prompt.max_repo_bytes`, `prompt.harnesses`, `mail.enabled`,
+`mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
+`dash.*` key, any `pace.*` key, `review`, or `worker`; doing so is an error
+that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
+`ZIRV_CTX_*` variable below, which comes from the operator rather than the
+checkout:
 
 | Forbidden repo key | Set instead via |
 |---|---|
@@ -846,6 +848,7 @@ variable below, which comes from the operator rather than the checkout:
 | `prompt.enabled` | `ZIRV_CTX_PROMPT` |
 | `prompt.repo_layer` | `ZIRV_CTX_PROMPT_REPO` |
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
+| `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
 | `chrome.events` | `ZIRV_CTX_QUIET` (see the note below on why this one's name looks different) |
@@ -855,21 +858,45 @@ variable below, which comes from the operator rather than the checkout:
 | `memory.max_entry_bytes` | `ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES` |
 | `memory.max_injected_bytes` | `ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES` |
 | `memory.shared_enabled` | `ZIRV_CTX_MEMORY_SHARED` |
+| `dash.enabled` | `ZIRV_CTX_DASH` |
+| `dash.sidebar_cols` | `ZIRV_CTX_DASH_SIDEBAR_COLS` |
+| `dash.roster_max_age_secs` | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS` |
+| `dash.max_panes` | `ZIRV_CTX_DASH_MAX_PANES` |
+| `dash.mouse` | `ZIRV_CTX_DASH_MOUSE` |
+| `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
+| `pace.poll_enabled` | `ZIRV_CTX_PACE_POLL` |
+| `pace.poll_min_interval_secs` | `ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS` |
+| `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
+| `worker` (`worker.claude`, `worker.codex`) | `ZIRV_CTX_WORKER_MODEL_CLAUDE` / `ZIRV_CTX_WORKER_MODEL_CODEX` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
 repo raising its own delivered-mail cap (or turning delivery back on after an
 operator disabled it) would make the operator's choice decorative; a repo
 silencing the announcement channel would hide its own degradation notices
-from anyone running zirv there. `memory.*` closes the same hole again for the
-memory bank: a repo checkout must not be able to seed the bank, raise its own
-caps, or switch automatic harvesting on for anyone who runs zirv there.
-`agent` closes a narrower hole discovered once codex shipped out of the box:
-an explicit `agent = "codex"` reaches `resolve_default`'s *configured* arm,
-which never consults the repo-narrowing guard the no-`agent`-configured
-fallback loop has (see [.settings.toml](#settingstoml) below) -- without this,
-a repo checkout could pick which vendor account gets spent with that guard
-never in the way. Everything else, including `chrome.banner`/`chrome.bar`,
+from anyone running zirv there. `prompt.harnesses` closes the same loop for
+the derived per-adapter harness-roster layer: a repo checkout must not be
+able to force that layer back on for an operator who turned it off.
+`memory.*` closes the same hole again for the memory bank: a repo checkout
+must not be able to seed either scope, raise its own caps, or switch
+automatic harvesting on for anyone who runs zirv there (see
+[Memory bank](#memory-bank) below -- this applies the same way to the
+*shared*, repo-committed scope as to the private one: a checkout may not
+flip its own gate). `dash.*` closes it once more for the session multiplexer
+`zirv chat` opens on a capable terminal: a repo checkout must not be able to
+switch it on or off, resize its sidebar, change how long a quit-time restore
+roster stays offered, raise its own pane cap, or decide whether the
+dashboard captures the mouse. `pace.*` closes it for usage pacing: a repo
+must not be able to flip a spend decision, re-enable the active vendor-API
+poll fallback an operator turned off, or change its cadence. `review`/`worker`
+close it for which model spends the operator's tokens running background
+review or delegated-worker sessions. `agent` closes a narrower hole
+discovered once codex shipped out of the box: an explicit `agent = "codex"`
+reaches `resolve_default`'s *configured* arm, which never consults the
+repo-narrowing guard the no-`agent`-configured fallback loop has (see
+[.settings.toml](#settingstoml) below) -- without this, a repo checkout could
+pick which vendor account gets spent with that guard never in the way.
+Everything else, including `chrome.banner`/`chrome.bar`,
 `supervise.max_nudges`, and every threshold, is still repo-configurable.
 
 #### Environment variables worth knowing
@@ -1219,11 +1246,19 @@ max_injected_bytes = 2048
 shared_enabled = true
 ```
 
-The memory bank lives under the state dir, never in the repo (the same
-"a checkout is not the operator" reasoning as handoffs and mail), and every
-`[memory]` key is repo-forbidden for the same reason `mail.*` is: a checkout
-must not be able to seed the bank, raise its own cap, or switch harvesting on
-for anyone who runs zirv there. See [Trust boundary](#trust-boundary) above.
+There are two independent memory scopes. The **private** bank still lives
+under the state dir, never in the repo (the same "a checkout is not the
+operator" reasoning as handoffs and mail). The **shared** bank is the
+opposite by design: `<repo>/.zirv/memory/` is untrusted repository content,
+one key-addressed file per entry, meant to be committed, reviewed, and
+hand-edited like any other file in the checkout -- that is the whole point of
+a Git-friendly shared memory bank. What stays forbidden either way is the
+*configuration*, not the content: every `[memory]` key, including
+`shared_enabled`, is repo-forbidden outright -- a checkout may not set any of
+them to any value at all, so it can neither seed a bank, raise its own caps,
+nor switch its own shared scope on or off. Only `~/.zirv/ctx.toml`,
+`ZIRV_CTX_*`, or flags (the operator) may. See
+[Trust boundary](#trust-boundary) above.
 
 ### Consistent sessions
 
