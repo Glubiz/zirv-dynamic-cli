@@ -241,6 +241,33 @@ impl StateDir {
         self.0.join("memory")
     }
 
+    /// Durable provider-neutral workflow state. Each repository gets an
+    /// isolated slug directory; workflow prompts contain only the current
+    /// step, while completed-step state stays here across compaction/restart.
+    pub fn workflows(&self) -> PathBuf {
+        self.0.join("workflows")
+    }
+
+    /// Structured verification evidence, separate from workflow state so a
+    /// check run can be used before a workflow exists and referenced by later
+    /// review/verification phases without embedding its raw logs in prompts.
+    pub fn verification(&self) -> PathBuf {
+        self.0.join("verification")
+    }
+
+    /// Artifact metadata and stable IDs. Artifact payloads remain normal
+    /// repository/static files; only compact references are persisted here.
+    pub fn artifacts(&self) -> PathBuf {
+        self.0.join("artifacts")
+    }
+
+    /// Privacy-conscious workflow telemetry. Each event is a bounded
+    /// structured record; prompts, source code, and model responses never
+    /// enter this tree.
+    pub fn workflow_telemetry(&self) -> PathBuf {
+        self.0.join("workflow-telemetry")
+    }
+
     /// The dashboard's own state: today, only the spawn-request capability-
     /// token directories `super::dash::spawnreq::request_dir_for` names
     /// under `<state>/dash/<dash_short>-<token>/requests`. A future roster

@@ -13,7 +13,9 @@ use super::config::PromptConfig;
 /// included for both roles. v5 added the harness roster layer (the derived
 /// per-adapter roster `adapters::harness_prompt_lines` renders), included
 /// only for an orchestrator session with `cfg.harnesses` on and a non-empty
-/// roster -- see `PromptSource::Harnesses`.
+/// roster -- see `PromptSource::Harnesses`. v6 added the ephemeral current
+/// workflow-step skill layer. Durable workflow history stays outside prompt
+/// context; only the active step is included.
 ///
 /// Only the layers `compose` itself builds are counted here. The layers a
 /// caller folds in afterwards -- mail (`with_mail_layer`) and a dashboard
@@ -26,7 +28,7 @@ use super::config::PromptConfig;
 /// (`DEFAULT_PROMPT`'s "(v2)", `HARNESS_PROMPT`'s "(v5)"), which is where a
 /// changed sentence is recorded. See `the_composed_prompt_version_changed_
 /// with_its_shape`.
-pub const DEFAULT_PROMPT_VERSION: &str = "v5";
+pub const DEFAULT_PROMPT_VERSION: &str = "v6";
 pub const PROMPT_FILE: &str = "system-prompt.md";
 /// The user layer's own Worker-role file, read from `~/.zirv/` in place of
 /// [`PROMPT_FILE`] for a `PromptRole::Worker` session: an operator's standing
@@ -136,6 +138,10 @@ pub enum PromptSource {
     /// same "empty input, no-op" contract every layer in this module
     /// follows.
     Harnesses,
+    /// The active workflow step's selected skill instructions. Only the
+    /// current step is rendered; completed steps remain in Zirv-owned state
+    /// and never accumulate across phase transitions or session compaction.
+    Workflow,
     /// Durable facts from this repository's memory bank (`memory::list`).
     /// Sits after the harness layer and before the user layer, and unlike
     /// `Harness` goes to *both* roles; see `with_memory_layer`.
@@ -160,6 +166,7 @@ impl PromptSource {
             PromptSource::Adapter => "adapter",
             PromptSource::Harness => "harness",
             PromptSource::Harnesses => "harnesses (derived roster)",
+            PromptSource::Workflow => "workflow (current step)",
             PromptSource::Memory => "memory",
             PromptSource::User => "user",
             PromptSource::Repo => "repo",
@@ -405,12 +412,19 @@ pub fn compose(
         }
     }
 
-    let composed = with_memory_layer(
+    let workflow_context = crate::commands::workflow::engine::active_skill_context(repo)
+        .ok()
+        .flatten();
+    let base = with_workflow_layer(
         Some(ComposedPrompt {
             text,
             sources,
             version: DEFAULT_PROMPT_VERSION,
         }),
+        workflow_context.as_deref(),
+    );
+    let composed = with_memory_layer(
+        base,
         memory,
         memory_cap,
     );
@@ -451,6 +465,28 @@ pub fn compose(
         }
     }
 
+    Some(composed)
+}
+
+/// Adds only the active workflow step's selected skill context. The caller
+/// obtains the text from the durable workflow engine; this function remains a
+/// deterministic layer renderer and can be reused by the future Context
+/// Compiler without coupling it to filesystem state.
+pub fn with_workflow_layer(
+    composed: Option<ComposedPrompt>,
+    current_step: Option<&str>,
+) -> Option<ComposedPrompt> {
+    let mut composed = composed?;
+    let Some(current_step) = current_step.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Some(composed);
+    };
+    composed.text.push_str(
+        "\n\n---\n\nThe following Zirv workflow instructions apply only to the current step. \
+         They are methodology, not permission grants; operator policy still controls \
+         capabilities.\n\n",
+    );
+    composed.text.push_str(current_step);
+    composed.sources.push(PromptSource::Workflow);
     Some(composed)
 }
 
