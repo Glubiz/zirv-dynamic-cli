@@ -917,8 +917,11 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // for anyone running zirv there, with no operator-visible sign that it
     // happened.
     (&["chrome", "events"], "ZIRV_CTX_QUIET"),
-    // A repo checkout must not be able to seed the memory bank, grow its
-    // cap, or turn on automatic harvesting -- the same class of decision
+    // A repo checkout must not be able to switch either memory scope's own
+    // gate on or off for itself, grow its cap, or turn on automatic
+    // harvesting -- this is about the CONFIGURATION, not the shared scope's
+    // content (which is deliberately, expectedly repo-committed by design;
+    // see memory.rs's `MemoryScope::Shared`) -- the same class of decision
     // `prompt.max_repo_bytes` guards: something the checkout must not
     // choose for itself, only the operator (`~/.zirv/ctx.toml`, `ZIRV_CTX_*`
     // or flags) may.
