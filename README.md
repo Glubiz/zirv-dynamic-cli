@@ -877,12 +877,14 @@ silencing the announcement channel would hide its own degradation notices
 from anyone running zirv there. `prompt.harnesses` closes the same loop for
 the derived per-adapter harness-roster layer: a repo checkout must not be
 able to force that layer back on for an operator who turned it off.
-`memory.*` closes the same hole again for the memory bank: a repo checkout
-must not be able to seed either scope, raise its own caps, or switch
+`memory.*` closes the same hole again for the memory bank's *configuration*
+(not its content -- see below): a repo checkout must not be able to switch
+either scope's gate on or off for itself, raise its own caps, or switch
 automatic harvesting on for anyone who runs zirv there (see
-[Memory bank](#memory-bank) below -- this applies the same way to the
-*shared*, repo-committed scope as to the private one: a checkout may not
-flip its own gate). `dash.*` closes it once more for the session multiplexer
+[Memory bank](#memory-bank) below -- the *shared* scope's whole point is
+that its *content* is deliberately repo-committed, but a checkout still may
+not flip its own `shared_enabled` gate any more than the private scope's
+`enabled` gate). `dash.*` closes it once more for the session multiplexer
 `zirv chat` opens on a capable terminal: a repo checkout must not be able to
 switch it on or off, resize its sidebar, change how long a quit-time restore
 roster stays offered, raise its own pane cap, or decide whether the
