@@ -112,6 +112,34 @@ console over. Each of them still scrubs `ZIRV_CTX_SESSION`,
 before setting its own, so a worker can never inherit another session's
 identity.
 
+### `zirv memory`
+
+`zirv memory` manages this repository's memory bank without starting an AI
+session:
+
+```bash
+zirv memory status
+zirv memory list
+zirv memory recall staging-db
+zirv memory remember staging-db-creds "the staging DB creds live in 1Password under staging-db"
+zirv memory forget staging-db-creds
+zirv memory verify staging-db-creds
+```
+
+Every verb defaults to the **private** (machine-local) bank; pass `--shared`
+to act on the **shared**, repository-owned bank instead — see
+[Memory bank](#memory-bank) below for what the two scopes mean. `status`,
+`list` and `recall` respect each scope's own gate (`memory.enabled` /
+`memory.shared_enabled`): a disabled scope reports as disabled, or
+lists/recalls empty, rather than showing what it holds. `forget` and
+`verify` work even while a scope is disabled — disabling a scope must never
+trap data behind it. `status` never prints an entry's key or body, only
+scope availability, entry counts, stored bytes, and the configured
+injection budget. `zirv ctx remember --key <k> --text <t>` / `zirv ctx
+recall` / `zirv ctx forget <k>` (flag-based, private-scope only) are
+untouched and keep working exactly as before — `zirv memory` is a newer,
+scope-aware surface alongside them, not a replacement.
+
 ### Sending mail between sessions
 
 Agent sessions running on the same machine can leave each other short notes,
@@ -660,9 +688,9 @@ marks it as shadowed in the listing.
 
 ## Reserved Command Names
 
-`help`, `version`, `init`, `create`, `ctx`, `chat`, `agent`, and their short
-aliases `h`, `v`, `i`, `c`, are handled as built-in commands before zirv ever
-looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
+`help`, `version`, `init`, `create`, `ctx`, `memory`, `chat`, `agent`, and
+their short aliases `h`, `v`, `i`, `c`, are handled as built-in commands
+before zirv ever looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
 just as much as `chat`, matching how NTFS/APFS resolve script filenames), so
 a differently-cased script or shortcut is caught too, even though only the
 exact lowercase spelling is literally intercepted as a routing alias. A
@@ -1205,6 +1233,12 @@ zirv ctx remember --key staging-db-creds --text "the staging DB creds live in 1P
 zirv ctx recall
 zirv ctx forget staging-db-creds
 ```
+
+See [`zirv memory`](#zirv-memory) above for a newer, scope-aware surface over
+this same bank (`status`/`list`/`recall <query>`/`remember <key> <text>`/
+`forget <key>`/`verify <key>`, `--shared` for the repository-owned scope
+below) that works without starting an AI session — the two verbs above keep
+working unchanged alongside it.
 
 **The handoff-vs-memory boundary matters.** A handoff is task continuity: what
 this specific task was doing, what remains, what to try next — written once
