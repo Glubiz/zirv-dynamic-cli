@@ -270,6 +270,7 @@ fn compose_worker_launch_prompt(
         memory_entries,
         cfg.memory.core_max_bytes,
         &[],
+        cfg.context.max_harness_roster_bytes,
     )
 }
 

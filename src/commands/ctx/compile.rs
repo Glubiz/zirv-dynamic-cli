@@ -81,22 +81,24 @@ pub struct ContextProvenance {
 /// The compiled result of one launch-time context assembly: the composed
 /// prompt (`None` for a `--simple` run or a disabled prompt, exactly like
 /// `prompt::compose`'s own `None`), the honest policy report for the adapter
-/// this session launched, and structured provenance for the canonical
-/// context surfaces this compile actually read.
+/// this session launched, structured provenance for the canonical context
+/// surfaces this compile actually read, and the same raw/delivered/truncated
+/// shape for the derived harness/orchestration roster layer.
 ///
-/// `policy`/`provenance` have no production reader yet: `composed` is what
-/// every one of the six launch paths needs today (issue #44, this module).
-/// Rendering the other two is issue #46 ("Context 7/8")'s own job -- the
-/// same split `policy.rs`'s own module doc describes for `evaluate`/
-/// `PolicyReport` itself. Exercised by this module's own tests in the
-/// meantime.
+/// `zirv context status` (issue #46) is the production reader of `policy`/
+/// `provenance`/`harness_roster`; `composed` is what every one of the six
+/// launch paths needs at launch time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledContext {
     pub composed: Option<ComposedPrompt>,
-    #[allow(dead_code)]
     pub policy: PolicyReport,
-    #[allow(dead_code)]
     pub provenance: Vec<ContextProvenance>,
+    /// `None` when no roster layer was actually added: a Worker role,
+    /// `cfg.prompt.harnesses` off, an empty roster, or no composed prompt at
+    /// all (`--simple`/`prompt.enabled = false`) -- mirroring `prompt::
+    /// compose`'s own gating for `PromptSource::Harnesses` exactly, so this
+    /// is `Some` precisely when that layer is present in `composed`.
+    pub harness_roster: Option<prompt::HarnessRosterInjection>,
 }
 
 /// Gathers the always-present core memory layer and the independent,
@@ -390,9 +392,26 @@ pub fn compile_with_harness_roster(
         &memory_entries,
         cfg.memory.core_max_bytes,
         &harness_lines,
+        cfg.context.max_harness_roster_bytes,
     );
     let composed =
         prompt::with_memory_layer(composed, &retrieved_memory, cfg.memory.retrieval_max_bytes);
+    // Mirrors `compose`'s own gate for `PromptSource::Harnesses` exactly
+    // (role == Orchestrator, `cfg.prompt.harnesses`, a non-empty roster) plus
+    // the top-level `composed.is_some()` gate every layer in this module
+    // respects (a `--simple` run or a disabled prompt gets no layer at all,
+    // so there is nothing to report provenance for either).
+    let harness_roster = if composed.is_some()
+        && role == PromptRole::Orchestrator
+        && cfg.prompt.harnesses
+        && !harness_lines.is_empty()
+    {
+        let (_, injection) =
+            prompt::harness_roster_injection(&harness_lines, cfg.context.max_harness_roster_bytes);
+        Some(injection)
+    } else {
+        None
+    };
     let (composed, provenance) =
         with_canonical_context_layer(composed, adapter.name(), repo, home, cfg);
 
@@ -405,6 +424,7 @@ pub fn compile_with_harness_roster(
         composed,
         policy,
         provenance,
+        harness_roster,
     }
 }
 
@@ -591,6 +611,79 @@ mod tests {
         assert!(claude_provenance.truncated);
         assert_eq!(claude_provenance.delivered_bytes, 20);
         assert_eq!(claude_provenance.raw_bytes, 200);
+    }
+
+    /// Issue #46 follow-up: `context.max_harness_roster_bytes` is a real,
+    /// enforced budget -- truncated in the actual composed prompt, not just
+    /// reported against, and the compiler records that truncation the same
+    /// raw/delivered/truncated way `ContextProvenance` already does for the
+    /// canonical layer.
+    #[test]
+    fn an_over_budget_harness_roster_is_truncated_and_recorded() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig {
+            context: crate::commands::ctx::config::ContextConfig {
+                max_harness_roster_bytes: 5,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+        let adapter = ClaudeAdapter::new(None);
+        let compiled = compile_for(repo.path(), &cfg, &adapter, PromptRole::Orchestrator);
+
+        let roster = compiled
+            .harness_roster
+            .expect("the default roster is non-empty, so this must be Some");
+        assert!(roster.truncated);
+        assert_eq!(roster.delivered_bytes, 5);
+        assert!(
+            roster.raw_bytes > 5,
+            "the roster must genuinely be over budget for this test to mean anything"
+        );
+
+        // The truncation is real, not merely reported: the composed prompt's
+        // own roster section is capped too.
+        let text = compiled.composed.expect("composed").text;
+        const LABEL: &str = "zirv harness roster (session)\n\n";
+        let roster_at = text.find(LABEL).expect("roster label present") + LABEL.len();
+        assert_eq!(
+            text[roster_at..].len(),
+            5,
+            "the delivered roster in the composed prompt must match the budget: {:?}",
+            &text[roster_at..]
+        );
+    }
+
+    /// The under-budget half of the same guarantee: `CompiledContext.
+    /// harness_roster` reports `truncated: false` and `raw_bytes ==
+    /// delivered_bytes` when the roster already fits, and the compiled
+    /// prompt's roster section is unaffected.
+    #[test]
+    fn a_harness_roster_under_budget_is_not_marked_truncated() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default(); // context.max_harness_roster_bytes = 4096
+        let adapter = ClaudeAdapter::new(None);
+        let compiled = compile_for(repo.path(), &cfg, &adapter, PromptRole::Orchestrator);
+
+        let roster = compiled
+            .harness_roster
+            .expect("the default roster is non-empty");
+        assert!(!roster.truncated);
+        assert_eq!(roster.raw_bytes, roster.delivered_bytes);
+    }
+
+    /// A Worker role never gets the harness/orchestration layer at all
+    /// (`prompt::compose`'s own `role == Orchestrator` gate), so there is
+    /// nothing to report provenance for -- mirrors `no_canonical_files_
+    /// means_no_provenance_and_no_extra_layer` for the canonical layer.
+    #[test]
+    fn a_worker_role_has_no_harness_roster_provenance() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let compiled = compile_for(repo.path(), &cfg, &adapter, PromptRole::Worker);
+
+        assert!(compiled.harness_roster.is_none());
     }
 
     #[test]

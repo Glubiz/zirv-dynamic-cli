@@ -108,6 +108,7 @@ fn compose_cycle_prompt(
         memory_entries,
         cfg.memory.core_max_bytes,
         &[],
+        cfg.context.max_harness_roster_bytes,
     )
 }
 

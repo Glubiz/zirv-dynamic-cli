@@ -1117,6 +1117,7 @@ fn compose_launch_prompt(
         memory_entries,
         cfg.memory.core_max_bytes,
         harness_lines,
+        cfg.context.max_harness_roster_bytes,
     )
 }
 

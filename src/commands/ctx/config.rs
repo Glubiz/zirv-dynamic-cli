@@ -306,9 +306,12 @@ pub struct ContextConfig {
     /// folded in as `PromptSource::Harnesses`). Every other layer already had
     /// a configured cap (`prompt.max_repo_bytes`, `context.max_common_bytes`/
     /// `max_harness_bytes`, `mail.max_delivered_bytes`, `memory.max_injected_
-    /// bytes`); this is the missing one `zirv context status` reports
-    /// against. Same trust rationale as `max_common_bytes`/`max_harness_
-    /// bytes` above -- see `REPO_FORBIDDEN`.
+    /// bytes`); this closes the gap the same way: enforced by `prompt::
+    /// compose` itself (`prompt::harness_roster_injection`, truncated with
+    /// `crate::utils::truncate_bytes` exactly like every layer above), not
+    /// merely reported against by `zirv context status`. Same trust
+    /// rationale as `max_common_bytes`/`max_harness_bytes` above -- see
+    /// `REPO_FORBIDDEN`.
     pub max_harness_roster_bytes: usize,
 }
 

@@ -372,11 +372,17 @@ fn render_handoff_section<W: Write>(w: &mut W, state: &StateDir, repo: &Path) ->
 
 /// "Harness/orchestration contribution": the one layer that had no
 /// configured budget before this issue (`context.max_harness_roster_bytes`,
-/// added by this task -- see `config.rs`). The comparison here is for
-/// visibility only: `prompt::compose` does not currently truncate this
-/// layer the way it truncates memory/mail/canonical context, and the report
-/// says so rather than implying an enforcement that does not exist.
-fn render_harness_roster_section<W: Write>(w: &mut W, cfg: &CtxConfig) -> CtxResult<()> {
+/// added by this task -- see `config.rs`). Reads truncation straight off
+/// `CompiledContext::harness_roster`, the same raw/delivered/truncated
+/// provenance `prompt::compose` itself computes when it truncates this
+/// layer (via `prompt::harness_roster_injection`) -- this section can never
+/// disagree with what a real launch actually delivers, because it is
+/// reading the same computation, not a second one.
+fn render_harness_roster_section<W: Write>(
+    w: &mut W,
+    cfg: &CtxConfig,
+    compiled_by_adapter: &[(&'static str, compile::CompiledContext)],
+) -> CtxResult<()> {
     writeln!(
         w,
         "\nharness / orchestration layer (Orchestrator sessions only):"
@@ -394,21 +400,22 @@ fn render_harness_roster_section<W: Write>(w: &mut W, cfg: &CtxConfig) -> CtxRes
         return Ok(());
     }
 
-    let mut names: Vec<&'static str> = adapters::all(None).iter().map(|a| a.name()).collect();
-    names.sort_unstable();
-    for name in names {
-        let lines = adapters::harness_prompt_lines(cfg, name);
-        let bytes = lines.join("\n").len();
-        let exceeds = bytes > cfg.context.max_harness_roster_bytes;
-        writeln!(
-            w,
-            "  derived roster as seen by {name}: {bytes}B (~{} tok, est.) -- budget \
-             (context.max_harness_roster_bytes): {} ({}; measured for visibility, not yet \
-             enforced at compose time)",
-            estimate_tokens(bytes),
-            cfg.context.max_harness_roster_bytes,
-            if exceeds { "EXCEEDS" } else { "within" }
-        )?;
+    for (name, compiled) in compiled_by_adapter {
+        match &compiled.harness_roster {
+            Some(roster) => {
+                let flag = if roster.truncated { " [TRUNCATED]" } else { "" };
+                writeln!(
+                    w,
+                    "  derived roster as seen by {name}: {}B raw, {}B delivered (~{} tok, \
+                     est.){flag} -- budget (context.max_harness_roster_bytes): {}",
+                    roster.raw_bytes,
+                    roster.delivered_bytes,
+                    estimate_tokens(roster.delivered_bytes),
+                    cfg.context.max_harness_roster_bytes
+                )?;
+            }
+            None => writeln!(w, "  derived roster as seen by {name}: none (empty roster)")?,
+        }
     }
     Ok(())
 }
@@ -420,15 +427,12 @@ fn render_harness_roster_section<W: Write>(w: &mut W, cfg: &CtxConfig) -> CtxRes
 /// harness-specific file and the roster both differ per adapter -- a single
 /// combined number would either double-count or silently pick one harness.
 ///
-/// **Never starts a session**: `compile::compile` only reads config/files
-/// and calls `adapter.name()`/`adapter.policy_support()`, both pure.
+/// **Never starts a session**: `compile::compile` (already run once per
+/// adapter by the caller, `run_with`) only reads config/files and calls
+/// `adapter.name()`/`adapter.policy_support()`, both pure.
 fn render_per_harness_section<W: Write>(
     w: &mut W,
-    home: Option<&Path>,
-    repo: &Path,
-    cfg: &CtxConfig,
-    state: &StateDir,
-    now: u64,
+    compiled_by_adapter: &[(&'static str, compile::CompiledContext)],
 ) -> CtxResult<()> {
     writeln!(
         w,
@@ -436,22 +440,8 @@ fn render_per_harness_section<W: Write>(
          handoff, which are shown separately above and are only added at an actual launch):"
     )?;
 
-    let mut registered = adapters::all(None);
-    registered.sort_by_key(|a| a.name());
-
-    for adapter in &registered {
-        let compiled = compile::compile(
-            home,
-            repo,
-            false,
-            cfg,
-            adapter.as_ref(),
-            PromptRole::Orchestrator,
-            state,
-            now,
-        );
-
-        writeln!(w, "\n  -- {} --", adapter.name())?;
+    for (name, compiled) in compiled_by_adapter {
+        writeln!(w, "\n  -- {name} --")?;
         match &compiled.composed {
             Some(composed) => {
                 let bytes = composed.text.len();
@@ -498,10 +488,10 @@ fn render_per_harness_section<W: Write>(
 
 /// "Every configured hard budget with whether it truncated or omitted
 /// anything" -- the summary line. Per-surface/per-layer truncation detail is
-/// already shown inline in the sections above (canonical context provenance,
-/// memory's omitted count, mail's exceeds/fits comparison, the harness
-/// roster's exceeds/within comparison); this section is the flat reference
-/// list an operator can scan without re-reading every section.
+/// already shown inline in the sections above (canonical context and harness
+/// roster provenance, memory's omitted count, mail's exceeds/fits
+/// comparison); this section is the flat reference list an operator can
+/// scan without re-reading every section.
 fn render_budgets_section<W: Write>(w: &mut W, cfg: &CtxConfig) -> CtxResult<()> {
     writeln!(w, "\nconfigured hard budgets:")?;
     writeln!(
@@ -521,8 +511,8 @@ fn render_budgets_section<W: Write>(w: &mut W, cfg: &CtxConfig) -> CtxResult<()>
     )?;
     writeln!(
         w,
-        "  context.max_harness_roster_bytes = {} (derived harness roster -- measured for \
-         visibility, not yet enforced at compose time)",
+        "  context.max_harness_roster_bytes = {} (derived harness roster, truncated at compose \
+         time the same way memory and canonical context are)",
         cfg.context.max_harness_roster_bytes
     )?;
     writeln!(
@@ -597,8 +587,32 @@ pub fn run_with<W: Write>(
     render_memory_section(w, &state, repo, &slug, &cfg)?;
     render_mail_section(w, &state, &slug, &cfg)?;
     render_handoff_section(w, &state, repo)?;
-    render_harness_roster_section(w, &cfg)?;
-    render_per_harness_section(w, home.as_deref(), repo, &cfg, &state, now)?;
+
+    // Computed once, here, and shared by both sections below: the harness
+    // roster section and the per-harness section both need `compile::
+    // compile`'s output per adapter, and computing it twice would risk the
+    // two sections silently disagreeing about the same truncation.
+    let mut registered = adapters::all(None);
+    registered.sort_by_key(|a| a.name());
+    let compiled_by_adapter: Vec<(&'static str, compile::CompiledContext)> = registered
+        .iter()
+        .map(|adapter| {
+            let compiled = compile::compile(
+                home.as_deref(),
+                repo,
+                false,
+                &cfg,
+                adapter.as_ref(),
+                PromptRole::Orchestrator,
+                &state,
+                now,
+            );
+            (adapter.name(), compiled)
+        })
+        .collect();
+
+    render_harness_roster_section(w, &cfg, &compiled_by_adapter)?;
+    render_per_harness_section(w, &compiled_by_adapter)?;
     render_budgets_section(w, &cfg)?;
     render_unknown_context_section(w)?;
     render_token_estimate_note(w)?;
@@ -891,6 +905,46 @@ mod tests {
         assert!(
             out.contains("memory.max_injected_bytes = 2048"),
             "got {out}"
+        );
+    }
+
+    /// Issue #46 follow-up: `context.max_harness_roster_bytes` is a real,
+    /// enforced budget, and the report must show when it actually bit --
+    /// not merely compare against it for visibility. `REPO_FORBIDDEN`
+    /// (like every other budget key), so the override goes through the
+    /// environment, the same way an operator would actually set it.
+    #[test]
+    fn an_over_budget_harness_roster_is_flagged_truncated_in_the_report() {
+        let fixture = Fixture::new();
+        let mut env = fixture.env.clone();
+        env.insert(
+            "ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES".to_string(),
+            "5".to_string(),
+        );
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &default_args(),
+            &mut out,
+            &fixture.repo,
+            &|k| env.get(k).cloned(),
+            1_700_000_000,
+        )
+        .expect("run_with");
+        let out = String::from_utf8(out).expect("utf8");
+
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("context.max_harness_roster_bytes = 5"),
+            "got {out}"
+        );
+        assert!(
+            out.contains("[TRUNCATED]"),
+            "an over-budget harness roster must be flagged truncated, not just measured: {out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("not yet enforced"),
+            "the budget is real now, so the report must not disclaim it as unenforced: {out}"
         );
     }
 
