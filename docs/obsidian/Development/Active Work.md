@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-20
+last-verified: 2026-08-21
 ---
 
 # Active Work
@@ -20,7 +20,8 @@ _None right now — see Recently Completed below for the latest completed implem
 
 ## Recently Completed
 
-### Provider-neutral workflow system (`feat/workflow-system`, 2026-08-20, v2.14.0, PR #59)
+### Provider-neutral workflow system (`feat/workflow-system`, 2026-08-21, v2.14.0, PR #59)
+**Status (2026-08-21):** Implementation, full-diff acceptance review, and the review's own fix round are complete and pushed to PR #59. The fix round closed the subsystem's untrusted-input gaps (a `REPO_FORBIDDEN` `[workflow]` section gating repo-supplied checks/skills/telemetry, with timeout/count caps and per-check source labels), review-evidence integrity (state reloaded after the reviewer runs; a dashboard spawn-ack credits nothing; the reviewer pinned read-only per adapter; sensitive untracked bodies excluded), evidence freshness (fingerprint taken before the checks; a `--check`-narrowed run cannot satisfy a gate; results printed before persistence), and risk measurement (declared scope can only raise the band; gated steps re-measure). See the 2026-08-21 [[Work Journal]] entry and the two [[Decision Log]] entries.
 **Status (2026-08-20):** Implementation and full-diff acceptance review complete. Issues #47–#56 are covered by the skill/capability registry, built-in skills, durable engine, deterministic classification, verification evidence, review packages/findings, artifacts, custom-skill boundaries, and telemetry. Context/policy/memory dependencies use narrow seams for #43–#46; final CI and external reviewer state are tracked on PR #59.
 **Evidence:** deterministic risk floors and gates, fresh verification/review fingerprints, bounded retry/output/context inputs, custom-skill trust-root tests, 1,675+ unit tests, formatting, Linux/Windows clippy, version-bump check, and documentation coverage/staleness checks are the merge gates on PR #59.
 

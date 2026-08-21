@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-20
+last-verified: 2026-08-21
 ---
 
 # Decision Log
@@ -23,6 +23,20 @@ last-verified: 2026-08-20
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-21 — Repository-authored checks and skills answer to operator-only `[workflow]` keys
+**Context:** PR #59's review found the workflow subsystem's untrusted-input handling weaker than the rest of the codebase's: `.zirv/verify.toml` commands and `package.json` scripts reached `sh -c` with repo-chosen timeouts up to 24h and no operator switch, a repo skill silently replaced a built-in's methodology text by id, and telemetry retention came from plain `ZIRV_WORKFLOW_TELEMETRY*` environment reads any repo script could set for itself.
+**Decision:** A new `[workflow]` config section, `REPO_FORBIDDEN` per key, mirroring `mail.enabled`: `repo_checks_enabled` (off = repo-supplied checks listed with a skip line, never executed, never passing evidence), `repo_skills_enabled`, and three `telemetry_*` keys. Caps that hold regardless of the gate: repo timeouts clamped to 900s, repo checks truncated to 32, both noted in the report; every check records its source (`repo-config`, `discovered-script`, `discovered-toolchain`). A repo skill may only add ids; a collision is ignored and warned.
+**Rejected:** Refuse an over-long repo timeout outright — a clamp keeps the check useful and the note keeps it honest. Treat Cargo and npm discovery identically — `npm run <id>` executes a body written in the checkout's own package.json, while the Cargo commands are zirv's text; collapsing them would either over-gate the toolchain or under-gate repo scripts. Let a repo skill override with the untrusted label as the only guard — a label does not stop the text from replacing `review`'s or `verify`'s methodology.
+**Consequences:** An operator who disables repo checks still sees what the repository wanted to run. A skipped check cannot satisfy a step gate, so a disabled gate fails closed. Adding a `[workflow]` key means adding it to `REPO_FORBIDDEN` too, or the section's guarantee is only partly true.
+**Spec / link:** [[Workflows]], [[Untrusted Configuration]], PR #59.
+
+### 2026-08-21 — Risk is re-measured at gated steps and declared inputs can only raise it
+**Context:** Classification was computed once at `workflow start` and frozen. For the usual order of work — start the workflow, then write the code — that measured an empty tree, so the review step was decided before the change existed. Separately, `--path`/`--changed-lines` switched Git measurement off entirely, so declaring a README edit talked a real auth-file change from High down to Low and dropped its review step.
+**Decision:** Declared and measured classifications are both computed and the higher risk band wins, with `declared_scope: true` recorded. Advancing *into* a review or verify step re-measures and takes the max, adding a missing review/verify step if the new band requires one. `classify` now shares `review`'s merge-base diff base so both subsystems mean the same thing by "the change".
+**Rejected:** Refuse a declared scope that disagrees with the tree — a dirty unrelated file would then block a legitimate declared classification. Re-materialize the full step list at a gate — a design approval gate appearing after the implementation is finished is ceremony, not safety, so only Review/Verify steps are added. Re-measure on every advance — the gated steps are where the decision actually matters.
+**Consequences:** A workflow's risk band can rise mid-flight and never falls; the reason line records why. A repository with no Git history keeps the start-time classification, and the reason says the measurement was unavailable.
+**Spec / link:** [[Workflows]], PR #59.
 
 ### 2026-08-20 — Workflow history is durable state; only the current skill is prompt context
 **Context:** A methodology implemented as an always-loaded handbook consumes tokens every turn, and conversation-only progress repeats completed work after compaction/resume. The pending shared Context Compiler must not own workflow state itself.

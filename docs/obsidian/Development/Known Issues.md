@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-19
+last-verified: 2026-08-21
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-21 (feat/workflow-system, PR #59 review fixes): extended the codex --sandbox read-only entry -- the pin now also reaches the workflow reviewer via AgentAdapter::read_only_args, so a broken sandbox helper breaks review as well as the distiller -->
 <!-- Updated 2026-08-19 (feat/dash-adaptive-poll-help-overlay, uncommitted, extends PR #29): resolved a mail-routing gap -- a dashboard-spawned worker pane's report-back reply used to broadcast rather than address, claimable by the wrong pane (issue #30); extended the Shift+Enter ESC-CR entry to cover Alt+Enter and the Windows-Terminal key-folding root cause; extended the crossterm::EnableMouseCapture entry for ?1002 now being on (click-drag text selection + OSC 52 copy) -->
 <!-- Updated 2026-08-19 (feat/chat-token-economy, role-gated worker prompt): recorded three gotchas -- the user-layer role split means a Worker no longer reads ~/.zirv/system-prompt.md at all (an operator with standing worker instructions must create ~/.zirv/system-prompt.worker.md), wrap's pty-harness tests wedge a spawned child in kernel exit state ?Es on this macOS machine (pre-existing on unmodified main, A/B-verified, run them on Linux CI), and five exec nudge tests time out (exit 76) intermittently in a full-suite batch while passing in isolation -->
 <!-- Updated 2026-08-18 (feat/chat-token-economy, live inter-session messaging): recorded that on a standalone-installer codex-cli 0.147.0 with [windows] sandbox = "elevated", `codex exec --sandbox read-only` fails outright with a missing-helper error, so CodexAdapter::distiller_cmd's pinned --sandbox read-only breaks optimize/handoff on such installs until the sandbox helper exists or the pin is made conditional -->
@@ -218,7 +219,7 @@ same way `-s, --sandbox` was.
 
 ## `--sandbox read-only` fails outright on a codex-cli install with the Windows sandbox helper missing
 
-On one real machine (codex-cli 0.147.0, the standalone OpenAI installer, `[windows] sandbox = "elevated"` in `~/.codex/config.toml`), `codex exec --sandbox read-only` — the exact flag `CodexAdapter::distiller_cmd` pins for `zirv ctx optimize`/handoff's report-only guarantee (see the entry above) — fails immediately with `windows sandbox: orchestrator_helper_launch_failed ... helper=codex-windows-sandbox-setup.exe ... program not found`, rather than degrading or falling back. `codex exec` with no sandbox flag at all works on the same install. Since `distiller_cmd` always passes `--sandbox read-only` unconditionally, every `zirv ctx optimize`/handoff run that resolves to the codex distiller fails the same way on such an install until either the sandbox helper binary is present or the pin is made conditional on the installed CLI actually supporting it. Not fixed here — recorded so a codex-distiller failure that looks like a zirv bug is checked against this first.
+On one real machine (codex-cli 0.147.0, the standalone OpenAI installer, `[windows] sandbox = "elevated"` in `~/.codex/config.toml`), `codex exec --sandbox read-only` — the exact flag `CodexAdapter::distiller_cmd` pins for `zirv ctx optimize`/handoff's report-only guarantee (see the entry above) — fails immediately with `windows sandbox: orchestrator_helper_launch_failed ... helper=codex-windows-sandbox-setup.exe ... program not found`, rather than degrading or falling back. `codex exec` with no sandbox flag at all works on the same install. Since `distiller_cmd` always passes `--sandbox read-only` unconditionally, every `zirv ctx optimize`/handoff run that resolves to the codex distiller fails the same way on such an install until either the sandbox helper binary is present or the pin is made conditional on the installed CLI actually supporting it. Not fixed here — recorded so a codex-distiller failure that looks like a zirv bug is checked against this first. **Wider blast radius since 2026-08-21:** the pin now comes from `AgentAdapter::read_only_args`, which the workflow reviewer (`zirv workflow review run --agent codex`, see [[Workflows]]) also applies, so on such an install the reviewer fails for the same reason as the distiller.
 
 ## A `~/.codex/config.toml` model pin unsupported by the operator's login breaks every zirv codex delegation with a 400
 

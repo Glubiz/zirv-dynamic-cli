@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-20
+last-verified: 2026-08-21
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-08-20
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-08-21: PR #59 review fixes — workflow trust gates, review integrity, evidence freshness
+**What:** Implemented the confirmed opus review of the workflow subsystem: a `REPO_FORBIDDEN` `[workflow]` config section gating repo-supplied checks/skills/telemetry with independent timeout and count caps; `review run` no longer overwrites findings the reviewer recorded mid-run, no longer credits a dashboard spawn-ack as a completed review, pins the reviewer read-only through the adapter, and excludes sensitive/binary/oversized untracked bodies; verification fingerprints before running, records `--check` narrowing (which can no longer satisfy a gate), scrubs control characters out of check output, and prints results before persisting them; classification measures the tree even when scope is declared and re-measures at gated steps; artifact state paths canonicalize in one place (the macOS `/var` test failure) and the bounded server must actually accept a connection before success is reported.
+**Key changes:** `src/commands/ctx/{config,announce,prompt,agent,optimize}.rs`, `src/commands/ctx/adapters/{mod,claude,codex}.rs` (new `read_only_args`), all of `src/commands/workflow/`, prompt version v7, [[Workflows]]/[[Untrusted Configuration]]/[[Ctx Adapters]].
+**Follow-up:** `zirv verify`'s own gate now requires a full (non-narrowed) run, so any workflow that was advancing on `--check`-narrowed evidence needs a full run instead.
 
 ### 2026-08-20: provider-neutral workflow system (issues #47–#56, v2.14.0, PR #59)
 **What:** Added compact versioned skills/capabilities and built-ins; durable feature/bugfix/refactor/spike/review workflows; deterministic intent/complexity/risk; changed-scope/final verification with fresh fingerprints; compact review packages and finding disposition; static-first artifacts with bounded server cleanup; layered custom skills; privacy-conscious local telemetry. Acceptance review then hardened sensitive-risk floors, persistent built-in-only mode, symlinked-parent/stack-size trust checks, untracked review content, `HEAD`-aware evidence, bounded output capture, open-finding gates, and per-adapter/non-duplicating stats.
