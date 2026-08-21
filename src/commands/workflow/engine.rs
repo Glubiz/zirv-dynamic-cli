@@ -297,6 +297,49 @@ pub enum WorkflowProfile {
     Frontend,
 }
 
+impl WorkflowProfile {
+    fn for_classification(classification: &Classification) -> Self {
+        match classification.work_domain.domain {
+            WorkDomain::Frontend => Self::Frontend,
+            WorkDomain::General => Self::Standard,
+        }
+    }
+}
+
+fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
+    if profile != WorkflowProfile::Frontend {
+        return;
+    }
+    for step in steps {
+        step.skill = match step.phase {
+            WorkflowPhase::Design => "frontend-design",
+            WorkflowPhase::Plan => "frontend-plan",
+            WorkflowPhase::Implement => "frontend-implement",
+            WorkflowPhase::Debug => "frontend-debug",
+            WorkflowPhase::Test => "frontend-test",
+            WorkflowPhase::Review => "frontend-review",
+            WorkflowPhase::Verify => "frontend-verify",
+            WorkflowPhase::Delegate | WorkflowPhase::Present => continue,
+        }
+        .into();
+        // The agent owns routine visual decisions. The workflow still
+        // enforces evidence gates; it never pauses for a theme vote.
+        if step.phase == WorkflowPhase::Design {
+            step.approval = false;
+        }
+    }
+}
+
+fn materialize(
+    kind: WorkflowKind,
+    classification: &Classification,
+    profile: WorkflowProfile,
+) -> Vec<WorkflowStep> {
+    let mut steps = definition(kind).materialize(classification);
+    apply_profile(profile, &mut steps);
+    steps
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowState {
     pub schema_version: u32,
@@ -342,11 +385,8 @@ impl WorkflowState {
         include_custom_skills: bool,
         classification: Classification,
     ) -> Self {
-        let steps = definition(kind).materialize(&classification);
-        let profile = match classification.work_domain.domain {
-            WorkDomain::Frontend => WorkflowProfile::Frontend,
-            WorkDomain::General => WorkflowProfile::Standard,
-        };
+        let profile = WorkflowProfile::for_classification(&classification);
+        let steps = materialize(kind, &classification, profile);
         let status = if steps.first().is_some_and(|step| step.approval) {
             WorkflowStatus::AwaitingApproval
         } else {
@@ -474,6 +514,7 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
     {
         state.profile = WorkflowProfile::Frontend;
         state.classification.work_domain = measured.work_domain.clone();
+        apply_profile(state.profile, &mut state.steps);
         state
             .classification
             .reasons
@@ -499,8 +540,7 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
         .filter_map(|id| state.steps.iter().find(|step| &step.id == id).cloned())
         .collect();
     steps.extend(
-        definition(state.kind)
-            .materialize(&state.classification)
+        materialize(state.kind, &state.classification, state.profile)
             .into_iter()
             .filter(|step| {
                 !completed.contains(&step.id)
@@ -983,6 +1023,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 super::frontend::ensure_profile(&state_dir, &repo)?;
             }
             let definition = definition(args.kind);
+            let profile = WorkflowProfile::for_classification(&classification);
             if let Some(agent) = &args.agent {
                 let registry = SkillRegistry::load_for_repo(
                     &repo,
@@ -990,7 +1031,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     !args.built_in_only,
                 )?;
                 let report = super::capability::CapabilityReport::for_adapter(agent);
-                for step in definition.materialize(&classification) {
+                for step in materialize(definition.kind, &classification, profile) {
                     registry.ensure_supported(&step.skill, &report)?;
                 }
             }
@@ -1159,6 +1200,31 @@ mod tests {
         );
 
         assert_eq!(state.profile, WorkflowProfile::Frontend);
+        assert_eq!(state.current().unwrap().skill, "frontend-implement");
+    }
+
+    #[test]
+    fn frontend_design_is_autonomous_but_keeps_the_evidence_phases() {
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::High;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+
+        let state = WorkflowState::start(
+            PathBuf::from("repo"),
+            "build a frontend design system".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+
+        assert_eq!(state.status, WorkflowStatus::Running);
+        assert_eq!(state.steps[0].skill, "frontend-design");
+        assert!(!state.steps[0].approval);
+        assert!(state.steps.iter().any(|step| step.skill == "frontend-review"));
+        assert!(state.steps.iter().any(|step| step.skill == "frontend-verify"));
     }
 
     #[test]

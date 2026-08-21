@@ -546,7 +546,84 @@ Build hierarchy with composition, typography, spacing, alignment, contrast, and 
 
 Every interactive surface must have meaningful default, hover, focus-visible, active, disabled, loading, empty, error, and success behavior where applicable. Use semantic elements, keyboard-complete interaction, accessible names, sufficient contrast, resilient text wrapping, and reduced-motion behavior. Responsive layouts must be composed for narrow and wide viewports rather than merely scaled down.
 
-Before completion, inspect the rendered result rather than trusting source code alone. Check visual hierarchy, alignment rhythm, overflow, contrast, interaction states, responsive behavior, and whether the result could be swapped into an unrelated AI-generated product without anyone noticing. If it could, revise it toward the actual product. Never claim visual quality from intent or code inspection when render evidence is required or available."#,
+            Before completion, inspect the rendered result rather than trusting source code alone. Check visual hierarchy, alignment rhythm, overflow, contrast, interaction states, responsive behavior, and whether the result could be swapped into an unrelated AI-generated product without anyone noticing. If it could, revise it toward the actual product. Never claim visual quality from intent or code inspection when render evidence is required or available."#,
+        ),
+        manifest(
+            "frontend-design",
+            "Frontend design",
+            "Autonomously establish a product-specific visual and interaction direction.",
+            &["frontend", "ui", "design", "visual direction"],
+            &[Cap::RepoRead],
+            &[Cap::ArtifactRender, Cap::BrowserOpen],
+            &[Phase::Design],
+            &["frontend-craft", "design"],
+            "Inspect the current product surface, shared components, tokens, assets, type, and content before proposing change. State one concise design thesis tied to the product and user goal, then decide the information hierarchy, layout rhythm, responsive composition, visual vocabulary, and critical interaction states. Reuse strong existing language; when none exists, make the missing decisions autonomously from product semantics. Do not generate theme menus, mood-board variants, or questions a capable designer can resolve. Identify what will make this interface recognizably this product and what tempting generic patterns will be excluded. Translate the thesis into acceptance criteria that can be verified in a rendered artifact.",
+        ),
+        manifest(
+            "frontend-plan",
+            "Frontend plan",
+            "Plan coherent UI work across structure, states, responsiveness, and evidence.",
+            &["frontend", "ui", "plan"],
+            &[Cap::RepoRead],
+            &[Cap::ArtifactRender],
+            &[Phase::Plan],
+            &["frontend-craft", "plan"],
+            "Order work from product structure and reusable primitives through page composition, interaction states, responsive behavior, and visual verification. Name the actual routes, components, styles, assets, and tests involved. Include empty, loading, error, success, narrow, and wide states when they exist. Keep the plan within the chosen design thesis and existing system. The agent owns routine design decisions; no initialization wizard, screenshot-registration step, server-start request, or human theme choice belongs in the plan.",
+        ),
+        manifest(
+            "frontend-implement",
+            "Frontend implementation",
+            "Implement intentional interfaces with complete states and responsive behavior.",
+            &["frontend", "ui", "component", "responsive"],
+            &[Cap::RepoRead, Cap::RepoWrite],
+            &[Cap::TestRun, Cap::ArtifactRender, Cap::BrowserOpen],
+            &[Phase::Implement],
+            &["frontend-craft", "implement"],
+            "Implement the chosen hierarchy and visual thesis in the project's existing framework and component system. Start with semantic structure and realistic content, then tokens and reusable primitives, then composition and polish. Prefer CSS and native platform behavior over dependencies for simple effects. Preserve data flow and behavior; do not replace real interactions with a static mockup. Build complete interaction and data states, keyboard behavior, accessible names, visible focus, resilient overflow, reduced motion, and intentional narrow/wide layouts as part of the change—not as cleanup. Keep typography, spacing, color roles, geometry, iconography, and motion internally consistent. After meaningful edits, run the fastest relevant checks and render the affected surface when the environment permits. Evaluate what is actually visible and revise concrete defects; never stop at code that merely appears plausible.",
+        ),
+        manifest(
+            "frontend-debug",
+            "Frontend debugging",
+            "Reproduce visual and interaction defects at the state and viewport where they occur.",
+            &["frontend", "ui", "visual bug", "interaction bug"],
+            &[Cap::RepoRead],
+            &[Cap::RepoWrite, Cap::TestRun, Cap::ArtifactRender, Cap::BrowserOpen],
+            &[Phase::Debug],
+            &["frontend-craft", "systematic-debugging"],
+            "Reproduce the defect in its actual route, viewport, data state, input method, and color or motion preference. Determine whether the cause is structure, CSS cascade, tokens, component state, data flow, browser behavior, or an accessibility contract before editing. Preserve the product's design language while fixing the cause. Add the smallest durable regression check available, then render the original failing state and at least one adjacent responsive or interaction state to rule out displacement bugs.",
+        ),
+        manifest(
+            "frontend-test",
+            "Frontend testing",
+            "Verify behavior, accessibility, states, and layout with proportional evidence.",
+            &["frontend", "ui", "test", "accessibility"],
+            &[Cap::TestRun],
+            &[Cap::RepoRead, Cap::ArtifactRender, Cap::BrowserOpen],
+            &[Phase::Test],
+            &["frontend-craft", "testing"],
+            "Run the project's deterministic frontend checks, then cover the changed user path and component contract. Verify semantic roles, labels, keyboard order, focus behavior, state transitions, reduced motion, and realistic loading, empty, error, and success states where applicable. Exercise narrow and wide layouts and stress long text or dense data. Record which surface, viewport, state, and current change fingerprint each result represents. A passing unit test is behavioral evidence, not proof that layout and visual hierarchy are correct.",
+        ),
+        manifest(
+            "frontend-review",
+            "Frontend review",
+            "Review rendered product quality independently from implementation intent.",
+            &["frontend", "ui", "review", "visual qa"],
+            &[Cap::RepoRead],
+            &[Cap::AgentSpawn, Cap::ArtifactRender, Cap::BrowserOpen],
+            &[Phase::Review],
+            &["frontend-craft", "review"],
+            "Review the requirement, autonomous profile, diff, deterministic findings, and fresh render evidence. Judge the visible result before reading implementation rationale. Look for generic AI composition, weak hierarchy, gratuitous containers or effects, token drift, fake content, inconsistent geometry, typography problems, overflow, missing states, inaccessible interaction, and narrow/wide regressions. Distinguish enforceable defects from subjective preference: cite the profile, existing product evidence, semantic contract, accessibility rule, or visible artifact supporting each finding. Do not request a human design vote. Give concrete dispositions and require re-rendering after material fixes.",
+        ),
+        manifest(
+            "frontend-verify",
+            "Frontend verification",
+            "Require fresh behavioral and visual proof for the final frontend change.",
+            &["frontend", "ui", "verify", "complete"],
+            &[Cap::TestRun],
+            &[Cap::RepoRead, Cap::ArtifactRender, Cap::BrowserOpen],
+            &[Phase::Verify],
+            &["frontend-craft", "verify"],
+            "Inspect the final diff and require fresh deterministic checks plus current render evidence for every affected surface. Confirm the evidence matches the final change fingerprint and covers representative narrow and wide viewports, the primary user state, and material loading, empty, error, success, focus, and reduced-motion states. Resolve blocking detector or visual-review findings before completion. Compare the result against the autonomous profile and established product language, including the interchangeable-product test. State exact passed, failed, unavailable, and skipped evidence; never convert a missing renderer or stale screenshot into a visual-quality claim.",
         ),
         manifest(
             "plan",
@@ -816,9 +893,9 @@ mod tests {
     #[test]
     fn builtins_are_valid_compact_and_provider_neutral() {
         let skills = builtin_manifests().expect("valid builtins");
-        assert_eq!(skills.len(), 11);
+        assert_eq!(skills.len(), 18);
         let total: usize = skills.iter().map(|skill| skill.instructions.len()).sum();
-        assert!(total < 12 * 1024, "built-ins should stay compact: {total}");
+        assert!(total < 24 * 1024, "built-ins should stay compact: {total}");
         for skill in skills {
             assert!(skill.instructions.len() <= skill.context_budget_bytes);
             for forbidden in ["Claude", "Codex", "Bash tool", "Agent tool"] {
@@ -847,6 +924,25 @@ mod tests {
         assert_eq!(skill.source, SkillSource::BuiltIn);
         assert!(skill.manifest.instructions.contains("Reject interchangeable AI UI"));
         assert!(registry.warnings()[0].contains("frontend-craft"));
+    }
+
+    #[test]
+    fn every_frontend_phase_skill_resolves_the_craft_floor_first() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        for id in [
+            "frontend-design",
+            "frontend-plan",
+            "frontend-implement",
+            "frontend-debug",
+            "frontend-test",
+            "frontend-review",
+            "frontend-verify",
+        ] {
+            let stack = registry.resolve_stack(id).unwrap();
+            assert_eq!(stack[0].manifest.id, "frontend-craft", "stack for {id}");
+            assert_eq!(stack.last().unwrap().manifest.id, id);
+        }
     }
 
     #[test]
