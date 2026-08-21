@@ -903,6 +903,7 @@ mod tests {
             changed_files: 1,
             changed_lines: 10,
             declared_scope: false,
+            work_domain: Default::default(),
             reasons: vec![],
         };
         let state = WorkflowState::start(

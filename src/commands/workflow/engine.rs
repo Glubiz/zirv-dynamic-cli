@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use super::classify::{self, Classification, Complexity, Intent, RiskBand};
+use super::classify::{self, Classification, Complexity, Intent, RiskBand, WorkDomain};
 use super::skill::{SkillRegistry, WorkflowPhase};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{
@@ -289,6 +289,14 @@ pub enum WorkflowStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowProfile {
+    #[default]
+    Standard,
+    Frontend,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowState {
     pub schema_version: u32,
@@ -296,6 +304,10 @@ pub struct WorkflowState {
     pub repo: PathBuf,
     pub task: String,
     pub kind: WorkflowKind,
+    /// Automatically selected methodology overlay. This is derived from the
+    /// task and change surface; there is deliberately no initialization flag.
+    #[serde(default)]
+    pub profile: WorkflowProfile,
     #[serde(default)]
     pub adapter: Option<String>,
     /// Whether operator-global and repository skills may override built-ins.
@@ -331,6 +343,10 @@ impl WorkflowState {
         classification: Classification,
     ) -> Self {
         let steps = definition(kind).materialize(&classification);
+        let profile = match classification.work_domain.domain {
+            WorkDomain::Frontend => WorkflowProfile::Frontend,
+            WorkDomain::General => WorkflowProfile::Standard,
+        };
         let status = if steps.first().is_some_and(|step| step.approval) {
             WorkflowStatus::AwaitingApproval
         } else {
@@ -343,6 +359,7 @@ impl WorkflowState {
             repo,
             task,
             kind,
+            profile,
             adapter,
             include_custom_skills,
             classification,
@@ -452,6 +469,16 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
     let Ok(measured) = classify::classify(&input) else {
         return;
     };
+    if measured.work_domain.domain == WorkDomain::Frontend
+        && state.profile == WorkflowProfile::Standard
+    {
+        state.profile = WorkflowProfile::Frontend;
+        state.classification.work_domain = measured.work_domain.clone();
+        state
+            .classification
+            .reasons
+            .push(format!("frontend workflow profile selected at step '{}'", step.id));
+    }
     if measured.risk <= state.classification.risk {
         return;
     }
@@ -664,12 +691,20 @@ pub fn render_current_context(
     let registry = SkillRegistry::load_for_repo(repo, home, state.include_custom_skills)?;
     let stack = registry.resolve_stack(&step.skill)?;
     let mut rendered = format!(
-        "zirv workflow step\nworkflow: {}\nstep: {}\nphase: {}\nstate: {:?}\n",
+        "zirv workflow step\nworkflow: {}\nprofile: {:?}\nstep: {}\nphase: {}\nstate: {:?}\n",
         state.kind.as_str(),
+        state.profile,
         step.id,
         step.phase,
         state.status
     );
+    if state.profile == WorkflowProfile::Frontend {
+        let state_dir = StateDir::resolve(&|key| std::env::var(key).ok())?;
+        let profile = super::frontend::ensure_profile(&state_dir, repo)?;
+        rendered.push('\n');
+        rendered.push_str(&super::frontend::render_profile(&profile));
+        rendered.push('\n');
+    }
     for skill in stack {
         rendered.push_str(&format!(
             "\n[skill {}@{}; source={}]\n{}\n",
@@ -844,6 +879,7 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
     } else {
         writeln!(writer, "workflow: {}", state.id)?;
         writeln!(writer, "kind: {}", state.kind.as_str())?;
+        writeln!(writer, "profile: {:?}", state.profile)?;
         writeln!(writer, "status: {:?}", state.status)?;
         writeln!(
             writer,
@@ -914,8 +950,12 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             } else {
                 writeln!(
                     writer,
-                    "intent={:?} complexity={:?} risk={:?} score={}",
-                    value.intent, value.complexity, value.risk, value.risk_score
+                    "intent={:?} domain={:?} complexity={:?} risk={:?} score={}",
+                    value.intent,
+                    value.work_domain.domain,
+                    value.complexity,
+                    value.risk,
+                    value.risk_score
                 )?;
                 for reason in value.reasons {
                     writeln!(writer, "- {reason}")?;
@@ -936,6 +976,12 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 json: false,
             };
             let classification = classify::from_args(&classify_args)?;
+            let state_dir = resolve_state()?;
+            if classification.work_domain.domain == WorkDomain::Frontend {
+                // Eager zero-touch bootstrap. Prompt rendering refreshes this
+                // derived profile as repository evidence evolves.
+                super::frontend::ensure_profile(&state_dir, &repo)?;
+            }
             let definition = definition(args.kind);
             if let Some(agent) = &args.agent {
                 let registry = SkillRegistry::load_for_repo(
@@ -956,7 +1002,6 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 !args.built_in_only,
                 classification,
             );
-            let state_dir = resolve_state()?;
             save(&state_dir, &state, true)?;
             let mut event = super::telemetry::TelemetryEvent::new(
                 super::telemetry::TelemetryKind::WorkflowStarted,
@@ -1057,6 +1102,7 @@ mod tests {
             changed_files: 1,
             changed_lines: 5,
             declared_scope: false,
+            work_domain: Default::default(),
             reasons: vec!["small".into()],
         }
     }
@@ -1094,6 +1140,25 @@ mod tests {
                 .first()
                 .is_some_and(|step| step.id == "design" && step.approval)
         );
+    }
+
+    #[test]
+    fn frontend_classification_selects_the_frontend_profile_automatically() {
+        let repo = tempdir().unwrap();
+        let mut classification = low_classification();
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "build a responsive dashboard UI".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+
+        assert_eq!(state.profile, WorkflowProfile::Frontend);
     }
 
     #[test]

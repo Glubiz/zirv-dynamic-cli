@@ -41,6 +41,21 @@ pub enum RiskBand {
     Critical,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkDomain {
+    #[default]
+    General,
+    Frontend,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainClassification {
+    pub domain: WorkDomain,
+    pub score: u8,
+    pub reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Classification {
     pub intent: Intent,
@@ -56,6 +71,10 @@ pub struct Classification {
     /// [`from_args`]).
     #[serde(default)]
     pub declared_scope: bool,
+    /// Orthogonal work-domain classification. This chooses methodology, not
+    /// permissions; older durable state defaults safely to `general`.
+    #[serde(default)]
+    pub work_domain: DomainClassification,
     pub reasons: Vec<String>,
 }
 
@@ -76,6 +95,7 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
     }
     let task = input.task.to_ascii_lowercase();
     let intent = input.intent_override.unwrap_or_else(|| infer_intent(&task));
+    let work_domain = infer_work_domain(&task, &input.paths);
     let changed_files = input.paths.len();
     let inferred_complexity = infer_complexity(changed_files, input.changed_lines, &input.paths);
     let complexity = input.complexity_override.unwrap_or(inferred_complexity);
@@ -219,8 +239,73 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         changed_files,
         changed_lines: input.changed_lines,
         declared_scope: false,
+        work_domain,
         reasons,
     })
+}
+
+fn infer_work_domain(task: &str, paths: &[PathBuf]) -> DomainClassification {
+    let mut score = 0u8;
+    let mut reasons = Vec::new();
+    let task_terms = [
+        "frontend",
+        "front-end",
+        "user interface",
+        " ui ",
+        "component",
+        "responsive",
+        "accessibility",
+        "landing page",
+        "dashboard",
+        "design system",
+    ];
+    if task_terms.iter().any(|term| task.contains(term))
+        || task.starts_with("ui ")
+        || task.ends_with(" ui")
+    {
+        score = score.saturating_add(55);
+        reasons.push("task describes a frontend or visual surface (+55)".into());
+    }
+
+    let lowered = paths
+        .iter()
+        .map(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    if lowered.iter().any(|path| {
+        matches!(
+            Path::new(path).extension().and_then(|value| value.to_str()),
+            Some("css" | "scss" | "sass" | "less" | "tsx" | "jsx" | "vue" | "svelte" | "html")
+        )
+    }) {
+        score = score.saturating_add(45);
+        reasons.push("changed path uses a frontend file type (+45)".into());
+    }
+    if lowered.iter().any(|path| {
+        path.contains("/components/")
+            || path.contains("/ui/")
+            || path.contains("/styles/")
+            || path.starts_with("components/")
+            || path.starts_with("ui/")
+            || path.starts_with("styles/")
+    }) {
+        score = score.saturating_add(25);
+        reasons.push("changed path is in a component, UI, or styles boundary (+25)".into());
+    }
+    score = score.min(100);
+    reasons.sort();
+    DomainClassification {
+        domain: if score >= 45 {
+            WorkDomain::Frontend
+        } else {
+            WorkDomain::General
+        },
+        score,
+        reasons,
+    }
 }
 
 /// `true` when the signal matched, so a caller can act on it structurally
@@ -466,6 +551,10 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
         classification.complexity = measured.complexity;
         raised = true;
     }
+    if measured.work_domain.score > classification.work_domain.score {
+        classification.work_domain = measured.work_domain;
+        raised = true;
+    }
     if !raised {
         classification
             .reasons
@@ -640,5 +729,38 @@ mod tests {
                 .to_string()
                 .contains("exceeds")
         );
+    }
+
+    #[test]
+    fn frontend_domain_is_inferred_from_task_without_an_init_flag() {
+        let classification = classify(&ClassificationInput {
+            task: "Build a responsive billing dashboard UI".into(),
+            paths: Vec::new(),
+            changed_lines: 0,
+            tests_changed: false,
+            intent_override: None,
+            complexity_override: None,
+            risk_override: None,
+        })
+        .expect("classification");
+
+        assert_eq!(classification.work_domain.domain, WorkDomain::Frontend);
+        assert!(classification.work_domain.score >= 45);
+    }
+
+    #[test]
+    fn frontend_domain_is_inferred_from_changed_file_types() {
+        let classification = classify(&ClassificationInput {
+            task: "Adjust the settings experience".into(),
+            paths: vec![PathBuf::from("src/settings/Panel.tsx")],
+            changed_lines: 12,
+            tests_changed: true,
+            intent_override: None,
+            complexity_override: None,
+            risk_override: None,
+        })
+        .expect("classification");
+
+        assert_eq!(classification.work_domain.domain, WorkDomain::Frontend);
     }
 }
