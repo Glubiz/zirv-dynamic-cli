@@ -14,7 +14,15 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
 };
 
-const VERIFY_SCHEMA_VERSION: u32 = 1;
+/// `.zirv/verify.toml`'s own schema. Repository-facing: bumping it asks every
+/// repository to rewrite its config, so it moves only for a real config-format
+/// change.
+const VERIFY_CONFIG_SCHEMA_VERSION: u32 = 1;
+/// The stored report's schema, which only zirv writes and reads. Bumped to 2
+/// when `narrowed_to` was added: the field is `#[serde(default)]`, so a
+/// narrowed report written by an earlier build would otherwise deserialize as
+/// un-narrowed and satisfy the freshness gate it was supposed to fail.
+const VERIFY_REPORT_SCHEMA_VERSION: u32 = 2;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_FAILURE_OUTPUT_BYTES: usize = 16 * 1024;
 /// Hard ceiling on a repository-supplied check's own timeout, independent of
@@ -25,6 +33,10 @@ const MAX_FAILURE_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_REPO_TIMEOUT_SECS: u64 = 900;
 /// Hard ceiling on how many repository-supplied checks one run will consider.
 const MAX_REPO_CHECKS: usize = 32;
+/// Shared wall-clock budget across every repository-supplied check in one run.
+/// The per-check clamp alone still allows 32 x 900s; this is the ceiling on the
+/// whole set.
+const MAX_REPO_TOTAL_TIME: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -98,10 +110,10 @@ pub struct VerificationConfig {
 
 impl VerificationConfig {
     fn validate(&self) -> CtxResult<()> {
-        if self.schema_version != VERIFY_SCHEMA_VERSION {
+        if self.schema_version != VERIFY_CONFIG_SCHEMA_VERSION {
             return Err(format!(
                 "unsupported verification schema_version {}; supported version is {}",
-                self.schema_version, VERIFY_SCHEMA_VERSION
+                self.schema_version, VERIFY_CONFIG_SCHEMA_VERSION
             )
             .into());
         }
@@ -307,7 +319,7 @@ fn load_or_discover_raw(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
         }
     }
     let config = VerificationConfig {
-        schema_version: VERIFY_SCHEMA_VERSION,
+        schema_version: VERIFY_CONFIG_SCHEMA_VERSION,
         checks,
     };
     config
@@ -624,6 +636,14 @@ fn scrub_output(text: &str) -> String {
     out
 }
 
+/// `scrub_output` for a field that is one line by construction (a check id, a
+/// command, a note). Newlines go too: a `command` string may legally contain
+/// one, and a printed newline lets repository text start a line of its own that
+/// looks like zirv's.
+fn scrub_line(text: &str) -> String {
+    scrub_output(text).replace(['\n', '\t'], " ")
+}
+
 fn check_result(check: &ResolvedCheck, status: CheckStatus) -> CheckResult {
     CheckResult {
         id: check.spec.id.clone(),
@@ -739,7 +759,7 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<Verificati
     let id = std::fs::read_to_string(latest)?;
     let path = dir.join(format!("{}.json", id.trim()));
     let report: VerificationReport = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-    if report.schema_version != VERIFY_SCHEMA_VERSION {
+    if report.schema_version != VERIFY_REPORT_SCHEMA_VERSION {
         return Err(format!(
             "verification report '{}': unsupported schema_version {}",
             report.id, report.schema_version
@@ -772,10 +792,10 @@ fn run_mode(
     dry_run: bool,
 ) -> CtxResult<VerificationReport> {
     let resolved = load_or_discover(repo)?;
-    let repo_checks_enabled =
-        crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())?
-            .workflow
-            .repo_checks_enabled;
+    // Not `?`: an unparseable ctx.toml closes the repo-check gate (and
+    // announces itself) rather than failing the whole command, which a
+    // checkout could otherwise use to brick `zirv test`/`zirv verify`.
+    let repo_checks_enabled = super::repo_gates(repo).checks;
     let mut notes = resolved.notes;
     let paths = changed_paths(repo)?;
     let mut fallback_to_full = false;
@@ -825,17 +845,37 @@ fn run_mode(
     // Before the checks, not after: a fingerprint taken afterwards records
     // edits made *during* a long suite as if they had been tested.
     let change_fingerprint = change_fingerprint(repo)?;
-    let checks = selected
-        .into_iter()
-        .map(|check| {
-            if !repo_checks_enabled && check.source.repo_supplied() {
-                return check_result(check, CheckStatus::Skipped);
+    let mut checks = Vec::with_capacity(selected.len());
+    // The per-check clamp bounds one command; 32 clamped commands still add up
+    // to eight hours, so the repo-supplied set gets one shared wall-clock
+    // budget as well. Whatever is left over is reported as skipped rather than
+    // quietly dropped.
+    let mut repo_spent = Duration::ZERO;
+    let mut budget_noted = false;
+    for check in selected {
+        if !repo_checks_enabled && check.source.repo_supplied() {
+            checks.push(check_result(check, CheckStatus::Skipped));
+            continue;
+        }
+        if check.source.repo_supplied() && repo_spent >= MAX_REPO_TOTAL_TIME {
+            if !budget_noted {
+                notes.push(format!(
+                    "repo-supplied checks exceeded the {}s total budget; the rest were skipped",
+                    MAX_REPO_TOTAL_TIME.as_secs()
+                ));
+                budget_noted = true;
             }
-            run_check(repo, check, dry_run)
-        })
-        .collect();
+            checks.push(check_result(check, CheckStatus::Skipped));
+            continue;
+        }
+        let result = run_check(repo, check, dry_run);
+        if check.source.repo_supplied() {
+            repo_spent = repo_spent.saturating_add(Duration::from_millis(result.duration_ms));
+        }
+        checks.push(result);
+    }
     Ok(VerificationReport {
-        schema_version: VERIFY_SCHEMA_VERSION,
+        schema_version: VERIFY_REPORT_SCHEMA_VERSION,
         id: uuid::Uuid::new_v4().to_string(),
         mode,
         source: resolved.origin.to_string(),
@@ -886,6 +926,12 @@ fn persist(report: &VerificationReport, repo: &Path, mode: VerificationMode) -> 
     Ok(())
 }
 
+fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
 /// One run: results printed first, then persisted. A persistence failure is a
 /// warning on the way out, never a reason to lose the results themselves.
 fn run_and_report(
@@ -895,7 +941,15 @@ fn run_and_report(
     writer: &mut impl Write,
 ) -> CtxResult<i32> {
     let report = run_mode(repo, mode, &args.checks, args.dry_run)?;
-    write_report(writer, &report, args.json)?;
+    // `zirv verify | head` closes the pipe mid-report. Printing is the part
+    // that failed, so the run's own results are still worth storing -- without
+    // this, piping into a pager silently cost the workflow its evidence.
+    if let Err(error) = write_report(writer, &report, args.json) {
+        if !is_broken_pipe(error.as_ref()) {
+            return Err(error);
+        }
+        crate::output::warn("verification output was cut short (broken pipe)");
+    }
     if !args.dry_run
         && let Err(error) = persist(&report, repo, mode)
     {
@@ -951,6 +1005,14 @@ fn resolved_repo(path: Option<&Path>) -> CtxResult<PathBuf> {
     })
 }
 
+/// Every string here that a repository could have written goes through
+/// `scrub_output` on the way to the terminal, not just the captured failure
+/// output: a check's own `command` is repository text too, so
+/// `command = "true # <ESC>[2J<ESC>[H all checks passed"` could clear the
+/// screen and forge a summary from the *header* line, without the check ever
+/// producing a byte of output. Ids and notes are zirv-shaped today, and are
+/// scrubbed anyway rather than relying on that staying true. JSON output needs
+/// none of this: serde escapes control characters.
 fn write_report(writer: &mut impl Write, report: &VerificationReport, json: bool) -> CtxResult<()> {
     if json {
         serde_json::to_writer_pretty(&mut *writer, report)?;
@@ -959,26 +1021,33 @@ fn write_report(writer: &mut impl Write, report: &VerificationReport, json: bool
         writeln!(
             writer,
             "verification {} ({:?}, {}, targeted_fallback={})",
-            report.id, report.mode, report.source, report.fallback_to_full
+            scrub_line(&report.id),
+            report.mode,
+            scrub_line(&report.source),
+            report.fallback_to_full
         )?;
         if !report.narrowed_to.is_empty() {
             writeln!(
                 writer,
                 "narrowed to: {} (not completion evidence for the change set)",
-                report.narrowed_to.join(", ")
+                scrub_line(&report.narrowed_to.join(", "))
             )?;
         }
         for note in &report.notes {
-            writeln!(writer, "note: {note}")?;
+            writeln!(writer, "note: {}", scrub_line(note))?;
         }
         for check in &report.checks {
             writeln!(
                 writer,
                 "{}\t{:?}\t{:?}\t{} ms\t{}",
-                check.id, check.source, check.status, check.duration_ms, check.command
+                scrub_line(&check.id),
+                check.source,
+                check.status,
+                check.duration_ms,
+                scrub_line(&check.command)
             )?;
             if let Some(output) = &check.failure_output {
-                writeln!(writer, "{output}")?;
+                writeln!(writer, "{}", scrub_output(output))?;
             }
         }
     }
@@ -1092,43 +1161,272 @@ mod tests {
         assert!(error.to_string().contains("workflow.repo_checks_enabled"));
     }
 
+    /// A repository with one commit, so the Git-backed halves of a run
+    /// (`changed_paths`, `change_fingerprint`) have something real to read.
+    fn git_repo() -> tempfile::TempDir {
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        repo
+    }
+
+    /// Every state-touching run in this module writes under `state_root`, so a
+    /// test never reads or writes the operator's own state directory.
+    fn with_state<T>(state_root: &Path, body: impl FnOnce() -> T) -> T {
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, state_root);
+        }
+        let value = body();
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        value
+    }
+
+    fn write_verify_toml(repo: &Path, body: &str) {
+        std::fs::create_dir_all(repo.join(".zirv")).unwrap();
+        std::fs::write(repo.join(".zirv/verify.toml"), body).unwrap();
+    }
+
+    /// The command a repo check would run if the gate let it: it leaves a file
+    /// behind, so "was it executed" is a filesystem fact rather than a status
+    /// this test reads back from the report it is testing.
+    fn marker_command() -> &'static str {
+        if cfg!(windows) {
+            "type nul > ran"
+        } else {
+            "touch ran"
+        }
+    }
+
     #[test]
     fn disabled_repo_checks_are_listed_but_never_executed() {
-        let repo = tempdir().unwrap();
-        std::fs::create_dir(repo.path().join(".zirv")).unwrap();
-        // A command that would leave a file behind if it ran at all.
-        let marker = repo.path().join("ran");
-        std::fs::write(
-            repo.path().join(".zirv/verify.toml"),
-            format!(
-                "schema_version=1\n[[checks]]\nid='sneaky'\nkind='custom'\ncommand='{} ran'\n",
-                if cfg!(windows) { "type nul >" } else { "touch" }
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='sneaky'\nkind='custom'\ncommand='{}'\n",
+                marker_command()
             ),
-        )
-        .unwrap();
-        let resolved = load_or_discover(repo.path()).unwrap();
-        let skipped = check_result(&resolved.checks[0], CheckStatus::Skipped);
-        assert_eq!(skipped.status, CheckStatus::Skipped);
-        assert_eq!(skipped.source, CheckSource::RepoConfig);
-        assert!(!marker.exists());
-        let report = VerificationReport {
-            schema_version: VERIFY_SCHEMA_VERSION,
-            id: "report".into(),
+        );
+        let report = with_state(state_root.path(), || {
+            // SAFETY: single-threaded suite.
+            unsafe {
+                std::env::set_var("ZIRV_CTX_WORKFLOW_REPO_CHECKS", "false");
+            }
+            let report = run_mode(repo.path(), VerificationMode::Final, &[], false);
+            unsafe {
+                std::env::remove_var("ZIRV_CTX_WORKFLOW_REPO_CHECKS");
+            }
+            report.expect("a disabled gate is not an error")
+        });
+        assert!(
+            !repo.path().join("ran").exists(),
+            "the gated command must not have executed"
+        );
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].status, CheckStatus::Skipped);
+        assert_eq!(report.checks[0].source, CheckSource::RepoConfig);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("workflow.repo_checks_enabled")),
+            "the skip must be stated: {:?}",
+            report.notes
+        );
+        assert!(!report.passed(), "a skipped check is not a passing check");
+    }
+
+    /// An unparseable repo `ctx.toml` used to do two contradictory wrong
+    /// things: re-enable repo skills (fail open) and hard-error verification
+    /// (bricking `zirv test` in that checkout). Both now fail closed on the
+    /// security decision while the run itself still works.
+    #[test]
+    fn an_unparseable_repo_config_closes_the_check_gate_instead_of_failing_the_run() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='sneaky'\nkind='custom'\ncommand='{}'\n",
+                marker_command()
+            ),
+        );
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "this is not = = toml\n").unwrap();
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false)
+                .expect("a malformed repo config must not brick verification")
+        });
+        assert!(!repo.path().join("ran").exists());
+        assert_eq!(report.checks[0].status, CheckStatus::Skipped);
+    }
+
+    /// A fingerprint taken *after* the checks records edits made during the
+    /// run as if they had been tested. This check edits a tracked file, so the
+    /// recorded fingerprint must differ from the tree's fingerprint afterwards.
+    #[test]
+    fn the_change_fingerprint_is_taken_before_the_checks_run() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='edit'\nkind='custom'\ncommand='echo two >> tracked.txt'\n",
+        );
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("run")
+        });
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
+        assert_ne!(
+            report.change_fingerprint,
+            change_fingerprint(repo.path()).unwrap(),
+            "the report must describe the tree as it was before the edit"
+        );
+    }
+
+    /// A `--check`-narrowed run is evidence about the checks it ran, not about
+    /// the change set, so it can never satisfy a step gate.
+    #[test]
+    fn a_narrowed_run_never_satisfies_the_freshness_gate() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let fingerprint = change_fingerprint(repo.path()).unwrap();
+        let mut report = VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "narrowed".into(),
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec!["format".into()],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![CheckResult {
+                id: "format".into(),
+                kind: CheckKind::Format,
+                command: "true".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+            }],
+        };
+        save_report(&state, &report).unwrap();
+        assert!(
+            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            "a narrowed run is not completion evidence"
+        );
+
+        report.id = "full".into();
+        report.narrowed_to.clear();
+        save_report(&state, &report).unwrap();
+        assert!(
+            latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            "the same run, un-narrowed, is"
+        );
+    }
+
+    /// Results are printed before they are persisted, so a state-directory
+    /// failure costs the report but not the operator's own output.
+    #[test]
+    fn results_are_printed_even_when_persistence_fails() {
+        let repo = git_repo();
+        let blocker = tempdir().unwrap();
+        // A *file* where the state directory should be: `StateDir` resolves,
+        // and every write under it fails.
+        let state_path = blocker.path().join("not-a-dir");
+        std::fs::write(&state_path, "").unwrap();
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='ok'\nkind='custom'\ncommand='true'\n",
+        );
+        let mut out = Vec::new();
+        let code = with_state(&state_path, || {
+            run_and_report(
+                repo.path(),
+                VerificationMode::Final,
+                &RunArgs {
+                    repo: None,
+                    checks: vec![],
+                    dry_run: false,
+                    json: false,
+                },
+                &mut out,
+            )
+            .expect("a persistence failure is a warning, not an error")
+        });
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\tok\t") || text.contains("ok\t"),
+            "got {text}"
+        );
+    }
+
+    /// The `command` field is repository text printed straight to the
+    /// terminal, so it needs the same scrubbing the captured output gets: an
+    /// escape sequence there could clear the screen and forge a summary from
+    /// the header line alone, with the check producing no output at all.
+    #[test]
+    fn a_report_never_prints_repo_controlled_escape_sequences() {
+        let report = VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "report".into(),
+            mode: VerificationMode::Final,
+            source: "configured".into(),
+            repo: PathBuf::from("/repo"),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
             narrowed_to: vec![],
-            notes: vec![
-                "skipped: repo-supplied checks disabled (workflow.repo_checks_enabled)".into(),
-            ],
+            notes: vec!["note \u{1b}[2Jforged".into()],
+            checks: vec![CheckResult {
+                id: "ok".into(),
+                kind: CheckKind::Custom,
+                command: "true # \u{1b}[2J\u{1b}[H\nverification all checks passed".into(),
+                source: CheckSource::RepoConfig,
+                status: CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+            }],
             started_at: 0,
             finished_at: 0,
-            checks: vec![skipped],
         };
-        assert!(!report.passed(), "a skipped check is not a passing check");
+        let mut out = Vec::new();
+        write_report(&mut out, &report, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains('\u{1b}'), "got {text:?}");
+        assert_eq!(
+            text.lines().count(),
+            3,
+            "a command's own newline must not start a line of its own: {text:?}"
+        );
     }
 
     #[test]

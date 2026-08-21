@@ -214,18 +214,17 @@ impl SkillRegistry {
 
     /// [`Self::load`] with `include_repo` taken from the operator's
     /// `[workflow] repo_skills_enabled` (`REPO_FORBIDDEN`, so a checkout
-    /// cannot turn its own skill layer back on). A configuration that will
-    /// not load leaves the layer on, which is the pre-existing behavior; the
-    /// error itself surfaces elsewhere on every other config read.
+    /// cannot turn its own skill layer back on). A configuration that will not
+    /// parse closes the gate rather than leaving it open -- a checkout controls
+    /// a layer of that config, so a malformed `.zirv/ctx.toml` would otherwise
+    /// be a way to force the untrusted skill layer back on. See
+    /// `super::repo_gates`, which decides this for verification too.
     pub fn load_for_repo(
         repo: &Path,
         home: Option<&Path>,
         include_custom: bool,
     ) -> CtxResult<Self> {
-        let include_repo =
-            crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())
-                .map_or(true, |cfg| cfg.workflow.repo_skills_enabled);
-        Self::load(repo, home, include_custom, include_repo)
+        Self::load(repo, home, include_custom, super::repo_gates(repo).skills)
     }
 
     pub fn list(&self) -> impl Iterator<Item = &RegisteredSkill> {
@@ -872,6 +871,30 @@ mod tests {
         let registry = SkillRegistry::load(repo.path(), None, true, true).unwrap();
         assert_eq!(registry.get("design").unwrap().source, SkillSource::BuiltIn);
         assert!(registry.warnings()[0].contains("built-in"));
+    }
+
+    /// The gate resolver failed *open* on an unparseable config, and a
+    /// repository controls one layer of that config -- so a malformed
+    /// `.zirv/ctx.toml` was a way to force the untrusted skill layer back on.
+    #[test]
+    fn an_unparseable_repo_config_drops_repository_skills_instead_of_keeping_them() {
+        let repo = tempdir().unwrap();
+        let project = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&project).unwrap();
+        write(
+            &project.join("extra.yaml"),
+            "schema_version: 1\nid: extra\nversion: 1\nname: Extra\ndescription: added\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: added by the repo\n",
+        );
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "not = = toml\n").unwrap();
+        let registry = SkillRegistry::load_for_repo(repo.path(), None, true).unwrap();
+        assert!(
+            registry.get("extra").is_err(),
+            "a malformed repo config must not widen what the repo may contribute"
+        );
+        assert!(
+            registry.get("design").is_ok(),
+            "zirv's own built-ins keep working"
+        );
     }
 
     #[test]

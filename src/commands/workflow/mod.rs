@@ -25,6 +25,59 @@ pub mod verification;
 /// now prevents a repository script from taking one over between releases.
 pub const TOP_LEVEL_COMMANDS: &[&str] = &["skill", "workflow", "test", "verify", "artifact"];
 
+/// The two operator gates over repository-provided workflow input:
+/// `workflow.repo_checks_enabled` (may `.zirv/verify.toml` and `package.json`
+/// script commands run at all) and `workflow.repo_skills_enabled` (is
+/// `.zirv/skills/` loaded at all).
+pub(crate) struct RepoGates {
+    pub checks: bool,
+    pub skills: bool,
+}
+
+/// Resolves both gates, failing **closed** when the configuration cannot be
+/// read.
+///
+/// This is the one answer both gates need, and it has to be the same answer.
+/// Reading the config per-gate produced two different wrong behaviors on an
+/// unparseable `.zirv/ctx.toml` -- which a repository checkout controls: the
+/// skill gate defaulted to *enabled* (so a malformed repo config was a way to
+/// force the untrusted skill layer back on) while verification hard-errored
+/// (so the same file bricked `zirv test`/`zirv verify` in that checkout).
+/// Neither is acceptable, and they disagree: an unreadable config means the
+/// operator's intent is unknown, so the security decision goes to "no
+/// repository-provided input" while everything zirv owns itself -- built-in
+/// skills, discovered toolchain checks -- keeps working.
+pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
+    match crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok()) {
+        Ok(cfg) => RepoGates {
+            checks: cfg.workflow.repo_checks_enabled,
+            skills: cfg.workflow.repo_skills_enabled,
+        },
+        Err(error) => {
+            announce_unreadable_config(&error.to_string());
+            RepoGates {
+                checks: false,
+                skills: false,
+            }
+        }
+    }
+}
+
+/// The degradation notice for a configuration that would not load. `chrome.
+/// events` is the switch this channel normally reads, and it lives in the very
+/// file that just failed to parse, so the operator's own `--quiet`/
+/// `ZIRV_CTX_QUIET` is consulted directly instead of assuming silence.
+fn announce_unreadable_config(reason: &str) {
+    let quiet = std::env::var("ZIRV_CTX_QUIET")
+        .map(|value| matches!(value.trim(), "true" | "1"))
+        .unwrap_or(false);
+    crate::commands::ctx::announce::Announcer::new(!quiet, false).emit(
+        &crate::commands::ctx::announce::Event::WorkflowGatesClosed {
+            reason: reason.to_string(),
+        },
+    );
+}
+
 /// Put a shell-backed workflow command in its own process group on Unix so a
 /// timeout can stop descendants as well as the shell. Windows uses
 /// `taskkill /T` in [`terminate_process_tree`] instead.
