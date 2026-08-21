@@ -522,6 +522,33 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
             "Establish the goal, constraints, affected boundaries, and acceptance criteria. Inspect existing architecture before proposing changes. Compare only materially different options. Choose the simplest design that meets the need, record important tradeoffs, and request approval only when the workflow marks a gate.",
         ),
         manifest(
+            "frontend-craft",
+            "Frontend craft floor",
+            "A non-negotiable quality floor for intentional, product-specific interfaces.",
+            &["frontend", "ui", "visual", "component", "responsive"],
+            &[Cap::RepoRead],
+            &[Cap::ArtifactRender, Cap::BrowserOpen],
+            &[
+                Phase::Design,
+                Phase::Plan,
+                Phase::Implement,
+                Phase::Test,
+                Phase::Review,
+                Phase::Verify,
+                Phase::Present,
+            ],
+            &[],
+            r#"Treat the autonomous frontend profile and the product's existing visual language as requirements. If evidence is sparse, choose a single clear visual concept from the product, audience, and content and carry it through; do not ask a human to initialize a profile, choose among generated themes, start a server, register screenshots, or vote on routine design decisions.
+
+Reject interchangeable AI UI. Do not default to a hero-plus-three-cards landing page, a generic sidebar dashboard, a grid of floating rounded panels, gratuitous glassmorphism, purple-blue gradients, gradient text, oversized marketing headings, pill-shaped controls everywhere, decorative blobs, fake analytics, or generic filler copy. A technique is allowed only when the product semantics or established system justifies it.
+
+Build hierarchy with composition, typography, spacing, alignment, contrast, and content before adding containers or effects. Preserve coherent tokens and component patterns; remove local inconsistency instead of adding another design system. Use a restrained semantic palette, deliberate type hierarchy, consistent geometry, and purposeful density. Prefer real product language and realistic states over slogans and placeholder content. Use icons from the project's icon system, not emoji as interface chrome.
+
+Every interactive surface must have meaningful default, hover, focus-visible, active, disabled, loading, empty, error, and success behavior where applicable. Use semantic elements, keyboard-complete interaction, accessible names, sufficient contrast, resilient text wrapping, and reduced-motion behavior. Responsive layouts must be composed for narrow and wide viewports rather than merely scaled down.
+
+Before completion, inspect the rendered result rather than trusting source code alone. Check visual hierarchy, alignment rhythm, overflow, contrast, interaction states, responsive behavior, and whether the result could be swapped into an unrelated AI-generated product without anyone noticing. If it could, revise it toward the actual product. Never claim visual quality from intent or code inspection when render evidence is required or available."#,
+        ),
+        manifest(
             "plan",
             "Plan",
             "Turn substantial work into ordered executable units.",
@@ -789,7 +816,7 @@ mod tests {
     #[test]
     fn builtins_are_valid_compact_and_provider_neutral() {
         let skills = builtin_manifests().expect("valid builtins");
-        assert_eq!(skills.len(), 10);
+        assert_eq!(skills.len(), 11);
         let total: usize = skills.iter().map(|skill| skill.instructions.len()).sum();
         assert!(total < 12 * 1024, "built-ins should stay compact: {total}");
         for skill in skills {
@@ -802,6 +829,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn frontend_craft_floor_is_built_in_and_cannot_be_replaced_by_a_repo() {
+        let repo = tempdir().unwrap();
+        let project = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&project).unwrap();
+        write(
+            &project.join("frontend-craft.yaml"),
+            "schema_version: 1\nid: frontend-craft\nversion: 9\nname: Weak\ndescription: disable the floor\ncontext_budget_bytes: 32\nphases: [implement]\ninstructions: make generic cards\n",
+        );
+
+        let registry = SkillRegistry::load(repo.path(), None, true, true).unwrap();
+        let skill = registry.get("frontend-craft@1").unwrap();
+
+        assert_eq!(skill.source, SkillSource::BuiltIn);
+        assert!(skill.manifest.instructions.contains("Reject interchangeable AI UI"));
+        assert!(registry.warnings()[0].contains("frontend-craft"));
     }
 
     #[test]
