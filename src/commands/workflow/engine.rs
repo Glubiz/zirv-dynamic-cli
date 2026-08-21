@@ -322,7 +322,7 @@ impl WorkflowState {
         self.steps.get(self.current_step)
     }
 
-    fn start(
+    pub(crate) fn start(
         repo: PathBuf,
         task: String,
         kind: WorkflowKind,
@@ -426,6 +426,68 @@ pub struct TransitionEvidence {
     pub worker_count: u32,
 }
 
+/// Re-measure risk when a workflow reaches a gated step, and never lower it.
+///
+/// Classification used to be frozen at `workflow start`, which for the common
+/// case (start the workflow, then do the work) measured an empty tree: the
+/// review step was decided before a single line existed. Re-measuring here
+/// means the tree that actually got written is what decides whether review is
+/// required. Only Review/Verify steps are added by this path -- a design gate
+/// appearing after the implementation is finished would be ceremony, not
+/// safety -- and completed steps are never re-run.
+///
+/// Silent when Git cannot be measured (not a repository, no commits): the
+/// classification recorded at start stands, exactly as before.
+fn reclassify_at_gate(state: &mut WorkflowState) {
+    let Some(step) = state.current().cloned() else {
+        return;
+    };
+    if !matches!(step.phase, WorkflowPhase::Review | WorkflowPhase::Verify) {
+        return;
+    }
+    let Ok(mut input) = classify::git_change_input(&state.repo, state.task.clone()) else {
+        return;
+    };
+    input.intent_override = Some(state.classification.intent);
+    let Ok(measured) = classify::classify(&input) else {
+        return;
+    };
+    if measured.risk <= state.classification.risk {
+        return;
+    }
+    state.classification.risk = measured.risk;
+    state.classification.risk_score = state.classification.risk_score.max(measured.risk_score);
+    state.classification.changed_files = measured.changed_files;
+    state.classification.changed_lines = measured.changed_lines;
+    state.classification.reasons.push(format!(
+        "reclassified at step '{}': measured risk {:?}",
+        step.id, measured.risk
+    ));
+    state.classification.reasons.sort();
+
+    let completed = state.completed_steps.clone();
+    let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
+    let mut steps: Vec<WorkflowStep> = completed
+        .iter()
+        .filter_map(|id| state.steps.iter().find(|step| &step.id == id).cloned())
+        .collect();
+    steps.extend(
+        definition(state.kind)
+            .materialize(&state.classification)
+            .into_iter()
+            .filter(|step| {
+                !completed.contains(&step.id)
+                    && (known.contains(&step.id)
+                        || matches!(step.phase, WorkflowPhase::Review | WorkflowPhase::Verify))
+            }),
+    );
+    state.current_step = steps
+        .iter()
+        .position(|step| !completed.contains(&step.id))
+        .unwrap_or(steps.len());
+    state.steps = steps;
+}
+
 pub fn advance_with_evidence(
     state_dir: &StateDir,
     mut state: WorkflowState,
@@ -499,6 +561,7 @@ pub fn advance_with_evidence(
             }
             state.completed_steps.push(current.id.clone());
             state.current_step += 1;
+            reclassify_at_gate(&mut state);
             state.status = match state.current() {
                 None => WorkflowStatus::Completed,
                 Some(step) if step.approval => WorkflowStatus::AwaitingApproval,
@@ -547,7 +610,7 @@ pub fn advance_with_evidence(
         state_dir,
         &state.repo,
         &event,
-        &super::telemetry::TelemetryConfig::from_env(),
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
     );
     if state.status == WorkflowStatus::Completed {
         let mut completed = super::telemetry::TelemetryEvent::new(
@@ -565,7 +628,7 @@ pub fn advance_with_evidence(
             state_dir,
             &state.repo,
             &completed,
-            &super::telemetry::TelemetryConfig::from_env(),
+            &super::telemetry::TelemetryConfig::for_repo(&state.repo),
         );
     }
     Ok(state)
@@ -598,7 +661,7 @@ pub fn render_current_context(
     ) {
         return Ok(None);
     }
-    let registry = SkillRegistry::load(repo, home, state.include_custom_skills)?;
+    let registry = SkillRegistry::load_for_repo(repo, home, state.include_custom_skills)?;
     let stack = registry.resolve_stack(&step.skill)?;
     let mut rendered = format!(
         "zirv workflow step\nworkflow: {}\nstep: {}\nphase: {}\nstate: {:?}\n",
@@ -624,7 +687,28 @@ pub fn active_skill_context(repo: &Path) -> CtxResult<Option<String>> {
     let Some(state) = load_active(&state_dir, repo)? else {
         return Ok(None);
     };
-    render_current_context(&state, repo, dirs::home_dir().as_deref())
+    match render_current_context(&state, repo, dirs::home_dir().as_deref()) {
+        Ok(context) => Ok(context),
+        // The caller composes a prompt and cannot fail over this, but a
+        // silently dropped workflow layer is a session running without the
+        // methodology it thinks it has. Say so once, on the channel a repo
+        // cannot silence (`chrome.events` is REPO_FORBIDDEN).
+        Err(error) => {
+            announce_degradation(repo, &error.to_string());
+            Ok(None)
+        }
+    }
+}
+
+fn announce_degradation(repo: &Path, reason: &str) {
+    let enabled =
+        crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())
+            .map_or(true, |cfg| cfg.chrome.events);
+    crate::commands::ctx::announce::Announcer::new(enabled, false).emit(
+        &crate::commands::ctx::announce::Event::WorkflowLayerSkipped {
+            reason: reason.to_string(),
+        },
+    );
 }
 
 #[derive(Debug, Args)]
@@ -854,8 +938,11 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let classification = classify::from_args(&classify_args)?;
             let definition = definition(args.kind);
             if let Some(agent) = &args.agent {
-                let registry =
-                    SkillRegistry::load(&repo, dirs::home_dir().as_deref(), !args.built_in_only)?;
+                let registry = SkillRegistry::load_for_repo(
+                    &repo,
+                    dirs::home_dir().as_deref(),
+                    !args.built_in_only,
+                )?;
                 let report = super::capability::CapabilityReport::for_adapter(agent);
                 for step in definition.materialize(&classification) {
                     registry.ensure_supported(&step.skill, &report)?;
@@ -882,7 +969,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 &state_dir,
                 &state.repo,
                 &event,
-                &super::telemetry::TelemetryConfig::from_env(),
+                &super::telemetry::TelemetryConfig::for_repo(&state.repo),
             );
             write_state(writer, &state, args.json)?;
         }
@@ -969,6 +1056,7 @@ mod tests {
             risk_score: 0,
             changed_files: 1,
             changed_lines: 5,
+            declared_scope: false,
             reasons: vec!["small".into()],
         }
     }

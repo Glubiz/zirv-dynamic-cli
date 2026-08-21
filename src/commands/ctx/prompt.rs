@@ -28,7 +28,7 @@ use super::config::PromptConfig;
 /// (`DEFAULT_PROMPT`'s "(v2)", `HARNESS_PROMPT`'s "(v5)"), which is where a
 /// changed sentence is recorded. See `the_composed_prompt_version_changed_
 /// with_its_shape`.
-pub const DEFAULT_PROMPT_VERSION: &str = "v6";
+pub const DEFAULT_PROMPT_VERSION: &str = "v7";
 pub const PROMPT_FILE: &str = "system-prompt.md";
 /// The user layer's own Worker-role file, read from `~/.zirv/` in place of
 /// [`PROMPT_FILE`] for a `PromptRole::Worker` session: an operator's standing
@@ -3766,6 +3766,97 @@ mod tests {
             "the harness roster layer changed the composed shape too, so the version marker must \
              move again"
         );
+        assert_ne!(
+            DEFAULT_PROMPT_VERSION, "v5",
+            "the memory-bank layer changed the composed shape too, so the version marker must \
+             move again"
+        );
+        assert_ne!(
+            DEFAULT_PROMPT_VERSION, "v6",
+            "the workflow-step layer changed the composed shape too; v6 belongs to the parallel \
+             memory work that merges before this branch, so this shape needs its own marker"
+        );
+    }
+
+    /// The workflow layer is a real layer with its own label and source, and
+    /// an inactive workflow must add nothing at all.
+    #[test]
+    fn the_workflow_layer_is_present_only_while_a_step_is_active() {
+        let base = || {
+            Some(ComposedPrompt {
+                text: String::from("base"),
+                sources: vec![PromptSource::Default],
+                version: DEFAULT_PROMPT_VERSION,
+            })
+        };
+        let inactive = with_workflow_layer(base(), None).expect("composed");
+        assert_eq!(inactive.sources, vec![PromptSource::Default]);
+        assert_eq!(inactive.text, "base");
+        assert_eq!(
+            with_workflow_layer(base(), Some("   \n "))
+                .expect("composed")
+                .text,
+            "base",
+            "an empty step context is not a layer"
+        );
+
+        let active = with_workflow_layer(
+            base(),
+            Some("zirv workflow step\nstep: review\n\n[skill review@1; source=built-in]\ninstructions"),
+        )
+        .expect("composed");
+        assert_eq!(
+            active.sources,
+            vec![PromptSource::Default, PromptSource::Workflow]
+        );
+        assert!(active.text.contains("[skill review@1; source=built-in]"));
+        assert!(
+            active.text.contains("methodology, not permission grants"),
+            "the layer states what it is not: {}",
+            active.text
+        );
+        assert_eq!(
+            with_workflow_layer(None, Some("anything")),
+            None,
+            "no composed prompt in, no composed prompt out"
+        );
+    }
+
+    /// A repository skill that will not load must not take the whole workflow
+    /// layer down with it, and composition itself must still succeed.
+    #[test]
+    fn a_broken_repository_skill_manifest_leaves_the_rest_of_the_prompt_intact() {
+        let (tmp, home, repo) = tree();
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).expect("mkdir state");
+        let skills = repo.join(".zirv/skills");
+        std::fs::create_dir_all(&skills).expect("mkdir skills");
+        std::fs::write(
+            skills.join("broken.yaml"),
+            "schema_version: 99\nid: broken\n",
+        )
+        .expect("write manifest");
+        // Hermetic: `compose` reaches the workflow engine, which resolves a
+        // state directory. Without this it would read the operator's own.
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, &state);
+        }
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+            &[],
+            0,
+            &[],
+        );
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        let composed = composed.expect("composition still succeeds");
+        assert_eq!(composed.sources, vec![PromptSource::Default]);
     }
 
     // T7: mail delivered into a composed prompt, between the repo layer and

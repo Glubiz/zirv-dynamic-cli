@@ -49,6 +49,13 @@ pub struct Classification {
     pub risk_score: u16,
     pub changed_files: usize,
     pub changed_lines: usize,
+    /// The change surface was declared on the command line (`--path`/
+    /// `--changed-lines`) rather than measured from Git. Consumers can tell a
+    /// measured classification from a stated one; the risk band itself is
+    /// never *lower* than the measured tree would give (see
+    /// [`from_args`]).
+    #[serde(default)]
+    pub declared_scope: bool,
     pub reasons: Vec<String>,
 }
 
@@ -84,34 +91,33 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
                 .to_ascii_lowercase()
         })
         .collect();
-    let mut sensitive_floor = None;
-    add_path_signal(
+    let mut sensitive_floor: Option<RiskBand> = None;
+    // `max`, and derived from the signal's own return value rather than from
+    // string-matching the reasons vector: a later signal must never be able to
+    // lower a floor an earlier one set, and a reason worded differently must
+    // never be able to drop the floor entirely.
+    let raise_floor = |band: RiskBand, floor: &mut Option<RiskBand>| {
+        *floor = Some(floor.map_or(band, |current: RiskBand| current.max(band)));
+    };
+    if add_path_signal(
         &lowered_paths,
         &["auth", "security", "permission", "credential", "secret"],
         30,
         "authentication/security surface",
         &mut score,
         &mut reasons,
-    );
-    if reasons
-        .iter()
-        .any(|reason| reason == "authentication/security surface")
-    {
-        sensitive_floor = Some(RiskBand::High);
+    ) {
+        raise_floor(RiskBand::High, &mut sensitive_floor);
     }
-    add_path_signal(
+    if add_path_signal(
         &lowered_paths,
         &["migration", "schema", "database", "sql"],
         25,
         "database/schema surface",
         &mut score,
         &mut reasons,
-    );
-    if reasons
-        .iter()
-        .any(|reason| reason == "database/schema surface")
-    {
-        sensitive_floor = Some(RiskBand::High);
+    ) {
+        raise_floor(RiskBand::High, &mut sensitive_floor);
     }
     add_path_signal(
         &lowered_paths,
@@ -212,10 +218,13 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         risk_score: score,
         changed_files,
         changed_lines: input.changed_lines,
+        declared_scope: false,
         reasons,
     })
 }
 
+/// `true` when the signal matched, so a caller can act on it structurally
+/// rather than by searching the reasons it wrote.
 fn add_path_signal(
     paths: &[String],
     needles: &[&str],
@@ -223,14 +232,16 @@ fn add_path_signal(
     reason: &str,
     score: &mut u16,
     reasons: &mut Vec<String>,
-) {
-    if paths
+) -> bool {
+    if !paths
         .iter()
         .any(|path| needles.iter().any(|needle| path.contains(needle)))
     {
-        *score += points;
-        reasons.push(reason.to_string());
+        return false;
     }
+    *score += points;
+    reasons.push(reason.to_string());
+    true
 }
 
 fn infer_intent(task: &str) -> Intent {
@@ -284,10 +295,15 @@ fn band_for_score(score: u16) -> RiskBand {
 }
 
 pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
+    // The same base `review::package` uses (merge-base against origin/main,
+    // then main, then HEAD^, then HEAD). Measuring against bare HEAD made
+    // classification and review disagree about what "the change" even is:
+    // everything already committed on the branch was invisible here.
+    let base = super::review::default_base(repo)?;
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["diff", "--numstat", "HEAD"])
+        .args(["diff", "--numstat", &base])
         .output()?;
     if !output.status.success() {
         return Err(format!(
@@ -392,9 +408,8 @@ pub struct ClassifyArgs {
 
 pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
-    let mut input = if args.paths.is_empty() && args.changed_lines.is_none() {
-        git_change_input(&repo, args.task.clone())?
-    } else {
+    let declared = !args.paths.is_empty() || args.changed_lines.is_some();
+    let mut input = if declared {
         ClassificationInput {
             task: args.task.clone(),
             paths: args.paths.clone(),
@@ -404,11 +419,44 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
             complexity_override: None,
             risk_override: None,
         }
+    } else {
+        git_change_input(&repo, args.task.clone())?
     };
     input.intent_override = args.intent;
     input.complexity_override = args.complexity;
     input.risk_override = args.risk;
-    classify(&input)
+    let mut classification = classify(&input)?;
+    if !declared {
+        return Ok(classification);
+    }
+    classification.declared_scope = true;
+    // Declared inputs used to switch Git measurement off entirely, which
+    // turned `--path README.md` into a way to talk a real auth-file change
+    // down from High to Low and drop the review step with it. Declared and
+    // measured are both computed; the risk band is the higher of the two.
+    let Ok(mut measured_input) = git_change_input(&repo, args.task.clone()) else {
+        classification
+            .reasons
+            .push("declared change scope (Git measurement unavailable)".to_string());
+        classification.reasons.sort();
+        return Ok(classification);
+    };
+    measured_input.intent_override = args.intent;
+    measured_input.complexity_override = args.complexity;
+    let measured = classify(&measured_input)?;
+    classification
+        .reasons
+        .push(if measured.risk > classification.risk {
+            format!("measured-tree risk floor: {:?}", measured.risk)
+        } else {
+            "declared change scope".to_string()
+        });
+    if measured.risk > classification.risk {
+        classification.risk = measured.risk;
+        classification.risk_score = classification.risk_score.max(measured.risk_score);
+    }
+    classification.reasons.sort();
+    Ok(classification)
 }
 
 #[cfg(test)]
@@ -454,6 +502,78 @@ mod tests {
         let classification = classify(&value).unwrap();
         assert_eq!(classification.complexity, Complexity::Trivial);
         assert_eq!(classification.risk, RiskBand::Low);
+    }
+
+    /// A committed repository with `file` in the working tree but not in
+    /// `HEAD`, so a Git measurement has something real to see.
+    fn repo_with_pending_file(file: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let path = repo.path().join(file);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(&path, "fn check_password() {}\n").expect("write");
+        repo
+    }
+
+    #[test]
+    fn declared_inputs_cannot_talk_a_measured_sensitive_surface_down() {
+        let repo = repo_with_pending_file("src/auth/session.rs");
+        let args = ClassifyArgs {
+            task: "implement feature".into(),
+            paths: vec![PathBuf::from("README.md")],
+            changed_lines: Some(2),
+            tests_changed: true,
+            intent: None,
+            complexity: None,
+            risk: None,
+            repo: Some(repo.path().to_path_buf()),
+            json: false,
+        };
+        let declared_only = classify(&ClassificationInput {
+            task: args.task.clone(),
+            paths: args.paths.clone(),
+            changed_lines: 2,
+            tests_changed: true,
+            intent_override: None,
+            complexity_override: None,
+            risk_override: None,
+        })
+        .unwrap();
+        assert_eq!(declared_only.risk, RiskBand::Low);
+
+        let classification = from_args(&args).unwrap();
+        assert!(classification.declared_scope);
+        assert!(
+            classification.risk >= RiskBand::High,
+            "the measured auth surface must floor the declared band: {classification:?}"
+        );
+        assert!(
+            classification
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("measured-tree risk floor"))
+        );
     }
 
     #[test]

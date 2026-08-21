@@ -101,8 +101,13 @@ fn infer_kind(path: &Path) -> ArtifactKind {
     }
 }
 
+/// The one place a repository path becomes a state-directory slug. Every entry
+/// point has to agree on it: `register` canonicalized while `load`/`list` used
+/// the caller's path verbatim, so on a platform where the two differ (macOS
+/// `/var` -> `/private/var`) a just-registered artifact could not be read back.
 fn artifact_dir(state: &StateDir, repo: &Path) -> PathBuf {
-    state.artifacts().join(repo_slug(repo))
+    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    state.artifacts().join(repo_slug(&repo))
 }
 
 fn record_path(state: &StateDir, repo: &Path, id: &str) -> CtxResult<PathBuf> {
@@ -152,7 +157,7 @@ pub fn register(
         state,
         &repo,
         &event,
-        &super::telemetry::TelemetryConfig::from_env(),
+        &super::telemetry::TelemetryConfig::for_repo(&repo),
     );
     Ok(record)
 }
@@ -295,6 +300,53 @@ fn open_url(url: &str) -> CtxResult<()> {
     Ok(())
 }
 
+/// `host:port` for a readiness probe. Only `http://` and `https://` are
+/// accepted at all: `--url` is handed to the platform opener, and `file://`,
+/// `vscode://` or any other registered scheme turns "open the local preview"
+/// into "launch whatever this string names".
+fn probe_target(url: &str) -> CtxResult<String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or("--url must be an http:// or https:// address")?;
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        other => return Err(format!("--url scheme '{other}' is not http or https").into()),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err("--url has no host".into());
+    }
+    if authority.contains('@') {
+        return Err("--url must not carry credentials".into());
+    }
+    if authority.starts_with('[') {
+        // IPv6 literal: `[::1]` or `[::1]:8000`, already in connect form.
+        return Ok(match authority.rsplit_once("]:") {
+            Some(_) => authority.to_string(),
+            None => format!("{authority}:{default_port}"),
+        });
+    }
+    Ok(match authority.split_once(':') {
+        Some(_) => authority.to_string(),
+        None => format!("{authority}:{default_port}"),
+    })
+}
+
+/// How long the spawned server gets to accept a connection before the run is
+/// called a failure. Counted inside the artifact's own lifetime.
+const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn drain_stderr(child: &mut std::process::Child) -> String {
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut buffer = Vec::new();
+    use std::io::Read;
+    let _ = stderr.by_ref().take(4096).read_to_end(&mut buffer);
+    String::from_utf8_lossy(&buffer).trim().to_string()
+}
+
 fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
     let command = args
         .server_command
@@ -303,19 +355,62 @@ fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
     if args.lifetime_secs == 0 || args.lifetime_secs > 3600 {
         return Err("--lifetime-secs must be in 1..=3600".into());
     }
+    let target = probe_target(&args.url)?;
     let mut child = shell(command, repo)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     let mut job = crate::commands::ctx::supervise::JobGuard::adopt(child.id());
-    std::thread::sleep(Duration::from_millis(300));
+    // The clock starts at spawn, not after the blocking browser open: an
+    // opener that sits waiting for a user used to extend the "hard" lifetime
+    // by however long that took.
+    let deadline = Instant::now() + Duration::from_secs(args.lifetime_secs);
+
+    // Success means a live server, not a spawn that returned. A command that
+    // exits immediately (typo, port in use) used to report success with its
+    // own error message thrown away.
+    let ready_by = Instant::now() + SERVER_READY_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let stderr = drain_stderr(&mut child);
+            job.close();
+            return Err(format!(
+                "server command exited before serving ({status}){}",
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            )
+            .into());
+        }
+        if std::net::TcpStream::connect(&target).is_ok() {
+            break;
+        }
+        if Instant::now() >= ready_by {
+            let stderr = drain_stderr(&mut child);
+            super::terminate_process_tree(&mut child)?;
+            job.close();
+            return Err(format!(
+                "server did not accept a connection on {target} within {}s{}",
+                SERVER_READY_TIMEOUT.as_secs(),
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     if let Err(error) = open_url(&args.url) {
         super::terminate_process_tree(&mut child)?;
         job.close();
         return Err(error);
     }
-    let deadline = Instant::now() + Duration::from_secs(args.lifetime_secs);
     while Instant::now() < deadline {
         if child.try_wait()?.is_some() {
             super::terminate_process_tree(&mut child)?;
@@ -425,6 +520,51 @@ mod tests {
         let plan = presentation_plan("codex", true).unwrap();
         assert_eq!(plan.method, PresentationMethod::InteractiveServer);
         assert!(plan.cleanup_required);
+    }
+
+    #[test]
+    fn only_http_urls_reach_the_platform_opener() {
+        assert_eq!(
+            probe_target("http://127.0.0.1:8000").unwrap(),
+            "127.0.0.1:8000"
+        );
+        assert_eq!(
+            probe_target("https://localhost/x").unwrap(),
+            "localhost:443"
+        );
+        assert_eq!(probe_target("http://[::1]:8000/").unwrap(), "[::1]:8000");
+        for rejected in [
+            "file:///etc/passwd",
+            "vscode://file/tmp",
+            "127.0.0.1:8000",
+            "http://user:pass@host/",
+        ] {
+            assert!(probe_target(rejected).is_err(), "{rejected} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_server_command_that_exits_immediately_is_a_failure() {
+        let repo = tempdir().unwrap();
+        let args = PresentArgs {
+            id: "unused".into(),
+            agent: "claude".into(),
+            interactive: true,
+            server_command: Some(if cfg!(windows) {
+                "exit /b 7".into()
+            } else {
+                "echo boom >&2; exit 7".into()
+            }),
+            // Port 0 never accepts, so a passing readiness probe is impossible
+            // and the exit is what this must report.
+            url: "http://127.0.0.1:1/".into(),
+            lifetime_secs: 5,
+            repo: None,
+            json: false,
+        };
+        let error = run_interactive(&args, repo.path()).unwrap_err().to_string();
+        assert!(error.contains("exited before serving"), "got {error}");
+        assert!(error.contains("boom") || cfg!(windows), "got {error}");
     }
 
     #[test]
