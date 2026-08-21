@@ -17,6 +17,14 @@ use crate::commands::ctx::state::{
 const VERIFY_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_FAILURE_OUTPUT_BYTES: usize = 16 * 1024;
+/// Hard ceiling on a repository-supplied check's own timeout, independent of
+/// `workflow.repo_checks_enabled`. `CheckSpec::validate` allows up to a day,
+/// which for a checkout-authored command is a wall-clock denial of service
+/// dressed as a test suite. Clamped rather than refused, with a report note:
+/// the check still runs, it just cannot hold the session for hours.
+const MAX_REPO_TIMEOUT_SECS: u64 = 900;
+/// Hard ceiling on how many repository-supplied checks one run will consider.
+const MAX_REPO_CHECKS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -111,7 +119,96 @@ impl VerificationConfig {
     }
 }
 
-pub fn load_or_discover(repo: &Path) -> CtxResult<(VerificationConfig, &'static str)> {
+/// Where one check's command text came from. A report records this per check
+/// so a vacuous `command = "true"` gate is visible as repo-authored rather
+/// than looking like a real toolchain check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckSource {
+    /// A command written in the repository's own `.zirv/verify.toml`.
+    RepoConfig,
+    /// `npm run <script>`, whose body is written in the repository's own
+    /// `package.json`. Discovered by zirv, authored by the checkout.
+    DiscoveredScript,
+    /// A command zirv itself owns (the Cargo checks), discovered from the
+    /// presence of a manifest but never taken from repository text.
+    DiscoveredToolchain,
+}
+
+impl CheckSource {
+    /// Whether the command text this check runs was authored by the checkout.
+    fn repo_supplied(self) -> bool {
+        !matches!(self, Self::DiscoveredToolchain)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCheck {
+    pub spec: CheckSpec,
+    pub source: CheckSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedChecks {
+    pub checks: Vec<ResolvedCheck>,
+    pub origin: &'static str,
+    pub notes: Vec<String>,
+}
+
+/// Caps that hold whether or not `workflow.repo_checks_enabled` is on: a
+/// checkout must not be able to choose its own wall-clock budget or flood a
+/// run with hundreds of commands.
+fn apply_repo_caps(checks: &mut Vec<ResolvedCheck>, notes: &mut Vec<String>) {
+    for check in checks.iter_mut() {
+        if check.source.repo_supplied() && check.spec.timeout_secs > MAX_REPO_TIMEOUT_SECS {
+            notes.push(format!(
+                "check '{}': repo-supplied timeout {}s clamped to {MAX_REPO_TIMEOUT_SECS}s",
+                check.spec.id, check.spec.timeout_secs
+            ));
+            check.spec.timeout_secs = MAX_REPO_TIMEOUT_SECS;
+        }
+    }
+    let repo_supplied = checks
+        .iter()
+        .filter(|check| check.source.repo_supplied())
+        .count();
+    if repo_supplied > MAX_REPO_CHECKS {
+        let mut kept = 0usize;
+        checks.retain(|check| {
+            if !check.source.repo_supplied() {
+                return true;
+            }
+            kept += 1;
+            kept <= MAX_REPO_CHECKS
+        });
+        notes.push(format!(
+            "{repo_supplied} repo-supplied checks truncated to the first {MAX_REPO_CHECKS}"
+        ));
+    }
+}
+
+pub fn load_or_discover(repo: &Path) -> CtxResult<ResolvedChecks> {
+    let (config, origin, source) = load_or_discover_raw(repo)?;
+    let mut checks: Vec<ResolvedCheck> = config
+        .checks
+        .into_iter()
+        .map(|spec| ResolvedCheck {
+            source: source(&spec),
+            spec,
+        })
+        .collect();
+    let mut notes = Vec::new();
+    apply_repo_caps(&mut checks, &mut notes);
+    Ok(ResolvedChecks {
+        checks,
+        origin,
+        notes,
+    })
+}
+
+type SourceFor = fn(&CheckSpec) -> CheckSource;
+
+fn load_or_discover_raw(repo: &Path) -> CtxResult<(VerificationConfig, &'static str, SourceFor)> {
     let path = repo.join(".zirv").join("verify.toml");
     if path.exists() {
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -131,7 +228,7 @@ pub fn load_or_discover(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
         }
         let config: VerificationConfig = toml::from_str(&std::fs::read_to_string(&path)?)?;
         config.validate()?;
-        return Ok((config, "configured"));
+        return Ok((config, "configured", |_| CheckSource::RepoConfig));
     }
 
     let mut checks = Vec::new();
@@ -216,9 +313,18 @@ pub fn load_or_discover(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
     config
         .validate()
         .map_err(|_| -> Box<dyn std::error::Error> {
-            "no verification checks configured or safely discoverable; add .zirv/verify.toml".into()
+            "no verification checks configured or discoverable; add .zirv/verify.toml".into()
         })?;
-    Ok((config, "discovered"))
+    // `npm run <id>` executes a command body written in the repository's own
+    // package.json: discovered by zirv, authored by the checkout, and gated
+    // as such. The Cargo commands are zirv's own text.
+    Ok((config, "discovered", |spec| {
+        if spec.command.starts_with("npm run ") {
+            CheckSource::DiscoveredScript
+        } else {
+            CheckSource::DiscoveredToolchain
+        }
+    }))
 }
 
 fn path_matches(pattern: &str, path: &str) -> bool {
@@ -257,17 +363,51 @@ fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     p == pattern.len()
 }
 
+/// The worktree root, so every path this module handles is root-relative.
+/// `git diff --name-only` already reports root-relative paths while `git
+/// ls-files --others` reports them relative to the process's directory, so
+/// running both from a subdirectory (`--repo <subdir>`) mixed two path bases
+/// in one list and content edits then matched nothing.
+fn git_root(repo: &Path) -> PathBuf {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if text.is_empty() {
+                repo.to_path_buf()
+            } else {
+                PathBuf::from(text)
+            }
+        }
+        _ => repo.to_path_buf(),
+    }
+}
+
+/// `-c core.quotePath=false`: with the default on, git escapes any non-ASCII
+/// path into `"\303\244..."`, which no later `hash-object`/pattern match can
+/// resolve back to the real file.
+fn git_at(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-c")
+        .arg("core.quotePath=false")
+        .arg("-C")
+        .arg(repo);
+    command
+}
+
 pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
+    let root = git_root(repo);
     let mut paths = Vec::new();
     for args in [
         &["diff", "--name-only", "HEAD"][..],
-        &["ls-files", "--others", "--exclude-standard"][..],
+        &["ls-files", "--others", "--exclude-standard", "--full-name"][..],
     ] {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()?;
+        let output = git_at(&root).args(args).output()?;
         if !output.status.success() {
             return Err(format!(
                 "cannot inspect changed paths: {}",
@@ -288,19 +428,12 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
 }
 
 pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
-    let head = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()?;
+    let root = git_root(repo);
+    let head = git_at(&root).args(["rev-parse", "HEAD"]).output()?;
     if !head.status.success() {
         return Err("cannot fingerprint repository HEAD".into());
     }
-    let diff = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["diff", "--raw", "HEAD"])
-        .output()?;
+    let diff = git_at(&root).args(["diff", "--raw", "HEAD"]).output()?;
     if !diff.status.success() {
         return Err("cannot fingerprint repository diff".into());
     }
@@ -309,10 +442,8 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     for path in changed_paths(repo)? {
         input.push_str("\npath:");
         input.push_str(&path.to_string_lossy());
-        if std::fs::symlink_metadata(repo.join(&path)).is_ok() {
-            let hashed = Command::new("git")
-                .arg("-C")
-                .arg(repo)
+        if std::fs::symlink_metadata(root.join(&path)).is_ok() {
+            let hashed = git_at(&root)
                 .args(["hash-object", "--no-filters", "--"])
                 .arg(&path)
                 .output()?;
@@ -348,6 +479,9 @@ pub enum CheckStatus {
     Failed,
     TimedOut,
     DryRun,
+    /// Selected and reported, but deliberately not executed -- today only
+    /// because `workflow.repo_checks_enabled` is off. Never counts as passing.
+    Skipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,11 +489,17 @@ pub struct CheckResult {
     pub id: String,
     pub kind: CheckKind,
     pub command: String,
+    #[serde(default = "default_check_source")]
+    pub source: CheckSource,
     pub status: CheckStatus,
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_output: Option<String>,
+}
+
+fn default_check_source() -> CheckSource {
+    CheckSource::RepoConfig
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +512,15 @@ pub struct VerificationReport {
     pub change_fingerprint: u64,
     pub changed_paths: Vec<PathBuf>,
     pub fallback_to_full: bool,
+    /// The `--check` ids this run was narrowed to. A narrowed run is not
+    /// completion evidence for the whole change set -- see
+    /// [`latest_is_fresh_and_passing`], which used to accept a format-only run
+    /// as a satisfied gate.
+    #[serde(default)]
+    pub narrowed_to: Vec<String>,
+    /// Clamps, truncations, and skips applied to this run.
+    #[serde(default)]
+    pub notes: Vec<String>,
     pub started_at: u64,
     pub finished_at: u64,
     pub checks: Vec<CheckResult>,
@@ -402,12 +551,20 @@ fn command_for_shell(command: &str) -> Command {
     }
 }
 
-fn read_capped_tail(mut reader: impl Read, cap: usize) -> Vec<u8> {
+/// The retained tail, plus whether the stream ended in a read error rather
+/// than at EOF. An error read as a clean end silently turned a truncated
+/// failure log into a complete-looking one.
+fn read_capped_tail(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
     let mut kept = Vec::with_capacity(cap);
     let mut chunk = [0u8; 8192];
+    let mut errored = false;
     loop {
         let count = match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(_) => {
+                errored = true;
+                break;
+            }
             Ok(count) => count,
         };
         if count >= cap {
@@ -421,21 +578,71 @@ fn read_capped_tail(mut reader: impl Read, cap: usize) -> Vec<u8> {
         }
         kept.extend_from_slice(&chunk[..count]);
     }
-    kept
+    (kept, errored)
 }
 
-fn run_check(repo: &Path, check: &CheckSpec, dry_run: bool) -> CheckResult {
-    if dry_run {
-        return CheckResult {
-            id: check.id.clone(),
-            kind: check.kind,
-            command: check.command.clone(),
-            status: CheckStatus::DryRun,
-            exit_code: None,
-            duration_ms: 0,
-            failure_output: None,
-        };
+/// The last `cap` bytes as text, on a char boundary. `utils::truncate_bytes`
+/// keeps the *head*, which throws away the failure tail this whole capped-tail
+/// path exists to preserve (lossy UTF-8 replacement can inflate the byte
+/// count past the cap, so the head-truncating call was reachable).
+fn tail_text(bytes: &[u8], cap: usize) -> String {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    if text.len() <= cap {
+        return text;
     }
+    let mut start = text.len() - cap;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
+}
+
+/// Check output is repository-controlled text printed straight to the
+/// operator's terminal, where an escape sequence can clear the screen and
+/// forge an "all checks passed" summary. Same treatment as `mail.rs` and
+/// `wrap.rs` give relayed text, except that `\n`/`\t` stay: a failure log is
+/// read as lines.
+fn scrub_output(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\t' {
+            out.push(ch);
+            in_run = false;
+            continue;
+        }
+        if ch.is_control() {
+            if !in_run {
+                out.push(' ');
+                in_run = true;
+            }
+            continue;
+        }
+        out.push(ch);
+        in_run = false;
+    }
+    out
+}
+
+fn check_result(check: &ResolvedCheck, status: CheckStatus) -> CheckResult {
+    CheckResult {
+        id: check.spec.id.clone(),
+        kind: check.spec.kind,
+        command: check.spec.command.clone(),
+        source: check.source,
+        status,
+        exit_code: None,
+        duration_ms: 0,
+        failure_output: None,
+    }
+}
+
+fn run_check(repo: &Path, check: &ResolvedCheck, dry_run: bool) -> CheckResult {
+    if dry_run {
+        return check_result(check, CheckStatus::DryRun);
+    }
+    let check_source = check.source;
+    let check = &check.spec;
     let started = Instant::now();
     let mut command = command_for_shell(&check.command);
     super::isolate_process_tree(&mut command);
@@ -481,26 +688,28 @@ fn run_check(repo: &Path, check: &CheckSpec, dry_run: bool) -> CheckResult {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let mut output = stdout_thread.join().unwrap_or_default();
-        output.extend(stderr_thread.join().unwrap_or_default());
+        let (mut output, mut errored) = stdout_thread.join().unwrap_or_default();
+        let (stderr_output, stderr_errored) = stderr_thread.join().unwrap_or_default();
+        output.extend(stderr_output);
+        errored |= stderr_errored;
         if output.len() > MAX_FAILURE_OUTPUT_BYTES {
             output.drain(..output.len() - MAX_FAILURE_OUTPUT_BYTES);
+        }
+        if errored {
+            output.extend_from_slice(b"\n[output stream ended in a read error]");
         }
         Ok((status, code, output))
     })();
 
     let (status, exit_code, output) =
         result.unwrap_or_else(|err| (CheckStatus::Failed, None, err.to_string().into_bytes()));
-    let failure_output = (status != CheckStatus::Passed).then(|| {
-        crate::utils::truncate_bytes(
-            String::from_utf8_lossy(&output).into_owned(),
-            Some(MAX_FAILURE_OUTPUT_BYTES),
-        )
-    });
+    let failure_output = (status != CheckStatus::Passed)
+        .then(|| scrub_output(&tail_text(&output, MAX_FAILURE_OUTPUT_BYTES)));
     CheckResult {
         id: check.id.clone(),
         kind: check.kind,
         command: check.command.clone(),
+        source: check_source,
         status,
         exit_code,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -550,6 +759,9 @@ pub fn latest_is_fresh_and_passing(
     };
     Ok(report.passed()
         && (!final_only || report.mode == VerificationMode::Final)
+        // A `--check format` run is evidence about formatting, not about the
+        // change set, so it can never satisfy a step gate.
+        && report.narrowed_to.is_empty()
         && report.change_fingerprint == change_fingerprint(repo)?)
 }
 
@@ -559,18 +771,23 @@ fn run_mode(
     only: &[String],
     dry_run: bool,
 ) -> CtxResult<VerificationReport> {
-    let (config, source) = load_or_discover(repo)?;
+    let resolved = load_or_discover(repo)?;
+    let repo_checks_enabled =
+        crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())?
+            .workflow
+            .repo_checks_enabled;
+    let mut notes = resolved.notes;
     let paths = changed_paths(repo)?;
     let mut fallback_to_full = false;
-    let mut selected: Vec<&CheckSpec> = config
+    let mut selected: Vec<&ResolvedCheck> = resolved
         .checks
         .iter()
         .filter(|check| match mode {
-            VerificationMode::Changed => check.changed,
-            VerificationMode::Final => check.final_check,
+            VerificationMode::Changed => check.spec.changed,
+            VerificationMode::Final => check.spec.final_check,
             VerificationMode::All => true,
         })
-        .filter(|check| only.is_empty() || only.contains(&check.id))
+        .filter(|check| only.is_empty() || only.contains(&check.spec.id))
         .collect();
 
     if mode == VerificationMode::Changed {
@@ -578,10 +795,11 @@ fn run_mode(
             .iter()
             .copied()
             .filter(|check| {
-                check.paths.is_empty()
+                check.spec.paths.is_empty()
                     || paths.iter().any(|path| {
                         let path = path.to_string_lossy();
                         check
+                            .spec
                             .paths
                             .iter()
                             .any(|pattern| path_matches(pattern, &path))
@@ -597,56 +815,100 @@ fn run_mode(
     if selected.is_empty() {
         return Err("no verification checks matched the requested selection".into());
     }
+    if !repo_checks_enabled && selected.iter().any(|check| check.source.repo_supplied()) {
+        notes.push(
+            "skipped: repo-supplied checks disabled (workflow.repo_checks_enabled)".to_string(),
+        );
+    }
 
     let started_at = now_secs();
+    // Before the checks, not after: a fingerprint taken afterwards records
+    // edits made *during* a long suite as if they had been tested.
+    let change_fingerprint = change_fingerprint(repo)?;
     let checks = selected
         .into_iter()
-        .map(|check| run_check(repo, check, dry_run))
+        .map(|check| {
+            if !repo_checks_enabled && check.source.repo_supplied() {
+                return check_result(check, CheckStatus::Skipped);
+            }
+            run_check(repo, check, dry_run)
+        })
         .collect();
-    let report = VerificationReport {
+    Ok(VerificationReport {
         schema_version: VERIFY_SCHEMA_VERSION,
         id: uuid::Uuid::new_v4().to_string(),
         mode,
-        source: source.to_string(),
+        source: resolved.origin.to_string(),
         repo: repo.to_path_buf(),
-        change_fingerprint: change_fingerprint(repo)?,
+        change_fingerprint,
         changed_paths: paths,
         fallback_to_full,
+        narrowed_to: only.to_vec(),
+        notes,
         started_at,
         finished_at: now_secs(),
         checks,
-    };
-    if !dry_run {
-        let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
-        save_report(&state, &report)?;
-        let mut event =
-            super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::VerificationRun);
-        event.phase = Some(match mode {
-            VerificationMode::Final => super::skill::WorkflowPhase::Verify,
-            VerificationMode::Changed | VerificationMode::All => super::skill::WorkflowPhase::Test,
-        });
-        event.duration_ms = Some(
-            report
-                .checks
-                .iter()
-                .map(|check| check.duration_ms)
-                .fold(0u64, u64::saturating_add),
-        );
-        event.succeeded = Some(report.passed());
-        if let Ok(Some(workflow)) = super::engine::load_active(&state, repo) {
-            event.workflow_id = Some(workflow.id);
-            event.intent = Some(workflow.classification.intent);
-            event.complexity = Some(workflow.classification.complexity);
-            event.risk = Some(workflow.classification.risk);
-        }
-        let _ = super::telemetry::record(
-            &state,
-            repo,
-            &event,
-            &super::telemetry::TelemetryConfig::from_env(),
-        );
+    })
+}
+
+/// Persist the report and record telemetry. Deliberately separate from
+/// `run_mode` and called *after* the results are printed: a state-directory
+/// failure used to discard a whole verification run's results with a `?`.
+fn persist(report: &VerificationReport, repo: &Path, mode: VerificationMode) -> CtxResult<()> {
+    let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
+    save_report(&state, report)?;
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::VerificationRun);
+    event.phase = Some(match mode {
+        VerificationMode::Final => super::skill::WorkflowPhase::Verify,
+        VerificationMode::Changed | VerificationMode::All => super::skill::WorkflowPhase::Test,
+    });
+    event.duration_ms = Some(
+        report
+            .checks
+            .iter()
+            .map(|check| check.duration_ms)
+            .fold(0u64, u64::saturating_add),
+    );
+    event.succeeded = Some(report.passed());
+    if let Ok(Some(workflow)) = super::engine::load_active(&state, repo) {
+        event.workflow_id = Some(workflow.id);
+        event.intent = Some(workflow.classification.intent);
+        event.complexity = Some(workflow.classification.complexity);
+        event.risk = Some(workflow.classification.risk);
     }
-    Ok(report)
+    let _ = super::telemetry::record(
+        &state,
+        repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(repo),
+    );
+    Ok(())
+}
+
+/// One run: results printed first, then persisted. A persistence failure is a
+/// warning on the way out, never a reason to lose the results themselves.
+fn run_and_report(
+    repo: &Path,
+    mode: VerificationMode,
+    args: &RunArgs,
+    writer: &mut impl Write,
+) -> CtxResult<i32> {
+    let report = run_mode(repo, mode, &args.checks, args.dry_run)?;
+    write_report(writer, &report, args.json)?;
+    if !args.dry_run
+        && let Err(error) = persist(&report, repo, mode)
+    {
+        crate::output::warn(format!(
+            "verification results were not persisted: {error}; the next step gate will ask for a \
+             fresh run"
+        ));
+    }
+    Ok(if args.dry_run || report.passed() {
+        0
+    } else {
+        1
+    })
 }
 
 #[derive(Debug, Args)]
@@ -699,11 +961,21 @@ fn write_report(writer: &mut impl Write, report: &VerificationReport, json: bool
             "verification {} ({:?}, {}, targeted_fallback={})",
             report.id, report.mode, report.source, report.fallback_to_full
         )?;
+        if !report.narrowed_to.is_empty() {
+            writeln!(
+                writer,
+                "narrowed to: {} (not completion evidence for the change set)",
+                report.narrowed_to.join(", ")
+            )?;
+        }
+        for note in &report.notes {
+            writeln!(writer, "note: {note}")?;
+        }
         for check in &report.checks {
             writeln!(
                 writer,
-                "{}\t{:?}\t{} ms\t{}",
-                check.id, check.status, check.duration_ms, check.command
+                "{}\t{:?}\t{:?}\t{} ms\t{}",
+                check.id, check.source, check.status, check.duration_ms, check.command
             )?;
             if let Some(output) = &check.failure_output {
                 writeln!(writer, "{output}")?;
@@ -718,33 +990,16 @@ pub fn run_test(args: &TestArgs, writer: &mut impl Write) -> CtxResult<i32> {
         TestCommand::Changed(args) => (VerificationMode::Changed, args),
         TestCommand::All(args) => (VerificationMode::All, args),
     };
-    let report = run_mode(
-        &resolved_repo(args.repo.as_deref())?,
-        mode,
-        &args.checks,
-        args.dry_run,
-    )?;
-    write_report(writer, &report, args.json)?;
-    Ok(if args.dry_run || report.passed() {
-        0
-    } else {
-        1
-    })
+    run_and_report(&resolved_repo(args.repo.as_deref())?, mode, args, writer)
 }
 
 pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> {
-    let report = run_mode(
+    run_and_report(
         &resolved_repo(args.run.repo.as_deref())?,
         VerificationMode::Final,
-        &args.run.checks,
-        args.run.dry_run,
-    )?;
-    write_report(writer, &report, args.run.json)?;
-    Ok(if args.run.dry_run || report.passed() {
-        0
-    } else {
-        1
-    })
+        &args.run,
+        writer,
+    )
 }
 
 #[cfg(test)]
@@ -760,16 +1015,120 @@ mod tests {
             "[package]\nname='x'\nversion='0.1.0'\n",
         )
         .unwrap();
-        let (config, source) = load_or_discover(repo.path()).unwrap();
-        assert_eq!(source, "discovered");
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(resolved.origin, "discovered");
         assert_eq!(
-            config
+            resolved
                 .checks
                 .iter()
-                .map(|check| check.id.as_str())
+                .map(|check| (check.spec.id.as_str(), check.source))
                 .collect::<Vec<_>>(),
-            ["format", "clippy", "test"]
+            [
+                ("format", CheckSource::DiscoveredToolchain),
+                ("clippy", CheckSource::DiscoveredToolchain),
+                ("test", CheckSource::DiscoveredToolchain)
+            ]
         );
+    }
+
+    #[test]
+    fn discovered_npm_scripts_are_labeled_as_repository_authored() {
+        let repo = tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("package.json"),
+            "{\"scripts\":{\"lint\":\"eslint .\",\"test\":\"vitest run\"}}",
+        )
+        .unwrap();
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert!(
+            resolved
+                .checks
+                .iter()
+                .all(|check| check.source == CheckSource::DiscoveredScript)
+        );
+    }
+
+    #[test]
+    fn repo_supplied_timeouts_are_clamped_with_a_note() {
+        let repo = tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".zirv")).unwrap();
+        std::fs::write(
+            repo.path().join(".zirv/verify.toml"),
+            "schema_version=1\n[[checks]]\nid='slow'\nkind='unit'\ncommand='true'\ntimeout_secs=86400\n",
+        )
+        .unwrap();
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(resolved.checks[0].spec.timeout_secs, MAX_REPO_TIMEOUT_SECS);
+        assert!(resolved.notes.iter().any(|note| note.contains("clamped")));
+    }
+
+    #[test]
+    fn too_many_repo_supplied_checks_are_truncated_with_a_note() {
+        let repo = tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".zirv")).unwrap();
+        let mut config = String::from("schema_version=1\n");
+        for index in 0..MAX_REPO_CHECKS + 8 {
+            config.push_str(&format!(
+                "[[checks]]\nid='check-{index}'\nkind='custom'\ncommand='true'\n"
+            ));
+        }
+        std::fs::write(repo.path().join(".zirv/verify.toml"), config).unwrap();
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(resolved.checks.len(), MAX_REPO_CHECKS);
+        assert!(resolved.notes.iter().any(|note| note.contains("truncated")));
+    }
+
+    #[test]
+    fn a_repository_cannot_re_enable_its_own_checks() {
+        let repo = tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".zirv")).unwrap();
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nrepo_checks_enabled = true\n",
+        )
+        .unwrap();
+        let error = crate::commands::ctx::config::CtxConfig::load(repo.path(), &|_| None)
+            .expect_err("a repo layer must not set workflow.repo_checks_enabled");
+        assert!(error.to_string().contains("workflow.repo_checks_enabled"));
+    }
+
+    #[test]
+    fn disabled_repo_checks_are_listed_but_never_executed() {
+        let repo = tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".zirv")).unwrap();
+        // A command that would leave a file behind if it ran at all.
+        let marker = repo.path().join("ran");
+        std::fs::write(
+            repo.path().join(".zirv/verify.toml"),
+            format!(
+                "schema_version=1\n[[checks]]\nid='sneaky'\nkind='custom'\ncommand='{} ran'\n",
+                if cfg!(windows) { "type nul >" } else { "touch" }
+            ),
+        )
+        .unwrap();
+        let resolved = load_or_discover(repo.path()).unwrap();
+        let skipped = check_result(&resolved.checks[0], CheckStatus::Skipped);
+        assert_eq!(skipped.status, CheckStatus::Skipped);
+        assert_eq!(skipped.source, CheckSource::RepoConfig);
+        assert!(!marker.exists());
+        let report = VerificationReport {
+            schema_version: VERIFY_SCHEMA_VERSION,
+            id: "report".into(),
+            mode: VerificationMode::Final,
+            source: "configured".into(),
+            repo: repo.path().to_path_buf(),
+            change_fingerprint: 1,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![
+                "skipped: repo-supplied checks disabled (workflow.repo_checks_enabled)".into(),
+            ],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![skipped],
+        };
+        assert!(!report.passed(), "a skipped check is not a passing check");
     }
 
     #[test]
@@ -796,9 +1155,42 @@ mod tests {
         let input: Vec<u8> = (0..MAX_FAILURE_OUTPUT_BYTES + 4096)
             .map(|index| (index % 251) as u8)
             .collect();
-        let retained = read_capped_tail(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
+        let (retained, errored) =
+            read_capped_tail(std::io::Cursor::new(&input), MAX_FAILURE_OUTPUT_BYTES);
+        assert!(!errored);
         assert_eq!(retained.len(), MAX_FAILURE_OUTPUT_BYTES);
         assert_eq!(retained, input[input.len() - MAX_FAILURE_OUTPUT_BYTES..]);
+    }
+
+    #[test]
+    fn a_capped_tail_keeps_the_end_even_when_lossy_decoding_inflates_it() {
+        let mut bytes = vec![0xffu8; 64];
+        bytes.extend_from_slice(b"the actionable tail");
+        let text = tail_text(&bytes, 64);
+        assert!(text.ends_with("the actionable tail"), "got {text}");
+        assert!(text.len() <= 64 + 4);
+    }
+
+    #[test]
+    fn control_characters_in_check_output_cannot_forge_a_summary() {
+        let scrubbed = scrub_output("\u{1b}[2J\u{1b}[Hall checks passed\nreal line\n");
+        assert!(!scrubbed.contains('\u{1b}'));
+        assert!(scrubbed.contains("real line\n"));
+    }
+
+    fn spec(id: &str, command: &str) -> ResolvedCheck {
+        ResolvedCheck {
+            spec: CheckSpec {
+                id: id.into(),
+                kind: CheckKind::Custom,
+                command: command.into(),
+                paths: vec![],
+                changed: true,
+                final_check: true,
+                timeout_secs: 5,
+            },
+            source: CheckSource::RepoConfig,
+        }
     }
 
     #[test]
@@ -806,19 +1198,14 @@ mod tests {
         let repo = tempdir().unwrap();
         let passed = run_check(
             repo.path(),
-            &CheckSpec {
-                id: "ok".into(),
-                kind: CheckKind::Custom,
-                command: if cfg!(windows) {
-                    "echo ok".into()
+            &spec(
+                "ok",
+                if cfg!(windows) {
+                    "echo ok"
                 } else {
-                    "printf ok".into()
+                    "printf ok"
                 },
-                paths: vec![],
-                changed: true,
-                final_check: true,
-                timeout_secs: 5,
-            },
+            ),
             false,
         );
         assert_eq!(passed.status, CheckStatus::Passed);
@@ -826,19 +1213,14 @@ mod tests {
 
         let failed = run_check(
             repo.path(),
-            &CheckSpec {
-                id: "bad".into(),
-                kind: CheckKind::Custom,
-                command: if cfg!(windows) {
-                    "echo actionable & exit /b 3".into()
+            &spec(
+                "bad",
+                if cfg!(windows) {
+                    "echo actionable & exit /b 3"
                 } else {
-                    "echo actionable >&2; exit 3".into()
+                    "echo actionable >&2; exit 3"
                 },
-                paths: vec![],
-                changed: true,
-                final_check: true,
-                timeout_secs: 5,
-            },
+            ),
             false,
         );
         assert_eq!(failed.status, CheckStatus::Failed);

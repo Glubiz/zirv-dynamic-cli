@@ -160,11 +160,21 @@ pub struct RegisteredSkill {
 #[derive(Debug, Clone)]
 pub struct SkillRegistry {
     skills: BTreeMap<String, RegisteredSkill>,
+    warnings: Vec<String>,
 }
 
 impl SkillRegistry {
-    pub fn load(repo: &Path, home: Option<&Path>, include_custom: bool) -> CtxResult<Self> {
+    /// `include_repo` is the operator's `workflow.repo_skills_enabled`; see
+    /// [`Self::load_for_repo`], which resolves it from configuration. Kept an
+    /// explicit parameter so this stays a pure function of its inputs.
+    pub fn load(
+        repo: &Path,
+        home: Option<&Path>,
+        include_custom: bool,
+        include_repo: bool,
+    ) -> CtxResult<Self> {
         let mut skills = BTreeMap::new();
+        let mut warnings = Vec::new();
         for manifest in builtin_manifests()? {
             skills.insert(
                 manifest.id.clone(),
@@ -183,23 +193,50 @@ impl SkillRegistry {
                     home,
                     SkillSource::OperatorGlobal,
                     &mut skills,
+                    &mut warnings,
                 )?;
             }
-            load_dir(
-                &repo.join(".zirv").join("skills"),
-                repo,
-                SkillSource::Repository,
-                &mut skills,
-            )?;
+            if include_repo {
+                load_dir(
+                    &repo.join(".zirv").join("skills"),
+                    repo,
+                    SkillSource::Repository,
+                    &mut skills,
+                    &mut warnings,
+                )?;
+            }
         }
 
-        let registry = Self { skills };
+        let registry = Self { skills, warnings };
         registry.validate_dependencies()?;
         Ok(registry)
     }
 
+    /// [`Self::load`] with `include_repo` taken from the operator's
+    /// `[workflow] repo_skills_enabled` (`REPO_FORBIDDEN`, so a checkout
+    /// cannot turn its own skill layer back on). A configuration that will
+    /// not load leaves the layer on, which is the pre-existing behavior; the
+    /// error itself surfaces elsewhere on every other config read.
+    pub fn load_for_repo(
+        repo: &Path,
+        home: Option<&Path>,
+        include_custom: bool,
+    ) -> CtxResult<Self> {
+        let include_repo =
+            crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())
+                .map_or(true, |cfg| cfg.workflow.repo_skills_enabled);
+        Self::load(repo, home, include_custom, include_repo)
+    }
+
     pub fn list(&self) -> impl Iterator<Item = &RegisteredSkill> {
         self.skills.values()
+    }
+
+    /// Collisions a repository manifest lost, one line each. Surfaced by the
+    /// CLI rather than swallowed: an ignored override is exactly the case an
+    /// operator needs told about.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     pub fn get(&self, requested: &str) -> CtxResult<&RegisteredSkill> {
@@ -325,11 +362,17 @@ impl SkillRegistry {
     }
 }
 
+/// Operator-global manifests may replace a built-in: the operator is trusted.
+/// A repository manifest may only ADD an id. Replacing `review`'s or
+/// `verify`'s methodology text with a checkout's own version is the one thing
+/// an untrusted layer must not be able to do, so a colliding id is ignored and
+/// named in `warnings` rather than silently overwriting the trusted entry.
 fn load_dir(
     root: &Path,
     allowed_root: &Path,
     source: SkillSource,
     skills: &mut BTreeMap<String, RegisteredSkill>,
+    warnings: &mut Vec<String>,
 ) -> CtxResult<()> {
     if !root.exists() {
         return Ok(());
@@ -409,6 +452,17 @@ fn load_dir(
                 .map_err(|err| format!("invalid skill '{}': {err}", path.display()))?,
         };
         manifest.validate()?;
+        if source == SkillSource::Repository
+            && let Some(existing) = skills.get(&manifest.id)
+        {
+            warnings.push(format!(
+                "repository skill '{}' ({}) is ignored: id already provided by {}",
+                manifest.id,
+                path.display(),
+                existing.source
+            ));
+            continue;
+        }
         skills.insert(
             manifest.id.clone(),
             RegisteredSkill {
@@ -631,13 +685,20 @@ fn registry(repo: Option<&Path>, built_in_only: bool) -> CtxResult<SkillRegistry
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir()?,
     };
-    SkillRegistry::load(&repo, dirs::home_dir().as_deref(), !built_in_only)
+    SkillRegistry::load_for_repo(&repo, dirs::home_dir().as_deref(), !built_in_only)
+}
+
+fn report_warnings(registry: &SkillRegistry) {
+    for warning in registry.warnings() {
+        crate::output::warn(warning);
+    }
 }
 
 pub fn run(args: &SkillArgs, writer: &mut impl Write) -> CtxResult<i32> {
     match &args.command {
         SkillCommand::List(args) => {
             let registry = registry(args.repo.as_deref(), args.built_in_only)?;
+            report_warnings(&registry);
             if args.json {
                 serde_json::to_writer_pretty(&mut *writer, &registry.list().collect::<Vec<_>>())?;
                 writeln!(writer)?;
@@ -658,6 +719,7 @@ pub fn run(args: &SkillArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         SkillCommand::Show(args) => {
             let registry = registry(args.repo.as_deref(), args.built_in_only)?;
+            report_warnings(&registry);
             let skill = registry.get(&args.id)?;
             let dependency_order = registry
                 .resolve_stack(&args.id)?
@@ -719,6 +781,12 @@ mod tests {
         std::fs::write(path, text).expect("write fixture");
     }
 
+    fn custom_design(name: &str) -> String {
+        format!(
+            "schema_version: 1\nid: design\nversion: 2\nname: {name}\ndescription: custom\ncontext_budget_bytes: 64\nphases: [design]\ninstructions: custom\n"
+        )
+    }
+
     #[test]
     fn builtins_are_valid_compact_and_provider_neutral() {
         let skills = builtin_manifests().expect("valid builtins");
@@ -740,7 +808,7 @@ mod tests {
     #[test]
     fn unselected_skills_contribute_no_instruction_text() {
         let repo = tempdir().unwrap();
-        let registry = SkillRegistry::load(repo.path(), None, false).unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
         let stack = registry.resolve_stack("design").unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].manifest.id, "design");
@@ -749,7 +817,7 @@ mod tests {
     #[test]
     fn stable_id_and_version_resolution_is_identical_across_adapters() {
         let repo = tempdir().unwrap();
-        let registry = SkillRegistry::load(repo.path(), None, false).unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
         for adapter in ["claude", "codex"] {
             let report = CapabilityReport::for_adapter(adapter);
             registry.ensure_supported("design@1", &report).unwrap();
@@ -758,25 +826,66 @@ mod tests {
     }
 
     #[test]
-    fn repository_overrides_global_and_builtin_with_visible_provenance() {
+    fn an_operator_global_skill_still_overrides_a_built_in() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let global = home.path().join(".zirv/skills");
+        std::fs::create_dir_all(&global).unwrap();
+        write(&global.join("design.yaml"), &custom_design("Global"));
+
+        let registry = SkillRegistry::load(repo.path(), Some(home.path()), true, true).unwrap();
+        let skill = registry.get("design@2").unwrap();
+        assert_eq!(skill.manifest.name, "Global");
+        assert_eq!(skill.source, SkillSource::OperatorGlobal);
+        assert!(registry.warnings().is_empty());
+    }
+
+    #[test]
+    fn a_repository_skill_may_only_add_ids_and_a_collision_is_ignored_with_a_warning() {
         let home = tempdir().unwrap();
         let repo = tempdir().unwrap();
         let global = home.path().join(".zirv/skills");
         let project = repo.path().join(".zirv/skills");
         std::fs::create_dir_all(&global).unwrap();
         std::fs::create_dir_all(&project).unwrap();
-        let yaml = |name: &str| {
-            format!(
-                "schema_version: 1\nid: design\nversion: 2\nname: {name}\ndescription: custom\ncontext_budget_bytes: 64\nphases: [design]\ninstructions: custom\n"
-            )
-        };
-        write(&global.join("design.yaml"), &yaml("Global"));
-        write(&project.join("design.yaml"), &yaml("Project"));
+        write(&global.join("design.yaml"), &custom_design("Global"));
+        write(&project.join("design.yaml"), &custom_design("Project"));
+        write(
+            &project.join("extra.yaml"),
+            "schema_version: 1\nid: extra\nversion: 1\nname: Extra\ndescription: added\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: added by the repo\n",
+        );
 
-        let registry = SkillRegistry::load(repo.path(), Some(home.path()), true).unwrap();
-        let skill = registry.get("design@2").unwrap();
-        assert_eq!(skill.manifest.name, "Project");
-        assert_eq!(skill.source, SkillSource::Repository);
+        let registry = SkillRegistry::load(repo.path(), Some(home.path()), true, true).unwrap();
+        let design = registry.get("design").unwrap();
+        assert_eq!(design.manifest.name, "Global");
+        assert_eq!(design.source, SkillSource::OperatorGlobal);
+        assert_eq!(
+            registry.get("extra").unwrap().source,
+            SkillSource::Repository,
+            "a new id from a repository still loads, labeled untrusted"
+        );
+        assert_eq!(registry.warnings().len(), 1);
+        assert!(registry.warnings()[0].contains("design"));
+        assert!(registry.warnings()[0].contains("operator-global"));
+
+        // A built-in id collides the same way, with no operator layer present.
+        let registry = SkillRegistry::load(repo.path(), None, true, true).unwrap();
+        assert_eq!(registry.get("design").unwrap().source, SkillSource::BuiltIn);
+        assert!(registry.warnings()[0].contains("built-in"));
+    }
+
+    #[test]
+    fn disabling_repository_skills_drops_the_whole_layer() {
+        let repo = tempdir().unwrap();
+        let project = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&project).unwrap();
+        write(
+            &project.join("extra.yaml"),
+            "schema_version: 1\nid: extra\nversion: 1\nname: Extra\ndescription: added\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: added by the repo\n",
+        );
+        let registry = SkillRegistry::load(repo.path(), None, true, false).unwrap();
+        assert!(registry.get("extra").is_err());
+        assert!(registry.warnings().is_empty());
     }
 
     #[test]
@@ -788,7 +897,7 @@ mod tests {
             &dir.join("danger.yaml"),
             "schema_version: 1\nid: danger\nversion: 1\nname: Danger\ndescription: test\nrequired_capabilities: [repo.write]\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: write files\n",
         );
-        let registry = SkillRegistry::load(repo.path(), None, true).unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, true, true).unwrap();
         let report = CapabilityReport::for_adapter("claude").with_policy(|capability| {
             if capability == CapabilityId::RepoWrite {
                 super::super::capability::PolicyDecision::Deny
@@ -809,7 +918,7 @@ mod tests {
             &dir.join("bad.yaml"),
             "schema_version: 2\nid: bad\nversion: 1\nname: Bad\ndescription: bad\ncontext_budget_bytes: 16\ninstructions: bad\n",
         );
-        let error = SkillRegistry::load(repo.path(), None, true).unwrap_err();
+        let error = SkillRegistry::load(repo.path(), None, true, true).unwrap_err();
         assert!(error.to_string().contains("unsupported schema_version"));
 
         std::fs::remove_file(dir.join("bad.yaml")).unwrap();
@@ -817,7 +926,7 @@ mod tests {
             &dir.join("bad.yaml"),
             "schema_version: 1\nid: bad\nversion: 1\nname: Bad\ndescription: bad\ncontext_budget_bytes: 16\ninstructions: bad\nsurprise: true\n",
         );
-        let error = SkillRegistry::load(repo.path(), None, true).unwrap_err();
+        let error = SkillRegistry::load(repo.path(), None, true, true).unwrap_err();
         assert!(error.to_string().contains("unknown field"));
 
         std::fs::remove_file(dir.join("bad.yaml")).unwrap();
@@ -829,7 +938,7 @@ mod tests {
                 ),
             );
         }
-        let error = SkillRegistry::load(repo.path(), None, true).unwrap_err();
+        let error = SkillRegistry::load(repo.path(), None, true, true).unwrap_err();
         assert!(error.to_string().contains("cyclic"));
     }
 
@@ -850,7 +959,7 @@ mod tests {
             dir.join("outside.yaml"),
         )
         .unwrap();
-        let error = SkillRegistry::load(repo.path(), None, true).unwrap_err();
+        let error = SkillRegistry::load(repo.path(), None, true, true).unwrap_err();
         assert!(error.to_string().contains("symlinked"));
     }
 
@@ -867,7 +976,7 @@ mod tests {
             "schema_version: 1\nid: outside\nversion: 1\nname: Outside\ndescription: test\ncontext_budget_bytes: 16\ninstructions: test\n",
         );
         symlink(outside.path(), repo.path().join(".zirv")).unwrap();
-        let error = SkillRegistry::load(repo.path(), None, true).unwrap_err();
+        let error = SkillRegistry::load(repo.path(), None, true, true).unwrap_err();
         assert!(error.to_string().contains("escapes trust root"));
     }
 }

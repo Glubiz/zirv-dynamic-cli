@@ -31,26 +31,35 @@ pub struct TelemetryConfig {
 }
 
 impl TelemetryConfig {
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("ZIRV_WORKFLOW_TELEMETRY")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(true);
-        let max_events = std::env::var("ZIRV_WORKFLOW_TELEMETRY_MAX_EVENTS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .map(|value: usize| value.min(MAX_CONFIGURED_EVENTS))
-            .unwrap_or(DEFAULT_MAX_EVENTS);
-        let retention_days = std::env::var("ZIRV_WORKFLOW_TELEMETRY_RETENTION_DAYS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .map(|value: u64| value.min(MAX_CONFIGURED_RETENTION_DAYS))
-            .unwrap_or(DEFAULT_RETENTION_DAYS);
+    /// The operator's `[workflow]` config, with this module's hard caps still
+    /// applied on top. Retention/enablement used to come straight from the
+    /// process environment, which any repository script could set for itself;
+    /// the keys now live in `ctx.toml` and are `REPO_FORBIDDEN`.
+    pub fn from_config(cfg: &crate::commands::ctx::config::WorkflowConfig) -> Self {
         Self {
-            enabled,
-            max_events,
-            retention_days,
+            enabled: cfg.telemetry_enabled,
+            max_events: match cfg.telemetry_max_events {
+                0 => DEFAULT_MAX_EVENTS,
+                value => value.min(MAX_CONFIGURED_EVENTS),
+            },
+            retention_days: cfg
+                .telemetry_retention_days
+                .min(MAX_CONFIGURED_RETENTION_DAYS),
+        }
+    }
+
+    /// Resolved for one repository. A configuration that will not load at all
+    /// (a repo setting a forbidden key, say) disables telemetry rather than
+    /// falling back to defaults: recording is the optional half here, and the
+    /// operator's real intent is unknown at that point.
+    pub fn for_repo(repo: &Path) -> Self {
+        match crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok()) {
+            Ok(cfg) => Self::from_config(&cfg.workflow),
+            Err(_) => Self {
+                enabled: false,
+                max_events: DEFAULT_MAX_EVENTS,
+                retention_days: DEFAULT_RETENTION_DAYS,
+            },
         }
     }
 }
@@ -193,8 +202,19 @@ pub fn list(state: &StateDir, repo: &Path) -> CtxResult<Vec<TelemetryEvent>> {
         if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(event) =
-            serde_json::from_str::<TelemetryEvent>(&std::fs::read_to_string(entry.path())?)
+        // One unreadable event file used to fail the whole `workflow stats`
+        // command. Statistics over almost every event beat no statistics.
+        let body = match std::fs::read_to_string(entry.path()) {
+            Ok(body) => body,
+            Err(error) => {
+                crate::output::warn(format!(
+                    "skipping telemetry event {}: {error}",
+                    entry.path().display()
+                ));
+                continue;
+            }
+        };
+        if let Ok(event) = serde_json::from_str::<TelemetryEvent>(&body)
             && event.schema_version == TELEMETRY_SCHEMA_VERSION
         {
             events.push(event);
@@ -489,6 +509,49 @@ mod tests {
         )
         .unwrap();
         assert!(list(&state, repo.path()).unwrap().is_empty());
+    }
+
+    /// The old reader was `std::env::var(..).and_then(|v| v.parse().ok())
+    /// .unwrap_or(true)`, so `0` -- a perfectly ordinary way to write "off" --
+    /// failed to parse and *enabled* telemetry. A privacy opt-out has to fail
+    /// closed in both spellings.
+    #[test]
+    fn a_zero_or_false_opt_out_actually_disables_telemetry() {
+        use crate::commands::ctx::config::CtxConfig;
+        for value in ["0", "false"] {
+            let cfg = CtxConfig::load(Path::new("."), &|key| {
+                (key == "ZIRV_CTX_WORKFLOW_TELEMETRY").then(|| value.to_string())
+            })
+            .expect("config loads");
+            assert!(
+                !TelemetryConfig::from_config(&cfg.workflow).enabled,
+                "'{value}' must disable telemetry"
+            );
+        }
+        for value in ["1", "true"] {
+            let cfg = CtxConfig::load(Path::new("."), &|key| {
+                (key == "ZIRV_CTX_WORKFLOW_TELEMETRY").then(|| value.to_string())
+            })
+            .expect("config loads");
+            assert!(TelemetryConfig::from_config(&cfg.workflow).enabled);
+        }
+        let error = CtxConfig::load(Path::new("."), &|key| {
+            (key == "ZIRV_CTX_WORKFLOW_TELEMETRY").then(|| "maybe".to_string())
+        })
+        .expect_err("an unparseable value is loud, not a guess");
+        assert!(error.to_string().contains("true or false"));
+    }
+
+    #[test]
+    fn retention_and_event_caps_still_bound_an_operator_value() {
+        let cfg = crate::commands::ctx::config::WorkflowConfig {
+            telemetry_max_events: MAX_CONFIGURED_EVENTS * 4,
+            telemetry_retention_days: MAX_CONFIGURED_RETENTION_DAYS * 4,
+            ..Default::default()
+        };
+        let resolved = TelemetryConfig::from_config(&cfg);
+        assert_eq!(resolved.max_events, MAX_CONFIGURED_EVENTS);
+        assert_eq!(resolved.retention_days, MAX_CONFIGURED_RETENTION_DAYS);
     }
 
     #[test]
