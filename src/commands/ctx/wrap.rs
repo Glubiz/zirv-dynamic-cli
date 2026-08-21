@@ -1094,20 +1094,6 @@ fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
-/// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
-/// not something a user ever types on the `wrap` command line, only something
-/// another verb (`zirv ctx chat`) decides on the caller's behalf. Both callers
-/// pass `PromptRole::Orchestrator` today -- `chat`, and the bare `wrap` verb
-/// itself, whose command an operator is sitting in front of and driving
-/// interactively. A relaunch inside `pump` never re-decides: it reuses this
-/// launch's own composed prompt, so it keeps this launch's role by
-/// construction.
-/// `session` lets a caller that already generated a session id for its own
-/// purposes (`chat.rs`'s launch banner, printed before this function is ever
-/// called) hand it in rather than have two different ids exist for the same
-/// launch. `None` (every caller but `chat`) keeps today's behavior: a fresh
-/// id minted here.
-///
 /// This launch's composed prompt: `memory_entries` (already rendered by the
 /// caller) and the derived harness roster (only for an Orchestrator role)
 /// folded through `prompt::compose`, capped by `cfg.memory.core_max_bytes`.
@@ -1134,6 +1120,20 @@ fn compose_launch_prompt(
     )
 }
 
+/// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
+/// not something a user ever types on the `wrap` command line, only something
+/// another verb (`zirv ctx chat`) decides on the caller's behalf. Both callers
+/// pass `PromptRole::Orchestrator` today -- `chat`, and the bare `wrap` verb
+/// itself, whose command an operator is sitting in front of and driving
+/// interactively. A relaunch inside `pump` never re-decides: it reuses this
+/// launch's own composed prompt, so it keeps this launch's role by
+/// construction.
+/// `session` lets a caller that already generated a session id for its own
+/// purposes (`chat.rs`'s launch banner, printed before this function is ever
+/// called) hand it in rather than have two different ids exist for the same
+/// launch. `None` (every caller but `chat`) keeps today's behavior: a fresh
+/// id minted here.
+///
 /// No writer parameter: this function never had anything of its own to print
 /// on a healthy path, and its one former write (a rare internal pump
 /// failure) went to `output::error` on stderr instead (item 6 audit) --
