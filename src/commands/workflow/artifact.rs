@@ -101,13 +101,13 @@ fn infer_kind(path: &Path) -> ArtifactKind {
     }
 }
 
-/// The one place a repository path becomes a state-directory slug. Every entry
-/// point has to agree on it: `register` canonicalized while `load`/`list` used
-/// the caller's path verbatim, so on a platform where the two differ (macOS
-/// `/var` -> `/private/var`) a just-registered artifact could not be read back.
+/// `register` canonicalized its repo path while `load`/`list` used the
+/// caller's verbatim, so where the two spellings differ (macOS `/var` ->
+/// `/private/var`) a just-registered artifact could not be read back. The
+/// canonicalization now lives inside `repo_slug` itself, so every caller on
+/// either side of that split agrees.
 fn artifact_dir(state: &StateDir, repo: &Path) -> PathBuf {
-    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    state.artifacts().join(repo_slug(&repo))
+    state.artifacts().join(repo_slug(repo))
 }
 
 fn record_path(state: &StateDir, repo: &Path, id: &str) -> CtxResult<PathBuf> {
@@ -300,10 +300,12 @@ fn open_url(url: &str) -> CtxResult<()> {
     Ok(())
 }
 
-/// `host:port` for a readiness probe. Only `http://` and `https://` are
-/// accepted at all: `--url` is handed to the platform opener, and `file://`,
-/// `vscode://` or any other registered scheme turns "open the local preview"
-/// into "launch whatever this string names".
+/// `host:port` for a readiness probe. `--url` is both dialed by this process
+/// and handed to the platform opener, so it is restricted twice over: to
+/// `http`/`https` (a `file://` or `vscode://` value turns "open the local
+/// preview" into "launch whatever this string names"), and to a loopback host
+/// (any other host makes `artifact present` a way to make the operator's
+/// machine reach out to, and open a browser on, an address the caller chose).
 fn probe_target(url: &str) -> CtxResult<String> {
     let (scheme, rest) = url
         .split_once("://")
@@ -320,34 +322,99 @@ fn probe_target(url: &str) -> CtxResult<String> {
     if authority.contains('@') {
         return Err("--url must not carry credentials".into());
     }
-    if authority.starts_with('[') {
-        // IPv6 literal: `[::1]` or `[::1]:8000`, already in connect form.
-        return Ok(match authority.rsplit_once("]:") {
-            Some(_) => authority.to_string(),
-            None => format!("{authority}:{default_port}"),
-        });
+    // IPv6 literals arrive bracketed (`[::1]`, `[::1]:8000`) and are already
+    // in connect form; everything else splits on the last colon.
+    let (host, target) = match authority.strip_prefix('[') {
+        Some(_) => (
+            authority
+                .split_once(']')
+                .map(|(host, _)| host.trim_start_matches('[').to_string())
+                .ok_or("--url has an unterminated IPv6 host")?,
+            match authority.rsplit_once("]:") {
+                Some(_) => authority.to_string(),
+                None => format!("{authority}:{default_port}"),
+            },
+        ),
+        None => match authority.split_once(':') {
+            Some((host, _)) => (host.to_string(), authority.to_string()),
+            None => (authority.to_string(), format!("{authority}:{default_port}")),
+        },
+    };
+    if !is_loopback_host(&host) {
+        return Err(format!(
+            "--url host '{host}' is not loopback; only localhost, 127.0.0.0/8 and ::1 are allowed"
+        )
+        .into());
     }
-    Ok(match authority.split_once(':') {
-        Some(_) => authority.to_string(),
-        None => format!("{authority}:{default_port}"),
-    })
+    Ok(target)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" || host == "::1" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 /// How long the spawned server gets to accept a connection before the run is
 /// called a failure. Counted inside the artifact's own lifetime.
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How much of the server's stderr is kept for a diagnostic message. The rest
+/// is read and discarded: a chatty server must never wedge on a full pipe.
+const MAX_SERVER_STDERR_BYTES: usize = 4096;
 
-fn drain_stderr(child: &mut std::process::Child) -> String {
-    let Some(mut stderr) = child.stderr.take() else {
-        return String::new();
+/// Drains the child's stderr continuously on its own thread, keeping only the
+/// last [`MAX_SERVER_STDERR_BYTES`] for diagnostics.
+///
+/// Both halves matter. Reading it *only on failure* deadlocked a still-live
+/// child (`read_to_end` waits for EOF, and EOF needs the child to exit, which
+/// on the readiness-timeout path it has not), and not reading it at all wedged
+/// a server that printed more than a pipe buffer's worth of log lines during
+/// its lifetime -- the failure `Stdio::null()` never had.
+fn spawn_stderr_drain(
+    stderr: Option<std::process::ChildStderr>,
+) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let Some(mut stderr) = stderr else {
+        return tail;
     };
-    let mut buffer = Vec::new();
-    use std::io::Read;
-    let _ = stderr.by_ref().take(4096).read_to_end(&mut buffer);
-    String::from_utf8_lossy(&buffer).trim().to_string()
+    let sink = std::sync::Arc::clone(&tail);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut chunk = [0u8; 4096];
+        while let Ok(count) = stderr.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            let Ok(mut kept) = sink.lock() else { break };
+            kept.extend_from_slice(&chunk[..count]);
+            let overflow = kept.len().saturating_sub(MAX_SERVER_STDERR_BYTES);
+            if overflow > 0 {
+                kept.drain(..overflow);
+            }
+        }
+    });
+    tail
+}
+
+fn stderr_note(tail: &std::sync::Mutex<Vec<u8>>) -> String {
+    let text = tail
+        .lock()
+        .map(|kept| String::from_utf8_lossy(&kept).trim().to_string())
+        .unwrap_or_default();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!(": {text}")
 }
 
 fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
+    run_interactive_with(args, repo, SERVER_READY_TIMEOUT)
+}
+
+fn run_interactive_with(args: &PresentArgs, repo: &Path, ready_timeout: Duration) -> CtxResult<()> {
     let command = args
         .server_command
         .as_deref()
@@ -362,6 +429,7 @@ fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
         .stderr(Stdio::piped())
         .spawn()?;
     let mut job = crate::commands::ctx::supervise::JobGuard::adopt(child.id());
+    let stderr = spawn_stderr_drain(child.stderr.take());
     // The clock starts at spawn, not after the blocking browser open: an
     // opener that sits waiting for a user used to extend the "hard" lifetime
     // by however long that took.
@@ -370,18 +438,13 @@ fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
     // Success means a live server, not a spawn that returned. A command that
     // exits immediately (typo, port in use) used to report success with its
     // own error message thrown away.
-    let ready_by = Instant::now() + SERVER_READY_TIMEOUT;
+    let ready_by = Instant::now() + ready_timeout;
     loop {
         if let Some(status) = child.try_wait()? {
-            let stderr = drain_stderr(&mut child);
             job.close();
             return Err(format!(
                 "server command exited before serving ({status}){}",
-                if stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {stderr}")
-                }
+                stderr_note(&stderr)
             )
             .into());
         }
@@ -389,17 +452,15 @@ fn run_interactive(args: &PresentArgs, repo: &Path) -> CtxResult<()> {
             break;
         }
         if Instant::now() >= ready_by {
-            let stderr = drain_stderr(&mut child);
+            // Terminate before reading: the tail is a live snapshot either
+            // way, but the child has no reason to keep running once this run
+            // has been called a failure.
             super::terminate_process_tree(&mut child)?;
             job.close();
             return Err(format!(
                 "server did not accept a connection on {target} within {}s{}",
-                SERVER_READY_TIMEOUT.as_secs(),
-                if stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {stderr}")
-                }
+                ready_timeout.as_secs(),
+                stderr_note(&stderr)
             )
             .into());
         }
@@ -523,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn only_http_urls_reach_the_platform_opener() {
+    fn only_loopback_http_urls_are_dialed_or_opened() {
         assert_eq!(
             probe_target("http://127.0.0.1:8000").unwrap(),
             "127.0.0.1:8000"
@@ -533,38 +594,79 @@ mod tests {
             "localhost:443"
         );
         assert_eq!(probe_target("http://[::1]:8000/").unwrap(), "[::1]:8000");
+        assert_eq!(probe_target("http://127.9.9.9/").unwrap(), "127.9.9.9:80");
         for rejected in [
             "file:///etc/passwd",
             "vscode://file/tmp",
             "127.0.0.1:8000",
             "http://user:pass@host/",
+            // The residual this closes: a non-loopback host was both dialed
+            // by this process and handed to the platform opener.
+            "http://attacker.example.com/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[2001:db8::1]:8000/",
+            "http://0.0.0.0:8000/",
         ] {
             assert!(probe_target(rejected).is_err(), "{rejected} was accepted");
+        }
+    }
+
+    fn present_args(server_command: &str) -> PresentArgs {
+        PresentArgs {
+            id: "unused".into(),
+            agent: "claude".into(),
+            interactive: true,
+            server_command: Some(server_command.to_string()),
+            // Port 1 never accepts, so a passing readiness probe is impossible
+            // and the child's own fate is what must be reported.
+            url: "http://127.0.0.1:1/".into(),
+            lifetime_secs: 5,
+            repo: None,
+            json: false,
         }
     }
 
     #[test]
     fn a_server_command_that_exits_immediately_is_a_failure() {
         let repo = tempdir().unwrap();
-        let args = PresentArgs {
-            id: "unused".into(),
-            agent: "claude".into(),
-            interactive: true,
-            server_command: Some(if cfg!(windows) {
-                "exit /b 7".into()
-            } else {
-                "echo boom >&2; exit 7".into()
-            }),
-            // Port 0 never accepts, so a passing readiness probe is impossible
-            // and the exit is what this must report.
-            url: "http://127.0.0.1:1/".into(),
-            lifetime_secs: 5,
-            repo: None,
-            json: false,
-        };
-        let error = run_interactive(&args, repo.path()).unwrap_err().to_string();
+        let args = present_args(if cfg!(windows) {
+            "exit /b 7"
+        } else {
+            "echo boom >&2; exit 7"
+        });
+        let error = run_interactive_with(&args, repo.path(), Duration::from_secs(2))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("exited before serving"), "got {error}");
         assert!(error.contains("boom") || cfg!(windows), "got {error}");
+    }
+
+    /// The readiness-timeout path used to `read_to_end` a still-live child's
+    /// stderr, which waits for EOF, which waits for the child to exit: a
+    /// server slower than the readiness window that had printed only a short
+    /// banner hung `artifact present --interactive` forever. This child stays
+    /// alive well past the window, so the test only returns if the fix holds.
+    #[test]
+    fn a_slow_server_that_stays_alive_times_out_instead_of_hanging() {
+        let repo = tempdir().unwrap();
+        let args = present_args(if cfg!(windows) {
+            "echo starting up 1>&2 & timeout /t 30 /nobreak"
+        } else {
+            "echo starting up >&2; sleep 30"
+        });
+        let started = Instant::now();
+        let error = run_interactive_with(&args, repo.path(), Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not accept a connection"), "got {error}");
+        assert!(
+            error.contains("starting up") || cfg!(windows),
+            "the drained stderr tail should still be reported: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the readiness timeout must not wait for the child's own EOF"
+        );
     }
 
     #[test]
