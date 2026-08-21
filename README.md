@@ -705,7 +705,7 @@ marks it as shadowed in the listing.
 ## Reserved Command Names
 
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `chat`, `agent`, `skill`,
-`workflow`, `test`, `verify`, `artifact`, and their short aliases `h`, `v`,
+`workflow`, `test`, `verify`, `artifact`, `frontend`, and their short aliases `h`, `v`,
 `i`, `c`, are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
 just as much as `chat`, matching how NTFS/APFS resolve script filenames), so
@@ -735,6 +735,11 @@ zirv workflow classify --task "fix authentication race"
 zirv workflow start bugfix --task "fix authentication race" --agent codex
 zirv workflow start feature --task "use only shipped methodology" --built-in-only
 zirv workflow status
+zirv frontend profile
+zirv frontend check
+zirv frontend render
+zirv frontend review --verdict pass
+zirv frontend benchmark
 zirv test changed
 zirv verify
 zirv workflow stats
@@ -744,6 +749,16 @@ Built-in workflows cover `feature`, `bugfix`, `refactor`, `spike`, and
 `review`. Deterministic intent/complexity/risk classification selects
 proportional design, approval, test, and review depth; sensitive auth/security
 and database/schema changes cannot be downgraded below High risk.
+
+Frontend tasks are selected automatically from task and path evidence. Zirv
+derives a repository-specific design profile, applies a built-in anti-slop
+craft floor plus phase-specific frontend skills, runs an offline deterministic
+detector, starts and cleans up the discovered dev server, captures narrow and
+wide screenshots, and requires a fresh AI visual-review verdict. There is no
+frontend init command or questionnaire: the active agent owns routine design,
+rendering, and review decisions. Missing, stale, truncated, unavailable, or
+failed detector/render/review evidence cannot advance frontend test, review,
+or verify gates.
 
 Optional repository checks live in `.zirv/verify.toml`. Custom skills may be
 shared under `.zirv/skills/` or kept operator-global under

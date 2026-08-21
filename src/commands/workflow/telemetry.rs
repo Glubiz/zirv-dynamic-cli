@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
-use super::classify::{Complexity, Intent, RiskBand};
+use super::classify::{Complexity, Intent, RiskBand, WorkDomain};
 use super::review::FindingDisposition;
 use super::skill::WorkflowPhase;
 use crate::commands::ctx::CtxResult;
@@ -75,6 +75,9 @@ pub enum TelemetryKind {
     ArtifactProduced,
     WorkflowCompleted,
     FindingUpdated,
+    FrontendDetectorRun,
+    FrontendRenderRun,
+    FrontendVisualReview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +91,8 @@ pub struct TelemetryEvent {
     pub intent: Option<Intent>,
     pub complexity: Option<Complexity>,
     pub risk: Option<RiskBand>,
+    #[serde(default)]
+    pub work_domain: Option<WorkDomain>,
     pub duration_ms: Option<u64>,
     pub adapter: Option<String>,
     pub model: Option<String>,
@@ -115,6 +120,7 @@ impl TelemetryEvent {
             intent: None,
             complexity: None,
             risk: None,
+            work_domain: None,
             duration_ms: None,
             adapter: None,
             model: None,
@@ -273,6 +279,12 @@ pub struct StatsReport {
     pub findings_total: u64,
     pub findings_meaningful: u64,
     pub findings_dismissed: u64,
+    pub frontend_detector_runs: usize,
+    pub frontend_detector_failures: usize,
+    pub frontend_render_runs: usize,
+    pub frontend_render_failures: usize,
+    pub frontend_visual_reviews: usize,
+    pub frontend_visual_review_failures: usize,
 }
 
 pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
@@ -280,6 +292,12 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut adapters: BTreeMap<String, AdapterStats> = BTreeMap::new();
     let mut verification_runs = 0usize;
     let mut verification_failures = 0usize;
+    let mut frontend_detector_runs = 0usize;
+    let mut frontend_detector_failures = 0usize;
+    let mut frontend_render_runs = 0usize;
+    let mut frontend_render_failures = 0usize;
+    let mut frontend_visual_reviews = 0usize;
+    let mut frontend_visual_review_failures = 0usize;
     let mut finding_snapshots: BTreeMap<String, (u64, String, u32, u32, u32)> = BTreeMap::new();
     for event in events {
         if let Some(phase) = event.phase {
@@ -319,6 +337,27 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
             if event.succeeded == Some(false) {
                 verification_failures += 1;
             }
+        }
+        match event.kind {
+            TelemetryKind::FrontendDetectorRun => {
+                frontend_detector_runs += 1;
+                if event.succeeded == Some(false) {
+                    frontend_detector_failures += 1;
+                }
+            }
+            TelemetryKind::FrontendRenderRun => {
+                frontend_render_runs += 1;
+                if event.succeeded == Some(false) {
+                    frontend_render_failures += 1;
+                }
+            }
+            TelemetryKind::FrontendVisualReview => {
+                frontend_visual_reviews += 1;
+                if event.succeeded == Some(false) {
+                    frontend_visual_review_failures += 1;
+                }
+            }
+            _ => {}
         }
         if let Some(workflow_id) = &event.workflow_id
             && matches!(
@@ -377,6 +416,12 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         findings_total,
         findings_meaningful,
         findings_dismissed,
+        frontend_detector_runs,
+        frontend_detector_failures,
+        frontend_render_runs,
+        frontend_render_failures,
+        frontend_visual_reviews,
+        frontend_visual_review_failures,
     }
 }
 
@@ -472,6 +517,16 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
             writer,
             "findings: {} total, {} meaningful, {} dismissed",
             report.findings_total, report.findings_meaningful, report.findings_dismissed
+        )?;
+        writeln!(
+            writer,
+            "frontend: detector {} runs/{} failures, render {} runs/{} failures, visual review {} runs/{} failures",
+            report.frontend_detector_runs,
+            report.frontend_detector_failures,
+            report.frontend_render_runs,
+            report.frontend_render_failures,
+            report.frontend_visual_reviews,
+            report.frontend_visual_review_failures
         )?;
     }
     Ok(0)
@@ -572,6 +627,28 @@ mod tests {
         assert_eq!(stats.most_token_expensive_phase.as_deref(), Some("review"));
         assert_eq!(stats.adapters["claude"].duration_ms, 500);
         assert_eq!(stats.adapters["codex"].input_tokens, 1000);
+    }
+
+    #[test]
+    fn frontend_runs_are_aggregated_without_storing_ui_or_model_output() {
+        let mut detector = TelemetryEvent::new(TelemetryKind::FrontendDetectorRun);
+        detector.work_domain = Some(WorkDomain::Frontend);
+        detector.succeeded = Some(false);
+        detector.findings_total = 2;
+        let mut render = TelemetryEvent::new(TelemetryKind::FrontendRenderRun);
+        render.work_domain = Some(WorkDomain::Frontend);
+        render.succeeded = Some(true);
+        render.artifact_count = 2;
+        let mut review = TelemetryEvent::new(TelemetryKind::FrontendVisualReview);
+        review.work_domain = Some(WorkDomain::Frontend);
+        review.succeeded = Some(true);
+
+        let stats = aggregate(&[detector, render, review]);
+
+        assert_eq!(stats.frontend_detector_runs, 1);
+        assert_eq!(stats.frontend_detector_failures, 1);
+        assert_eq!(stats.frontend_render_runs, 1);
+        assert_eq!(stats.frontend_visual_reviews, 1);
     }
 
     #[test]

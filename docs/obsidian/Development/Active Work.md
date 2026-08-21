@@ -16,7 +16,9 @@ Entries use the format:
 
 ## In Progress
 
-_None right now — see Recently Completed below for the latest completed implementation._
+### Frontend quality workflow — implementation complete, stacked PR pending (`feat/frontend-quality`, 2026-08-21, v2.19.0)
+**Status (2026-08-21):** Issues #70–#77 are implemented as eight dependency-ordered commits on one branch: zero-touch design-profile synthesis, automatic frontend workflow selection, a built-in anti-slop craft floor, seven phase skills, an offline deterministic detector and benchmark, autonomous dev-server/render capture, bounded AI visual review, fresh-evidence gates, adapter parity/provenance, and privacy-conscious frontend telemetry. No frontend init flag, questionnaire, manual server start, screenshot registration, or human design vote is required. The branch targets `main` as one stacked review unit.
+**Next:** push `feat/frontend-quality`, open the draft PR to `main`, and use GitHub CI for Rust build/test/fmt/clippy because this implementation environment has no Rust toolchain. Triage only compiler/test/review findings; the implementation scope itself is complete.
 
 ## Recently Completed
 

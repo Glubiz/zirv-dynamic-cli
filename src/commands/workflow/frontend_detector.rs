@@ -22,14 +22,14 @@ const MAX_FILES: usize = 256;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FINDINGS: usize = 256;
+const MAX_SCAN_DEPTH: usize = 32;
 
 static IMAGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)<img\b[^>]*>").expect("valid image regex"));
 static ALT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\balt\s*="#).expect("valid alt regex"));
 static CLICK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?is)<(div|span)\b[^>]*(onclick|on:click)\s*=")
-        .expect("valid click target regex")
+    Regex::new(r"(?is)<(div|span)\b[^>]*(onclick|on:click)\s*=").expect("valid click target regex")
 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -103,11 +103,31 @@ pub struct DetectorArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct BenchmarkArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BenchmarkCaseResult {
+    pub name: String,
+    pub expected_rules: Vec<String>,
+    pub observed_rules: Vec<String>,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BenchmarkReport {
+    pub schema_version: u32,
+    pub cases: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub results: Vec<BenchmarkCaseResult>,
+}
+
 fn report_dir(state: &StateDir, repo: &Path) -> PathBuf {
-    state
-        .frontend()
-        .join(repo_slug(repo))
-        .join("detector")
+    state.frontend().join(repo_slug(repo)).join("detector")
 }
 
 pub(crate) fn save_report(state: &StateDir, report: &DetectorReport) -> CtxResult<()> {
@@ -238,6 +258,23 @@ pub fn detect(
         findings,
     };
     save_report(state, &report)?;
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::FrontendDetectorRun);
+    event.workflow_id = super::engine::load_active(state, &report.repo)
+        .ok()
+        .flatten()
+        .map(|workflow| workflow.id);
+    event.phase = Some(super::skill::WorkflowPhase::Test);
+    event.work_domain = Some(super::classify::WorkDomain::Frontend);
+    event.succeeded = Some(report.passed() && !report.truncated);
+    event.findings_total = u32::try_from(report.findings.len()).unwrap_or(u32::MAX);
+    event.findings_meaningful = u32::try_from(report.blocking_count()).unwrap_or(u32::MAX);
+    let _ = super::telemetry::record(
+        state,
+        &report.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&report.repo),
+    );
     Ok(report)
 }
 
@@ -247,9 +284,7 @@ fn resolve_file(repo: &Path, requested: &Path) -> CtxResult<(PathBuf, PathBuf)> 
     } else {
         repo.join(requested)
     };
-    let normalized = absolute
-        .canonicalize()
-        .unwrap_or_else(|_| absolute.clone());
+    let normalized = absolute.canonicalize().unwrap_or_else(|_| absolute.clone());
     if !normalized.starts_with(repo) {
         return Err(format!(
             "frontend detector path '{}' escapes repository '{}'",
@@ -269,24 +304,19 @@ fn collect_all(repo: &Path) -> CtxResult<(Vec<PathBuf>, bool)> {
     let mut paths = Vec::new();
     let mut entries = 0usize;
     let mut truncated = false;
-    collect_directory(
-        repo,
-        repo,
-        &mut entries,
-        &mut paths,
-        &mut truncated,
-    )?;
+    collect_directory(repo, repo, 0, &mut entries, &mut paths, &mut truncated)?;
     Ok((paths, truncated))
 }
 
 fn collect_directory(
     repo: &Path,
     directory: &Path,
+    depth: usize,
     entries: &mut usize,
     paths: &mut Vec<PathBuf>,
     truncated: &mut bool,
 ) -> CtxResult<()> {
-    if *entries >= 4_096 || paths.len() >= MAX_FILES {
+    if depth > MAX_SCAN_DEPTH || *entries >= 4_096 || paths.len() >= MAX_FILES {
         *truncated = true;
         return Ok(());
     }
@@ -319,7 +349,7 @@ fn collect_directory(
                         | "vendor"
                 )
             ) {
-                collect_directory(repo, &path, entries, paths, truncated)?;
+                collect_directory(repo, &path, depth + 1, entries, paths, truncated)?;
             }
         } else if metadata.is_file() {
             let relative = path.strip_prefix(repo).unwrap_or(&path).to_path_buf();
@@ -335,16 +365,7 @@ fn is_frontend_source(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|value| value.to_str()),
         Some(
-            "css"
-                | "scss"
-                | "sass"
-                | "less"
-                | "html"
-                | "tsx"
-                | "jsx"
-                | "vue"
-                | "svelte"
-                | "astro"
+            "css" | "scss" | "sass" | "less" | "html" | "tsx" | "jsx" | "vue" | "svelte" | "astro"
         )
     )
 }
@@ -568,10 +589,7 @@ fn write_report(writer: &mut impl Write, report: &DetectorReport, json: bool) ->
 }
 
 pub fn run(args: &DetectorArgs, writer: &mut impl Write) -> CtxResult<i32> {
-    let repo = args
-        .repo
-        .clone()
-        .unwrap_or(std::env::current_dir()?);
+    let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
     let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
     let report = detect(&state, &repo, &args.paths, args.all)?;
     write_report(writer, &report, args.json)?;
@@ -580,6 +598,99 @@ pub fn run(args: &DetectorArgs, writer: &mut impl Write) -> CtxResult<i32> {
     } else {
         1
     })
+}
+
+pub fn benchmark() -> BenchmarkReport {
+    let cases: [(&str, &str, &[&str]); 7] = [
+        (
+            "semantic-control",
+            "<button type=\"button\">Save changes</button>",
+            &[],
+        ),
+        (
+            "missing-image-alt",
+            "<img src={avatar} />",
+            &["a11y/image-alt"],
+        ),
+        (
+            "non-semantic-action",
+            "<div onClick={save}>Save</div>",
+            &["a11y/semantic-action"],
+        ),
+        (
+            "generic-gradient-copy",
+            ".hero { background: linear-gradient(red, blue); } /* unlock your potential */",
+            &["content/generic-ai-copy", "craft/unjustified-gradient"],
+        ),
+        (
+            "emoji-navigation",
+            "<nav><button>🚀 Launch</button></nav>",
+            &["craft/emoji-chrome"],
+        ),
+        (
+            "imprecise-motion",
+            ".card { transition: all .2s; }",
+            &["motion/reduced-motion", "motion/transition-all"],
+        ),
+        (
+            "reduced-motion-covered",
+            ".card { transition: opacity .2s; } @media (prefers-reduced-motion: reduce) { .card { transition: none; } }",
+            &[],
+        ),
+    ];
+    let mut results = Vec::new();
+    for (name, source, expected) in cases {
+        let mut findings = Vec::new();
+        analyze(Path::new("benchmark.tsx"), source, &mut findings);
+        let mut observed_rules = findings
+            .into_iter()
+            .map(|finding| finding.rule_id)
+            .collect::<Vec<_>>();
+        observed_rules.sort();
+        observed_rules.dedup();
+        let mut expected_rules = expected
+            .iter()
+            .map(|rule| (*rule).to_string())
+            .collect::<Vec<_>>();
+        expected_rules.sort();
+        results.push(BenchmarkCaseResult {
+            name: name.into(),
+            passed: observed_rules == expected_rules,
+            expected_rules,
+            observed_rules,
+        });
+    }
+    let passed = results.iter().filter(|result| result.passed).count();
+    BenchmarkReport {
+        schema_version: 1,
+        cases: results.len(),
+        passed,
+        failed: results.len() - passed,
+        results,
+    }
+}
+
+pub fn run_benchmark(args: &BenchmarkArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    let report = benchmark();
+    if args.json {
+        serde_json::to_writer_pretty(&mut *writer, &report)?;
+        writeln!(writer)?;
+    } else {
+        writeln!(
+            writer,
+            "frontend detector benchmark: {}/{} passed",
+            report.passed, report.cases
+        )?;
+        for result in &report.results {
+            writeln!(
+                writer,
+                "{}\t{}",
+                if result.passed { "pass" } else { "fail" },
+                result.name
+            )?;
+        }
+    }
+    Ok(if report.failed == 0 { 0 } else { 1 })
 }
 
 #[cfg(test)]
@@ -602,8 +713,16 @@ mod tests {
                 .count(),
             2
         );
-        assert!(findings.iter().any(|finding| finding.rule_id == "a11y/image-alt"));
-        assert!(findings.iter().any(|finding| finding.rule_id == "a11y/semantic-action"));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "a11y/image-alt")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "a11y/semantic-action")
+        );
     }
 
     #[test]
@@ -615,9 +734,21 @@ mod tests {
             &mut findings,
         );
 
-        assert!(findings.iter().any(|finding| finding.rule_id == "craft/gradient-text"));
-        assert!(findings.iter().any(|finding| finding.rule_id == "craft/unjustified-gradient"));
-        assert!(findings.iter().any(|finding| finding.rule_id == "motion/transition-all"));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "craft/gradient-text")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "craft/unjustified-gradient")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "motion/transition-all")
+        );
     }
 
     #[test]
@@ -626,5 +757,11 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().expect("outside");
         let error = resolve_file(repo.path(), outside.path()).unwrap_err();
         assert!(error.to_string().contains("escapes repository"));
+    }
+
+    #[test]
+    fn benchmark_corpus_has_no_detector_drift() {
+        let report = benchmark();
+        assert_eq!(report.failed, 0, "{:#?}", report.results);
     }
 }

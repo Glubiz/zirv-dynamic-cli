@@ -19,10 +19,12 @@ pub const RENDER_REPORT_SCHEMA_VERSION: u32 = 1;
 pub const VISUAL_REVIEW_SCHEMA_VERSION: u32 = 1;
 const MAX_PACKAGE_BYTES: u64 = 128 * 1024;
 const MAX_ROUTE_SCAN_ENTRIES: usize = 4_096;
+const MAX_ROUTE_SCAN_DEPTH: usize = 32;
 const MAX_ROUTES: usize = 8;
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REVIEW_FINDINGS: usize = 32;
 const MAX_REVIEW_FINDING_BYTES: usize = 512;
+const MAX_REVIEW_IDENTITY_BYTES: usize = 256;
 const SERVER_TIMEOUT: Duration = Duration::from_secs(45);
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -170,6 +172,27 @@ fn save_render(state: &StateDir, report: &RenderReport) -> CtxResult<()> {
     Ok(())
 }
 
+fn finish_render(state: &StateDir, report: RenderReport) -> CtxResult<RenderReport> {
+    save_render(state, &report)?;
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::FrontendRenderRun);
+    event.workflow_id = super::engine::load_active(state, &report.repo)
+        .ok()
+        .flatten()
+        .map(|workflow| workflow.id);
+    event.phase = Some(super::skill::WorkflowPhase::Present);
+    event.work_domain = Some(super::classify::WorkDomain::Frontend);
+    event.succeeded = Some(report.passed());
+    event.artifact_count = u32::try_from(report.captures.len()).unwrap_or(u32::MAX);
+    let _ = super::telemetry::record(
+        state,
+        &report.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&report.repo),
+    );
+    Ok(report)
+}
+
 pub fn load_latest_render(state: &StateDir, repo: &Path) -> CtxResult<Option<RenderReport>> {
     let root = render_root(state, repo);
     let pointer = root.join("latest");
@@ -276,15 +299,13 @@ pub fn render(state: &StateDir, repo: &Path) -> CtxResult<RenderReport> {
         report.notes.push(
             "repository-authored frontend start commands are disabled by operator policy".into(),
         );
-        save_render(state, &report)?;
-        return Ok(report);
+        return finish_render(state, report);
     }
     let Some(server) = discover_server(&repo)? else {
         report
             .notes
             .push("no bounded frontend dev/start script was discovered".into());
-        save_render(state, &report)?;
-        return Ok(report);
+        return finish_render(state, report);
     };
     report.server = Some(server.clone());
     if !command_available(&server.program) {
@@ -292,15 +313,13 @@ pub fn render(state: &StateDir, repo: &Path) -> CtxResult<RenderReport> {
             "package runner '{}' is unavailable",
             server.program
         ));
-        save_render(state, &report)?;
-        return Ok(report);
+        return finish_render(state, report);
     }
     let Some(browser) = discover_browser() else {
         report
             .notes
             .push("no supported local Chromium-family browser was discovered".into());
-        save_render(state, &report)?;
-        return Ok(report);
+        return finish_render(state, report);
     };
     report.browser = Some(browser.clone());
 
@@ -325,19 +344,20 @@ pub fn render(state: &StateDir, repo: &Path) -> CtxResult<RenderReport> {
             report
                 .notes
                 .push(format!("frontend server could not start: {error}"));
-            save_render(state, &report)?;
-            return Ok(report);
+            return finish_render(state, report);
         }
     };
 
-    let result = if wait_for_server(&mut child, port)? {
-        capture_all(state, &repo, &browser, &base_url, &mut report)
-    } else {
-        report.status = RenderStatus::Failed;
-        report
-            .notes
-            .push("frontend server did not become ready within the bounded timeout".into());
-        Ok(())
+    let result = match wait_for_server(&mut child, port) {
+        Ok(true) => capture_all(state, &repo, &browser, &base_url, &mut report),
+        Ok(false) => {
+            report.status = RenderStatus::Failed;
+            report
+                .notes
+                .push("frontend server did not become ready within the bounded timeout".into());
+            Ok(())
+        }
+        Err(error) => Err(error),
     };
     let cleanup = super::terminate_process_tree(&mut child);
     if let Err(error) = result {
@@ -355,8 +375,7 @@ pub fn render(state: &StateDir, repo: &Path) -> CtxResult<RenderReport> {
     {
         report.status = RenderStatus::Passed;
     }
-    save_render(state, &report)?;
-    Ok(report)
+    finish_render(state, report)
 }
 
 fn discover_server(repo: &Path) -> CtxResult<Option<RenderCommand>> {
@@ -441,14 +460,17 @@ fn command_available(program: &str) -> bool {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => return false,
+            Err(_) => {
+                let _ = super::terminate_process_tree(&mut child);
+                return false;
+            }
         }
     }
     let _ = super::terminate_process_tree(&mut child);
     false
 }
 
-fn discover_browser() -> Option<String> {
+pub(crate) fn discover_browser() -> Option<String> {
     [
         "chromium",
         "chromium-browser",
@@ -541,7 +563,10 @@ fn capture(browser: &str, url: &str, path: &Path, viewport: Viewport) -> CtxResu
         .arg("--no-first-run")
         .arg("--virtual-time-budget=2000")
         .arg("--host-resolver-rules=MAP * 0.0.0.0, EXCLUDE localhost, EXCLUDE 127.0.0.1")
-        .arg(format!("--window-size={},{}", viewport.width, viewport.height))
+        .arg(format!(
+            "--window-size={},{}",
+            viewport.width, viewport.height
+        ))
         .arg(format!("--screenshot={}", path.display()))
         .arg(url)
         .stdin(Stdio::null())
@@ -551,8 +576,13 @@ fn capture(browser: &str, url: &str, path: &Path, viewport: Viewport) -> CtxResu
     let mut child = command.spawn()?;
     let started = Instant::now();
     while started.elapsed() < BROWSER_TIMEOUT {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status.success());
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.success()),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = super::terminate_process_tree(&mut child);
+                return Err(error.into());
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -611,7 +641,7 @@ fn route_slug(route: &str) -> String {
 fn discover_routes(repo: &Path) -> CtxResult<Vec<String>> {
     let mut files = Vec::new();
     let mut entries = 0usize;
-    collect_route_files(repo, repo, &mut entries, &mut files)?;
+    collect_route_files(repo, 0, &mut entries, &mut files)?;
     let mut routes = BTreeSet::from(["/".to_string()]);
     for path in files {
         let relative = path.strip_prefix(repo).unwrap_or(&path);
@@ -653,12 +683,15 @@ fn discover_routes(repo: &Path) -> CtxResult<Vec<String>> {
 }
 
 fn collect_route_files(
-    repo: &Path,
     directory: &Path,
+    depth: usize,
     entries: &mut usize,
     files: &mut Vec<PathBuf>,
 ) -> CtxResult<()> {
-    if *entries >= MAX_ROUTE_SCAN_ENTRIES || files.len() >= MAX_ROUTE_SCAN_ENTRIES {
+    if depth > MAX_ROUTE_SCAN_DEPTH
+        || *entries >= MAX_ROUTE_SCAN_ENTRIES
+        || files.len() >= MAX_ROUTE_SCAN_ENTRIES
+    {
         return Ok(());
     }
     let mut children = std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
@@ -689,7 +722,7 @@ fn collect_route_files(
                         | "vendor"
                 )
             ) {
-                collect_route_files(repo, &path, entries, files)?;
+                collect_route_files(&path, depth + 1, entries, files)?;
             }
         } else if metadata.is_file()
             && matches!(
@@ -708,7 +741,12 @@ fn record_review(
     repo: &Path,
     args: &VisualReviewArgs,
 ) -> CtxResult<VisualReview> {
-    validate_review_input(args.verdict, &args.findings)?;
+    validate_review_input(
+        args.verdict,
+        &args.agent,
+        args.model.as_deref(),
+        &args.findings,
+    )?;
     let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let render = load_latest_render(state, &repo)?.ok_or("no frontend render evidence")?;
     let fingerprint = super::verification::change_fingerprint(&repo)?;
@@ -729,10 +767,47 @@ fn record_review(
         created_at: now_secs(),
     };
     save_review(state, &review)?;
+    let mut event = super::telemetry::TelemetryEvent::new(
+        super::telemetry::TelemetryKind::FrontendVisualReview,
+    );
+    event.workflow_id = super::engine::load_active(state, &review.repo)
+        .ok()
+        .flatten()
+        .map(|workflow| workflow.id);
+    event.phase = Some(super::skill::WorkflowPhase::Review);
+    event.work_domain = Some(super::classify::WorkDomain::Frontend);
+    event.adapter = Some(review.reviewer.clone());
+    event.model = review.model.clone();
+    event.succeeded = Some(review.verdict == VisualVerdict::Pass);
+    event.findings_total = u32::try_from(review.findings.len()).unwrap_or(u32::MAX);
+    event.findings_meaningful = event.findings_total;
+    let _ = super::telemetry::record(
+        state,
+        &review.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&review.repo),
+    );
     Ok(review)
 }
 
-fn validate_review_input(verdict: VisualVerdict, findings: &[String]) -> CtxResult<()> {
+fn validate_review_input(
+    verdict: VisualVerdict,
+    agent: &str,
+    model: Option<&str>,
+    findings: &[String],
+) -> CtxResult<()> {
+    if agent.trim().is_empty() || agent.len() > MAX_REVIEW_IDENTITY_BYTES {
+        return Err(format!(
+            "visual review agent must contain 1..={MAX_REVIEW_IDENTITY_BYTES} bytes"
+        )
+        .into());
+    }
+    if model.is_some_and(|value| value.len() > MAX_REVIEW_IDENTITY_BYTES) {
+        return Err(format!(
+            "visual review model must contain at most {MAX_REVIEW_IDENTITY_BYTES} bytes"
+        )
+        .into());
+    }
     if findings.len() > MAX_REVIEW_FINDINGS {
         return Err(format!(
             "visual review has {} findings; limit is {MAX_REVIEW_FINDINGS}",
@@ -802,10 +877,7 @@ fn write_review(writer: &mut impl Write, review: &VisualReview, json: bool) -> C
 }
 
 pub fn run_render(args: &RenderArgs, writer: &mut impl Write) -> CtxResult<i32> {
-    let repo = args
-        .repo
-        .clone()
-        .unwrap_or(std::env::current_dir()?);
+    let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
     let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
     let report = render(&state, &repo)?;
     write_render(writer, &report, args.json)?;
@@ -813,10 +885,7 @@ pub fn run_render(args: &RenderArgs, writer: &mut impl Write) -> CtxResult<i32> 
 }
 
 pub fn run_review(args: &VisualReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
-    let repo = args
-        .repo
-        .clone()
-        .unwrap_or(std::env::current_dir()?);
+    let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
     let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
     let review = record_review(&state, &repo, args)?;
     write_review(writer, &review, args.json)?;
@@ -840,7 +909,9 @@ mod tests {
         )
         .expect("package");
 
-        let server = discover_server(repo.path()).expect("discovery").expect("server");
+        let server = discover_server(repo.path())
+            .expect("discovery")
+            .expect("server");
 
         assert_eq!(server.program, "npm");
         assert_eq!(server.args, ["run", "dev"]);
@@ -870,9 +941,16 @@ mod tests {
     #[test]
     fn visual_review_findings_are_bounded_and_pass_cannot_hide_them() {
         assert!(
-            validate_review_input(VisualVerdict::Pass, &["alignment defect".into()]).is_err()
+            validate_review_input(
+                VisualVerdict::Pass,
+                "autonomous-agent",
+                None,
+                &["alignment defect".into()],
+            )
+            .is_err()
         );
-        assert!(validate_review_input(VisualVerdict::Fail, &[]).is_err());
-        assert!(validate_review_input(VisualVerdict::Pass, &[]).is_ok());
+        assert!(validate_review_input(VisualVerdict::Fail, "autonomous-agent", None, &[]).is_err());
+        assert!(validate_review_input(VisualVerdict::Pass, "autonomous-agent", None, &[]).is_ok());
+        assert!(validate_review_input(VisualVerdict::Pass, "", None, &[]).is_err());
     }
 }

@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-21 (feat/frontend-quality, issues #70-#77): added the autonomous frontend stack and recorded its fail-closed render coverage and heuristic-detector residuals -->
 <!-- Updated 2026-08-21 (docs/vault-merge-pass, memory+context+workflow rework merge train): recorded eleven residuals surfaced across the three topics' review rounds -- repo_slug canonicalization orphaning pre-existing state, the shared memory scope's unix-only symlink tests plus its inherent TOCTOU window, stamp_verified_in_place's CRLF normalization, the canonical policy model's malformed-repo-config hole (MUST close with #44), the ALL_LAYERS/Capability::ALL exhaustiveness ceiling, the shared-block closing-marker's literal-only match, a cross-surface duplicate with no eligible diff target, the workflow secret filter's name-denylist gap, classification's git-based safety net failing open outside a repo, the FNV-1a fingerprint hash, and verification reports' unbounded retention -->
 <!-- Updated 2026-08-21 (feat/workflow-system, PR #59 review fixes): extended the codex --sandbox read-only entry -- the pin now also reaches the workflow reviewer via AgentAdapter::read_only_args, so a broken sandbox helper breaks review as well as the distiller -->
 <!-- Updated 2026-08-19 (feat/dash-adaptive-poll-help-overlay, uncommitted, extends PR #29): resolved a mail-routing gap -- a dashboard-spawned worker pane's report-back reply used to broadcast rather than address, claimable by the wrong pane (issue #30); extended the Shift+Enter ESC-CR entry to cover Alt+Enter and the Windows-Terminal key-folding root cause; extended the crossterm::EnableMouseCapture entry for ?1002 now being on (click-drag text selection + OSC 52 copy) -->
@@ -42,6 +43,16 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Autonomous frontend rendering covers static discoverable routes on a local Chromium-family browser
+
+`zirv frontend render` discovers root-level `package.json` `dev`/`start`/`preview` scripts, static Next-style `app/**/page.*` and `pages/**` routes, and a Chromium-family executable on `PATH`. It does not synthesize authenticated sessions or fixture data, instantiate `[dynamic]` routes, discover a package buried in a monorepo workspace, drive native/mobile/browser-engine-specific UIs, or use a harness-native screenshot API. A runner, browser, script, route, or server that is missing or times out is recorded as `unavailable`/`failed`, and review/verify cannot pass — there is deliberately no source-only fallback that claims visual quality. Closing these coverage gaps needs explicit adapter-owned render providers or a bounded fixture contract; it must not reintroduce human server startup or screenshot registration.
+
+The browser's host-resolver rule maps DNS names away from external hosts and the served URL is loopback, but it is not an OS network sandbox: a page that fetches a literal external IP may still reach it if the operator's environment allows that traffic. Repository start scripts remain arbitrary checkout-authored code and therefore run only when the operator-only `workflow.repo_checks_enabled` gate is open, with direct argv, fixed local host/port inputs, timeouts, and process-tree cleanup.
+
+## Frontend detector craft rules are high-signal heuristics, not a proof of visual taste
+
+Blocking detector rules are kept to structural accessibility hazards with relatively objective source evidence; generic-AI signals such as gradients, rounded-card density, emoji chrome, promotional filler, and transition breadth are advisory because the same technique can be legitimate in an established product system. The AI visual review must inspect rendered evidence and use the autonomous profile/product provenance to resolve that context. This means a determined or careless agent can still record a passing visual verdict after a poor inspection; the render id, capture fingerprints, reviewer/model provenance, fresh change fingerprint, bounded findings, and independent workflow review make that act auditable, but Zirv cannot prove the model attended to every pixel. The built-in seven-case benchmark catches detector drift, not subjective design-quality regressions across model releases.
 
 ## Repository state slugs now canonicalize, and a relocated slug orphans state filed under the old one
 

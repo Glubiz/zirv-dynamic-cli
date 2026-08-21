@@ -24,6 +24,13 @@ last-verified: 2026-08-21
 
 ## Decisions
 
+### 2026-08-21 — Frontend quality is autonomous derived state plus fresh evidence, never an init ritual
+**Context:** AI-generated frontends need both stronger taste guidance and enforcement, but a profile wizard, manual dev-server start, screenshot registration, or human theme vote would make the feature unusable by unattended agents. Zirv also cannot honestly call source inspection proof of visual quality.
+**Decision:** Automatically classify frontend work, derive a bounded profile from repository evidence, and give unresolved routine decisions to the active AI through a built-in craft floor and phase skills. Enforce an offline detector at test/review/verify and fresh loopback render plus AI visual-review evidence at review/verify; every artifact links the current change/profile/render fingerprints and missing capability fails closed.
+**Rejected:** Impeccable-style instructions alone — no freshness or completion guarantee. Committed project config/screenshots — noisy cross-user derived state and a required bootstrap. Calling a model from the detector — destroys deterministic offline behavior and adapter parity. Treating a missing browser as a pass — converts unavailable visual evidence into a false quality claim.
+**Consequences:** The repository's package start script is still untrusted executable text and runs only through the existing operator-only repo-check gate, direct argv, loopback binding, hard timeouts, and process-tree cleanup. The current prompt integration remains the narrow workflow layer until context compiler issue #44 replaces the seam; frontend state and schemas do not depend on that compiler.
+**Spec / link:** issues #70–#77; `src/commands/workflow/frontend*.rs`; [[Workflows]], [[Known Issues]].
+
 ### 2026-08-21 — Stacked topic branches merge by retargeting to `main` and merging only the stack's top PR
 **Context:** The memory and context reworks were each developed as a stack of small, reviewable PRs (memory: #57→#58→#62→#64→#66; context: #60→#61→#63→#65, then #67 on top of that). Merging each PR into `main` in sequence would cost one version bump and one release per PR — five releases for one coherent topic.
 **Decision:** Retarget every PR in a stack's base to `main`, then merge only the top PR; GitHub resolves the lower PRs in the stack as merged too, since their commits are already ancestors of the top's once the stack lands. One version bump and one CI/release cycle per topic, not per PR.
@@ -344,4 +351,3 @@ last-verified: 2026-08-21
 **Rejected:** A single combined write (message text inside the marker file itself) — couples the fast path (wake-up) to the durable path (message); losing or racing the one file loses both, and the message would no longer show up in `zirv ctx inbox` independent of whether the wake-up was ever claimed. A dedicated notification channel (new socket message type) — turn signals already exist for a different purpose (transcript-derived verdicts from *inside* the agent); a nudge originates *outside* it, from an operator, and reusing the socket would conflate the two origins.
 **Consequences:** Losing the marker (a crash between the two writes, or nobody claiming it before the state dir is swept) never loses the message — it's just picked up at the next natural poll or cycle instead of immediately. `exec`'s nudge-restart is budget-free by the same design split: it is not rot, so it must never spend the rot-restart budget.
 **Spec / link:** `src/commands/ctx/sessions.rs`'s N4 module doc comment; [[Ctx Subsystem]], [[Ctx Supervisors]].
-

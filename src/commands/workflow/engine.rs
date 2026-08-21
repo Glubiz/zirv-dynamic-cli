@@ -515,12 +515,13 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
         state.profile = WorkflowProfile::Frontend;
         state.classification.work_domain = measured.work_domain.clone();
         apply_profile(state.profile, &mut state.steps);
-        state
-            .classification
-            .reasons
-            .push(format!("frontend workflow profile selected at step '{}'", step.id));
+        state.classification.reasons.push(format!(
+            "frontend workflow profile selected at step '{}'",
+            step.id
+        ));
     }
     if measured.risk <= state.classification.risk {
+        state.classification.reasons.sort();
         return;
     }
     state.classification.risk = measured.risk;
@@ -578,10 +579,7 @@ pub fn advance_with_evidence(
                     current.phase,
                     WorkflowPhase::Test | WorkflowPhase::Review | WorkflowPhase::Verify
                 )
-                && !super::frontend_detector::latest_is_fresh_and_passing(
-                    state_dir,
-                    &state.repo,
-                )?
+                && !super::frontend_detector::latest_is_fresh_and_passing(state_dir, &state.repo)?
             {
                 return Err(format!(
                     "frontend step '{}' requires a fresh, non-truncated detector report with no blocking findings for the current change set; run `zirv frontend check` (or `zirv frontend check --all` when the change is already committed)",
@@ -690,6 +688,7 @@ pub fn advance_with_evidence(
     event.intent = Some(state.classification.intent);
     event.complexity = Some(state.classification.complexity);
     event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
     event.duration_ms = evidence.duration_ms;
     event.adapter = evidence.adapter;
     event.model = evidence.model;
@@ -716,6 +715,7 @@ pub fn advance_with_evidence(
         completed.intent = Some(state.classification.intent);
         completed.complexity = Some(state.classification.complexity);
         completed.risk = Some(state.classification.risk);
+        completed.work_domain = Some(state.classification.work_domain.domain);
         completed.succeeded = Some(true);
         completed.findings_total = findings_total;
         completed.findings_meaningful = findings_meaningful;
@@ -1080,6 +1080,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             event.intent = Some(state.classification.intent);
             event.complexity = Some(state.classification.complexity);
             event.risk = Some(state.classification.risk);
+            event.work_domain = Some(state.classification.work_domain.domain);
             let _ = super::telemetry::record(
                 &state_dir,
                 &state.repo,
@@ -1252,8 +1253,18 @@ mod tests {
         assert_eq!(state.status, WorkflowStatus::Running);
         assert_eq!(state.steps[0].skill, "frontend-design");
         assert!(!state.steps[0].approval);
-        assert!(state.steps.iter().any(|step| step.skill == "frontend-review"));
-        assert!(state.steps.iter().any(|step| step.skill == "frontend-verify"));
+        assert!(
+            state
+                .steps
+                .iter()
+                .any(|step| step.skill == "frontend-review")
+        );
+        assert!(
+            state
+                .steps
+                .iter()
+                .any(|step| step.skill == "frontend-verify")
+        );
     }
 
     #[test]
@@ -1307,8 +1318,11 @@ mod tests {
             assert!(status.success());
         };
         git(&["init", "-q"]);
-        std::fs::write(repo.path().join("App.tsx"), "export const App = () => <main />;\n")
-            .unwrap();
+        std::fs::write(
+            repo.path().join("App.tsx"),
+            "export const App = () => <main />;\n",
+        )
+        .unwrap();
         git(&["add", "App.tsx"]);
         git(&["commit", "-q", "-m", "base"]);
         std::fs::write(

@@ -587,7 +587,12 @@ Every interactive surface must have meaningful default, hover, focus-visible, ac
             "Reproduce visual and interaction defects at the state and viewport where they occur.",
             &["frontend", "ui", "visual bug", "interaction bug"],
             &[Cap::RepoRead],
-            &[Cap::RepoWrite, Cap::TestRun, Cap::ArtifactRender, Cap::BrowserOpen],
+            &[
+                Cap::RepoWrite,
+                Cap::TestRun,
+                Cap::ArtifactRender,
+                Cap::BrowserOpen,
+            ],
             &[Phase::Debug],
             &["frontend-craft", "systematic-debugging"],
             "Reproduce the defect in its actual route, viewport, data state, input method, and color or motion preference. Determine whether the cause is structure, CSS cascade, tokens, component state, data flow, browser behavior, or an accessibility contract before editing. Preserve the product's design language while fixing the cause. Add the smallest durable regression check available, then render the original failing state and at least one adjacent responsive or interaction state to rule out displacement bugs.",
@@ -922,7 +927,12 @@ mod tests {
         let skill = registry.get("frontend-craft@1").unwrap();
 
         assert_eq!(skill.source, SkillSource::BuiltIn);
-        assert!(skill.manifest.instructions.contains("Reject interchangeable AI UI"));
+        assert!(
+            skill
+                .manifest
+                .instructions
+                .contains("Reject interchangeable AI UI")
+        );
         assert!(registry.warnings()[0].contains("frontend-craft"));
     }
 

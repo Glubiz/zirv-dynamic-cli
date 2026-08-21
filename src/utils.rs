@@ -373,6 +373,7 @@ mod tests {
     fn test_is_reserved_command() {
         assert!(is_reserved_command("help"));
         assert!(is_reserved_command("c"));
+        assert!(is_reserved_command("frontend"));
         assert!(!is_reserved_command("build"));
     }
 
@@ -386,6 +387,7 @@ mod tests {
         assert!(is_reserved_command("CHAT"));
         assert!(is_reserved_command("Agent"));
         assert!(is_reserved_command("CtX"));
+        assert!(is_reserved_command("FRONTEND"));
         assert!(!is_reserved_command("Build"));
     }
 

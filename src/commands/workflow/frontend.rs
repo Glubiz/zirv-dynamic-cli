@@ -88,6 +88,10 @@ pub enum FrontendSubcommand {
     Render(super::frontend_render::RenderArgs),
     /// Record the active AI agent's bounded review of fresh render evidence.
     Review(super::frontend_render::VisualReviewArgs),
+    /// Inspect provider-neutral frontend capability and skill provenance.
+    Capabilities(FrontendCapabilitiesArgs),
+    /// Run the built-in deterministic detector benchmark corpus.
+    Benchmark(super::frontend_detector::BenchmarkArgs),
 }
 
 #[derive(Debug, Args)]
@@ -101,11 +105,76 @@ pub struct ProfileArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct FrontendCapabilitiesArgs {
+    /// Agent adapter whose logical capabilities should be resolved.
+    #[arg(long)]
+    pub agent: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FrontendCapabilities {
+    schema_version: u32,
+    adapter: String,
+    profile: &'static str,
+    detector: &'static str,
+    phase_skills: Vec<&'static str>,
+    local_browser: Option<String>,
+    capabilities: super::capability::CapabilityReport,
+}
+
+fn capabilities_for(adapter: &str, probe_browser: bool) -> FrontendCapabilities {
+    FrontendCapabilities {
+        schema_version: 1,
+        adapter: adapter.to_string(),
+        profile: "frontend-profile@1 (built-in)",
+        detector: "frontend-detector@1 (built-in, offline)",
+        phase_skills: vec![
+            "frontend-craft@1",
+            "frontend-design@1",
+            "frontend-plan@1",
+            "frontend-implement@1",
+            "frontend-debug@1",
+            "frontend-test@1",
+            "frontend-review@1",
+            "frontend-verify@1",
+        ],
+        local_browser: probe_browser
+            .then(super::frontend_render::discover_browser)
+            .flatten(),
+        capabilities: super::capability::CapabilityReport::for_adapter(adapter),
+    }
+}
+
+fn write_capabilities(
+    writer: &mut impl Write,
+    report: &FrontendCapabilities,
+    json: bool,
+) -> CtxResult<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut *writer, report)?;
+        writeln!(writer)?;
+    } else {
+        writeln!(writer, "frontend adapter: {}", report.adapter)?;
+        writeln!(writer, "profile: {}", report.profile)?;
+        writeln!(writer, "detector: {}", report.detector)?;
+        writeln!(writer, "skills: {}", report.phase_skills.join(", "))?;
+        writeln!(
+            writer,
+            "local browser: {}",
+            report.local_browser.as_deref().unwrap_or("unavailable")
+        )?;
+        for status in &report.capabilities.statuses {
+            writeln!(writer, "{}: {}", status.capability, status.support)?;
+        }
+    }
+    Ok(())
+}
+
 fn profile_path(state: &StateDir, repo: &Path) -> PathBuf {
-    state
-        .frontend()
-        .join(repo_slug(repo))
-        .join("profile.json")
+    state.frontend().join(repo_slug(repo)).join("profile.json")
 }
 
 fn canonical_repo(repo: &Path) -> PathBuf {
@@ -151,7 +220,8 @@ pub fn ensure_profile(state: &StateDir, repo: &Path) -> CtxResult<FrontendProfil
 
 pub fn refresh_profile(state: &StateDir, repo: &Path) -> CtxResult<FrontendProfile> {
     let repo = canonical_repo(repo);
-    let profile = synthesize_profile(repo, scan_repository(repo.as_path())?);
+    let evidence = scan_repository(&repo)?;
+    let profile = synthesize_profile(repo, evidence);
     save(state, &profile)?;
     Ok(profile)
 }
@@ -251,14 +321,7 @@ fn scan_repository(repo: &Path) -> CtxResult<RepositoryEvidence> {
     let mut candidates = Vec::new();
     let mut entries = 0usize;
     let mut truncated = false;
-    collect_candidates(
-        repo,
-        repo,
-        0,
-        &mut entries,
-        &mut candidates,
-        &mut truncated,
-    )?;
+    collect_candidates(repo, repo, 0, &mut entries, &mut candidates, &mut truncated)?;
     candidates.sort();
     candidates.truncate(MAX_EVIDENCE_FILES);
 
@@ -346,14 +409,7 @@ fn collect_candidates(
                     | ".cache"
                     | "vendor"
             ) {
-                collect_candidates(
-                    root,
-                    &path,
-                    depth + 1,
-                    entries,
-                    candidates,
-                    truncated,
-                )?;
+                collect_candidates(root, &path, depth + 1, entries, candidates, truncated)?;
             }
         } else if metadata.is_file()
             && metadata.len() <= MAX_FILE_BYTES
@@ -367,7 +423,10 @@ fn collect_candidates(
 
 fn is_frontend_evidence(root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
     if matches!(
         name,
         "package.json"
@@ -384,9 +443,12 @@ fn is_frontend_evidence(root: &Path, path: &Path) -> bool {
     matches!(
         extension,
         Some("css" | "scss" | "sass" | "less" | "html" | "tsx" | "jsx" | "vue" | "svelte")
-    ) || relative
-        .components()
-        .any(|part| matches!(part.as_os_str().to_str(), Some("components" | "ui" | "styles")))
+    ) || relative.components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some("components" | "ui" | "styles")
+        )
+    })
 }
 
 fn read_bounded(path: &Path, cap: usize) -> CtxResult<Vec<u8>> {
@@ -411,7 +473,7 @@ fn extract_fonts(text: &str, values: &mut BTreeSet<String>) {
             .next()
             .unwrap_or("")
             .trim()
-            .trim_matches(['\'', '"']);
+            .trim_matches(|character| character == '\'' || character == '"');
         if !value.is_empty() && value.len() <= 96 {
             values.insert(value.to_string());
         }
@@ -458,11 +520,7 @@ impl StableHash {
     }
 }
 
-fn write_profile(
-    writer: &mut impl Write,
-    profile: &FrontendProfile,
-    json: bool,
-) -> CtxResult<()> {
+fn write_profile(writer: &mut impl Write, profile: &FrontendProfile, json: bool) -> CtxResult<()> {
     if json {
         serde_json::to_writer_pretty(&mut *writer, profile)?;
         writeln!(writer)?;
@@ -477,10 +535,7 @@ fn write_profile(
 pub fn run(args: &FrontendArgs, writer: &mut impl Write) -> CtxResult<i32> {
     match &args.command {
         FrontendSubcommand::Profile(args) => {
-            let repo = args
-                .repo
-                .clone()
-                .unwrap_or(std::env::current_dir()?);
+            let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
             let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
             let profile = if args.refresh {
                 refresh_profile(&state, &repo)?
@@ -497,6 +552,13 @@ pub fn run(args: &FrontendArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         FrontendSubcommand::Review(args) => {
             return super::frontend_render::run_review(args, writer);
+        }
+        FrontendSubcommand::Capabilities(args) => {
+            let report = capabilities_for(&args.agent, true);
+            write_capabilities(writer, &report, args.json)?;
+        }
+        FrontendSubcommand::Benchmark(args) => {
+            return super::frontend_detector::run_benchmark(args, writer);
         }
     }
     Ok(0)
@@ -523,7 +585,12 @@ mod tests {
         assert!(!first.autonomy.human_initialization_required);
         assert_eq!(first, second);
         assert_eq!(first.basis, ProfileBasis::ExistingSystem);
-        assert!(first.observed_fonts.iter().any(|font| font.contains("Sora")));
+        assert!(
+            first
+                .observed_fonts
+                .iter()
+                .any(|font| font.contains("Sora"))
+        );
         assert!(first.observed_colors.contains(&"#123456".to_string()));
     }
 
@@ -555,5 +622,16 @@ mod tests {
         assert_eq!(profile.basis, ProfileBasis::AutonomousBaseline);
         assert!(context.contains("human initialization required: no"));
         assert!(context.contains("without pausing for initialization or a design vote"));
+    }
+
+    #[test]
+    fn claude_and_codex_get_the_same_frontend_skill_and_capability_contract() {
+        let claude = capabilities_for("claude", false);
+        let codex = capabilities_for("codex", false);
+
+        assert_eq!(claude.phase_skills, codex.phase_skills);
+        assert_eq!(claude.profile, codex.profile);
+        assert_eq!(claude.detector, codex.detector);
+        assert_eq!(claude.capabilities.statuses, codex.capabilities.statuses);
     }
 }

@@ -528,6 +528,7 @@ fn record_finding_update(state_dir: &StateDir, state: &WorkflowState) {
     event.intent = Some(state.classification.intent);
     event.complexity = Some(state.classification.complexity);
     event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
     event.findings_total = total;
     event.findings_meaningful = meaningful;
     event.findings_dismissed = dismissed;
@@ -726,6 +727,7 @@ fn run_independent_review(
     event.intent = Some(state.classification.intent);
     event.complexity = Some(state.classification.complexity);
     event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
     event.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
     event.adapter = Some(args.agent.clone());
     event.succeeded = Some(records_evidence(&run, fingerprint_unchanged));

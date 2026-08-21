@@ -27,12 +27,7 @@ pub mod verification;
 /// layers add implementations for every name; reserving the complete surface
 /// now prevents a repository script from taking one over between releases.
 pub const TOP_LEVEL_COMMANDS: &[&str] = &[
-    "skill",
-    "workflow",
-    "test",
-    "verify",
-    "artifact",
-    "frontend",
+    "skill", "workflow", "test", "verify", "artifact", "frontend",
 ];
 
 /// The two operator gates over repository-provided workflow input:
