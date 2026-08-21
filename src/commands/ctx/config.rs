@@ -314,6 +314,13 @@ impl Default for MailConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
+    /// MASTER switch for the whole memory subsystem, kept under its
+    /// original name for backward compatibility (it predates
+    /// `memory::MemoryScope`). `false` disables both the private and the
+    /// shared scope, however `shared_enabled` below is set: an operator who
+    /// disabled memory before the shared scope existed must not silently
+    /// start receiving repo-controlled prompt content on upgrade. See
+    /// `memory::MemoryScope::enabled`.
     pub enabled: bool,
     /// Whether facts may be harvested automatically from distilled handoffs.
     /// Off by default: an entry worth keeping across sessions is, for now, a
@@ -325,8 +332,38 @@ pub struct MemoryConfig {
     /// Cap on a single entry's body. Enforced by `memory::remember`, which
     /// truncates rather than fails an oversize entry.
     pub max_entry_bytes: usize,
-    /// Cap on how much of the bank is surfaced to a session at once.
+    /// Superseded by `core_max_bytes` (issue #34): every prompt-injection
+    /// call site now caps the merged private+shared core layer with that key
+    /// instead. Kept, parsed, and still `REPO_FORBIDDEN`, purely so an
+    /// existing `ctx.toml`/env setting this key does not hard-error on load
+    /// (this struct is `deny_unknown_fields`) -- the same "kept under its
+    /// original name" reasoning `enabled`'s own doc comment gives for a
+    /// different field.
     pub max_injected_bytes: usize,
+    /// Gate for the **shared** (repo-owned) memory bank under
+    /// `<repo>/.zirv/memory/` (`memory::MemoryScope::Shared`), UNDERNEATH
+    /// the master switch above: with `enabled = true`, an operator can turn
+    /// this off to keep the private scope while dropping shared, but
+    /// `enabled = false` always wins regardless of this value. On by
+    /// default like every other memory switch.
+    pub shared_enabled: bool,
+    /// Hard byte budget for the **core** memory layer (issue #34): private
+    /// and shared entries merged with private-first precedence (see
+    /// `prompt::select_memory_within_cap`), always eligible for injection
+    /// into every zirv-started session regardless of query or context.
+    /// Independent of `max_entries`/`max_entry_bytes` (which cap what the
+    /// bank *stores*) and of the bank's total size -- a strict ceiling on
+    /// what a session actually *receives*.
+    pub core_max_bytes: usize,
+    /// Hard byte budget for the **retrieved** memory layer (issue #35):
+    /// entries selected by context-aware ranking, added on top of the core
+    /// layer for a query or session context. Independent of
+    /// `core_max_bytes`.
+    pub retrieval_max_bytes: usize,
+    /// Hard cap on the *number* of entries the retrieval layer may select,
+    /// independent of `retrieval_max_bytes`'s byte budget -- a ranking that
+    /// matches many small entries must not still return dozens of them.
+    pub retrieval_max_entries: usize,
 }
 
 impl Default for MemoryConfig {
@@ -337,6 +374,10 @@ impl Default for MemoryConfig {
             max_entries: 50,
             max_entry_bytes: 512,
             max_injected_bytes: 2048,
+            shared_enabled: true,
+            core_max_bytes: 2048,
+            retrieval_max_bytes: 2048,
+            retrieval_max_entries: 6,
         }
     }
 }
@@ -734,6 +775,26 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_MEMORY_SHARED",
+        &["memory", "shared_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_CORE_MAX_BYTES",
+        &["memory", "core_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES",
+        &["memory", "retrieval_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES",
+        &["memory", "retrieval_max_entries"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_CHROME_BANNER",
         &["chrome", "banner"],
         EnvKind::Bool,
@@ -900,8 +961,11 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // for anyone running zirv there, with no operator-visible sign that it
     // happened.
     (&["chrome", "events"], "ZIRV_CTX_QUIET"),
-    // A repo checkout must not be able to seed the memory bank, grow its
-    // cap, or turn on automatic harvesting -- the same class of decision
+    // A repo checkout must not be able to switch either memory scope's own
+    // gate on or off for itself, grow its cap, or turn on automatic
+    // harvesting -- this is about the CONFIGURATION, not the shared scope's
+    // content (which is deliberately, expectedly repo-committed by design;
+    // see memory.rs's `MemoryScope::Shared`) -- the same class of decision
     // `prompt.max_repo_bytes` guards: something the checkout must not
     // choose for itself, only the operator (`~/.zirv/ctx.toml`, `ZIRV_CTX_*`
     // or flags) may.
@@ -915,6 +979,32 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["memory", "max_injected_bytes"],
         "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
+    ),
+    // `shared_enabled` is the same class of decision as `enabled` right
+    // above, for the newer repo-owned scope (`memory::MemoryScope::Shared`):
+    // a checkout must not be able to switch its own shared bank back on for
+    // an operator who disabled it. A separate entry, not folded into
+    // `enabled` above: each memory switch is forbidden individually, the
+    // same granularity `harvest`/`max_entries`/etc. already get.
+    (&["memory", "shared_enabled"], "ZIRV_CTX_MEMORY_SHARED"),
+    // Same class of decision as `max_injected_bytes` right above (which this
+    // key supersedes for actual injection sizing): a repo checkout must not
+    // be able to grow the merged core layer's own delivered-bytes cap, the
+    // same trust asymmetry `prompt.max_repo_bytes`/`mail.max_delivered_bytes`
+    // already enforce.
+    (
+        &["memory", "core_max_bytes"],
+        "ZIRV_CTX_MEMORY_CORE_MAX_BYTES",
+    ),
+    // Same reasoning, for the retrieval layer's byte budget (issue #35).
+    (
+        &["memory", "retrieval_max_bytes"],
+        "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES",
+    ),
+    // Same reasoning, for the retrieval layer's entry-count cap.
+    (
+        &["memory", "retrieval_max_entries"],
+        "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES",
     ),
     // A repo checkout must not be able to switch its own dashboard on or off,
     // resize the sidebar, change how long a quit-time roster is offered for
@@ -2029,7 +2119,7 @@ mod tests {
     #[test]
     fn memory_defaults_are_enabled_off_harvest_with_sane_caps() {
         let memory = MemoryConfig::default();
-        assert!(memory.enabled, "the memory bank is on by default");
+        assert!(memory.enabled, "the private memory bank is on by default");
         assert!(
             !memory.harvest,
             "automatic harvesting is off by default: remembering is a deliberate act"
@@ -2037,6 +2127,13 @@ mod tests {
         assert_eq!(memory.max_entries, 50);
         assert_eq!(memory.max_entry_bytes, 512);
         assert_eq!(memory.max_injected_bytes, 2048);
+        assert!(
+            memory.shared_enabled,
+            "the shared (repo-owned) scope is on by default too"
+        );
+        assert_eq!(memory.core_max_bytes, 2048);
+        assert_eq!(memory.retrieval_max_bytes, 2048);
+        assert_eq!(memory.retrieval_max_entries, 6);
     }
 
     #[test]
@@ -2048,6 +2145,10 @@ mod tests {
             ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "9"),
             ("ZIRV_CTX_MEMORY_MAX_ENTRY_BYTES", "128"),
             ("ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES", "999"),
+            ("ZIRV_CTX_MEMORY_SHARED", "false"),
+            ("ZIRV_CTX_MEMORY_CORE_MAX_BYTES", "1024"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES", "4096"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "3"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled);
@@ -2055,6 +2156,10 @@ mod tests {
         assert_eq!(cfg.memory.max_entries, 9);
         assert_eq!(cfg.memory.max_entry_bytes, 128);
         assert_eq!(cfg.memory.max_injected_bytes, 999);
+        assert!(!cfg.memory.shared_enabled);
+        assert_eq!(cfg.memory.core_max_bytes, 1024);
+        assert_eq!(cfg.memory.retrieval_max_bytes, 4096);
+        assert_eq!(cfg.memory.retrieval_max_entries, 3);
     }
 
     /// N4: `supervise.max_nudges` reads from its own env var like every
@@ -2089,8 +2194,8 @@ mod tests {
 
     /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and
     /// `mail.max_delivered_bytes`: a repo checkout must not be able to seed
-    /// the bank, grow its own cap, or switch automatic harvesting on for
-    /// anyone who runs zirv there.
+    /// the bank, grow its own cap, switch automatic harvesting on, or switch
+    /// its own shared scope back on for anyone who runs zirv there.
     #[test]
     fn a_repository_config_may_not_raise_a_memory_cap_or_enable_harvesting() {
         for (key, value) in [
@@ -2099,6 +2204,10 @@ mod tests {
             ("max_entries", "100000"),
             ("max_entry_bytes", "100000"),
             ("max_injected_bytes", "100000"),
+            ("shared_enabled", "true"),
+            ("core_max_bytes", "100000"),
+            ("retrieval_max_bytes", "100000"),
+            ("retrieval_max_entries", "100000"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -2129,10 +2238,21 @@ mod tests {
         let env = env_map(&[
             ("ZIRV_CTX_MEMORY", "false"),
             ("ZIRV_CTX_MEMORY_MAX_ENTRIES", "5"),
+            ("ZIRV_CTX_MEMORY_SHARED", "false"),
+            ("ZIRV_CTX_MEMORY_CORE_MAX_BYTES", "512"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES", "1024"),
+            ("ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES", "2"),
         ]);
         let cfg = CtxConfig::load(home_only.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(!cfg.memory.enabled, "the environment is the operator");
+        assert!(
+            !cfg.memory.shared_enabled,
+            "including the shared-scope gate"
+        );
         assert_eq!(cfg.memory.max_entries, 5);
+        assert_eq!(cfg.memory.core_max_bytes, 512);
+        assert_eq!(cfg.memory.retrieval_max_bytes, 1024);
+        assert_eq!(cfg.memory.retrieval_max_entries, 2);
     }
 
     #[test]
@@ -2475,6 +2595,10 @@ mod tests {
         ("memory", "max_entries"),
         ("memory", "max_entry_bytes"),
         ("memory", "max_injected_bytes"),
+        ("memory", "shared_enabled"),
+        ("memory", "core_max_bytes"),
+        ("memory", "retrieval_max_bytes"),
+        ("memory", "retrieval_max_entries"),
         ("chrome", "banner"),
         ("chrome", "bar"),
         ("chrome", "events"),
@@ -2586,6 +2710,49 @@ mod tests {
                 section_has_key(&section, key),
                 "{}: key `{key}` missing from table `[{table}]` (active or commented)",
                 path.display()
+            );
+        }
+    }
+
+    /// Companion to the exhaustiveness test above, guarding the *other*
+    /// direction: every entry in `REPO_FORBIDDEN` must have its own row in
+    /// both hand-maintained trust-boundary tables (README.md, and
+    /// `docs/obsidian/Concepts/Untrusted Configuration.md`). A repo-forbidden
+    /// key with no doc row is invisible to anyone reading either table to
+    /// find out what's blocked and why. This drift already happened once
+    /// (Task 1's round 1 review caught `memory.shared_enabled` missing from
+    /// both tables); this test exists so a NEW `REPO_FORBIDDEN` entry can
+    /// never repeat it silently. Only presence is checked, not wording: each
+    /// table's own prose explains the rationale in its own voice.
+    ///
+    /// The needle is anchored to the actual table-row shape
+    /// (`` | `key` ``, a markdown table cell), not a bare backtick-wrapped
+    /// mention anywhere in the file: a prose sentence merely naming the key
+    /// (as this file's own trust-boundary intro paragraphs do) must not
+    /// count as "documented in the table" -- a fix-round review caught this
+    /// weaker check passing on prose alone.
+    #[test]
+    fn every_repo_forbidden_key_has_a_row_in_both_trust_boundary_tables() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let readme = std::fs::read_to_string(repo.join("README.md")).expect("read README.md");
+        let untrusted_config = std::fs::read_to_string(
+            repo.join("docs")
+                .join("obsidian")
+                .join("Concepts")
+                .join("Untrusted Configuration.md"),
+        )
+        .expect("read Untrusted Configuration.md");
+
+        for (path, _env_var) in REPO_FORBIDDEN {
+            let canonical = path.join(".");
+            let needle = format!("| `{canonical}`");
+            assert!(
+                readme.contains(&needle),
+                "README.md's trust-boundary table is missing a row for `{canonical}`"
+            );
+            assert!(
+                untrusted_config.contains(&needle),
+                "Untrusted Configuration.md's forbidden-key table is missing a row for `{canonical}`"
             );
         }
     }

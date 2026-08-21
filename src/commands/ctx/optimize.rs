@@ -4961,6 +4961,10 @@ mod tests {
             verified,
             source: "explicit".to_string(),
             body: body.to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
         };
         crate::commands::ctx::memory::remember(state, slug, &entry, &cfg).expect("seed memory");
     }
