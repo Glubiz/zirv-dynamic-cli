@@ -91,6 +91,8 @@ The `&&` is the trust boundary: a repo's `enabled = true` is a silent no-op (the
 
 **The load-failure case is still open here.** There is no `EffectivePolicy` analogue of `AgentGate::load_operator_only` yet, so `optimize.rs`/`hook.rs`'s degradation arms land on `CtxConfig::default()`'s all-`allow` policy — the exact hole the paragraph above describes, for the newer surface. Inert while nothing enforces policy; a real gap the moment issue #44 wires it into launches.
 
+`[policy]` and the canonical `.zirv/context/` layer (below) are two different repo-owned surfaces built on the identical trust shape (`Scope::Repo`, `Trust::RepoUntrusted`, no path to operator authority by construction) but answering different questions: `[policy]` is *what a session may do* — an enforcement stance a harness pins on launch — while the canonical layer is *what a session is told* — instruction text, advisory only. See that section's own cross-reference back to this one.
+
 ## `system-prompt.md`: capped, labeled, and outranked
 
 The composed session prompt (`prompt::compose`) concatenates layers in a fixed order that never lets a later layer silently replace an earlier one:
@@ -144,6 +146,8 @@ Since 2026-08-20 (issue #41), `collect_surfaces` also reads a sixth family of la
 The new `src/commands/ctx/context.rs` module owns this layer's file locations (`common_path`/`claude_path`/`codex_path`) and its precedence semantics: `PrecedenceTier` (`CanonicalCommon < CanonicalHarnessSpecific < Native`) is the deterministic order a future compiler (issue #44) is meant to compose these layers in — canonical content applies first, a harness-specific canonical addition layers on top of it, and a harness's own native file composes last, closest to the session, so a conflicting instruction there reads as refining or overriding the canonical layer. Nothing consumes `PrecedenceTier` in production yet (`#[allow(dead_code)]`, the same dormancy pattern as `Layer::trust`/`Surface::context_surface` above) — issue #42's drift detection and issue #44's compiler are its first real callers.
 
 **Context vs. memory**, made explicit in code as well as here: `context.rs`'s module doc states the boundary directly — this layer (and CLAUDE.md/AGENTS.md) is *how an agent should work*, authored by a person and read fresh every session; the memory bank (below) is *what a past session learned*, accumulated automatically and recalled by key. Neither substitutes for the other, and `optimize.rs`'s own memory/CLAUDE.md separation (N7, described below) already enforces the same split from the opposite direction.
+
+**Context vs. policy**: canonical text can *describe* a permission stance in prose ("don't run destructive git commands"), but describing is not enforcing — whether a stance actually holds a harness to something real is `[policy]`'s question (see "The same fold, now for `[policy]`" above), answered per capability via `policy::evaluate`'s `Support` states (`Enforced`/`Degraded`/`Unsupported`/`OperatorControlled`), never this layer's. Issue #44's compiler composes both into the same launch, so repo-owned canonical text must never be able to express something the policy report would call enforced — see `AgentAdapter::policy_support`'s own doc comment in `src/commands/ctx/adapters/mod.rs`.
 
 ## Mail: a different trust model, same instinct
 

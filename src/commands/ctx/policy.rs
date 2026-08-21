@@ -53,6 +53,14 @@
 // report. Every item below is exercised by this module's own tests in the
 // meantime, module-wide rather than per item because the whole evaluation
 // surface is in the same position, not a stray unused helper.
+//
+// The same compiler also composes the canonical `.zirv/context/` layer
+// (issue #41, `context.rs`) into a launch -- and that coupling matters here:
+// repo-owned canonical text can describe a permission stance in prose, but
+// describing is not enforcing, so #44 must never let canonical text cause a
+// launch to be reported as `Enforced`/`Degraded` for a capability this
+// module did not itself verify a mechanism for. See `docs/obsidian/Concepts/
+// Untrusted Configuration.md`'s "Context vs. policy" section.
 #![allow(dead_code)]
 
 use super::CtxResult;
