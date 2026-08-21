@@ -110,7 +110,7 @@ fn report_dir(state: &StateDir, repo: &Path) -> PathBuf {
         .join("detector")
 }
 
-fn save_report(state: &StateDir, report: &DetectorReport) -> CtxResult<()> {
+pub(crate) fn save_report(state: &StateDir, report: &DetectorReport) -> CtxResult<()> {
     let directory = report_dir(state, &report.repo);
     create_private_dir_all(&directory)?;
     let body = serde_json::to_string_pretty(report)?;
@@ -143,8 +143,11 @@ pub fn latest_is_fresh_and_passing(state: &StateDir, repo: &Path) -> CtxResult<b
     let Some(report) = load_latest(state, repo)? else {
         return Ok(false);
     };
+    let profile = super::frontend::ensure_profile(state, repo)?;
     Ok(report.passed()
         && !report.truncated
+        && !report.analyzed_files.is_empty()
+        && report.profile_fingerprint == profile.source_fingerprint
         && report.change_fingerprint == super::verification::change_fingerprint(repo)?)
 }
 

@@ -229,8 +229,10 @@ pub fn latest_visual_is_fresh_and_passing(state: &StateDir, repo: &Path) -> CtxR
         return Ok(false);
     };
     let fingerprint = super::verification::change_fingerprint(repo)?;
+    let profile = super::frontend::ensure_profile(state, repo)?;
     Ok(render.passed()
         && render.change_fingerprint == fingerprint
+        && render.profile_fingerprint == profile.source_fingerprint
         && review.verdict == VisualVerdict::Pass
         && review.findings.is_empty()
         && review.change_fingerprint == fingerprint

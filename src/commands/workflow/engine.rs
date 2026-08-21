@@ -573,6 +573,35 @@ pub fn advance_with_evidence(
         .ok_or("workflow has no current step")?;
     match outcome {
         StepOutcome::Success => {
+            if state.profile == WorkflowProfile::Frontend
+                && matches!(
+                    current.phase,
+                    WorkflowPhase::Test | WorkflowPhase::Review | WorkflowPhase::Verify
+                )
+                && !super::frontend_detector::latest_is_fresh_and_passing(
+                    state_dir,
+                    &state.repo,
+                )?
+            {
+                return Err(format!(
+                    "frontend step '{}' requires a fresh, non-truncated detector report with no blocking findings for the current change set; run `zirv frontend check` (or `zirv frontend check --all` when the change is already committed)",
+                    current.id
+                )
+                .into());
+            }
+            if state.profile == WorkflowProfile::Frontend
+                && matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify)
+                && !super::frontend_render::latest_visual_is_fresh_and_passing(
+                    state_dir,
+                    &state.repo,
+                )?
+            {
+                return Err(format!(
+                    "frontend step '{}' requires fresh narrow/wide render evidence and a passing AI visual review for the current change set; run `zirv frontend render`, inspect every capture, then `zirv frontend review --verdict pass`",
+                    current.id
+                )
+                .into());
+            }
             if current.phase == WorkflowPhase::Review {
                 if state
                     .review_findings
@@ -1225,6 +1254,108 @@ mod tests {
         assert!(!state.steps[0].approval);
         assert!(state.steps.iter().any(|step| step.skill == "frontend-review"));
         assert!(state.steps.iter().any(|step| step.skill == "frontend-verify"));
+    }
+
+    #[test]
+    fn frontend_test_step_fails_closed_without_detector_evidence() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut classification = low_classification();
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "build a frontend component".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("zirv frontend check"));
+    }
+
+    #[test]
+    fn frontend_review_step_names_the_autonomous_visual_evidence_commands() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("App.tsx"), "export const App = () => <main />;\n")
+            .unwrap();
+        git(&["add", "App.tsx"]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(
+            repo.path().join("App.tsx"),
+            "export const App = () => <main><h1>Settings</h1></main>;\n",
+        )
+        .unwrap();
+        let profile = super::super::frontend::ensure_profile(&state_dir, repo.path()).unwrap();
+        let detector = super::super::frontend_detector::DetectorReport {
+            schema_version: super::super::frontend_detector::DETECTOR_REPORT_SCHEMA_VERSION,
+            id: uuid::Uuid::new_v4().to_string(),
+            repo: repo.path().canonicalize().unwrap(),
+            change_fingerprint: super::super::verification::change_fingerprint(repo.path())
+                .unwrap(),
+            profile_fingerprint: profile.source_fingerprint,
+            scope: super::super::frontend_detector::DetectorScope::Changed,
+            generated_at: now_secs(),
+            analyzed_files: vec![PathBuf::from("App.tsx")],
+            analyzed_bytes: 64,
+            truncated: false,
+            findings: Vec::new(),
+        };
+        super::super::frontend_detector::save_report(&state_dir, &detector).unwrap();
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Review)
+            .unwrap();
+
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("zirv frontend render"));
+        assert!(error.contains("zirv frontend review --verdict pass"));
     }
 
     #[test]
