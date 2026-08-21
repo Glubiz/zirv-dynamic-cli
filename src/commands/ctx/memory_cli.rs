@@ -18,12 +18,15 @@
 //! of the store's own `get_scoped` lookup -- see `run_recall_with`'s own
 //! doc comment for the resulting behavior change.
 //!
-//! Gating: `status`/`list`/`recall` are reads and respect each scope's own
-//! gate (`memory.enabled`/`memory.shared_enabled`) -- a disabled scope
-//! reports as disabled rather than showing what it holds, via
-//! `MemoryScope::enabled`/`list_scoped`/`get_scoped`, which already encode
-//! this. `forget`/`verify` are maintenance verbs and stay ungated, per the
-//! "disabling a scope must never trap data" rule `forget_scoped`/
+//! Gating: `list`/`recall` are reads and respect each scope's own gate
+//! (`memory.enabled`/`memory.shared_enabled`) -- a disabled scope lists or
+//! recalls nothing, via `MemoryScope::enabled`/`list_scoped`/`get_scoped`,
+//! which already encode this. `status` is the one exception: it reports a
+//! disabled scope's counts and bytes too (marked `disabled`), the same
+//! "must never trap data" rule as `forget`/`verify`, since a byte count is
+//! not the entry content the gate exists to withhold -- see
+//! `write_scope_status`. `forget`/`verify` are maintenance verbs and stay
+//! ungated, per the "disabling a scope must never trap data" rule `forget_scoped`/
 //! `verify_scoped` already follow.
 
 use std::io::{Read, Write};
@@ -53,9 +56,9 @@ pub struct MemoryCli {
 #[derive(Debug, Subcommand)]
 pub enum MemoryVerb {
     /// Report scope availability, entry counts, stored bytes, and the
-    /// configured injection budget -- never entry bodies. Reads respect each
-    /// scope's own gate: a disabled scope reports as disabled rather than
-    /// showing what it holds.
+    /// configured injection budget -- never entry bodies. A disabled scope
+    /// is marked `disabled` but still reports its counts and bytes: a byte
+    /// count is not the content the gate exists to withhold.
     Status,
     /// List every entry in one scope (private by default).
     List(ListArgs),
@@ -112,6 +115,41 @@ pub struct RememberArgs {
     /// it isn't.
     #[arg(long, default_value_t = false)]
     pub shared: bool,
+    /// How important this fact is: `low`, `normal`, or `high`. Affects
+    /// `zirv memory recall`'s ranking (`retrieval::score_one`); has no
+    /// effect on `status`/`list`. Unset by default.
+    #[arg(long)]
+    pub importance: Option<String>,
+    /// How confident this fact is: `low`, `normal`, or `high`. Affects
+    /// `zirv memory recall`'s ranking the same way `--importance` does.
+    #[arg(long)]
+    pub confidence: Option<String>,
+    /// A keyword `zirv memory recall` can also match this entry by.
+    /// Repeatable: pass `--tag` more than once for more than one.
+    #[arg(long = "tag")]
+    pub tags: Vec<String>,
+}
+
+/// The only values `--importance`/`--confidence` accept -- the same two
+/// levels `retrieval::score_one` treats specially (`"high"`/`"low"`);
+/// `"normal"` is the explicit no-op middle value. Rejects anything else
+/// outright rather than silently storing a string ranking will just
+/// ignore.
+const LEVELS: [&str; 3] = ["low", "normal", "high"];
+
+fn validate_level(flag: &str, value: &str) -> CtxResult<String> {
+    if LEVELS.contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(format!("{flag} must be one of {}; got '{value}'", LEVELS.join(", ")).into())
+    }
+}
+
+fn validate_level_opt(flag: &str, value: &Option<String>) -> CtxResult<Option<String>> {
+    value
+        .as_deref()
+        .map(|v| validate_level(flag, v))
+        .transpose()
 }
 
 #[derive(Debug, clap::Args)]
@@ -147,12 +185,19 @@ fn scope_label(scope: MemoryScope) -> &'static str {
     }
 }
 
-/// Reports one scope's line: `disabled`, or `enabled, N entries, B bytes`
-/// (body bytes only -- the same measure `optimize::memory_bank_summary`
-/// uses, never header overhead). Never prints a key or a body. For the
-/// shared scope only, also warns about any canonical-key collision
-/// (`duplicate_keys`): a hand-edited or merged directory can produce one,
-/// though `upsert_shared` itself never creates one.
+/// Reports one scope's line: `enabled, N entries, B bytes` or `disabled, N
+/// entries, B bytes` (body bytes only -- the same measure `optimize::
+/// memory_bank_summary` uses, never header overhead). Counts and bytes are
+/// shown even when the scope is disabled -- disabling a scope must never
+/// hide what it holds, the same "must never trap data" rule `forget`/
+/// `verify` already follow, so this reads through `list_scoped_unchecked`
+/// rather than the gated `list_scoped`. An unreadable bank (I/O error) is
+/// treated as empty rather than aborting the whole status report, the same
+/// "unreadable means nothing" contract every other read path in this
+/// module follows. Never prints a key or a body. For the shared scope
+/// only, also warns about any canonical-key collision (`duplicate_keys`):
+/// a hand-edited or merged directory can produce one, though
+/// `upsert_shared` itself never creates one.
 fn write_scope_status<W: Write>(
     w: &mut W,
     scope: MemoryScope,
@@ -162,15 +207,16 @@ fn write_scope_status<W: Write>(
     cfg: &CtxConfig,
 ) -> CtxResult<()> {
     let label = scope_label(scope);
-    if !scope.enabled(cfg) {
-        writeln!(w, "{label} memory: disabled")?;
-        return Ok(());
-    }
-    let entries = memory::list_scoped(scope, repo, state, slug, cfg)?;
+    let status = if scope.enabled(cfg) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let entries = memory::list_scoped_unchecked(scope, repo, state, slug).unwrap_or_default();
     let bytes: usize = entries.iter().map(|(_, e)| e.body.len()).sum();
     writeln!(
         w,
-        "{label} memory: enabled, {} entries, {bytes} bytes",
+        "{label} memory: {status}, {} entries, {bytes} bytes",
         entries.len()
     )?;
     if matches!(scope, MemoryScope::Shared) {
@@ -202,7 +248,8 @@ pub fn run_status_with<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> 
     )?;
     writeln!(
         w,
-        "retrieval injection budget: {} bytes, {} entries max (context-ranked, on top of core; issue #35)",
+        "retrieval budget: {} bytes, {} entries max (bounds `zirv memory recall` today; \
+         session-start injection lands with issue #44)",
         cfg.memory.retrieval_max_bytes, cfg.memory.retrieval_max_entries
     )?;
     Ok(0)
@@ -391,16 +438,25 @@ pub fn run_remember_with<W: Write>(
     env: EnvLookup<'_>,
     stdin: &mut dyn Read,
 ) -> CtxResult<i32> {
+    let importance = validate_level_opt("--importance", &args.importance)?;
+    let confidence = validate_level_opt("--confidence", &args.confidence)?;
+
     if !args.shared {
         // The private arm is a thin wrapper over the exact code path `zirv
         // ctx remember` calls (identity resolution, the `memory.enabled`
         // gate, the oversize/prune rules) -- reused rather than
         // reimplemented, so the two surfaces can never drift apart here.
+        // `importance`/`confidence`/`tags` are `#[arg(skip)]` fields on
+        // `memory::RememberArgs`: invisible to `zirv ctx remember`'s own
+        // CLI parsing, settable only by building the struct directly here.
         let ctx_args = memory::RememberArgs {
             key: args.key.clone(),
             text: Some(args.text.clone()),
             text_file: None,
             verify: false,
+            importance,
+            confidence,
+            tags: args.tags.clone(),
         };
         return memory::run_remember_with(&ctx_args, w, repo, env, stdin);
     }
@@ -423,9 +479,9 @@ pub fn run_remember_with<W: Write>(
         verified: now,
         source: "explicit".to_string(),
         body,
-        importance: None,
-        confidence: None,
-        tags: Vec::new(),
+        importance,
+        confidence,
+        tags: args.tags.clone(),
         paths: Vec::new(),
     };
     let path = memory::upsert_scoped(MemoryScope::Shared, repo, &state, &slug, &cfg, &entry)?;
@@ -663,6 +719,104 @@ mod tests {
         assert!(text.contains("shared memory: disabled"), "got {text}");
     }
 
+    /// Fix round (memory review): disabling a scope must never hide what it
+    /// holds, the same "must never trap data" rule `forget`/`verify`
+    /// already follow -- a byte count is not the content the gate exists
+    /// to withhold.
+    #[test]
+    fn status_reports_a_disabled_scopes_real_counts_and_bytes_not_zero() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let enabled_env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        run_remember_with(
+            &RememberArgs {
+                key: "private-fact".to_string(),
+                text: "private body".to_string(),
+                shared: false,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| enabled_env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember private");
+        run_remember_with(
+            &RememberArgs {
+                key: "shared-fact".to_string(),
+                text: "shared body".to_string(),
+                shared: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| enabled_env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember shared");
+
+        let disabled_env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            ("ZIRV_CTX_MEMORY", "false"),
+        ]);
+        let mut out = Vec::new();
+        run_status_with(&mut out, repo.path(), &|k| disabled_env.get(k).cloned()).expect("status");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("private memory: disabled, 1 entries"),
+            "a disabled scope must still report what it holds: {text}"
+        );
+        assert!(
+            text.contains("shared memory: disabled, 1 entries"),
+            "got {text}"
+        );
+    }
+
+    /// Fix round (memory review): a scope directory this process cannot
+    /// read must never abort the whole status report -- treated as empty,
+    /// the same "unreadable means nothing" contract every other read path
+    /// in this module follows.
+    #[cfg(unix)]
+    #[test]
+    fn status_treats_an_unreadable_private_bank_as_empty_rather_than_erroring() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+
+        let state = StateDir::from_root(state_dir);
+        let slug = repo_slug(repo.path());
+        let bank_dir = state.memory().join(&slug);
+        std::fs::create_dir_all(&bank_dir).expect("mkdir");
+        std::fs::set_permissions(&bank_dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let mut out = Vec::new();
+        let result = run_status_with(&mut out, repo.path(), &|k| env.get(k).cloned());
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&bank_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+
+        let code = result.expect("an unreadable bank must not abort the status report");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("private memory: enabled, 0 entries"),
+            "an unreadable bank must be treated as empty, not abort the report: {text}"
+        );
+    }
+
     #[test]
     fn status_counts_entries_and_bytes_per_scope_without_printing_bodies() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -675,6 +829,9 @@ mod tests {
             key: "private-fact".to_string(),
             text: "this body must never appear verbatim in status".to_string(),
             shared: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
         };
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
         run_remember_with(
@@ -690,6 +847,9 @@ mod tests {
             key: "shared-fact".to_string(),
             text: "shared body text".to_string(),
             shared: true,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
         };
         run_remember_with(
             &shared_args,
@@ -741,8 +901,13 @@ mod tests {
             "got {text}"
         );
         assert!(
-            text.contains("retrieval injection budget: 4096 bytes, 3 entries max"),
+            text.contains("retrieval budget: 4096 bytes, 3 entries max"),
             "got {text}"
+        );
+        assert!(
+            text.contains("bounds `zirv memory recall` today"),
+            "the status line must not overstate retrieval as already wired into session-start \
+             injection (that lands with issue #44): {text}"
         );
     }
 
@@ -785,6 +950,9 @@ mod tests {
                 key: "priv".to_string(),
                 text: "private body".to_string(),
                 shared: false,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),
@@ -797,6 +965,9 @@ mod tests {
                 key: "shr".to_string(),
                 text: "shared body".to_string(),
                 shared: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),
@@ -924,6 +1095,9 @@ mod tests {
                 key: "db".to_string(),
                 text: "the exact-key entry".to_string(),
                 shared: false,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),
@@ -936,6 +1110,9 @@ mod tests {
                 key: "staging-db-creds".to_string(),
                 text: "mentions db in its key only".to_string(),
                 shared: false,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),
@@ -984,6 +1161,9 @@ mod tests {
                     key: key.to_string(),
                     text: format!("body for {key}"),
                     shared: false,
+                    importance: None,
+                    confidence: None,
+                    tags: Vec::new(),
                 },
                 &mut Vec::new(),
                 repo.path(),
@@ -1032,6 +1212,9 @@ mod tests {
                     key: format!("release-note-{i}"),
                     text: "mentions the release process".to_string(),
                     shared: false,
+                    importance: None,
+                    confidence: None,
+                    tags: Vec::new(),
                 },
                 &mut Vec::new(),
                 repo.path(),
@@ -1075,6 +1258,9 @@ mod tests {
                 key: "staging-db-creds".to_string(),
                 text: "the staging DB creds live in 1Password".to_string(),
                 shared: false,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),
@@ -1117,6 +1303,9 @@ mod tests {
                 key: "build-cmd".to_string(),
                 text: "cargo build --release".to_string(),
                 shared: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut out,
             repo.path(),
@@ -1141,6 +1330,9 @@ mod tests {
                 key: "other".to_string(),
                 text: "text".to_string(),
                 shared: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),
@@ -1169,6 +1361,9 @@ mod tests {
                 key: "k".to_string(),
                 text: "t".to_string(),
                 shared: false,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),
@@ -1177,6 +1372,127 @@ mod tests {
         )
         .expect_err("memory.enabled = false must refuse the private write");
         assert!(err.to_string().contains("disabled"), "got {err}");
+    }
+
+    /// The entry format already supports these fields (`memory::Entry`);
+    /// `zirv memory remember` is the only surface that can set them, and
+    /// the point of doing so is that `zirv memory recall`'s ranking
+    /// actually uses them (`retrieval::score_one`).
+    #[test]
+    fn remember_flags_land_in_the_stored_entry_and_affect_recall_ordering() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        run_remember_with(
+            &RememberArgs {
+                key: "release-notes-a".to_string(),
+                text: "how the release process works".to_string(),
+                shared: false,
+                importance: Some("high".to_string()),
+                confidence: Some("high".to_string()),
+                tags: vec!["release".to_string(), "deploy".to_string()],
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember with flags");
+        run_remember_with(
+            &RememberArgs {
+                key: "release-notes-b".to_string(),
+                text: "also about the release process".to_string(),
+                shared: false,
+                importance: Some("low".to_string()),
+                confidence: None,
+                tags: Vec::new(),
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember without flags");
+
+        // The flags land in the stored entry.
+        let entries = memory::list(
+            &StateDir::resolve(&|k| env.get(k).cloned()).expect("state"),
+            &repo_slug(repo.path()),
+        )
+        .expect("list");
+        let a = entries
+            .iter()
+            .find(|(_, e)| e.key == "release-notes-a")
+            .expect("entry a")
+            .1
+            .clone();
+        assert_eq!(a.importance, Some("high".to_string()));
+        assert_eq!(a.confidence, Some("high".to_string()));
+        assert_eq!(a.tags, vec!["release".to_string(), "deploy".to_string()]);
+
+        // And they affect `zirv memory recall`'s ranking: both entries
+        // match the query equally on keywords, so the higher-importance,
+        // higher-confidence one (with a matching tag too) must rank first.
+        let mut out = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                query: "release process".to_string(),
+                shared: false,
+                json: false,
+            },
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("recall");
+        let text = String::from_utf8(out).expect("utf8");
+        let a_at = text.find("release-notes-a").expect("entry a present");
+        let b_at = text.find("release-notes-b").expect("entry b present");
+        assert!(
+            a_at < b_at,
+            "the higher importance/confidence/tag-matched entry must rank first: {text}"
+        );
+    }
+
+    #[test]
+    fn remember_rejects_an_invalid_importance_value() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        let err = run_remember_with(
+            &RememberArgs {
+                key: "k".to_string(),
+                text: "t".to_string(),
+                shared: false,
+                importance: Some("urgent".to_string()),
+                confidence: None,
+                tags: Vec::new(),
+            },
+            &mut Vec::new(),
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("an unrecognized --importance value must be rejected");
+        assert!(err.to_string().contains("--importance"), "got {err}");
+        assert!(
+            !repo.path().join("state").join("memory").exists()
+                || memory::list(
+                    &StateDir::resolve(&|k| env.get(k).cloned()).expect("state"),
+                    &repo_slug(repo.path())
+                )
+                .expect("list")
+                .is_empty(),
+            "a rejected value must write nothing"
+        );
     }
 
     #[test]
@@ -1193,6 +1509,9 @@ mod tests {
                 key: "priv".to_string(),
                 text: "text".to_string(),
                 shared: false,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),
@@ -1205,6 +1524,9 @@ mod tests {
                 key: "shr".to_string(),
                 text: "text".to_string(),
                 shared: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo.path(),

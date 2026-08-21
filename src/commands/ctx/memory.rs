@@ -287,13 +287,20 @@ pub enum MemoryScope {
 }
 
 impl MemoryScope {
-    /// Whether this scope may be used at all. Each scope has its own
-    /// independent gate under `cfg.memory`, both `REPO_FORBIDDEN`: `Private`
-    /// keeps the pre-existing `enabled`; `Shared` is the new
-    /// `shared_enabled`.
+    /// Whether this scope may be used at all. `cfg.memory.enabled` is a
+    /// MASTER switch: `false` disables both scopes outright, so an operator
+    /// who turned memory off before the shared scope existed does not
+    /// silently start receiving repo-controlled prompt content on upgrade.
+    /// `shared_enabled` is a second, shared-only toggle underneath that
+    /// master switch -- `Shared` needs both flags on; `Private` only needs
+    /// the master switch, same as before scopes existed. Both flags are
+    /// `REPO_FORBIDDEN`.
     pub fn enabled(self, cfg: &CtxConfig) -> bool {
+        if !cfg.memory.enabled {
+            return false;
+        }
         match self {
-            MemoryScope::Private => cfg.memory.enabled,
+            MemoryScope::Private => true,
             MemoryScope::Shared => cfg.memory.shared_enabled,
         }
     }
@@ -385,8 +392,8 @@ pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
 /// `render_for_prompt` already follow.
 ///
 /// Consumed by the `zirv memory status`/`list`/`recall` verbs
-/// (`memory_cli.rs`, issue #33). Not yet wired into any prompt: ranking,
-/// budgeting, and prompt injection for the shared scope are later tasks.
+/// (`memory_cli.rs`, issue #33) and, since issue #34, by `render_for_prompt`
+/// for the shared half of the core prompt layer.
 ///
 /// NOT a drop-in replacement for `list`: `list` ignores `cfg` entirely and
 /// always reads the private directory regardless of `memory.enabled`, which
@@ -406,6 +413,26 @@ pub fn list_scoped(
     if !scope.enabled(cfg) {
         return Ok(Vec::new());
     }
+    let Some(dir) = scope.dir(repo, state, slug) else {
+        return Ok(Vec::new());
+    };
+    read_entries(&dir)
+}
+
+/// UNGATED sibling of `list_scoped`: ignores `scope.enabled(cfg)` entirely,
+/// reading whatever the scope's directory actually holds. Exists only for
+/// `zirv memory status` (`memory_cli.rs`), so a disabled scope still
+/// reports its counts and bytes rather than hiding them -- the same
+/// "disabling a scope must never trap data" rule `forget_scoped`/
+/// `verify_scoped` already follow for maintenance verbs. Not a
+/// replacement for `list_scoped` anywhere reads are meant to respect the
+/// operator's switch (recall, prompt injection).
+pub fn list_scoped_unchecked(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+) -> CtxResult<Vec<(PathBuf, Entry)>> {
     let Some(dir) = scope.dir(repo, state, slug) else {
         return Ok(Vec::new());
     };
@@ -476,7 +503,8 @@ pub fn list_scoped(
 /// itself rather than checking for an exact key first. Kept as public
 /// store API -- a future task may still want a direct single-key lookup --
 /// same "dormant read primitive" pattern `MemoryScope`/`list_scoped`
-/// followed before issue #33 gave them a consumer.
+/// followed before issue #33 gave them a consumer. Tracked as issue #68
+/// so this dormancy is not "discovered" as dead code by a later cleanup.
 #[allow(dead_code)]
 pub fn get_scoped(
     scope: MemoryScope,
@@ -711,9 +739,12 @@ fn upsert_shared(
     entry: &Entry,
 ) -> CtxResult<PathBuf> {
     if !MemoryScope::Shared.enabled(cfg) {
-        return Err(
-            "shared memory is disabled (memory.shared_enabled = false); nothing was stored".into(),
-        );
+        let reason = if !cfg.memory.enabled {
+            "memory.enabled = false"
+        } else {
+            "memory.shared_enabled = false"
+        };
+        return Err(format!("shared memory is disabled ({reason}); nothing was stored").into());
     }
     validate_shared_key(&entry.key)?;
     validate_shared_entry_fields(entry)?;
@@ -1171,7 +1202,11 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
 /// `select_memory_within_cap` is what enforces "private outranks shared"
 /// structurally, using that tag -- see its own doc comment for why a shared
 /// entry's own `verified`/`written` fields must never be trusted to compete
-/// with a private one directly.
+/// with a private one directly. That same function also drops any shared
+/// line whose `key` collides with a private line's `key` before either is
+/// ranked, so a repo-controlled entry can never shadow a private one by
+/// reusing its key -- this function returns both, unfiltered, and lets the
+/// prompt layer make that call.
 pub fn render_for_prompt(
     state: &StateDir,
     repo: &Path,
@@ -1389,6 +1424,19 @@ pub struct RememberArgs {
     /// stamp rather than requiring new text.
     #[arg(long, default_value_t = false)]
     pub verify: bool,
+    /// NOT a CLI flag on `zirv ctx remember` -- `#[arg(skip)]` always
+    /// leaves this at its default (`None`) here. `zirv memory remember`'s
+    /// private arm (`memory_cli.rs`, the only surface with `--importance`)
+    /// builds this struct directly (not through clap parsing) and sets it,
+    /// reusing this same write path rather than duplicating it.
+    #[arg(skip)]
+    pub importance: Option<String>,
+    /// See `importance`'s doc comment -- same reasoning, for `--confidence`.
+    #[arg(skip)]
+    pub confidence: Option<String>,
+    /// See `importance`'s doc comment -- same reasoning, for `--tag`.
+    #[arg(skip)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1487,9 +1535,9 @@ pub fn run_remember_with<W: Write>(
                 verified: now,
                 source: "explicit".to_string(),
                 body,
-                importance: None,
-                confidence: None,
-                tags: Vec::new(),
+                importance: args.importance.clone(),
+                confidence: args.confidence.clone(),
+                tags: args.tags.clone(),
                 paths: Vec::new(),
             };
             let path = remember(&state, &slug, &entry, &cfg)?;
@@ -1951,13 +1999,20 @@ This should not appear in the body.\n";
     // MemoryScope: `Shared` (repo-owned, untrusted, `<repo>/.zirv/memory/`)
     // vs. `Private` (machine-local, unchanged by this task).
 
+    /// `memory.enabled` is a MASTER switch (fix round: memory review): off,
+    /// it disables `Shared` too, however `shared_enabled` is set.
+    /// `shared_enabled` is a second, shared-only toggle underneath it --
+    /// `Private` never consults it, and `Shared` needs both flags on.
     #[test]
-    fn memory_scope_enabled_reads_its_own_independent_gate() {
+    fn memory_scope_enabled_treats_the_master_switch_as_a_floor_for_shared() {
         let mut cfg = CtxConfig::default();
         cfg.memory.enabled = false;
         cfg.memory.shared_enabled = true;
         assert!(!MemoryScope::Private.enabled(&cfg));
-        assert!(MemoryScope::Shared.enabled(&cfg));
+        assert!(
+            !MemoryScope::Shared.enabled(&cfg),
+            "the master switch must suppress shared too, even with shared_enabled on"
+        );
 
         cfg.memory.enabled = true;
         cfg.memory.shared_enabled = false;
@@ -2336,6 +2391,9 @@ This should not appear in the body.\n";
             text: Some("cargo build --release".to_string()),
             text_file: None,
             verify: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
         };
         let mut out = Vec::new();
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
@@ -2377,6 +2435,9 @@ This should not appear in the body.\n";
             text: None,
             text_file: None,
             verify: true,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
         };
         let mut out = Vec::new();
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
@@ -2421,6 +2482,9 @@ This should not appear in the body.\n";
             text: Some("should not be stored".to_string()),
             text_file: None,
             verify: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
         };
         let mut out = Vec::new();
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
@@ -2564,12 +2628,17 @@ This should not appear in the body.\n";
         assert!(shared_line.shared);
     }
 
-    /// Each scope is gated independently: disabling private must not hide
-    /// shared entries, and vice versa (the two `render_for_prompt_is_empty_
-    /// when_both_scopes_are_disabled...`/this test pair covers both
-    /// directions).
+    /// `memory.enabled = false` is a MASTER switch (fix round: memory
+    /// review), superseding the old behavior this test used to pin (a
+    /// disabled private scope leaving shared untouched): an operator who
+    /// disabled memory before the shared scope existed must not silently
+    /// start receiving repo-controlled prompt content on upgrade. Disabling
+    /// `shared_enabled` specifically (leaving the master switch on) is the
+    /// still-independent toggle -- see `render_for_prompt_merges_private_
+    /// and_shared_entries_with_provenance` for the "both on" case this test
+    /// used to contrast against.
     #[test]
-    fn render_for_prompt_still_renders_shared_entries_when_private_is_disabled() {
+    fn disabling_memory_master_switch_suppresses_shared_entries_too() {
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(repo.path().join("state"));
         let shared_dir = repo.path().join(".zirv").join("memory");
@@ -2583,14 +2652,49 @@ This should not appear in the body.\n";
         let cfg = CtxConfig {
             memory: super::super::config::MemoryConfig {
                 enabled: false,
+                // shared_enabled stays at its default (true): the master
+                // switch alone must be enough to suppress shared too.
                 ..super::super::config::MemoryConfig::default()
             },
             ..CtxConfig::default()
         };
-        let rendered = render_for_prompt(&state, repo.path(), "-work-repo", &cfg);
-        assert_eq!(rendered.len(), 1);
-        assert_eq!(rendered[0].key, "shared-fact");
-        assert!(rendered[0].shared);
+        assert!(
+            render_for_prompt(&state, repo.path(), "-work-repo", &cfg).is_empty(),
+            "memory.enabled = false must suppress the shared scope too, not just private"
+        );
+    }
+
+    #[test]
+    fn memory_enabled_false_and_shared_enabled_true_injects_nothing() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        remember(
+            &state,
+            "-work-repo",
+            &sample("private-fact", 1_700_000_000),
+            &CtxConfig::default(),
+        )
+        .expect("remember private");
+        let shared_dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&shared_dir).expect("mkdir");
+        std::fs::write(
+            shared_dir.join("shared-fact.md"),
+            sample("shared-fact", 1_700_000_000).to_markdown(),
+        )
+        .expect("write shared");
+
+        let cfg = CtxConfig {
+            memory: super::super::config::MemoryConfig {
+                enabled: false,
+                shared_enabled: true,
+                ..super::super::config::MemoryConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        assert!(
+            render_for_prompt(&state, repo.path(), "-work-repo", &cfg).is_empty(),
+            "enabled=false must win over an explicit shared_enabled=true"
+        );
     }
 
     // N6: handoff -> memory harvest.

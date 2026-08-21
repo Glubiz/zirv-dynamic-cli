@@ -314,10 +314,13 @@ impl Default for MailConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
-    /// Gate for the **private** (machine-local) memory bank -- the only
-    /// scope that existed before `memory::MemoryScope` -- kept under its
-    /// original name for backward compatibility. `shared_enabled` below is
-    /// the same kind of switch for the newer repo-owned shared scope.
+    /// MASTER switch for the whole memory subsystem, kept under its
+    /// original name for backward compatibility (it predates
+    /// `memory::MemoryScope`). `false` disables both the private and the
+    /// shared scope, however `shared_enabled` below is set: an operator who
+    /// disabled memory before the shared scope existed must not silently
+    /// start receiving repo-controlled prompt content on upgrade. See
+    /// `memory::MemoryScope::enabled`.
     pub enabled: bool,
     /// Whether facts may be harvested automatically from distilled handoffs.
     /// Off by default: an entry worth keeping across sessions is, for now, a
@@ -338,9 +341,11 @@ pub struct MemoryConfig {
     /// different field.
     pub max_injected_bytes: usize,
     /// Gate for the **shared** (repo-owned) memory bank under
-    /// `<repo>/.zirv/memory/` (`memory::MemoryScope::Shared`). Independent of
-    /// `enabled` above, so an operator can turn either scope off without
-    /// touching the other. On by default like every other memory switch.
+    /// `<repo>/.zirv/memory/` (`memory::MemoryScope::Shared`), UNDERNEATH
+    /// the master switch above: with `enabled = true`, an operator can turn
+    /// this off to keep the private scope while dropping shared, but
+    /// `enabled = false` always wins regardless of this value. On by
+    /// default like every other memory switch.
     pub shared_enabled: bool,
     /// Hard byte budget for the **core** memory layer (issue #34): private
     /// and shared entries merged with private-first precedence (see
