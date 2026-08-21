@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-21 (docs/vault-merge-pass, memory+context+workflow rework merge train): recorded eleven residuals surfaced across the three topics' review rounds -- repo_slug canonicalization orphaning pre-existing state, the shared memory scope's unix-only symlink tests plus its inherent TOCTOU window, stamp_verified_in_place's CRLF normalization, the canonical policy model's malformed-repo-config hole (MUST close with #44), the ALL_LAYERS/Capability::ALL exhaustiveness ceiling, the shared-block closing-marker's literal-only match, a cross-surface duplicate with no eligible diff target, the workflow secret filter's name-denylist gap, classification's git-based safety net failing open outside a repo, the FNV-1a fingerprint hash, and verification reports' unbounded retention -->
 <!-- Updated 2026-08-21 (feat/workflow-system, PR #59 review fixes): extended the codex --sandbox read-only entry -- the pin now also reaches the workflow reviewer via AgentAdapter::read_only_args, so a broken sandbox helper breaks review as well as the distiller -->
 <!-- Updated 2026-08-19 (feat/dash-adaptive-poll-help-overlay, uncommitted, extends PR #29): resolved a mail-routing gap -- a dashboard-spawned worker pane's report-back reply used to broadcast rather than address, claimable by the wrong pane (issue #30); extended the Shift+Enter ESC-CR entry to cover Alt+Enter and the Windows-Terminal key-folding root cause; extended the crossterm::EnableMouseCapture entry for ?1002 now being on (click-drag text selection + OSC 52 copy) -->
 <!-- Updated 2026-08-19 (feat/chat-token-economy, role-gated worker prompt): recorded three gotchas -- the user-layer role split means a Worker no longer reads ~/.zirv/system-prompt.md at all (an operator with standing worker instructions must create ~/.zirv/system-prompt.worker.md), wrap's pty-harness tests wedge a spawned child in kernel exit state ?Es on this macOS machine (pre-existing on unmodified main, A/B-verified, run them on Linux CI), and five exec nudge tests time out (exit 76) intermittently in a full-suite batch while passing in isolation -->
@@ -41,6 +42,52 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Repository state slugs now canonicalize, and a relocated slug orphans state filed under the old one
+
+**Fixed 2026-08-21 (`fix(ctx): give one repository one state slug`).** `state::repo_slug` now canonicalizes the path before slugging it, so macOS's `/var` → `/private/var` split, or any symlinked checkout, no longer writes one repository's memory/mail/handoffs/workflow state across two different slugs depending on which spelling a given caller happened to pass in.
+
+**Residual: no migration for state filed under the old, non-canonical slug.** A repository whose raw and canonical paths already differed before this fix has real state sitting under the old slug; after upgrading, every reader computes the new canonical slug and simply does not find it — the old directory is not moved, merged, or even flagged as orphaned. There is no cleanup command for it today.
+
+## The shared memory scope's symlink defenses are unix-tested only, and can't close every race or forgery
+
+`memory.rs`'s `safe_shared_dir` refuses `.zirv/`/`.zirv/memory` when either is a symlink, and `read_entries`/`is_regular_file` skip a symlinked entry file within an otherwise-legitimate shared bank — both defenses are exercised only via `std::os::unix::fs::symlink` in tests. **Residuals, not fixed:** (1) no test exercises a Windows junction/reparse point, which `symlink_metadata`'s `is_symlink()` may not classify the same way a real unix symlink does. (2) The check is inherently a TOCTOU window: `safe_shared_dir` calls `symlink_metadata` and a later read/write reopens the path by name, so a concurrent local process that swaps a real directory for a symlink between the two can still be raced — closing this for good needs an `O_NOFOLLOW`-style atomic open this code does not use. (3) `select_memory_within_cap`'s closing-marker suppression (see the 2026-08-21 [[Decision Log]] entry) matches only the exact `SHARED_BLOCK_END_MARKER` literal, case-insensitively — a lookalike (extra whitespace, a homoglyph, a different case *of a different string*) renders as ordinary body text rather than being caught, which is the deliberately narrow, honest scope of that suppression, not a bug in it.
+
+## `stamp_verified_in_place` normalizes CRLF to LF on a Windows checkout
+
+`memory.rs`'s `stamp_verified_in_place` (the write path of `zirv memory verify`) splits the file on `text.lines()`, which strips both `\n` and `\r\n` without recording which one it saw, then rejoins every line with a plain `\n` (`out.join("\n")`). A memory file checked out with Windows line endings survives a verify call with its byte content correct but every one of its line endings silently converted from `\r\n` to `\n`.
+
+## The canonical permissions policy has no enforcement caller yet, and a malformed repo `[policy]` table still erases an operator's own narrowing
+
+`policy.rs`'s `EffectivePolicy`/`evaluate`/`PolicyReport` are fully built and tested but have no production caller — issue #44 (the context compiler) is what will pin a stance onto a real launch, and issue #46 (`zirv ctx status`) what will render a report. Until then, `hook.rs`'s `a_malformed_repo_policy_table_still_erases_the_operators_own_policy_narrowing` test pins a real, recorded gap: `cfg_or_operator_only_gate`'s error arm (reached when a repo `[policy]` table fails to parse) falls back to `CtxConfig::default()`, whose `policy` field is all-`Allow` — the exact trust hole review finding 1 already closed for `[agents]` (which does have an operator-only salvage path), but not yet for `[policy]`. **This is a MUST-close item, not an accepted residual:** issue #44 must add the same salvage path `AgentGate` already has and flip this test's assertion from `Stance::Allow` to `Stance::Deny`, or the canonical policy model would ship on top of a hole one malformed repo file can already open.
+
+## Two hand-maintained exhaustiveness guards can't catch a variant that is never appended to their own array
+
+Both `optimize.rs`'s `ALL_LAYERS: &[Layer]` and `policy.rs`'s `Capability::ALL` are hand-maintained arrays paired with an exhaustive (no-wildcard) match, each pinned by a position-agreement test. What that test catches: a variant duplicated or reordered relative to the array (the realistic drift — copy-pasting an arm instead of adding one). What it provably cannot catch: a brand-new enum variant that gets its own honest match arm but is never appended to `ALL_LAYERS`/`Capability::ALL` at all — such a variant is simply never exercised, since every test call is seeded from the array's own contents. Closing this needs a derive macro (`strum::EnumIter`) or nightly's `variant_count`, neither pulled in; documented as a ceiling on the current design, not a bug in it.
+
+## A cross-surface duplicate whose only other copies are canonical gets no proposed diff
+
+`optimize.rs`'s `lint_redundancy` proposes a diff (delete the later copy) for a repeated instruction, but `is_eligible_deletion_target` refuses two kinds of copy as a deletion target: an operator's own global surface, and — when the duplicate spans more than one surface — a `Layer::ContextCommon`/`ContextClaude`/`ContextCodex` copy in the canonical `.zirv/context/` layer. A duplicate group whose only candidates besides the first occurrence are canonical-layer copies therefore still gets a `Finding`, correctly flagging the redundancy, but with `proposed_diff: None` — nothing for an operator to apply, only the observation that it exists.
+
+## The workflow secret filter is a name denylist, and misses a plain `token.txt`/`api_key.txt`
+
+`review.rs`'s `is_sensitive_name` excludes an untracked file's *body* from a review package by matching its filename against fixed prefixes (`.env`, `id_rsa`, `.netrc`, `kubeconfig`, ...), fixed suffixes (`.pem`, `.key`, `.p12`, ...), and the substrings `"credential"`/`"secret"`. A file named `token.txt` or `api_key.txt` matches none of these — no prefix, no suffix, and "token"/"api" aren't in the substring list — so its contents would be included in a review package like any ordinary text file, unlike a same-purpose file spelled `my-secrets.yaml`.
+
+## Workflow classification's git-based safety net fails open outside a git repository
+
+Two independent places in `src/commands/workflow/` treat "Git cannot be measured" (no repository, or one with no commits) as silence rather than an error the operator sees: `classify.rs`'s declared-scope path records "declared change scope (Git measurement unavailable)" and keeps whatever risk band the declared inputs alone produced, and `engine.rs`'s `reclassify_at_gate` (the re-measurement that is supposed to catch a risk band rising mid-flight) simply returns early, by its own doc comment, "exactly as before." Outside a git repository, neither mechanism can ever raise a workflow's risk band beyond what was declared or measured at `workflow start` — the safety net that exists specifically to catch a mismatch is inert exactly where declaring a low-risk scope over real high-risk work would otherwise go unchecked.
+
+## The verification fingerprint hash is FNV-1a, not a cryptographic hash
+
+`verification.rs`'s `change_fingerprint` (the value that proves a verification report matches the tree it was run against) hashes `git rev-parse HEAD` plus a diff plus every changed path's blob hash through `event::input_hash` — FNV-1a 64, chosen originally for the rot engine's own deterministic-across-compilers event hashing. FNV-1a has no collision resistance against a deliberately constructed input; a party who could already engineer a specific fingerprint collision could already control the diff and paths being fingerprinted, so this is a low-severity, recorded reuse of a non-cryptographic hash for an integrity-adjacent purpose, not a new attack surface.
+
+## `package.json` discovery has no size cap before it is read and parsed
+
+`verification.rs`'s check discovery reads the whole of a repo's `package.json` into a `String` and parses it as JSON with no byte-size guard, unlike `optimize.rs`'s surface collection (`cfg.optimize.max_surface_bytes`) or `review.rs`'s untracked-file cap (`MAX_UNTRACKED_FILE_BYTES`). An unusually large `package.json` is read and parsed in full before any of its `scripts` are consulted.
+
+## Verification reports accumulate with no retention pruning
+
+`verification.rs`'s `save_report` writes one `{report.id}.json` file per verification run under `<state>/verification/<repo_slug>/` and updates a `latest` pointer, but nothing ever deletes an old report — unlike `telemetry.rs`, which prunes events past `retention_days`, or `memory.rs`'s `prune_to_cap`. A long-lived repository accumulates one file per verification run indefinitely.
 
 ## A nudge/mail delivery queued for a live codex dashboard pane used to wait forever
 

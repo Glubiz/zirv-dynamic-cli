@@ -24,6 +24,34 @@ last-verified: 2026-08-21
 
 ## Decisions
 
+### 2026-08-21 — Stacked topic branches merge by retargeting to `main` and merging only the stack's top PR
+**Context:** The memory and context reworks were each developed as a stack of small, reviewable PRs (memory: #57→#58→#62→#64→#66; context: #60→#61→#63→#65, then #67 on top of that). Merging each PR into `main` in sequence would cost one version bump and one release per PR — five releases for one coherent topic.
+**Decision:** Retarget every PR in a stack's base to `main`, then merge only the top PR; GitHub resolves the lower PRs in the stack as merged too, since their commits are already ancestors of the top's once the stack lands. One version bump and one CI/release cycle per topic, not per PR.
+**Rejected:** Merging each stacked PR into `main` in order — correct, but multiplies version bumps and release noise for what is, from an operator's perspective, one feature landing at once.
+**Consequences:** A PR low in a stack still carries its own real review and fix history on its own page, even though it never gets its own merge commit on `main`; anyone auditing history should read the top PR's diff as the union of the whole stack, not assume the lower PRs landed independently.
+**Spec / link:** PRs #57–#67; issues #31–43.
+
+### 2026-08-21 — `memory.enabled` is a master switch over both scopes; `shared_enabled` only narrows the shared one
+**Context:** The shared, repo-committed memory scope had to compose with the pre-existing private scope's own on/off flag without an operator who disabled memory before the shared scope existed silently starting to receive repo-controlled prompt content on upgrade.
+**Decision:** `MemoryScope::enabled(cfg)` is the sole choke point: `cfg.memory.enabled == false` disables both scopes outright; `cfg.memory.shared_enabled` is a second, shared-only toggle consulted only once the master switch is already on. Both fields are `REPO_FORBIDDEN`.
+**Rejected:** Two independent flags with no ordering — a caller reading `shared_enabled` on its own could get the shared scope on despite the operator's own master switch being off, since nothing forced the check through one function.
+**Consequences:** Every scope-gated caller (`memory_cli.rs`'s verbs, the prompt injection layer) must call through `MemoryScope::enabled`/`disabled_reason` rather than reading either config field directly, or a new call site could reintroduce the ordering bug this closes.
+**Spec / link:** `src/commands/ctx/memory.rs`'s `MemoryScope::enabled`/`disabled_reason`; issues #31–35, PR #66.
+
+### 2026-08-21 — Private memory structurally outranks shared, by partition and suppression, never by score
+**Context:** A shared, repo-committed memory scope sits alongside the operator's own private one in the same injected prompt block. A repo-controlled entry could otherwise compete for budget on equal footing with a private fact, pick the same key to shadow what that key means to the reader, or embed a copy of the block's own closing marker to forge where untrusted content ends.
+**Decision:** `select_memory_within_cap` fills the private group's budget first and gives shared only what remains (a structural partition, not a weighted score); a shared entry whose key case-insensitively collides with a private one is dropped entirely, and so is a shared entry whose body contains the block's `SHARED_BLOCK_END_MARKER` (case-insensitively).
+**Rejected:** A trust-weighted score that ranks private above shared but still lets a strong shared entry win when private has little content — reintroduces the "trusting the data" failure mode partitioning exists to avoid; a repo can already control how much content it produces.
+**Consequences:** A repo with no shared memory (or an all-private selection) renders exactly as before the shared scope existed. Both suppressions count toward the same shared-omitted total `with_memory_layer` reports, so a suppressed entry is not silently invisible.
+**Spec / link:** `src/commands/ctx/prompt.rs`'s `select_memory_within_cap`; [[Known Issues]] for the residual it does not close.
+
+### 2026-08-21 — The always-injected core memory layer ranks on verification recency, not the `importance` field
+**Context:** Two different consumers read the same memory entries: the core layer injected at every launch seam (budget-capped, no query to rank against) and the query-driven `zirv memory recall` retrieval engine. `importance` is repo/operator-supplied text on a shared entry, the same untrusted-signal class `Source`/`Written-By` already are.
+**Decision:** The core layer's `ranked_by_recency` sorts strictly by `verified` then `written` (most recently confirmed first) and never reads `importance`. The separate retrieval engine (`retrieval.rs`) does use `importance`/`confidence` — but only as a modifier refining an already-relevant match, never as a way to manufacture relevance from an empty or unrelated query.
+**Rejected:** Letting the core layer's selection read `importance` too — a repo-writable field would then let a shared entry buy guaranteed injection regardless of staleness, the trust asymmetry the retrieval engine's own "modifier, not floor" rule was built to avoid.
+**Consequences:** An operator who wants to pin a specific fact into every session has no lever for that today beyond keeping it verified; revisit if that need becomes concrete, without touching the retrieval engine's own, already-shipped use of `importance`.
+**Spec / link:** `src/commands/ctx/prompt.rs`'s `ranked_by_recency`; `src/commands/ctx/retrieval.rs`'s scoring; issues #31–38.
+
 ### 2026-08-21 — An unreadable ctx config closes the repo-input gates rather than opening them
 **Context:** The `[workflow]` gates each resolved the config on their own. On an unparseable `.zirv/ctx.toml` — a file the repository checkout itself supplies a layer of — the skill gate defaulted to *enabled* (a malformed config forced the untrusted layer back on) while verification propagated the error (the same file bricked `zirv test`/`zirv verify` in that checkout). Two different wrong answers from one condition.
 **Decision:** One resolver, `workflow::repo_gates`, fails closed on both: no repo-provided checks, no repo-provided skills, a `zirv ▸` notice naming the parse error, and everything zirv owns itself (built-in skills, discovered toolchain checks) still working. The vacuity question is answered separately and deliberately: a `final_check` of `true` stays *visible* (per-check provenance in every report) rather than rejected, because "is this command a real test" is not decidable and a plausible-looking command can be equally vacuous.
@@ -317,9 +345,3 @@ last-verified: 2026-08-21
 **Consequences:** Losing the marker (a crash between the two writes, or nobody claiming it before the state dir is swept) never loses the message — it's just picked up at the next natural poll or cycle instead of immediately. `exec`'s nudge-restart is budget-free by the same design split: it is not rot, so it must never spend the rot-restart budget.
 **Spec / link:** `src/commands/ctx/sessions.rs`'s N4 module doc comment; [[Ctx Subsystem]], [[Ctx Supervisors]].
 
-### 2026-08-13 — The memory bank lives in the state dir, not the repo
-**Context:** The memory bank needed a storage location, and the repo itself was one candidate (a checked-in file, versioned alongside the code it describes) versus the platform state dir zirv already uses for handoffs, mail, and the decision log.
-**Decision:** `<state>/memory/<repo_slug>/`, mirroring handoffs and mail exactly — one file per entry, keyed by key rather than by message, `0600`/`0700` on unix. Nothing under the repo checkout is ever consulted (`nothing_in_the_repository_checkout_can_seed_the_bank` pins this with a decoy file planted at the would-be repo path).
-**Rejected:** A repo-committed file (e.g. `.zirv/memory.toml`) — would make the bank part of the checkout, reopening exactly the trust boundary `REPO_FORBIDDEN` exists to close: anyone who can open a PR could seed facts every future session treats as established, with none of the "the checkout is not the operator" guardrails the rest of `zirv ctx` enforces. It would also force a choice between committing machine-specific or session-specific facts (a local DB port, a personal shortcut) into shared history, or maintaining a `.gitignore`d file that behaves like state pretending to be config.
-**Consequences:** The bank does not travel with `git clone` — a fresh checkout of an existing repo starts with an empty bank on a new machine, same as it starts with no handoffs or mail. `memory.*` joins `mail.*`/`prompt.*` in `REPO_FORBIDDEN`, closing the same class of hole (seeding, cap-raising, harvest-enabling) for the same reason.
-**Spec / link:** `src/commands/ctx/memory.rs`'s module doc comment; [[Untrusted Configuration]]'s "Memory" section, [[Ctx Subsystem]].
