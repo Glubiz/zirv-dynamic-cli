@@ -326,19 +326,16 @@ impl Support {
         }
     }
 
-    /// Whether zirv itself is holding this capability to *something*, even if
-    /// only approximately (`Degraded`). False for everything an operator or a
-    /// prompt is carrying instead. See [`is_fully_enforced`](Self::is_fully_enforced)
-    /// for the stricter question of whether the requested stance itself is met.
-    pub fn is_enforced_by_zirv(self) -> bool {
-        matches!(self, Support::Enforced | Support::Degraded)
-    }
-
     /// Whether the harness enforces *exactly* the requested stance, with
     /// nothing left for prompt text or the operator's own settings to carry
     /// instead. `Degraded` deliberately answers `false` here: a mechanism
     /// that only approximates the request is real, but it is not the same
-    /// guarantee as `Enforced`, and a report must never treat the two alike.
+    /// guarantee as `Enforced`, and a report must never treat the two alike
+    /// -- this is the predicate `PolicyReport::unenforced` keys off of. There
+    /// used to be a looser `is_enforced_by_zirv` (true for `Enforced` *or*
+    /// `Degraded`) that `unenforced` was built on; that looser question is
+    /// exactly what let a `Degraded` cell hide from a report as if it were
+    /// `Enforced`, so it was removed rather than kept alongside this one.
     pub fn is_fully_enforced(self) -> bool {
         matches!(self, Support::Enforced)
     }
@@ -705,10 +702,6 @@ mod tests {
     /// say so out loud.
     #[test]
     fn an_unsupported_capability_never_renders_as_enforcement() {
-        assert!(!Support::Unsupported.is_enforced_by_zirv());
-        assert!(!Support::OperatorControlled.is_enforced_by_zirv());
-        assert!(Support::Enforced.is_enforced_by_zirv());
-        assert!(Support::Degraded.is_enforced_by_zirv());
         assert!(Support::Unsupported.label().contains("not enforced"));
         assert!(Support::Unsupported.label().contains("advisory"));
         assert!(
@@ -718,13 +711,11 @@ mod tests {
         );
     }
 
-    /// `is_fully_enforced` is the stricter question `is_enforced_by_zirv`
-    /// does not answer: only `Enforced` means the requested stance itself is
-    /// met with nothing left for prompt text or the operator's own settings
-    /// to carry. `Degraded` answers `true` to the looser question but `false`
-    /// here -- that gap is exactly what `PolicyReport::unenforced` now keys
-    /// off of, instead of the looser predicate that used to hide `Degraded`
-    /// cells from a report.
+    /// Only `Enforced` means the requested stance itself is fully met, with
+    /// nothing left for prompt text or the operator's own settings to carry
+    /// -- see `is_fully_enforced`'s own doc for why the looser
+    /// `Enforced`-or-`Degraded` question this replaced is gone rather than
+    /// kept alongside it.
     #[test]
     fn only_enforced_is_fully_enforced() {
         assert!(Support::Enforced.is_fully_enforced());
@@ -814,8 +805,8 @@ mod tests {
         for capability in Capability::ALL {
             let descriptor = claude.policy_support(capability, Stance::Ask);
             assert!(
-                !descriptor.support.is_enforced_by_zirv(),
-                "{} must not claim a per-run ask mechanism",
+                !matches!(descriptor.support, Support::Enforced | Support::Degraded),
+                "{} must not claim a per-run ask mechanism, not even a degraded one",
                 capability.key()
             );
         }
@@ -992,33 +983,59 @@ mod tests {
         );
     }
 
-    /// `Capability::ALL` is hand-maintained, so a new `Capability` variant
-    /// can be added without anyone remembering to list it there too. The
-    /// match below is exhaustive (no wildcard arm): adding a variant fails
-    /// this file to compile until an arm exists for it here, and the
-    /// `assert_eq!` then catches a variant that was added to the match but
-    /// never added to `Capability::ALL` itself.
+    /// `Capability::ALL` is hand-maintained, and so is the match below -- so
+    /// what does this actually catch?
+    ///
+    /// The match is exhaustive (no wildcard arm): the moment `Capability`
+    /// gains a new variant, this file fails to compile until an arm exists
+    /// for it here, one line saying which position that variant belongs at
+    /// in `Capability::ALL`. The test then confirms each entry *already in*
+    /// `Capability::ALL` sits at the exact position its own arm claims, and
+    /// that no two entries claim the same position -- so a variant that got
+    /// **duplicated or reordered** relative to `Capability::ALL` (the
+    /// realistic way this list actually drifts: copy-pasting an existing arm
+    /// instead of adding a fresh one, or an entry moved without updating its
+    /// neighbours) is caught.
+    ///
+    /// What it provably does **not** catch: a variant added to the enum,
+    /// given its own honest arm here, but never appended to `Capability::ALL`
+    /// at all. This function is only ever called with values already drawn
+    /// from `Capability::ALL`'s own contents, so an arm for a variant absent
+    /// from that array is simply never exercised -- no test in this file can
+    /// call `capability_all_index` with a variant it has no way to name
+    /// without already knowing about the very omission it would need to
+    /// detect. Closing that gap for real needs either a derive macro (e.g.
+    /// `strum::EnumIter`) or nightly's unstable `variant_count`, neither of
+    /// which this fix pulls in -- so a brand new variant appended to
+    /// `Capability` and never added to `Capability::ALL` still relies on
+    /// code review, not this test, to be caught.
     #[test]
-    fn capability_all_lists_every_capability_variant() {
-        fn is_a_known_capability(capability: Capability) {
+    fn capability_all_entries_are_at_their_declared_position_with_no_duplicates() {
+        fn capability_all_index(capability: Capability) -> usize {
             match capability {
-                Capability::RepoFsWrite
-                | Capability::OutsideRepoFsWrite
-                | Capability::ShellExec
-                | Capability::Network
-                | Capability::Approval
-                | Capability::GitPushDestructive
-                | Capability::ToolAccess => {}
+                Capability::RepoFsWrite => 0,
+                Capability::OutsideRepoFsWrite => 1,
+                Capability::ShellExec => 2,
+                Capability::Network => 3,
+                Capability::Approval => 4,
+                Capability::GitPushDestructive => 5,
+                Capability::ToolAccess => 6,
             }
         }
-        for capability in Capability::ALL {
-            is_a_known_capability(capability);
+
+        let mut claimed_positions = std::collections::HashSet::new();
+        for (position, &capability) in Capability::ALL.iter().enumerate() {
+            let claimed = capability_all_index(capability);
+            assert_eq!(
+                claimed, position,
+                "{capability:?} is at Capability::ALL[{position}] but claims position {claimed} \
+                 -- reordered, or a stale/duplicated entry"
+            );
+            assert!(
+                claimed_positions.insert(claimed),
+                "{capability:?}'s position {claimed} is claimed by more than one Capability::ALL \
+                 entry"
+            );
         }
-        assert_eq!(
-            Capability::ALL.len(),
-            7,
-            "a Capability variant exists that the exhaustive match above already covers but \
-             Capability::ALL does not list -- add it there, then bump this count"
-        );
     }
 }

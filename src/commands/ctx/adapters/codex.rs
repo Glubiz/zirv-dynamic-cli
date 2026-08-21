@@ -303,6 +303,18 @@ impl AgentAdapter for CodexAdapter {
     ///   does block writes inside the repo, just not by denying any tool.
     /// - **Writes outside the repo** are `Degraded` at `Deny` the same way,
     ///   via `--sandbox workspace-write` (writes confined to the workspace).
+    ///
+    ///   **These two descriptors name mechanisms that conflict, not merely
+    ///   differ.** `--sandbox` is a single flag with one value per launch:
+    ///   `read-only` cannot be passed alongside `workspace-write` on the same
+    ///   command line. So a policy asking to deny `repo_fs_write` *and* deny
+    ///   `outside_repo_fs_write` in the same launch cannot have both
+    ///   descriptors' mechanisms honored at once -- issue #44's pin
+    ///   construction, which turns an `EffectivePolicy` into actual argv,
+    ///   has to resolve that conflict itself (e.g. `read-only` is the
+    ///   stricter of the two and implies the other, so it should win), not
+    ///   assume each capability's mechanism composes independently the way
+    ///   claude's tool-name pins do.
     /// - **Shell execution** is `Unsupported` at `Deny`: read-only scopes what
     ///   a command may write, it does not stop a command from running at
     ///   all. A worker under `--sandbox read-only` can still run, say,
