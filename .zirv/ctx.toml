@@ -136,3 +136,23 @@ model = "fable"
 # max_panes = 9                      # REPO-FORBIDDEN (ZIRV_CTX_DASH_MAX_PANES): most panes one dashboard may hold at once, counting the orchestrator. Default: 9.
 # mouse = true                       # REPO-FORBIDDEN (ZIRV_CTX_DASH_MOUSE): whether the dashboard captures the mouse for wheel-scroll. Default: true.
 # idle_quiet_ms = 10000              # not REPO-FORBIDDEN (a tuning knob, like pace.soft_percent): how long a signal-less pane's pty output must be quiet before it counts as Idle. Default: 10000 (10s).
+
+# [policy]                           # zirv's own canonical permissions policy (src/commands/ctx/policy.rs).
+# Not REPO-FORBIDDEN, and the ONE table here that does NOT deep-merge:
+# `[policy]` is lifted out of every layer and folded by `policy::resolve` as
+# `env(cap)` if set, else `max(home(cap), repo(cap))`, over the ordered stance
+# `allow < ask < deny`. So a repo checkout may only ever ratchet a stance
+# STRICTER, never looser -- which is why forbidding these keys outright would
+# also forbid the narrowing they exist for. `ZIRV_CTX_POLICY_<CAPABILITY>`
+# sits above the fold and wins in both directions (the operator's escape
+# hatch, mirroring ZIRV_AGENT_<NAME>_ENABLED). Every stance defaults to
+# "allow", meaning "zirv declares no restriction of its own"; what each
+# harness can actually enforce for a stricter one is reported per adapter,
+# honestly, rather than assumed -- see AgentAdapter::policy_support.
+# repo_fs_write = "allow"            # writes inside this checkout. Default: "allow".
+# outside_repo_fs_write = "allow"    # writes anywhere else on the machine. Default: "allow".
+# shell_exec = "allow"               # running shell commands at all. Default: "allow".
+# network = "allow"                  # outbound network access from the session. Default: "allow".
+# approval = "allow"                 # "allow" = approvals may be bypassed, "ask" = must be requested, "deny" = attempt nothing needing approval (a read-only session). Default: "allow".
+# git_push_destructive = "allow"     # `git push`, and history-rewriting/destructive git. Default: "allow".
+# tool_access = "allow"              # which of the harness's own tools (including MCP servers) may run. Default: "allow".

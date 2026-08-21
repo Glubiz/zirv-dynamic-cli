@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-19
+last-verified: 2026-08-20
 ---
 
 # Ctx Adapters
@@ -145,6 +145,17 @@ Command shapes, per comments citing `docs/superpowers/notes/2026-07-31-codex-cli
 **`default_worker_model()`** (2026-08-18) returns `None`, the trait default: codex has no adapter-owned hard default for a delegated worker either, so its own CLI/config default applies untouched when `worker.codex` is unset — see "The delegated-worker model default" above. **`worker_system_prompt()`** (2026-08-19) is `None` for the same reason `base_system_prompt()` is: zirv has verified no codex-specific tool vocabulary to write either layer in, and codex has no injection mechanism to carry one anyway (`capabilities().system_prompt == false`).
 
 **The Windows `cmd.exe`-shim gap is closed.** `CodexAdapter::base()` now routes `self.program` through `resolve_program`, exactly like claude's own `base()` (see "Windows launcher rewriting" above and [[Known Issues]]). `launches_through_cmd_shim` is overridden the same way claude's is (`super::launches_through_cmd_shim(&self.program)`), so an npm-installed `codex.cmd` on Windows is recognised as the shim shape. `headless_cmd_stdin` builds the same `codex exec <extra...>` invocation `headless_cmd` does but with the positional prompt token dropped — codex's own verified stdin fallback (`codex exec` with `[PROMPT]` omitted, or `-`, reads from stdin) — so `exec.rs`/`run_loop.rs`'s FIX B branch (see [[Ctx Supervisors]]) delivers a headless prompt on stdin instead of an argv token cmd.exe would reparse, on exactly the shim-launch shape. `guard_cmd_shim_reparse` remains the fail-closed backstop at the spawn seams, not the primary mechanism, for codex exactly as it is for claude.
+
+## `policy_support` — translating zirv's policy honestly (2026-08-20)
+
+`AgentAdapter::policy_support(capability, stance)` is the per-adapter half of zirv's canonical permissions policy (`src/commands/ctx/policy.rs`, issue #43 — see [[Ctx Subsystem]] for the policy model itself). Given one of zirv's seven harness-neutral capabilities and the stance an operator asked for (`ask`/`deny`), an adapter answers with a `CapabilityDescriptor`: one of `Enforced` / `Degraded` / `Unsupported` / `OperatorControlled`, plus the **named verified mechanism** it would use. Defaulted on the trait to `CapabilityDescriptor::advisory_only()` (`Unsupported`), matching every other "no verified mechanism" default here.
+
+**The honesty rule is the point:** prompt text asking a session to respect a stance is advisory context, never enforcement, so an adapter with only that to offer reports `Unsupported` — whose own rendered label reads "not enforced (advisory only)". Never round a partial mechanism up to `Enforced`.
+
+- **claude** has exactly one verified per-run enforcement mechanism: the same `--disallowedTools=Write,Edit,Bash,NotebookEdit` pin `distiller_cmd` relies on (see below). It names *tools*, so it answers repo filesystem writes, shell execution, MCP/tool access and "attempt nothing needing approval" at `deny` — and nothing else. Network has no verified per-run flag. **git push/destructive git** and **writes outside the repo** are reported `Unsupported`, not `Degraded`: the only pin available is over-broad (it denies every shell command, or every write anywhere), so claiming it implements a git-scoped or path-scoped policy would both mislead and break an ordinary session. No stance is ever `Enforced` at `ask` — `--permission-mode plan` was probed and does not resolve in headless `-p` mode, and claude's interactive ask-by-default comes from `.claude/settings.json`/its own prompts, which zirv reads and never rewrites (`OperatorControlled`).
+- **codex** never reports `Enforced` at all. `-s, --sandbox <read-only|workspace-write|danger-full-access>` is its one verified flag, and the repo's recorded reading of it (see [[Untrusted Configuration]]) is that it scopes what a codex-*executed shell command* may touch rather than which of codex's own tools may run — close to several capabilities, exactly equal to none, hence `Degraded` for writes, shell execution and approval-at-`deny`. Network, MCP/tool access and git operations are advisory-only (`--disable <FEATURE>` is a feature-flag switch, not a tool deny-list). Approval at `ask` is `OperatorControlled` via `~/.codex/config.toml`'s own `approval` setting; the only approval-related CLI flag verified, `--dangerously-bypass-approvals-and-sandbox`, only ever *widens* and is never used. **These descriptors come from recorded facts** (`docs/superpowers/notes/2026-07-31-codex-cli-facts.md`), not a live CLI — codex is not runnable on the machine they were written on, and the descriptors' own `mechanism` strings say so where it matters.
+
+The asymmetry between the two is reported rather than smoothed over: `policy::evaluate` over one canonical policy yields two different, honest answers.
 
 ## `distiller_cmd` and the untrusted-CLAUDE.md trust boundary
 
