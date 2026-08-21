@@ -18,6 +18,14 @@
 //! `candidates_for_repo`/`select` unchanged for the same "dormant read
 //! primitive, wired in later" pattern `memory::list_scoped` followed
 //! before `zirv memory` (issue #33) consumed it.
+//!
+//! The other half of that signal, an entry's OWN `paths` (matched against
+//! `cwd_path`/`changed_paths` in `score_one` below), is equally inert for
+//! the same reason: `zirv memory remember` writes `importance`/
+//! `confidence`/`tags` (all three now settable, see its own CLI flags) but
+//! deliberately has no `--path` flag, since a path an entry claims to
+//! relate to has nothing to score against until #44 populates the other
+//! side of the match.
 
 use std::path::Path;
 

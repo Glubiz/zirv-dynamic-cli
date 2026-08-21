@@ -305,6 +305,21 @@ impl MemoryScope {
         }
     }
 
+    /// Names which flag is responsible for `!self.enabled(cfg)`, for an
+    /// error or advisory that wants to say why rather than just that.
+    /// Callers only ever call this after already checking `!enabled(cfg)`
+    /// -- meaningless otherwise, since then neither flag is actually at
+    /// fault. The master switch is checked first because it always wins:
+    /// if it is off, that is the reason regardless of `shared_enabled`'s
+    /// own value.
+    pub fn disabled_reason(self, cfg: &CtxConfig) -> &'static str {
+        if !cfg.memory.enabled {
+            "memory.enabled = false"
+        } else {
+            "memory.shared_enabled = false"
+        }
+    }
+
     /// This scope's canonical storage directory, or `None` when the location
     /// cannot be trusted (`Shared` only -- see `safe_shared_dir`). `Private`
     /// always resolves; the directory may simply not exist yet, same as
@@ -739,11 +754,7 @@ fn upsert_shared(
     entry: &Entry,
 ) -> CtxResult<PathBuf> {
     if !MemoryScope::Shared.enabled(cfg) {
-        let reason = if !cfg.memory.enabled {
-            "memory.enabled = false"
-        } else {
-            "memory.shared_enabled = false"
-        };
+        let reason = MemoryScope::Shared.disabled_reason(cfg);
         return Err(format!("shared memory is disabled ({reason}); nothing was stored").into());
     }
     validate_shared_key(&entry.key)?;
@@ -1538,6 +1549,10 @@ pub fn run_remember_with<W: Write>(
                 importance: args.importance.clone(),
                 confidence: args.confidence.clone(),
                 tags: args.tags.clone(),
+                // Deliberately unwritable, unlike importance/confidence/tags
+                // above: a path signal is inert until issue #44 wires it up
+                // (see retrieval.rs's module doc), so no `--path` flag
+                // exists to set it yet.
                 paths: Vec::new(),
             };
             let path = remember(&state, &slug, &entry, &cfg)?;

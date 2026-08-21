@@ -368,6 +368,12 @@ fn render_ranked<W: Write>(
     Ok(0)
 }
 
+/// A disabled scope prints nothing on stdout (its own contract, unchanged
+/// -- `list` is a read that respects the gate). Nit (fix round, memory
+/// review): that used to be indistinguishable from a merely-empty scope,
+/// and now reads inconsistently with `status`'s "(disabled)" transparency.
+/// A one-line stderr note closes the gap without touching stdout, which a
+/// caller may be parsing (`--json` or otherwise).
 pub fn run_list_with<W: Write>(
     args: &ListArgs,
     w: &mut W,
@@ -378,6 +384,13 @@ pub fn run_list_with<W: Write>(
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
     let scope = scope_of(args.shared);
+    if !scope.enabled(&cfg) {
+        crate::output::warn(format!(
+            "{} memory disabled ({}); listing nothing",
+            scope_label(scope),
+            scope.disabled_reason(&cfg)
+        ));
+    }
     let entries: Vec<Entry> = memory::list_scoped(scope, repo, &state, &slug, &cfg)?
         .into_iter()
         .map(|(_, e)| e)
@@ -482,6 +495,10 @@ pub fn run_remember_with<W: Write>(
         importance,
         confidence,
         tags: args.tags.clone(),
+        // Deliberately unwritable, unlike importance/confidence/tags above:
+        // a path signal is inert until issue #44 wires it up (see
+        // retrieval.rs's module doc), so no `--path` flag exists to set it
+        // yet.
         paths: Vec::new(),
     };
     let path = memory::upsert_scoped(MemoryScope::Shared, repo, &state, &slug, &cfg, &entry)?;
