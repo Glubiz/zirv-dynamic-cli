@@ -614,26 +614,43 @@ pub fn group_by_normalized(
 /// live once issue #41 applies, so it must never be the deletion target; an
 /// operator's `Scope::Global` surface (e.g. `~/CLAUDE.md`) is the operator's
 /// own file, not this repo's, so a repo-scoped tool must never propose
-/// editing it either. Everything else -- the repo-native harness copy
-/// (`RepoClaudeMd`/`RepoAgentsMd`) or a nested one -- is fair game.
-fn is_eligible_deletion_target(layer: Layer) -> bool {
-    !matches!(
-        layer,
-        Layer::ContextCommon | Layer::ContextClaude | Layer::ContextCodex
-    ) && layer.scope() != surface::Scope::Global
+/// editing it either -- absolute, regardless of `spans_multiple_surfaces`:
+/// even a same-file repeat inside a global file is still that file.
+///
+/// The canonical `.zirv/context/` exclusion is narrower: it only applies
+/// when `spans_multiple_surfaces` is true, i.e. when the canonical layer is
+/// competing with a *different* surface that redundantly restates it (that
+/// other surface is always the right target -- the whole point of having a
+/// canonical home). A duplicate entirely *within* one canonical file (the
+/// same bullet stated twice in `.zirv/context/common.md`, say) has no other
+/// surface to prefer, so the later copy in that same file is still a valid,
+/// safe deletion target -- excluding it there bought nothing but silently
+/// dropping the diff for the single most common kind of same-file repeat.
+fn is_eligible_deletion_target(layer: Layer, spans_multiple_surfaces: bool) -> bool {
+    if layer.scope() == surface::Scope::Global {
+        return false;
+    }
+    if spans_multiple_surfaces {
+        return !matches!(
+            layer,
+            Layer::ContextCommon | Layer::ContextClaude | Layer::ContextCodex
+        );
+    }
+    true
 }
 
 /// Rules stated more than once, whether across layers or inside one file. The
 /// first occurrence is treated as the home of the rule; among the later
 /// copies, the first one `is_eligible_deletion_target` accepts is what the
-/// proposed diff removes -- never the canonical layer, never an operator's
-/// global surface (see that function's doc). `collect_surfaces` always
-/// pushes global surfaces before the canonical layer and the canonical layer
-/// before repo-native ones, so this also means the repo-native copy is
-/// preferred over a nested one whenever both are candidates, with no extra
-/// tie-break needed. A group with no eligible target at all (e.g. a rule
-/// stated only in an operator's global file and the canonical layer) still
-/// gets a finding, just without a diff.
+/// proposed diff removes -- never an operator's global surface, and never a
+/// *different* surface's canonical `.zirv/context/` copy (see that
+/// function's doc for why a same-file canonical repeat is still eligible).
+/// `collect_surfaces` always pushes global surfaces before the canonical
+/// layer and the canonical layer before repo-native ones, so this also means
+/// the repo-native copy is preferred over a nested one whenever both are
+/// candidates, with no extra tie-break needed. A group with no eligible
+/// target at all (e.g. a rule stated only in an operator's global file and
+/// the canonical layer) still gets a finding, just without a diff.
 pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
     let all = all_instructions(surfaces);
     let (order, groups) = group_by_normalized(&all);
@@ -651,11 +668,14 @@ pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
             .iter()
             .map(|i| evidence_ref(&surfaces[i.surface], i.line))
             .collect();
-        let duplicate = group[1..]
-            .iter()
-            .copied()
-            .find(|instruction| is_eligible_deletion_target(surfaces[instruction.surface].layer));
-        let where_stated = if group.iter().any(|i| i.surface != group[0].surface) {
+        let spans_multiple_surfaces = group.iter().any(|i| i.surface != group[0].surface);
+        let duplicate = group[1..].iter().copied().find(|instruction| {
+            is_eligible_deletion_target(
+                surfaces[instruction.surface].layer,
+                spans_multiple_surfaces,
+            )
+        });
+        let where_stated = if spans_multiple_surfaces {
             "in more than one layer"
         } else {
             "more than once in the same file"
@@ -2361,42 +2381,69 @@ mod tests {
         );
     }
 
-    /// `ALL_LAYERS` is hand-maintained, so a new `Layer` variant can be added
-    /// without anyone remembering to list it there too. The match below is
-    /// exhaustive (no wildcard arm): adding a variant fails this file to
-    /// compile until an arm exists for it here, and the `assert_eq!` then
-    /// catches a variant that was added to the match but never added to
-    /// `ALL_LAYERS` itself.
+    /// `ALL_LAYERS` is hand-maintained, and so is the match below -- so what
+    /// does this actually catch?
+    ///
+    /// The match is exhaustive (no wildcard arm): the moment `Layer` gains a
+    /// new variant, this file fails to compile until an arm exists for it
+    /// here, one line saying which position that variant belongs at in
+    /// `ALL_LAYERS`. The test then confirms each entry *already in*
+    /// `ALL_LAYERS` sits at the exact position its own arm claims, and that
+    /// no two entries claim the same position -- so a variant that got
+    /// **duplicated or reordered** relative to `ALL_LAYERS` (the realistic
+    /// way this list actually drifts: copy-pasting an existing arm instead
+    /// of adding a fresh one, or an entry moved without updating its
+    /// neighbours) is caught.
+    ///
+    /// What it provably does **not** catch: a variant added to the enum,
+    /// given its own honest arm here (say, index 14), but never appended to
+    /// `ALL_LAYERS` at all. This function is only ever called with values
+    /// already drawn from `ALL_LAYERS`'s own contents, so an arm for a
+    /// variant absent from that array is simply never exercised -- no test
+    /// in this file can call `all_layers_index` with a variant it has no
+    /// way to name without already knowing about the very omission it would
+    /// need to detect. That gap is not unique to this guard: it is the same
+    /// gap `context::precedence_tier`'s
+    /// `every_instructions_layer_has_a_defined_tier` test already lives
+    /// with elsewhere in this codebase. Closing it for real needs either a
+    /// derive macro (e.g. `strum::EnumIter`) or nightly's unstable
+    /// `variant_count`, neither of which this fix pulls in -- so a brand
+    /// new variant appended to `Layer` and never added to `ALL_LAYERS`
+    /// still relies on code review, not this test, to be caught.
     #[test]
-    fn all_layers_lists_every_layer_variant() {
-        fn is_a_known_layer(layer: Layer) {
+    fn all_layers_entries_are_at_their_declared_position_with_no_duplicates() {
+        fn all_layers_index(layer: Layer) -> usize {
             match layer {
-                Layer::GlobalClaudeMd
-                | Layer::RepoClaudeMd
-                | Layer::NestedClaudeMd
-                | Layer::UserSettings
-                | Layer::ProjectSettings
-                | Layer::LocalSettings
-                | Layer::GlobalAgentsMd
-                | Layer::RepoAgentsMd
-                | Layer::NestedAgentsMd
-                | Layer::CodexUserSettings
-                | Layer::CodexProjectSettings
-                | Layer::ContextCommon
-                | Layer::ContextClaude
-                | Layer::ContextCodex => {}
+                Layer::GlobalClaudeMd => 0,
+                Layer::RepoClaudeMd => 1,
+                Layer::NestedClaudeMd => 2,
+                Layer::UserSettings => 3,
+                Layer::ProjectSettings => 4,
+                Layer::LocalSettings => 5,
+                Layer::GlobalAgentsMd => 6,
+                Layer::RepoAgentsMd => 7,
+                Layer::NestedAgentsMd => 8,
+                Layer::CodexUserSettings => 9,
+                Layer::CodexProjectSettings => 10,
+                Layer::ContextCommon => 11,
+                Layer::ContextClaude => 12,
+                Layer::ContextCodex => 13,
             }
         }
-        for layer in ALL_LAYERS.iter().copied() {
-            is_a_known_layer(layer);
+
+        let mut claimed_positions = hashbrown::HashSet::new();
+        for (position, &layer) in ALL_LAYERS.iter().enumerate() {
+            let claimed = all_layers_index(layer);
+            assert_eq!(
+                claimed, position,
+                "{layer:?} is at ALL_LAYERS[{position}] but claims position {claimed} -- \
+                 reordered, or a stale/duplicated entry"
+            );
+            assert!(
+                claimed_positions.insert(claimed),
+                "{layer:?}'s position {claimed} is claimed by more than one ALL_LAYERS entry"
+            );
         }
-        assert_eq!(
-            ALL_LAYERS.len(),
-            14,
-            "a Layer variant exists that the exhaustive match above already \
-             covers but ALL_LAYERS does not list -- add it there, then bump \
-             this count"
-        );
     }
 
     /// Fix round 1, review finding 11-1: `collect_surfaces` pushes the
@@ -2559,6 +2606,60 @@ mod tests {
         assert_eq!(
             finding.proposed_diff, None,
             "no surface is an eligible deletion target: {finding:?}"
+        );
+    }
+
+    /// The canonical-layer exclusion only applies when a *different*
+    /// surface is competing with it (see `is_eligible_deletion_target`'s
+    /// doc). The same bullet stated twice within one canonical file has no
+    /// other surface to prefer, so the later copy in that same file must
+    /// still be a valid deletion target -- excluding it here would silently
+    /// drop the diff for the single most common same-file repeat.
+    #[test]
+    fn a_duplicate_within_one_canonical_file_still_gets_a_diff() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![Surface {
+            layer: Layer::ContextCommon,
+            path: repo.join(".zirv/context/common.md"),
+            text: "# common\n- always run tests\n- something else\n- always run tests\n"
+                .to_string(),
+        }];
+
+        let findings = lint_redundancy(&surfaces, repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        let diff = finding
+            .proposed_diff
+            .as_ref()
+            .expect("a same-file canonical duplicate still gets a proposed diff");
+        assert!(diff.contains("common.md"), "{diff}");
+    }
+
+    /// Unlike the canonical exclusion, the operator's `Scope::Global`
+    /// exclusion is absolute: even a same-file repeat inside a global
+    /// `CLAUDE.md` must never get a proposed diff, since that file is the
+    /// operator's own, not this repo's to edit.
+    #[test]
+    fn a_duplicate_within_one_global_file_still_gets_no_diff() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![Surface {
+            layer: Layer::GlobalClaudeMd,
+            path: PathBuf::from("/home/CLAUDE.md"),
+            text: "# global\n- always run tests\n- something else\n- always run tests\n"
+                .to_string(),
+        }];
+
+        let findings = lint_redundancy(&surfaces, repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        assert_eq!(
+            finding.proposed_diff, None,
+            "a repo-scoped tool must never propose editing the operator's global file: \
+             {finding:?}"
         );
     }
 
