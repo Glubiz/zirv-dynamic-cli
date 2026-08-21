@@ -656,6 +656,44 @@ mod tests {
         assert!(analyze(&surfaces).is_empty());
     }
 
+    /// Exceeding `MAX_PAIR_FINDINGS` must report the truncation finding and
+    /// keep the total bounded rather than growing unboundedly or truncating
+    /// silently. 22 surfaces each state a near-duplicate of the same rule
+    /// with one unique word swapped in -- every cross-surface pair clears
+    /// the 0.7 Jaccard threshold without ever being an exact duplicate, so
+    /// all `C(22, 2) = 231` pairs qualify, comfortably over the 200 cap.
+    #[test]
+    fn exceeding_the_pair_finding_cap_reports_truncation_and_stays_bounded() {
+        let surfaces: Vec<Surface> = (0..22)
+            .map(|i| {
+                surface(
+                    Layer::NestedClaudeMd,
+                    &format!("/repo/dir{i}/CLAUDE.md"),
+                    &format!("- always keep functions short and readable unique{i}\n"),
+                )
+            })
+            .collect();
+
+        let findings = analyze(&surfaces);
+        let truncation = findings
+            .iter()
+            .find(|f| f.kind == "near-duplicate-scan-truncated")
+            .unwrap_or_else(|| panic!("no truncation finding: total={}", findings.len()));
+        assert_eq!(truncation.severity, Severity::Info);
+        assert!(truncation.evidence.is_empty());
+
+        let near_duplicates = findings
+            .iter()
+            .filter(|f| f.kind == "near-duplicate")
+            .count();
+        assert_eq!(near_duplicates, MAX_PAIR_FINDINGS, "{findings:#?}");
+        assert_eq!(
+            findings.len(),
+            MAX_PAIR_FINDINGS + 1,
+            "the capped near-duplicate findings plus exactly one truncation finding: {findings:#?}"
+        );
+    }
+
     #[test]
     fn analyze_is_deterministic_for_the_same_input() {
         let surfaces = vec![
