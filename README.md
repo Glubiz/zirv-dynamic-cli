@@ -122,23 +122,37 @@ zirv memory status
 zirv memory list
 zirv memory recall staging-db
 zirv memory remember staging-db-creds "the staging DB creds live in 1Password under staging-db"
+zirv memory remember deploy-cmd "cargo build --release" --importance high --confidence high --tag deploy --tag release
 zirv memory forget staging-db-creds
 zirv memory verify staging-db-creds
 ```
 
+`remember` also takes `--importance <low|normal|high>`, `--confidence
+<low|normal|high>`, and a repeatable `--tag <t>` — all optional, unset by
+default. They land in the stored entry and feed `zirv memory recall`'s
+ranking (`retrieval::score_one`); `zirv ctx remember` has no equivalent
+flags. `--importance`/`--confidence` reject any value outside the three
+listed.
+
 Every verb defaults to the **private** (machine-local) bank; pass `--shared`
 to act on the **shared**, repository-owned bank instead — see
-[Memory bank](#memory-bank) below for what the two scopes mean. `status`,
-`list` and `recall` respect each scope's own gate (`memory.enabled` /
-`memory.shared_enabled`): a disabled scope reports as disabled, or
-lists/recalls empty, rather than showing what it holds. `forget` and
-`verify` work even while a scope is disabled — disabling a scope must never
-trap data behind it. `status` never prints an entry's key or body, only
-scope availability, entry counts, stored bytes, and the configured
-injection budget. `zirv ctx remember --key <k> --text <t>` / `zirv ctx
-recall` / `zirv ctx forget <k>` (flag-based, private-scope only) are
-untouched and keep working exactly as before — `zirv memory` is a newer,
-scope-aware surface alongside them, not a replacement.
+[Memory bank](#memory-bank) below for what the two scopes mean. `list` and
+`recall` respect each scope's own gate (`memory.enabled` /
+`memory.shared_enabled`): a disabled scope lists or recalls empty rather
+than showing what it holds. `status` never hides a disabled scope's counts
+— it marks the scope `disabled` but still reports its entry count and
+stored bytes, since a byte count is not the entry content the gate exists
+to withhold. `forget` and `verify` work even while a scope is disabled —
+disabling a scope must never trap data behind it. `status` never prints an
+entry's key or body, only scope availability, entry counts, stored bytes,
+and the configured injection budget. `zirv ctx remember --key <k> --text
+<t>` / `zirv ctx recall` / `zirv ctx forget <k>` (flag-based, private-scope
+only) are untouched and keep working exactly as before — `zirv memory` is a
+newer, scope-aware surface alongside them, not a replacement. `forget` on a
+missing key exits `0` (it is idempotent — "already gone" is success);
+`verify` on a missing key exits `1` (it is stamping a claim about an entry
+that does not exist, which is a real failure) — the asymmetry is
+deliberate, not a bug.
 
 ### Sending mail between sessions
 
@@ -835,8 +849,8 @@ max_entry_bytes = 512          # per-entry body cap
 max_injected_bytes = 2048      # superseded by core_max_bytes; kept only so an old config does not error
 shared_enabled = true          # whether the repo-owned shared bank (<repo>/.zirv/memory/) is read at all
 core_max_bytes = 2048          # cap on the merged private+shared core layer folded into every session
-retrieval_max_bytes = 2048     # cap on context-ranked retrieved entries, on top of core
-retrieval_max_entries = 6      # max number of retrieved entries, independent of bytes
+retrieval_max_bytes = 2048     # cap on `zirv memory recall` output today; session-start injection lands with issue #44
+retrieval_max_entries = 6      # max number of recalled entries, independent of bytes
 
 [chrome]
 banner = true   # the one-time launch banner
@@ -1287,11 +1301,16 @@ max_entry_bytes = 512
 max_injected_bytes = 2048       # superseded by core_max_bytes; kept only so an old config does not error
 shared_enabled = true
 core_max_bytes = 2048           # cap on the merged private+shared core layer folded into every session
-retrieval_max_bytes = 2048      # cap on context-ranked retrieved entries, on top of core
-retrieval_max_entries = 6       # max number of retrieved entries, independent of bytes
+retrieval_max_bytes = 2048      # cap on `zirv memory recall` output today; session-start injection lands with issue #44
+retrieval_max_entries = 6       # max number of recalled entries, independent of bytes
 ```
 
-There are two independent memory scopes. The **private** bank still lives
+There are two memory scopes, gated separately but not independently:
+`enabled` is a master switch that disables both scopes, and `shared_enabled`
+is a second, shared-only toggle underneath it -- `enabled = false` always
+wins, so an operator who turned memory off before the shared scope existed
+does not silently start receiving repo-controlled prompt content on
+upgrade. The **private** bank still lives
 under the state dir, never in the repo (the same "a checkout is not the
 operator" reasoning as handoffs and mail). The **shared** bank is the
 opposite by design: `<repo>/.zirv/memory/` is untrusted repository content,
