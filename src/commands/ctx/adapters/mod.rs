@@ -896,6 +896,12 @@ pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
 /// when `name` is `None` or matches no registered adapter at all (an unknown
 /// or absent configuration, where there truly is nothing more specific to
 /// say than the legacy default).
+pub fn provider_for_agent_name(name: Option<&str>) -> &'static str {
+    name.and_then(|n| ADAPTERS.iter().find(|(adapter_name, _)| *adapter_name == n))
+        .map(|(_, ctor)| ctor(None).provider())
+        .unwrap_or(super::window::LEGACY_USAGE_PROVIDER)
+}
+
 /// `AgentAdapter::read_only_args` for a registered adapter name, without
 /// requiring that adapter to be enabled or ready -- the same static-fact
 /// lookup through `ADAPTERS` that `provider_for_agent_name` does. `None` for
@@ -906,12 +912,6 @@ pub fn read_only_args_for_agent_name(name: &str) -> Option<Vec<String>> {
         .iter()
         .find(|(adapter_name, _)| *adapter_name == name)
         .map(|(_, ctor)| ctor(None).read_only_args())
-}
-
-pub fn provider_for_agent_name(name: Option<&str>) -> &'static str {
-    name.and_then(|n| ADAPTERS.iter().find(|(adapter_name, _)| *adapter_name == n))
-        .map(|(_, ctor)| ctor(None).provider())
-        .unwrap_or(super::window::LEGACY_USAGE_PROVIDER)
 }
 
 /// Final wave item 4: `provider_for_agent_name(cfg.agent)` alone gets an

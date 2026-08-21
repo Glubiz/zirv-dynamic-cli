@@ -244,11 +244,24 @@ fn is_sensitive_name(path: &Path) -> bool {
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    name.starts_with(".env")
+    const PREFIXES: &[&str] = &[
+        ".env",
+        // SSH private keys, the single most common untracked secret in a
+        // working checkout after `.env`. The public halves (`.pub`) are caught
+        // by the same prefix, which costs nothing.
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        ".netrc",
+        ".pgpass",
+        "kubeconfig",
+    ];
+    const SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".keystore"];
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        || SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
         || name.contains("credential")
         || name.contains("secret")
-        || name.ends_with(".pem")
-        || name.ends_with(".key")
 }
 
 /// Untracked files contribute their path always, their body only when it is
@@ -538,19 +551,26 @@ struct ReviewerRun {
 }
 
 /// One delegated run's stdout line, read as "the dashboard took this request".
+///
+/// Only consulted when a dashboard spawn-request channel actually exists
+/// (`dash_active`): the relayed lines include the reviewer's own output, which
+/// quotes a repository diff, so a diff containing this very prefix would
+/// otherwise suppress evidence for a real completed review. Fail-closed either
+/// way, but there is no reason to read the marker where no dashboard could have
+/// written it.
 fn is_dashboard_ack(line: &str) -> bool {
     line.trim_start()
         .starts_with(crate::commands::ctx::agent::DASH_SPAWN_ACK_PREFIX)
 }
 
-/// Whether a delegated run counts as a completed independent review. A
-/// dashboard spawn-ack exits 0 for a review that has not started yet, so exit
-/// status alone is not the answer.
-fn records_evidence(run: &ReviewerRun, fingerprint_unchanged: bool) -> bool {
-    !run.dashboard_spawn && run.code == 0 && fingerprint_unchanged
+fn dash_channel_active() -> bool {
+    std::env::var(crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV).is_ok()
 }
 
-fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
+/// The argv a reviewer is launched with, after the program itself. The
+/// adapter's read-only pin travels as trailing `-- flags`, which `zirv agent`
+/// passes through to the harness's own CLI.
+fn reviewer_argv(agent: &str) -> CtxResult<Vec<String>> {
     if agent.is_empty()
         || agent.len() > 64
         || !agent
@@ -565,13 +585,54 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
     // with no registered pin is refused rather than launched unrestricted.
     let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(agent)
         .ok_or_else(|| format!("unknown adapter '{agent}'; cannot pin the reviewer read-only"))?;
+    let mut argv = vec![
+        "agent".to_string(),
+        agent.to_string(),
+        "-".to_string(),
+        "--".to_string(),
+    ];
+    argv.extend(read_only);
+    Ok(argv)
+}
+
+/// Relays the child's stdout to this process's stdout line by line, lossily:
+/// a reviewer that emits a non-UTF-8 byte used to end the relay early (a
+/// `lines()` error was read as end-of-stream), which dropped the read end,
+/// which handed the reviewer a SIGPIPE mid-review.
+fn relay_lines(mut stdout: impl Read, mut on_line: impl FnMut(&str)) {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while let Ok(count) = stdout.read(&mut chunk) {
+        if count == 0 {
+            break;
+        }
+        pending.extend_from_slice(&chunk[..count]);
+        while let Some(at) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=at).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+            on_line(text.trim_end_matches('\r'));
+        }
+    }
+    if !pending.is_empty() {
+        on_line(&String::from_utf8_lossy(&pending));
+    }
+}
+
+/// Whether a delegated run counts as a completed independent review. A
+/// dashboard spawn-ack exits 0 for a review that has not started yet, so exit
+/// status alone is not the answer.
+fn records_evidence(run: &ReviewerRun, fingerprint_unchanged: bool) -> bool {
+    !run.dashboard_spawn && run.code == 0 && fingerprint_unchanged
+}
+
+fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
+    let argv = reviewer_argv(agent)?;
     let prompt = format!(
         "Review the following compact Zirv review package. Return only confirmed concrete findings with severity, file/location, reasoning, and disposition recommendation. Do not modify files.\n\n{}",
         serde_json::to_string(package)?
     );
     let mut child = Command::new(std::env::current_exe()?)
-        .args(["agent", agent, "-", "--"])
-        .args(&read_only)
+        .args(&argv)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -583,16 +644,13 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
         }
         drop(stdin);
     });
+    let dash_active = dash_channel_active();
     let mut dashboard_spawn = false;
     if let Some(stdout) = child.stdout.take() {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            dashboard_spawn |= is_dashboard_ack(&line);
+        relay_lines(stdout, |line| {
+            dashboard_spawn |= dash_active && is_dashboard_ack(line);
             println!("{line}");
-        }
+        });
     }
     let code = child.wait()?.code().unwrap_or(1);
     let _ = writer.join();
@@ -600,6 +658,94 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
         code,
         dashboard_spawn,
     })
+}
+
+/// `zirv workflow review run`, with the reviewer launch injected.
+///
+/// `launch` is a parameter so a test can drive this whole path -- including the
+/// state reload below -- against a stand-in reviewer that writes to the same
+/// state file, which is exactly what a real reviewer does through `zirv
+/// workflow review add` while this function waits.
+fn run_independent_review(
+    args: &RunReviewArgs,
+    writer: &mut impl Write,
+    launch: &dyn Fn(&str, &ReviewPackage) -> CtxResult<ReviewerRun>,
+) -> CtxResult<i32> {
+    let (state_dir, state) = state_and_repo(args.repo.as_deref(), &args.id)?;
+    if depth_for_risk(state.classification.risk) == ReviewDepth::SelfVerification {
+        return Err(
+            "risk policy selects self-verification; an independent reviewer is not required".into(),
+        );
+    }
+    if state.status != WorkflowStatus::Running
+        || state.current().map(|step| step.phase) != Some(super::skill::WorkflowPhase::Review)
+    {
+        return Err("independent review can only run during an active review step".into());
+    }
+    let package = package(&state_dir, &state, args.base.as_deref())?;
+    let started = std::time::Instant::now();
+    let run = launch(&args.agent, &package)?;
+    let code = run.code;
+    let fingerprint_unchanged =
+        verification::change_fingerprint(&state.repo)? == package.change_fingerprint;
+    // The reviewer runs `zirv workflow review add` against the same state file
+    // while this process waits. The snapshot loaded before the spawn is stale
+    // by definition, so the evidence is appended to freshly loaded state --
+    // writing the old snapshot back used to erase every finding the reviewer
+    // had just recorded.
+    let mut state = engine::load(&state_dir, &state.repo, &args.id)?;
+    if run.dashboard_spawn {
+        writeln!(
+            writer,
+            "the review was spawned as a dashboard pane; review evidence requires a completed \
+             run, so none was recorded"
+        )?;
+    } else if records_evidence(&run, fingerprint_unchanged) {
+        state.review_evidence.push(ReviewRunEvidence {
+            id: uuid::Uuid::new_v4().to_string(),
+            change_fingerprint: package.change_fingerprint,
+            adapter: args.agent.clone(),
+            review_round: package.review_round,
+            completed_at: now_secs(),
+        });
+        let overflow = state
+            .review_evidence
+            .len()
+            .saturating_sub(MAX_REVIEW_EVIDENCE);
+        if overflow > 0 {
+            state.review_evidence.drain(..overflow);
+        }
+        state.updated_at = now_secs();
+        save_state(&state_dir, &state)?;
+    }
+    let (total, meaningful, dismissed) = super::telemetry::finding_counts(&state.review_findings);
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::ReviewRun);
+    event.workflow_id = Some(state.id.clone());
+    event.phase = Some(super::skill::WorkflowPhase::Review);
+    event.intent = Some(state.classification.intent);
+    event.complexity = Some(state.classification.complexity);
+    event.risk = Some(state.classification.risk);
+    event.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    event.adapter = Some(args.agent.clone());
+    event.succeeded = Some(records_evidence(&run, fingerprint_unchanged));
+    event.findings_total = total;
+    event.findings_meaningful = meaningful;
+    event.findings_dismissed = dismissed;
+    event.fix_round = package.review_round.saturating_sub(1);
+    event.worker_count = 1;
+    let _ = super::telemetry::record(
+        &state_dir,
+        &state.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+    );
+    if code == 0 && !fingerprint_unchanged && !run.dashboard_spawn {
+        return Err(
+            "the change set changed during review; review evidence was not recorded".into(),
+        );
+    }
+    Ok(code)
 }
 
 pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
@@ -640,82 +786,7 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
         }
         ReviewCommand::Run(args) => {
-            let (state_dir, state) = state_and_repo(args.repo.as_deref(), &args.id)?;
-            if depth_for_risk(state.classification.risk) == ReviewDepth::SelfVerification {
-                return Err("risk policy selects self-verification; an independent reviewer is not required".into());
-            }
-            if state.status != WorkflowStatus::Running
-                || state.current().map(|step| step.phase)
-                    != Some(super::skill::WorkflowPhase::Review)
-            {
-                return Err("independent review can only run during an active review step".into());
-            }
-            let package = package(&state_dir, &state, args.base.as_deref())?;
-            let started = std::time::Instant::now();
-            let run = launch_reviewer(&args.agent, &package)?;
-            let code = run.code;
-            let fingerprint_unchanged =
-                verification::change_fingerprint(&state.repo)? == package.change_fingerprint;
-            // The reviewer runs `zirv workflow review add` against the same
-            // state file while this process waits. The snapshot loaded before
-            // the spawn is stale by definition, so the evidence is appended to
-            // freshly loaded state -- writing the old snapshot back used to
-            // erase every finding the reviewer had just recorded.
-            let mut state = engine::load(&state_dir, &state.repo, &args.id)?;
-            if run.dashboard_spawn {
-                writeln!(
-                    writer,
-                    "the review was spawned as a dashboard pane; review evidence requires a \
-                     completed run, so none was recorded"
-                )?;
-            } else if records_evidence(&run, fingerprint_unchanged) {
-                state.review_evidence.push(ReviewRunEvidence {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    change_fingerprint: package.change_fingerprint,
-                    adapter: args.agent.clone(),
-                    review_round: package.review_round,
-                    completed_at: now_secs(),
-                });
-                let overflow = state
-                    .review_evidence
-                    .len()
-                    .saturating_sub(MAX_REVIEW_EVIDENCE);
-                if overflow > 0 {
-                    state.review_evidence.drain(..overflow);
-                }
-                state.updated_at = now_secs();
-                save_state(&state_dir, &state)?;
-            }
-            let (total, meaningful, dismissed) =
-                super::telemetry::finding_counts(&state.review_findings);
-            let mut event =
-                super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::ReviewRun);
-            event.workflow_id = Some(state.id.clone());
-            event.phase = Some(super::skill::WorkflowPhase::Review);
-            event.intent = Some(state.classification.intent);
-            event.complexity = Some(state.classification.complexity);
-            event.risk = Some(state.classification.risk);
-            event.duration_ms =
-                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-            event.adapter = Some(args.agent.clone());
-            event.succeeded = Some(records_evidence(&run, fingerprint_unchanged));
-            event.findings_total = total;
-            event.findings_meaningful = meaningful;
-            event.findings_dismissed = dismissed;
-            event.fix_round = package.review_round.saturating_sub(1);
-            event.worker_count = 1;
-            let _ = super::telemetry::record(
-                &state_dir,
-                &state.repo,
-                &event,
-                &super::telemetry::TelemetryConfig::for_repo(&state.repo),
-            );
-            if code == 0 && !fingerprint_unchanged && !run.dashboard_spawn {
-                return Err(
-                    "the change set changed during review; review evidence was not recorded".into(),
-                );
-            }
-            return Ok(code);
+            return run_independent_review(args, writer, &launch_reviewer);
         }
         ReviewCommand::Add(args) => {
             let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
@@ -796,15 +867,34 @@ mod tests {
     use crate::commands::ctx::state::StateDir;
     use tempfile::tempdir;
 
-    /// C3: the reviewer records findings through `zirv workflow review add`
-    /// while `review run` waits, so the snapshot `run` loaded before the spawn
-    /// is stale. Writing it back destroyed the reviewer's work; the fix is to
-    /// re-load and append to the fresh state.
-    #[test]
-    fn evidence_is_appended_to_state_the_reviewer_may_have_changed() {
+    /// A repository with one commit, so `package` has a real base, diff and
+    /// fingerprint to read.
+    fn git_repo() -> tempfile::TempDir {
         let repo = tempdir().unwrap();
-        let root = tempdir().unwrap();
-        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        repo
+    }
+
+    fn review_workflow(repo: &Path, state_dir: &StateDir) -> WorkflowState {
         let classification = super::super::classify::Classification {
             intent: super::super::classify::Intent::Review,
             complexity: super::super::classify::Complexity::Trivial,
@@ -815,47 +905,122 @@ mod tests {
             declared_scope: false,
             reasons: vec![],
         };
-        let mut state = WorkflowState::start(
-            repo.path().to_path_buf(),
+        let state = WorkflowState::start(
+            repo.to_path_buf(),
             "review change".into(),
             super::super::engine::WorkflowKind::Review,
             None,
             true,
             classification,
         );
-        engine::save(&state_dir, &state, true).unwrap();
+        engine::save(state_dir, &state, true).unwrap();
+        state
+    }
 
-        // The reviewer's own process: a finding added against the same file.
-        let mut reviewer_view = engine::load(&state_dir, repo.path(), &state.id).unwrap();
-        reviewer_view.review_findings.push(ReviewFinding {
-            id: "finding-from-reviewer".into(),
-            severity: FindingSeverity::Major,
-            summary: "real defect".into(),
-            path: None,
-            line: None,
-            disposition: FindingDisposition::Open,
-            created_at: now_secs(),
-        });
-        engine::save(&state_dir, &reviewer_view, true).unwrap();
+    /// C3: a real reviewer records findings through `zirv workflow review add`
+    /// against the same state file while `review run` waits on it, so the
+    /// snapshot taken before the spawn is stale by the time the run finishes.
+    /// The injected launch below does exactly that — writes a finding to the
+    /// state file mid-run — so restoring the old "serialize the pre-spawn
+    /// snapshot" behavior makes this test fail on the finding count.
+    #[test]
+    fn a_finding_recorded_while_the_reviewer_ran_survives_the_evidence_write() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = review_workflow(repo.path(), &state_dir);
 
-        // The parent, holding its pre-spawn snapshot, records evidence.
-        let fresh = engine::load(&state_dir, repo.path(), &state.id).unwrap();
-        state = fresh;
-        state.review_evidence.push(ReviewRunEvidence {
-            id: "evidence".into(),
-            change_fingerprint: 7,
-            adapter: "claude".into(),
-            review_round: 1,
-            completed_at: now_secs(),
-        });
-        save_state(&state_dir, &state).unwrap();
+        let id = state.id.clone();
+        let repo_path = repo.path().to_path_buf();
+        let state_root = root.path().to_path_buf();
+        let reviewer = move |_agent: &str, _package: &ReviewPackage| -> CtxResult<ReviewerRun> {
+            // What the reviewer process does while the parent waits.
+            let state_dir = StateDir::from_root(state_root.clone());
+            let mut theirs = engine::load(&state_dir, &repo_path, &id)?;
+            theirs.review_findings.push(ReviewFinding {
+                id: "finding-from-reviewer".into(),
+                severity: FindingSeverity::Major,
+                summary: "real defect".into(),
+                path: None,
+                line: None,
+                disposition: FindingDisposition::Open,
+                created_at: now_secs(),
+            });
+            engine::save(&state_dir, &theirs, true)?;
+            Ok(ReviewerRun {
+                code: 0,
+                dashboard_spawn: false,
+            })
+        };
+
+        let args = RunReviewArgs {
+            id: state.id.clone(),
+            agent: "claude".into(),
+            base: None,
+            repo: Some(repo.path().to_path_buf()),
+        };
+        let mut out = Vec::new();
+        let code = run_independent_review(&args, &mut out, &reviewer);
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        assert_eq!(code.expect("the review runs"), 0);
 
         let stored = engine::load(&state_dir, repo.path(), &state.id).unwrap();
-        assert_eq!(stored.review_evidence.len(), 1);
+        assert_eq!(
+            stored.review_evidence.len(),
+            1,
+            "a completed review records evidence"
+        );
         assert_eq!(
             stored.review_findings.len(),
             1,
-            "the reviewer's finding must survive the parent's own write"
+            "the finding recorded during the run must survive the evidence write"
+        );
+    }
+
+    /// The same path, but the delegation only reported that a dashboard pane
+    /// was spawned: nothing has been reviewed yet, so nothing is recorded.
+    #[test]
+    fn a_dashboard_spawn_records_no_evidence_through_the_real_run_path() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        // SAFETY: single-threaded suite.
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = review_workflow(repo.path(), &state_dir);
+        let args = RunReviewArgs {
+            id: state.id.clone(),
+            agent: "claude".into(),
+            base: None,
+            repo: Some(repo.path().to_path_buf()),
+        };
+        let mut out = Vec::new();
+        let code = run_independent_review(&args, &mut out, &|_, _| {
+            Ok(ReviewerRun {
+                code: 0,
+                dashboard_spawn: true,
+            })
+        });
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        assert_eq!(code.expect("the run reports the spawn"), 0);
+        assert!(
+            engine::load(&state_dir, repo.path(), &state.id)
+                .unwrap()
+                .review_evidence
+                .is_empty()
+        );
+        assert!(
+            String::from_utf8(out).unwrap().contains("dashboard pane"),
+            "the operator is told why no evidence was recorded"
         );
     }
 
@@ -930,22 +1095,88 @@ mod tests {
         ));
     }
 
+    /// The pin has to reach the argv the reviewer is actually launched with,
+    /// after a `--` so `zirv agent` passes it through to the harness's own CLI
+    /// -- a correct lookup table that never made it onto the command line
+    /// would restrict nothing.
     #[test]
     fn a_reviewer_is_always_pinned_read_only_or_refused() {
         assert_eq!(
-            crate::commands::ctx::adapters::read_only_args_for_agent_name("claude"),
-            Some(vec![
-                "--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string()
-            ])
+            reviewer_argv("claude").unwrap(),
+            [
+                "agent",
+                "claude",
+                "-",
+                "--",
+                "--disallowedTools=Write,Edit,Bash,NotebookEdit"
+            ]
         );
         assert_eq!(
-            crate::commands::ctx::adapters::read_only_args_for_agent_name("codex"),
-            Some(vec!["--sandbox".to_string(), "read-only".to_string()])
+            reviewer_argv("codex").unwrap(),
+            ["agent", "codex", "-", "--", "--sandbox", "read-only"]
         );
-        assert_eq!(
-            crate::commands::ctx::adapters::read_only_args_for_agent_name("nope"),
-            None
+        let error = reviewer_argv("nope").unwrap_err().to_string();
+        assert!(
+            error.contains("cannot pin the reviewer read-only"),
+            "{error}"
         );
+        assert!(
+            reviewer_argv("Claude").is_err(),
+            "the name is validated too"
+        );
+    }
+
+    /// A reviewer that emits a non-UTF-8 byte used to end the relay early (a
+    /// `lines()` error read as end-of-stream), dropping the read end and
+    /// handing the reviewer a SIGPIPE mid-review.
+    #[test]
+    fn non_utf8_reviewer_output_does_not_end_the_relay() {
+        let mut input: Vec<u8> = b"first line\n".to_vec();
+        input.extend_from_slice(&[0xff, 0xfe]);
+        input.extend_from_slice(b" second line\nthird line\n");
+        input.extend_from_slice(b"no trailing newline");
+        let mut lines = Vec::new();
+        relay_lines(std::io::Cursor::new(input), |line| {
+            lines.push(line.to_string())
+        });
+        assert_eq!(lines.len(), 4, "got {lines:?}");
+        assert_eq!(lines[0], "first line");
+        assert!(lines[1].ends_with(" second line"));
+        assert_eq!(lines[2], "third line");
+        assert_eq!(lines[3], "no trailing newline");
+    }
+
+    #[test]
+    fn common_untracked_secrets_are_all_recognised() {
+        for name in [
+            ".env",
+            ".env.local",
+            "credentials.json",
+            "my-secrets.yaml",
+            "server.pem",
+            "tls.key",
+            "id_rsa",
+            "id_rsa.pub",
+            "id_ed25519",
+            "id_ecdsa",
+            "id_dsa",
+            ".netrc",
+            ".pgpass",
+            "kubeconfig",
+            "kubeconfig.yaml",
+            "bundle.p12",
+            "cert.pfx",
+            "release.keystore",
+            "ID_RSA",
+        ] {
+            assert!(
+                is_sensitive_name(Path::new(name)),
+                "{name} should be treated as sensitive"
+            );
+        }
+        for name in ["main.rs", "README.md", "keyboard.ts", "environment.yml"] {
+            assert!(!is_sensitive_name(Path::new(name)), "{name} is ordinary");
+        }
     }
 
     #[test]
