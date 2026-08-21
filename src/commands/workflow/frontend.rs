@@ -84,6 +84,10 @@ pub enum FrontendSubcommand {
     Profile(ProfileArgs),
     /// Run Zirv's offline deterministic frontend quality detector.
     Check(super::frontend_detector::DetectorArgs),
+    /// Start the app and capture bounded narrow/wide render evidence.
+    Render(super::frontend_render::RenderArgs),
+    /// Record the active AI agent's bounded review of fresh render evidence.
+    Review(super::frontend_render::VisualReviewArgs),
 }
 
 #[derive(Debug, Args)]
@@ -487,6 +491,12 @@ pub fn run(args: &FrontendArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         FrontendSubcommand::Check(args) => {
             return super::frontend_detector::run(args, writer);
+        }
+        FrontendSubcommand::Render(args) => {
+            return super::frontend_render::run_render(args, writer);
+        }
+        FrontendSubcommand::Review(args) => {
+            return super::frontend_render::run_review(args, writer);
         }
     }
     Ok(0)
