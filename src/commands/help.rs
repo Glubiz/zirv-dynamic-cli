@@ -111,6 +111,10 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     )?;
     writeln!(
         writer,
+        "  frontend       Inspect autonomous frontend quality state"
+    )?;
+    writeln!(
+        writer,
         "  ctx            Context management (score, loop, exec, wrap, handoff, resume,"
     )?;
     writeln!(

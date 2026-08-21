@@ -312,6 +312,13 @@ impl StateDir {
         self.0.join("workflow-telemetry")
     }
 
+    /// Autonomous frontend profiles and visual evidence. Profiles are local
+    /// derived state: repository files remain the source of truth and are
+    /// never modified while Zirv infers a design direction.
+    pub fn frontend(&self) -> PathBuf {
+        self.0.join("frontend")
+    }
+
     /// The dashboard's own state: today, only the spawn-request capability-
     /// token directories `super::dash::spawnreq::request_dir_for` names
     /// under `<state>/dash/<dash_short>-<token>/requests`. A future roster
