@@ -738,7 +738,11 @@ zirv workflow status
 zirv frontend profile
 zirv frontend check
 zirv frontend render
-zirv frontend review --verdict pass
+zirv frontend review --verdict pass \
+  --product-specificity 4 --user-journey 4 --hierarchy 4 \
+  --system-coherence 4 --typography 4 --color-contrast 4 \
+  --layout-rhythm 4 --interaction-affordance 4 --state-completeness 4 \
+  --responsive-composition 4 --accessibility 4 --content-clarity 4 --resilience 4
 zirv frontend benchmark
 zirv test changed
 zirv verify
@@ -751,14 +755,18 @@ proportional design, approval, test, and review depth; sensitive auth/security
 and database/schema changes cannot be downgraded below High risk.
 
 Frontend tasks are selected automatically from task and path evidence. Zirv
-derives a repository-specific design profile, applies a built-in anti-slop
-craft floor plus phase-specific frontend skills, runs an offline deterministic
-detector, starts and cleans up the discovered dev server, captures narrow and
-wide screenshots, and requires a fresh AI visual-review verdict. There is no
-frontend init command or questionnaire: the active agent owns routine design,
-rendering, and review decisions. Missing, stale, truncated, unavailable, or
-failed detector/render/review evidence cannot advance frontend test, review,
-or verify gates.
+derives a repository-specific design profile, classifies each surface as
+persuade/operate/read/experience, and requires a product-grounded design thesis,
+signature, justified risk, system, complete user journey, and resilient state
+matrix before implementation. A built-in craft floor plus phase skills drive
+the work; a 44-rule offline detector checks deterministic accessibility, UX,
+responsive, content, motion, internationalization, media, performance, and
+anti-slop hazards. Zirv starts and cleans up the discovered dev server, captures
+narrow/intermediate/wide screenshots, and requires a fresh AI review with 13
+explicit UI/UX scores, each at least 4/5. There is no frontend init command or
+questionnaire: the active agent owns routine design, rendering, and review
+decisions. Missing, stale, truncated, unavailable, weak, or failed evidence
+cannot advance frontend test, review, or verify gates.
 
 Optional repository checks live in `.zirv/verify.toml`. Custom skills may be
 shared under `.zirv/skills/` or kept operator-global under

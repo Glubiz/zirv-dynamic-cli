@@ -58,7 +58,7 @@ One line: `Version: {CARGO_PKG_VERSION}`.
 
 ### `zirv frontend` (`commands/workflow/frontend*.rs`)
 
-The reserved `frontend` family is an autonomous workflow-quality surface, not an initializer. `profile` lazily infers or refreshes bounded design evidence; `capabilities --agent <name>` reports the provider-neutral skill and capability provenance; `check` runs the offline detector; `render` discovers a package script, starts/cleans the loopback server, and captures narrow/wide PNGs; `review` stores the active AI agent's bounded verdict; and `benchmark` mutation-checks the detector's built-in corpus. A frontend workflow selects and runs these requirements automatically through its phase skills and evidence gates. See [[Workflows]] for trust boundaries, caps, freshness, and known rendering limits.
+The reserved `frontend` family is an autonomous workflow-quality surface, not an initializer. `profile` lazily infers or refreshes bounded product/design evidence and adds the built-in quality contract; `capabilities --agent <name>` reports provider-neutral skill, surface-mode, detector, rubric, and capability provenance; `check` runs the 44-rule offline detector; `render` discovers a package script, starts/cleans the loopback server, and captures narrow/intermediate/wide PNGs; `review` stores the active AI agent's bounded verdict plus all 13 required UI/UX scores; and `benchmark` mutation-checks the detector corpus and complete rule inventory. A frontend workflow selects and runs these requirements automatically through its phase skills and evidence gates. See [[Workflows]] for trust boundaries, caps, freshness, and known rendering limits.
 
 ### `zirv memory` (`commands/ctx/memory_cli.rs`)
 

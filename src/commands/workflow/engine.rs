@@ -595,7 +595,7 @@ pub fn advance_with_evidence(
                 )?
             {
                 return Err(format!(
-                    "frontend step '{}' requires fresh narrow/wide render evidence and a passing AI visual review for the current change set; run `zirv frontend render`, inspect every capture, then `zirv frontend review --verdict pass`",
+                    "frontend step '{}' requires fresh narrow/intermediate/wide render evidence and a passing scored AI visual review for the current change set; run `zirv frontend render`, inspect every capture, then use `zirv frontend review --help` to record every required score with your verdict",
                     current.id
                 )
                 .into());
@@ -759,10 +759,23 @@ pub fn render_current_context(
     }
     let registry = SkillRegistry::load_for_repo(repo, home, state.include_custom_skills)?;
     let stack = registry.resolve_stack(&step.skill)?;
+    let task = state
+        .task
+        .chars()
+        .take(1_024)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
     let mut rendered = format!(
-        "zirv workflow step\nworkflow: {}\nprofile: {:?}\nstep: {}\nphase: {}\nstate: {:?}\n",
+        "zirv workflow step\nworkflow: {}\nprofile: {:?}\ntask: {}\nstep: {}\nphase: {}\nstate: {:?}\n",
         state.kind.as_str(),
         state.profile,
+        task,
         step.id,
         step.phase,
         state.status
@@ -1369,7 +1382,7 @@ mod tests {
             .to_string();
 
         assert!(error.contains("zirv frontend render"));
-        assert!(error.contains("zirv frontend review --verdict pass"));
+        assert!(error.contains("zirv frontend review --help"));
     }
 
     #[test]
@@ -1452,6 +1465,7 @@ mod tests {
         let implement = render_current_context(&state, repo.path(), None)
             .unwrap()
             .unwrap();
+        assert!(implement.contains("task: small feature"));
         state.completed_steps.push("implement".into());
         state.current_step += 1;
         let testing = render_current_context(&state, repo.path(), None)

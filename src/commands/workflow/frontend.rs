@@ -19,6 +19,7 @@ use crate::commands::ctx::state::{
 };
 
 pub const FRONTEND_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const FRONTEND_QUALITY_CONTRACT_VERSION: u32 = 2;
 const MAX_SCAN_ENTRIES: usize = 4_096;
 const MAX_EVIDENCE_FILES: usize = 256;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -84,7 +85,7 @@ pub enum FrontendSubcommand {
     Profile(ProfileArgs),
     /// Run Zirv's offline deterministic frontend quality detector.
     Check(super::frontend_detector::DetectorArgs),
-    /// Start the app and capture bounded narrow/wide render evidence.
+    /// Start the app and capture bounded narrow/intermediate/wide evidence.
     Render(super::frontend_render::RenderArgs),
     /// Record the active AI agent's bounded review of fresh render evidence.
     Review(super::frontend_render::VisualReviewArgs),
@@ -119,7 +120,11 @@ struct FrontendCapabilities {
     schema_version: u32,
     adapter: String,
     profile: &'static str,
+    quality_contract_version: u32,
     detector: &'static str,
+    detector_rules: usize,
+    review_dimensions: Vec<&'static str>,
+    surface_modes: Vec<&'static str>,
     phase_skills: Vec<&'static str>,
     local_browser: Option<String>,
     capabilities: super::capability::CapabilityReport,
@@ -127,10 +132,14 @@ struct FrontendCapabilities {
 
 fn capabilities_for(adapter: &str, probe_browser: bool) -> FrontendCapabilities {
     FrontendCapabilities {
-        schema_version: 1,
+        schema_version: 2,
         adapter: adapter.to_string(),
-        profile: "frontend-profile@1 (built-in)",
-        detector: "frontend-detector@1 (built-in, offline)",
+        profile: "frontend-profile@1 + quality-contract@2 (built-in)",
+        quality_contract_version: FRONTEND_QUALITY_CONTRACT_VERSION,
+        detector: "frontend-detector@2 (built-in, offline)",
+        detector_rules: super::frontend_detector::detector_rule_count(),
+        review_dimensions: super::frontend_render::REVIEW_DIMENSIONS.to_vec(),
+        surface_modes: vec!["persuade", "operate", "read", "experience"],
         phase_skills: vec![
             "frontend-craft@1",
             "frontend-design@1",
@@ -159,7 +168,19 @@ fn write_capabilities(
     } else {
         writeln!(writer, "frontend adapter: {}", report.adapter)?;
         writeln!(writer, "profile: {}", report.profile)?;
+        writeln!(
+            writer,
+            "quality contract: {}",
+            report.quality_contract_version
+        )?;
         writeln!(writer, "detector: {}", report.detector)?;
+        writeln!(writer, "detector rules: {}", report.detector_rules)?;
+        writeln!(writer, "surface modes: {}", report.surface_modes.join(", "))?;
+        writeln!(
+            writer,
+            "review dimensions: {}",
+            report.review_dimensions.join(", ")
+        )?;
         writeln!(writer, "skills: {}", report.phase_skills.join(", "))?;
         writeln!(
             writer,
@@ -314,7 +335,14 @@ preservation: {}",
         profile.density,
         profile.autonomy.unresolved_decisions,
         profile.autonomy.preservation_rule,
-    )
+    ) + r#"
+quality contract v2 (resolve autonomously; never ask for initialization):
+- classify the current surface, not the whole product: persuade = earn a decision; operate = complete a task; read = understand; experience = encounter the work itself. Let that mode set expression, density, motion, and familiarity.
+- before code, name the concrete subject, audience, single user job, product truth that cannot be invented, one design thesis, one memorable signature, one justified aesthetic risk, and the category-default arrangement this surface refuses. Preserve an established world; replace it only when the task explicitly calls for redesign.
+- derive a compact system for type roles, semantic color, spacing rhythm, geometry, elevation, imagery/iconography, and motion. Spend boldness in one place. Every structural or decorative device must encode content, state, or the chosen world.
+- design the whole journey: arrival, primary path, decision points, feedback, cancellation/undo, loading, empty, partial, error, success, disabled, permission, offline/slow, long-content, localization/RTL, keyboard, touch, zoom, reduced-motion, narrow, intermediate, and wide behavior where relevant.
+- evaluate with the interchangeable-product test plus hierarchy, system coherence, typography, color/contrast, layout rhythm, interaction affordance, state completeness, responsive composition, accessibility, content clarity, and resilience. A clean detector is a floor, not proof of quality.
+- verification is bounded: build fully, inspect all device captures together, batch fixes, confirm once, then stop. Missing or stale visual evidence never becomes a pass."#
 }
 
 fn scan_repository(repo: &Path) -> CtxResult<RepositoryEvidence> {
@@ -631,7 +659,14 @@ mod tests {
 
         assert_eq!(claude.phase_skills, codex.phase_skills);
         assert_eq!(claude.profile, codex.profile);
+        assert_eq!(claude.quality_contract_version, 2);
         assert_eq!(claude.detector, codex.detector);
+        assert_eq!(claude.detector_rules, 44);
+        assert_eq!(
+            claude.review_dimensions.as_slice(),
+            super::super::frontend_render::REVIEW_DIMENSIONS
+        );
+        assert_eq!(claude.surface_modes.len(), 4);
         assert_eq!(claude.capabilities.statuses, codex.capabilities.statuses);
     }
 }

@@ -16,7 +16,22 @@ use crate::commands::ctx::state::{
 };
 
 pub const RENDER_REPORT_SCHEMA_VERSION: u32 = 1;
-pub const VISUAL_REVIEW_SCHEMA_VERSION: u32 = 1;
+pub const VISUAL_REVIEW_SCHEMA_VERSION: u32 = 2;
+pub const REVIEW_DIMENSIONS: &[&str] = &[
+    "product-specificity",
+    "user-journey",
+    "hierarchy",
+    "system-coherence",
+    "typography",
+    "color-contrast",
+    "layout-rhythm",
+    "interaction-affordance",
+    "state-completeness",
+    "responsive-composition",
+    "accessibility",
+    "content-clarity",
+    "resilience",
+];
 const MAX_PACKAGE_BYTES: u64 = 128 * 1024;
 const MAX_ROUTE_SCAN_ENTRIES: usize = 4_096;
 const MAX_ROUTE_SCAN_DEPTH: usize = 32;
@@ -102,6 +117,61 @@ pub enum VisualVerdict {
     Fail,
 }
 
+#[derive(Debug, Args, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ReviewRubric {
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub product_specificity: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub user_journey: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub hierarchy: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub system_coherence: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub typography: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub color_contrast: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub layout_rhythm: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub interaction_affordance: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub state_completeness: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub responsive_composition: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub accessibility: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub content_clarity: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub resilience: u8,
+}
+
+impl ReviewRubric {
+    fn scores(&self) -> [(&'static str, u8); 13] {
+        [
+            ("product-specificity", self.product_specificity),
+            ("user-journey", self.user_journey),
+            ("hierarchy", self.hierarchy),
+            ("system-coherence", self.system_coherence),
+            ("typography", self.typography),
+            ("color-contrast", self.color_contrast),
+            ("layout-rhythm", self.layout_rhythm),
+            ("interaction-affordance", self.interaction_affordance),
+            ("state-completeness", self.state_completeness),
+            ("responsive-composition", self.responsive_composition),
+            ("accessibility", self.accessibility),
+            ("content-clarity", self.content_clarity),
+            ("resilience", self.resilience),
+        ]
+    }
+
+    fn passing(&self) -> bool {
+        self.scores().iter().all(|(_, score)| *score >= 4)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisualReview {
     pub schema_version: u32,
@@ -113,6 +183,8 @@ pub struct VisualReview {
     pub reviewer: String,
     pub model: Option<String>,
     pub verdict: VisualVerdict,
+    #[serde(default)]
+    pub rubric: ReviewRubric,
     pub findings: Vec<String>,
     pub created_at: u64,
 }
@@ -139,6 +211,9 @@ pub struct VisualReviewArgs {
     pub agent: String,
     #[arg(long)]
     pub model: Option<String>,
+    /// Required 1–5 scores; a passing review requires every dimension >=4.
+    #[command(flatten)]
+    pub rubric: ReviewRubric,
     #[arg(long)]
     pub json: bool,
 }
@@ -257,6 +332,7 @@ pub fn latest_visual_is_fresh_and_passing(state: &StateDir, repo: &Path) -> CtxR
         && render.change_fingerprint == fingerprint
         && render.profile_fingerprint == profile.source_fingerprint
         && review.verdict == VisualVerdict::Pass
+        && review.rubric.passing()
         && review.findings.is_empty()
         && review.change_fingerprint == fingerprint
         && review.render_report_id == render.id
@@ -272,6 +348,10 @@ pub fn render(state: &StateDir, repo: &Path) -> CtxResult<RenderReport> {
         Viewport {
             width: 390,
             height: 844,
+        },
+        Viewport {
+            width: 768,
+            height: 1024,
         },
         Viewport {
             width: 1440,
@@ -745,6 +825,7 @@ fn record_review(
         args.verdict,
         &args.agent,
         args.model.as_deref(),
+        &args.rubric,
         &args.findings,
     )?;
     let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
@@ -763,6 +844,7 @@ fn record_review(
         reviewer: args.agent.clone(),
         model: args.model.clone(),
         verdict: args.verdict,
+        rubric: args.rubric.clone(),
         findings: args.findings.clone(),
         created_at: now_secs(),
     };
@@ -778,7 +860,7 @@ fn record_review(
     event.work_domain = Some(super::classify::WorkDomain::Frontend);
     event.adapter = Some(review.reviewer.clone());
     event.model = review.model.clone();
-    event.succeeded = Some(review.verdict == VisualVerdict::Pass);
+    event.succeeded = Some(review.verdict == VisualVerdict::Pass && review.rubric.passing());
     event.findings_total = u32::try_from(review.findings.len()).unwrap_or(u32::MAX);
     event.findings_meaningful = event.findings_total;
     let _ = super::telemetry::record(
@@ -794,6 +876,7 @@ fn validate_review_input(
     verdict: VisualVerdict,
     agent: &str,
     model: Option<&str>,
+    rubric: &ReviewRubric,
     findings: &[String],
 ) -> CtxResult<()> {
     if agent.trim().is_empty() || agent.len() > MAX_REVIEW_IDENTITY_BYTES {
@@ -807,6 +890,15 @@ fn validate_review_input(
             "visual review model must contain at most {MAX_REVIEW_IDENTITY_BYTES} bytes"
         )
         .into());
+    }
+    if let Some((dimension, score)) = rubric
+        .scores()
+        .into_iter()
+        .find(|(_, score)| !(1..=5).contains(score))
+    {
+        return Err(
+            format!("visual review dimension '{dimension}' has invalid score {score}").into(),
+        );
     }
     if findings.len() > MAX_REVIEW_FINDINGS {
         return Err(format!(
@@ -827,6 +919,19 @@ fn validate_review_input(
     }
     if verdict == VisualVerdict::Pass && !findings.is_empty() {
         return Err("a passing visual review cannot contain unresolved findings".into());
+    }
+    if verdict == VisualVerdict::Pass && !rubric.passing() {
+        let below_floor = rubric
+            .scores()
+            .into_iter()
+            .filter(|(_, score)| *score < 4)
+            .map(|(dimension, score)| format!("{dimension}={score}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "a passing visual review requires every rubric score >=4; below floor: {below_floor}"
+        )
+        .into());
     }
     if verdict == VisualVerdict::Fail && findings.is_empty() {
         return Err("a failing visual review requires at least one concrete finding".into());
@@ -869,6 +974,9 @@ fn write_review(writer: &mut impl Write, review: &VisualReview, json: bool) -> C
     } else {
         writeln!(writer, "frontend visual review: {:?}", review.verdict)?;
         writeln!(writer, "render: {}", review.render_report_id)?;
+        for (dimension, score) in review.rubric.scores() {
+            writeln!(writer, "{dimension}: {score}/5")?;
+        }
         for finding in &review.findings {
             writeln!(writer, "- {finding}")?;
         }
@@ -899,6 +1007,24 @@ pub fn run_review(args: &VisualReviewArgs, writer: &mut impl Write) -> CtxResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn passing_rubric() -> ReviewRubric {
+        ReviewRubric {
+            product_specificity: 4,
+            user_journey: 4,
+            hierarchy: 4,
+            system_coherence: 4,
+            typography: 4,
+            color_contrast: 4,
+            layout_rhythm: 4,
+            interaction_affordance: 4,
+            state_completeness: 4,
+            responsive_composition: 4,
+            accessibility: 4,
+            content_clarity: 4,
+            resilience: 4,
+        }
+    }
 
     #[test]
     fn server_discovery_is_bounded_and_uses_argv_not_a_shell() {
@@ -945,12 +1071,39 @@ mod tests {
                 VisualVerdict::Pass,
                 "autonomous-agent",
                 None,
+                &passing_rubric(),
                 &["alignment defect".into()],
             )
             .is_err()
         );
-        assert!(validate_review_input(VisualVerdict::Fail, "autonomous-agent", None, &[]).is_err());
-        assert!(validate_review_input(VisualVerdict::Pass, "autonomous-agent", None, &[]).is_ok());
-        assert!(validate_review_input(VisualVerdict::Pass, "", None, &[]).is_err());
+        assert!(
+            validate_review_input(
+                VisualVerdict::Fail,
+                "autonomous-agent",
+                None,
+                &passing_rubric(),
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_review_input(
+                VisualVerdict::Pass,
+                "autonomous-agent",
+                None,
+                &passing_rubric(),
+                &[],
+            )
+            .is_ok()
+        );
+        let mut weak = passing_rubric();
+        weak.product_specificity = 3;
+        assert!(
+            validate_review_input(VisualVerdict::Pass, "autonomous-agent", None, &weak, &[],)
+                .is_err()
+        );
+        assert!(
+            validate_review_input(VisualVerdict::Pass, "", None, &passing_rubric(), &[],).is_err()
+        );
     }
 }
