@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use super::context;
+use super::surface;
+
 /// Deep enough for a workspace's crate directories, shallow enough that a
 /// monorepo scan stays instant.
 pub const MAX_NESTED_DEPTH: usize = 4;
@@ -7,6 +10,11 @@ pub const MAX_SURFACES: usize = 40;
 
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "vendor", "dist", "build"];
 
+/// One of the surfaces `collect_surfaces` reads. Each variant maps onto a
+/// `(surface::Provider, surface::Kind, surface::Scope)` triple (`provider`/
+/// `kind`/`scope`); `is_settings`/`is_repo_owned`/`trust` are derived from
+/// that mapping rather than tracked independently, so a new variant cannot
+/// get them out of sync with each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     GlobalClaudeMd,
@@ -15,7 +23,52 @@ pub enum Layer {
     UserSettings,
     ProjectSettings,
     LocalSettings,
+    /// Codex's own analogue of `GlobalClaudeMd`/`RepoClaudeMd`/
+    /// `NestedClaudeMd`: `~/.codex/AGENTS.md`, `<repo>/AGENTS.md`, and every
+    /// nested `AGENTS.md` up to `MAX_NESTED_DEPTH`, read the same way and by
+    /// the same walk (issue #40).
+    GlobalAgentsMd,
+    RepoAgentsMd,
+    NestedAgentsMd,
+    /// Codex's own analogue of `UserSettings`/`ProjectSettings`:
+    /// `~/.codex/config.toml` and `<repo>/.codex/config.toml`. TOML, not
+    /// JSON -- see `redact_settings_strings`.
+    CodexUserSettings,
+    CodexProjectSettings,
+    /// The canonical, repo-owned `.zirv/context/` layer (issue #41): one
+    /// place project instructions live once for every Zirv-launched
+    /// harness, with optional harness-specific additions layered on top.
+    /// See `super::context` for the precedence rules between these three
+    /// and the native instruction files above, and for the context-vs-memory
+    /// distinction this layer is not a substitute for.
+    ContextCommon,
+    ContextClaude,
+    ContextCodex,
 }
+
+/// Every `Layer` variant, in declaration order. Test-only: exists so a test
+/// that needs to check a property against "every layer" doesn't hand-
+/// maintain a second, easily out-of-sync copy of the variant list (fix
+/// round 1, review finding 12-2 -- `context::tests::
+/// every_instructions_layer_has_a_defined_tier` is the cross-module
+/// consumer this replaced a hardcoded 9-layer list with).
+#[cfg(test)]
+pub const ALL_LAYERS: &[Layer] = &[
+    Layer::GlobalClaudeMd,
+    Layer::RepoClaudeMd,
+    Layer::NestedClaudeMd,
+    Layer::UserSettings,
+    Layer::ProjectSettings,
+    Layer::LocalSettings,
+    Layer::GlobalAgentsMd,
+    Layer::RepoAgentsMd,
+    Layer::NestedAgentsMd,
+    Layer::CodexUserSettings,
+    Layer::CodexProjectSettings,
+    Layer::ContextCommon,
+    Layer::ContextClaude,
+    Layer::ContextCodex,
+];
 
 impl Layer {
     pub fn label(&self) -> &'static str {
@@ -26,17 +79,95 @@ impl Layer {
             Layer::UserSettings => "user settings.json",
             Layer::ProjectSettings => "project settings.json",
             Layer::LocalSettings => "local settings.json",
+            Layer::GlobalAgentsMd => "global AGENTS.md",
+            Layer::RepoAgentsMd => "repo AGENTS.md",
+            Layer::NestedAgentsMd => "nested AGENTS.md",
+            Layer::CodexUserSettings => "user config.toml",
+            Layer::CodexProjectSettings => "project config.toml",
+            Layer::ContextCommon => "zirv context common.md",
+            Layer::ContextClaude => "zirv context claude.md",
+            Layer::ContextCodex => "zirv context codex.md",
         }
     }
 
-    /// Whether this layer is a JSON settings file rather than prose. Their
+    /// Which harness this layer belongs to. Consumed by
+    /// `lint_dead_references`'s hook-command check (Claude-only: Codex's
+    /// `config.toml` has no equivalent JSON hook schema this lint knows how
+    /// to parse) and by `context_surface()` below.
+    ///
+    /// `ContextCommon` names `Provider::Zirv`: it is zirv's own canonical
+    /// layer, meant for every harness alike, not authored by or specific to
+    /// one of them (see `super::context`'s module doc). `ContextClaude`
+    /// names the harness it targets explicitly; `ContextCodex` falls
+    /// through the wildcard arm below like every other Codex-provider layer.
+    pub fn provider(&self) -> surface::Provider {
+        match self {
+            Layer::GlobalAgentsMd
+            | Layer::RepoAgentsMd
+            | Layer::NestedAgentsMd
+            | Layer::CodexUserSettings
+            | Layer::CodexProjectSettings
+            | Layer::ContextCodex => surface::Provider::Codex,
+            Layer::ContextCommon => surface::Provider::Zirv,
+            _ => surface::Provider::Claude,
+        }
+    }
+
+    pub fn kind(&self) -> surface::Kind {
+        match self {
+            Layer::GlobalClaudeMd
+            | Layer::RepoClaudeMd
+            | Layer::NestedClaudeMd
+            | Layer::GlobalAgentsMd
+            | Layer::RepoAgentsMd
+            | Layer::NestedAgentsMd
+            | Layer::ContextCommon
+            | Layer::ContextClaude
+            | Layer::ContextCodex => surface::Kind::Instructions,
+            Layer::UserSettings
+            | Layer::ProjectSettings
+            | Layer::LocalSettings
+            | Layer::CodexUserSettings
+            | Layer::CodexProjectSettings => surface::Kind::PolicySettings,
+        }
+    }
+
+    pub fn scope(&self) -> surface::Scope {
+        match self {
+            Layer::GlobalClaudeMd
+            | Layer::UserSettings
+            | Layer::GlobalAgentsMd
+            | Layer::CodexUserSettings => surface::Scope::Global,
+            Layer::RepoClaudeMd
+            | Layer::ProjectSettings
+            | Layer::RepoAgentsMd
+            | Layer::CodexProjectSettings
+            | Layer::ContextCommon
+            | Layer::ContextClaude
+            | Layer::ContextCodex => surface::Scope::Repo,
+            Layer::NestedClaudeMd | Layer::NestedAgentsMd => surface::Scope::Nested,
+            Layer::LocalSettings => surface::Scope::LocalPrivate,
+        }
+    }
+
+    /// Derived from `scope()` alone (`surface::Scope::trust`) -- see that
+    /// method's doc for why this is the property that makes a repo-owned
+    /// layer's promotion to operator authority impossible by construction.
+    // No production caller yet, same as `provider()` above -- enforced by
+    // `repo_owned_layers_can_never_carry_operator_trust` until a later task
+    // consumes it directly (issue #39's "impossible by construction, or
+    // tested against").
+    #[allow(dead_code)]
+    pub fn trust(&self) -> surface::Trust {
+        self.scope().trust()
+    }
+
+    /// Whether this layer is a settings file (JSON for Claude, TOML for
+    /// Codex -- see `redact_settings_strings`) rather than prose. Their
     /// values are secrets often enough -- an `env` block with an API key is
     /// ordinary -- that they are never sent to a model verbatim.
     pub fn is_settings(&self) -> bool {
-        matches!(
-            self,
-            Layer::UserSettings | Layer::ProjectSettings | Layer::LocalSettings
-        )
+        self.kind() == surface::Kind::PolicySettings
     }
 
     /// Whether cloning the repository is enough to change this layer. Decides
@@ -45,13 +176,7 @@ impl Layer {
     /// against the repo root (see `resolve_candidates`): a layer this returns
     /// false for has no fixed repo to be relative to.
     pub fn is_repo_owned(&self) -> bool {
-        matches!(
-            self,
-            Layer::RepoClaudeMd
-                | Layer::NestedClaudeMd
-                | Layer::ProjectSettings
-                | Layer::LocalSettings
-        )
+        self.scope().is_repo_owned()
     }
 }
 
@@ -60,6 +185,37 @@ pub struct Surface {
     pub layer: Layer,
     pub path: PathBuf,
     pub text: String,
+}
+
+impl Surface {
+    /// This surface's provenance in the harness-neutral vocabulary
+    /// (`surface::ContextSurface`), for callers that reason about trust or
+    /// provider rather than this module's own `Layer` variants.
+    ///
+    /// `repo`/`home` are the same values `collect_surfaces` was given: the
+    /// `Global`-vs-repo-owned split is derived fresh from `self.path`'s
+    /// relationship to `repo` (`surface::ContextSurface::for_path`), not
+    /// copied from `self.layer.scope()` -- if a `Layer`'s own `scope()` were
+    /// ever wrong for the path it was actually collected from, this
+    /// conversion would not blindly repeat the mistake. `self.layer.scope()`
+    /// is still consulted, but only to choose which repo-owned refinement
+    /// (`into_nested`/`into_local_private`) to apply, never to decide `Global`.
+    // No production caller yet -- Tasks 10-16's handoff API (issue #39).
+    #[allow(dead_code)]
+    pub fn context_surface(&self, repo: &Path, home: Option<&Path>) -> surface::ContextSurface {
+        let generic = surface::ContextSurface::for_path(
+            self.layer.provider(),
+            self.layer.kind(),
+            self.path.clone(),
+            repo,
+            home,
+        );
+        match self.layer.scope() {
+            surface::Scope::Nested => generic.into_nested(),
+            surface::Scope::LocalPrivate => generic.into_local_private(),
+            surface::Scope::Global | surface::Scope::Repo => generic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,8 +241,15 @@ fn push_surface(into: &mut Vec<Surface>, layer: Layer, path: PathBuf, max_bytes:
     }
 }
 
-fn nested_claude_files(repo: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
+/// Every nested `CLAUDE.md` and every nested `AGENTS.md` found in a
+/// subdirectory of `repo`, up to `MAX_NESTED_DEPTH`, collected in one tree
+/// walk rather than two -- issue #40's review flagged the doubled directory
+/// walk once a second instruction-file convention started sharing this
+/// cap-sensitive path with the first. Same depth cap, same symlink-escape
+/// posture, same skipped directories as the original single-filename walk.
+fn nested_instruction_files(repo: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut claude = Vec::new();
+    let mut agents = Vec::new();
     let mut stack = vec![(repo.to_path_buf(), 0usize)];
 
     while let Some((dir, depth)) = stack.pop() {
@@ -114,21 +277,38 @@ fn nested_claude_files(repo: &Path) -> Vec<PathBuf> {
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            let candidate = path.join("CLAUDE.md");
-            if candidate.is_file() {
-                found.push(candidate);
+            let claude_candidate = path.join("CLAUDE.md");
+            if claude_candidate.is_file() {
+                claude.push(claude_candidate);
+            }
+            let agents_candidate = path.join("AGENTS.md");
+            if agents_candidate.is_file() {
+                agents.push(agents_candidate);
             }
             stack.push((path, depth + 1));
         }
     }
 
     // Sorted so two runs over the same tree report in the same order.
-    found.sort();
-    found
+    claude.sort();
+    agents.sort();
+    (claude, agents)
 }
 
 /// Every configuration surface that steers a session in this repo, in a fixed
-/// order. Missing files are simply absent: most repos have only some of these.
+/// order. Missing files are simply absent: most repos have only some of
+/// these.
+///
+/// Every fixed-path surface (both providers' global/repo instructions, both
+/// providers' settings) is pushed before either nested walk runs. Nested
+/// discovery is open-ended -- a large enough monorepo can genuinely produce
+/// more nested `CLAUDE.md`/`AGENTS.md` files than `MAX_SURFACES` -- and
+/// `push_surface` silently stops once the cap is hit. Pushing the nested
+/// walks last means an oversized nested count can only crowd out further
+/// nested surfaces, never the fixed settings surfaces the dead-reference
+/// lint depends on (a prior ordering pushed the nested walk before settings,
+/// so a large monorepo could silently lose every settings surface instead;
+/// see `settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap`).
 pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> Vec<Surface> {
     let mut surfaces = Vec::new();
 
@@ -145,7 +325,41 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
             home.join(".claude").join("CLAUDE.md"),
             max_bytes,
         );
+        push_surface(
+            &mut surfaces,
+            Layer::GlobalAgentsMd,
+            home.join(".codex").join("AGENTS.md"),
+            max_bytes,
+        );
     }
+
+    // Issue #41: zirv's own canonical instruction layer, pushed before every
+    // native repo instruction file (fix round 1, review finding 11-1): both
+    // `lint_redundancy` and `drift.rs` treat the first occurrence in
+    // collection order as an exact-duplicate group's "home", so the
+    // canonical copy must be seen first -- otherwise `lint_redundancy`'s own
+    // proposed diff would delete the canonical line and keep the native one,
+    // directly contradicting `drift.rs`'s "the native copy is the redundant
+    // one" finding. Repo-owned and entirely optional in every part, read the
+    // same capped/absent-is-fine way as every other fixed-path surface here.
+    push_surface(
+        &mut surfaces,
+        Layer::ContextCommon,
+        context::common_path(repo),
+        max_bytes,
+    );
+    push_surface(
+        &mut surfaces,
+        Layer::ContextClaude,
+        context::claude_path(repo),
+        max_bytes,
+    );
+    push_surface(
+        &mut surfaces,
+        Layer::ContextCodex,
+        context::codex_path(repo),
+        max_bytes,
+    );
 
     push_surface(
         &mut surfaces,
@@ -153,15 +367,24 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
         repo.join("CLAUDE.md"),
         max_bytes,
     );
-    for path in nested_claude_files(repo) {
-        push_surface(&mut surfaces, Layer::NestedClaudeMd, path, max_bytes);
-    }
+    push_surface(
+        &mut surfaces,
+        Layer::RepoAgentsMd,
+        repo.join("AGENTS.md"),
+        max_bytes,
+    );
 
     if let Some(home) = home {
         push_surface(
             &mut surfaces,
             Layer::UserSettings,
             home.join(".claude").join("settings.json"),
+            max_bytes,
+        );
+        push_surface(
+            &mut surfaces,
+            Layer::CodexUserSettings,
+            home.join(".codex").join("config.toml"),
             max_bytes,
         );
     }
@@ -173,10 +396,24 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
     );
     push_surface(
         &mut surfaces,
+        Layer::CodexProjectSettings,
+        repo.join(".codex").join("config.toml"),
+        max_bytes,
+    );
+    push_surface(
+        &mut surfaces,
         Layer::LocalSettings,
         repo.join(".claude").join("settings.local.json"),
         max_bytes,
     );
+
+    let (nested_claude, nested_agents) = nested_instruction_files(repo);
+    for path in nested_claude {
+        push_surface(&mut surfaces, Layer::NestedClaudeMd, path, max_bytes);
+    }
+    for path in nested_agents {
+        push_surface(&mut surfaces, Layer::NestedAgentsMd, path, max_bytes);
+    }
 
     surfaces
 }
@@ -336,27 +573,87 @@ fn deletion_diff(surface: &Surface, line: usize, repo: &Path) -> Option<String> 
     ))
 }
 
-/// Rules stated more than once, whether across layers or inside one file. The
-/// first occurrence is treated as the home of the rule and every later copy is
-/// what the proposed diff removes.
-pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
-    let all: Vec<Instruction> = surfaces
+/// Every bullet-line instruction across every non-settings surface. A
+/// settings surface (JSON or TOML) is structured config, not prose: a
+/// multi-line TOML basic string value can contain a line that happens to
+/// look like a bullet, and without this guard it would be picked up as an
+/// "instruction" and quoted verbatim in a finding's title/evidence/
+/// proposed_diff -- a report-level leak `judgment_prompt`'s own redaction
+/// never covers, since it only guards the model-prompt path. Shared by
+/// `lint_redundancy` and `drift.rs`'s duplicate/contradiction detection:
+/// both start from the same "every instruction, everywhere" list.
+pub fn all_instructions(surfaces: &[Surface]) -> Vec<Instruction> {
+    surfaces
         .iter()
         .enumerate()
+        .filter(|(_, surface)| !surface.layer.is_settings())
         .flat_map(|(index, surface)| statements(index, surface))
-        .collect();
+        .collect()
+}
 
-    // Grouped by normalized text, keyed in first-seen order so the report does
-    // not depend on hash iteration order.
+/// Groups `instructions` by normalized text, in first-seen order so a report
+/// built by walking `order` does not depend on hash iteration order. Shared
+/// by `lint_redundancy` and `drift.rs`.
+pub fn group_by_normalized(
+    instructions: &[Instruction],
+) -> (Vec<String>, hashbrown::HashMap<String, Vec<&Instruction>>) {
     let mut order: Vec<String> = Vec::new();
     let mut groups: hashbrown::HashMap<String, Vec<&Instruction>> = hashbrown::HashMap::new();
-    for instruction in &all {
+    for instruction in instructions {
         let bucket = groups.entry(instruction.normalized.clone()).or_default();
         if bucket.is_empty() {
             order.push(instruction.normalized.clone());
         }
         bucket.push(instruction);
     }
+    (order, groups)
+}
+
+/// Whether `layer` is safe for `lint_redundancy` to propose *deleting from*.
+/// The canonical `.zirv/context/` layer is the one place a rule is meant to
+/// live once issue #41 applies, so it must never be the deletion target; an
+/// operator's `Scope::Global` surface (e.g. `~/CLAUDE.md`) is the operator's
+/// own file, not this repo's, so a repo-scoped tool must never propose
+/// editing it either -- absolute, regardless of `spans_multiple_surfaces`:
+/// even a same-file repeat inside a global file is still that file.
+///
+/// The canonical `.zirv/context/` exclusion is narrower: it only applies
+/// when `spans_multiple_surfaces` is true, i.e. when the canonical layer is
+/// competing with a *different* surface that redundantly restates it (that
+/// other surface is always the right target -- the whole point of having a
+/// canonical home). A duplicate entirely *within* one canonical file (the
+/// same bullet stated twice in `.zirv/context/common.md`, say) has no other
+/// surface to prefer, so the later copy in that same file is still a valid,
+/// safe deletion target -- excluding it there bought nothing but silently
+/// dropping the diff for the single most common kind of same-file repeat.
+fn is_eligible_deletion_target(layer: Layer, spans_multiple_surfaces: bool) -> bool {
+    if layer.scope() == surface::Scope::Global {
+        return false;
+    }
+    if spans_multiple_surfaces {
+        return !matches!(
+            layer,
+            Layer::ContextCommon | Layer::ContextClaude | Layer::ContextCodex
+        );
+    }
+    true
+}
+
+/// Rules stated more than once, whether across layers or inside one file. The
+/// first occurrence is treated as the home of the rule; among the later
+/// copies, the first one `is_eligible_deletion_target` accepts is what the
+/// proposed diff removes -- never an operator's global surface, and never a
+/// *different* surface's canonical `.zirv/context/` copy (see that
+/// function's doc for why a same-file canonical repeat is still eligible).
+/// `collect_surfaces` always pushes global surfaces before the canonical
+/// layer and the canonical layer before repo-native ones, so this also means
+/// the repo-native copy is preferred over a nested one whenever both are
+/// candidates, with no extra tie-break needed. A group with no eligible
+/// target at all (e.g. a rule stated only in an operator's global file and
+/// the canonical layer) still gets a finding, just without a diff.
+pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
+    let all = all_instructions(surfaces);
+    let (order, groups) = group_by_normalized(&all);
 
     let mut findings = Vec::new();
     for key in order {
@@ -371,8 +668,14 @@ pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
             .iter()
             .map(|i| evidence_ref(&surfaces[i.surface], i.line))
             .collect();
-        let duplicate = group[1];
-        let where_stated = if group.iter().any(|i| i.surface != group[0].surface) {
+        let spans_multiple_surfaces = group.iter().any(|i| i.surface != group[0].surface);
+        let duplicate = group[1..].iter().copied().find(|instruction| {
+            is_eligible_deletion_target(
+                surfaces[instruction.surface].layer,
+                spans_multiple_surfaces,
+            )
+        });
+        let where_stated = if spans_multiple_surfaces {
             "in more than one layer"
         } else {
             "more than once in the same file"
@@ -387,7 +690,8 @@ pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
                 "The same instruction appears {} times. Keeping one copy makes the rule easier to change later.",
                 group.len()
             ),
-            proposed_diff: deletion_diff(&surfaces[duplicate.surface], duplicate.line, repo),
+            proposed_diff: duplicate
+                .and_then(|d| deletion_diff(&surfaces[d.surface], d.line, repo)),
         });
     }
 
@@ -494,7 +798,7 @@ fn resolve_candidates(
     repo: &Path,
     home: Option<&Path>,
 ) -> Vec<PathBuf> {
-    if surface.layer == Layer::NestedClaudeMd {
+    if matches!(surface.layer, Layer::NestedClaudeMd | Layer::NestedAgentsMd) {
         let mut candidates = Vec::new();
         if let Some(dir) = surface.path.parent() {
             candidates.push(dir.join(token));
@@ -526,10 +830,11 @@ pub fn lint_dead_references(
     let mut findings = Vec::new();
 
     for surface in surfaces {
-        if matches!(
-            surface.layer,
-            Layer::UserSettings | Layer::ProjectSettings | Layer::LocalSettings
-        ) {
+        // Claude's own settings schema (JSON `hooks` block); derived from the
+        // generic model rather than a hand-rolled variant list a future
+        // Claude settings layer could be added to without also updating this
+        // match -- see `Layer::provider`/`Layer::is_settings`.
+        if surface.layer.provider() == surface::Provider::Claude && surface.layer.is_settings() {
             for command in hook_commands(&surface.text) {
                 let Some(program) = command.split_whitespace().next() else {
                     continue;
@@ -549,6 +854,11 @@ pub fn lint_dead_references(
                     proposed_diff: None,
                 });
             }
+            continue;
+        }
+        if surface.layer.is_settings() {
+            // Codex's `config.toml` is not JSON-hook-shaped like the three
+            // layers above; nothing here knows how to check it yet.
             continue;
         }
 
@@ -1035,28 +1345,48 @@ pub const OPTIMIZE_PROMPT_VERSION: &str = "v1";
 /// so one enormous CLAUDE.md cannot crowd out the others.
 const DEFAULT_EXCERPT_LINES: usize = 40;
 
-/// Keys and structure survive; every string value becomes `<redacted>`. The
-/// contradiction check reads the shape of a settings file -- which hooks are
-/// registered, what is permitted -- and never needs the values, which
-/// routinely include an `env` block holding an API key. Unparseable input is
-/// withheld rather than passed through: a settings file truncated by the byte
-/// cap must not fall back to raw bytes.
-fn redact_json_strings(text: &str) -> String {
-    fn walk(value: &mut serde_json::Value) {
+/// Keys and structure survive; every string value becomes `<redacted>`,
+/// whether the settings file is JSON (Claude's `settings.json`) or TOML
+/// (Codex's `config.toml`, issue #40). The contradiction check reads the
+/// shape of a settings file -- which hooks are registered, what is
+/// permitted -- and never needs the values, which routinely include an
+/// `env` block or a token holding a secret. Unparseable input is withheld
+/// rather than passed through: a settings file truncated by the byte cap
+/// must not fall back to raw bytes, in either format.
+fn redact_settings_strings(text: &str) -> String {
+    fn walk_json(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::String(text) => *text = "<redacted>".to_string(),
-            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
-            serde_json::Value::Object(map) => map.values_mut().for_each(walk),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk_json),
+            serde_json::Value::Object(map) => map.values_mut().for_each(walk_json),
+            _ => {}
+        }
+    }
+    fn walk_toml(value: &mut toml::Value) {
+        match value {
+            toml::Value::String(text) => *text = "<redacted>".to_string(),
+            toml::Value::Array(items) => items.iter_mut().for_each(walk_toml),
+            toml::Value::Table(map) => map.iter_mut().for_each(|(_, v)| walk_toml(v)),
             _ => {}
         }
     }
 
-    let withheld = "(not valid JSON on its own; contents withheld)".to_string();
-    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text) else {
-        return withheld;
-    };
-    walk(&mut parsed);
-    serde_json::to_string_pretty(&parsed).unwrap_or(withheld)
+    let withheld = "(not valid JSON or TOML on its own; contents withheld)".to_string();
+    if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text) {
+        walk_json(&mut parsed);
+        return serde_json::to_string_pretty(&parsed).unwrap_or(withheld);
+    }
+    // A bare `str::parse::<toml::Value>()` parses one TOML *value*, not a
+    // document -- the same idiom `config.rs`'s own layer loader uses
+    // (`toml::from_str::<toml::Table>`) is what actually parses a whole
+    // `config.toml` file.
+    if let Ok(mut parsed) = toml::from_str::<toml::Table>(text) {
+        for value in parsed.iter_mut().map(|(_, v)| v) {
+            walk_toml(value);
+        }
+        return toml::to_string(&parsed).unwrap_or(withheld);
+    }
+    withheld
 }
 
 pub fn judgment_prompt(surfaces: &[Surface], evidence: &Evidence, excerpt_lines: usize) -> String {
@@ -1091,7 +1421,7 @@ nothing rather than guessing.\n\n"
                 .push_str("(string values redacted; this file's structure is what matters here)\n");
         }
         let body = if surface.layer.is_settings() {
-            redact_json_strings(&surface.text)
+            redact_settings_strings(&surface.text)
         } else {
             surface.text.clone()
         };
@@ -1816,6 +2146,12 @@ mod tests {
         let (_tmp, home, repo) = fixture_tree();
         let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
 
+        // Order changed (issue #40 review, IMPORTANT 2): `nested CLAUDE.md`
+        // used to come before the settings surfaces; it now comes after
+        // them, so an oversized nested-file count can only crowd out
+        // further nested surfaces against `MAX_SURFACES`, never the fixed
+        // settings surfaces the dead-reference lint depends on. See
+        // `settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap`.
         let layers: Vec<&'static str> = surfaces.iter().map(|s| s.layer.label()).collect();
         assert_eq!(
             layers,
@@ -1823,10 +2159,10 @@ mod tests {
                 "global CLAUDE.md",
                 "global CLAUDE.md",
                 "repo CLAUDE.md",
-                "nested CLAUDE.md",
                 "user settings.json",
                 "project settings.json",
                 "local settings.json",
+                "nested CLAUDE.md",
             ],
             "collection order must be deterministic so reports are comparable"
         );
@@ -1834,6 +2170,568 @@ mod tests {
         // Same inputs, same output, every time.
         let again = collect_surfaces(Some(&home), &repo, 1_000_000);
         assert_eq!(surfaces, again);
+    }
+
+    /// The regression IMPORTANT 2 (issue #40 review) guards against: with
+    /// the old ordering, pushing the nested walk before the settings
+    /// surfaces meant a monorepo with `MAX_SURFACES` or more nested
+    /// instruction files silently starved every settings surface out of the
+    /// collection -- killing `lint_dead_references`' hook-command check
+    /// (`UserSettings`/`ProjectSettings`/`LocalSettings`) in exactly the
+    /// large-tree shape `MAX_NESTED_DEPTH` exists to bound, not prevent.
+    #[test]
+    fn settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+        for i in 0..MAX_SURFACES + 10 {
+            let dir = repo.join(format!("crates/gen{i}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("CLAUDE.md"), format!("# gen {i}\n- rule\n")).expect("write");
+        }
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert_eq!(
+            surfaces.len(),
+            MAX_SURFACES,
+            "still capped at MAX_SURFACES overall"
+        );
+
+        let labels: Vec<&'static str> = surfaces.iter().map(|s| s.layer.label()).collect();
+        assert!(labels.contains(&"user settings.json"), "{labels:?}");
+        assert!(labels.contains(&"project settings.json"), "{labels:?}");
+        assert!(labels.contains(&"local settings.json"), "{labels:?}");
+        assert!(labels.contains(&"user config.toml"), "{labels:?}");
+        assert!(labels.contains(&"project config.toml"), "{labels:?}");
+    }
+
+    /// Adds every Codex-flavored surface `fixture_tree`'s Claude-only tree is
+    /// missing, so a test can exercise one repo with both providers rather
+    /// than two trees that never coexist in a real collection.
+    fn add_codex_surfaces(home: &Path, repo: &Path) {
+        std::fs::create_dir_all(home.join(".codex")).expect("mkdir home/.codex");
+        std::fs::write(
+            home.join(".codex/AGENTS.md"),
+            "# global agents\n- prefer rg over grep\n",
+        )
+        .expect("write");
+        std::fs::write(home.join(".codex/config.toml"), "model = \"gpt-5.6-sol\"\n")
+            .expect("write");
+
+        std::fs::create_dir_all(repo.join(".codex")).expect("mkdir repo/.codex");
+        std::fs::write(
+            repo.join("AGENTS.md"),
+            "# repo agents\n- always run tests\n",
+        )
+        .expect("write");
+        std::fs::write(
+            repo.join("crates/inner/AGENTS.md"),
+            "# nested agents\n- inner agents rule\n",
+        )
+        .expect("write");
+        std::fs::write(
+            repo.join(".codex/config.toml"),
+            "sandbox_mode = \"read-only\"\n",
+        )
+        .expect("write");
+    }
+
+    #[test]
+    fn agents_md_is_collected_at_global_repo_and_nested_scope_alongside_claude_md() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let labels: Vec<&'static str> = surfaces.iter().map(|s| s.layer.label()).collect();
+
+        assert!(labels.contains(&"global AGENTS.md"), "{labels:?}");
+        assert!(labels.contains(&"repo AGENTS.md"), "{labels:?}");
+        assert!(labels.contains(&"nested AGENTS.md"), "{labels:?}");
+
+        let nested = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::NestedAgentsMd)
+            .expect("nested AGENTS.md present");
+        assert!(nested.text.contains("inner agents rule"));
+    }
+
+    #[test]
+    fn codex_config_toml_is_collected_at_global_and_project_scope() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let user = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::CodexUserSettings)
+            .expect("codex user config.toml present");
+        assert!(user.text.contains("gpt-5.6-sol"));
+
+        let project = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::CodexProjectSettings)
+            .expect("codex project config.toml present");
+        assert!(project.text.contains("read-only"));
+    }
+
+    #[test]
+    fn a_mixed_claude_and_codex_repo_collects_both_providers_without_cross_contamination() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let claude_count = surfaces
+            .iter()
+            .filter(|s| s.layer.provider() == surface::Provider::Claude)
+            .count();
+        let codex_count = surfaces
+            .iter()
+            .filter(|s| s.layer.provider() == surface::Provider::Codex)
+            .count();
+
+        // fixture_tree(): 2 global + 1 repo + 1 nested CLAUDE.md, 3 claude settings.
+        assert_eq!(claude_count, 7, "{surfaces:#?}");
+        // add_codex_surfaces: global + repo + nested AGENTS.md, 2 config.toml.
+        assert_eq!(codex_count, 5, "{surfaces:#?}");
+        assert_eq!(surfaces.len(), claude_count + codex_count);
+    }
+
+    /// Issue #41: the canonical `.zirv/context/` layer is optional in every
+    /// part -- a repo with none of the three files analyses to nothing extra,
+    /// exactly like a repo with no CLAUDE.md today.
+    #[test]
+    fn zirv_context_files_are_absent_when_the_directory_does_not_exist() {
+        let (_tmp, home, repo) = fixture_tree();
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert!(
+            surfaces.iter().all(|s| !matches!(
+                s.layer,
+                Layer::ContextCommon | Layer::ContextClaude | Layer::ContextCodex
+            )),
+            "{surfaces:#?}"
+        );
+    }
+
+    #[test]
+    fn zirv_context_files_are_collected_when_present() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::create_dir_all(repo.join(".zirv/context")).expect("mkdir");
+        std::fs::write(
+            repo.join(".zirv/context/common.md"),
+            "# common\n- write tests first\n",
+        )
+        .expect("write common.md");
+        std::fs::write(
+            repo.join(".zirv/context/claude.md"),
+            "# claude\n- prefer the Task tool for subagents\n",
+        )
+        .expect("write claude.md");
+        std::fs::write(
+            repo.join(".zirv/context/codex.md"),
+            "# codex\n- use apply_patch for edits\n",
+        )
+        .expect("write codex.md");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+
+        let common = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::ContextCommon)
+            .expect("common.md collected");
+        assert!(common.text.contains("write tests first"));
+
+        let claude = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::ContextClaude)
+            .expect("claude.md collected");
+        assert!(claude.text.contains("Task tool"));
+
+        let codex = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::ContextCodex)
+            .expect("codex.md collected");
+        assert!(codex.text.contains("apply_patch"));
+    }
+
+    /// Provenance survives into the same redundancy lint every other
+    /// instruction surface goes through: a rule stated once in the canonical
+    /// common layer and restated in a native CLAUDE.md is flagged with both
+    /// paths as evidence, the same way two native surfaces would be.
+    #[test]
+    fn a_rule_duplicated_between_canonical_common_and_a_native_claude_md_is_flagged() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::create_dir_all(repo.join(".zirv/context")).expect("mkdir");
+        std::fs::write(
+            repo.join(".zirv/context/common.md"),
+            "# common\n- always run tests\n",
+        )
+        .expect("write");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let findings = lint_redundancy(&surfaces, &repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|e| e.contains(".zirv/context/common.md")),
+            "{finding:?}"
+        );
+        assert!(
+            finding.evidence.iter().any(|e| e.contains("CLAUDE.md")),
+            "{finding:?}"
+        );
+    }
+
+    /// `ALL_LAYERS` is hand-maintained, and so is the match below -- so what
+    /// does this actually catch?
+    ///
+    /// The match is exhaustive (no wildcard arm): the moment `Layer` gains a
+    /// new variant, this file fails to compile until an arm exists for it
+    /// here, one line saying which position that variant belongs at in
+    /// `ALL_LAYERS`. The test then confirms each entry *already in*
+    /// `ALL_LAYERS` sits at the exact position its own arm claims, and that
+    /// no two entries claim the same position -- so a variant that got
+    /// **duplicated or reordered** relative to `ALL_LAYERS` (the realistic
+    /// way this list actually drifts: copy-pasting an existing arm instead
+    /// of adding a fresh one, or an entry moved without updating its
+    /// neighbours) is caught.
+    ///
+    /// What it provably does **not** catch: a variant added to the enum,
+    /// given its own honest arm here (say, index 14), but never appended to
+    /// `ALL_LAYERS` at all. This function is only ever called with values
+    /// already drawn from `ALL_LAYERS`'s own contents, so an arm for a
+    /// variant absent from that array is simply never exercised -- no test
+    /// in this file can call `all_layers_index` with a variant it has no
+    /// way to name without already knowing about the very omission it would
+    /// need to detect. That gap is not unique to this guard: it is the same
+    /// gap `context::precedence_tier`'s
+    /// `every_instructions_layer_has_a_defined_tier` test already lives
+    /// with elsewhere in this codebase. Closing it for real needs either a
+    /// derive macro (e.g. `strum::EnumIter`) or nightly's unstable
+    /// `variant_count`, neither of which this fix pulls in -- so a brand
+    /// new variant appended to `Layer` and never added to `ALL_LAYERS`
+    /// still relies on code review, not this test, to be caught.
+    #[test]
+    fn all_layers_entries_are_at_their_declared_position_with_no_duplicates() {
+        fn all_layers_index(layer: Layer) -> usize {
+            match layer {
+                Layer::GlobalClaudeMd => 0,
+                Layer::RepoClaudeMd => 1,
+                Layer::NestedClaudeMd => 2,
+                Layer::UserSettings => 3,
+                Layer::ProjectSettings => 4,
+                Layer::LocalSettings => 5,
+                Layer::GlobalAgentsMd => 6,
+                Layer::RepoAgentsMd => 7,
+                Layer::NestedAgentsMd => 8,
+                Layer::CodexUserSettings => 9,
+                Layer::CodexProjectSettings => 10,
+                Layer::ContextCommon => 11,
+                Layer::ContextClaude => 12,
+                Layer::ContextCodex => 13,
+            }
+        }
+
+        let mut claimed_positions = hashbrown::HashSet::new();
+        for (position, &layer) in ALL_LAYERS.iter().enumerate() {
+            let claimed = all_layers_index(layer);
+            assert_eq!(
+                claimed, position,
+                "{layer:?} is at ALL_LAYERS[{position}] but claims position {claimed} -- \
+                 reordered, or a stale/duplicated entry"
+            );
+            assert!(
+                claimed_positions.insert(claimed),
+                "{layer:?}'s position {claimed} is claimed by more than one ALL_LAYERS entry"
+            );
+        }
+    }
+
+    /// Fix round 1, review finding 11-1: `collect_surfaces` pushes the
+    /// canonical `.zirv/context/` layer before any native repo instruction
+    /// file, so a caller walking the surface list in order sees the
+    /// canonical copy first. This is what makes `lint_redundancy`'s
+    /// first-occurrence-is-home rule agree with `drift.rs`'s own
+    /// "the native copy is redundant" reading of the same duplicate, instead
+    /// of the two contradicting each other.
+    #[test]
+    fn context_surfaces_are_collected_before_repo_native_instructions() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::create_dir_all(repo.join(".zirv/context")).expect("mkdir");
+        std::fs::write(repo.join(".zirv/context/common.md"), "# common\n").expect("write");
+        std::fs::write(repo.join(".zirv/context/claude.md"), "# claude\n").expect("write");
+        std::fs::write(repo.join(".zirv/context/codex.md"), "# codex\n").expect("write");
+        add_codex_surfaces(&home, &repo);
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let index_of = |layer: Layer| {
+            surfaces
+                .iter()
+                .position(|s| s.layer == layer)
+                .unwrap_or_else(|| panic!("{layer:?} not collected: {surfaces:#?}"))
+        };
+
+        let common = index_of(Layer::ContextCommon);
+        let claude = index_of(Layer::ContextClaude);
+        let codex = index_of(Layer::ContextCodex);
+        let repo_claude_md = index_of(Layer::RepoClaudeMd);
+        let repo_agents_md = index_of(Layer::RepoAgentsMd);
+
+        assert!(common < repo_claude_md, "{surfaces:#?}");
+        assert!(claude < repo_claude_md, "{surfaces:#?}");
+        assert!(codex < repo_agents_md, "{surfaces:#?}");
+        assert!(common < repo_agents_md, "{surfaces:#?}");
+    }
+
+    /// The proposed-diff half of the same fix: `lint_redundancy`'s
+    /// `deletion_diff` must remove the line from the native `CLAUDE.md`
+    /// copy, never from the canonical `common.md` copy -- deleting the
+    /// canonical line would be exactly backwards, since `common.md` is the
+    /// one place this rule is meant to live.
+    #[test]
+    fn the_proposed_deletion_for_a_canonical_duplicate_targets_the_native_copy_not_the_canonical_one()
+     {
+        let repo = Path::new("/repo");
+        let surfaces = vec![
+            Surface {
+                layer: Layer::ContextCommon,
+                path: repo.join(".zirv/context/common.md"),
+                text: "# common\n- always run tests\n".to_string(),
+            },
+            Surface {
+                layer: Layer::RepoClaudeMd,
+                path: repo.join("CLAUDE.md"),
+                text: "# repo\n- always run tests\n".to_string(),
+            },
+        ];
+
+        let findings = lint_redundancy(&surfaces, repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        let diff = finding
+            .proposed_diff
+            .as_ref()
+            .expect("a repo-owned duplicate gets a proposed diff");
+
+        assert!(
+            diff.contains("CLAUDE.md") && !diff.contains("common.md"),
+            "the diff must remove the native copy, not the canonical one: {diff}"
+        );
+    }
+
+    /// The bug a prior fix round's reordering did not actually fix: when an
+    /// operator's *global* file states the same rule as the canonical
+    /// `.zirv/context/common.md` layer AND the repo's own CLAUDE.md, the
+    /// group is `[global, canonical, repo]` in `collect_surfaces`'s
+    /// collection order (global pushed first, canonical second, repo third).
+    /// Picking `group[1]` unconditionally lands on the canonical copy --
+    /// exactly backwards. The deletion target must be chosen by layer
+    /// semantics: never canonical, never the operator's global surface, so
+    /// it lands on the repo-native copy, leaving both the operator's file and
+    /// the canonical rule untouched.
+    #[test]
+    fn a_three_way_duplicate_with_a_global_copy_still_targets_the_repo_copy_never_canonical_never_global()
+     {
+        let repo = Path::new("/repo");
+        let surfaces = vec![
+            Surface {
+                layer: Layer::GlobalClaudeMd,
+                path: PathBuf::from("/home/CLAUDE.md"),
+                text: "# global\n- always run tests\n".to_string(),
+            },
+            Surface {
+                layer: Layer::ContextCommon,
+                path: repo.join(".zirv/context/common.md"),
+                text: "# common\n- always run tests\n".to_string(),
+            },
+            Surface {
+                layer: Layer::RepoClaudeMd,
+                path: repo.join("CLAUDE.md"),
+                text: "# repo\n- always run tests\n".to_string(),
+            },
+        ];
+
+        let findings = lint_redundancy(&surfaces, repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        let diff = finding
+            .proposed_diff
+            .as_ref()
+            .expect("the repo-native copy is an eligible deletion target");
+
+        assert!(
+            diff.contains("CLAUDE.md") && repo.join("CLAUDE.md").starts_with(repo),
+            "diff must target the repo copy: {diff}"
+        );
+        assert!(
+            !diff.contains("common.md"),
+            "must never touch canonical: {diff}"
+        );
+        assert!(
+            !diff.contains("/home/CLAUDE.md"),
+            "must never touch the operator's global copy: {diff}"
+        );
+    }
+
+    /// When a duplicate group contains no eligible deletion target at all --
+    /// here, only the operator's global file and the canonical layer state
+    /// the rule, with no repo-native copy to remove -- the finding is still
+    /// reported (it is real redundancy worth knowing about) but with no
+    /// proposed diff, since every candidate is off-limits.
+    #[test]
+    fn a_duplicate_with_no_eligible_deletion_target_gets_a_finding_but_no_diff() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![
+            Surface {
+                layer: Layer::GlobalClaudeMd,
+                path: PathBuf::from("/home/CLAUDE.md"),
+                text: "# global\n- always run tests\n".to_string(),
+            },
+            Surface {
+                layer: Layer::ContextCommon,
+                path: repo.join(".zirv/context/common.md"),
+                text: "# common\n- always run tests\n".to_string(),
+            },
+        ];
+
+        let findings = lint_redundancy(&surfaces, repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+
+        assert_eq!(
+            finding.proposed_diff, None,
+            "no surface is an eligible deletion target: {finding:?}"
+        );
+    }
+
+    /// The canonical-layer exclusion only applies when a *different*
+    /// surface is competing with it (see `is_eligible_deletion_target`'s
+    /// doc). The same bullet stated twice within one canonical file has no
+    /// other surface to prefer, so the later copy in that same file must
+    /// still be a valid deletion target -- excluding it here would silently
+    /// drop the diff for the single most common same-file repeat.
+    #[test]
+    fn a_duplicate_within_one_canonical_file_still_gets_a_diff() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![Surface {
+            layer: Layer::ContextCommon,
+            path: repo.join(".zirv/context/common.md"),
+            text: "# common\n- always run tests\n- something else\n- always run tests\n"
+                .to_string(),
+        }];
+
+        let findings = lint_redundancy(&surfaces, repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        let diff = finding
+            .proposed_diff
+            .as_ref()
+            .expect("a same-file canonical duplicate still gets a proposed diff");
+        assert!(diff.contains("common.md"), "{diff}");
+    }
+
+    /// Unlike the canonical exclusion, the operator's `Scope::Global`
+    /// exclusion is absolute: even a same-file repeat inside a global
+    /// `CLAUDE.md` must never get a proposed diff, since that file is the
+    /// operator's own, not this repo's to edit.
+    #[test]
+    fn a_duplicate_within_one_global_file_still_gets_no_diff() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![Surface {
+            layer: Layer::GlobalClaudeMd,
+            path: PathBuf::from("/home/CLAUDE.md"),
+            text: "# global\n- always run tests\n- something else\n- always run tests\n"
+                .to_string(),
+        }];
+
+        let findings = lint_redundancy(&surfaces, repo);
+        let finding = findings
+            .iter()
+            .find(|f| f.title.contains("always run tests"))
+            .expect("duplicate flagged");
+        assert_eq!(
+            finding.proposed_diff, None,
+            "a repo-scoped tool must never propose editing the operator's global file: \
+             {finding:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_nested_agents_md_scan_does_not_follow_a_symlink_out_of_the_repo_either() {
+        let (tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+        let outside = tmp.path().join("outside-agents");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::fs::write(outside.join("AGENTS.md"), "# private codex notes\n").expect("write");
+        std::os::unix::fs::symlink(&outside, repo.join("linked-agents")).expect("symlink");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert!(
+            surfaces
+                .iter()
+                .all(|s| !s.text.contains("private codex notes")),
+            "a symlinked directory is not this repository's configuration"
+        );
+    }
+
+    #[test]
+    fn a_nested_agents_md_reference_is_checked_against_its_own_directory_first() {
+        let (_tmp, home, repo) = fixture_tree();
+        add_codex_surfaces(&home, &repo);
+        std::fs::write(repo.join("crates/inner/helper.rs"), "// helper\n").expect("write");
+        std::fs::write(
+            repo.join("crates/inner/AGENTS.md"),
+            "# nested agents\n- see `helper.rs`\n",
+        )
+        .expect("write");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let findings = lint_dead_references(&surfaces, &repo, Some(&home), &|_| false);
+        assert!(
+            findings.iter().all(|f| !f.title.contains("helper.rs")),
+            "helper.rs exists next to the nested AGENTS.md that names it: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn codex_settings_toml_values_are_redacted_before_reaching_the_model() {
+        let surfaces = vec![
+            Surface {
+                layer: Layer::CodexProjectSettings,
+                path: PathBuf::from("/repo/.codex/config.toml"),
+                text: "model = \"gpt-5.6-sol\"\n\n[shell_environment_policy]\ntoken = \"sk-codex-secret\"\n"
+                    .to_string(),
+            },
+            Surface {
+                layer: Layer::RepoAgentsMd,
+                path: PathBuf::from("/repo/AGENTS.md"),
+                text: "- always run tests".to_string(),
+            },
+        ];
+
+        let prompt = judgment_prompt(&surfaces, &Evidence::default(), 40);
+
+        assert!(
+            !prompt.contains("sk-codex-secret"),
+            "a codex settings value must never reach the model: {prompt}"
+        );
+        assert!(
+            prompt.contains("token") && prompt.contains("<redacted>"),
+            "the structure is what the contradiction check needs: {prompt}"
+        );
+        assert!(prompt.contains("- always run tests"));
     }
 
     #[test]
@@ -1886,6 +2784,172 @@ mod tests {
         assert!(Layer::NestedClaudeMd.is_repo_owned());
         assert!(Layer::ProjectSettings.is_repo_owned());
         assert!(Layer::LocalSettings.is_repo_owned());
+        assert!(Layer::ContextCommon.is_repo_owned());
+        assert!(Layer::ContextClaude.is_repo_owned());
+        assert!(Layer::ContextCodex.is_repo_owned());
+    }
+
+    /// Every layer maps onto the generic surface vocabulary (`surface::`),
+    /// and `is_repo_owned`/`is_settings` are derived from that mapping, not
+    /// hand-rolled independently -- so a new `Layer` variant cannot get the
+    /// two answers out of sync with its own `scope`/`kind`.
+    #[test]
+    fn every_layer_carries_generic_provenance_consistent_with_its_own_helpers() {
+        let layers = [
+            Layer::GlobalClaudeMd,
+            Layer::RepoClaudeMd,
+            Layer::NestedClaudeMd,
+            Layer::UserSettings,
+            Layer::ProjectSettings,
+            Layer::LocalSettings,
+            Layer::GlobalAgentsMd,
+            Layer::RepoAgentsMd,
+            Layer::NestedAgentsMd,
+            Layer::CodexUserSettings,
+            Layer::CodexProjectSettings,
+            Layer::ContextCommon,
+            Layer::ContextClaude,
+            Layer::ContextCodex,
+        ];
+        for layer in layers {
+            assert_eq!(layer.is_repo_owned(), layer.scope().is_repo_owned());
+            assert_eq!(
+                layer.is_settings(),
+                layer.kind() == surface::Kind::PolicySettings
+            );
+        }
+    }
+
+    #[test]
+    fn new_codex_layers_have_the_expected_labels_and_provider() {
+        assert_eq!(Layer::GlobalAgentsMd.label(), "global AGENTS.md");
+        assert_eq!(Layer::RepoAgentsMd.label(), "repo AGENTS.md");
+        assert_eq!(Layer::NestedAgentsMd.label(), "nested AGENTS.md");
+        assert_eq!(Layer::CodexUserSettings.label(), "user config.toml");
+        assert_eq!(Layer::CodexProjectSettings.label(), "project config.toml");
+        for layer in [
+            Layer::GlobalAgentsMd,
+            Layer::RepoAgentsMd,
+            Layer::NestedAgentsMd,
+            Layer::CodexUserSettings,
+            Layer::CodexProjectSettings,
+        ] {
+            assert_eq!(layer.provider(), surface::Provider::Codex);
+        }
+        for layer in [
+            Layer::GlobalClaudeMd,
+            Layer::RepoClaudeMd,
+            Layer::NestedClaudeMd,
+            Layer::UserSettings,
+            Layer::ProjectSettings,
+            Layer::LocalSettings,
+        ] {
+            assert_eq!(layer.provider(), surface::Provider::Claude);
+        }
+    }
+
+    /// The load-bearing property (issue #39): a repo-owned layer's trust is
+    /// always `RepoUntrusted`, and only a `Global`-scoped layer is
+    /// `Operator`-trusted -- derived from `scope()`, not an independent flag
+    /// a new variant could set wrong.
+    #[test]
+    fn repo_owned_layers_can_never_carry_operator_trust() {
+        assert_eq!(Layer::GlobalClaudeMd.trust(), surface::Trust::Operator);
+        assert_eq!(Layer::UserSettings.trust(), surface::Trust::Operator);
+        assert_eq!(Layer::GlobalAgentsMd.trust(), surface::Trust::Operator);
+        assert_eq!(Layer::CodexUserSettings.trust(), surface::Trust::Operator);
+        for layer in [
+            Layer::RepoClaudeMd,
+            Layer::NestedClaudeMd,
+            Layer::ProjectSettings,
+            Layer::LocalSettings,
+            Layer::RepoAgentsMd,
+            Layer::NestedAgentsMd,
+            Layer::CodexProjectSettings,
+            Layer::ContextCommon,
+            Layer::ContextClaude,
+            Layer::ContextCodex,
+        ] {
+            assert_eq!(
+                layer.trust(),
+                surface::Trust::RepoUntrusted,
+                "{layer:?} is inside the repo checkout and must never be operator-trusted"
+            );
+        }
+    }
+
+    /// Issue #41: naming choice for the canonical layer's providers.
+    /// `ContextCommon` targets every harness alike, so it names
+    /// `Provider::Zirv` (zirv's own layer, not one harness's); the
+    /// harness-specific additions name the harness they are written for.
+    #[test]
+    fn zirv_context_layers_have_the_expected_provider_kind_and_scope() {
+        assert_eq!(Layer::ContextCommon.provider(), surface::Provider::Zirv);
+        assert_eq!(Layer::ContextClaude.provider(), surface::Provider::Claude);
+        assert_eq!(Layer::ContextCodex.provider(), surface::Provider::Codex);
+        for layer in [
+            Layer::ContextCommon,
+            Layer::ContextClaude,
+            Layer::ContextCodex,
+        ] {
+            assert_eq!(layer.kind(), surface::Kind::Instructions);
+            assert_eq!(layer.scope(), surface::Scope::Repo);
+            assert!(!layer.is_settings());
+        }
+    }
+
+    #[test]
+    fn a_surface_produces_the_matching_generic_context_surface() {
+        let repo = Path::new("/repo");
+        let surface = Surface {
+            layer: Layer::RepoClaudeMd,
+            path: PathBuf::from("/repo/CLAUDE.md"),
+            text: "- always run tests".to_string(),
+        };
+        let generic = surface.context_surface(repo, None);
+        assert_eq!(generic.provider(), surface::Provider::Claude);
+        assert_eq!(generic.kind(), surface::Kind::Instructions);
+        assert_eq!(generic.scope(), surface::Scope::Repo);
+        assert_eq!(generic.trust(), surface::Trust::RepoUntrusted);
+        assert_eq!(generic.path(), Path::new("/repo/CLAUDE.md"));
+    }
+
+    #[test]
+    fn a_global_surfaces_generic_scope_is_derived_from_its_path_not_copied() {
+        let repo = Path::new("/repo");
+        let home = Path::new("/home/operator");
+        let surface = Surface {
+            layer: Layer::GlobalClaudeMd,
+            path: home.join("CLAUDE.md"),
+            text: "- prefer rg over grep".to_string(),
+        };
+        let generic = surface.context_surface(repo, Some(home));
+        assert_eq!(generic.scope(), surface::Scope::Global);
+        assert_eq!(generic.trust(), surface::Trust::Operator);
+    }
+
+    #[test]
+    fn nested_and_local_layers_carry_their_refined_scope_through_context_surface() {
+        let repo = Path::new("/repo");
+        let nested = Surface {
+            layer: Layer::NestedClaudeMd,
+            path: repo.join("crates/inner/CLAUDE.md"),
+            text: "- inner rule".to_string(),
+        };
+        assert_eq!(
+            nested.context_surface(repo, None).scope(),
+            surface::Scope::Nested
+        );
+
+        let local = Surface {
+            layer: Layer::LocalSettings,
+            path: repo.join(".claude/settings.local.json"),
+            text: "{}".to_string(),
+        };
+        assert_eq!(
+            local.context_surface(repo, None).scope(),
+            surface::Scope::LocalPrivate
+        );
     }
 
     #[test]
@@ -2091,6 +3155,26 @@ mod tests {
             "- run fmt before pushing\n- run clippy before pushing\n",
         )];
         assert!(lint_redundancy(&surfaces, Path::new("/repo")).is_empty());
+    }
+
+    /// A TOML multi-line basic string value can contain a line shaped like a
+    /// bullet; without filtering settings surfaces out, `statements()` would
+    /// read it as an instruction and this lint would quote it verbatim in a
+    /// finding -- a report-level leak `judgment_prompt`'s own redaction does
+    /// not cover, since that only guards the model-prompt path.
+    #[test]
+    fn lint_redundancy_never_quotes_a_settings_surfaces_own_values() {
+        let surfaces = vec![Surface {
+            layer: Layer::CodexProjectSettings,
+            path: PathBuf::from("/repo/.codex/config.toml"),
+            text: "notes = \"\"\"\n- always run tests\n- always run tests\n\"\"\"\n".to_string(),
+        }];
+
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
+        assert!(
+            findings.is_empty(),
+            "a settings surface's own value lines must never be treated as instructions: {findings:?}"
+        );
     }
 
     #[test]
@@ -3881,6 +4965,10 @@ mod tests {
             verified,
             source: "explicit".to_string(),
             body: body.to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
         };
         crate::commands::ctx::memory::remember(state, slug, &entry, &cfg).expect("seed memory");
     }

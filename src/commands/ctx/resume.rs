@@ -157,8 +157,7 @@ pub fn run_with<W: Write>(
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
 
     let memory_slug = super::state::repo_slug(repo);
-    let memory_entries =
-        super::memory::render_for_prompt(&state, &memory_slug, &cfg, super::state::now_secs());
+    let memory_entries = super::memory::render_for_prompt(&state, repo, &memory_slug, &cfg);
     let (user_extra, composed) = compose_prompt(
         adapter.as_ref(),
         crate::utils::home_dir().ok().as_deref(),
@@ -166,7 +165,7 @@ pub fn run_with<W: Write>(
         args.simple,
         &cfg.prompt,
         &memory_entries,
-        cfg.memory.max_injected_bytes,
+        cfg.memory.core_max_bytes,
         &args.extra,
     );
     // M2: attribution is logged per session, not once per verb. A resumed run
@@ -622,6 +621,53 @@ mod tests {
         assert!(
             !composed.text.contains("zirv worker conventions"),
             "a resumed session must never be coached as a delegated worker: {}",
+            composed.text
+        );
+    }
+
+    /// Issue #34 seam coverage (memory review, fix round): `run_with` passes
+    /// `memory_entries` and `cfg.memory.core_max_bytes` into `compose_prompt`
+    /// (line ~161) -- this proves that composition step actually carries the
+    /// memory core layer, bounded by whatever cap is handed in, rather than
+    /// dropping it or ignoring the cap. `run_with` itself `exec`s over
+    /// itself on unix, so it is `compose_prompt` (already split out for that
+    /// reason) that gets exercised directly here.
+    #[test]
+    fn compose_prompt_carries_the_memory_layer_under_its_configured_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let entries = [crate::commands::ctx::prompt::MemoryLine {
+            key: "seam-fact".to_string(),
+            body: format!("{}TAIL_MARKER_NOT_TRUNCATED", "z".repeat(200)),
+            verified: 1,
+            written: 1,
+            shared: false,
+        }];
+
+        let adapter =
+            crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let cfg = crate::commands::ctx::config::PromptConfig::default();
+        let (_, composed) =
+            compose_prompt(&adapter, Some(&home), &repo, false, &cfg, &entries, 40, &[]);
+        let composed = composed.expect("composed");
+
+        assert!(
+            composed.text.contains("seam-fact"),
+            "the memory core layer must reach the composed prompt: {}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("TAIL_MARKER_NOT_TRUNCATED"),
+            "a tiny configured cap must actually bound the delivered memory layer: {}",
+            composed.text
+        );
+        assert!(
+            composed.text.contains("[memory truncated:"),
+            "the truncation must be visible, not silent: {}",
             composed.text
         );
     }

@@ -419,8 +419,7 @@ pub(crate) fn dash_orchestrator_pane(
     simple: bool,
 ) -> CtxResult<PaneSpec> {
     let slug = super::state::repo_slug(repo);
-    let memory_entries =
-        super::memory::render_for_prompt(state, &slug, cfg, super::state::now_secs());
+    let memory_entries = super::memory::render_for_prompt(state, repo, &slug, cfg);
     // Only an Orchestrator session hears about other harnesses at all; see
     // `prompt::PromptSource::Harnesses`.
     let harness_lines = if launch.role == PromptRole::Orchestrator {
@@ -435,7 +434,7 @@ pub(crate) fn dash_orchestrator_pane(
         &cfg.prompt,
         launch.role,
         &memory_entries,
-        cfg.memory.max_injected_bytes,
+        cfg.memory.core_max_bytes,
         &harness_lines,
     );
     let (mut argv, composed) = super::prompt::merge_command_line_prompt(
@@ -732,6 +731,70 @@ mod tests {
             pane.argv.first().map(String::as_str),
             Some("/nonexistent/fake-claude"),
             "the launch program is still the adapter's own binary: {argv}"
+        );
+    }
+
+    /// Issue #34 seam coverage (memory review, fix round): the dashboard
+    /// orchestrator pane's composed prompt must actually carry the memory
+    /// core layer, bounded by the CONFIGURED `cfg.memory.core_max_bytes` --
+    /// not a hardcoded default. A tiny cap forces `prompt::with_memory_layer`
+    /// to truncate, which only happens if the seam really threads the
+    /// configured value through (see `with_memory_layer`'s own truncation
+    /// note).
+    #[test]
+    fn the_dash_orchestrator_pane_carries_the_memory_layer_under_its_configured_cap() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.core_max_bytes = 40;
+        let slug = crate::commands::ctx::state::repo_slug(tmp.path());
+
+        crate::commands::ctx::memory::remember(
+            &state,
+            &slug,
+            &crate::commands::ctx::memory::Entry {
+                key: "seam-fact".to_string(),
+                written_by: "test".to_string(),
+                written: 1,
+                verified: 1,
+                source: "explicit".to_string(),
+                body: format!("{}TAIL_MARKER_NOT_TRUNCATED", "z".repeat(200)),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+            &cfg,
+        )
+        .expect("remember");
+
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let launch = build_launch(&adapter, None, &[]);
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+        )
+        .expect("pane");
+
+        let argv = pane.argv.join(" ");
+        assert!(
+            argv.contains("seam-fact"),
+            "the memory core layer must reach the composed prompt: {argv}"
+        );
+        assert!(
+            !argv.contains("TAIL_MARKER_NOT_TRUNCATED"),
+            "a tiny core_max_bytes must actually bound the delivered memory layer: {argv}"
+        );
+        assert!(
+            argv.contains("[memory truncated:"),
+            "the truncation must be visible, not silent: {argv}"
         );
     }
 

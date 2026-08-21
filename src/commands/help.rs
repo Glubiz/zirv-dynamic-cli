@@ -119,6 +119,11 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     )?;
     writeln!(
         writer,
+        "  memory         Manage the memory bank without an AI session (status, list, recall,"
+    )?;
+    writeln!(writer, "                 remember, forget, verify)")?;
+    writeln!(
+        writer,
         "  chat           Alias for `zirv ctx chat`: start an interactive orchestrator session"
     )?;
     writeln!(
@@ -368,6 +373,23 @@ shortcuts:
 
         assert!(text.contains("chat"), "got {text}");
         assert!(text.contains("agent"), "got {text}");
+        Ok(())
+    }
+
+    /// `zirv memory` is a top-level built-in with its own verb tree
+    /// (`is_top_level_memory` in `main.rs`); it belongs in the help listing
+    /// next to the other built-ins so it's discoverable, not just documented.
+    #[test]
+    fn help_lists_memory_as_a_built_in() -> Result<(), Box<dyn std::error::Error>> {
+        let empty = tempdir()?;
+        let home = tempdir()?;
+        let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
+
+        let mut out = Cursor::new(Vec::new());
+        show_help(&mut out)?;
+        let text = String::from_utf8(out.into_inner())?;
+
+        assert!(text.contains("memory"), "got {text}");
         Ok(())
     }
 

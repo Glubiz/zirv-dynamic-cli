@@ -291,6 +291,93 @@ impl AgentAdapter for CodexAdapter {
         }
     }
 
+    /// Codex's descriptors come from the repo's **recorded** facts
+    /// (docs/superpowers/notes/2026-07-31-codex-cli-facts.md, and the
+    /// `distiller_cmd` notes above), not from a live CLI: codex is not
+    /// runnable on the machine this was written on, so anything not in those
+    /// notes is reported unsupported rather than guessed at.
+    ///
+    /// `-s, --sandbox <read-only|workspace-write|danger-full-access>` is the
+    /// one verified enforcement flag, and it scopes what a codex-*executed
+    /// shell command may write*, not whether shell commands may execute or
+    /// which of codex's own tools may run (see `docs/obsidian/Concepts/
+    /// Untrusted Configuration.md`). That distinction matters per capability:
+    ///
+    /// - **Repo filesystem writes** are `Degraded` at `Deny`: read-only really
+    ///   does block writes inside the repo, just not by denying any tool.
+    /// - **Writes outside the repo** are `Degraded` at `Deny` the same way,
+    ///   via `--sandbox workspace-write` (writes confined to the workspace).
+    ///
+    ///   **These two descriptors name mechanisms that conflict, not merely
+    ///   differ.** `--sandbox` is a single flag with one value per launch:
+    ///   `read-only` cannot be passed alongside `workspace-write` on the same
+    ///   command line. So a policy asking to deny `repo_fs_write` *and* deny
+    ///   `outside_repo_fs_write` in the same launch cannot have both
+    ///   descriptors' mechanisms honored at once -- issue #44's pin
+    ///   construction, which turns an `EffectivePolicy` into actual argv,
+    ///   has to resolve that conflict itself (e.g. `read-only` is the
+    ///   stricter of the two and implies the other, so it should win), not
+    ///   assume each capability's mechanism composes independently the way
+    ///   claude's tool-name pins do.
+    /// - **Shell execution** is `Unsupported` at `Deny`: read-only scopes what
+    ///   a command may write, it does not stop a command from running at
+    ///   all. A worker under `--sandbox read-only` can still run, say,
+    ///   `cat ~/.aws/credentials` -- reading is untouched by a write-scoping
+    ///   flag, so claiming `Degraded` here would overstate what the sandbox
+    ///   does.
+    /// - **Approval** is `Unsupported` at `Deny`: the sandbox flag is not
+    ///   codex's approval mechanism at all. Only codex's own `approval`
+    ///   setting in `~/.codex/config.toml` governs that (it appears in
+    ///   `codex exec`'s stdout preamble as `approval: never`), which zirv
+    ///   reads and never rewrites -- so an `Ask` stance is
+    ///   operator-controlled, but a `Deny` stance has no verified per-run pin
+    ///   at all (the only bypass flag verified on the CLI,
+    ///   `--dangerously-bypass-approvals-and-sandbox`, only ever *widens*).
+    /// - **Network** and **MCP/tool access** have no verified per-run flag.
+    ///   `--disable <FEATURE>` is a feature-flag switch, not a tool deny-list.
+    /// - **git push / destructive git** has none either, same as claude.
+    fn policy_support(
+        &self,
+        capability: crate::commands::ctx::policy::Capability,
+        stance: crate::commands::ctx::policy::Stance,
+    ) -> crate::commands::ctx::policy::CapabilityDescriptor {
+        use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
+
+        const SANDBOX: &str = "--sandbox read-only, which scopes what an executed shell command may write rather \
+             than which of codex's own tools may run (recorded facts only -- not verified against \
+             a live codex CLI)";
+        const WORKSPACE: &str = "--sandbox workspace-write, which keeps writes inside the workspace (documented, not \
+             verified against a live codex CLI)";
+        const CONFIG: &str = "codex's own `approval` setting in ~/.codex/config.toml, which zirv reads and never \
+             rewrites";
+        const SHELL_EXEC_DENY_UNSUPPORTED: &str = "--sandbox read-only scopes what a command may write, not whether it may run at \
+             all -- a command still executes under it and can read anything the process can \
+             reach (e.g. `cat ~/.aws/credentials`); codex has no verified per-run flag that \
+             denies shell execution itself";
+        const APPROVAL_DENY_UNSUPPORTED: &str = "--sandbox read-only is not codex's approval mechanism; only codex's own \
+             `approval` setting in ~/.codex/config.toml governs that, and zirv reads it but \
+             never rewrites it";
+
+        match (capability, stance) {
+            (Capability::RepoFsWrite, Stance::Deny) => CapabilityDescriptor::degraded(SANDBOX),
+            (Capability::OutsideRepoFsWrite, Stance::Deny) => {
+                CapabilityDescriptor::degraded(WORKSPACE)
+            }
+            (Capability::ShellExec, Stance::Deny) => {
+                CapabilityDescriptor::unsupported(SHELL_EXEC_DENY_UNSUPPORTED)
+            }
+            (Capability::Approval, Stance::Deny) => {
+                CapabilityDescriptor::unsupported(APPROVAL_DENY_UNSUPPORTED)
+            }
+            (Capability::ShellExec | Capability::Approval, Stance::Ask) => {
+                CapabilityDescriptor::operator_controlled(CONFIG)
+            }
+            // Network, MCP/tool access, git operations, and every `Ask` stance
+            // codex has no verified mechanism for -- see this method's own doc.
+            _ => CapabilityDescriptor::advisory_only(),
+        }
+    }
+
     fn launch_prefix_len(&self) -> usize {
         1 + self.bin_args.len()
     }
