@@ -17,6 +17,11 @@ cargo clippy --all-targets -- -D warnings
 
 - `src/main.rs` — CLI entry point, arg parsing, built-in command dispatch
 - `src/commands/` — Built-in commands (create, init, help, version)
+- `src/commands/workflow/` — Provider-neutral engineering workflows
+  - `skill.rs` / `capability.rs` — versioned skills, layered registry, logical capabilities
+  - `engine.rs` / `classify.rs` — durable phases and deterministic intent/complexity/risk
+  - `verification.rs` / `review.rs` — targeted checks, evidence, review packages/findings
+  - `artifact.rs` / `telemetry.rs` — static-first outputs and privacy-conscious statistics
 - `src/script_runner/` — Script execution engine
   - `script.rs` — Script data model and execution loop
   - `command.rs` — Single command execution with parameter substitution (`${var}`)
@@ -54,6 +59,23 @@ cargo clippy --all-targets -- -D warnings
 - `zirv ctx` is a built-in resolved in `main.rs` before YAML script lookup, so a
   `.zirv/ctx.yaml` script named `ctx` is shadowed. `.zirv/ctx.toml` is the ctx
   config file and is excluded from script listing in `help.rs`.
+- `skill`, `workflow`, `test`, `verify`, and `artifact` are also raw-argv
+  built-ins with an independent clap tree. `.zirv/verify.toml` is reserved
+  from script lookup.
+- Workflow state is Zirv-owned and durable; only the current step's selected
+  skill context is injected. Repository skills are untrusted requests and can
+  never widen operator policy/capabilities: a repo manifest may only ADD an id,
+  and one colliding with a built-in or operator-global skill is ignored with a
+  warning (operator-global may still override a built-in). The `[workflow]`
+  config section is `REPO_FORBIDDEN` in full: `repo_checks_enabled` gates
+  whether `.zirv/verify.toml` and `package.json` script commands execute at all
+  (off = listed with a skip line, never run, and never passing evidence),
+  `repo_skills_enabled` gates the repo skill layer, and the three
+  `telemetry_*` keys replaced plain `ZIRV_WORKFLOW_TELEMETRY*` environment
+  reads any repo script could set for itself. Repo-supplied check timeouts are
+  clamped to 900s and repo-supplied checks to 32, gate or no gate. The workflow
+  reviewer is pinned read-only through `AgentAdapter::read_only_args`, the same
+  flags `distiller_cmd` uses, because its prompt embeds a repo diff.
 - The rot engine is pure: no clock, no filesystem, no environment reads inside
   `rot.rs`, so the same events always produce the same verdict.
 - `wrap` must never make a session worse. No `unwrap`/`expect` on its hot path,

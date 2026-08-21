@@ -15,9 +15,21 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Replaces every character outside `[A-Za-z0-9-]` with `-`, the same rule the
-/// claude adapter uses for transcript directories.
+/// Canonicalizes first, then replaces every character outside `[A-Za-z0-9-]`
+/// with `-` -- the same rule the claude adapter uses for transcript
+/// directories.
+///
+/// The canonicalization is what makes this a single answer per repository.
+/// Callers reach it from both sides: some pass a path they canonicalized
+/// (`artifact::register`), some pass the raw `--repo` value or a bare
+/// `current_dir()` (`workflow stats`, verification reports, workflow state).
+/// On a machine where the two spellings differ -- macOS's `/var` ->
+/// `/private/var`, any symlinked checkout -- that split one repository's state
+/// across two slugs, so events were written where the reader never looked. A
+/// path that cannot be canonicalized (it does not exist yet, or is not
+/// readable) falls back to its own text, which is the pre-existing behavior.
 pub fn repo_slug(path: &Path) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     path.to_string_lossy()
         .chars()
         .map(|c| {
@@ -273,6 +285,33 @@ impl StateDir {
         self.0.join("memory")
     }
 
+    /// Durable provider-neutral workflow state. Each repository gets an
+    /// isolated slug directory; workflow prompts contain only the current
+    /// step, while completed-step state stays here across compaction/restart.
+    pub fn workflows(&self) -> PathBuf {
+        self.0.join("workflows")
+    }
+
+    /// Structured verification evidence, separate from workflow state so a
+    /// check run can be used before a workflow exists and referenced by later
+    /// review/verification phases without embedding its raw logs in prompts.
+    pub fn verification(&self) -> PathBuf {
+        self.0.join("verification")
+    }
+
+    /// Artifact metadata and stable IDs. Artifact payloads remain normal
+    /// repository/static files; only compact references are persisted here.
+    pub fn artifacts(&self) -> PathBuf {
+        self.0.join("artifacts")
+    }
+
+    /// Privacy-conscious workflow telemetry. Each event is a bounded
+    /// structured record; prompts, source code, and model responses never
+    /// enter this tree.
+    pub fn workflow_telemetry(&self) -> PathBuf {
+        self.0.join("workflow-telemetry")
+    }
+
     /// The dashboard's own state: today, only the spawn-request capability-
     /// token directories `super::dash::spawnreq::request_dir_for` names
     /// under `<state>/dash/<dash_short>-<token>/requests`. A future roster
@@ -463,6 +502,39 @@ mod tests {
             repo_slug(std::path::Path::new("/Users/x/Documents/my repo.git")),
             "-Users-x-Documents-my-repo-git"
         );
+    }
+
+    /// One repository, one slug, whichever spelling of its path a caller
+    /// happens to hold. Callers reach this from both sides -- a canonicalized
+    /// path in one place, a raw `--repo` value or `current_dir()` in another --
+    /// and a split slug means events written where the reader never looks.
+    #[cfg(unix)]
+    #[test]
+    fn two_spellings_of_one_repository_share_a_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("repo");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert_eq!(repo_slug(&link), repo_slug(&real));
+        assert_eq!(
+            repo_slug(&real.join(".")),
+            repo_slug(&real),
+            "a path that needs normalising resolves to the same slug"
+        );
+        // A path that does not exist keeps its own text, as before.
+        let missing = tmp.path().join("gone");
+        assert_eq!(repo_slug(&missing), {
+            let mut expected = String::new();
+            for ch in missing.to_string_lossy().chars() {
+                expected.push(if ch.is_ascii_alphanumeric() || ch == '-' {
+                    ch
+                } else {
+                    '-'
+                });
+            }
+            expected
+        });
     }
 
     #[cfg(unix)]

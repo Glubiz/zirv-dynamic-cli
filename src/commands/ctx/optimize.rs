@@ -2036,6 +2036,10 @@ mod tests {
             std::process::Command::new("true")
         }
 
+        fn read_only_args(&self) -> Vec<String> {
+            Vec::new()
+        }
+
         fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
             Vec::new()
         }

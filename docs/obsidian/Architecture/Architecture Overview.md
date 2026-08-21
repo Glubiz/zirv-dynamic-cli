@@ -1,13 +1,13 @@
 ---
-last-verified: 2026-08-12
+last-verified: 2026-08-20
 ---
 
 # Architecture Overview
 
 ## Quick Reference
 
-- Single binary crate `zirv`. Entry point `src/main.rs` intercepts `ctx` and top-level help *before* clap even parses, then dispatches to a built-in command or falls through to `.zirv/` script resolution.
-- Module map: `main.rs` (dispatch) -> `input.rs` (clap args + script-path resolution) -> `utils.rs` (file parsing, shortcuts, suggestions) -> `script_runner/` (execution engine). `commands/` holds the built-ins (`create`, `help`, `init`, `version`) plus the much larger `commands/ctx/` subsystem.
+- Single binary crate `zirv`. Entry point `src/main.rs` intercepts `ctx`, workflow commands, aliases, and top-level help before legacy clap/script resolution.
+- Module map: `main.rs` (dispatch) -> top-level built-ins, `commands/workflow/`, `commands/ctx/`, or `input.rs`/`script_runner/` for legacy scripts. `commands/workflow/` owns provider-neutral development methodology and durable lifecycle state; `commands/ctx/` owns agent supervision/context.
 - **If changed:** update [[Script Resolution]] (dispatch order lives in `main.rs`), [[Technology Stack]] (if a module gains/drops a dependency), [[Script Runner]] and [[Ctx Subsystem]] (module-level detail for their halves of the tree).
 - **Gotchas:** `zirv ctx` is matched on raw `argv[1]`, ahead of clap parsing — a `.zirv/ctx.yaml` script named `ctx` can never be reached (see [[Script Resolution]]). `zirv --help`/`-h` is also intercepted on raw argv so clap's auto-generated help never fires.
 
@@ -24,6 +24,7 @@ src/
 │   ├── help.rs             # `zirv help` / `h` — usage + script/shortcut listing
 │   ├── init.rs             # `zirv init` / `i` — creates a .zirv directory
 │   ├── version.rs          # `zirv version` / `v`
+│   ├── workflow/            # skills, workflows, risk, tests, reviews, artifacts, telemetry
 │   └── ctx/                # `zirv ctx <verb>` — AI-agent context management subsystem
 └── script_runner/
     ├── script.rs           # Script model + run loop
@@ -37,7 +38,7 @@ src/
     └── mod.rs                # execute(): build_context + Script::run
 ```
 
-See [[Script Runner]] for the execution-loop internals, [[Ctx Subsystem]] for the `commands/ctx/` module breakdown, and [[Utilities]] for what lives in `utils.rs`.
+See [[Script Runner]] for the execution-loop internals, [[Workflows]] for the development lifecycle, [[Ctx Subsystem]] for the `commands/ctx/` module breakdown, and [[Utilities]] for what lives in `utils.rs`.
 
 ## Execution flow
 
@@ -45,7 +46,9 @@ See [[Script Runner]] for the execution-loop internals, [[Ctx Subsystem]] for th
 graph TB
     A[argv collected in main] --> B{argv[1] == 'ctx'?}
     B -- yes --> C[ctx::dispatch - exits process]
-    B -- no --> D{is_top_level_help:<br/>argv[1] in --help/-h?}
+    B -- no --> W{workflow command?}
+    W -- yes --> WC[workflow::dispatch]
+    W -- no --> D{is_top_level_help:<br/>argv[1] in --help/-h?}
     D -- yes --> E[show_help, return]
     D -- no --> F[Input::parse via clap]
     F --> G{misplaced create-only flag<br/>on a non-create command?}

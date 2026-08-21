@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-15
+last-verified: 2026-08-20
 ---
 
 # _system-context
@@ -35,6 +35,7 @@ Dispatch order matters: `ctx` and top-level `--help` are matched on **raw argv**
 |---|---|---|---|
 | Script runner core | `src/script_runner/{script,command,command_types,options,agent_command,fallback_command,operating_system,secret}.rs`, `mod.rs` | [[Script Runner]] | Parses/executes a `Script`: shell steps, concurrent terminal blocks, supervised agent steps |
 | Built-ins & entry point | `src/main.rs`, `src/input.rs`, `src/commands/{mod,create,init,help,version}.rs` | [[Built-in Commands]] | Dispatch table; `help`/`version`/`init`/`create` and their aliases |
+| Development workflows | `src/commands/workflow/` | [[Workflows]] | Skills/capabilities, durable lifecycle state, risk classification, verification, review, artifacts, telemetry |
 | Utilities | `src/utils.rs` | [[Utilities]] | File parsing, reserved names, shortcuts struct, home dir, Levenshtein "did you mean" |
 | Ctx hub / verb tree | `src/commands/ctx/{mod,config,state,log}.rs` | [[Ctx Subsystem]] | `CtxCli`/`CtxVerb`, dispatch + parse-failure classification, layered `CtxConfig`, `StateDir`, decision log |
 | Ctx verb modules | `src/commands/ctx/{score,handoff,resume,hook,status,chat,agent,mail,sessions,memory,memory_cli}.rs` | [[Ctx Subsystem]] | One module per verb: read-transcript/decide/maybe-write-state, the meta-harness verbs (chat/agent/mail), the session registry + nudge, the memory bank, and its top-level `zirv memory` management surface |
@@ -81,6 +82,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 | How a script name resolves to a file | [[Script Resolution]], [[Shortcuts]] |
 | `main.rs` dispatch, built-in commands (`help`/`version`/`init`/`create`) | [[Built-in Commands]] |
 | Adding/changing a `zirv ctx` verb | [[Ctx Subsystem]] |
+| Skills, workflow phases, risk, verification, review, artifacts, telemetry | [[Workflows]], [[Untrusted Configuration]] |
 | `loop`/`exec`/`wrap` process supervision, raw mode, signals | [[Ctx Supervisors]] |
 | Claude/Codex launch commands, transcript parsing, the distiller restriction | [[Ctx Adapters]] |
 | Rot scoring thresholds, verdict logic, event model | [[Rot Engine]] |

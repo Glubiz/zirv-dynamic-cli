@@ -94,6 +94,23 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     writeln!(writer, "  create, c      Create a new script")?;
     writeln!(
         writer,
+        "  skill          Inspect model-agnostic engineering skills"
+    )?;
+    writeln!(
+        writer,
+        "  workflow       Run and inspect development workflows"
+    )?;
+    writeln!(
+        writer,
+        "  test           Run repository-aware verification checks"
+    )?;
+    writeln!(writer, "  verify         Run final repository verification")?;
+    writeln!(
+        writer,
+        "  artifact       Register and inspect workflow artifacts"
+    )?;
+    writeln!(
+        writer,
         "  ctx            Context management (score, loop, exec, wrap, handoff, resume,"
     )?;
     writeln!(

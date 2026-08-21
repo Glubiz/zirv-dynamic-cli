@@ -642,8 +642,12 @@ impl AgentAdapter for ClaudeAdapter {
             .arg(model)
             .arg("--output-format")
             .arg("text")
-            .arg("--disallowedTools=Write,Edit,Bash,NotebookEdit");
+            .args(self.read_only_args());
         cmd
+    }
+
+    fn read_only_args(&self) -> Vec<String> {
+        vec!["--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string()]
     }
 
     /// A real, verified cheap-model name for claude's own lineup -- the

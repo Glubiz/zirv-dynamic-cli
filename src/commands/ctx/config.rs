@@ -314,6 +314,43 @@ impl Default for MailConfig {
     }
 }
 
+/// Operator-only switches over the workflow subsystem
+/// (`src/commands/workflow/`). Every key here is `REPO_FORBIDDEN`: each one
+/// decides whether repository-authored content -- shell commands in
+/// `.zirv/verify.toml`, `npm run` scripts named by `package.json`, skill
+/// methodology in `.zirv/skills/` -- gets executed or injected at all, or how
+/// long local telemetry is kept, and a checkout must never be able to answer
+/// that for the operator.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowConfig {
+    /// Whether repository-supplied verification checks may actually run.
+    /// When false they are still listed in the report, with a skip line, so
+    /// an operator can see what the repo asked for without running it.
+    pub repo_checks_enabled: bool,
+    /// Whether `.zirv/skills/` manifests are loaded at all. Repository
+    /// skills can only ever *add* ids (see `skill::load_dir`); this turns the
+    /// whole layer off.
+    pub repo_skills_enabled: bool,
+    /// Local workflow telemetry. Previously read straight from the process
+    /// environment, which a repository script could set for itself.
+    pub telemetry_enabled: bool,
+    pub telemetry_max_events: usize,
+    pub telemetry_retention_days: u64,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            repo_checks_enabled: true,
+            repo_skills_enabled: true,
+            telemetry_enabled: true,
+            telemetry_max_events: 1000,
+            telemetry_retention_days: 30,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
@@ -565,6 +602,7 @@ pub struct CtxConfig {
     pub optimize: OptimizeConfig,
     pub prompt: PromptConfig,
     pub mail: MailConfig,
+    pub workflow: WorkflowConfig,
     pub memory: MemoryConfig,
     pub chrome: ChromeConfig,
     pub dash: DashConfig,
@@ -765,6 +803,31 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     ("ZIRV_CTX_MAIL_KEEP", &["mail", "keep"], EnvKind::Int),
+    (
+        "ZIRV_CTX_WORKFLOW_REPO_CHECKS",
+        &["workflow", "repo_checks_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_WORKFLOW_REPO_SKILLS",
+        &["workflow", "repo_skills_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_WORKFLOW_TELEMETRY",
+        &["workflow", "telemetry_enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS",
+        &["workflow", "telemetry_max_events"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS",
+        &["workflow", "telemetry_retention_days"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MEMORY", &["memory", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_MEMORY_HARVEST",
@@ -907,14 +970,20 @@ fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
             .parse::<f64>()
             .map(toml::Value::Float)
             .map_err(|_| format!("expected a number, got '{raw}'").into()),
-        EnvKind::Bool => raw
-            .parse::<bool>()
-            .map(toml::Value::Boolean)
-            .map_err(|_| format!("expected true or false, got '{raw}'").into()),
-        EnvKind::NegatedBool => raw
-            .parse::<bool>()
-            .map(|b| toml::Value::Boolean(!b))
-            .map_err(|_| format!("expected true or false, got '{raw}'").into()),
+        EnvKind::Bool => parse_bool(raw).map(toml::Value::Boolean),
+        EnvKind::NegatedBool => parse_bool(raw).map(|b| toml::Value::Boolean(!b)),
+    }
+}
+
+/// `true`/`false`, plus `1`/`0`: an operator writing `ZIRV_CTX_..._TELEMETRY=0`
+/// means "off", and `bool::from_str` alone rejects that -- which for a
+/// privacy opt-out is the one failure mode that must not happen silently.
+/// Anything else is still a loud error rather than a guess.
+fn parse_bool(raw: &str) -> CtxResult<bool> {
+    match raw.trim() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        other => Err(format!("expected true or false, got '{other}'").into()),
     }
 }
 
@@ -973,6 +1042,34 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // for anyone running zirv there, with no operator-visible sign that it
     // happened.
     (&["chrome", "events"], "ZIRV_CTX_QUIET"),
+    // The workflow subsystem's own trust boundary, one entry per key so the
+    // error message names the exact one a checkout tried to set. A repo must
+    // not be able to re-enable execution of its own `.zirv/verify.toml`
+    // commands or its own `package.json` scripts after an operator turned
+    // that off, put its own untrusted skill methodology back into the prompt,
+    // or -- previously a plain `std::env::var` read, which any repo script
+    // could set for itself -- turn local telemetry on/off or stretch its
+    // retention out to years.
+    (
+        &["workflow", "repo_checks_enabled"],
+        "ZIRV_CTX_WORKFLOW_REPO_CHECKS",
+    ),
+    (
+        &["workflow", "repo_skills_enabled"],
+        "ZIRV_CTX_WORKFLOW_REPO_SKILLS",
+    ),
+    (
+        &["workflow", "telemetry_enabled"],
+        "ZIRV_CTX_WORKFLOW_TELEMETRY",
+    ),
+    (
+        &["workflow", "telemetry_max_events"],
+        "ZIRV_CTX_WORKFLOW_TELEMETRY_MAX_EVENTS",
+    ),
+    (
+        &["workflow", "telemetry_retention_days"],
+        "ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS",
+    ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
     // harvesting -- this is about the CONFIGURATION, not the shared scope's
@@ -2631,6 +2728,11 @@ mod tests {
         ("dash", "max_panes"),
         ("dash", "mouse"),
         ("dash", "idle_quiet_ms"),
+        ("workflow", "repo_checks_enabled"),
+        ("workflow", "repo_skills_enabled"),
+        ("workflow", "telemetry_enabled"),
+        ("workflow", "telemetry_max_events"),
+        ("workflow", "telemetry_retention_days"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),

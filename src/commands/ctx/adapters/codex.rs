@@ -257,8 +257,12 @@ impl AgentAdapter for CodexAdapter {
         if !model.is_empty() {
             cmd.arg("--model").arg(model);
         }
-        cmd.arg("--sandbox").arg("read-only");
+        cmd.args(self.read_only_args());
         cmd
+    }
+
+    fn read_only_args(&self) -> Vec<String> {
+        vec!["--sandbox".to_string(), "read-only".to_string()]
     }
 
     /// Codex's own model ladder, top to bottom: `gpt-5.6-sol` (the default

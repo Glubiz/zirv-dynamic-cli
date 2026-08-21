@@ -3,6 +3,7 @@ use std::path::Path;
 
 use clap::Parser;
 use commands::ctx;
+use commands::workflow;
 use commands::{
     create::{CreateOptions, create_script},
     help::show_help,
@@ -39,6 +40,16 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// user typed never reaches the verb tree.
 fn is_top_level_ctx(argv: &[String]) -> bool {
     argv.get(1).is_some_and(|s| s.eq_ignore_ascii_case("ctx"))
+}
+
+/// Workflow commands have their own clap tree and must be intercepted before
+/// the legacy script runner resolves a same-named file under `.zirv/`.
+fn is_top_level_workflow_command(argv: &[String]) -> bool {
+    argv.get(1).is_some_and(|name| {
+        workflow::TOP_LEVEL_COMMANDS
+            .iter()
+            .any(|command| name.eq_ignore_ascii_case(command))
+    })
 }
 
 /// True when argv[1] names the `memory` built-in, compared case-insensitively
@@ -133,6 +144,10 @@ async fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if is_top_level_ctx(&argv) {
         std::process::exit(ctx::dispatch(&argv[1..]));
+    }
+
+    if is_top_level_workflow_command(&argv) {
+        std::process::exit(workflow::dispatch(&argv));
     }
 
     if is_top_level_memory(&argv) {
@@ -313,6 +328,10 @@ mod tests {
             Some("agent")
         );
         assert_eq!(top_level_ctx_alias(&argv(&["zirv", "build"])), None);
+
+        assert!(is_top_level_workflow_command(&argv(&["zirv", "skill"])));
+        assert!(is_top_level_workflow_command(&argv(&["zirv", "SKILL"])));
+        assert!(!is_top_level_workflow_command(&argv(&["zirv", "build"])));
     }
 
     /// FINDING 2: every reserved command name -- whatever its casing -- is

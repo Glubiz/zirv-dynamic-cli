@@ -235,6 +235,17 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// uses to turn `Option<&str>` config into this parameter.
     fn distiller_cmd(&self, model: &str) -> Command;
 
+    /// The flags that keep this agent from writing files or running shell
+    /// commands: claude's `--disallowedTools=...`, codex's `--sandbox
+    /// read-only`. This is the pin `distiller_cmd` applies, exposed on the
+    /// trait so any other child that embeds untrusted repository text in its
+    /// prompt (the workflow reviewer, which is handed a repo diff) applies the
+    /// *same* restriction instead of a hardcoded copy that can drift from it.
+    ///
+    /// No default: a new adapter has to answer this deliberately rather than
+    /// inherit "no restriction" by omission.
+    fn read_only_args(&self) -> Vec<String>;
+
     /// The model name to use for the judgment/distiller child when the
     /// operator has not named one explicitly (`handoff.model`/`optimize.
     /// model` both empty/unset). `None` -- the default, and codex's own
@@ -932,6 +943,18 @@ pub fn provider_for_agent_name(name: Option<&str>) -> &'static str {
     name.and_then(|n| ADAPTERS.iter().find(|(adapter_name, _)| *adapter_name == n))
         .map(|(_, ctor)| ctor(None).provider())
         .unwrap_or(super::window::LEGACY_USAGE_PROVIDER)
+}
+
+/// `AgentAdapter::read_only_args` for a registered adapter name, without
+/// requiring that adapter to be enabled or ready -- the same static-fact
+/// lookup through `ADAPTERS` that `provider_for_agent_name` does. `None` for
+/// an unknown name, so a caller that must not launch an unpinned child can
+/// refuse rather than guess an empty restriction.
+pub fn read_only_args_for_agent_name(name: &str) -> Option<Vec<String>> {
+    ADAPTERS
+        .iter()
+        .find(|(adapter_name, _)| *adapter_name == name)
+        .map(|(_, ctor)| ctor(None).read_only_args())
 }
 
 /// Final wave item 4: `provider_for_agent_name(cfg.agent)` alone gets an

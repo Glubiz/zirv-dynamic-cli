@@ -16,6 +16,7 @@ pub const SCRIPT_DIR_NAME: &str = ".zirv";
 /// shortcut sharing one of these names can never be reached.
 pub const RESERVED_COMMANDS: &[&str] = &[
     "help", "h", "version", "v", "init", "i", "create", "c", "ctx", "chat", "agent", "memory",
+    "skill", "workflow", "test", "verify", "artifact",
 ];
 
 /// Compared case-insensitively, the same way `is_reserved_zirv_file` compares
@@ -31,12 +32,17 @@ pub fn is_reserved_command(name: &str) -> bool {
 }
 
 /// File names inside a `.zirv` directory that are zirv's own configuration
-/// rather than an invocable script: the shortcuts map and the two config
-/// files (`ctx.toml`, `.settings.toml`). Shared by script listing
+/// rather than an invocable script: the shortcuts map plus `ctx.toml`,
+/// `.settings.toml`, and workflow verification config. Shared by script listing
 /// (`candidate_names_in_dir`, `help.rs`) and script lookup (`input.rs`'s
 /// `find_script_in_dir`), so a name like `.settings` can never resolve to
 /// `.settings.toml` by way of the usual `{name}.{ext}` search.
-pub const RESERVED_ZIRV_FILES: &[&str] = &[".shortcuts.yaml", "ctx.toml", ".settings.toml"];
+pub const RESERVED_ZIRV_FILES: &[&str] = &[
+    ".shortcuts.yaml",
+    "ctx.toml",
+    ".settings.toml",
+    "verify.toml",
+];
 
 /// Whether `name` is one of `RESERVED_ZIRV_FILES`, compared the way the
 /// filesystem that put it there will resolve it: case-insensitively on
@@ -435,6 +441,7 @@ mod tests {
         assert!(is_reserved_zirv_file(".Settings.toml"));
         assert!(is_reserved_zirv_file(".SETTINGS.TOML"));
         assert!(is_reserved_zirv_file("CTX.toml"));
+        assert!(is_reserved_zirv_file("VERIFY.toml"));
         assert!(is_reserved_zirv_file(".Shortcuts.YAML"));
         assert!(!is_reserved_zirv_file("build.yaml"));
     }

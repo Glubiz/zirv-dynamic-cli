@@ -93,6 +93,20 @@ pub enum Event {
     },
     /// Supervision degraded to permanent passthrough, naming what caused it.
     Degraded { cause: String },
+    /// The ctx configuration could not be parsed, so the workflow subsystem's
+    /// two gates over repository-provided input (`workflow.repo_checks_enabled`
+    /// and `workflow.repo_skills_enabled`) both closed. A repository checkout
+    /// controls a file in that layered config, so an unreadable config must
+    /// never be a way to *widen* what the checkout may contribute -- and the
+    /// operator has to be told, because zirv is now running with less of the
+    /// repository's own input than the repository asked for.
+    WorkflowGatesClosed { reason: String },
+    /// The active workflow step's skill context could not be rendered, so the
+    /// composed prompt is missing its workflow layer. A repository skill
+    /// manifest that will not load is the usual cause, and the whole layer
+    /// used to disappear in silence (`.ok().flatten()`) -- leaving a session
+    /// running with no methodology and no way to notice.
+    WorkflowLayerSkipped { reason: String },
     /// Context health is slipping (the rot advisory `wrap`'s pump used to
     /// build by hand as `advisory_line`).
     RotAdvisory { score: u32, tokens: u64 },
@@ -231,6 +245,13 @@ impl Event {
                 "pacing: throttling the {window} window at {percent:.1}%, ~{delay_secs}s before the next run"
             ),
             Event::Degraded { cause } => format!("supervision degraded: {cause}"),
+            Event::WorkflowGatesClosed { reason } => format!(
+                "ctx config unreadable, so repo-provided workflow checks and skills are disabled: \
+                 {reason}"
+            ),
+            Event::WorkflowLayerSkipped { reason } => {
+                format!("workflow step context skipped: {reason}")
+            }
             Event::RotAdvisory { score, tokens } => format!(
                 "context health is slipping (score {score}, {tokens} tokens in context); a \
                  /compact soon will keep instruction-following sharp"

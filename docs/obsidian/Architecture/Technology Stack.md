@@ -1,12 +1,12 @@
 ---
-last-verified: 2026-08-17
+last-verified: 2026-08-20
 ---
 
 # Technology Stack
 
 ## Quick Reference
 
-- Crate `zirv`, version 2.9.0, Rust edition 2024.
+- Crate `zirv`, version 2.14.0, Rust edition 2024.
 - Async runtime is `tokio` (multi-thread), used for process spawning throughout `script_runner/` and the `ctx` supervisors.
 - Release profile is tuned for a small, fast-starting CLI binary and sets `panic = "abort"` — see the Gotcha below.
 - **If changed:** update this page whenever a dependency is added, removed, or re-pinned in `Cargo.toml`. If the release profile changes (especially `panic`), also check [[Ctx Supervisors]] and [[Architecture Overview]] for correctness of any assumption built on it.
@@ -17,7 +17,7 @@ last-verified: 2026-08-17
 | Field | Value |
 |---|---|
 | name | `zirv` |
-| version | `2.9.0` |
+| version | `2.14.0` |
 | edition | `2024` |
 | license | MIT |
 | repository | https://github.com/Glubiz/zirv |
@@ -26,7 +26,7 @@ last-verified: 2026-08-17
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `clap` (derive) | 4.6.0 | CLI argument parsing for both the top-level `Input` struct and the `zirv ctx` subcommand tree |
+| `clap` (derive) | 4.6.0 | CLI argument parsing for the top-level `Input`, `zirv ctx`, and provider-neutral workflow command trees |
 | `serde` (derive) | 1.0.228 | Serialization/deserialization backbone for scripts and config |
 | `serde_yaml_ng` | 0.10.0 | YAML script parsing (`.yaml`/`.yml`), and `.shortcuts.yaml` |
 | `serde_json` | 1.0.149 | JSON script parsing (`.json`) |
@@ -50,7 +50,7 @@ last-verified: 2026-08-17
 
 | Crate | Version | Scope | Purpose |
 |---|---|---|---|
-| `libc` | 0.2.183 | `cfg(unix)` | Unix system calls needed by `ctx` process/terminal primitives |
+| `libc` | 0.2.183 | `cfg(unix)` | Unix system calls needed by `ctx` process/terminal primitives and workflow process-group cleanup on verification or interactive-artifact timeout |
 | `windows-sys` (Win32_Foundation, Win32_Security, Win32_Storage_FileSystem, Win32_System_Console, Win32_System_IO, Win32_System_JobObjects, Win32_System_Pipes, Win32_System_Threading) | 0.61.2 | `cfg(windows)` | Console-mode and named-pipe APIs for `ctx wrap` on Windows. `Win32_System_JobObjects` (added 2026-08-16) is `ctx::supervise::JobGuard`'s kill-on-close job object, the kernel-enforced backstop that reaps a supervised agent's whole process tree when zirv itself dies with no user code running (`taskkill /F`, a crash, `panic = "abort"`) — see [[Ctx Supervisors]]. Named explicitly rather than relying on the transitive copy pulled in by `console`/`dirs-sys`/`mio`/`tempfile`, to avoid a second win32 binding crate |
 
 ### Dev-dependencies

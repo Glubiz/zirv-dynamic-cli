@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-20
+last-verified: 2026-08-21
 ---
 
 # Ctx Adapters
@@ -28,6 +28,7 @@ Defined in `mod.rs`, with `Debug` as a supertrait (so `Box<dyn AgentAdapter>` ca
 - `headless_cmd(prompt, session, extra)` — builds the one-shot, non-interactive command (`exec`'s launch shape).
 - `interactive_cmd(initial_prompt, extra)` — builds the TUI command (`wrap`'s launch shape).
 - `distiller_cmd(model)` — builds the command for the small judgment/summarization model child used by handoff distillation and `optimize`.
+- `read_only_args()` — the flags that keep this agent from writing files or running shell commands (claude `--disallowedTools=Write,Edit,Bash,NotebookEdit`, codex `--sandbox read-only`). `distiller_cmd` applies them, and so does any other child whose prompt embeds untrusted repository text — the workflow reviewer, handed a repository diff (see [[Workflows]]). No trait default: a new adapter has to answer deliberately rather than inherit "no restriction" by omission.
 - `system_prompt_args(prompt)` — argv that appends `prompt` to the agent's system prompt for one run; empty when the adapter has no verified mechanism.
 - `transcript_path(session)` — where this agent's own transcript file lives on disk.
 - `parse_events(jsonl)` / `structural_context(jsonl, last_n)` — turn a raw transcript into the ctx subsystem's normalized event stream and rolling structural summary. Must be line-local (each line's events depend only on that line), because `score.rs` feeds adapters only the bytes appended since the last incremental pass.

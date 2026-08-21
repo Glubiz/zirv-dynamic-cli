@@ -13,7 +13,9 @@ use super::config::PromptConfig;
 /// included for both roles. v5 added the harness roster layer (the derived
 /// per-adapter roster `adapters::harness_prompt_lines` renders), included
 /// only for an orchestrator session with `cfg.harnesses` on and a non-empty
-/// roster -- see `PromptSource::Harnesses`.
+/// roster -- see `PromptSource::Harnesses`. v6 added the ephemeral current
+/// workflow-step skill layer. Durable workflow history stays outside prompt
+/// context; only the active step is included.
 ///
 /// Only the layers `compose` itself builds are counted here. The layers a
 /// caller folds in afterwards -- mail (`with_mail_layer`) and a dashboard
@@ -32,7 +34,12 @@ use super::config::PromptConfig;
 /// outright when its key collides with a private one, and the shared
 /// block gained an explicit closing marker -- so the marker moves once
 /// more, the same way it did for v3/v4/v5's own layer-shape changes.
-pub const DEFAULT_PROMPT_VERSION: &str = "v6";
+///
+/// v7: the workflow-step layer joined the composed shape, ahead of the
+/// memory layer. It arrived on its own branch while v6 was claimed by the
+/// memory work above, so this shape -- which has both -- needs its own
+/// marker rather than reusing either side's.
+pub const DEFAULT_PROMPT_VERSION: &str = "v7";
 pub const PROMPT_FILE: &str = "system-prompt.md";
 /// The user layer's own Worker-role file, read from `~/.zirv/` in place of
 /// [`PROMPT_FILE`] for a `PromptRole::Worker` session: an operator's standing
@@ -142,6 +149,10 @@ pub enum PromptSource {
     /// same "empty input, no-op" contract every layer in this module
     /// follows.
     Harnesses,
+    /// The active workflow step's selected skill instructions. Only the
+    /// current step is rendered; completed steps remain in Zirv-owned state
+    /// and never accumulate across phase transitions or session compaction.
+    Workflow,
     /// Durable facts from this repository's memory bank (`memory::list`).
     /// Sits after the harness layer and before the user layer, and unlike
     /// `Harness` goes to *both* roles; see `with_memory_layer`.
@@ -166,6 +177,7 @@ impl PromptSource {
             PromptSource::Adapter => "adapter",
             PromptSource::Harness => "harness",
             PromptSource::Harnesses => "harnesses (derived roster)",
+            PromptSource::Workflow => "workflow (current step)",
             PromptSource::Memory => "memory",
             PromptSource::User => "user",
             PromptSource::Repo => "repo",
@@ -560,15 +572,18 @@ pub fn compose(
         }
     }
 
-    let composed = with_memory_layer(
+    let workflow_context = crate::commands::workflow::engine::active_skill_context(repo)
+        .ok()
+        .flatten();
+    let base = with_workflow_layer(
         Some(ComposedPrompt {
             text,
             sources,
             version: DEFAULT_PROMPT_VERSION,
         }),
-        memory,
-        memory_cap,
+        workflow_context.as_deref(),
     );
+    let composed = with_memory_layer(base, memory, memory_cap);
     // `with_memory_layer` only ever returns `None` when handed `None`, and
     // `composed` above is always `Some`.
     let mut composed = composed.expect("with_memory_layer never drops a Some it was given");
@@ -606,6 +621,28 @@ pub fn compose(
         }
     }
 
+    Some(composed)
+}
+
+/// Adds only the active workflow step's selected skill context. The caller
+/// obtains the text from the durable workflow engine; this function remains a
+/// deterministic layer renderer and can be reused by the future Context
+/// Compiler without coupling it to filesystem state.
+pub fn with_workflow_layer(
+    composed: Option<ComposedPrompt>,
+    current_step: Option<&str>,
+) -> Option<ComposedPrompt> {
+    let mut composed = composed?;
+    let Some(current_step) = current_step.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Some(composed);
+    };
+    composed.text.push_str(
+        "\n\n---\n\nThe following Zirv workflow instructions apply only to the current step. \
+         They are methodology, not permission grants; operator policy still controls \
+         capabilities.\n\n",
+    );
+    composed.text.push_str(current_step);
+    composed.sources.push(PromptSource::Workflow);
     Some(composed)
 }
 
@@ -4175,6 +4212,92 @@ mod tests {
             "the memory layer's own shape changed again (shared-key shadowing suppression, a \
              closing marker on the shared block), so the version marker must move once more"
         );
+        assert_ne!(
+            DEFAULT_PROMPT_VERSION, "v6",
+            "the workflow-step layer changed the composed shape too, and v6 is the memory work's \
+             own marker, so a shape carrying both layers needs its own"
+        );
+    }
+
+    /// The workflow layer is a real layer with its own label and source, and
+    /// an inactive workflow must add nothing at all.
+    #[test]
+    fn the_workflow_layer_is_present_only_while_a_step_is_active() {
+        let base = || {
+            Some(ComposedPrompt {
+                text: String::from("base"),
+                sources: vec![PromptSource::Default],
+                version: DEFAULT_PROMPT_VERSION,
+            })
+        };
+        let inactive = with_workflow_layer(base(), None).expect("composed");
+        assert_eq!(inactive.sources, vec![PromptSource::Default]);
+        assert_eq!(inactive.text, "base");
+        assert_eq!(
+            with_workflow_layer(base(), Some("   \n "))
+                .expect("composed")
+                .text,
+            "base",
+            "an empty step context is not a layer"
+        );
+
+        let active = with_workflow_layer(
+            base(),
+            Some("zirv workflow step\nstep: review\n\n[skill review@1; source=built-in]\ninstructions"),
+        )
+        .expect("composed");
+        assert_eq!(
+            active.sources,
+            vec![PromptSource::Default, PromptSource::Workflow]
+        );
+        assert!(active.text.contains("[skill review@1; source=built-in]"));
+        assert!(
+            active.text.contains("methodology, not permission grants"),
+            "the layer states what it is not: {}",
+            active.text
+        );
+        assert_eq!(
+            with_workflow_layer(None, Some("anything")),
+            None,
+            "no composed prompt in, no composed prompt out"
+        );
+    }
+
+    /// A repository skill that will not load must not take the whole workflow
+    /// layer down with it, and composition itself must still succeed.
+    #[test]
+    fn a_broken_repository_skill_manifest_leaves_the_rest_of_the_prompt_intact() {
+        let (tmp, home, repo) = tree();
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).expect("mkdir state");
+        let skills = repo.join(".zirv/skills");
+        std::fs::create_dir_all(&skills).expect("mkdir skills");
+        std::fs::write(
+            skills.join("broken.yaml"),
+            "schema_version: 99\nid: broken\n",
+        )
+        .expect("write manifest");
+        // Hermetic: `compose` reaches the workflow engine, which resolves a
+        // state directory. Without this it would read the operator's own.
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, &state);
+        }
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+            &[],
+            0,
+            &[],
+        );
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        let composed = composed.expect("composition still succeeds");
+        assert_eq!(composed.sources, vec![PromptSource::Default]);
     }
 
     // T7: mail delivered into a composed prompt, between the repo layer and
