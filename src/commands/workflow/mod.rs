@@ -16,6 +16,7 @@ pub mod capability;
 pub mod classify;
 pub mod engine;
 pub mod frontend;
+pub mod frontend_detector;
 pub mod review;
 pub mod skill;
 pub mod telemetry;

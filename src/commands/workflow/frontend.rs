@@ -82,6 +82,8 @@ pub struct FrontendArgs {
 pub enum FrontendSubcommand {
     /// Infer or inspect the repository's autonomous frontend profile.
     Profile(ProfileArgs),
+    /// Run Zirv's offline deterministic frontend quality detector.
+    Check(super::frontend_detector::DetectorArgs),
 }
 
 #[derive(Debug, Args)]
@@ -482,6 +484,9 @@ pub fn run(args: &FrontendArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 ensure_profile(&state, &repo)?
             };
             write_profile(writer, &profile, args.json)?;
+        }
+        FrontendSubcommand::Check(args) => {
+            return super::frontend_detector::run(args, writer);
         }
     }
     Ok(0)
