@@ -9,11 +9,15 @@
 //! discipline `rot.rs` holds for the same reason (CLAUDE.md).
 //!
 //! `zirv memory recall <query>` (`memory_cli.rs`) is the first live
-//! consumer, wired in this task. A future task's session-startup wiring
-//! (the compiler, issue #44) can reuse `candidates_for_repo`/`select`
-//! unchanged for the same "dormant read primitive, wired in later" pattern
-//! `memory::list_scoped` followed before `zirv memory` (issue #33)
-//! consumed it.
+//! consumer, wired in this task. It only ever fills in `query`: `cwd_path`
+//! and `changed_paths` are inert on that path today (`RetrievalContext`
+//! defaults them empty, so no path/module signal can fire), because
+//! `recall` is a one-shot CLI call with no session context to gather them
+//! from. A future task's session-startup wiring (the compiler, issue #44)
+//! is what will actually populate those two fields, and can reuse
+//! `candidates_for_repo`/`select` unchanged for the same "dormant read
+//! primitive, wired in later" pattern `memory::list_scoped` followed
+//! before `zirv memory` (issue #33) consumed it.
 
 use std::path::Path;
 
@@ -63,16 +67,31 @@ pub struct RetrievalContext {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ranked<'a> {
     pub candidate: &'a RetrievalCandidate,
+    /// The relevance floor is tested against THIS field, never `score`
+    /// (see `MIN_RELEVANCE_SCORE`'s doc comment): it is the key/keyword/
+    /// path signal total before importance/confidence/staleness modifiers
+    /// are applied, so a genuine match can never be pushed below the floor
+    /// by those modifiers alone.
+    pub base_score: i64,
     pub score: i64,
     pub reasons: Vec<String>,
 }
 
-/// A candidate needs at least this much score to be selectable at all --
-/// the floor that makes an empty/weak query degrade to "select nothing"
-/// rather than "select an arbitrary top N" (issue #35's acceptance
-/// criterion). A single keyword/path/key-substring hit clears it; nothing
-/// at all (bare importance/confidence/staleness adjustments only) does
-/// not.
+/// A candidate needs at least this much BASE score (key/keyword/path
+/// signals, before importance/confidence/staleness modifiers) to be
+/// selectable at all -- the floor that makes an empty/weak query degrade
+/// to "select nothing" rather than "select an arbitrary top N" (issue
+/// #35's acceptance criterion). A single keyword/path/key-substring hit
+/// clears it; nothing at all (bare importance/confidence/staleness
+/// adjustments only) does not.
+///
+/// This floor is checked against the BASE score, never the final
+/// (modifier-applied) score: staleness/importance/confidence only ever
+/// refine the ORDERING of an already-relevant match, and must never be
+/// able to erase it. Without this split, an exact-key match old enough
+/// (or low-importance/low-confidence enough) could accumulate a large
+/// enough negative modifier to drop below the floor and vanish from
+/// `zirv memory recall` entirely, even though the match itself is real.
 const MIN_RELEVANCE_SCORE: i64 = 1;
 
 fn normalized_words(text: &str) -> Vec<String> {
@@ -109,7 +128,7 @@ fn path_relates(entry_path: &str, other: &str) -> bool {
 /// unrelated query still clear `MIN_RELEVANCE_SCORE` on importance alone --
 /// exactly the "arbitrary top-N of the whole bank" issue #35's degrade-
 /// safely requirement rules out.
-fn score_one(candidate: &RetrievalCandidate, ctx: &RetrievalContext) -> (i64, Vec<String>) {
+fn score_one(candidate: &RetrievalCandidate, ctx: &RetrievalContext) -> (i64, i64, Vec<String>) {
     let mut base_score = 0i64;
     let mut reasons = Vec::new();
     let entry = &candidate.entry;
@@ -154,7 +173,7 @@ fn score_one(candidate: &RetrievalCandidate, ctx: &RetrievalContext) -> (i64, Ve
     // Modifiers below only apply once a real signal above has already
     // established relevance -- see this function's own doc comment.
     if base_score <= 0 {
-        return (base_score, reasons);
+        return (base_score, base_score, reasons);
     }
     let mut score = base_score;
 
@@ -182,7 +201,7 @@ fn score_one(candidate: &RetrievalCandidate, ctx: &RetrievalContext) -> (i64, Ve
         score -= staleness_penalty;
     }
 
-    (score, reasons)
+    (base_score, score, reasons)
 }
 
 /// PURE deterministic ranking (issue #35): identical `candidates`/`ctx` ->
@@ -197,9 +216,10 @@ pub fn rank<'a>(candidates: &'a [RetrievalCandidate], ctx: &RetrievalContext) ->
     let scored: Vec<Ranked> = candidates
         .iter()
         .map(|candidate| {
-            let (score, reasons) = score_one(candidate, ctx);
+            let (base_score, score, reasons) = score_one(candidate, ctx);
             Ranked {
                 candidate,
+                base_score,
                 score,
                 reasons,
             }
@@ -234,11 +254,14 @@ pub struct RetrievalSelection<'a> {
 
 /// Ranks, then greedily fills `max_bytes`/`max_entries` in rank order
 /// (private-first, the same structural precedence `rank` already
-/// establishes) -- a candidate below `MIN_RELEVANCE_SCORE` is never
-/// selected regardless of budget headroom, which is what makes an
-/// empty/weak query select nothing rather than an arbitrary top-N of the
-/// whole bank. An oversized entry is skipped rather than starving smaller
-/// ones behind it, the same rule `prompt::select_memory_within_cap` uses.
+/// establishes) -- a candidate whose BASE score is below
+/// `MIN_RELEVANCE_SCORE` is never selected regardless of budget headroom,
+/// which is what makes an empty/weak query select nothing rather than an
+/// arbitrary top-N of the whole bank. Checking the base score (not the
+/// final, modifier-adjusted `score`) is deliberate: a genuine match must
+/// never be erased by staleness/importance/confidence penalties alone. An
+/// oversized entry is skipped rather than starving smaller ones behind
+/// it, the same rule `prompt::select_memory_within_cap` uses.
 pub fn select<'a>(
     candidates: &'a [RetrievalCandidate],
     ctx: &RetrievalContext,
@@ -252,7 +275,7 @@ pub fn select<'a>(
     let mut over_budget = 0usize;
 
     for entry in ranked {
-        if entry.score < MIN_RELEVANCE_SCORE {
+        if entry.base_score < MIN_RELEVANCE_SCORE {
             below_relevance += 1;
             continue;
         }
@@ -488,8 +511,8 @@ mod tests {
         low.entry.importance = Some("low".to_string());
         low.entry.confidence = Some("low".to_string());
 
-        let (high_score, _) = score_one(&high, &ctx("release-notes"));
-        let (low_score, _) = score_one(&low, &ctx("release-notes"));
+        let (_, high_score, _) = score_one(&high, &ctx("release-notes"));
+        let (_, low_score, _) = score_one(&low, &ctx("release-notes"));
         assert!(
             high_score > low_score,
             "high importance/confidence must score above low: {high_score} vs {low_score}"
@@ -505,10 +528,14 @@ mod tests {
         let mut c = candidate("a", "body", false);
         c.entry.importance = Some("high".to_string());
         c.entry.confidence = Some("high".to_string());
-        let (score, reasons) = score_one(&c, &ctx(""));
+        let (base_score, score, reasons) = score_one(&c, &ctx(""));
         assert!(
-            score < MIN_RELEVANCE_SCORE,
-            "importance/confidence alone must not establish relevance: {score}, {reasons:?}"
+            base_score < MIN_RELEVANCE_SCORE,
+            "importance/confidence alone must not establish relevance: {base_score}, {reasons:?}"
+        );
+        assert_eq!(
+            base_score, score,
+            "with no real signal, base and final score must be equal (zero)"
         );
     }
 
@@ -521,12 +548,66 @@ mod tests {
         let mut stale = candidate("release-notes", "body", false);
         stale.verified_age_days = 400;
 
-        let (fresh_score, _) = score_one(&fresh, &ctx("release-notes"));
-        let (stale_score, _) = score_one(&stale, &ctx("release-notes"));
+        let (_, fresh_score, _) = score_one(&fresh, &ctx("release-notes"));
+        let (_, stale_score, _) = score_one(&stale, &ctx("release-notes"));
         assert!(
             fresh_score > stale_score,
             "a fresh entry must score above a stale one, all else equal"
         );
+    }
+
+    // Regression: the relevance floor is tested against the BASE score,
+    // never the final (modifier-adjusted) score -- staleness/importance/
+    // confidence must never be able to erase a genuine match.
+
+    #[test]
+    fn an_exact_key_match_survives_selection_even_when_verified_two_years_ago() {
+        let mut old = candidate("deploy-cmd", "run the deploy script", false);
+        old.verified_age_days = 730;
+        let candidates = [old];
+        let selection = select(&candidates, &ctx("deploy-cmd"), 4096, 6);
+        assert_eq!(
+            selection.selected.len(),
+            1,
+            "an exact key match must survive a heavy staleness penalty: {:?}",
+            selection.selected
+        );
+        assert_eq!(selection.below_relevance, 0);
+    }
+
+    #[test]
+    fn a_single_body_keyword_match_survives_selection_at_seventy_days_stale() {
+        let mut old = candidate(
+            "staging-db-creds",
+            "the staging DB creds live in 1Password",
+            false,
+        );
+        old.verified_age_days = 70;
+        let candidates = [old];
+        let selection = select(&candidates, &ctx("1password"), 4096, 6);
+        assert_eq!(
+            selection.selected.len(),
+            1,
+            "a body keyword match must survive a moderate staleness penalty: {:?}",
+            selection.selected
+        );
+        assert_eq!(selection.below_relevance, 0);
+    }
+
+    #[test]
+    fn an_entry_with_zero_base_relevance_still_drops_regardless_of_modifiers() {
+        let mut c = candidate("unrelated", "nothing to do with the query", false);
+        c.entry.importance = Some("high".to_string());
+        c.entry.confidence = Some("high".to_string());
+        c.verified_age_days = 0;
+        let candidates = [c];
+        let selection = select(&candidates, &ctx("release"), 4096, 6);
+        assert!(
+            selection.selected.is_empty(),
+            "zero base relevance must still drop even with favorable modifiers: {:?}",
+            selection.selected
+        );
+        assert_eq!(selection.below_relevance, 1);
     }
 
     // Precedence: private outranks shared, structurally.
