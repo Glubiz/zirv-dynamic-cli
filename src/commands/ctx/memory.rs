@@ -37,17 +37,75 @@ pub struct Entry {
     /// tolerance `mail::parse_markdown` gives unknown header values.
     pub source: String,
     pub body: String,
+    /// Coarse, free-form priority signal for later retrieval ranking (issue
+    /// #35) and lifecycle/staleness decisions (issue #38) -- by convention
+    /// "high"/"normal"/"low", but not enforced: like `source`, a hand-edited
+    /// value that doesn't match the convention is still kept as-is rather
+    /// than rejected. `None` when unset. `skip_serializing_if` keeps
+    /// `zirv ctx recall --json` emitting the pre-issue-#32 shape for any
+    /// entry that doesn't use this field -- every entry before this change,
+    /// and every entry since that never sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub importance: Option<String>,
+    /// Coarse, free-form confidence signal, same shape and parsing rules as
+    /// `importance`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// Free-form labels for keyword-based retrieval (issue #35). Rendered as
+    /// one comma-separated header line; empty when unset.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Repository paths this entry is about, for path-aware retrieval (issue
+    /// #35) and dead-reference checks (issue #38). Free text, not validated
+    /// against the filesystem here: a path that no longer exists is exactly
+    /// the kind of fact a later task wants to *detect*, not something this
+    /// store should silently reject. Rendered as one comma-separated header
+    /// line; empty when unset.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 impl Entry {
     /// Renders the `## Memory` header block (Key, Written-by, Written,
-    /// Verified, Source as list items) followed by the free markdown body.
+    /// Verified, Source as list items, plus Importance/Confidence/Tags/Paths
+    /// when set) followed by the free markdown body. The optional fields are
+    /// omitted entirely when unset rather than rendered empty, so an entry
+    /// that doesn't use them reads exactly as it did before they existed --
+    /// this is the "versionable" part of the schema (issue #32): a header
+    /// line absent from an old entry, or one a future task adds that this
+    /// parser doesn't know about, is simply not there or is skipped, never a
+    /// parse failure (see `parse_markdown`'s unknown-header tolerance).
     pub fn to_markdown(&self) -> String {
-        format!(
-            "## Memory\n- Key: {}\n- Written-by: {}\n- Written: {}\n- Verified: {}\n- Source: {}\n\n{}\n",
-            self.key, self.written_by, self.written, self.verified, self.source, self.body
-        )
+        let mut header = format!(
+            "## Memory\n- Key: {}\n- Written-by: {}\n- Written: {}\n- Verified: {}\n- Source: {}\n",
+            self.key, self.written_by, self.written, self.verified, self.source
+        );
+        if let Some(importance) = &self.importance {
+            header.push_str(&format!("- Importance: {importance}\n"));
+        }
+        if let Some(confidence) = &self.confidence {
+            header.push_str(&format!("- Confidence: {confidence}\n"));
+        }
+        if !self.tags.is_empty() {
+            header.push_str(&format!("- Tags: {}\n", self.tags.join(", ")));
+        }
+        if !self.paths.is_empty() {
+            header.push_str(&format!("- Paths: {}\n", self.paths.join(", ")));
+        }
+        format!("{header}\n{}\n", self.body)
     }
+}
+
+/// Splits a comma-separated header value (`Tags`/`Paths`) into trimmed,
+/// non-empty items -- the same "tolerant, never fails" spirit as the rest of
+/// this parser: a stray comma or extra space is normalized away rather than
+/// producing an empty tag.
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 /// Same bullet styles `mail::strip_bullet` accepts. Duplicated locally
@@ -78,6 +136,10 @@ pub fn parse_markdown(md: &str) -> Entry {
         verified: 0,
         source: "explicit".to_string(),
         body: String::new(),
+        importance: None,
+        confidence: None,
+        tags: Vec::new(),
+        paths: Vec::new(),
     };
     let mut in_entry = false;
     let mut in_header = false;
@@ -117,6 +179,10 @@ pub fn parse_markdown(md: &str) -> Entry {
                     "written" => entry.written = value.trim().parse().unwrap_or(0),
                     "verified" => entry.verified = value.trim().parse().unwrap_or(0),
                     "source" => entry.source = value.trim().to_string(),
+                    "importance" => entry.importance = Some(value.trim().to_string()),
+                    "confidence" => entry.confidence = Some(value.trim().to_string()),
+                    "tags" => entry.tags = split_csv(value),
+                    "paths" => entry.paths = split_csv(value),
                     // Unknown header inside the block: skipped, not an error.
                     _ => {}
                 }
@@ -194,20 +260,120 @@ fn slug_key(key: &str) -> String {
     }
 }
 
-/// Lists every entry stored for `slug`, oldest-written-first by filename
-/// order (the zero-padded seconds prefix each file name carries). Files that
-/// cannot be read are skipped rather than failing the whole listing. Reads
-/// only `state.memory().join(slug)` -- no repository path is ever consulted,
-/// so nothing checked into a repo can seed, alter, or hide what this
-/// returns.
-pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
-    let dir = state.memory().join(slug);
+/// Which memory bank an operation targets. `Private` is this operator's
+/// pre-existing machine-local bank -- `<state>/memory/<repo_slug>/`,
+/// unchanged by the introduction of scopes. `Shared` is a second,
+/// independent bank meant to be committed with the repository itself:
+/// `<repo>/.zirv/memory/`. Both scopes store the same `Entry` markdown
+/// format through the same parser; only the storage root and trust level
+/// differ. Shared content is repository-owned and therefore UNTRUSTED,
+/// exactly like `.zirv/ctx.toml`'s repo layer: a checkout can fill it with
+/// any text it likes, but nothing here ever reads that text back as
+/// configuration (see `shared_scope_content_is_never_read_back_as_
+/// configuration` below), and `CtxConfig`'s `REPO_FORBIDDEN` list keeps a
+/// repo from even switching the scope on for itself (`MemoryConfig::
+/// shared_enabled`). A shared `Entry`'s header fields (`Written`, `Verified`,
+/// `Written-By`, `Source`) are themselves attacker-supplied repo content, the
+/// same as the body -- a later task wiring this scope into ranking, recency,
+/// or overwrite-protection decisions (the way `write_harvested` trusts
+/// `Source == "explicit"` for the private scope today) must not treat any of
+/// them as trustworthy signal without its own independent check.
+// Consumed by the `zirv memory` CLI (`memory_cli.rs`, issue #33) and any
+// later injection work built on top of this store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryScope {
+    Shared,
+    Private,
+}
+
+impl MemoryScope {
+    /// Whether this scope may be used at all. `cfg.memory.enabled` is a
+    /// MASTER switch: `false` disables both scopes outright, so an operator
+    /// who turned memory off before the shared scope existed does not
+    /// silently start receiving repo-controlled prompt content on upgrade.
+    /// `shared_enabled` is a second, shared-only toggle underneath that
+    /// master switch -- `Shared` needs both flags on; `Private` only needs
+    /// the master switch, same as before scopes existed. Both flags are
+    /// `REPO_FORBIDDEN`.
+    pub fn enabled(self, cfg: &CtxConfig) -> bool {
+        if !cfg.memory.enabled {
+            return false;
+        }
+        match self {
+            MemoryScope::Private => true,
+            MemoryScope::Shared => cfg.memory.shared_enabled,
+        }
+    }
+
+    /// Names which flag is responsible for `!self.enabled(cfg)`, for an
+    /// error or advisory that wants to say why rather than just that.
+    /// Callers only ever call this after already checking `!enabled(cfg)`
+    /// -- meaningless otherwise, since then neither flag is actually at
+    /// fault. The master switch is checked first because it always wins:
+    /// if it is off, that is the reason regardless of `shared_enabled`'s
+    /// own value.
+    pub fn disabled_reason(self, cfg: &CtxConfig) -> &'static str {
+        if !cfg.memory.enabled {
+            "memory.enabled = false"
+        } else {
+            "memory.shared_enabled = false"
+        }
+    }
+
+    /// This scope's canonical storage directory, or `None` when the location
+    /// cannot be trusted (`Shared` only -- see `safe_shared_dir`). `Private`
+    /// always resolves; the directory may simply not exist yet, same as
+    /// before scopes existed.
+    pub fn dir(self, repo: &Path, state: &StateDir, slug: &str) -> Option<PathBuf> {
+        match self {
+            MemoryScope::Private => Some(state.memory().join(slug)),
+            MemoryScope::Shared => safe_shared_dir(repo),
+        }
+    }
+}
+
+/// `<repo>/.zirv/memory/`, refused (returned as `None`) if either it or
+/// `<repo>/.zirv` itself is a symlink. A repository checkout can commit a
+/// symlink at either level pointing anywhere on the filesystem; following it
+/// would read (and, once a later task adds writes, write) outside the
+/// repository the operator thinks they are trusting -- the same escape
+/// `optimize.rs`'s `nested_claude_files` refuses for `CLAUDE.md` discovery.
+/// `None` reads the same as "does not exist" to every caller here
+/// (`read_entries`'s own `!dir.is_dir()` short circuit), so an unsafe
+/// location is silently treated as an empty bank rather than an error. This
+/// is also the write path's traversal defense at the directory level;
+/// `upsert_shared`'s own `validate_shared_key` is the matching defense at the
+/// file-name level, since a shared entry's file name is its key.
+fn safe_shared_dir(repo: &Path) -> Option<PathBuf> {
+    let zirv_dir = repo.join(crate::utils::SCRIPT_DIR_NAME);
+    let dir = zirv_dir.join("memory");
+    let is_symlink = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+    };
+    if is_symlink(&zirv_dir) || is_symlink(&dir) {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Core directory scan shared by both scopes: reads every `.md` file in
+/// `dir`, parses it, and skips anything that fails to read -- the same
+/// tolerance every caller of `list` has always had. Symlinked entry files are
+/// always skipped rather than followed: a no-op for the private scope's own
+/// 0700 directory (nothing legitimate ever puts a symlink there), but
+/// load-bearing for the shared scope, where a committed symlink could
+/// otherwise make an arbitrary file on this machine read back as if it were a
+/// memory entry. One rule for both scopes rather than a per-call toggle: the
+/// private scope pays nothing for it, and the shared scope can never
+/// accidentally be called without it.
+fn read_entries(dir: &Path) -> CtxResult<Vec<(PathBuf, Entry)>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
 
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
         .flatten()
+        .filter(|entry| !entry.file_type().is_ok_and(|kind| kind.is_symlink()))
         .map(|entry| entry.path())
         .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md"))
         .collect();
@@ -221,6 +387,668 @@ pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
         out.push((path, parse_markdown(&text)));
     }
     Ok(out)
+}
+
+/// Lists every entry stored for `slug`, oldest-written-first by filename
+/// order (the zero-padded seconds prefix each file name carries). Files that
+/// cannot be read are skipped rather than failing the whole listing. Reads
+/// only `state.memory().join(slug)` -- no repository path is ever consulted,
+/// so nothing checked into a repo can seed, alter, or hide what this
+/// returns.
+pub fn list(state: &StateDir, slug: &str) -> CtxResult<Vec<(PathBuf, Entry)>> {
+    read_entries(&state.memory().join(slug))
+}
+
+/// Lists every entry in `scope`'s bank for this repository, gated on that
+/// scope's own `cfg.memory` switch (see `MemoryScope::enabled`) and, for
+/// `Shared`, on the directory's own safety (`safe_shared_dir`). Both
+/// conditions read the same as an absent bank -- an empty vector, never an
+/// error -- the same "disabled/missing means nothing" contract `list` and
+/// `render_for_prompt` already follow.
+///
+/// Consumed by the `zirv memory status`/`list`/`recall` verbs
+/// (`memory_cli.rs`, issue #33) and, since issue #34, by `render_for_prompt`
+/// for the shared half of the core prompt layer.
+///
+/// NOT a drop-in replacement for `list`: `list` ignores `cfg` entirely and
+/// always reads the private directory regardless of `memory.enabled`, which
+/// is why callers like `forget`/`forget_all` can still operate on a disabled
+/// bank (`prune_to_cap` similarly never consults `cfg` at all -- it does its
+/// own `read_dir`, not a call through `list`). `list_scoped` is gated on
+/// `scope.enabled(cfg)` and returns empty when the scope is off -- swapping
+/// one call for the other silently changes that "disabling reads must never
+/// trap data" behavior.
+pub fn list_scoped(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> CtxResult<Vec<(PathBuf, Entry)>> {
+    if !scope.enabled(cfg) {
+        return Ok(Vec::new());
+    }
+    let Some(dir) = scope.dir(repo, state, slug) else {
+        return Ok(Vec::new());
+    };
+    read_entries(&dir)
+}
+
+/// UNGATED sibling of `list_scoped`: ignores `scope.enabled(cfg)` entirely,
+/// reading whatever the scope's directory actually holds. Exists only for
+/// `zirv memory status` (`memory_cli.rs`), so a disabled scope still
+/// reports its counts and bytes rather than hiding them -- the same
+/// "disabling a scope must never trap data" rule `forget_scoped`/
+/// `verify_scoped` already follow for maintenance verbs. Not a
+/// replacement for `list_scoped` anywhere reads are meant to respect the
+/// operator's switch (recall, prompt injection).
+pub fn list_scoped_unchecked(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+) -> CtxResult<Vec<(PathBuf, Entry)>> {
+    let Some(dir) = scope.dir(repo, state, slug) else {
+        return Ok(Vec::new());
+    };
+    read_entries(&dir)
+}
+
+/// **Collision policy for every per-key shared-scope operation below**
+/// (`get_scoped`, `forget_scoped`, `verify_scoped`): the shared scope's
+/// canonical file for key `k` is always `dir.join(k + ".md")` (see
+/// `shared_canonical_path`) -- that file, and only that file, is what a
+/// per-key lookup, forget, or verify ever reads or writes. A *different*
+/// file elsewhere in the directory whose own `Key:` header happens to claim
+/// the same value is a canonical-key collision: it can only exist from a
+/// hand edit, a merge, or copy-pasted content, since `upsert_shared` itself
+/// refuses to create one (see its own doc comment). Such a stray file is
+/// never scanned for, matched against, silently included in, or destroyed by
+/// a per-key operation here -- `duplicate_keys` (above, against a full
+/// `list_scoped`) is the only way to learn one exists, and `forget_scoped`
+/// additionally logs a `forget-collision-left` decision when it notices one
+/// survives after removing the canonical file (see its own doc comment). A
+/// key that fails `validate_shared_key` can never have had a canonical file
+/// in the first place, so every operation below reports "not found" for one
+/// rather than erroring -- consistent with `forget`/`verify`'s existing "an
+/// absent key is not a failure" contract for the private scope.
+///
+/// Two more rules on the READ side specifically (`get_scoped`/`verify_scoped`,
+/// fix round 2): the canonical path is refused outright if it is a symlink
+/// rather than a regular file (`is_regular_file`) -- unlike a directory scan
+/// through `read_entries`, a single-path `read_to_string` does not filter
+/// symlinks out on its own, and following one here would read (`get_scoped`)
+/// or read-then-rewrite (`verify_scoped`) an arbitrary file elsewhere on the
+/// machine as if it were this repository's own committed content. And
+/// `get_scoped` additionally requires the parsed entry's OWN `key` to equal
+/// the key requested -- a mismatch (a hand-edited file whose header
+/// disagrees with its file name, or any readable non-entry file, which
+/// parses to `key == ""`) is refused and logged as `get-key-mismatch` rather
+/// than trusted or silently returned as a phantom entry.
+///
+/// `Private` is unaffected by any of this: it has no canonical per-key file
+/// name at all (a key's file name always carries its `Written` timestamp
+/// too), so it keeps routing through its own pre-existing, unchanged
+/// `get`/`forget`/`verify`, which scan by embedded `Key:` -- the only way
+/// private lookup has ever worked.
+///
+/// `get_scoped` itself: the `_scoped` sibling of the private-only `get`
+/// above. Gated on `scope.enabled(cfg)` for both scopes (unlike
+/// `forget_scoped`/`verify_scoped`, which are deliberately ungated -- see
+/// their own doc comments): `None` (never an error) when the scope is
+/// disabled, the key's canonical file does not exist, or (for `Shared`) the
+/// key or directory is unsafe.
+///
+/// Two more `Shared`-only refusals, both fix round 2: the canonical path is
+/// refused if it is a symlink rather than a regular file (`is_regular_file`
+/// -- see its own doc comment for why `read_to_string` alone is not enough
+/// here, unlike a `read_entries`-based scan, which already filters symlinks
+/// out); and the parsed entry's OWN `key` must equal the `key` requested --
+/// a mismatch (a file whose header disagrees with its file name, or any
+/// readable non-entry file, which parses to `key == ""`) is refused too,
+/// logged as `get-key-mismatch` (naming both the requested key and the
+/// header's actual key) rather than silently trusting the file name or
+/// silently returning a phantom entry. The parsed key is never overwritten
+/// to paper over the disagreement -- masking a repo-committed inconsistency
+/// would be worse than refusing it outright.
+///
+/// Dormant again as of issue #35: `zirv memory recall`'s exact-match fast
+/// path (its one production caller since issue #33) was replaced by the
+/// ranking engine (`retrieval::select`), which scores every candidate
+/// itself rather than checking for an exact key first. Kept as public
+/// store API -- a future task may still want a direct single-key lookup --
+/// same "dormant read primitive" pattern `MemoryScope`/`list_scoped`
+/// followed before issue #33 gave them a consumer. Tracked as issue #68
+/// so this dormancy is not "discovered" as dead code by a later cleanup.
+#[allow(dead_code)]
+pub fn get_scoped(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+    key: &str,
+) -> CtxResult<Option<Entry>> {
+    if !scope.enabled(cfg) {
+        return Ok(None);
+    }
+    match scope {
+        MemoryScope::Private => get(state, slug, key),
+        MemoryScope::Shared => {
+            let Some(path) = shared_canonical_path(repo, key) else {
+                return Ok(None);
+            };
+            if !is_regular_file(&path) {
+                return Ok(None);
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return Ok(None);
+            };
+            let parsed = parse_markdown(&text);
+            if parsed.key != key {
+                let _ = super::log::append(
+                    state,
+                    &super::log::Decision {
+                        ts: now_secs(),
+                        session: "n/a",
+                        verb: "memory",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "get-key-mismatch",
+                        detail: &format!(
+                            "canonical file for '{key}' has header Key '{}': refusing to return it",
+                            parsed.key
+                        ),
+                    },
+                );
+                return Ok(None);
+            }
+            Ok(Some(parsed))
+        }
+    }
+}
+
+/// Every key that appears on more than one file in `entries`, sorted for a
+/// deterministic result. A collision can only arise from something outside
+/// `upsert_shared`'s own writes -- a hand-edited file, a merge, or
+/// copy-pasted content -- since `upsert_shared` itself refuses to create one
+/// (see below). Exposed so a caller (a future `zirv memory status`/`optimize`
+/// surface) can report an existing collision rather than the read path
+/// picking one silently.
+pub fn duplicate_keys(entries: &[(PathBuf, Entry)]) -> Vec<String> {
+    let mut counts = std::collections::HashMap::<&str, usize>::new();
+    for (_, entry) in entries {
+        *counts.entry(entry.key.as_str()).or_insert(0) += 1;
+    }
+    let mut dups: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(key, _)| key.to_string())
+        .collect();
+    dups.sort();
+    dups
+}
+
+/// Cap on a shared entry's key: generous for a descriptive slug, short enough
+/// that `<key>.md` is always a reasonable file name.
+const MAX_SHARED_KEY_LEN: usize = 80;
+
+/// Windows reserved device names: forbidden as a base file name regardless
+/// of case or extension (`CON`, `Con.txt`, `con.md` all name the same
+/// device). Every key `validate_shared_key` accepts is already
+/// lowercase-only, so comparing against this lowercase set is exhaustive.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Validates a key meant to address a *shared* entry's file directly (see
+/// `upsert_shared` below): non-empty, at most `MAX_SHARED_KEY_LEN` bytes,
+/// composed only of lowercase ASCII letters, digits, and hyphens -- the same
+/// charset `parse_harvest` already requires of a harvested key -- containing
+/// at least one letter or digit (rejects `-`, `--`, and the like: a key with
+/// nothing but hyphens is not a meaningful identifier), and not a Windows
+/// reserved device name. Unlike `slug_key` (used by the private scope's
+/// `remember`, which silently sanitizes any key into a safe file name), this
+/// REJECTS an invalid key outright: a shared entry's file name *is* its key,
+/// so silently rewriting an invalid key into a different, sanitized one
+/// would silently write to a different file than the one the caller named
+/// -- exactly the ambiguity a canonical, key-addressed store must not allow.
+///
+/// This charset is also the write path's traversal defense at the file-name
+/// level: a key restricted to `[a-z0-9-]` can never contain `/`, `\`, `..`,
+/// or a null byte, so `dir.join(format!("{key}.md"))` can never resolve
+/// outside `dir` no matter what `dir` is.
+fn validate_shared_key(key: &str) -> CtxResult<()> {
+    if key.is_empty() {
+        return Err("a memory key must not be empty".into());
+    }
+    if key.len() > MAX_SHARED_KEY_LEN {
+        return Err(
+            format!("memory key '{key}' is too long (max {MAX_SHARED_KEY_LEN} bytes)").into(),
+        );
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "memory key '{key}' is invalid: only lowercase letters, digits, and hyphens are allowed"
+        )
+        .into());
+    }
+    if key.chars().all(|c| c == '-') {
+        return Err(format!("memory key '{key}' must contain at least one letter or digit").into());
+    }
+    if WINDOWS_RESERVED_NAMES.contains(&key) {
+        return Err(format!(
+            "memory key '{key}' is a reserved Windows device name and cannot be used as a file name"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Header-rendered string fields must not contain `\n`/`\r`: `to_markdown`
+/// writes each of these directly into its own `## Memory` header line, and
+/// `parse_markdown`'s header parser recognizes any line starting with a
+/// bullet prefix as a new header entry -- so a value containing an embedded
+/// newline can inject an entirely different header line (a different `Key`,
+/// `Source`, etc.) that a later read parses back as if it were legitimate
+/// (demonstrated directly, independent of this guard, by
+/// `a_header_rendered_field_with_an_embedded_newline_would_inject_a_fake_
+/// header_line`). Checked for every field `to_markdown` interpolates into a
+/// header line: `written_by`, `source`, `importance`/`confidence` (if set),
+/// and every individual tag/path (each one still ends up on the SAME
+/// rendered line, joined by `", "`, so a newline inside any single one of
+/// them still breaks that line in two). `key` is excluded: `validate_shared_
+/// key`'s charset already rules out `\n`/`\r` there. `body` is excluded too:
+/// N2's header-terminates-at-the-first-blank-line rule already means
+/// anything after the header, including a body that itself contains
+/// newlines, can never be read back as a header line.
+fn validate_shared_entry_fields(entry: &Entry) -> CtxResult<()> {
+    let no_newline = |value: &str, field: &str| -> CtxResult<()> {
+        if value.contains(['\n', '\r']) {
+            return Err(format!(
+                "memory entry field `{field}` must not contain a newline (it would inject a fake header line into the stored file)"
+            )
+            .into());
+        }
+        Ok(())
+    };
+    no_newline(&entry.written_by, "written_by")?;
+    no_newline(&entry.source, "source")?;
+    if let Some(importance) = &entry.importance {
+        no_newline(importance, "importance")?;
+    }
+    if let Some(confidence) = &entry.confidence {
+        no_newline(confidence, "confidence")?;
+    }
+    for tag in &entry.tags {
+        no_newline(tag, "tags")?;
+    }
+    for path in &entry.paths {
+        no_newline(path, "paths")?;
+    }
+    Ok(())
+}
+
+/// The shared scope's canonical file for `key` -- `<repo>/.zirv/memory/
+/// <key>.md` -- or `None` when the key is invalid (never a valid file name;
+/// see `validate_shared_key`) or the directory itself is unsafe (see
+/// `safe_shared_dir`). Every per-key shared-scope operation (`get_scoped`,
+/// `forget_scoped`, `verify_scoped`) builds its path through this helper
+/// rather than by hand, so none of them can ever construct a path from
+/// caller-controlled input that resolves outside `.zirv/memory/`.
+fn shared_canonical_path(repo: &Path, key: &str) -> Option<PathBuf> {
+    validate_shared_key(key).ok()?;
+    let dir = safe_shared_dir(repo)?;
+    Some(dir.join(format!("{key}.md")))
+}
+
+/// Whether `path` is an ordinary regular file, not a symlink -- the
+/// single-path analogue of `read_entries`'s own symlink skip (fix round 2).
+/// `get_scoped`/`verify_scoped`'s canonical-file reads bypass `read_entries`
+/// entirely (each reads exactly one known path, not a directory listing), so
+/// neither inherited that skip on its own. A symlinked canonical file (a
+/// repo-committed `some-key.md -> /etc/passwd`) must never be followed:
+/// `parse_markdown` only ever recognizes text between a `## Memory` heading
+/// and the next one, so an arbitrary target with no such heading (a literal
+/// `/etc/passwd`) parses to an empty phantom entry, not its actual bytes --
+/// but a target an attacker specifically crafts to look like a well-formed,
+/// key-matching entry is not so limited: `get_scoped` would read it back as
+/// if it were a genuine memory entry, and `verify_scoped` would go further
+/// and rewrite that crafted content into the repository as ordinary,
+/// committable text (`stamp_verified_in_place` still operates on whatever
+/// `read_to_string` handed it). `read_to_string` follows a symlink
+/// transparently, unlike `write_shared`'s `rename`, which replaces one
+/// without ever reading through it.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// Writes `entry` to the shared bank's canonical, key-addressed file
+/// (`<repo>/.zirv/memory/<key>.md`) -- stable rather than timestamp-addressed
+/// (issue #32): updating a key rewrites this same file, so `git diff` shows
+/// an ordinary content change rather than a delete-and-add pair, and two
+/// unrelated keys always land in two different files by construction.
+///
+/// Gated on `cfg.memory.shared_enabled` and on the directory's own safety
+/// (`safe_shared_dir`, via `MemoryScope::Shared::dir`), same as every other
+/// shared-scope entry point. Rejects an invalid key (`validate_shared_key`)
+/// or a header-rendered field containing a newline
+/// (`validate_shared_entry_fields`) before touching the filesystem, and
+/// refuses to write if some *other* file already claims the same key (a
+/// canonical-key collision -- see `duplicate_keys` above for the read-side
+/// counterpart): only a hand-edited or merged directory can produce that
+/// state, since this function itself never does. The write is atomic
+/// (`state::write_shared`, temp sibling + `rename`), so a concurrent reader
+/// never observes a partial file, and two concurrent upserts of the same key
+/// each write in full before either `rename` lands -- the result is always
+/// one of the two complete entries, never a mix of both.
+fn upsert_shared(
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+    entry: &Entry,
+) -> CtxResult<PathBuf> {
+    if !MemoryScope::Shared.enabled(cfg) {
+        let reason = MemoryScope::Shared.disabled_reason(cfg);
+        return Err(format!("shared memory is disabled ({reason}); nothing was stored").into());
+    }
+    validate_shared_key(&entry.key)?;
+    validate_shared_entry_fields(entry)?;
+    let Some(dir) = MemoryScope::Shared.dir(repo, state, slug) else {
+        return Err(
+            "the shared memory directory is unsafe (a symlink) and cannot be written to".into(),
+        );
+    };
+    std::fs::create_dir_all(&dir)?;
+
+    let path = dir.join(format!("{}.md", entry.key));
+    for (other_path, other) in read_entries(&dir)? {
+        if other.key == entry.key && other_path != path {
+            return Err(format!(
+                "memory key '{}' is already claimed by {} (its canonical file is {}); refusing to create a duplicate",
+                entry.key,
+                other_path.display(),
+                path.display(),
+            )
+            .into());
+        }
+    }
+
+    super::state::write_shared(&path, &entry.to_markdown())?;
+    Ok(path)
+}
+
+/// Scope-aware upsert: `Private` delegates unchanged to `remember` above;
+/// `Shared` writes through the new key-addressed `upsert_shared`.
+///
+/// **Gating asymmetry, deliberate, pin the contract before building a CLI
+/// verb on this:** `remember` (and so `Private` here) has never itself
+/// consulted `cfg.memory.enabled` -- only the `zirv ctx remember` CLI
+/// wrapper (`run_remember_with`) checks that before calling `remember`. So
+/// `upsert_scoped(Private, ...)` WRITES even while `memory.enabled` is
+/// false; a caller that wants the CLI's refusal behavior must check
+/// `cfg.memory.enabled` itself before calling this, the same way `run_
+/// remember_with` does. `Shared`, by contrast, DOES check its own gate
+/// (`cfg.memory.shared_enabled`) internally, inside `upsert_shared`. This
+/// asymmetry is pinned by a test
+/// (`upsert_scoped_private_writes_even_when_memory_enabled_is_false_
+/// unlike_shared`) precisely so it is never "discovered" as a surprise by a
+/// later CLI verb.
+pub fn upsert_scoped(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+    entry: &Entry,
+) -> CtxResult<PathBuf> {
+    match scope {
+        MemoryScope::Private => remember(state, slug, entry, cfg),
+        MemoryScope::Shared => upsert_shared(repo, state, slug, cfg, entry),
+    }
+}
+
+/// Scope-aware forget: `Private` delegates unchanged to `forget` above.
+/// `Shared` removes only the canonical file (see the collision policy on
+/// `get_scoped` above) -- nothing else in the directory is ever touched, so
+/// a human-named notes file that happens to have its own `Key:` header set
+/// to the same value can never be swept up as collateral damage. If, after
+/// removing the canonical file, some OTHER file still claims this key (a
+/// pre-existing collision `upsert_shared` could never have created itself),
+/// that fact is written to the decision log as `forget-collision-left`
+/// (naming the key and the surviving path) rather than passed over in
+/// silence -- the boolean return value still only reports whether the
+/// canonical file itself was removed, since it carries no room for a
+/// structured warning. Deliberately does not gate on `cfg.memory.
+/// shared_enabled` either, the same "disabling a feature must never trap
+/// data" contract the private scope's own `forget` already follows --
+/// forgetting must still work while the scope is switched off.
+pub fn forget_scoped(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    key: &str,
+) -> CtxResult<bool> {
+    match scope {
+        MemoryScope::Private => forget(state, slug, key),
+        MemoryScope::Shared => {
+            let Some(path) = shared_canonical_path(repo, key) else {
+                return Ok(false);
+            };
+            let removed = if path.is_file() {
+                std::fs::remove_file(&path)?;
+                true
+            } else {
+                false
+            };
+
+            if let Some(dir) = safe_shared_dir(repo) {
+                // Best-effort (fix round 2): this is an ADVISORY scan after
+                // the canonical delete already succeeded -- a scan failure
+                // (e.g. the directory becomes unreadable mid-call) must not
+                // turn an already-completed forget into an `Err`.
+                let stray: Vec<String> = read_entries(&dir)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(other_path, other)| other.key == key && *other_path != path)
+                    .map(|(other_path, _)| other_path.display().to_string())
+                    .collect();
+                if !stray.is_empty() {
+                    let _ = super::log::append(
+                        state,
+                        &super::log::Decision {
+                            ts: now_secs(),
+                            session: "n/a",
+                            verb: "memory",
+                            verdict: "n/a",
+                            score: 0,
+                            action: "forget-collision-left",
+                            detail: &format!("'{key}' still claimed by: {}", stray.join(", ")),
+                        },
+                    );
+                }
+            }
+
+            Ok(removed)
+        }
+    }
+}
+
+/// Scope-aware verify: `Private` delegates unchanged to `verify` above,
+/// which still refreshes via a parse-then-`to_markdown` re-render (unchanged
+/// contract: refreshes only the `Verified` stamp, leaving `Written`/body
+/// untouched).
+///
+/// `Shared` touches only the canonical file (same "canonical claimant only"
+/// policy as `get_scoped`/`forget_scoped` above; a pre-existing collision
+/// from some other file is left untouched, exactly as `duplicate_keys` would
+/// report it). Ungated on `shared_enabled` for the same "must not trap data"
+/// reason `forget_scoped` is. Refuses (reports `false`, touches nothing) if
+/// the canonical path is a symlink rather than a regular file (fix round 2,
+/// `is_regular_file`) -- see that function's doc comment for exactly what
+/// following one could and couldn't expose.
+///
+/// **Key agreement (fix round 3: extended from `get_scoped` -- the round-2
+/// ruling that scoped this check to `get_scoped` alone was an
+/// under-scoping, corrected here):** after parsing, if the entry's own `key`
+/// disagrees with the requested `key`, this logs a `verify-key-mismatch`
+/// decision (same shape as `get_scoped`'s `get-key-mismatch`) and returns
+/// `Ok(false)` WITHOUT writing anything. Before this fix, `verify_scoped`
+/// would stamp false freshness onto a mismatched file, answer `true` for a
+/// key `get_scoped` already refuses to return, and (see the next point)
+/// destroy a readable non-entry file by overwriting it with an empty
+/// phantom stub.
+///
+/// **In-place stamping (fix round 3, data-loss fix):** once the key is
+/// confirmed to agree, the `Verified` bullet is refreshed via
+/// `stamp_verified_in_place` -- NOT a parse-then-`to_markdown` re-render
+/// (what this used to do, and what `Private`'s `verify` still does for the
+/// machine-local bank). A re-render silently drops anything `parse_markdown`
+/// doesn't recognize into its own fixed field set: an unknown header bullet
+/// (`- Priority: urgent`) or a trailing `## Notes` section a human added
+/// would both vanish. Issue #32 requires shared entries to stay "readable
+/// and editable without Zirv" -- a hand-edited file must survive a `verify`
+/// call with everything it wasn't asked to change intact, so the write path
+/// edits the raw text directly instead.
+pub fn verify_scoped(
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    key: &str,
+) -> CtxResult<bool> {
+    match scope {
+        MemoryScope::Private => verify(state, slug, key),
+        MemoryScope::Shared => {
+            let Some(path) = shared_canonical_path(repo, key) else {
+                return Ok(false);
+            };
+            if !is_regular_file(&path) {
+                return Ok(false);
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return Ok(false);
+            };
+            let parsed = parse_markdown(&text);
+            if parsed.key != key {
+                let _ = super::log::append(
+                    state,
+                    &super::log::Decision {
+                        ts: now_secs(),
+                        session: "n/a",
+                        verb: "memory",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "verify-key-mismatch",
+                        detail: &format!(
+                            "canonical file for '{key}' has header Key '{}': refusing to verify it",
+                            parsed.key
+                        ),
+                    },
+                );
+                return Ok(false);
+            }
+            let stamped = stamp_verified_in_place(&text, now_secs());
+            super::state::write_shared(&path, &stamped)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Refreshes the `## Memory` header's `Verified` bullet IN PLACE, leaving
+/// every other byte of `text` untouched -- the write-time half of
+/// `verify_scoped`'s "hand-edited files must survive a verify call" contract
+/// (see that function's own doc comment for the full reasoning).
+///
+/// Mirrors `parse_markdown`'s own header-boundary rule exactly (the header
+/// block runs from the line after `## Memory` up to the first blank line, or
+/// the first line that is neither blank nor a well-formed `key: value`
+/// bullet, if there is no blank separator) so the two can never disagree
+/// about where the header ends. If an existing bullet whose key is
+/// `Verified` (case-insensitive, matching `parse_markdown`'s own lookup) is
+/// found in that range, its WHOLE line is replaced with a canonical
+/// `- Verified: {verified}`; otherwise a new such line is appended at the
+/// end of the header block. Every other line -- every other header bullet
+/// (recognized or not), the body, and any later `## ` section -- is copied
+/// through unchanged. Falls back to returning `text` unchanged if no
+/// `## Memory` heading is found at all (unreachable through `verify_scoped`
+/// itself, since a file with no such heading parses to `key == ""`, which
+/// the key-agreement check above already refuses before this is called; kept
+/// as a safe no-op for any other caller).
+fn stamp_verified_in_place(text: &str, verified: u64) -> String {
+    let had_trailing_newline = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+
+    let Some(memory_idx) = lines.iter().position(|line| {
+        line.trim()
+            .strip_prefix("## ")
+            .is_some_and(|rest| rest.trim().eq_ignore_ascii_case("Memory"))
+    }) else {
+        return text.to_string();
+    };
+
+    let mut header_end = memory_idx + 1;
+    let mut verified_idx = None;
+    for (offset, line) in lines[memory_idx + 1..].iter().enumerate() {
+        let idx = memory_idx + 1 + offset;
+        if line.trim().is_empty() {
+            header_end = idx;
+            break;
+        }
+        match strip_bullet(line).and_then(|bullet| {
+            bullet
+                .split_once(':')
+                .map(|(key, _)| key.trim().to_string())
+        }) {
+            Some(bullet_key) => {
+                if bullet_key.eq_ignore_ascii_case("verified") {
+                    verified_idx = Some(idx);
+                }
+                header_end = idx + 1;
+            }
+            None => {
+                header_end = idx;
+                break;
+            }
+        }
+    }
+
+    let new_line = format!("- Verified: {verified}");
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 1);
+    match verified_idx {
+        Some(idx) => {
+            for (i, line) in lines.iter().enumerate() {
+                out.push(if i == idx {
+                    new_line.clone()
+                } else {
+                    (*line).to_string()
+                });
+            }
+        }
+        None => {
+            for (i, line) in lines.iter().enumerate() {
+                if i == header_end {
+                    out.push(new_line.clone());
+                }
+                out.push((*line).to_string());
+            }
+            if header_end == lines.len() {
+                out.push(new_line.clone());
+            }
+        }
+    }
+
+    let mut result = out.join("\n");
+    if had_trailing_newline {
+        result.push('\n');
+    }
+    result
 }
 
 /// Removes every file whose parsed `Written` timestamp is not among the
@@ -323,7 +1151,6 @@ pub fn remember(
 /// The single entry for `key`, if any.
 // Consumed by the memory prompt layer and harvest (next waves); recall's own
 // key filter goes through `list` so its output ordering matches the bank.
-#[allow(dead_code)]
 pub fn get(state: &StateDir, slug: &str, key: &str) -> CtxResult<Option<Entry>> {
     Ok(list(state, slug)?
         .into_iter()
@@ -368,43 +1195,61 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
 }
 
 /// Loads this repo's memory bank as already-rendered prompt lines
-/// (`prompt::MemoryLine`), gated on `cfg.memory.enabled` -- an empty vec
-/// when disabled, the same "disabled means nothing delivered" contract
-/// every mail delivery seam already follows for `cfg.mail.enabled`. `now` is
-/// a plain `u64` (`state::now_secs()`, read by the caller) rather than read
-/// in here: `prompt.rs` stays clock-free like `rot.rs`, so the one clock
-/// read for "how old is this entry" happens at this call, the last point
-/// before the rendered text crosses into that module.
+/// (`prompt::MemoryLine`) for the **core** layer (issue #34): both the
+/// private and shared scopes, merged, each gated on its own switch --
+/// `cfg.memory.enabled` for private (via `list`, unchanged), `list_scoped`'s
+/// own `scope.enabled(cfg)` check for shared (`cfg.memory.shared_enabled`,
+/// already returns an empty vec rather than an error when disabled or
+/// unsafe, never a hard failure).
 ///
-/// The wording ("written Nd ago, verified Nd ago") matches `run_recall_
-/// with`'s own human-readable branch, so "how old" reads the same everywhere
-/// it appears.
+/// Renders compact key/body pairs only -- no `Written`/`Verified` storage
+/// metadata is spent into the prompt by default (issue #34) -- but keeps the
+/// raw timestamps on `MemoryLine` for `prompt::select_memory_within_cap`'s
+/// ranking and for Task 5's retrieval ranking to reuse.
+///
+/// Precedence between the two scopes is NOT decided here: this is a plain
+/// "list everything eligible" read that tags each line with which scope it
+/// came from (`MemoryLine::shared`). `prompt::with_memory_layer`/
+/// `select_memory_within_cap` is what enforces "private outranks shared"
+/// structurally, using that tag -- see its own doc comment for why a shared
+/// entry's own `verified`/`written` fields must never be trusted to compete
+/// with a private one directly. That same function also drops any shared
+/// line whose `key` collides with a private line's `key` before either is
+/// ranked, so a repo-controlled entry can never shadow a private one by
+/// reusing its key -- this function returns both, unfiltered, and lets the
+/// prompt layer make that call.
 pub fn render_for_prompt(
     state: &StateDir,
+    repo: &Path,
     slug: &str,
     cfg: &CtxConfig,
-    now: u64,
 ) -> Vec<super::prompt::MemoryLine> {
-    if !cfg.memory.enabled {
-        return Vec::new();
+    let mut lines: Vec<super::prompt::MemoryLine> = if cfg.memory.enabled {
+        list(state, slug)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, entry)| render_prompt_line(entry, false))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    lines.extend(
+        list_scoped(MemoryScope::Shared, repo, state, slug, cfg)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, entry)| render_prompt_line(entry, true)),
+    );
+    lines
+}
+
+fn render_prompt_line(entry: Entry, shared: bool) -> super::prompt::MemoryLine {
+    super::prompt::MemoryLine {
+        key: entry.key,
+        body: entry.body,
+        verified: entry.verified,
+        written: entry.written,
+        shared,
     }
-    list(state, slug)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, entry)| {
-            let written_days = now.saturating_sub(entry.written) / 86_400;
-            let verified_days = now.saturating_sub(entry.verified) / 86_400;
-            super::prompt::MemoryLine {
-                key: entry.key,
-                age: format!("written {written_days}d ago, verified {verified_days}d ago"),
-                body: entry.body,
-                // N3: carried through raw so the injection cap can rank
-                // entries newest-first; `prompt` itself stays clock-free.
-                verified: entry.verified,
-                written: entry.written,
-            }
-        })
-        .collect()
 }
 
 // N6: harvesting durable repository facts out of a *distilled* handoff
@@ -563,6 +1408,10 @@ fn write_harvested(
             verified: now,
             source: "handoff".to_string(),
             body: body.clone(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
         };
         remember(state, slug, &entry, cfg)?;
         written += 1;
@@ -586,6 +1435,19 @@ pub struct RememberArgs {
     /// stamp rather than requiring new text.
     #[arg(long, default_value_t = false)]
     pub verify: bool,
+    /// NOT a CLI flag on `zirv ctx remember` -- `#[arg(skip)]` always
+    /// leaves this at its default (`None`) here. `zirv memory remember`'s
+    /// private arm (`memory_cli.rs`, the only surface with `--importance`)
+    /// builds this struct directly (not through clap parsing) and sets it,
+    /// reusing this same write path rather than duplicating it.
+    #[arg(skip)]
+    pub importance: Option<String>,
+    /// See `importance`'s doc comment -- same reasoning, for `--confidence`.
+    #[arg(skip)]
+    pub confidence: Option<String>,
+    /// See `importance`'s doc comment -- same reasoning, for `--tag`.
+    #[arg(skip)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -684,6 +1546,14 @@ pub fn run_remember_with<W: Write>(
                 verified: now,
                 source: "explicit".to_string(),
                 body,
+                importance: args.importance.clone(),
+                confidence: args.confidence.clone(),
+                tags: args.tags.clone(),
+                // Deliberately unwritable, unlike importance/confidence/tags
+                // above: a path signal is inert until issue #44 wires it up
+                // (see retrieval.rs's module doc), so no `--path` flag
+                // exists to set it yet.
+                paths: Vec::new(),
             };
             let path = remember(&state, &slug, &entry, &cfg)?;
             writeln!(
@@ -842,6 +1712,10 @@ mod tests {
             verified: 42,
             source: "explicit".to_string(),
             body: "- build: cargo build\n- test: cargo test".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
         };
         let parsed = parse_markdown(&entry.to_markdown());
         assert_eq!(parsed, entry, "a bulleted body must survive a round trip");
@@ -871,6 +1745,10 @@ mod tests {
             verified: written,
             source: "explicit".to_string(),
             body: "the staging DB creds live in 1Password.".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
         }
     }
 
@@ -890,6 +1768,10 @@ mod tests {
             verified: 1_700_000_500,
             source: "handoff".to_string(),
             body: "The staging DB creds live in 1Password under 'staging-db'.".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
         };
         let parsed = parse_markdown(&entry.to_markdown());
         assert_eq!(parsed, entry);
@@ -1096,8 +1978,19 @@ This should not appear in the body.\n";
         assert_eq!(listed_b[0].1.key, "only-in-b");
     }
 
+    // N8: this test used to be named `nothing_in_the_repository_checkout_
+    // can_seed_the_bank`, back when there was only one bank. `MemoryScope`
+    // below makes that no longer true system-wide: the whole point of
+    // `Shared` is that a checkout DOES seed a bank. The invariant this test
+    // actually guards -- narrowed, not weakened -- is that the *private*
+    // scope specifically still never reads anything a repo checkout wrote;
+    // see `shared_scope_reads_memory_committed_in_the_repository_checkout`
+    // just below for the shared scope's deliberately opposite behavior, and
+    // `shared_scope_content_is_never_read_back_as_configuration` for the
+    // boundary that still holds for both: repo-owned memory content can
+    // never reach `CtxConfig`.
     #[test]
-    fn nothing_in_the_repository_checkout_can_seed_the_bank() {
+    fn nothing_in_the_repository_checkout_can_seed_the_private_bank() {
         let repo = tempfile::tempdir().expect("tempdir");
         let slug = repo_slug(repo.path());
         let decoy_dir = repo.path().join(".zirv").join("memory").join(&slug);
@@ -1114,7 +2007,249 @@ This should not appear in the body.\n";
         let listed = list(&state, &slug).expect("list");
         assert!(
             listed.is_empty(),
-            "a repo-side memory tree must never be consulted: {listed:?}"
+            "a repo-side memory tree must never seed the private scope: {listed:?}"
+        );
+    }
+
+    // MemoryScope: `Shared` (repo-owned, untrusted, `<repo>/.zirv/memory/`)
+    // vs. `Private` (machine-local, unchanged by this task).
+
+    /// `memory.enabled` is a MASTER switch (fix round: memory review): off,
+    /// it disables `Shared` too, however `shared_enabled` is set.
+    /// `shared_enabled` is a second, shared-only toggle underneath it --
+    /// `Private` never consults it, and `Shared` needs both flags on.
+    #[test]
+    fn memory_scope_enabled_treats_the_master_switch_as_a_floor_for_shared() {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.enabled = false;
+        cfg.memory.shared_enabled = true;
+        assert!(!MemoryScope::Private.enabled(&cfg));
+        assert!(
+            !MemoryScope::Shared.enabled(&cfg),
+            "the master switch must suppress shared too, even with shared_enabled on"
+        );
+
+        cfg.memory.enabled = true;
+        cfg.memory.shared_enabled = false;
+        assert!(MemoryScope::Private.enabled(&cfg));
+        assert!(!MemoryScope::Shared.enabled(&cfg));
+    }
+
+    #[test]
+    fn shared_scope_resolves_to_a_deterministic_repo_relative_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            Some(repo.path().join(".zirv").join("memory"))
+        );
+    }
+
+    #[test]
+    fn private_scope_dir_is_unchanged_from_before_scopes_existed() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = repo_slug(repo.path());
+        assert_eq!(
+            MemoryScope::Private.dir(repo.path(), &state, &slug),
+            Some(state.memory().join(&slug))
+        );
+    }
+
+    /// A repository checkout can commit a symlink at `.zirv` pointing
+    /// anywhere on the filesystem. Following it would treat an arbitrary
+    /// directory elsewhere on this machine as this repo's shared memory --
+    /// the same escape `optimize.rs`'s `nested_claude_files` refuses for
+    /// `CLAUDE.md` discovery.
+    #[cfg(unix)]
+    #[test]
+    fn shared_scope_refuses_a_symlinked_zirv_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(outside.path().join("memory")).expect("mkdir");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".zirv")).expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            None,
+            "a symlinked .zirv must never be followed"
+        );
+    }
+
+    /// Same escape one level deeper: `.zirv` itself is real, but
+    /// `.zirv/memory` is the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn shared_scope_refuses_a_symlinked_memory_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("secret.md"), "leak").expect("write");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".zirv").join("memory"))
+            .expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            None,
+            "a symlinked .zirv/memory must never be followed"
+        );
+    }
+
+    /// The deliberate counterpart of `nothing_in_the_repository_checkout_
+    /// can_seed_the_private_bank` above: the whole point of the shared scope
+    /// is that a checkout's own committed content is read.
+    #[test]
+    fn shared_scope_reads_memory_committed_in_the_repository_checkout() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("0000000001-shared-fact.md"),
+            sample("shared-fact", 1).to_markdown(),
+        )
+        .expect("write");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.key, "shared-fact");
+    }
+
+    #[test]
+    fn list_scoped_is_empty_when_the_shared_scope_is_disabled() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("0000000001-shared-fact.md"),
+            sample("shared-fact", 1).to_markdown(),
+        )
+        .expect("write");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.shared_enabled = false;
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+        assert!(
+            listed.is_empty(),
+            "a disabled shared scope must report empty even with entries on disk: {listed:?}"
+        );
+    }
+
+    /// A committed symlink inside an otherwise-legitimate shared memory
+    /// directory (rather than at the directory itself) is a narrower version
+    /// of the same escape: `foo.md -> /etc/passwd` would read an arbitrary
+    /// file on this machine back as if it were an innocuous memory entry.
+    #[cfg(unix)]
+    #[test]
+    fn list_scoped_skips_a_symlinked_entry_file_in_the_shared_bank() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("0000000001-real.md"),
+            sample("real", 1).to_markdown(),
+        )
+        .expect("write real entry");
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let leaked = outside.path().join("leaked.md");
+        std::fs::write(&leaked, sample("leaked", 2).to_markdown()).expect("write outside file");
+        std::os::unix::fs::symlink(&leaked, dir.join("0000000002-linked.md")).expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "the symlinked entry is skipped: {listed:?}"
+        );
+        assert_eq!(listed[0].1.key, "real");
+    }
+
+    /// The acceptance-criterion test for issue #31: shared memory is
+    /// repo-owned but must never be able to alter agent binary/model/
+    /// security settings. Reading it back only ever produces `Entry`
+    /// markdown (key/body text) -- `CtxConfig::load` never looks inside
+    /// `.zirv/memory/` at all, so a body engineered to look like forbidden
+    /// `ctx.toml` keys still round-trips as inert text, and loading config
+    /// from the same repository is unaffected.
+    #[test]
+    fn shared_scope_content_is_never_read_back_as_configuration() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let malicious = Entry {
+            key: "sneaky".to_string(),
+            written_by: "attacker".to_string(),
+            written: 1,
+            verified: 1,
+            source: "explicit".to_string(),
+            body:
+                "agent_bin = \"/malicious\"\nagent = \"codex\"\nworker.claude = \"attacker-model\""
+                    .to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        std::fs::write(dir.join("0000000001-sneaky.md"), malicious.to_markdown()).expect("write");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].1.body.contains("agent_bin"),
+            "planted content survives only as inert text: {:?}",
+            listed[0].1.body
+        );
+
+        let empty = env_map(&[]);
+        let loaded = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load config");
+        assert_eq!(
+            loaded.agent, None,
+            "no agent was chosen by planted shared-memory content"
+        );
+        assert_eq!(
+            loaded.agent_bin, None,
+            "no binary was chosen by planted shared-memory content"
         );
     }
 
@@ -1271,6 +2406,9 @@ This should not appear in the body.\n";
             text: Some("cargo build --release".to_string()),
             text_file: None,
             verify: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
         };
         let mut out = Vec::new();
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
@@ -1312,6 +2450,9 @@ This should not appear in the body.\n";
             text: None,
             text_file: None,
             verify: true,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
         };
         let mut out = Vec::new();
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
@@ -1356,6 +2497,9 @@ This should not appear in the body.\n";
             text: Some("should not be stored".to_string()),
             text_file: None,
             verify: false,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
         };
         let mut out = Vec::new();
         let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
@@ -1415,31 +2559,30 @@ This should not appear in the body.\n";
         assert!(err.to_string().contains("--all"), "got {err}");
     }
 
-    // N5: the memory prompt layer's own source, `render_for_prompt`.
+    // N5/issue #34: the memory prompt layer's own source, `render_for_prompt`
+    // -- now the merged **core** layer (private + shared).
 
     #[test]
-    fn render_for_prompt_renders_the_key_and_age_of_every_entry() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
+    fn render_for_prompt_renders_the_key_and_body_of_every_private_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
         let cfg = CtxConfig::default();
-        let now = 1_700_000_000u64;
 
-        let mut fresh = sample("build-cmd", now.saturating_sub(3 * 86_400));
-        fresh.verified = now.saturating_sub(86_400);
+        let mut fresh = sample("build-cmd", 1_700_000_000);
         fresh.body = "cargo build --release".to_string();
         remember(&state, "-work-repo", &fresh, &cfg).expect("remember");
 
-        let rendered = render_for_prompt(&state, "-work-repo", &cfg, now);
+        let rendered = render_for_prompt(&state, repo.path(), "-work-repo", &cfg);
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].key, "build-cmd");
         assert_eq!(rendered[0].body, "cargo build --release");
-        assert_eq!(rendered[0].age, "written 3d ago, verified 1d ago");
+        assert!(!rendered[0].shared, "a private entry is tagged as such");
     }
 
     #[test]
-    fn render_for_prompt_is_empty_when_memory_is_disabled_even_with_entries_stored() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
+    fn render_for_prompt_is_empty_when_both_scopes_are_disabled_even_with_entries_stored() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
         remember(
             &state,
             "-work-repo",
@@ -1451,13 +2594,121 @@ This should not appear in the body.\n";
         let disabled = CtxConfig {
             memory: super::super::config::MemoryConfig {
                 enabled: false,
+                shared_enabled: false,
                 ..super::super::config::MemoryConfig::default()
             },
             ..CtxConfig::default()
         };
         assert!(
-            render_for_prompt(&state, "-work-repo", &disabled, 1_700_000_000).is_empty(),
-            "a disabled bank must render nothing, however much is stored"
+            render_for_prompt(&state, repo.path(), "-work-repo", &disabled).is_empty(),
+            "a fully disabled bank must render nothing, however much is stored"
+        );
+    }
+
+    /// Issue #34: the core layer merges both scopes, tagging each line with
+    /// where it came from.
+    #[test]
+    fn render_for_prompt_merges_private_and_shared_entries_with_provenance() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        remember(
+            &state,
+            "-work-repo",
+            &sample("private-fact", 1_700_000_000),
+            &cfg,
+        )
+        .expect("remember private");
+
+        let shared_dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&shared_dir).expect("mkdir");
+        std::fs::write(
+            shared_dir.join("shared-fact.md"),
+            sample("shared-fact", 1_700_000_000).to_markdown(),
+        )
+        .expect("write shared");
+
+        let rendered = render_for_prompt(&state, repo.path(), "-work-repo", &cfg);
+        assert_eq!(rendered.len(), 2, "both scopes are merged: {rendered:?}");
+        let private_line = rendered
+            .iter()
+            .find(|l| l.key == "private-fact")
+            .expect("private entry present");
+        assert!(!private_line.shared);
+        let shared_line = rendered
+            .iter()
+            .find(|l| l.key == "shared-fact")
+            .expect("shared entry present");
+        assert!(shared_line.shared);
+    }
+
+    /// `memory.enabled = false` is a MASTER switch (fix round: memory
+    /// review), superseding the old behavior this test used to pin (a
+    /// disabled private scope leaving shared untouched): an operator who
+    /// disabled memory before the shared scope existed must not silently
+    /// start receiving repo-controlled prompt content on upgrade. Disabling
+    /// `shared_enabled` specifically (leaving the master switch on) is the
+    /// still-independent toggle -- see `render_for_prompt_merges_private_
+    /// and_shared_entries_with_provenance` for the "both on" case this test
+    /// used to contrast against.
+    #[test]
+    fn disabling_memory_master_switch_suppresses_shared_entries_too() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let shared_dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&shared_dir).expect("mkdir");
+        std::fs::write(
+            shared_dir.join("shared-fact.md"),
+            sample("shared-fact", 1_700_000_000).to_markdown(),
+        )
+        .expect("write shared");
+
+        let cfg = CtxConfig {
+            memory: super::super::config::MemoryConfig {
+                enabled: false,
+                // shared_enabled stays at its default (true): the master
+                // switch alone must be enough to suppress shared too.
+                ..super::super::config::MemoryConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        assert!(
+            render_for_prompt(&state, repo.path(), "-work-repo", &cfg).is_empty(),
+            "memory.enabled = false must suppress the shared scope too, not just private"
+        );
+    }
+
+    #[test]
+    fn memory_enabled_false_and_shared_enabled_true_injects_nothing() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        remember(
+            &state,
+            "-work-repo",
+            &sample("private-fact", 1_700_000_000),
+            &CtxConfig::default(),
+        )
+        .expect("remember private");
+        let shared_dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&shared_dir).expect("mkdir");
+        std::fs::write(
+            shared_dir.join("shared-fact.md"),
+            sample("shared-fact", 1_700_000_000).to_markdown(),
+        )
+        .expect("write shared");
+
+        let cfg = CtxConfig {
+            memory: super::super::config::MemoryConfig {
+                enabled: false,
+                shared_enabled: true,
+                ..super::super::config::MemoryConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        assert!(
+            render_for_prompt(&state, repo.path(), "-work-repo", &cfg).is_empty(),
+            "enabled=false must win over an explicit shared_enabled=true"
         );
     }
 
@@ -1624,6 +2875,10 @@ This should not appear in the body.\n";
             verified: 1_000,
             source: "explicit".to_string(),
             body: "cargo build --release   # the operator said so".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
         };
         remember(&state, "-work-repo", &explicit, &cfg).expect("remember");
 
@@ -1680,6 +2935,10 @@ This should not appear in the body.\n";
             verified: 1_000,
             source: "handoff".to_string(),
             body: "old inference".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
         };
         remember(&state, "-work-repo", &earlier, &cfg).expect("remember");
 
@@ -1820,6 +3079,1494 @@ This should not appear in the body.\n";
         assert_ne!(
             build_cmd[0].1.body, "cargo build",
             "the body was refreshed too"
+        );
+    }
+
+    // Issue #32: the shared memory store's own schema and CRUD.
+
+    /// The full extended schema -- importance, confidence, tags, and paths,
+    /// on top of the fields Task 1 already had -- round-trips intact. This is
+    /// the "versionable" half of issue #32: each new field is its own header
+    /// line, omitted entirely when unset, so an entry that never sets them
+    /// (every private-scope entry so far) renders exactly as before.
+    #[test]
+    fn an_entry_with_the_extended_schema_fields_round_trips_intact() {
+        let mut entry = sample("architecture-invariant", 1_700_000_000);
+        entry.importance = Some("high".to_string());
+        entry.confidence = Some("medium".to_string());
+        entry.tags = vec!["architecture".to_string(), "invariant".to_string()];
+        entry.paths = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+
+        let parsed = parse_markdown(&entry.to_markdown());
+        assert_eq!(parsed, entry, "the extended schema must round-trip intact");
+    }
+
+    /// Minor fix (review round 1): `zirv ctx recall --json` must keep
+    /// emitting the pre-issue-#32 shape for an entry that never sets the new
+    /// fields -- no `importance`/`confidence`/`tags`/`paths` keys at all,
+    /// not `null`/`[]`. `#[serde(skip_serializing_if = ...)]` on each new
+    /// field is what guarantees this.
+    #[test]
+    fn json_serialization_omits_the_new_fields_entirely_when_unset() {
+        let entry = sample("build-cmd", 1);
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(!json.contains("importance"), "got {json}");
+        assert!(!json.contains("confidence"), "got {json}");
+        assert!(!json.contains("\"tags\""), "got {json}");
+        assert!(!json.contains("\"paths\""), "got {json}");
+    }
+
+    /// The other half: when the new fields ARE set, they do appear.
+    #[test]
+    fn json_serialization_includes_the_new_fields_once_set() {
+        let mut entry = sample("build-cmd", 1);
+        entry.importance = Some("high".to_string());
+        entry.tags = vec!["ci".to_string()];
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(json.contains("\"importance\":\"high\""), "got {json}");
+        assert!(json.contains("\"tags\":[\"ci\"]"), "got {json}");
+        assert!(!json.contains("confidence"), "still unset: {json}");
+    }
+
+    /// Tags and paths are comma-separated on one header line; stray spaces
+    /// and empty items (a trailing comma, doubled commas) are normalized away
+    /// rather than producing a blank tag.
+    #[test]
+    fn tags_and_paths_are_split_on_commas_and_trimmed() {
+        let md = concat!(
+            "## Memory\n",
+            "- Key: k\n",
+            "- Source: explicit\n",
+            "- Tags:  build ,  ci ,, \n",
+            "- Paths: src/a.rs ,src/b.rs\n",
+            "\n",
+            "body\n",
+        );
+        let entry = parse_markdown(md);
+        assert_eq!(entry.tags, vec!["build".to_string(), "ci".to_string()]);
+        assert_eq!(
+            entry.paths,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+    }
+
+    /// The "versionable" property in practice: a header line this parser
+    /// doesn't know about yet (as a later task's schema extension, e.g. issue
+    /// #38's lifecycle states, would add) is simply skipped, never a parse
+    /// failure -- the same unknown-header tolerance
+    /// `an_unknown_header_or_section_is_skipped_rather_than_failing_the_read`
+    /// already covers for Task 1's fields, exercised here against a
+    /// plausible future field name.
+    #[test]
+    fn a_future_schema_field_this_parser_does_not_know_about_yet_is_skipped_not_fatal() {
+        let md = concat!(
+            "## Memory\n",
+            "- Key: k\n",
+            "- Source: explicit\n",
+            "- Lifecycle: archived\n",
+            "\n",
+            "body\n",
+        );
+        let entry = parse_markdown(md);
+        assert_eq!(entry.key, "k");
+        assert_eq!(entry.body, "body");
+    }
+
+    #[test]
+    fn validate_shared_key_rejects_an_empty_key() {
+        assert!(validate_shared_key("").is_err());
+    }
+
+    #[test]
+    fn validate_shared_key_rejects_a_key_over_the_length_cap() {
+        let long = "a".repeat(MAX_SHARED_KEY_LEN + 1);
+        assert!(validate_shared_key(&long).is_err());
+        let ok = "a".repeat(MAX_SHARED_KEY_LEN);
+        assert!(validate_shared_key(&ok).is_ok());
+    }
+
+    /// The traversal defense at the file-name level: anything outside
+    /// `[a-z0-9-]` is rejected outright, which rules out `/`, `\`, `..`,
+    /// uppercase, spaces, and null bytes in one charset check.
+    #[test]
+    fn validate_shared_key_rejects_path_traversal_and_separators() {
+        for bad in [
+            "../../etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            "..",
+            "Build-Cmd",
+            "has space",
+            "trailing.",
+        ] {
+            assert!(
+                validate_shared_key(bad).is_err(),
+                "'{bad}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_shared_key_accepts_lowercase_kebab_case() {
+        assert!(validate_shared_key("build-cmd").is_ok());
+        assert!(validate_shared_key("a").is_ok());
+        assert!(validate_shared_key("has-123-digits").is_ok());
+    }
+
+    #[test]
+    fn validate_shared_key_rejects_pure_dash_keys() {
+        for bad in ["-", "--", "---"] {
+            assert!(
+                validate_shared_key(bad).is_err(),
+                "'{bad}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_shared_key_rejects_windows_reserved_device_names() {
+        for bad in ["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"] {
+            assert!(
+                validate_shared_key(bad).is_err(),
+                "'{bad}' must be rejected"
+            );
+        }
+        // A reserved word as part of a longer name is not itself reserved --
+        // Windows matches the whole base name, never a substring.
+        assert!(validate_shared_key("console").is_ok());
+        assert!(validate_shared_key("con-fig").is_ok());
+    }
+
+    /// IMPORTANT fix (review round 1): `upsert_shared` validated only
+    /// `entry.key`, but `to_markdown` interpolates `written_by`/`source`/
+    /// `importance`/`confidence`/`tags`/`paths` directly into `## Memory`
+    /// header lines. A newline embedded in any of those fields would inject
+    /// a fake header line that `parse_markdown` reads back as legitimate --
+    /// demonstrated directly (independent of the write-time guard) by
+    /// `a_header_rendered_field_with_an_embedded_newline_would_inject_a_
+    /// fake_header_line` below. This test proves the guard actually stops it
+    /// at write time.
+    #[test]
+    fn upsert_scoped_shared_rejects_a_header_field_containing_a_newline() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut entry = sample("build-cmd", 1);
+        entry.paths = vec!["src/a.rs\n- Key: hijacked".to_string()];
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect_err("a header field containing a newline must be rejected");
+        assert!(err.to_string().contains("newline"), "got {err}");
+        assert!(
+            !repo
+                .path()
+                .join(".zirv")
+                .join("memory")
+                .join("build-cmd.md")
+                .exists(),
+            "nothing is written when a header field is rejected"
+        );
+    }
+
+    /// Same rejection, for each other header-rendered field individually --
+    /// `written_by`, `source`, `importance`, `confidence`, and `tags`.
+    #[test]
+    fn upsert_scoped_shared_rejects_a_newline_in_any_header_rendered_field() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let base = sample("build-cmd", 1);
+        let variants: Vec<Entry> = vec![
+            Entry {
+                written_by: "claude\n- Key: hijacked".to_string(),
+                ..base.clone()
+            },
+            Entry {
+                source: "explicit\n- Key: hijacked".to_string(),
+                ..base.clone()
+            },
+            Entry {
+                importance: Some("high\n- Key: hijacked".to_string()),
+                ..base.clone()
+            },
+            Entry {
+                confidence: Some("high\n- Key: hijacked".to_string()),
+                ..base.clone()
+            },
+            Entry {
+                tags: vec!["ok".to_string(), "bad\n- Key: hijacked".to_string()],
+                ..base.clone()
+            },
+        ];
+
+        for entry in variants {
+            let err = upsert_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &cfg,
+                &entry,
+            )
+            .expect_err("a newline in a header-rendered field must be rejected");
+            assert!(err.to_string().contains("newline"), "got {err}");
+        }
+    }
+
+    /// Documents the exact injection mechanism the guard above exists to
+    /// block, at the parser level, independent of the write-time guard: if a
+    /// header-rendered field's value ever reached `to_markdown` uninspected,
+    /// an embedded newline would render as a second, fake header line that
+    /// `parse_markdown` reads back as legitimate -- the exact scenario the
+    /// review flagged (a `paths` value living at `build-cmd.md` round-trips
+    /// with key `hijacked`).
+    #[test]
+    fn a_header_rendered_field_with_an_embedded_newline_would_inject_a_fake_header_line() {
+        let mut entry = sample("build-cmd", 1);
+        entry.paths = vec!["src/a.rs\n- Key: hijacked".to_string()];
+        // `to_markdown` itself has no opinion on this -- the guard lives one
+        // layer up, in `upsert_shared`'s `validate_shared_entry_fields` call,
+        // which is why this test builds the markdown directly.
+        let rendered = entry.to_markdown();
+        let parsed = parse_markdown(&rendered);
+        assert_eq!(
+            parsed.key, "hijacked",
+            "an embedded newline in a header field is read back as a new header line: {rendered:?}"
+        );
+    }
+
+    /// Pins the deliberate gating asymmetry documented on `upsert_scoped`:
+    /// `Private` (via `remember`) has never itself consulted
+    /// `cfg.memory.enabled` -- only the `zirv ctx remember` CLI wrapper does
+    /// that before calling `remember`. `Shared` (via `upsert_shared`) DOES
+    /// check its own gate internally. A future CLI verb built directly on
+    /// `upsert_scoped` must add its own `memory.enabled` check for the
+    /// Private path; this test exists so that requirement is never
+    /// "discovered" as a surprise.
+    #[test]
+    fn upsert_scoped_private_writes_even_when_memory_enabled_is_false_unlike_shared() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = repo_slug(repo.path());
+        let mut cfg = CtxConfig::default();
+        cfg.memory.enabled = false;
+
+        upsert_scoped(
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect(
+            "upsert_scoped(Private) writes even while memory.enabled is false, same as remember always has",
+        );
+        assert!(get(&state, &slug, "build-cmd").expect("get").is_some());
+
+        cfg.memory.shared_enabled = false;
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect_err("upsert_scoped(Shared) refuses while shared_enabled is false");
+        assert!(err.to_string().contains("disabled"), "got {err}");
+    }
+
+    /// Acceptance criterion: two unrelated memories modify different files.
+    #[test]
+    fn upsert_scoped_shared_writes_two_unrelated_keys_to_two_different_files() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert a");
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("staging-db-creds", 2),
+        )
+        .expect("upsert b");
+
+        assert!(dir.join("build-cmd.md").exists());
+        assert!(dir.join("staging-db-creds.md").exists());
+    }
+
+    /// Acceptance criterion: updating a key updates its stable file rather
+    /// than appending another historical copy.
+    #[test]
+    fn upsert_scoped_shared_updating_a_key_rewrites_the_same_file() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+
+        let mut entry = sample("build-cmd", 1);
+        entry.body = "cargo build".to_string();
+        let first_path = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect("first upsert");
+
+        entry.written = 2;
+        entry.body = "cargo build --release".to_string();
+        let second_path = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect("second upsert");
+
+        assert_eq!(first_path, second_path, "the same key -> the same file");
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["build-cmd.md".to_string()],
+            "no historical copy is left behind: {files:?}"
+        );
+        assert_eq!(
+            parse_markdown(&std::fs::read_to_string(&second_path).expect("read")).body,
+            "cargo build --release"
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_private_still_delegates_unchanged_to_remember() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = repo_slug(repo.path());
+        let cfg = CtxConfig::default();
+
+        upsert_scoped(
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert private");
+
+        let listed = list(&state, &slug).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.key, "build-cmd");
+        assert!(
+            listed[0]
+                .0
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .starts_with("0000000001-"),
+            "private upserts still use the timestamp-addressed naming remember always has: {:?}",
+            listed[0].0
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_shared_is_refused_when_shared_enabled_is_false() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.shared_enabled = false;
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect_err("a disabled shared scope must refuse the write");
+        assert!(err.to_string().contains("disabled"), "got {err}");
+        assert!(!repo.path().join(".zirv").join("memory").exists());
+    }
+
+    #[test]
+    fn upsert_scoped_shared_rejects_an_invalid_key_and_writes_nothing() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("../escape", 1),
+        )
+        .expect_err("an invalid key must be rejected");
+        assert!(err.to_string().contains("invalid"), "got {err}");
+        assert!(
+            !repo.path().join(".zirv").join("memory").exists(),
+            "nothing is written when the key is rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upsert_scoped_shared_refuses_to_write_through_a_symlinked_zirv_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".zirv")).expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect_err("a symlinked .zirv must refuse the write");
+        assert!(err.to_string().contains("symlink"), "got {err}");
+        assert!(
+            !outside.path().join("memory").exists(),
+            "nothing must ever be written outside the repository"
+        );
+    }
+
+    /// The write-path traversal test the Task 1 review explicitly flagged as
+    /// missing: `rename` replaces the directory entry rather than following
+    /// it, so writing over a canonical path that is currently a symlink
+    /// (e.g. a repo-committed `some-key.md -> /etc/passwd`) must replace the
+    /// link with a regular file, never write through it.
+    #[cfg(unix)]
+    #[test]
+    fn upsert_scoped_shared_replaces_a_symlinked_target_file_rather_than_writing_through_it() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "leak-me").expect("write secret");
+        std::os::unix::fs::symlink(&secret, dir.join("build-cmd.md")).expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let path = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert must succeed, replacing the symlink");
+
+        assert_eq!(
+            std::fs::read_to_string(&secret).expect("read secret"),
+            "leak-me",
+            "the symlink target must never be written through"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be replaced by a regular file"
+        );
+    }
+
+    /// The write-side counterpart of `duplicate_keys` below: a canonical-key
+    /// collision from a mismatched file name (hand-edited, or copy-pasted
+    /// content into the wrong file) is refused rather than silently creating
+    /// a second file claiming the same key.
+    #[test]
+    fn upsert_scoped_shared_detects_a_canonical_key_collision_from_a_mismatched_filename() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mismatched = sample("build-cmd", 1);
+        std::fs::write(dir.join("renamed-by-hand.md"), mismatched.to_markdown())
+            .expect("write mismatched");
+
+        let err = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 2),
+        )
+        .expect_err("a canonical-key collision must be refused");
+        assert!(err.to_string().contains("build-cmd"), "got {err}");
+        assert!(
+            !dir.join("build-cmd.md").exists(),
+            "the canonical file must not be created when a collision is refused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("renamed-by-hand.md")).expect("read"),
+            mismatched.to_markdown(),
+            "the pre-existing mismatched file is untouched"
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_reports_keys_claimed_by_more_than_one_file() {
+        let a = (PathBuf::from("a.md"), sample("build-cmd", 1));
+        let b = (PathBuf::from("b.md"), sample("build-cmd", 2));
+        let c = (PathBuf::from("c.md"), sample("staging-db-creds", 3));
+        assert_eq!(duplicate_keys(&[a, b, c]), vec!["build-cmd".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_keys_is_empty_when_every_key_is_unique() {
+        let a = (PathBuf::from("a.md"), sample("build-cmd", 1));
+        let b = (PathBuf::from("b.md"), sample("staging-db-creds", 2));
+        assert!(duplicate_keys(&[a, b]).is_empty());
+    }
+
+    #[test]
+    fn get_scoped_finds_an_entry_written_through_upsert_scoped_in_either_scope() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = repo_slug(repo.path());
+        let cfg = CtxConfig::default();
+
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("shared-key", 1),
+        )
+        .expect("upsert shared");
+        upsert_scoped(
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("private-key", 1),
+        )
+        .expect("upsert private");
+
+        let shared = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            "shared-key",
+        )
+        .expect("get shared")
+        .expect("present");
+        assert_eq!(shared.key, "shared-key");
+
+        let private = get_scoped(
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            "private-key",
+        )
+        .expect("get private")
+        .expect("present");
+        assert_eq!(private.key, "private-key");
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                "private-key"
+            )
+            .expect("get")
+            .is_none(),
+            "a private-scope key must not be visible through the shared scope"
+        );
+    }
+
+    #[test]
+    fn get_scoped_returns_none_when_the_scope_is_disabled_even_with_an_entry_on_disk() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert");
+
+        let mut disabled = cfg.clone();
+        disabled.memory.shared_enabled = false;
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &disabled,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn forget_scoped_removes_a_shared_entry_by_key() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert");
+
+        assert!(
+            forget_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("forget")
+        );
+        assert!(
+            !repo
+                .path()
+                .join(".zirv")
+                .join("memory")
+                .join("build-cmd.md")
+                .exists()
+        );
+        assert!(
+            !forget_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "no-such-key"
+            )
+            .expect("forget missing"),
+            "forgetting an absent key reports false, not an error"
+        );
+    }
+
+    /// Same "disabling a feature must never trap data" contract the private
+    /// scope's own `forget` already gives: forgetting a shared entry must
+    /// still work even while `shared_enabled` is off.
+    #[test]
+    fn forget_scoped_shared_still_works_when_shared_enabled_is_false() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert");
+
+        let mut disabled = cfg.clone();
+        disabled.memory.shared_enabled = false;
+        assert!(
+            forget_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("forget while disabled")
+        );
+    }
+
+    /// Minor fix (review round 1): `forget_scoped` used to scan the whole
+    /// directory and delete EVERY file whose own `Key:` header matched --
+    /// so a human-named notes file that happened to carry the same key
+    /// would be deleted as collateral damage. It must now touch only the
+    /// canonical `<key>.md` file, and report (via the decision log) rather
+    /// than silently ignore a stray file left behind.
+    #[test]
+    fn forget_scoped_shared_never_deletes_a_stray_file_with_a_matching_header_key() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert canonical");
+
+        // A human-named notes file that happens to carry the same Key
+        // header -- exactly the state a hand edit or a merge could produce.
+        let stray = sample("build-cmd", 2);
+        std::fs::write(dir.join("notes.md"), stray.to_markdown()).expect("write stray");
+
+        let removed = forget_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            "build-cmd",
+        )
+        .expect("forget");
+        assert!(removed, "the canonical file was removed");
+        assert!(
+            !dir.join("build-cmd.md").exists(),
+            "the canonical file is gone"
+        );
+        assert!(
+            dir.join("notes.md").exists(),
+            "a stray file with a matching header key must never be deleted as collateral damage"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("forget-collision-left") && log.contains("build-cmd"),
+            "the surviving collision is reported in the decision log: {log}"
+        );
+    }
+
+    #[test]
+    fn verify_scoped_refreshes_only_the_verified_stamp_for_a_shared_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut entry = sample("build-cmd", 1_700_000_000);
+        entry.verified = 1_700_000_000;
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect("upsert");
+
+        assert!(
+            verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify")
+        );
+
+        let refreshed = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            "build-cmd",
+        )
+        .expect("get")
+        .expect("present");
+        assert_eq!(refreshed.written, 1_700_000_000, "written stamp untouched");
+        assert!(
+            refreshed.verified >= now_secs().saturating_sub(5),
+            "verified was refreshed to roughly now: {}",
+            refreshed.verified
+        );
+
+        assert!(
+            !verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "no-such-key"
+            )
+            .expect("verify missing"),
+            "verifying an absent key reports false"
+        );
+    }
+
+    #[test]
+    fn verify_scoped_shared_still_works_when_shared_enabled_is_false() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &sample("build-cmd", 1),
+        )
+        .expect("upsert");
+
+        let mut disabled = cfg.clone();
+        disabled.memory.shared_enabled = false;
+        assert!(
+            verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify while disabled")
+        );
+    }
+
+    /// Minor fix (review round 1): `verify_scoped` must touch only the
+    /// canonical `<key>.md` file, same collision policy as `forget_scoped` --
+    /// a stray file elsewhere claiming the same key is left completely
+    /// untouched, never refreshed or read as if it were the real entry.
+    #[test]
+    fn verify_scoped_shared_only_touches_the_canonical_file_even_with_a_stray_collision_present() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut canonical = sample("build-cmd", 1_700_000_000);
+        canonical.verified = 1_700_000_000;
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &canonical,
+        )
+        .expect("upsert canonical");
+
+        let stray = sample("build-cmd", 5);
+        std::fs::write(dir.join("notes.md"), stray.to_markdown()).expect("write stray");
+
+        assert!(
+            verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify")
+        );
+
+        let refreshed = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            "build-cmd",
+        )
+        .expect("get")
+        .expect("present");
+        assert_eq!(
+            refreshed.written, 1_700_000_000,
+            "the canonical entry's written stamp is untouched"
+        );
+        assert!(refreshed.verified >= now_secs().saturating_sub(5));
+
+        let stray_text = std::fs::read_to_string(dir.join("notes.md")).expect("read stray");
+        assert_eq!(
+            parse_markdown(&stray_text).verified,
+            5,
+            "the stray collision is never touched by verify"
+        );
+    }
+
+    /// `get_scoped` follows the same canonical-file-only policy: a key only
+    /// claimed by a stray, non-canonically-named file is not found, even
+    /// though a full directory scan would have surfaced it.
+    #[test]
+    fn get_scoped_shared_does_not_find_a_key_only_claimed_by_a_non_canonical_file() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        std::fs::write(dir.join("notes.md"), sample("build-cmd", 1).to_markdown())
+            .expect("write stray");
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_none(),
+            "only the canonical file is ever consulted for a per-key lookup"
+        );
+    }
+
+    /// IMPORTANT fix (review round 2): `get_scoped` used to read the
+    /// canonical path with a plain `std::fs::read_to_string`, which follows
+    /// a symlink transparently -- bypassing the symlink skip `read_entries`
+    /// gives every directory scan. A repo-committed `build-cmd.md ->
+    /// /etc/passwd` must be refused, not read back as an entry.
+    #[cfg(unix)]
+    #[test]
+    fn get_scoped_shared_refuses_a_symlinked_canonical_file() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Deliberately a WELL-FORMED entry for the requested key, not
+        // garbage: this isolates the symlink defense from the separate
+        // key-agreement check below -- content that fails to parse as
+        // "build-cmd" would be refused by that other check regardless of
+        // whether the symlink is followed, which would make this test pass
+        // for the wrong reason.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, sample("build-cmd", 1).to_markdown()).expect("write secret");
+        std::os::unix::fs::symlink(&secret, dir.join("build-cmd.md")).expect("symlink");
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_none(),
+            "a symlinked canonical file must never be read back as an entry, even one that would otherwise match"
+        );
+    }
+
+    /// IMPORTANT fix (review round 2), the write-side counterpart:
+    /// `verify_scoped` used to read the canonical path the same unguarded
+    /// way, and would then WRITE the linked file's own content back into the
+    /// repository via `write_shared` -- reading a symlink's target and then
+    /// materializing it as ordinary, committable content. Must refuse
+    /// instead, touching neither the link nor its target.
+    ///
+    /// Deliberately a WELL-FORMED entry for the requested key at the symlink
+    /// target (not garbage), same reasoning as `get_scoped`'s analogous test:
+    /// this isolates the symlink defense from the separate key-agreement
+    /// check (fix round 3) -- content that fails to parse as "build-cmd"
+    /// would be refused by that other check regardless of whether the
+    /// symlink is followed, which would make this test pass for the wrong
+    /// reason.
+    #[cfg(unix)]
+    #[test]
+    fn verify_scoped_shared_refuses_a_symlinked_canonical_file_and_never_materializes_its_target() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let secret = outside.path().join("secret.txt");
+        let secret_contents = sample("build-cmd", 1).to_markdown();
+        std::fs::write(&secret, &secret_contents).expect("write secret");
+        std::os::unix::fs::symlink(&secret, dir.join("build-cmd.md")).expect("symlink");
+
+        assert!(
+            !verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify"),
+            "a symlinked canonical file must never be verified, even one that would otherwise match"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&secret).expect("read secret"),
+            secret_contents,
+            "the symlink target must never be read-then-rewritten"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.join("build-cmd.md"))
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be left completely untouched, not replaced"
+        );
+    }
+
+    /// IMPORTANT fix (review round 2): `get_scoped` used to return
+    /// `Some(parse_markdown(&text))` unconditionally. A hand-edited or
+    /// merged file whose header `Key:` disagrees with its own file name must
+    /// be refused, not returned as if it were an honest entry for the
+    /// requested key -- and the mismatch is logged, not silently masked by
+    /// overwriting the parsed key.
+    #[test]
+    fn get_scoped_shared_refuses_a_canonical_file_whose_header_key_disagrees_with_its_name() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // The file named build-cmd.md, but its own header claims a
+        // different key -- a hand edit or a merge, not something
+        // upsert_shared itself can produce.
+        std::fs::write(
+            dir.join("build-cmd.md"),
+            sample("something-else", 1).to_markdown(),
+        )
+        .expect("write mismatched");
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_none(),
+            "a canonical file whose header key disagrees with its file name must be refused"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("get-key-mismatch")
+                && log.contains("build-cmd")
+                && log.contains("something-else"),
+            "the mismatch is logged, naming both keys: {log}"
+        );
+    }
+
+    /// The phantom-entry case falls out of the same key-agreement check: any
+    /// readable file with no `## Memory` header at all parses to
+    /// `key == ""`, which can never equal a real requested key.
+    #[test]
+    fn get_scoped_shared_refuses_a_non_entry_file_at_the_canonical_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        std::fs::write(dir.join("build-cmd.md"), "not a memory entry at all\n")
+            .expect("write garbage");
+
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_none(),
+            "a readable non-entry file must never surface as a phantom entry"
+        );
+    }
+
+    /// IMPORTANT fix (review round 3): `verify_scoped` gets the same
+    /// key-agreement rule as `get_scoped` (the round-2 ruling scoping it to
+    /// `get_scoped` alone was an under-scoping). A canonical file whose
+    /// header key disagrees with its file name must be refused -- not
+    /// stamped with false freshness -- and the mismatch is logged. The file
+    /// on disk is byte-identical afterward: nothing was written.
+    #[test]
+    fn verify_scoped_shared_refuses_a_canonical_file_whose_header_key_disagrees_with_its_name() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mismatched = sample("something-else", 1).to_markdown();
+        std::fs::write(dir.join("build-cmd.md"), &mismatched).expect("write mismatched");
+
+        assert!(
+            !verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify"),
+            "a canonical file whose header key disagrees with its file name must be refused"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("build-cmd.md")).expect("read"),
+            mismatched,
+            "nothing is written when the key disagrees"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("verify-key-mismatch")
+                && log.contains("build-cmd")
+                && log.contains("something-else"),
+            "the mismatch is logged, naming both keys: {log}"
+        );
+    }
+
+    /// The phantom-entry case, same key-agreement check: a readable
+    /// non-entry file must never be "verified" -- doing so used to destroy
+    /// it by overwriting it with an empty phantom stub via the old
+    /// parse-then-`to_markdown` re-render.
+    #[test]
+    fn verify_scoped_shared_refuses_a_non_entry_file_and_leaves_it_byte_identical() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let garbage = "not a memory entry at all\n";
+        std::fs::write(dir.join("build-cmd.md"), garbage).expect("write garbage");
+
+        assert!(
+            !verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify"),
+            "a readable non-entry file must never be verified"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("build-cmd.md")).expect("read"),
+            garbage,
+            "the file must be left byte-identical, not overwritten with an empty phantom stub"
+        );
+    }
+
+    /// FOLDED fix (review round 3, data-loss hazard): a hand-edited shared
+    /// entry with an unknown header bullet and a trailing `## Notes` section
+    /// must survive `verify_scoped` byte-identical except for the `Verified`
+    /// line -- the old parse-then-`to_markdown` re-render would have
+    /// silently dropped both, violating issue #32's "readable and editable
+    /// without Zirv" contract.
+    #[test]
+    fn verify_scoped_shared_preserves_unknown_header_lines_and_trailing_sections() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let original = concat!(
+            "## Memory\n",
+            "- Key: build-cmd\n",
+            "- Written-by: claude\n",
+            "- Written: 1700000000\n",
+            "- Verified: 1700000000\n",
+            "- Source: explicit\n",
+            "- Priority: urgent\n",
+            "\n",
+            "cargo build --release\n",
+            "\n",
+            "## Notes\n",
+            "A human wrote this section; Zirv has never read it.\n",
+        );
+        std::fs::write(dir.join("build-cmd.md"), original).expect("write hand-edited entry");
+
+        let before = now_secs();
+        assert!(
+            verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify")
+        );
+        let after_call = now_secs();
+
+        let after = std::fs::read_to_string(dir.join("build-cmd.md")).expect("read");
+        // Read the actual stamped value back rather than assuming a second
+        // `now_secs()` call matches the one `verify_scoped` itself made --
+        // avoids a test that flakes if the clock ticks over between calls.
+        let new_verified = parse_markdown(&after).verified;
+        assert!(
+            (before..=after_call).contains(&new_verified),
+            "the Verified stamp was refreshed to roughly now: {new_verified}"
+        );
+
+        let expected = original.replace(
+            "- Verified: 1700000000",
+            &format!("- Verified: {new_verified}"),
+        );
+        assert_eq!(
+            after, expected,
+            "only the Verified line may change; every other byte, including the \
+             unknown Priority bullet and the trailing Notes section, must survive: {after:?}"
+        );
+    }
+
+    /// The same in-place stamping also handles the common case: no
+    /// pre-existing `Verified` bullet at all (e.g. a hand-written file that
+    /// never had one) gets one appended at the end of the header, rather
+    /// than failing or fabricating the rest of the entry.
+    #[test]
+    fn verify_scoped_shared_appends_a_verified_bullet_when_none_exists() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let original = concat!(
+            "## Memory\n",
+            "- Key: build-cmd\n",
+            "- Source: explicit\n",
+            "\n",
+            "cargo build\n",
+        );
+        std::fs::write(dir.join("build-cmd.md"), original).expect("write");
+
+        let before = now_secs();
+        assert!(
+            verify_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-irrelevant",
+                "build-cmd"
+            )
+            .expect("verify")
+        );
+        let after_call = now_secs();
+
+        let after = std::fs::read_to_string(dir.join("build-cmd.md")).expect("read");
+        let new_verified = parse_markdown(&after).verified;
+        assert!(
+            (before..=after_call).contains(&new_verified),
+            "a Verified bullet is appended and refreshed to roughly now: {after:?}"
+        );
+        assert!(
+            after.contains("- Key: build-cmd"),
+            "existing lines survive: {after:?}"
+        );
+        assert!(
+            after.contains("cargo build"),
+            "the body survives: {after:?}"
+        );
+    }
+
+    /// Concurrent-write test required by issue #32: distinct keys racing each
+    /// other must never interfere -- each lands in its own canonical file.
+    #[test]
+    fn concurrent_upserts_to_different_shared_keys_never_interfere() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let repo_path = repo.path().to_path_buf();
+        let state = StateDir::from_root(repo_path.join("state"));
+        let cfg = CtxConfig::default();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let repo_path = repo_path.clone();
+                let state = state.clone();
+                let cfg = cfg.clone();
+                std::thread::spawn(move || {
+                    let entry = sample(&format!("key-{i}"), i as u64 + 1);
+                    upsert_scoped(
+                        MemoryScope::Shared,
+                        &repo_path,
+                        &state,
+                        "-irrelevant",
+                        &cfg,
+                        &entry,
+                    )
+                    .expect("upsert")
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread must not panic");
+        }
+
+        let listed = list_scoped(MemoryScope::Shared, &repo_path, &state, "-irrelevant", &cfg)
+            .expect("list");
+        assert_eq!(listed.len(), 8, "each key gets its own file: {listed:?}");
+        let mut keys: Vec<&str> = listed.iter().map(|(_, e)| e.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "key-0", "key-1", "key-2", "key-3", "key-4", "key-5", "key-6", "key-7"
+            ]
+        );
+    }
+
+    /// Concurrent-write test required by issue #32: several writers racing
+    /// the SAME key must never corrupt the file (each write is atomic, temp
+    /// sibling + `rename`) and must converge to exactly one, whole entry --
+    /// never two files for one key, unlike the private scope's timestamp-
+    /// addressed naming, which needs its own best-effort dedup pass for
+    /// exactly this race.
+    #[test]
+    fn concurrent_upserts_to_the_same_shared_key_always_leave_one_whole_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let repo_path = repo.path().to_path_buf();
+        let state = StateDir::from_root(repo_path.join("state"));
+        let cfg = CtxConfig::default();
+        let canonical_path = repo_path
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join("memory")
+            .join("race-key.md");
+
+        // Deliberately different lengths per body (not just a trailing digit
+        // that leaves every rendered entry the same size): a reader
+        // observing any length outside the known-whole set can only be a
+        // torn read, never a coincidence.
+        let bodies: Vec<String> = (0..8)
+            .map(|i| format!("body-variant-{}", "x".repeat(i * 37)))
+            .collect();
+        // Minor fix (review round 1): precompute every racer's exact rendered
+        // length up front, so a reader thread racing the writers can assert
+        // each read is either absent or one of these WHOLE lengths -- never
+        // any other length, which would mean a torn (partial) read was
+        // observed mid-`rename`. Asserting only the final state (as before)
+        // proves the race converges, but not that no reader ever saw a torn
+        // write along the way.
+        let whole_lengths: std::collections::HashSet<usize> = bodies
+            .iter()
+            .map(|body| {
+                let mut entry = sample("race-key", 1);
+                entry.body = body.clone();
+                entry.to_markdown().len()
+            })
+            .collect();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_path = canonical_path.clone();
+        let reader_lengths = whole_lengths.clone();
+        let reader = std::thread::spawn(move || {
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(contents) = std::fs::read_to_string(&reader_path) {
+                    assert!(
+                        reader_lengths.contains(&contents.len()),
+                        "a reader must never observe a torn write: saw {} bytes, expected one of {:?}",
+                        contents.len(),
+                        reader_lengths
+                    );
+                }
+            }
+        });
+
+        let handles: Vec<_> = bodies
+            .iter()
+            .cloned()
+            .map(|body| {
+                let repo_path = repo_path.clone();
+                let state = state.clone();
+                let cfg = cfg.clone();
+                std::thread::spawn(move || {
+                    let mut entry = sample("race-key", 1);
+                    entry.body = body;
+                    upsert_scoped(
+                        MemoryScope::Shared,
+                        &repo_path,
+                        &state,
+                        "-irrelevant",
+                        &cfg,
+                        &entry,
+                    )
+                    .expect("upsert")
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread must not panic");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader
+            .join()
+            .expect("reader thread panicked on a torn read");
+
+        let listed = list_scoped(MemoryScope::Shared, &repo_path, &state, "-irrelevant", &cfg)
+            .expect("list");
+        assert_eq!(
+            listed.len(),
+            1,
+            "one key must never become two files, even under a race: {listed:?}"
+        );
+        assert_eq!(listed[0].1.key, "race-key");
+        assert!(
+            bodies.contains(&listed[0].1.body),
+            "the surviving body must be one of the raced writes, whole and uncorrupted: {:?}",
+            listed[0].1.body
         );
     }
 }
