@@ -287,6 +287,12 @@ fn rank_and_fill<'a>(
     (selected, omitted, used)
 }
 
+/// The literal `with_memory_layer` appends after the shared block, marking
+/// where its untrusted content ends. Named so the forgery suppression in
+/// `select_memory_within_cap` and the render site can never drift apart on
+/// the exact text.
+const SHARED_BLOCK_END_MARKER: &str = "[end of untrusted repository content]";
+
 /// N3/issue #34: which entries actually fit under `cap`, and how many were
 /// left out.
 ///
@@ -313,11 +319,6 @@ fn rank_and_fill<'a>(
 /// back to a shared entry only when there is no private entry to fall back
 /// on.
 ///
-/// The literal `with_memory_layer` appends after the shared block, marking
-/// where its untrusted content ends. Named so the suppression below and the
-/// render site can never drift apart on the exact text.
-const SHARED_BLOCK_END_MARKER: &str = "[end of untrusted repository content]";
-
 /// **Key-conflict suppression, ahead of ranking/selection:** a shared entry
 /// whose `key` matches a private entry's `key` CASE-INSENSITIVELY is dropped
 /// entirely before either group is ranked, never merely outranked. Case-
