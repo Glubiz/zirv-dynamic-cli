@@ -658,14 +658,26 @@ impl AgentAdapter for ClaudeAdapter {
     /// Claude's one verified per-run enforcement mechanism is the same
     /// `--disallowedTools=...` pin `distiller_cmd` above already relies on,
     /// probed against the real CLI (docs/superpowers/notes/2026-08-01-system-
-    /// prompt-injection-facts.md). It names *tools*, so it answers exactly the
-    /// capabilities that are tools -- writes, shell, tool access, and by
-    /// extension "attempt nothing needing approval", which is what denying all
-    /// four amounts to.
+    /// prompt-injection-facts.md). It names exactly four *tools*
+    /// (`Write`/`Edit`/`Bash`/`NotebookEdit`), so it fully enforces exactly
+    /// the two capabilities that pin denies outright:
     ///
-    /// It answers nothing else, and this method says so rather than rounding
-    /// up. In particular:
+    /// - **Repo filesystem writes** and **shell execution** -- `Write`/`Edit`
+    ///   and `Bash` are two of the four denied tools, so a `Deny` stance is
+    ///   `Enforced`.
     ///
+    /// It answers everything else only partially or not at all:
+    ///
+    /// - **MCP/tool access** is `Degraded`, not `Enforced`: the pin denies
+    ///   exactly `Write`/`Edit`/`Bash`/`NotebookEdit`, but `Read`, `Grep`,
+    ///   `WebFetch`, `WebSearch`, `Task`, and every MCP server's own tools
+    ///   remain available. Claiming `Enforced` here would claim a full tool
+    ///   deny the pin does not deliver (docs/superpowers/notes/2026-08-01-
+    ///   system-prompt-injection-facts.md:153).
+    /// - **Approval** is `Unsupported`: the pin does not address approvals at
+    ///   all. `WebFetch` domain approval and MCP tool approvals still prompt
+    ///   even with all four tools denied, and `--permission-mode plan` was
+    ///   probed and does not resolve in headless `-p` mode.
     /// - **Network** has no verified per-run flag at all.
     /// - **git push / destructive git** is reachable only through `Bash`, so
     ///   the only pin available denies *every* shell command, not git's --
@@ -676,10 +688,9 @@ impl AgentAdapter for ClaudeAdapter {
     ///   scopes writes by path, and the available pin denies writes
     ///   everywhere, in-repo included.
     ///
-    /// No stance reports as `Enforced` at `Ask`: `--permission-mode plan` was
-    /// probed and does not resolve in headless `-p` mode, and claude's
-    /// interactive ask-by-default comes from the operator's own settings, not
-    /// from anything zirv pins.
+    /// No stance reports as `Enforced` or `Degraded` at `Ask`: the pin can
+    /// only deny outright, and claude's interactive ask-by-default comes
+    /// from the operator's own settings, not from anything zirv pins.
     fn policy_support(
         &self,
         capability: crate::commands::ctx::policy::Capability,
@@ -688,15 +699,26 @@ impl AgentAdapter for ClaudeAdapter {
         use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
 
         const TOOL_PIN: &str = "--disallowedTools=Write,Edit,Bash,NotebookEdit";
+        const TOOL_PIN_PARTIAL: &str = "--disallowedTools=Write,Edit,Bash,NotebookEdit denies exactly those four \
+             tools; Read, Grep, WebFetch, WebSearch, Task and every MCP server's own tools \
+             remain available";
+        const APPROVAL_UNSUPPORTED: &str = "the tool pin does not address approvals at all: WebFetch domain approval and \
+             MCP tool approvals still prompt; `--permission-mode plan` was probed and does not \
+             resolve in headless `-p` mode";
         const SETTINGS: &str = "claude's own permission prompts and `.claude/settings.json` permissions, which zirv \
              reads and never rewrites";
 
         match capability {
-            Capability::RepoFsWrite
-            | Capability::ShellExec
-            | Capability::ToolAccess
-            | Capability::Approval => match stance {
+            Capability::RepoFsWrite | Capability::ShellExec => match stance {
                 Stance::Deny => CapabilityDescriptor::enforced(TOOL_PIN),
+                Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
+            },
+            Capability::ToolAccess => match stance {
+                Stance::Deny => CapabilityDescriptor::degraded(TOOL_PIN_PARTIAL),
+                Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
+            },
+            Capability::Approval => match stance {
+                Stance::Deny => CapabilityDescriptor::unsupported(APPROVAL_UNSUPPORTED),
                 Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
             },
             // Network, git push/destructive git, and path-scoped writes --

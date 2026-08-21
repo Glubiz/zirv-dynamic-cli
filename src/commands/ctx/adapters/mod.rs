@@ -430,6 +430,16 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// the only caller, `policy::evaluate`, has no production caller of its own
     /// until issues #44/#46 wire it in. Both adapters override it already, and
     /// `policy.rs`'s own tests exercise every arm.
+    ///
+    /// This method only ever sees one `(capability, stance)` pair at a time,
+    /// so it cannot express a cross-capability implication -- e.g. claude's
+    /// tool-deny pin denying all writes also happens to cover
+    /// `outside_repo_fs_write`/`git_push_destructive` whenever
+    /// `repo_fs_write = deny`, in the safe (narrowing) direction, but each of
+    /// those still answers `Unsupported` in isolation. Issue #44, which pins
+    /// a stance onto a real launch, needs the whole `EffectivePolicy` in
+    /// hand to exploit an implication like that; it is not visible from this
+    /// signature alone.
     #[allow(dead_code)]
     fn policy_support(
         &self,

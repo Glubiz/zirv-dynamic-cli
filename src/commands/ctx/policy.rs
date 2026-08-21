@@ -326,10 +326,21 @@ impl Support {
         }
     }
 
-    /// Whether zirv itself is holding this capability to its stance. False for
-    /// everything an operator or a prompt is carrying instead.
+    /// Whether zirv itself is holding this capability to *something*, even if
+    /// only approximately (`Degraded`). False for everything an operator or a
+    /// prompt is carrying instead. See [`is_fully_enforced`](Self::is_fully_enforced)
+    /// for the stricter question of whether the requested stance itself is met.
     pub fn is_enforced_by_zirv(self) -> bool {
         matches!(self, Support::Enforced | Support::Degraded)
+    }
+
+    /// Whether the harness enforces *exactly* the requested stance, with
+    /// nothing left for prompt text or the operator's own settings to carry
+    /// instead. `Degraded` deliberately answers `false` here: a mechanism
+    /// that only approximates the request is real, but it is not the same
+    /// guarantee as `Enforced`, and a report must never treat the two alike.
+    pub fn is_fully_enforced(self) -> bool {
+        matches!(self, Support::Enforced)
     }
 }
 
@@ -367,16 +378,26 @@ impl CapabilityDescriptor {
         }
     }
 
+    /// `Unsupported` with a specific reason -- for a capability/stance pair
+    /// where a mechanism exists but has been checked and ruled out (e.g. a
+    /// flag that scopes something adjacent, not the capability asked about),
+    /// as opposed to [`advisory_only`](Self::advisory_only)'s generic "no
+    /// mechanism at all" answer.
+    pub fn unsupported(mechanism: &'static str) -> Self {
+        Self {
+            support: Support::Unsupported,
+            mechanism,
+        }
+    }
+
     /// The trait default, and the honest answer for any harness/capability
     /// pair zirv has not verified a mechanism for. Named for what it leaves
     /// behind: an instruction in the prompt, which no harness is obliged to
     /// obey.
     pub fn advisory_only() -> Self {
-        Self {
-            support: Support::Unsupported,
-            mechanism: "no verified per-run mechanism; prompt text is advisory context, not \
-                        enforcement",
-        }
+        Self::unsupported(
+            "no verified per-run mechanism; prompt text is advisory context, not enforcement",
+        )
     }
 }
 
@@ -397,16 +418,32 @@ pub struct PolicyReport {
 }
 
 impl PolicyReport {
-    /// Every stance zirv asked for and cannot itself hold the harness to --
-    /// the lines an operator actually needs to see, since these are the ones
-    /// where only advisory prompt text or the operator's own harness settings
-    /// stand between the policy and the session.
+    /// Every stance zirv asked for that the harness does not fully hold to --
+    /// the lines an operator actually needs to see. This includes `Degraded`
+    /// (a real mechanism that only approximates the request), `Unsupported`
+    /// (only advisory prompt text) and `OperatorControlled` (only the
+    /// operator's own harness settings): none of these is the exact
+    /// guarantee `Enforced` is, so a report must never hide any of them.
+    /// [`partially_enforced`](Self::partially_enforced) narrows this to the
+    /// `Degraded` subset specifically.
     pub fn unenforced(&self) -> Vec<&CapabilityOutcome> {
         self.outcomes
             .iter()
             .filter(|outcome| {
-                outcome.stance != Stance::Allow && !outcome.support.is_enforced_by_zirv()
+                outcome.stance != Stance::Allow && !outcome.support.is_fully_enforced()
             })
+            .collect()
+    }
+
+    /// The subset of [`unenforced`](Self::unenforced) where zirv pins a real,
+    /// verified mechanism that only approximates the requested stance
+    /// (`Support::Degraded`) -- worth calling out on its own, since a
+    /// degraded pin is doing something, unlike `Unsupported` or
+    /// `OperatorControlled`.
+    pub fn partially_enforced(&self) -> Vec<&CapabilityOutcome> {
+        self.outcomes
+            .iter()
+            .filter(|outcome| outcome.support == Support::Degraded)
             .collect()
     }
 
@@ -681,6 +718,21 @@ mod tests {
         );
     }
 
+    /// `is_fully_enforced` is the stricter question `is_enforced_by_zirv`
+    /// does not answer: only `Enforced` means the requested stance itself is
+    /// met with nothing left for prompt text or the operator's own settings
+    /// to carry. `Degraded` answers `true` to the looser question but `false`
+    /// here -- that gap is exactly what `PolicyReport::unenforced` now keys
+    /// off of, instead of the looser predicate that used to hide `Degraded`
+    /// cells from a report.
+    #[test]
+    fn only_enforced_is_fully_enforced() {
+        assert!(Support::Enforced.is_fully_enforced());
+        assert!(!Support::Degraded.is_fully_enforced());
+        assert!(!Support::Unsupported.is_fully_enforced());
+        assert!(!Support::OperatorControlled.is_fully_enforced());
+    }
+
     /// A rendered report names the stance, the honest state and the mechanism
     /// on every line -- the three facts an operator needs to tell a real
     /// guarantee from an instruction.
@@ -700,16 +752,22 @@ mod tests {
     /// Claude's verified mechanisms, from
     /// docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md: the
     /// `--disallowedTools` pin is the one thing zirv can hold a claude launch
-    /// to, and it covers exactly tool access, shell execution and repo writes
-    /// -- not network, not git-specific operations, not path-scoped writes.
+    /// to, and it only fully covers repo writes and shell execution -- the
+    /// two capabilities the four denied tools (`Write`/`Edit`/`Bash`/
+    /// `NotebookEdit`) actually deny outright. Tool access is only
+    /// `Degraded` (the pin denies four tools, not every tool -- `Read`,
+    /// `Grep`, `WebFetch`, `WebSearch`, `Task` and MCP tools remain), and
+    /// approval is `Unsupported` (the pin does not address approvals at
+    /// all): claiming either as `Enforced` over-claims what a verified
+    /// four-tool pin can back.
     #[test]
     fn claude_enforces_what_its_verified_tool_pin_covers_and_nothing_else() {
         let claude = ClaudeAdapter::new(None);
         let enforced = |capability| claude.policy_support(capability, Stance::Deny).support;
         assert_eq!(enforced(Capability::RepoFsWrite), Support::Enforced);
         assert_eq!(enforced(Capability::ShellExec), Support::Enforced);
-        assert_eq!(enforced(Capability::ToolAccess), Support::Enforced);
-        assert_eq!(enforced(Capability::Approval), Support::Enforced);
+        assert_eq!(enforced(Capability::ToolAccess), Support::Degraded);
+        assert_eq!(enforced(Capability::Approval), Support::Unsupported);
         assert_eq!(enforced(Capability::Network), Support::Unsupported);
         assert_eq!(
             enforced(Capability::GitPushDestructive),
@@ -719,6 +777,30 @@ mod tests {
             enforced(Capability::OutsideRepoFsWrite),
             Support::Unsupported
         );
+    }
+
+    /// The tool-access `Degraded` mechanism must actually name what remains
+    /// available, not just what is denied -- otherwise an operator reads
+    /// "degraded" without learning that Read/Grep/WebFetch/WebSearch/Task and
+    /// every MCP server's tools are still reachable.
+    #[test]
+    fn claude_tool_access_degraded_mechanism_names_what_still_runs() {
+        let claude = ClaudeAdapter::new(None);
+        let descriptor = claude.policy_support(Capability::ToolAccess, Stance::Deny);
+        assert_eq!(descriptor.support, Support::Degraded);
+        assert!(descriptor.mechanism.contains("Write"));
+        assert!(descriptor.mechanism.contains("MCP"));
+    }
+
+    /// Approval has no verified per-run mechanism on claude at all -- the
+    /// four-tool pin never addresses approvals, so it must not be reported
+    /// as even `Degraded`.
+    #[test]
+    fn claude_approval_at_deny_is_unsupported_not_enforced() {
+        let claude = ClaudeAdapter::new(None);
+        let descriptor = claude.policy_support(Capability::Approval, Stance::Deny);
+        assert_eq!(descriptor.support, Support::Unsupported);
+        assert!(descriptor.mechanism.contains("approval"));
     }
 
     /// An `Ask` stance is a different question from a `Deny` one: claude's
@@ -774,6 +856,31 @@ mod tests {
         );
     }
 
+    /// `--sandbox read-only` scopes writes, not execution -- a command still
+    /// runs under it and can read anything the process can reach. Shell
+    /// execution at `Deny` must therefore be `Unsupported`, not `Degraded`:
+    /// reporting `Degraded` would claim the sandbox restricts *something*
+    /// about whether commands run, which it does not.
+    #[test]
+    fn codex_shell_exec_at_deny_is_unsupported_not_degraded() {
+        let codex = CodexAdapter::new(None);
+        let descriptor = codex.policy_support(Capability::ShellExec, Stance::Deny);
+        assert_eq!(descriptor.support, Support::Unsupported);
+        assert!(descriptor.mechanism.contains("write"));
+    }
+
+    /// The sandbox flag is not codex's approval mechanism at all -- that is
+    /// codex's own `approval` setting in `~/.codex/config.toml`, which zirv
+    /// reads but never rewrites, and which has no verified `Deny`-shaped
+    /// flag. `Approval` at `Deny` must be `Unsupported`, not `Degraded`.
+    #[test]
+    fn codex_approval_at_deny_is_unsupported_not_degraded() {
+        let codex = CodexAdapter::new(None);
+        let descriptor = codex.policy_support(Capability::Approval, Stance::Deny);
+        assert_eq!(descriptor.support, Support::Unsupported);
+        assert!(descriptor.mechanism.contains("approval mechanism"));
+    }
+
     /// Codex has no verified per-tool deny and no verified network control, so
     /// those stay advisory -- the asymmetry with claude is reported, not
     /// smoothed over.
@@ -797,6 +904,11 @@ mod tests {
     /// One canonical policy, evaluated against both harnesses, produces two
     /// different honest answers -- issue #43's acceptance criterion, and the
     /// reason the policy is not written per harness in the first place.
+    /// Claude fully enforces `repo_fs_write` at `Deny` (its four-tool pin
+    /// denies `Write`/`Edit` outright); codex only degrades it (its sandbox
+    /// flag scopes writes, it does not deny a tool), so codex's report must
+    /// still surface that capability as unenforced even though a real,
+    /// verified mechanism is doing something.
     #[test]
     fn one_policy_evaluates_differently_against_claude_and_codex() {
         let policy = EffectivePolicy {
@@ -809,7 +921,18 @@ mod tests {
         let codex_report = evaluate(&policy, &codex);
         assert_ne!(claude_report.outcomes, codex_report.outcomes);
         assert!(claude_report.unenforced().is_empty());
-        assert!(codex_report.unenforced().is_empty());
+        let codex_unenforced: Vec<_> = codex_report
+            .unenforced()
+            .iter()
+            .map(|outcome| outcome.capability)
+            .collect();
+        assert_eq!(codex_unenforced, vec![Capability::RepoFsWrite]);
+        let codex_partial: Vec<_> = codex_report
+            .partially_enforced()
+            .iter()
+            .map(|outcome| outcome.capability)
+            .collect();
+        assert_eq!(codex_partial, vec![Capability::RepoFsWrite]);
     }
 
     /// The lines an operator has to read: a stance zirv asked for that only
@@ -829,5 +952,73 @@ mod tests {
             .map(|outcome| outcome.capability)
             .collect();
         assert_eq!(unenforced, vec![Capability::Network]);
+    }
+
+    /// `partially_enforced` must isolate exactly the `Degraded` cells, not
+    /// every unenforced one: claude's tool-access pin is `Degraded` at
+    /// `Deny`, but its approval and network answers are `Unsupported`, which
+    /// must not show up here even though both also appear in `unenforced`.
+    #[test]
+    fn partially_enforced_lists_only_the_degraded_cells() {
+        let policy = EffectivePolicy {
+            tool_access: Stance::Deny,
+            approval: Stance::Deny,
+            network: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        let claude = ClaudeAdapter::new(None);
+        let report = evaluate(&policy, &claude);
+
+        let partial: Vec<_> = report
+            .partially_enforced()
+            .iter()
+            .map(|outcome| outcome.capability)
+            .collect();
+        assert_eq!(partial, vec![Capability::ToolAccess]);
+
+        let unenforced: Vec<_> = report
+            .unenforced()
+            .iter()
+            .map(|outcome| outcome.capability)
+            .collect();
+        assert_eq!(
+            unenforced,
+            vec![
+                Capability::Network,
+                Capability::Approval,
+                Capability::ToolAccess
+            ],
+            "unenforced must still include the Degraded cell, not just the Unsupported ones"
+        );
+    }
+
+    /// `Capability::ALL` is hand-maintained, so a new `Capability` variant
+    /// can be added without anyone remembering to list it there too. The
+    /// match below is exhaustive (no wildcard arm): adding a variant fails
+    /// this file to compile until an arm exists for it here, and the
+    /// `assert_eq!` then catches a variant that was added to the match but
+    /// never added to `Capability::ALL` itself.
+    #[test]
+    fn capability_all_lists_every_capability_variant() {
+        fn is_a_known_capability(capability: Capability) {
+            match capability {
+                Capability::RepoFsWrite
+                | Capability::OutsideRepoFsWrite
+                | Capability::ShellExec
+                | Capability::Network
+                | Capability::Approval
+                | Capability::GitPushDestructive
+                | Capability::ToolAccess => {}
+            }
+        }
+        for capability in Capability::ALL {
+            is_a_known_capability(capability);
+        }
+        assert_eq!(
+            Capability::ALL.len(),
+            7,
+            "a Capability variant exists that the exhaustive match above already covers but \
+             Capability::ALL does not list -- add it there, then bump this count"
+        );
     }
 }

@@ -1076,6 +1076,53 @@ mod tests {
         );
     }
 
+    /// **Recorded residual, not a fix.** Unlike `agents` (see the test
+    /// above), `[policy]` has no operator-only salvage path yet:
+    /// `cfg_or_operator_only_gate`'s error arm builds
+    /// `CtxConfig { agents: AgentGate::load_operator_only(env), ..CtxConfig::default() }`,
+    /// and `CtxConfig::default()`'s `policy` field is all-`Allow`. So a
+    /// malformed *repo* `[policy]` table -- which fails the whole
+    /// `CtxConfig::load` -- silently erases an *operator*-set narrowing too,
+    /// the exact trust hole review finding 1 closed for `AgentGate` but not
+    /// (yet) for `policy`. Issue #44, which pins policy onto a real launch,
+    /// MUST close this before that pin can be trusted; this test's
+    /// assertion is expected to flip once it does.
+    #[test]
+    fn a_malformed_repo_policy_table_still_erases_the_operators_own_policy_narrowing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"deny\"\n",
+        )
+        .expect("write");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir repo");
+        std::fs::write(
+            repo.join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"nope\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        assert!(
+            CtxConfig::load(&repo, &|k| empty.get(k).cloned()).is_err(),
+            "the malformed repo [policy] table must actually make CtxConfig::load fail, or this \
+             test proves nothing"
+        );
+
+        let cfg = cfg_or_operator_only_gate(&repo, &|k| empty.get(k).cloned());
+        assert_eq!(
+            cfg.policy.shell_exec,
+            super::super::policy::Stance::Allow,
+            "recorded residual: the operator's own shell_exec=deny should survive a broken repo \
+             layer the same way AgentGate does, but policy has no equivalent salvage yet -- #44 \
+             must add one and flip this assertion to Stance::Deny"
+        );
+    }
+
     #[test]
     fn a_clean_session_queues_nothing_and_says_nothing_about_optimize() {
         let dir = tempfile::tempdir().expect("tempdir");
