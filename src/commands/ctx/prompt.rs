@@ -26,7 +26,13 @@ use super::config::PromptConfig;
 /// (`DEFAULT_PROMPT`'s "(v2)", `HARNESS_PROMPT`'s "(v5)"), which is where a
 /// changed sentence is recorded. See `the_composed_prompt_version_changed_
 /// with_its_shape`.
-pub const DEFAULT_PROMPT_VERSION: &str = "v5";
+///
+/// v6 (memory review, fix round): the memory layer's own internal shape
+/// changed again -- `select_memory_within_cap` now drops a shared entry
+/// outright when its key collides with a private one, and the shared
+/// block gained an explicit closing marker -- so the marker moves once
+/// more, the same way it did for v3/v4/v5's own layer-shape changes.
+pub const DEFAULT_PROMPT_VERSION: &str = "v6";
 pub const PROMPT_FILE: &str = "system-prompt.md";
 /// The user layer's own Worker-role file, read from `~/.zirv/` in place of
 /// [`PROMPT_FILE`] for a `PromptRole::Worker` session: an operator's standing
@@ -4043,6 +4049,11 @@ mod tests {
             DEFAULT_PROMPT_VERSION, "v4",
             "the harness roster layer changed the composed shape too, so the version marker must \
              move again"
+        );
+        assert_ne!(
+            DEFAULT_PROMPT_VERSION, "v5",
+            "the memory layer's own shape changed again (shared-key shadowing suppression, a \
+             closing marker on the shared block), so the version marker must move once more"
         );
     }
 
