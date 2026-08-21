@@ -7974,6 +7974,70 @@ mod tests {
         );
     }
 
+    /// Issue #34 seam coverage (memory review, fix round): a spawned worker
+    /// pane's composed prompt must carry the memory core layer, bounded by
+    /// the CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded
+    /// default. A tiny cap forces `prompt::with_memory_layer` to truncate,
+    /// which only happens if this seam really threads the configured value
+    /// through.
+    #[test]
+    fn compose_worker_prompt_carries_the_memory_layer_under_its_configured_cap() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.core_max_bytes = 40;
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+
+        super::super::memory::remember(
+            &state,
+            &slug,
+            &super::super::memory::Entry {
+                key: "seam-fact".to_string(),
+                written_by: "test".to_string(),
+                written: 1,
+                verified: 1,
+                source: "explicit".to_string(),
+                body: format!("{}TAIL_MARKER_NOT_TRUNCATED", "z".repeat(200)),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+            &cfg,
+        )
+        .expect("remember");
+
+        let (composed, _, _) = compose_worker_prompt(
+            &spawn_request("do the work", repo),
+            &super::super::adapters::claude::ClaudeAdapter::new(None),
+            "cccc3333",
+            &cfg,
+            &state,
+            repo,
+            &slug,
+        );
+
+        let composed = composed.expect("a worker pane composes a prompt");
+        assert!(
+            composed.text.contains("seam-fact"),
+            "the memory core layer must reach the composed prompt: {}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("TAIL_MARKER_NOT_TRUNCATED"),
+            "a tiny core_max_bytes must actually bound the delivered memory layer: {}",
+            composed.text
+        );
+        assert!(
+            composed.text.contains("[memory truncated:"),
+            "the truncation must be visible, not silent: {}",
+            composed.text
+        );
+    }
+
     /// Codex has no system-prompt injection mechanism at all, so `compose_
     /// worker_prompt` must not fold mail or the report-back instruction into
     /// `composed` for it -- `injection_args_for_session` would turn that into

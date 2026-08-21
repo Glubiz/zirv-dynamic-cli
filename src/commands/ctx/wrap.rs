@@ -1108,6 +1108,32 @@ fn relaunch(
 /// launch. `None` (every caller but `chat`) keeps today's behavior: a fresh
 /// id minted here.
 ///
+/// This launch's composed prompt: `memory_entries` (already rendered by the
+/// caller) and the derived harness roster (only for an Orchestrator role)
+/// folded through `prompt::compose`, capped by `cfg.memory.core_max_bytes`.
+/// Pulled out of `run_with` (which opens a real pty) for the same reason
+/// other pure composition seams in this codebase are: testable without
+/// spawning anything.
+fn compose_launch_prompt(
+    memory_entries: &[super::prompt::MemoryLine],
+    harness_lines: &[String],
+    repo: &Path,
+    cfg: &CtxConfig,
+    role: PromptRole,
+    skip_injection: bool,
+) -> Option<super::prompt::ComposedPrompt> {
+    super::prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        skip_injection,
+        &cfg.prompt,
+        role,
+        memory_entries,
+        cfg.memory.core_max_bytes,
+        harness_lines,
+    )
+}
+
 /// No writer parameter: this function never had anything of its own to print
 /// on a healthy path, and its one former write (a rare internal pump
 /// failure) went to `output::error` on stderr instead (item 6 audit) --
@@ -1211,15 +1237,13 @@ pub fn run_with(
     } else {
         Vec::new()
     };
-    let composed = super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        skip_injection,
-        &cfg.prompt,
-        role,
+    let composed = compose_launch_prompt(
         &memory_entries,
-        cfg.memory.core_max_bytes,
         &harness_lines,
+        repo,
+        &cfg,
+        role,
+        skip_injection,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -5165,6 +5189,71 @@ mod tests {
         assert!(prompt.contains("Write the failing test"));
         assert!(prompt.to_lowercase().contains("previous session"));
         assert!(!prompt.contains('\u{2014}'));
+    }
+
+    /// Issue #34 seam coverage (memory review, fix round): `run_with`'s
+    /// launch prompt must carry the memory core layer, bounded by the
+    /// CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded default.
+    /// `run_with` itself opens a real pty (the `commands::ctx::wrap::tests`
+    /// pty family wedges on this machine, per this repo's own test
+    /// convention), so this exercises `compose_launch_prompt` directly: the
+    /// exact, pure composition step that call site uses -- no pty involved.
+    #[test]
+    fn compose_launch_prompt_carries_the_memory_layer_under_its_configured_cap() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = repo.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.core_max_bytes = 40;
+        let slug = crate::commands::ctx::state::repo_slug(repo.path());
+
+        crate::commands::ctx::memory::remember(
+            &state,
+            &slug,
+            &crate::commands::ctx::memory::Entry {
+                key: "seam-fact".to_string(),
+                written_by: "test".to_string(),
+                written: 1,
+                verified: 1,
+                source: "explicit".to_string(),
+                body: format!("{}TAIL_MARKER_NOT_TRUNCATED", "z".repeat(200)),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+            &cfg,
+        )
+        .expect("remember");
+
+        let memory_entries =
+            crate::commands::ctx::memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
+        let composed = compose_launch_prompt(
+            &memory_entries,
+            &[],
+            repo.path(),
+            &cfg,
+            PromptRole::Worker,
+            false,
+        )
+        .expect("a launch still composes a prompt");
+
+        assert!(
+            composed.text.contains("seam-fact"),
+            "the memory core layer must reach the composed prompt: {}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("TAIL_MARKER_NOT_TRUNCATED"),
+            "a tiny core_max_bytes must actually bound the delivered memory layer: {}",
+            composed.text
+        );
+        assert!(
+            composed.text.contains("[memory truncated:"),
+            "the truncation must be visible, not silent: {}",
+            composed.text
+        );
     }
 
     #[cfg(unix)]
