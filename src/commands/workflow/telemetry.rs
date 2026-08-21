@@ -518,27 +518,28 @@ mod tests {
     #[test]
     fn a_zero_or_false_opt_out_actually_disables_telemetry() {
         use crate::commands::ctx::config::CtxConfig;
-        for value in ["0", "false"] {
-            let cfg = CtxConfig::load(Path::new("."), &|key| {
+        // Hermetic: an empty temp repo and an empty temp home, so neither this
+        // machine's own `.zirv/ctx.toml` can decide the answer.
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let _env = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let load = |value: &str| {
+            CtxConfig::load(repo.path(), &|key| {
                 (key == "ZIRV_CTX_WORKFLOW_TELEMETRY").then(|| value.to_string())
             })
-            .expect("config loads");
+        };
+        for value in ["0", "false"] {
+            let cfg = load(value).expect("config loads");
             assert!(
                 !TelemetryConfig::from_config(&cfg.workflow).enabled,
                 "'{value}' must disable telemetry"
             );
         }
         for value in ["1", "true"] {
-            let cfg = CtxConfig::load(Path::new("."), &|key| {
-                (key == "ZIRV_CTX_WORKFLOW_TELEMETRY").then(|| value.to_string())
-            })
-            .expect("config loads");
+            let cfg = load(value).expect("config loads");
             assert!(TelemetryConfig::from_config(&cfg.workflow).enabled);
         }
-        let error = CtxConfig::load(Path::new("."), &|key| {
-            (key == "ZIRV_CTX_WORKFLOW_TELEMETRY").then(|| "maybe".to_string())
-        })
-        .expect_err("an unparseable value is loud, not a guess");
+        let error = load("maybe").expect_err("an unparseable value is loud, not a guess");
         assert!(error.to_string().contains("true or false"));
     }
 

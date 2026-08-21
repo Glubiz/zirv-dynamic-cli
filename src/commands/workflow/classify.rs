@@ -444,16 +444,32 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     measured_input.intent_override = args.intent;
     measured_input.complexity_override = args.complexity;
     let measured = classify(&measured_input)?;
-    classification
-        .reasons
-        .push(if measured.risk > classification.risk {
-            format!("measured-tree risk floor: {:?}", measured.risk)
-        } else {
-            "declared change scope".to_string()
-        });
+    let mut raised = false;
     if measured.risk > classification.risk {
+        classification
+            .reasons
+            .push(format!("measured-tree risk floor: {:?}", measured.risk));
         classification.risk = measured.risk;
         classification.risk_score = classification.risk_score.max(measured.risk_score);
+        raised = true;
+    }
+    // Complexity as well as risk. Complexity selects the plan step on its own
+    // (and the design gate together with risk), so a declared `--path
+    // README.md` over substantial real work dropped planning even where the
+    // risk band was unaffected. An explicit `--complexity` is the operator
+    // speaking and stands.
+    if args.complexity.is_none() && measured.complexity > classification.complexity {
+        classification.reasons.push(format!(
+            "measured-tree complexity: {:?}",
+            measured.complexity
+        ));
+        classification.complexity = measured.complexity;
+        raised = true;
+    }
+    if !raised {
+        classification
+            .reasons
+            .push("declared change scope".to_string());
     }
     classification.reasons.sort();
     Ok(classification)
@@ -573,6 +589,44 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("measured-tree risk floor"))
+        );
+    }
+
+    /// Risk is not the only band a declared scope could talk down: complexity
+    /// selects the plan step on its own, so a declared one-file scope over
+    /// substantial real work dropped planning even where the risk band was
+    /// unaffected.
+    #[test]
+    fn declared_inputs_cannot_talk_a_measured_complexity_down() {
+        let repo = repo_with_pending_file("src/one.rs");
+        for index in 0..8 {
+            std::fs::write(
+                repo.path().join(format!("src/extra-{index}.rs")),
+                "fn extra() {}\n",
+            )
+            .unwrap();
+        }
+        let classification = from_args(&ClassifyArgs {
+            task: "implement feature".into(),
+            paths: vec![PathBuf::from("README.md")],
+            changed_lines: Some(2),
+            tests_changed: true,
+            intent: None,
+            complexity: None,
+            risk: None,
+            repo: Some(repo.path().to_path_buf()),
+            json: false,
+        })
+        .unwrap();
+        assert!(
+            classification.complexity >= Complexity::Substantial,
+            "the measured tree is substantial: {classification:?}"
+        );
+        assert!(
+            classification
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("measured-tree complexity"))
         );
     }
 
