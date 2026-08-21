@@ -1011,6 +1011,10 @@ mod tests {
                 verified: now - 5 * 86_400,
                 source: "explicit".to_string(),
                 body: "cargo build --release".to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
             },
             &cfg,
         )

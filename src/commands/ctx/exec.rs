@@ -248,6 +248,31 @@ fn build_command(command: &[String], repo: &Path) -> CtxResult<Command> {
     Ok(cmd)
 }
 
+/// The Worker prompt composition `run_with`'s two call sites share (the
+/// initial launch, and a nudge-restart recompose): `memory_entries` (already
+/// rendered by the caller) folded through `prompt::compose` as a Worker,
+/// capped by `cfg.memory.core_max_bytes`, with no harness roster (a Worker
+/// never hears about other harnesses). Pulled out for the same reason
+/// `prompt_delivery_via_stdin` above was: testable without spawning the real
+/// supervised process `run_with` launches.
+fn compose_worker_launch_prompt(
+    memory_entries: &[super::prompt::MemoryLine],
+    repo: &Path,
+    cfg: &CtxConfig,
+    skip_injection: bool,
+) -> Option<super::prompt::ComposedPrompt> {
+    super::prompt::compose(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        skip_injection,
+        &cfg.prompt,
+        super::prompt::PromptRole::Worker,
+        memory_entries,
+        cfg.memory.core_max_bytes,
+        &[],
+    )
+}
+
 /// Whether this run's own headless launch reparses its downstream argv on a
 /// Windows launcher -- `cmd.exe /c <shim>` (an npm-installed `.cmd`) or
 /// `powershell -NoProfile -File <script>` (a `.ps1`) -- so the prompt has to
@@ -297,7 +322,7 @@ pub fn run_with<W: Write>(
     // mail, which is deliberately re-listed narrowly by session on that
     // path, the memory bank is repo-wide and does not go stale within one
     // `run_with` call the way a specific session's mailbox does.
-    let memory_entries = super::memory::render_for_prompt(&state, &mail_slug, &cfg, now_secs());
+    let memory_entries = super::memory::render_for_prompt(&state, repo, &mail_slug, &cfg);
 
     // A wrapped command that matches no adapter (no explicit `--agent`,
     // detection came up empty) is not actually the agent whose flags we would
@@ -308,18 +333,9 @@ pub fn run_with<W: Write>(
             agent_name.is_some(),
             &args.command,
         );
-    let composed = super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        skip_injection,
-        &cfg.prompt,
-        super::prompt::PromptRole::Worker,
-        &memory_entries,
-        cfg.memory.max_injected_bytes,
-        // A Worker session never hears about other harnesses; see
-        // `prompt::PromptSource::Harnesses`.
-        &[],
-    );
+    // A Worker session never hears about other harnesses; see
+    // `prompt::PromptSource::Harnesses`.
+    let composed = compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
     // Known before argv is touched, because it decides how argv is read: the
     // token holding this exact text is the prompt, whatever it looks like.
     let prompt = args
@@ -890,16 +906,8 @@ pub fn run_with<W: Write>(
             // re-listing mail for the session that was just nudged and
             // folding it in through `with_mail_layer` delivers it with zero
             // new injection machinery.
-            let mut fresh = super::prompt::compose(
-                crate::utils::home_dir().ok().as_deref(),
-                repo,
-                skip_injection,
-                &cfg.prompt,
-                super::prompt::PromptRole::Worker,
-                &memory_entries,
-                cfg.memory.max_injected_bytes,
-                &[],
-            );
+            let mut fresh =
+                compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
             // C7: `registry_short`, not `short_id(session)` -- `session`
             // has just been rotated above, and the nudge's own payload was
             // addressed to the stable registry address the sender resolved.
@@ -1526,6 +1534,64 @@ mod tests {
         assert!(
             !prompt_delivery_via_stdin(&direct, &session),
             "a non-shim program must keep the prompt on argv"
+        );
+    }
+
+    /// Issue #34 seam coverage (memory review, fix round): `run_with`'s
+    /// launch-time Worker prompt must carry the memory core layer, bounded
+    /// by the CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded
+    /// default. `run_with` itself spawns a real supervised process, so this
+    /// exercises `compose_worker_launch_prompt` directly: the exact
+    /// composition step both of `run_with`'s call sites (launch, and a
+    /// nudge-restart recompose) share.
+    #[test]
+    fn compose_worker_launch_prompt_carries_the_memory_layer_under_its_configured_cap() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = repo.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.core_max_bytes = 40;
+        let slug = crate::commands::ctx::state::repo_slug(repo.path());
+
+        crate::commands::ctx::memory::remember(
+            &state,
+            &slug,
+            &crate::commands::ctx::memory::Entry {
+                key: "seam-fact".to_string(),
+                written_by: "test".to_string(),
+                written: 1,
+                verified: 1,
+                source: "explicit".to_string(),
+                body: format!("{}TAIL_MARKER_NOT_TRUNCATED", "z".repeat(200)),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+            &cfg,
+        )
+        .expect("remember");
+
+        let memory_entries =
+            crate::commands::ctx::memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
+        let composed = compose_worker_launch_prompt(&memory_entries, repo.path(), &cfg, false)
+            .expect("a worker launch still composes a prompt");
+
+        assert!(
+            composed.text.contains("seam-fact"),
+            "the memory core layer must reach the composed prompt: {}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("TAIL_MARKER_NOT_TRUNCATED"),
+            "a tiny core_max_bytes must actually bound the delivered memory layer: {}",
+            composed.text
+        );
+        assert!(
+            composed.text.contains("[memory truncated:"),
+            "the truncation must be visible, not silent: {}",
+            composed.text
         );
     }
 
