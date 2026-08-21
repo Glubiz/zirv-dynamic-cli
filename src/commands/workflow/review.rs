@@ -149,7 +149,9 @@ fn git(repo: &Path, args: &[&str]) -> CtxResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn default_base(repo: &Path) -> CtxResult<String> {
+/// The diff base both this module and `classify` measure against, so the two
+/// subsystems always mean the same thing by "the change".
+pub fn default_base(repo: &Path) -> CtxResult<String> {
     for candidate in ["origin/main", "main", "HEAD^"] {
         if let Ok(base) = git(repo, &["merge-base", "HEAD", candidate])
             && !base.is_empty()
@@ -166,7 +168,13 @@ fn read_capped_head(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
     let mut chunk = [0u8; 8192];
     loop {
         let count = match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // A read error is not a clean EOF: what follows is missing, and a
+            // reviewer told `truncated: false` believes it has the whole diff.
+            Err(_) => {
+                truncated = true;
+                break;
+            }
             Ok(count) => count,
         };
         let remaining = cap.saturating_sub(kept.len());
@@ -220,6 +228,33 @@ fn append_capped(target: &mut String, text: &str, cap: usize, truncated: &mut bo
     }
 }
 
+/// Cap on one untracked file's body. Untracked files are whatever happens to
+/// be sitting in the working tree, so a generous per-file budget mostly buys a
+/// way to fill the review package with one file.
+const MAX_UNTRACKED_FILE_BYTES: usize = 16 * 1024;
+/// How much of a file is examined for NUL bytes before its body is included.
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// Name patterns whose *contents* never go into a review package, however
+/// small or textual the file is. An untracked `.env` or `credentials.json` is
+/// the normal state of a working checkout, and the package is handed to a
+/// separate agent process.
+fn is_sensitive_name(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name.starts_with(".env")
+        || name.contains("credential")
+        || name.contains("secret")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+}
+
+/// Untracked files contribute their path always, their body only when it is
+/// safe: text (no NUL in the first [`BINARY_SNIFF_BYTES`]), small, and not
+/// matching a sensitive name. Exclusions are stated in the package so a
+/// reviewer knows a file exists and why its body is absent.
 fn append_untracked(
     diff: &mut String,
     truncated: &mut bool,
@@ -247,11 +282,31 @@ fn append_untracked(
             );
             continue;
         }
-        let remaining = MAX_REVIEW_DIFF_BYTES.saturating_sub(diff.len());
+        if let Some(reason) = untracked_exclusion(path, &metadata) {
+            append_capped(
+                diff,
+                &format!("[untracked file body omitted: {reason}]\n"),
+                MAX_REVIEW_DIFF_BYTES,
+                truncated,
+            );
+            continue;
+        }
+        let remaining = MAX_REVIEW_DIFF_BYTES
+            .saturating_sub(diff.len())
+            .min(MAX_UNTRACKED_FILE_BYTES);
         let mut bytes = Vec::new();
         std::fs::File::open(&absolute)?
             .take(u64::try_from(remaining.saturating_add(1)).unwrap_or(u64::MAX))
             .read_to_end(&mut bytes)?;
+        if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+            append_capped(
+                diff,
+                "[untracked file body omitted: binary]\n",
+                MAX_REVIEW_DIFF_BYTES,
+                truncated,
+            );
+            continue;
+        }
         if bytes.len() > remaining {
             bytes.truncate(remaining);
             *truncated = true;
@@ -260,6 +315,19 @@ fn append_untracked(
         append_capped(diff, &body, MAX_REVIEW_DIFF_BYTES, truncated);
     }
     Ok(())
+}
+
+fn untracked_exclusion(path: &Path, metadata: &std::fs::Metadata) -> Option<String> {
+    if is_sensitive_name(path) {
+        return Some("sensitive filename".to_string());
+    }
+    if metadata.len() > MAX_UNTRACKED_FILE_BYTES as u64 {
+        return Some(format!(
+            "{} bytes, over the {MAX_UNTRACKED_FILE_BYTES} byte untracked-file limit",
+            metadata.len()
+        ));
+    }
+    None
 }
 
 pub fn package(
@@ -283,7 +351,14 @@ pub fn package(
         return Err("workflow contains an oversized review finding".into());
     }
     let base_sha = match base {
-        Some(base) => git(&state.repo, &["rev-parse", base])?,
+        // `--verify --end-of-options` so a revision starting with `-` is read
+        // as a revision and never as a flag to git itself. Verified against
+        // git 2.50: bare `--end-of-options` echoes itself into stdout, and a
+        // trailing `--` makes rev-parse treat the value as a path instead.
+        Some(base) => git(
+            &state.repo,
+            &["rev-parse", "--verify", "--end-of-options", base],
+        )?,
         None => default_base(&state.repo)?,
     };
     let head_sha = git(&state.repo, &["rev-parse", "HEAD"])?;
@@ -309,9 +384,15 @@ pub fn package(
     let current_fingerprint = verification::change_fingerprint(&state.repo)?;
     let verification = verification::load_latest(state_dir, &state.repo)?
         .map(|report| VerificationEvidence::from_report(report, current_fingerprint));
+    // The current step's own id, not the literal "review": a workflow whose
+    // review step is named anything else reported fix_round 0 forever.
+    let review_step = state
+        .current()
+        .map(|step| step.id.as_str())
+        .unwrap_or("review");
     let review_round = state
         .attempts
-        .get("review")
+        .get(review_step)
         .copied()
         .unwrap_or(0)
         .saturating_add(1);
@@ -441,11 +522,35 @@ fn record_finding_update(state_dir: &StateDir, state: &WorkflowState) {
         state_dir,
         &state.repo,
         &event,
-        &super::telemetry::TelemetryConfig::from_env(),
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
     );
 }
 
-fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<i32> {
+/// A completed reviewer run, or the dashboard's acknowledgement that it
+/// spawned a *pane* to do the review later.
+struct ReviewerRun {
+    code: i32,
+    /// True when the child reported that the dashboard took the request
+    /// (`agent.rs`'s [`crate::commands::ctx::agent::DASH_SPAWN_ACK_PREFIX`]
+    /// line, exit 0). The review has not happened yet, so this exit 0 is not
+    /// evidence of anything.
+    dashboard_spawn: bool,
+}
+
+/// One delegated run's stdout line, read as "the dashboard took this request".
+fn is_dashboard_ack(line: &str) -> bool {
+    line.trim_start()
+        .starts_with(crate::commands::ctx::agent::DASH_SPAWN_ACK_PREFIX)
+}
+
+/// Whether a delegated run counts as a completed independent review. A
+/// dashboard spawn-ack exits 0 for a review that has not started yet, so exit
+/// status alone is not the answer.
+fn records_evidence(run: &ReviewerRun, fingerprint_unchanged: bool) -> bool {
+    !run.dashboard_spawn && run.code == 0 && fingerprint_unchanged
+}
+
+fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
     if agent.is_empty()
         || agent.len() > 64
         || !agent
@@ -454,20 +559,47 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<i32> {
     {
         return Err(format!("invalid adapter name '{agent}'").into());
     }
+    // The reviewer's prompt embeds an untrusted repository diff, exactly like
+    // the distiller embeds untrusted CLAUDE.md text, so it gets the same
+    // adapter-owned read-only pin rather than full tool access. An adapter
+    // with no registered pin is refused rather than launched unrestricted.
+    let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(agent)
+        .ok_or_else(|| format!("unknown adapter '{agent}'; cannot pin the reviewer read-only"))?;
     let prompt = format!(
         "Review the following compact Zirv review package. Return only confirmed concrete findings with severity, file/location, reasoning, and disposition recommendation. Do not modify files.\n\n{}",
         serde_json::to_string(package)?
     );
     let mut child = Command::new(std::env::current_exe()?)
-        .args(["agent", agent, "-"])
+        .args(["agent", agent, "-", "--"])
+        .args(&read_only)
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes())?;
+    let mut stdin = child.stdin.take();
+    let writer = std::thread::spawn(move || {
+        if let Some(stdin) = stdin.as_mut() {
+            let _ = stdin.write_all(prompt.as_bytes());
+        }
+        drop(stdin);
+    });
+    let mut dashboard_spawn = false;
+    if let Some(stdout) = child.stdout.take() {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            dashboard_spawn |= is_dashboard_ack(&line);
+            println!("{line}");
+        }
     }
-    Ok(child.wait()?.code().unwrap_or(1))
+    let code = child.wait()?.code().unwrap_or(1);
+    let _ = writer.join();
+    Ok(ReviewerRun {
+        code,
+        dashboard_spawn,
+    })
 }
 
 pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
@@ -508,7 +640,7 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
         }
         ReviewCommand::Run(args) => {
-            let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.id)?;
+            let (state_dir, state) = state_and_repo(args.repo.as_deref(), &args.id)?;
             if depth_for_risk(state.classification.risk) == ReviewDepth::SelfVerification {
                 return Err("risk policy selects self-verification; an independent reviewer is not required".into());
             }
@@ -520,10 +652,23 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
             let package = package(&state_dir, &state, args.base.as_deref())?;
             let started = std::time::Instant::now();
-            let code = launch_reviewer(&args.agent, &package)?;
+            let run = launch_reviewer(&args.agent, &package)?;
+            let code = run.code;
             let fingerprint_unchanged =
                 verification::change_fingerprint(&state.repo)? == package.change_fingerprint;
-            if code == 0 && fingerprint_unchanged {
+            // The reviewer runs `zirv workflow review add` against the same
+            // state file while this process waits. The snapshot loaded before
+            // the spawn is stale by definition, so the evidence is appended to
+            // freshly loaded state -- writing the old snapshot back used to
+            // erase every finding the reviewer had just recorded.
+            let mut state = engine::load(&state_dir, &state.repo, &args.id)?;
+            if run.dashboard_spawn {
+                writeln!(
+                    writer,
+                    "the review was spawned as a dashboard pane; review evidence requires a \
+                     completed run, so none was recorded"
+                )?;
+            } else if records_evidence(&run, fingerprint_unchanged) {
                 state.review_evidence.push(ReviewRunEvidence {
                     id: uuid::Uuid::new_v4().to_string(),
                     change_fingerprint: package.change_fingerprint,
@@ -553,7 +698,7 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             event.duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
             event.adapter = Some(args.agent.clone());
-            event.succeeded = Some(code == 0 && fingerprint_unchanged);
+            event.succeeded = Some(records_evidence(&run, fingerprint_unchanged));
             event.findings_total = total;
             event.findings_meaningful = meaningful;
             event.findings_dismissed = dismissed;
@@ -563,9 +708,9 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 &state_dir,
                 &state.repo,
                 &event,
-                &super::telemetry::TelemetryConfig::from_env(),
+                &super::telemetry::TelemetryConfig::for_repo(&state.repo),
             );
-            if code == 0 && !fingerprint_unchanged {
+            if code == 0 && !fingerprint_unchanged && !run.dashboard_spawn {
                 return Err(
                     "the change set changed during review; review evidence was not recorded".into(),
                 );
@@ -648,6 +793,160 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ctx::state::StateDir;
+    use tempfile::tempdir;
+
+    /// C3: the reviewer records findings through `zirv workflow review add`
+    /// while `review run` waits, so the snapshot `run` loaded before the spawn
+    /// is stale. Writing it back destroyed the reviewer's work; the fix is to
+    /// re-load and append to the fresh state.
+    #[test]
+    fn evidence_is_appended_to_state_the_reviewer_may_have_changed() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let classification = super::super::classify::Classification {
+            intent: super::super::classify::Intent::Review,
+            complexity: super::super::classify::Complexity::Trivial,
+            risk: RiskBand::Medium,
+            risk_score: 25,
+            changed_files: 1,
+            changed_lines: 10,
+            declared_scope: false,
+            reasons: vec![],
+        };
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review change".into(),
+            super::super::engine::WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        engine::save(&state_dir, &state, true).unwrap();
+
+        // The reviewer's own process: a finding added against the same file.
+        let mut reviewer_view = engine::load(&state_dir, repo.path(), &state.id).unwrap();
+        reviewer_view.review_findings.push(ReviewFinding {
+            id: "finding-from-reviewer".into(),
+            severity: FindingSeverity::Major,
+            summary: "real defect".into(),
+            path: None,
+            line: None,
+            disposition: FindingDisposition::Open,
+            created_at: now_secs(),
+        });
+        engine::save(&state_dir, &reviewer_view, true).unwrap();
+
+        // The parent, holding its pre-spawn snapshot, records evidence.
+        let fresh = engine::load(&state_dir, repo.path(), &state.id).unwrap();
+        state = fresh;
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "evidence".into(),
+            change_fingerprint: 7,
+            adapter: "claude".into(),
+            review_round: 1,
+            completed_at: now_secs(),
+        });
+        save_state(&state_dir, &state).unwrap();
+
+        let stored = engine::load(&state_dir, repo.path(), &state.id).unwrap();
+        assert_eq!(stored.review_evidence.len(), 1);
+        assert_eq!(
+            stored.review_findings.len(),
+            1,
+            "the reviewer's finding must survive the parent's own write"
+        );
+    }
+
+    #[test]
+    fn untracked_secrets_contribute_a_path_but_never_a_body() {
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join(".env"), "TOKEN=super-secret\n").unwrap();
+        std::fs::write(
+            repo.path().join("credentials.json"),
+            "{\"credential\":\"x\"}",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("key.pem"), "-----BEGIN KEY-----\n").unwrap();
+        std::fs::write(repo.path().join("notes.txt"), "ordinary text\n").unwrap();
+        std::fs::write(repo.path().join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
+
+        let mut diff = String::new();
+        let mut truncated = false;
+        append_untracked(
+            &mut diff,
+            &mut truncated,
+            repo.path(),
+            &[
+                PathBuf::from(".env"),
+                PathBuf::from("credentials.json"),
+                PathBuf::from("key.pem"),
+                PathBuf::from("notes.txt"),
+                PathBuf::from("blob.bin"),
+            ],
+        )
+        .unwrap();
+
+        assert!(!diff.contains("super-secret"));
+        assert!(!diff.contains("BEGIN KEY"));
+        assert!(diff.contains(".env"), "the path itself stays visible");
+        assert_eq!(diff.matches("sensitive filename").count(), 3);
+        assert!(diff.contains("omitted: binary"));
+        assert!(diff.contains("ordinary text"));
+    }
+
+    /// C4: under `ZIRV_CTX_DASH_REQUESTS` a delegation exits 0 as soon as the
+    /// dashboard *accepts* the request. Recording review evidence off that
+    /// exit code credited a review that had not run.
+    #[test]
+    fn a_dashboard_spawn_ack_is_not_a_completed_review() {
+        let ack = format!(
+            "{}abcd1234",
+            crate::commands::ctx::agent::DASH_SPAWN_ACK_PREFIX
+        );
+        assert!(is_dashboard_ack(&ack));
+        assert!(!is_dashboard_ack("Findings: 1 major issue"));
+        assert!(!records_evidence(
+            &ReviewerRun {
+                code: 0,
+                dashboard_spawn: true
+            },
+            true
+        ));
+        assert!(records_evidence(
+            &ReviewerRun {
+                code: 0,
+                dashboard_spawn: false
+            },
+            true
+        ));
+        assert!(!records_evidence(
+            &ReviewerRun {
+                code: 0,
+                dashboard_spawn: false
+            },
+            false
+        ));
+    }
+
+    #[test]
+    fn a_reviewer_is_always_pinned_read_only_or_refused() {
+        assert_eq!(
+            crate::commands::ctx::adapters::read_only_args_for_agent_name("claude"),
+            Some(vec![
+                "--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string()
+            ])
+        );
+        assert_eq!(
+            crate::commands::ctx::adapters::read_only_args_for_agent_name("codex"),
+            Some(vec!["--sandbox".to_string(), "read-only".to_string()])
+        );
+        assert_eq!(
+            crate::commands::ctx::adapters::read_only_args_for_agent_name("nope"),
+            None
+        );
+    }
 
     #[test]
     fn review_depth_is_explicit_and_risk_based() {

@@ -161,6 +161,13 @@ const DASH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// answer is a failure, not a success.
 const DASH_CLAIM_EXTENSION: Duration = Duration::from_secs(10);
 
+/// The stdout line a delegation prints when the dashboard took the request and
+/// spawned a *pane* for it. Exit is 0, but nothing has run yet -- a caller that
+/// records evidence from a delegated run (the workflow reviewer) has to be able
+/// to tell this apart from a completed one, so the prefix is named rather than
+/// spelled out at two call sites. The printed text is unchanged.
+pub const DASH_SPAWN_ACK_PREFIX: &str = "spawned in dashboard as ";
+
 /// The requester's own reading of one [`spawnreq::SpawnAck`].
 ///
 /// O2: `ok: false` is two different answers. A policy refusal ends the
@@ -173,7 +180,7 @@ fn answer_for_ack<W: Write>(ack: spawnreq::SpawnAck, w: &mut W) -> Option<CtxRes
     if ack.ok {
         let short = ack.short.unwrap_or_default();
         return Some(
-            writeln!(w, "spawned in dashboard as {short}")
+            writeln!(w, "{DASH_SPAWN_ACK_PREFIX}{short}")
                 .map(|_| 0)
                 .map_err(|e| e.into()),
         );
