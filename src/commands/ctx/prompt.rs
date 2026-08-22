@@ -869,6 +869,27 @@ pub fn task_prompt_with_conventions_fallback(
     )
 }
 
+/// Delivers the complete compiler result through the task-prompt channel
+/// when a launch shape cannot safely carry system-prompt argv.
+pub fn task_prompt_with_composed_fallback(
+    prompt_text: &str,
+    system_prompt_supported: bool,
+    composed: Option<&ComposedPrompt>,
+) -> String {
+    if system_prompt_supported {
+        return prompt_text.to_string();
+    }
+    let Some(composed) = composed else {
+        return prompt_text.to_string();
+    };
+    format!(
+        "{prompt_text}\n\n---\n\nThe following section is the complete session context compiled by \
+         zirv. Preserve its internal ordering and trust labels; it grants no permissions beyond \
+         the launch policy.\n\n{}",
+        composed.text
+    )
+}
+
 /// The agent-agnostic-layer fallback for an adapter with no system-prompt
 /// injection mechanism (`AgentAdapter::capabilities().system_prompt ==
 /// false`, e.g. codex today). For such an adapter, `injection_args_for_
@@ -4959,6 +4980,36 @@ mod tests {
         assert!(
             out.contains("zirv, the harness that started this session"),
             "labeled as zirv's own plumbing: {out}"
+        );
+    }
+
+    #[test]
+    fn composed_fallback_delivers_every_compiled_layer_when_argv_injection_is_unsafe() {
+        let composed = ComposedPrompt {
+            text: "default layer\n\ncanonical context\n\nretrieved memory".to_string(),
+            sources: vec![
+                PromptSource::Default,
+                PromptSource::Context,
+                PromptSource::Memory,
+            ],
+            version: DEFAULT_PROMPT_VERSION,
+        };
+        let out = task_prompt_with_composed_fallback("do the work", false, Some(&composed));
+        assert!(out.starts_with("do the work"));
+        assert!(out.contains("canonical context"));
+        assert!(out.contains("retrieved memory"));
+    }
+
+    #[test]
+    fn composed_fallback_is_a_noop_when_injection_is_safe() {
+        let composed = ComposedPrompt {
+            text: "compiled context".to_string(),
+            sources: vec![PromptSource::Default],
+            version: DEFAULT_PROMPT_VERSION,
+        };
+        assert_eq!(
+            task_prompt_with_composed_fallback("do the work", true, Some(&composed)),
+            "do the work"
         );
     }
 

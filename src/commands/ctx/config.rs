@@ -1894,6 +1894,8 @@ mod tests {
         // The rejection is real, not decorative: a clean repo layer still
         // loads and keeps both review keys unset.
         let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert_eq!(cfg.review.claude, None);

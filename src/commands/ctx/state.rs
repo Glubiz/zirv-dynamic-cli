@@ -30,7 +30,19 @@ pub fn now_secs() -> u64 {
 /// readable) falls back to its own text, which is the pre-existing behavior.
 pub fn repo_slug(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    path.to_string_lossy()
+    let rendered = path.to_string_lossy();
+    #[cfg(windows)]
+    let rendered = if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        rendered
+            .strip_prefix(r"\\?\")
+            .unwrap_or(rendered.as_ref())
+            .to_string()
+    };
+    #[cfg(not(windows))]
+    let rendered = rendered.into_owned();
+    rendered
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
@@ -508,6 +520,16 @@ mod tests {
         assert_eq!(
             repo_slug(std::path::Path::new("/Users/x/Documents/my repo.git")),
             "-Users-x-Documents-my-repo-git"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repo_slug_matches_claudes_transcript_slug_after_canonicalization() {
+        let repo = crate::commands::ctx::testenv::repo();
+        assert_eq!(
+            repo_slug(repo.path()),
+            super::super::adapters::claude::project_slug(repo.path())
         );
     }
 

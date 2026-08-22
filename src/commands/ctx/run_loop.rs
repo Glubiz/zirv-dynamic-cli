@@ -287,23 +287,23 @@ pub fn run_with<W: Write>(
             cwd: repo.to_path_buf(),
         });
 
-        // The session conventions (`DEFAULT_PROMPT`) are the first task-
-        // prompt-text fallback applied, ahead of mail: gated identically to
-        // composition (`composed.is_some()`), unlike mail's own gate just
-        // below, which deliberately does not depend on `composed` for an
-        // uninjectable adapter (see the `mail_entries` gate above).
-        let prompt = if composed.is_some() {
-            super::prompt::task_prompt_with_conventions_fallback(&prompt, system_prompt_supported)
-        } else {
-            prompt.clone()
-        };
+        // When argv injection is unsafe, the complete compiled context moves
+        // to the task-prompt channel ahead of mail.
+        let prompt = super::prompt::task_prompt_with_composed_fallback(
+            &prompt,
+            system_prompt_supported,
+            composed.as_ref(),
+        );
+        let mail_in_composed = composed
+            .as_ref()
+            .is_some_and(|prompt| prompt.sources.contains(&super::prompt::PromptSource::Mail));
         // Mail is the one composed layer that still has somewhere to go for
         // an adapter with no system-prompt mechanism: the task prompt text
         // itself. A capable adapter (claude) gets the unchanged `prompt`
         // back, since its mail already rode the `composed` fold above.
         let prompt = super::prompt::task_prompt_with_mail_fallback(
             &prompt,
-            system_prompt_supported && composed.is_some(),
+            (system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
         );
@@ -612,7 +612,7 @@ mod tests {
             ),
             (
                 "ZIRV_CTX_AGENT_BIN".to_string(),
-                fixture("fake-agent.sh").display().to_string(),
+                format!("sh {}", fixture("fake-agent.sh").display()),
             ),
             ("ZIRV_CTX_POLL_MS".to_string(), "50".to_string()),
         ]

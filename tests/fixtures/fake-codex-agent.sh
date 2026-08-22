@@ -30,6 +30,17 @@
 #                                parked the same way a claude one can.
 set -eu
 
+head_bin=head
+tail_bin=tail
+sleep_bin=sleep
+mv_bin=mv
+[ ! -x /usr/bin/head ] || head_bin=/usr/bin/head
+[ ! -x /usr/bin/tail ] || tail_bin=/usr/bin/tail
+[ ! -x /usr/bin/sleep ] || sleep_bin=/usr/bin/sleep
+[ ! -x /bin/sleep ] || sleep_bin=/bin/sleep
+[ ! -x /usr/bin/mv ] || mv_bin=/usr/bin/mv
+[ ! -x /bin/mv ] || mv_bin=/bin/mv
+
 [ -z "${FAKE_AGENT_ARGV_LOG:-}" ] || printf '%s\n' "$*" >> "$FAKE_AGENT_ARGV_LOG"
 
 # Drain stdin so a stdin-delivered prompt (the shim-launch form) does not
@@ -43,13 +54,13 @@ fi
 
 mode="healthy"
 if [ -n "${FAKE_AGENT_MODE_FILE:-}" ] && [ -s "${FAKE_AGENT_MODE_FILE}" ]; then
-  mode=$(head -n 1 "$FAKE_AGENT_MODE_FILE")
-  tail -n +2 "$FAKE_AGENT_MODE_FILE" > "$FAKE_AGENT_MODE_FILE.next"
-  mv "$FAKE_AGENT_MODE_FILE.next" "$FAKE_AGENT_MODE_FILE"
+  mode=$("$head_bin" -n 1 "$FAKE_AGENT_MODE_FILE")
+  "$tail_bin" -n +2 "$FAKE_AGENT_MODE_FILE" > "$FAKE_AGENT_MODE_FILE.next"
+  "$mv_bin" "$FAKE_AGENT_MODE_FILE.next" "$FAKE_AGENT_MODE_FILE"
 fi
 
 case "$mode" in
-  hang) while true; do sleep 1; done ;;
+  hang) while true; do "$sleep_bin" 1; done ;;
   limit)
     printf "You've hit your session limit · resets 3:45pm\n"
     exit 1
