@@ -2117,7 +2117,9 @@ fn compose_worker_prompt(
         cfg.memory.core_max_bytes,
         &[],
     );
-    let system_prompt_supported = adapter.capabilities().system_prompt;
+    let composed =
+        prompt::with_context_layer(composed, repo, adapter.name(), cfg.prompt.max_repo_bytes);
+    let system_prompt_supported = adapter.system_prompt_supported(&[]);
     let should_list_mail = cfg.mail.enabled && (composed.is_some() || !system_prompt_supported);
     let mail_entries: Vec<(PathBuf, mail::Message)> = if should_list_mail {
         mail::list(
@@ -2233,7 +2235,7 @@ fn worker_task_prompt(
     cfg: &CtxConfig,
     fallback_is_safe: bool,
 ) -> String {
-    let system_prompt_supported = adapter.capabilities().system_prompt;
+    let system_prompt_supported = adapter.system_prompt_supported(&[]);
     if !system_prompt_supported && !fallback_is_safe {
         return req.prompt.clone();
     }
@@ -2341,7 +2343,7 @@ fn fulfill_spawn_request(
         "dash",
         &session_id,
         composed.as_ref(),
-        adapter.capabilities().system_prompt,
+        adapter.system_prompt_supported(&[]),
     );
 
     // I: on a Windows `cmd.exe /c <shim>` launch, neither fallback block has
@@ -2364,7 +2366,7 @@ fn fulfill_spawn_request(
     // walk is skipped for it entirely rather than paid on every spawn
     // request for an answer nothing reads. `true` is a safe placeholder for
     // the unused case, matching what `||` short-circuiting already gives.
-    let system_prompt_supported = adapter.capabilities().system_prompt;
+    let system_prompt_supported = adapter.system_prompt_supported(&[]);
     let fallback_is_safe =
         system_prompt_supported || task_prompt_fallback_is_safe(adapter.as_ref());
     if !system_prompt_supported && !fallback_is_safe {
@@ -8038,13 +8040,11 @@ mod tests {
         );
     }
 
-    /// Codex has no system-prompt injection mechanism at all, so `compose_
-    /// worker_prompt` must not fold mail or the report-back instruction into
-    /// `composed` for it -- `injection_args_for_session` would turn that into
-    /// an empty argv and silently destroy both. `worker_task_prompt`'s own
-    /// tests cover where they land instead (the task prompt text).
+    /// A direct Codex launch supports `developer_instructions`, so worker
+    /// mail and report-back guidance belong in the composed prompt. Separate
+    /// shim tests cover the task-prompt fallback.
     #[test]
-    fn compose_worker_prompt_leaves_mail_and_report_back_out_of_composed_for_codex() {
+    fn compose_worker_prompt_includes_mail_and_report_back_for_direct_codex() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -8067,21 +8067,21 @@ mod tests {
 
         let composed = composed.expect("codex still gets the agent-neutral layers");
         assert!(
-            !composed.text.contains("heads up: the webhook route moved"),
-            "mail must not be folded into a composed prompt codex never receives:\n{}",
+            composed.text.contains("heads up: the webhook route moved"),
+            "direct codex must receive mail in developer instructions:\n{}",
             composed.text
         );
-        assert!(!composed.sources.contains(&prompt::PromptSource::Mail));
+        assert!(composed.sources.contains(&prompt::PromptSource::Mail));
         assert!(
-            !composed.text.contains("zirv ctx send --to-session"),
-            "nor the report-back instruction:\n{}",
+            composed.text.contains("zirv ctx send --to-session"),
+            "direct codex must receive the report-back instruction:\n{}",
             composed.text
         );
-        assert!(!composed.sources.contains(&prompt::PromptSource::ReportBack));
+        assert!(composed.sources.contains(&prompt::PromptSource::ReportBack));
         assert_eq!(
             mail_entries.len(),
             1,
-            "the mail is still listed, so the caller can fold it into the task prompt instead"
+            "the caller still needs the listed paths to consume delivered mail"
         );
     }
 

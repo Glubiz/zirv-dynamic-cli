@@ -3,6 +3,7 @@ use std::path::Path;
 
 use clap::Parser;
 use commands::ctx;
+use commands::setup;
 use commands::workflow;
 use commands::{
     create::{CreateOptions, create_script},
@@ -56,12 +57,17 @@ fn is_top_level_workflow_command(argv: &[String]) -> bool {
 /// like the `ctx` check above, so a repo `.zirv/Memory.yaml` (or any
 /// differently-cased script) can never shadow it. Unlike `chat`/`agent`
 /// below, `memory` is not a 1:1 alias into a single `ctx` verb: it has its
-/// own verb tree (`status`/`list`/`recall`/`remember`/`forget`/`verify`),
+/// own verb tree (`init`/`status`/`list`/`recall`/`remember`/`forget`/`verify`),
 /// dispatched by `commands::ctx::memory_cli::dispatch` directly rather than
 /// through `ctx::dispatch`.
 fn is_top_level_memory(argv: &[String]) -> bool {
     argv.get(1)
         .is_some_and(|s| s.eq_ignore_ascii_case("memory"))
+}
+
+fn is_top_level_setup(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|name| name.eq_ignore_ascii_case("setup"))
 }
 
 /// `zirv chat` and `zirv agent` are top-level aliases for `zirv ctx chat`
@@ -152,6 +158,10 @@ async fn main() {
 
     if is_top_level_memory(&argv) {
         std::process::exit(ctx::memory_cli::dispatch(&argv[1..]));
+    }
+
+    if is_top_level_setup(&argv) {
+        std::process::exit(setup::dispatch(&argv[1..]));
     }
 
     if let Some(verb) = top_level_ctx_alias(&argv) {
@@ -334,6 +344,10 @@ mod tests {
         assert!(is_top_level_workflow_command(&argv(&["zirv", "frontend"])));
         assert!(is_top_level_workflow_command(&argv(&["zirv", "FRONTEND"])));
         assert!(!is_top_level_workflow_command(&argv(&["zirv", "build"])));
+
+        assert!(is_top_level_setup(&argv(&["zirv", "setup"])));
+        assert!(is_top_level_setup(&argv(&["zirv", "SETUP", "status"])));
+        assert!(!is_top_level_setup(&argv(&["zirv", "setups"])));
     }
 
     /// FINDING 2: every reserved command name -- whatever its casing -- is
@@ -343,7 +357,7 @@ mod tests {
     #[test]
     fn mis_cased_reserved_command_names_are_recognised_by_the_guard() {
         for name in [
-            "Help", "HELP", "Version", "CREATE", "Init", "Ctx", "Chat", "Agent",
+            "Help", "HELP", "Version", "CREATE", "Init", "Ctx", "Chat", "Agent", "Setup",
         ] {
             assert!(
                 utils::is_reserved_command(name),

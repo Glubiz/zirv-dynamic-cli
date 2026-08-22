@@ -55,6 +55,8 @@ pub struct MemoryCli {
 
 #[derive(Debug, Subcommand)]
 pub enum MemoryVerb {
+    /// Bootstrap a small shared memory bank from durable repository surfaces.
+    Init(InitArgs),
     /// Report scope availability, entry counts, stored bytes, and the
     /// configured injection budget -- never entry bodies. A disabled scope
     /// is marked `disabled` but still reports its counts and bytes: a byte
@@ -77,6 +79,25 @@ pub enum MemoryVerb {
     /// `Written` timestamp untouched. Works even when the target scope is
     /// disabled, same as `forget`.
     Verify(VerifyArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InitArgs {
+    /// Optional Markdown file or documentation/Obsidian directory to import.
+    #[arg(long)]
+    pub source: Option<std::path::PathBuf>,
+    /// Propose entries without writing `.zirv/memory/`.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    /// Add only missing keys when shared memory already exists.
+    #[arg(long, default_value_t = false)]
+    pub merge: bool,
+    /// Maximum number of proposed entries.
+    #[arg(long, default_value_t = 16)]
+    pub max_entries: usize,
+    /// Maximum total bytes across generated entry bodies.
+    #[arg(long, default_value_t = 8192)]
+    pub max_bytes: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -259,6 +280,33 @@ pub fn run_status<W: Write>(w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
     run_status_with(w, &repo, &env)
+}
+
+pub fn run_init_with<W: Write>(args: &InitArgs, w: &mut W, repo: &Path) -> CtxResult<i32> {
+    let report = crate::commands::setup::initialize_memory(
+        repo,
+        &crate::commands::setup::MemoryInitOptions {
+            source: args.source.clone(),
+            dry_run: args.dry_run,
+            merge: args.merge,
+            max_entries: args.max_entries,
+            max_bytes: args.max_bytes,
+        },
+    )?;
+    writeln!(
+        w,
+        "zirv memory init: {} proposed, {} written, {} existing skipped, {} body bytes{}",
+        report.proposed,
+        report.written,
+        report.skipped_existing,
+        report.body_bytes,
+        if args.dry_run { " (dry run)" } else { "" }
+    )?;
+    Ok(0)
+}
+
+pub fn run_init<W: Write>(args: &InitArgs, w: &mut W) -> CtxResult<i32> {
+    run_init_with(args, w, &std::env::current_dir()?)
 }
 
 /// An `Entry` plus the scope it was read from, for JSON output. `scope` is
@@ -599,6 +647,7 @@ pub fn dispatch(args: &[String]) -> i32 {
 
     let mut out = std::io::stdout();
     let result = match &cli.verb {
+        MemoryVerb::Init(a) => run_init(a, &mut out),
         MemoryVerb::Status => run_status(&mut out),
         MemoryVerb::List(a) => run_list(a, &mut out),
         MemoryVerb::Recall(a) => run_recall(a, &mut out),
@@ -631,6 +680,9 @@ mod tests {
 
     #[test]
     fn parses_every_verb() {
+        let cli = MemoryCli::try_parse_from(["zirv memory", "init", "--dry-run"]).expect("init");
+        assert!(matches!(cli.verb, MemoryVerb::Init(_)));
+
         let cli = MemoryCli::try_parse_from(["zirv memory", "status"]).expect("status");
         assert!(matches!(cli.verb, MemoryVerb::Status));
 
@@ -688,6 +740,7 @@ mod tests {
     fn help_exits_zero_on_every_verb_and_bare_memory() {
         for argv in [
             vec!["memory", "--help"],
+            vec!["memory", "init", "--help"],
             vec!["memory", "status", "--help"],
             vec!["memory", "list", "--help"],
             vec!["memory", "recall", "--help"],

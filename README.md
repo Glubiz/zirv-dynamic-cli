@@ -9,6 +9,7 @@
 ## Table of Contents
 
 - [Just Run `zirv`](#just-run-zirv)
+  - [AI setup and harness migration](#ai-setup-and-harness-migration)
 - [Features](#features)
 - [Installation](#installation)
 - [Upgrading](#upgrading)
@@ -61,6 +62,51 @@ piped stdin (`echo hi | zirv`, a CI job) or a redirected stdout (`zirv |
 less`) always falls back to help instead, so a bare invocation never blocks
 waiting on a chat session, or opens one into a pipe, when nothing interactive
 is on the other end.
+
+### AI setup and harness migration
+
+Run the guided setup when moving an existing Claude Code or Codex repository
+to Zirv:
+
+```bash
+zirv setup
+```
+
+The non-interactive equivalent is `zirv setup apply`. It initializes `.zirv/`,
+migrates root `CLAUDE.md`/`AGENTS.md` instructions into the canonical
+`.zirv/context/` layer without deleting or overwriting the native files,
+bootstraps a small shared memory bank, and merges Zirv's Stop,
+UserPromptSubmit, PreCompact, and guarded PreToolUse hooks into Claude's
+existing `settings.json` and Codex's existing `hooks.json`. Unrelated hooks
+are preserved and both files are backed up before modification. Codex asks you
+to review new hooks with `/hooks`. An existing Claude statusline is preserved;
+when none is configured, setup installs `zirv ctx usage tee`.
+
+```bash
+zirv setup status
+zirv setup status --json
+zirv setup apply --dry-run
+zirv setup apply --memory-source /path/to/docs-or-obsidian-vault
+```
+
+Canonical common context reaches both Claude and Codex; optional
+`.zirv/context/claude.md` and `.zirv/context/codex.md` additions apply only to
+that harness. Direct Codex launches receive the compiled prompt through the
+CLI's per-run `developer_instructions` config override. Windows shell-shim
+launches remain fail-closed: Zirv never puts repository-authored prompt text on
+an argv that `cmd.exe` or PowerShell would reparse.
+
+AI-specific settings can be factory-reset separately from Zirv setup. Reset is
+refused without `--yes`, supports `--dry-run`, backs up every exact target with
+a manifest under `.zirv/backups/ai-reset/` (project) or
+`~/.zirv/backups/ai-reset/` (global), and preserves authentication,
+sessions/history, and caches unless `--include-auth` is explicitly passed:
+
+```bash
+zirv setup reset claude --scope project --dry-run
+zirv setup reset codex --scope global --yes
+zirv setup reset all --scope all --yes
+```
 
 ### `zirv chat` and `zirv agent`
 
@@ -119,6 +165,9 @@ identity.
 session:
 
 ```bash
+zirv memory init --dry-run
+zirv memory init
+zirv memory init --source /path/to/docs --merge
 zirv memory status
 zirv memory list
 zirv memory recall staging-db
@@ -134,6 +183,13 @@ default. They land in the stored entry and feed `zirv memory recall`'s
 ranking (`retrieval::score_one`); `zirv ctx remember` has no equivalent
 flags. `--importance`/`--confidence` reject any value outside the three
 listed.
+
+`memory init` proposes a bounded set of durable shared entries from repository
+validation/toolchain surfaces and high-signal Markdown sections. `--dry-run`
+changes nothing, `--source` accepts a Markdown file or directory (including an
+Obsidian vault), and a non-empty shared bank is refused unless `--merge` is
+passed; merge mode adds missing keys and never silently overwrites curated
+entries. `--max-entries` and `--max-bytes` cap initialization.
 
 Every verb defaults to the **private** (machine-local) bank; pass `--shared`
 to act on the **shared**, repository-owned bank instead — see
@@ -804,19 +860,16 @@ authenticated CLI:
   sessions (`parse_events`/`structural_context` stay empty).
 - No usage source: a codex session's usage reads `openai: no usage source`
   rather than a real reading.
-- No turn signal: current Codex versions have no `notify` mechanism to hook.
-- No injected system prompt: there is no verified per-run mechanism to carry
-  one.
+- Lifecycle hooks are available and `zirv setup` registers them, but event
+  parsing is still absent, so Codex cannot yet produce a meaningful rot score
+  or structural context from its rollout.
+- Direct launches receive Zirv's composed prompt through Codex's official
+  per-run `developer_instructions` override. Windows command/PowerShell shims
+  stay fail-closed because inline repository text would be reparsed by a shell.
 
-A declared consequence of the last point: an interactive orchestrator session
-on codex (`zirv chat --agent codex`, or bare `zirv` resolving to it) runs with
-no role, memory, or repo-context layer injected at all -- the composed prompt
-zirv would otherwise carry never has anywhere on that launch to go, so the
-session starts exactly as a bare `codex` invocation would. (`zirv agent` is a
-different path -- a one-shot headless **Worker** delegation, not an
-orchestrator session -- and is unaffected: it delivers mail and its own
-task text through the codex CLI's argv/stdin directly, never through this
-injection mechanism.)
+That direct path covers interactive orchestrators and headless workers.
+Shell-shim launches retain the task-prompt fallback for mail and worker
+instructions but intentionally withhold repository-authored system layers.
 
 Full event support is tracked in
 [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
@@ -838,7 +891,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx wrap -- claude` | Supervises an interactive TUI through a PTY |
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
-| `zirv ctx hook <stop\|prompt\|pre-compact\|notify>` | Agent hook entrypoints |
+| `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify>` | Agent hook entrypoints |
 | `zirv ctx status` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions and handoffs |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
@@ -915,7 +968,7 @@ max_entry_bytes = 512          # per-entry body cap
 max_injected_bytes = 2048      # superseded by core_max_bytes; kept only so an old config does not error
 shared_enabled = true          # whether the repo-owned shared bank (<repo>/.zirv/memory/) is read at all
 core_max_bytes = 2048          # cap on the merged private+shared core layer folded into every session
-retrieval_max_bytes = 2048     # cap on `zirv memory recall` output today; session-start injection lands with issue #44
+retrieval_max_bytes = 2048     # cap on `zirv memory recall`; reserved for future context-aware session retrieval
 retrieval_max_entries = 6      # max number of recalled entries, independent of bytes
 
 [chrome]
@@ -1096,7 +1149,11 @@ Add to `~/.claude/settings.json`:
   "hooks": {
     "Stop": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook stop" }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook prompt" }] }],
-    "PreCompact": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook pre-compact" }] }]
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook pre-compact" }] }],
+    "PreToolUse": [{
+      "matcher": "Agent|Task",
+      "hooks": [{ "type": "command", "command": "zirv ctx hook pretool" }]
+    }]
   }
 }
 ```
@@ -1111,10 +1168,12 @@ the agent mints its own session id, so the transcript path travels on the turn
 signal the hook sends. Register it, or `wrap` has nothing to verify a
 compaction against and no context to distil a restart handoff from.
 
-There is a `zirv ctx hook notify` entry point intended for Codex, but no
-supported way to reach it: current Codex versions have no `notify` program
-setting. Do not wire anything to it yet, and see
-[issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
+Current Codex versions support lifecycle hooks with the same JSON event shape.
+`zirv setup apply` merges Zirv's handlers into `~/.codex/hooks.json`; review
+and trust new definitions with `/hooks` in Codex. The older
+`zirv ctx hook notify` compatibility entry point remains available for Codex
+versions configured with the external `notify` program. Rollout event parsing
+is still tracked in [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
 
 ### Interactive use
 
@@ -1372,7 +1431,7 @@ max_entry_bytes = 512
 max_injected_bytes = 2048       # superseded by core_max_bytes; kept only so an old config does not error
 shared_enabled = true
 core_max_bytes = 2048           # cap on the merged private+shared core layer folded into every session
-retrieval_max_bytes = 2048      # cap on `zirv memory recall` output today; session-start injection lands with issue #44
+retrieval_max_bytes = 2048      # cap on `zirv memory recall`; reserved for future context-aware session retrieval
 retrieval_max_entries = 6       # max number of recalled entries, independent of bytes
 ```
 

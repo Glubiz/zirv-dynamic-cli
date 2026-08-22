@@ -336,6 +336,12 @@ pub fn run_with<W: Write>(
     // A Worker session never hears about other harnesses; see
     // `prompt::PromptSource::Harnesses`.
     let composed = compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
+    let composed = super::prompt::with_context_layer(
+        composed,
+        repo,
+        adapter.name(),
+        cfg.prompt.max_repo_bytes,
+    );
     // Known before argv is touched, because it decides how argv is read: the
     // token holding this exact text is the prompt, whatever it looks like.
     let prompt = args
@@ -402,7 +408,7 @@ pub fn run_with<W: Write>(
     // below (`task_prompt_with_mail_fallback`), the one channel such an
     // adapter does have. A capable adapter (claude) is unaffected either
     // way: this still folds mail into `composed` exactly as before.
-    let system_prompt_supported = adapter.capabilities().system_prompt;
+    let system_prompt_supported = adapter.system_prompt_supported(&args.command);
     // But the task-prompt fallback only exists when zirv itself builds the
     // launch (`adapter_builds_launch`): when the caller passed an explicit
     // command (`-- codex exec "task" ...`), that argv is fixed by the caller
@@ -436,8 +442,7 @@ pub fn run_with<W: Write>(
     // independently of `composed` and does not care whether it is `--simple`
     // or not. `!system_prompt_supported` is the other way in.
     let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
-        if cfg.mail.enabled && mail_deliverable && (composed.is_some() || !system_prompt_supported)
-        {
+        if cfg.mail.enabled && mail_deliverable && (composed.is_some() || adapter_builds_launch) {
             super::mail::list(
                 &state,
                 &mail_slug,
@@ -545,11 +550,11 @@ pub fn run_with<W: Write>(
         "exec",
         session.as_str(),
         composed.as_ref(),
-        adapter.capabilities().system_prompt,
+        system_prompt_supported,
     );
     announcer.emit(&super::prompt::injection_event(
         composed.as_ref(),
-        adapter.capabilities().system_prompt,
+        system_prompt_supported,
     ));
 
     let derive_transcript = |session: &SessionId| {
@@ -709,7 +714,7 @@ pub fn run_with<W: Write>(
         };
         let prompt_text = super::prompt::task_prompt_with_mail_fallback(
             &prompt_text,
-            system_prompt_supported,
+            system_prompt_supported && composed.is_some(),
             &mail_messages,
             cfg.mail.max_delivered_bytes,
         );
@@ -906,8 +911,13 @@ pub fn run_with<W: Write>(
             // re-listing mail for the session that was just nudged and
             // folding it in through `with_mail_layer` delivers it with zero
             // new injection machinery.
-            let mut fresh =
-                compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
+            let fresh = compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
+            let mut fresh = super::prompt::with_context_layer(
+                fresh,
+                repo,
+                adapter.name(),
+                cfg.prompt.max_repo_bytes,
+            );
             // C7: `registry_short`, not `short_id(session)` -- `session`
             // has just been rotated above, and the nudge's own payload was
             // addressed to the stable registry address the sender resolved.
@@ -944,7 +954,7 @@ pub fn run_with<W: Write>(
             // deliverable` here understated what a relaunch can actually
             // deliver.
             let nudge_mail: Vec<(PathBuf, super::mail::Message)> = if cfg.mail.enabled
-                && (fresh.is_some() || !system_prompt_supported)
+                && (fresh.is_some() || adapter_builds_launch)
             {
                 // Read back off the guard, which is the one thing that
                 // demonstrably did not rotate when `refresh_session` ran
@@ -1020,11 +1030,11 @@ pub fn run_with<W: Write>(
                 "exec",
                 session.as_str(),
                 composed.as_ref(),
-                adapter.capabilities().system_prompt,
+                system_prompt_supported,
             );
             announcer.emit(&super::prompt::injection_event(
                 composed.as_ref(),
-                adapter.capabilities().system_prompt,
+                system_prompt_supported,
             ));
             announcer.emit(&super::announce::Event::Nudge {
                 from: nudged_from,
@@ -1064,7 +1074,7 @@ pub fn run_with<W: Write>(
             // same fresh listing, not the launch-time `mail_messages`.
             let combined = super::prompt::task_prompt_with_mail_fallback(
                 &combined,
-                system_prompt_supported,
+                system_prompt_supported && composed.is_some(),
                 &nudge_mail_msgs,
                 cfg.mail.max_delivered_bytes,
             );
@@ -1144,11 +1154,11 @@ pub fn run_with<W: Write>(
                 "exec",
                 session.as_str(),
                 composed.as_ref(),
-                adapter.capabilities().system_prompt,
+                system_prompt_supported,
             );
             announcer.emit(&super::prompt::injection_event(
                 composed.as_ref(),
-                adapter.capabilities().system_prompt,
+                system_prompt_supported,
             ));
             // M8: the user's own extra flags survive the relaunch too, not
             // just zirv's own (the system prompt args).
@@ -1174,7 +1184,7 @@ pub fn run_with<W: Write>(
             // reassigns it).
             let prompt_text = super::prompt::task_prompt_with_mail_fallback(
                 &prompt_text,
-                system_prompt_supported,
+                system_prompt_supported && composed.is_some(),
                 &mail_messages,
                 cfg.mail.max_delivered_bytes,
             );
@@ -1308,11 +1318,11 @@ pub fn run_with<W: Write>(
             "exec",
             session.as_str(),
             composed.as_ref(),
-            adapter.capabilities().system_prompt,
+            system_prompt_supported,
         );
         announcer.emit(&super::prompt::injection_event(
             composed.as_ref(),
-            adapter.capabilities().system_prompt,
+            system_prompt_supported,
         ));
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
         let combined = if composed.is_some() {
@@ -1326,7 +1336,7 @@ pub fn run_with<W: Write>(
         // nudge's own fresher one if this run was nudged first (Medium 4).
         let combined = super::prompt::task_prompt_with_mail_fallback(
             &combined,
-            system_prompt_supported,
+            system_prompt_supported && composed.is_some(),
             &mail_messages,
             cfg.mail.max_delivered_bytes,
         );
@@ -3002,18 +3012,12 @@ mod tests {
         );
     }
 
-    /// The other invocation shape: an explicit `-- <command>` (`adapter_
-    /// builds_launch == false`). Here the caller's own argv is fixed, so
-    /// zirv has no task-prompt text of its own to append a mail fallback
-    /// to -- unlike the bare-prompt shape above. Rather than either force
-    /// text into an arbitrary caller-provided command line, or silently
-    /// destroy mail it cannot deliver (the original bug this whole round
-    /// closes), the fix is to leave it untouched in the mailbox entirely:
-    /// never listed for this run, never announced as delivered, never
-    /// consumed. It stays visible to `zirv ctx inbox` and to any other
-    /// session (or a later, adapter-built run) that actually can deliver it.
+    /// Direct codex launches support `developer_instructions`, including the
+    /// explicit `-- <command>` shape. Zirv therefore delivers and consumes
+    /// mail through the same configuration override without rewriting the
+    /// caller's task prompt.
     #[test]
-    fn explicit_command_mail_is_left_untouched_for_an_uninjectable_adapter() {
+    fn explicit_command_mail_uses_codex_developer_instructions() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -3070,23 +3074,20 @@ mod tests {
 
         let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
         assert!(
-            !argv.contains("heads up: the webhook route moved"),
-            "the caller's own explicit command must never be rewritten to carry mail: {argv}"
+            argv.contains("-c developer_instructions=")
+                && argv.contains("heads up: the webhook route moved"),
+            "direct codex must receive mail through developer instructions: {argv}"
         );
 
         let unread = crate::commands::ctx::mail::list(&state, &slug, None, None).expect("list");
-        assert_eq!(
-            unread.len(),
-            1,
-            "mail that could not be delivered must stay unread, not be silently destroyed: \
-             {unread:?}"
+        assert!(
+            unread.is_empty(),
+            "mail delivered through developer instructions must be consumed: {unread:?}"
         );
     }
 
-    /// Final wave item 2: unlike the initial launch (see `explicit_command_
-    /// mail_is_left_untouched_for_an_uninjectable_adapter`, which this test
-    /// used to mirror the *opposite* way, before the mail_deliverable fix),
-    /// a nudge restart of an explicit-command codex run *does* deliver the
+    /// Final wave item 2: a nudge restart of an explicit-command codex run
+    /// delivers the
     /// nudge's own guidance -- stored as ordinary session-addressed mail by
     /// `sessions::run_nudge_with` -- because the relaunch it triggers always
     /// rebuilds through `build_headless`, unconditionally zirv's own launch

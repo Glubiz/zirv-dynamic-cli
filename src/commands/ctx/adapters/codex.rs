@@ -12,14 +12,13 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// `structural_context` stay empty on purpose (out of scope; tracked in
 /// [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11)): that
 /// file records the assistant/tool-call/token-usage event shapes and the
-/// notify contract as unverified, since codex requires authentication and
-/// exposes a notify mechanism (a `hooks` feature flag) that does not match
-/// the plan's originally assumed `notify = [...]` config array at all.
+/// rollout event parsing as unverified, since codex requires authentication.
+/// Current Codex releases expose both lifecycle hooks and the external
+/// `notify` program; `zirv setup` uses the documented lifecycle-hook schema.
 ///
 /// `ready()` no longer hard-errors, though: codex is a supported adapter with
-/// an honestly degraded capability set (`capabilities()` below is all-false,
-/// so no rot score, no turn signal, no injected system prompt, and `provider()`
-/// reports "openai: no usage source" until a usage collector exists for it).
+/// an honestly degraded capability set: rollout event parsing and turn scoring
+/// remain unavailable, while direct launches support developer instructions.
 /// It is selectable and launchable in the common case (`codex` resolves to a
 /// real binary) and also when nothing named `codex` is installed at all --
 /// `resolve_program` fails open for that case, so `--agent codex` on a
@@ -184,14 +183,16 @@ impl AgentAdapter for CodexAdapter {
         cmd
     }
 
-    fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
-        // No verified per-run mechanism (see
-        // docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md).
-        Vec::new()
+    fn system_prompt_args(&self, prompt: &str) -> Vec<String> {
+        // Current Codex exposes `-c/--config key=value` on interactive and
+        // `exec` launches, and its public config schema defines
+        // `developer_instructions` as a developer-role message. JSON string
+        // encoding is also valid TOML basic-string encoding for this value.
+        let value = serde_json::to_string(prompt).expect("serializing a Rust string cannot fail");
+        vec!["-c".to_string(), format!("developer_instructions={value}")]
     }
 
-    /// Spelled out rather than left to the trait default, for the same reason
-    /// `system_prompt_args` is empty: the only base layer zirv has is written
+    /// Spelled out rather than left to the trait default: the only base layer zirv has is written
     /// around Claude Code's tools (the Agent tool, `.claude/agents`, the
     /// `/code-review` skill), none of which codex has. Instructions about
     /// tools an agent does not have are worse than no instructions.
@@ -410,7 +411,9 @@ impl AgentAdapter for CodexAdapter {
             marker_signal: false,
             token_usage: false,
             turn_signal: false,
-            system_prompt: false,
+            // The adapter supports this generally. `system_prompt_supported`
+            // narrows the answer for Windows shell-shim launch shapes.
+            system_prompt: true,
             // D: parse_events/structural_context are stubbed to empty/default
             // (out of scope, issue #11) -- an honest `false` here is what
             // keeps score.rs from reading that emptiness as a real
@@ -418,6 +421,15 @@ impl AgentAdapter for CodexAdapter {
             // events`.
             events: false,
         }
+    }
+
+    fn system_prompt_supported(&self, launch: &[String]) -> bool {
+        let probe = if launch.is_empty() {
+            super::flatten_command(self.interactive_cmd(None, &[]))
+        } else {
+            launch.to_vec()
+        };
+        !super::launch_reparses_through_shim(&probe)
     }
 
     /// Verified (docs/superpowers/notes/2026-07-31-codex-cli-facts.md, line
@@ -476,17 +488,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_ships_without_injection_until_a_mechanism_is_verified() {
+    fn codex_injects_composed_context_with_the_official_config_override() {
         let adapter = CodexAdapter::new(None);
-        assert!(
-            adapter.system_prompt_args("be consistent").is_empty(),
-            "no verified mechanism means no arguments, not a guessed flag"
+        let args = adapter.system_prompt_args("be consistent\nacross turns");
+        assert_eq!(args[0], "-c");
+        assert_eq!(
+            args[1],
+            "developer_instructions=\"be consistent\\nacross turns\""
         );
-        assert!(!adapter.capabilities().system_prompt);
+        assert!(adapter.capabilities().system_prompt);
+        assert!(adapter.system_prompt_supported(&[]));
         assert_eq!(
             adapter.user_system_prompt_flag(),
             None,
-            "nothing to merge when there is no flag at all"
+            "generic -c overrides are not a dedicated user prompt flag"
         );
     }
 

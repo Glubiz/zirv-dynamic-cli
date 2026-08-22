@@ -199,6 +199,12 @@ pub fn run_with<W: Write>(
         // the previous cycle, not a snapshot taken once before the loop
         // started.
         let composed = compose_cycle_prompt(&memory_entries, repo, &cfg, args.simple);
+        let composed = super::prompt::with_context_layer(
+            composed,
+            repo,
+            adapter.name(),
+            cfg.prompt.max_repo_bytes,
+        );
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles. Minted here, ahead of
         // mail listing and the nudge-marker check below, both of which need
@@ -220,29 +226,17 @@ pub fn run_with<W: Write>(
         // `mut`: drained right after this cycle's own spawn actually
         // succeeds (Item 3), not here -- a launch that fails to spawn, or a
         // pacing park ahead of it, must not move mail to `read/` before any
-        // session has actually started to see it.
-        //
-        // Item 14: `composed.is_some()` alone used to gate this even for an
-        // adapter with no system-prompt mechanism at all, under `--simple`
-        // (`args.simple` above is `compose`'s own `skip_injection`, which
-        // always makes `composed` `None`) -- withholding mail from codex
-        // for a reason that has nothing to do with codex, which has no
-        // `composed`-shaped channel to lose in the first place: `loop`
-        // always builds its own launch (see `prompt_args`'s own comment
-        // below), so the task-prompt-text fallback
-        // (`task_prompt_with_mail_fallback` further down) exists
-        // unconditionally for it. `!system_prompt_supported` is the other
-        // way in; claude (the adapter `composed` actually matters for)
-        // keeps exactly its old gate.
-        let mut mail_entries: Vec<(PathBuf, super::mail::Message)> =
-            if cfg.mail.enabled && (composed.is_some() || !adapter.capabilities().system_prompt) {
-                let for_session =
-                    super::sessions::delivery_filter(registry_short.as_deref(), &session_short);
-                super::mail::list(&state, &mail_slug, Some(adapter.name()), for_session)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+        // session has actually started to see it. `loop` always owns a task
+        // prompt channel, so mail remains deliverable even when `--simple`
+        // suppresses the composed system prompt.
+        let mut mail_entries: Vec<(PathBuf, super::mail::Message)> = if cfg.mail.enabled {
+            let for_session =
+                super::sessions::delivery_filter(registry_short.as_deref(), &session_short);
+            super::mail::list(&state, &mail_slug, Some(adapter.name()), for_session)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mail_messages: Vec<super::mail::Message> =
             mail_entries.iter().map(|(_, msg)| msg.clone()).collect();
         if !mail_messages.is_empty() {
@@ -257,7 +251,7 @@ pub fn run_with<W: Write>(
         // (`task_prompt_with_mail_fallback`), the one channel such an
         // adapter does have. A capable adapter (claude) is unaffected: this
         // still folds mail into `composed` exactly as before.
-        let system_prompt_supported = adapter.capabilities().system_prompt;
+        let system_prompt_supported = adapter.system_prompt_supported(&[]);
         let composed = if system_prompt_supported {
             super::prompt::with_mail_layer(composed, &mail_messages, cfg.mail.max_delivered_bytes)
         } else {
@@ -305,11 +299,11 @@ pub fn run_with<W: Write>(
             "loop",
             session.as_str(),
             composed.as_ref(),
-            adapter.capabilities().system_prompt,
+            system_prompt_supported,
         );
         announcer.emit(&super::prompt::injection_event(
             composed.as_ref(),
-            adapter.capabilities().system_prompt,
+            system_prompt_supported,
         ));
         let transcript = adapter.transcript_path(&SessionRef {
             id: session.clone(),
@@ -332,7 +326,7 @@ pub fn run_with<W: Write>(
         // back, since its mail already rode the `composed` fold above.
         let prompt = super::prompt::task_prompt_with_mail_fallback(
             &prompt,
-            system_prompt_supported,
+            system_prompt_supported && composed.is_some(),
             &mail_messages,
             cfg.mail.max_delivered_bytes,
         );
