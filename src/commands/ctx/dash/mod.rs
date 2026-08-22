@@ -2230,12 +2230,11 @@ fn strip_leading_separator_for_an_empty_prompt(req_prompt: &str, text: String) -
 /// for a fact that cannot have changed between the two call sites.
 fn worker_task_prompt(
     req: &spawnreq::SpawnRequest,
-    adapter: &dyn AgentAdapter,
     mail_messages: &[mail::Message],
     cfg: &CtxConfig,
+    system_prompt_supported: bool,
     fallback_is_safe: bool,
 ) -> String {
-    let system_prompt_supported = adapter.system_prompt_supported(&[]);
     if !system_prompt_supported && !fallback_is_safe {
         return req.prompt.clone();
     }
@@ -2405,8 +2404,13 @@ fn fulfill_spawn_request(
         mail_messages.clear();
     }
 
-    let effective_prompt =
-        worker_task_prompt(req, adapter.as_ref(), &mail_messages, cfg, fallback_is_safe);
+    let effective_prompt = worker_task_prompt(
+        req,
+        &mail_messages,
+        cfg,
+        system_prompt_supported,
+        fallback_is_safe,
+    );
 
     let mut extra = pane_model_args(req, cfg, adapter.as_ref());
     extra.extend(pane_launch_extra(
@@ -7677,18 +7681,14 @@ mod tests {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt =
-            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+        let prompt = worker_task_prompt(&req, &[a_mail_message()], &cfg, true, fallback_is_safe);
         assert_eq!(prompt, "do the work");
     }
 
-    /// The bug this exists to close: codex has no system-prompt injection
-    /// mechanism at all, so `compose_worker_prompt`'s `composed` never
-    /// reaches the launched process (`injection_args_for_session` always
-    /// returns an empty argv for it). Without this fallback, a codex worker
-    /// pane never received its mail and was never told to report back --
-    /// the requesting session would then wait forever for a reply that was
-    /// never sent.
+    /// A Codex shell-shim launch cannot safely carry `developer_instructions`,
+    /// so it falls back to the task prompt when that positional channel is
+    /// safe. Without this fallback, a worker pane would receive neither its
+    /// mail nor the report-back instruction.
     #[test]
     fn worker_task_prompt_appends_mail_and_report_back_for_an_uninjectable_adapter() {
         let req = spawn_request("do the work", Path::new("/repo"));
@@ -7700,8 +7700,7 @@ mod tests {
         let adapter = super::super::adapters::codex::CodexAdapter::new(Some("/tmp/fake-codex"));
         let cfg = CtxConfig::default();
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt =
-            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+        let prompt = worker_task_prompt(&req, &[a_mail_message()], &cfg, false, fallback_is_safe);
 
         assert!(prompt.starts_with("do the work"), "got {prompt}");
         assert!(
@@ -7736,8 +7735,7 @@ mod tests {
         let adapter = super::super::adapters::codex::CodexAdapter::new(Some("/tmp/fake-codex"));
         let cfg = CtxConfig::default();
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt =
-            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+        let prompt = worker_task_prompt(&req, &[a_mail_message()], &cfg, false, fallback_is_safe);
 
         assert!(
             !prompt.trim_start().starts_with("---"),
@@ -7763,7 +7761,7 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.mail.enabled = false;
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt = worker_task_prompt(&req, &adapter, &[], &cfg, fallback_is_safe);
+        let prompt = worker_task_prompt(&req, &[], &cfg, false, fallback_is_safe);
         // The conventions layer still rides along when the fallback channel
         // is safe (it is gated on the prompt config and the shim guard, not
         // on mail) -- `fallback_is_safe` is platform-dependent: false on a
