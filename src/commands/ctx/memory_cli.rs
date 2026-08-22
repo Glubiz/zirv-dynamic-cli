@@ -794,6 +794,8 @@ mod tests {
     use super::*;
     use crate::commands::ctx::state;
     use crate::commands::ctx::testenv::HomeGuard;
+    #[cfg(unix)]
+    use crate::commands::ctx::testenv::VarGuard;
 
     fn env_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs
@@ -1891,6 +1893,39 @@ mod tests {
         .expect("remember shared");
     }
 
+    #[cfg(unix)]
+    fn remember_harvested_shared(
+        repo: &std::path::Path,
+        env: &std::collections::HashMap<String, String>,
+        key: &str,
+        text: &str,
+    ) {
+        let cfg = CtxConfig::load(repo, &|name| env.get(name).cloned()).expect("config");
+        let state = StateDir::resolve(&|name| env.get(name).cloned()).expect("state");
+        let slug = repo_slug(repo);
+        let timestamp = now_secs();
+        memory::upsert_scoped(
+            MemoryScope::Shared,
+            repo,
+            &state,
+            &slug,
+            &cfg,
+            &Entry {
+                key: key.to_string(),
+                written_by: "claude".to_string(),
+                written: timestamp,
+                verified: timestamp,
+                source: "handoff".to_string(),
+                body: text.to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+        )
+        .expect("remember harvested shared");
+    }
+
     #[test]
     fn optimize_report_only_run_never_modifies_the_shared_bank() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -2043,6 +2078,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn apply_consolidates_a_duplicate_group_as_an_ordinary_working_tree_change() {
+        let _model_mode = VarGuard::set(&[("FAKE_MODEL_MODE", Some("consolidate"))]);
         let repo = crate::commands::ctx::testenv::repo();
         let init = std::process::Command::new("git")
             .arg("-C")
@@ -2067,15 +2103,14 @@ mod tests {
                 "ZIRV_CTX_AGENT_BIN",
                 fixture("fake-model.sh").to_str().expect("utf8"),
             ),
-            ("FAKE_MODEL_MODE", "consolidate"),
         ]);
-        remember_shared(
+        remember_harvested_shared(
             repo.path(),
             &env,
             "db-a",
             "the project uses postgres for the database",
         );
-        remember_shared(
+        remember_harvested_shared(
             repo.path(),
             &env,
             "db-b",
