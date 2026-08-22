@@ -837,8 +837,12 @@ shell, network, or other permissions.
 
 Use `zirv workflow review package <id>` for a compact diff/test review input,
 `zirv artifact render <path>` for stable static artifact references, and
-`zirv workflow stats` for local bounded telemetry. Telemetry excludes prompts,
-source code, diffs, command output, and model responses by construction.
+`zirv workflow stats` for local bounded telemetry. Review results are persisted
+from a strict bounded JSON contract and fix/re-review stops after three rounds.
+Interactive artifact fallback obeys canonical policy (`ask` needs `--approve`),
+and supervised Claude/Codex workflows attribute available transcript token
+deltas automatically. Telemetry excludes prompts, source code, diffs, command
+output, and model responses by construction.
 
 ## Context Management (zirv ctx)
 
