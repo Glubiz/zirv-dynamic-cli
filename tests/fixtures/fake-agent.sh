@@ -58,7 +58,11 @@ if [ -n "${FAKE_AGENT_MODE_FILE:-}" ] && [ -s "${FAKE_AGENT_MODE_FILE}" ]; then
 fi
 turns="${FAKE_AGENT_TURNS:-12}"
 
-slug=$(printf '%s' "$(pwd)" | tr -c 'A-Za-z0-9-' '-')
+cwd=$(pwd)
+if windows_cwd=$(pwd -W 2>/dev/null); then
+  cwd="$windows_cwd"
+fi
+slug=$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9-' '-')
 dir="$HOME/.claude/projects/$slug"
 mkdir -p "$dir"
 t="$dir/$session.jsonl"
