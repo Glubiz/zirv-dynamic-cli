@@ -111,6 +111,9 @@ pub struct FrontendCapabilitiesArgs {
     /// Agent adapter whose logical capabilities should be resolved.
     #[arg(long)]
     pub agent: String,
+    /// Repository whose effective capability policy should be applied.
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -130,8 +133,12 @@ struct FrontendCapabilities {
     capabilities: super::capability::CapabilityReport,
 }
 
-fn capabilities_for(adapter: &str, probe_browser: bool) -> FrontendCapabilities {
-    FrontendCapabilities {
+fn capabilities_for(
+    adapter: &str,
+    repo: &Path,
+    probe_browser: bool,
+) -> CtxResult<FrontendCapabilities> {
+    Ok(FrontendCapabilities {
         schema_version: 2,
         adapter: adapter.to_string(),
         profile: "frontend-profile@1 + quality-contract@2 (built-in)",
@@ -153,8 +160,8 @@ fn capabilities_for(adapter: &str, probe_browser: bool) -> FrontendCapabilities 
         local_browser: probe_browser
             .then(super::frontend_render::discover_browser)
             .flatten(),
-        capabilities: super::capability::CapabilityReport::for_adapter(adapter),
-    }
+        capabilities: super::capability::CapabilityReport::for_repo(adapter, repo)?,
+    })
 }
 
 fn write_capabilities(
@@ -582,7 +589,8 @@ pub fn run(args: &FrontendArgs, writer: &mut impl Write) -> CtxResult<i32> {
             return super::frontend_render::run_review(args, writer);
         }
         FrontendSubcommand::Capabilities(args) => {
-            let report = capabilities_for(&args.agent, true);
+            let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
+            let report = capabilities_for(&args.agent, &repo, true)?;
             write_capabilities(writer, &report, args.json)?;
         }
         FrontendSubcommand::Benchmark(args) => {
@@ -654,8 +662,9 @@ mod tests {
 
     #[test]
     fn claude_and_codex_get_the_same_frontend_skill_and_capability_contract() {
-        let claude = capabilities_for("claude", false);
-        let codex = capabilities_for("codex", false);
+        let repo = tempfile::tempdir().unwrap();
+        let claude = capabilities_for("claude", repo.path(), false).unwrap();
+        let codex = capabilities_for("codex", repo.path(), false).unwrap();
 
         assert_eq!(claude.phase_skills, codex.phase_skills);
         assert_eq!(claude.profile, codex.profile);

@@ -6,7 +6,9 @@ pub mod codex;
 
 use super::CtxResult;
 use super::config::CtxConfig;
-use super::event::{Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext};
+use super::event::{
+    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
+};
 
 /// How an adapter arranges for turn-boundary events to reach a supervisor's
 /// socket. `env` is injected into the launched agent so the hook that runs
@@ -415,9 +417,38 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;
 
+    /// Cumulative input/output usage exposed by this harness's transcript.
+    /// This is deliberately separate from rot's latest-context token signal:
+    /// workflow telemetry needs phase cost, not current context occupancy.
+    fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
+        let _ = jsonl;
+        None
+    }
+
+    /// Whether [`transcript_usage`](Self::transcript_usage) returns the
+    /// transcript's cumulative latest snapshot instead of summing only the
+    /// supplied JSONL fragment.
+    fn transcript_usage_is_cumulative(&self) -> bool {
+        false
+    }
+
     fn compact_command(&self) -> Option<&'static str>;
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
+
+    /// A verified harness-owned way to present a local artifact directly in
+    /// that harness's UI, without launching a browser or development server.
+    /// Current Claude Code and Codex CLI adapters intentionally keep the
+    /// default: accepting an image as model input is not the same capability
+    /// as presenting an output artifact to the operator.
+    fn native_artifact_presentation(
+        &self,
+        path: &Path,
+        interactive_required: bool,
+    ) -> Option<&'static str> {
+        let _ = (path, interactive_required);
+        None
+    }
 
     /// Whether this concrete launch has a safe system-prompt channel. Most
     /// adapters are launch-invariant; adapters using shell shims can narrow
@@ -963,6 +994,21 @@ pub fn read_only_args_for_agent_name(name: &str) -> Option<Vec<String>> {
         .iter()
         .find(|(adapter_name, _)| *adapter_name == name)
         .map(|(_, ctor)| ctor(None).read_only_args())
+}
+
+/// Static adapter lookup for [`AgentAdapter::native_artifact_presentation`].
+/// This does not require an installed/ready harness: presentation support is
+/// adapter metadata, while the caller separately applies enablement and
+/// canonical policy.
+pub fn native_artifact_presentation_for_agent_name(
+    name: &str,
+    path: &Path,
+    interactive_required: bool,
+) -> Option<&'static str> {
+    ADAPTERS
+        .iter()
+        .find(|(adapter_name, _)| *adapter_name == name)
+        .and_then(|(_, ctor)| ctor(None).native_artifact_presentation(path, interactive_required))
 }
 
 /// Final wave item 4: `provider_for_agent_name(cfg.agent)` alone gets an

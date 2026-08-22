@@ -50,6 +50,70 @@ pub struct RetrievalCandidate {
     /// layer -- structurally, not by trusting the data.
     pub shared: bool,
     pub verified_age_days: u64,
+    /// This entry's lifecycle state (issue #38), derived purely from
+    /// `entry`/`verified_age_days` via `classify_lifecycle` -- see that
+    /// function's own doc comment for the rule. Precomputed on the
+    /// candidate (mirroring `verified_age_days` itself) so `score_one`
+    /// stays a pure function of already-gathered data, no different from
+    /// any other signal here.
+    pub lifecycle: Lifecycle,
+}
+
+/// Lifecycle state of a memory entry (issue #38): `Active` is eligible for
+/// normal ranking and injection like always; `Stale` is down-ranked but
+/// still selectable; `Archived` is excluded from normal selection
+/// altogether. Nothing on disk ever stores this -- `classify_lifecycle`
+/// derives it fresh from the entry's own current `verified`/`importance`/
+/// `confidence`/`source` every time, so re-verifying an entry (which resets
+/// `verified_age_days` to near zero) immediately restores `Active` on the
+/// very next read. This is also why the state is never destructive on its
+/// own: nothing is ever deleted to reach `Archived`, only excluded from
+/// ranking (see `memory_optimize` for the one place this module's
+/// consumers may additionally choose to *write* something, and even then
+/// never as a consequence of lifecycle alone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    Active,
+    Stale,
+    Archived,
+}
+
+/// Below this verified-age (days), an entry is always `Active` regardless
+/// of importance/confidence: freshly verified knowledge is never
+/// downgraded.
+pub const STALE_AFTER_DAYS: u64 = 180;
+
+/// At or beyond this verified-age (days), a low-value entry (see
+/// `classify_lifecycle`) becomes `Archived` rather than merely `Stale`.
+pub const ARCHIVE_AFTER_DAYS: u64 = 365;
+
+/// PURE, deterministic lifecycle classification (issue #38). Age is never
+/// the sole trigger for anything: an entry marked `importance: high` is
+/// always `Active`, no matter how long ago it was verified -- an important
+/// architectural invariant must never be downgraded by age alone.
+/// Otherwise: an entry fresher than `STALE_AFTER_DAYS` (by `verified`, the
+/// same recency signal `score_one`'s own staleness penalty already uses) is
+/// `Active`; one at or beyond `ARCHIVE_AFTER_DAYS` that is ALSO low-value
+/// (`importance: low` or `confidence: low`) AND not a deliberate, human
+/// `Source: explicit` entry becomes `Archived`; everything else past
+/// `STALE_AFTER_DAYS` is `Stale`. An `explicit` entry can still go `Stale`
+/// with age, but is never `Archived` by this function -- the strongest
+/// protection this module gives a deliberately human-authored fact, mirror
+/// of the N4 rule `memory::write_durable` already gives it on the write
+/// side.
+pub fn classify_lifecycle(entry: &Entry, verified_age_days: u64) -> Lifecycle {
+    if entry.importance.as_deref() == Some("high") {
+        return Lifecycle::Active;
+    }
+    if verified_age_days < STALE_AFTER_DAYS {
+        return Lifecycle::Active;
+    }
+    let low_value =
+        entry.importance.as_deref() == Some("low") || entry.confidence.as_deref() == Some("low");
+    if verified_age_days >= ARCHIVE_AFTER_DAYS && low_value && entry.source != "explicit" {
+        return Lifecycle::Archived;
+    }
+    Lifecycle::Stale
 }
 
 /// Local, deterministic signals the caller gathers before ranking -- no
@@ -67,6 +131,14 @@ pub struct RetrievalContext {
     /// Changed file paths (e.g. from `git diff --name-only`),
     /// repo-relative.
     pub changed_paths: Vec<String>,
+    /// Issue #38: when false (the default -- "normal injection"), an
+    /// `Archived` candidate is excluded from ranking altogether regardless
+    /// of how strongly it matches, the same way an empty/weak query
+    /// degrades to nothing (see `score_one`). Set true for an explicit
+    /// recall request (`zirv memory recall --include-archived`) so an
+    /// archived entry stays reachable on purpose -- excluded from normal
+    /// injection, never gone.
+    pub include_archived: bool,
 }
 
 /// One ranked candidate plus why it scored the way it did -- the
@@ -101,6 +173,14 @@ pub struct Ranked<'a> {
 /// enough negative modifier to drop below the floor and vanish from
 /// `zirv memory recall` entirely, even though the match itself is real.
 const MIN_RELEVANCE_SCORE: i64 = 1;
+
+/// Issue #38: the extra penalty a `Lifecycle::Stale` candidate takes on top
+/// of every other signal, once it has already cleared relevance -- small
+/// enough (same scale as `importance`/`confidence`'s own "low" penalty)
+/// that a real match still normally clears `MIN_RELEVANCE_SCORE` and stays
+/// selectable, which is what makes "down-ranked, not excluded" true for
+/// `Stale` in practice, not just in name.
+const STALE_DOWNRANK_PENALTY: i64 = 5;
 
 fn normalized_words(text: &str) -> Vec<String> {
     text.split_whitespace()
@@ -137,6 +217,20 @@ fn path_relates(entry_path: &str, other: &str) -> bool {
 /// exactly the "arbitrary top-N of the whole bank" issue #35's degrade-
 /// safely requirement rules out.
 fn score_one(candidate: &RetrievalCandidate, ctx: &RetrievalContext) -> (i64, i64, Vec<String>) {
+    // Issue #38: an archived candidate is excluded from NORMAL injection
+    // outright, before any other signal is even scored -- no key/keyword/
+    // path match, however strong, can pull it back in. `ctx.include_archived`
+    // is the one, explicit escape hatch (`zirv memory recall
+    // --include-archived`), which is why this check lives ahead of every
+    // other one: an "excluded unless explicitly asked for" rule must not be
+    // something a strong enough match can quietly override.
+    if candidate.lifecycle == Lifecycle::Archived && !ctx.include_archived {
+        return (
+            0,
+            i64::MIN,
+            vec!["archived: excluded from normal injection".to_string()],
+        );
+    }
     let mut base_score = 0i64;
     let mut reasons = Vec::new();
     let entry = &candidate.entry;
@@ -207,6 +301,16 @@ fn score_one(candidate: &RetrievalCandidate, ctx: &RetrievalContext) -> (i64, i6
     let staleness_penalty = (candidate.verified_age_days / 7) as i64;
     if staleness_penalty > 0 {
         score -= staleness_penalty;
+    }
+
+    // Issue #38: `Stale` (unlike `Archived` above) is never excluded, only
+    // down-ranked a little further on top of the gradual staleness penalty
+    // every candidate already takes -- "down-ranked from normal injection,
+    // still recallable" holds regardless of `ctx.include_archived`, which
+    // only ever gates the `Archived` exclusion.
+    if candidate.lifecycle == Lifecycle::Stale {
+        score -= STALE_DOWNRANK_PENALTY;
+        reasons.push("stale: down-ranked".to_string());
     }
 
     (base_score, score, reasons)
@@ -331,9 +435,11 @@ pub fn candidates_for_scope(
         .into_iter()
         .map(|(_, entry)| {
             let verified_age_days = now.saturating_sub(entry.verified) / 86_400;
+            let lifecycle = classify_lifecycle(&entry, verified_age_days);
             RetrievalCandidate {
                 shared: scope == MemoryScope::Shared,
                 verified_age_days,
+                lifecycle,
                 entry,
             }
         })
@@ -346,13 +452,8 @@ pub fn candidates_for_scope(
 /// to empty rather than erroring (`list_scoped`'s existing contract), so a
 /// disabled scope simply contributes nothing.
 ///
-/// Dormant: not yet wired into any live launch seam. Wiring session
-/// startup itself into a composed prompt is a later task's job (the
-/// context compiler, issue #44) -- this function is the ready-to-use
-/// primitive it should call, the same "dormant read primitive, wired in
-/// later" pattern `memory::list_scoped` followed before issue #33 gave it
-/// a consumer.
-#[allow(dead_code)]
+/// Used by the launch-time context compiler to build the independent
+/// context-ranked retrieval layer on top of core memory.
 pub fn candidates_for_repo(
     state: &StateDir,
     repo: &Path,
@@ -388,6 +489,7 @@ mod tests {
             },
             shared,
             verified_age_days: 0,
+            lifecycle: Lifecycle::Active,
         }
     }
 
@@ -779,6 +881,167 @@ mod tests {
             candidates
                 .iter()
                 .any(|c| c.entry.key == "shared-fact" && c.shared)
+        );
+    }
+
+    // Issue #38: lifecycle classification.
+
+    fn entry_with(importance: Option<&str>, confidence: Option<&str>, source: &str) -> Entry {
+        Entry {
+            key: "some-key".to_string(),
+            written_by: "claude".to_string(),
+            // Deliberately ancient: the acceptance criterion is "old but
+            // important verified memories are not removed merely because of
+            // age" -- `written` being ancient must never matter to
+            // `classify_lifecycle`, which never even looks at it.
+            written: 1,
+            verified: 1,
+            source: source.to_string(),
+            body: "some durable fact".to_string(),
+            importance: importance.map(str::to_string),
+            confidence: confidence.map(str::to_string),
+            tags: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn age_alone_never_archives_a_high_importance_entry() {
+        let entry = entry_with(Some("high"), None, "harvest");
+        // Far past both thresholds.
+        assert_eq!(classify_lifecycle(&entry, 10_000), Lifecycle::Active);
+    }
+
+    #[test]
+    fn an_old_but_recently_verified_high_importance_entry_stays_active() {
+        // "Old" here is `written` (see `entry_with`); `verified_age_days`
+        // is what classification actually reads, and it is fresh.
+        let entry = entry_with(Some("high"), None, "explicit");
+        assert_eq!(classify_lifecycle(&entry, 0), Lifecycle::Active);
+    }
+
+    #[test]
+    fn a_fresh_entry_is_active_regardless_of_importance() {
+        let entry = entry_with(Some("low"), Some("low"), "harvest");
+        assert_eq!(
+            classify_lifecycle(&entry, STALE_AFTER_DAYS - 1),
+            Lifecycle::Active
+        );
+    }
+
+    #[test]
+    fn a_low_value_unverified_entry_goes_stale_then_archived_with_age() {
+        let entry = entry_with(Some("low"), None, "harvest");
+        assert_eq!(
+            classify_lifecycle(&entry, STALE_AFTER_DAYS),
+            Lifecycle::Stale,
+            "past the stale threshold but short of the archive one"
+        );
+        assert_eq!(
+            classify_lifecycle(&entry, ARCHIVE_AFTER_DAYS),
+            Lifecycle::Archived
+        );
+    }
+
+    #[test]
+    fn a_neutral_entry_with_no_importance_or_confidence_never_archives() {
+        // Low-value requires an explicit `low` signal; a plain, unmarked
+        // entry only ever goes `Stale`, never `Archived`, no matter how old.
+        let entry = entry_with(None, None, "harvest");
+        assert_eq!(
+            classify_lifecycle(&entry, 100_000),
+            Lifecycle::Stale,
+            "no low-value signal means no archival, however old"
+        );
+    }
+
+    #[test]
+    fn an_explicit_entry_never_archives_even_when_old_and_low_value() {
+        let entry = entry_with(Some("low"), Some("low"), "explicit");
+        assert_eq!(
+            classify_lifecycle(&entry, 100_000),
+            Lifecycle::Stale,
+            "explicit entries may go stale but are never archived by age"
+        );
+    }
+
+    #[test]
+    fn classify_lifecycle_is_pure_and_deterministic() {
+        let entry = entry_with(Some("low"), None, "harvest");
+        assert_eq!(
+            classify_lifecycle(&entry, ARCHIVE_AFTER_DAYS),
+            classify_lifecycle(&entry, ARCHIVE_AFTER_DAYS),
+        );
+    }
+
+    // Issue #38: archived/stale ranking behavior.
+
+    fn candidate_with_lifecycle(key: &str, body: &str, lifecycle: Lifecycle) -> RetrievalCandidate {
+        let mut c = candidate(key, body, false);
+        c.lifecycle = lifecycle;
+        c
+    }
+
+    #[test]
+    fn an_archived_candidate_is_excluded_from_a_normal_recall() {
+        let candidates = vec![candidate_with_lifecycle(
+            "old-fact",
+            "a strong keyword match for release notes",
+            Lifecycle::Archived,
+        )];
+        let selection = select(&candidates, &ctx("release"), 4096, 10);
+        assert!(
+            selection.selected.is_empty(),
+            "an archived candidate must never surface in a normal recall: {selection:?}"
+        );
+        assert_eq!(selection.below_relevance, 1);
+    }
+
+    #[test]
+    fn an_archived_candidate_stays_explicitly_recallable() {
+        let candidates = vec![candidate_with_lifecycle(
+            "old-fact",
+            "a strong keyword match for release notes",
+            Lifecycle::Archived,
+        )];
+        let mut c = ctx("release");
+        c.include_archived = true;
+        let selection = select(&candidates, &c, 4096, 10);
+        assert_eq!(
+            selection.selected.len(),
+            1,
+            "explicitly asking for archived entries must surface them: {selection:?}"
+        );
+        assert_eq!(selection.selected[0].candidate.entry.key, "old-fact");
+    }
+
+    #[test]
+    fn a_stale_candidate_is_down_ranked_below_an_otherwise_identical_active_one() {
+        let candidates = vec![
+            candidate_with_lifecycle("fresh-fact", "mentions release notes", Lifecycle::Active),
+            candidate_with_lifecycle("stale-fact", "mentions release notes", Lifecycle::Stale),
+        ];
+        let ranked = rank(&candidates, &ctx("release"));
+        assert_eq!(ranked[0].candidate.entry.key, "fresh-fact");
+        assert_eq!(ranked[1].candidate.entry.key, "stale-fact");
+        assert!(
+            ranked[0].score > ranked[1].score,
+            "stale must score strictly lower than an otherwise identical active entry: {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_candidate_remains_selectable_in_a_normal_recall() {
+        let candidates = vec![candidate_with_lifecycle(
+            "stale-fact",
+            "mentions release notes",
+            Lifecycle::Stale,
+        )];
+        let selection = select(&candidates, &ctx("release"), 4096, 10);
+        assert_eq!(
+            selection.selected.len(),
+            1,
+            "stale must be down-ranked, not excluded, from a normal recall: {selection:?}"
         );
     }
 }

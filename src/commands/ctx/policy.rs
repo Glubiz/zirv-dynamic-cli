@@ -250,6 +250,28 @@ impl EffectivePolicy {
         }
         out
     }
+
+    /// The failed-config-load fallback (`config::degrade_to_operator_only`,
+    /// used by `optimize.rs`/`hook.rs`): full **Deny** on every capability.
+    /// `EffectivePolicy::default()` (all `Allow`) is the right answer to "no
+    /// `[policy]` table was ever written" -- it is the literal truth about an
+    /// operator who never opted in. It is the wrong answer to "the config
+    /// could not be read at all" (malformed TOML, a forbidden repo key):
+    /// that is not an operator statement that no restriction is wanted, and
+    /// handing it the widest policy zirv can state is a fail-open on the one
+    /// surface this module exists to keep narrowing-only, now that issue #44
+    /// makes `cfg.policy` load-bearing (attached to every `CompiledContext`).
+    pub fn fail_closed() -> Self {
+        EffectivePolicy {
+            repo_fs_write: Stance::Deny,
+            outside_repo_fs_write: Stance::Deny,
+            shell_exec: Stance::Deny,
+            network: Stance::Deny,
+            approval: Stance::Deny,
+            git_push_destructive: Stance::Deny,
+            tool_access: Stance::Deny,
+        }
+    }
 }
 
 /// Resolves the three policy layers per the module doc's fold: `home`/`repo`
@@ -525,6 +547,20 @@ mod tests {
         assert!(Stance::Allow < Stance::Ask);
         assert!(Stance::Ask < Stance::Deny);
         assert_eq!(Stance::default(), Stance::Allow);
+    }
+
+    #[test]
+    fn fail_closed_denies_every_capability_and_differs_from_default() {
+        let closed = EffectivePolicy::fail_closed();
+        for capability in Capability::ALL {
+            assert_eq!(
+                closed.stance(capability),
+                Stance::Deny,
+                "{} should be denied by the fail-closed fallback",
+                capability.key()
+            );
+        }
+        assert_ne!(closed, EffectivePolicy::default());
     }
 
     #[test]

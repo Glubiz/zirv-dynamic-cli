@@ -141,16 +141,17 @@ fn corrections_in(transcript: &Path, cfg: &CtxConfig) -> usize {
 /// `corrections_in` a fully permissive `AgentGate`, which is exactly the
 /// same trust hole `optimize.rs`'s config-load fallback had (review finding
 /// 1): a malformed *repo* `.settings.toml` would silently revive an agent
-/// the *operator* disabled. Falling back to `AgentGate::load_operator_only`
-/// keeps the operator's policy in force even when the rest of the config
-/// (or the repo settings layer specifically) cannot be read.
+/// the *operator* disabled. It would also, since issue #44 made `cfg.policy`
+/// load-bearing, hand back the widest possible policy from a config that
+/// could not even be read. `config::degrade_to_operator_only` substitutes
+/// `AgentGate::load_operator_only`/`EffectivePolicy::fail_closed` for those
+/// two fields, keeping both the operator's disable and the operator's policy
+/// in force even when the rest of the config (or the repo settings layer
+/// specifically) cannot be read.
 fn cfg_or_operator_only_gate(repo: &Path, env: EnvLookup<'_>) -> CtxConfig {
     match CtxConfig::load(repo, env) {
         Ok(cfg) => cfg,
-        Err(_) => CtxConfig {
-            agents: crate::settings::AgentGate::load_operator_only(env),
-            ..CtxConfig::default()
-        },
+        Err(_) => super::config::degrade_to_operator_only(env),
     }
 }
 
@@ -671,6 +672,15 @@ mod tests {
         );
     }
 
+    fn stop_payload(transcript: &std::path::Path, cwd: &std::path::Path) -> String {
+        serde_json::json!({
+            "session_id": "s",
+            "transcript_path": transcript,
+            "cwd": cwd,
+        })
+        .to_string()
+    }
+
     #[test]
     fn run_exits_zero_even_with_unparseable_stdin() {
         let mut out = Vec::new();
@@ -704,11 +714,7 @@ mod tests {
         )]
         .into();
 
-        let stdin = format!(
-            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
-            transcript.display(),
-            dir.path().display()
-        );
+        let stdin = stop_payload(&transcript, dir.path());
         let mut out = Vec::new();
         let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
         assert_eq!(code, 0);
@@ -742,11 +748,7 @@ mod tests {
             socket.display().to_string(),
         )]
         .into();
-        let stdin = format!(
-            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
-            transcript.display(),
-            dir.path().display()
-        );
+        let stdin = stop_payload(&transcript, dir.path());
 
         let mut out = Vec::new();
         run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
@@ -803,11 +805,7 @@ mod tests {
             state.display().to_string(),
         )]
         .into();
-        let stdin = format!(
-            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
-            transcript.display(),
-            dir.path().display()
-        );
+        let stdin = stop_payload(&transcript, dir.path());
 
         let mut out = Vec::new();
         let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
@@ -894,11 +892,7 @@ mod tests {
             state.display().to_string(),
         )]
         .into();
-        let stdin = format!(
-            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
-            transcript.display(),
-            dir.path().display()
-        );
+        let stdin = stop_payload(&transcript, dir.path());
 
         let mut out = Vec::new();
         run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
@@ -927,11 +921,7 @@ mod tests {
             state.display().to_string(),
         )]
         .into();
-        let stdin = format!(
-            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
-            transcript.display(),
-            dir.path().display()
-        );
+        let stdin = stop_payload(&transcript, dir.path());
 
         let mut out = Vec::new();
         run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
@@ -1026,11 +1016,7 @@ mod tests {
             state.display().to_string(),
         )]
         .into();
-        let stdin = format!(
-            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
-            transcript.display(),
-            dir.path().display()
-        );
+        let stdin = stop_payload(&transcript, dir.path());
 
         let mut out = Vec::new();
         run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
@@ -1074,21 +1060,17 @@ mod tests {
             !cfg.agents.is_enabled("claude"),
             "the operator's disable must survive a repo layer that could not be read"
         );
+        assert_eq!(
+            cfg.policy,
+            super::super::policy::EffectivePolicy::fail_closed(),
+            "issue #44: a failed config load must fail closed on policy too, not default to Allow"
+        );
     }
 
-    /// **Recorded residual, not a fix.** Unlike `agents` (see the test
-    /// above), `[policy]` has no operator-only salvage path yet:
-    /// `cfg_or_operator_only_gate`'s error arm builds
-    /// `CtxConfig { agents: AgentGate::load_operator_only(env), ..CtxConfig::default() }`,
-    /// and `CtxConfig::default()`'s `policy` field is all-`Allow`. So a
-    /// malformed *repo* `[policy]` table -- which fails the whole
-    /// `CtxConfig::load` -- silently erases an *operator*-set narrowing too,
-    /// the exact trust hole review finding 1 closed for `AgentGate` but not
-    /// (yet) for `policy`. Issue #44, which pins policy onto a real launch,
-    /// MUST close this before that pin can be trusted; this test's
-    /// assertion is expected to flip once it does.
+    /// A malformed repo policy must fail closed while preserving the
+    /// operator's own narrowing through `degrade_to_operator_only`.
     #[test]
-    fn a_malformed_repo_policy_table_still_erases_the_operators_own_policy_narrowing() {
+    fn a_malformed_repo_policy_table_preserves_the_operators_policy_narrowing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
@@ -1116,10 +1098,8 @@ mod tests {
         let cfg = cfg_or_operator_only_gate(&repo, &|k| empty.get(k).cloned());
         assert_eq!(
             cfg.policy.shell_exec,
-            super::super::policy::Stance::Allow,
-            "recorded residual: the operator's own shell_exec=deny should survive a broken repo \
-             layer the same way AgentGate does, but policy has no equivalent salvage yet -- #44 \
-             must add one and flip this assertion to Stance::Deny"
+            super::super::policy::Stance::Deny,
+            "the operator's shell_exec=deny survives a broken repo layer"
         );
     }
 
@@ -1141,11 +1121,7 @@ mod tests {
             state.display().to_string(),
         )]
         .into();
-        let stdin = format!(
-            "{{\"session_id\":\"s\",\"transcript_path\":\"{}\",\"cwd\":\"{}\"}}",
-            transcript.display(),
-            dir.path().display()
-        );
+        let stdin = stop_payload(&transcript, dir.path());
 
         let mut out = Vec::new();
         run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");

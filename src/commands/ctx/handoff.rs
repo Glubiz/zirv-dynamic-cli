@@ -487,7 +487,7 @@ mod tests {
     }
 
     fn fake_model_adapter() -> ClaudeAdapter {
-        ClaudeAdapter::new(Some(fixture("fake-model.sh").to_str().expect("utf8 path")))
+        ClaudeAdapter::new(Some(&format!("sh {}", fixture("fake-model.sh").display())))
     }
 
     /// Long enough that a working fake model always finishes inside it, short
@@ -1058,7 +1058,7 @@ mod tests {
             ),
             (
                 "ZIRV_CTX_AGENT_BIN".to_string(),
-                fixture("fake-model.sh").display().to_string(),
+                format!("sh {}", fixture("fake-model.sh").display()),
             ),
         ]
         .into();

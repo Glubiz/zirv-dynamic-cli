@@ -16,7 +16,7 @@ pub const SCRIPT_DIR_NAME: &str = ".zirv";
 /// shortcut sharing one of these names can never be reached.
 pub const RESERVED_COMMANDS: &[&str] = &[
     "help", "h", "version", "v", "init", "i", "create", "c", "ctx", "chat", "agent", "memory",
-    "setup", "skill", "workflow", "test", "verify", "artifact", "frontend",
+    "context", "setup", "skill", "workflow", "test", "verify", "artifact", "frontend",
 ];
 
 /// Compared case-insensitively, the same way `is_reserved_zirv_file` compares

@@ -837,8 +837,12 @@ shell, network, or other permissions.
 
 Use `zirv workflow review package <id>` for a compact diff/test review input,
 `zirv artifact render <path>` for stable static artifact references, and
-`zirv workflow stats` for local bounded telemetry. Telemetry excludes prompts,
-source code, diffs, command output, and model responses by construction.
+`zirv workflow stats` for local bounded telemetry. Review results are persisted
+from a strict bounded JSON contract and fix/re-review stops after three rounds.
+Interactive artifact fallback obeys canonical policy (`ask` needs `--approve`),
+and supervised Claude/Codex workflows attribute available transcript token
+deltas automatically. Telemetry excludes prompts, source code, diffs, command
+output, and model responses by construction.
 
 ## Context Management (zirv ctx)
 
@@ -1013,6 +1017,9 @@ checkout:
 | `prompt.repo_layer` | `ZIRV_CTX_PROMPT_REPO` |
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 | `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
+| `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
+| `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
+| `context.max_harness_roster_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES` |
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
 | `chrome.events` | `ZIRV_CTX_QUIET` (see the note below on why this one's name looks different) |
@@ -1025,6 +1032,8 @@ checkout:
 | `memory.core_max_bytes` | `ZIRV_CTX_MEMORY_CORE_MAX_BYTES` |
 | `memory.retrieval_max_bytes` | `ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES` |
 | `memory.retrieval_max_entries` | `ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES` |
+| `memory.harvest_max_entries` | `ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES` |
+| `memory.harvest_max_bytes` | `ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES` |
 | `dash.enabled` | `ZIRV_CTX_DASH` |
 | `dash.sidebar_cols` | `ZIRV_CTX_DASH_SIDEBAR_COLS` |
 | `dash.roster_max_age_secs` | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS` |

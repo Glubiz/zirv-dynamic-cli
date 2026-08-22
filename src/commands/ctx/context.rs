@@ -33,16 +33,6 @@ use std::path::{Path, PathBuf};
 
 use super::optimize::Layer;
 
-/// A deterministic, bounded canonical project-instruction block for one
-/// harness. `sources` is retained for status/debug output so a launch can
-/// explain exactly which repository surfaces contributed text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledContext {
-    pub text: String,
-    pub sources: Vec<PathBuf>,
-    pub truncated: bool,
-}
-
 /// The subdirectory holding zirv's own canonical instruction layer.
 pub const CONTEXT_DIR: &str = ".zirv/context";
 
@@ -63,67 +53,8 @@ pub fn codex_path(repo: &Path) -> PathBuf {
     repo.join(CONTEXT_DIR).join("codex.md")
 }
 
-fn read_regular_file(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
-        return None;
-    }
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-}
-
-/// Compiles `.zirv/context/common.md` plus the selected harness addition.
-/// Unknown harnesses receive common context only. The entire rendered block,
-/// including provenance labels, is capped on a UTF-8 boundary.
-pub fn compile(repo: &Path, harness: &str, max_bytes: usize) -> Option<CompiledContext> {
-    let mut layers = vec![common_path(repo)];
-    if harness.eq_ignore_ascii_case("claude") {
-        layers.push(claude_path(repo));
-    } else if harness.eq_ignore_ascii_case("codex") {
-        layers.push(codex_path(repo));
-    }
-
-    let mut sources = Vec::new();
-    let mut rendered = String::new();
-    for path in layers {
-        let Some(text) = read_regular_file(&path) else {
-            continue;
-        };
-        if !rendered.is_empty() {
-            rendered.push_str("\n\n---\n\n");
-        }
-        let relative = path.strip_prefix(repo).unwrap_or(&path);
-        rendered.push_str(&format!("Source: {}\n\n{text}", relative.display()));
-        sources.push(path);
-    }
-    if sources.is_empty() {
-        return None;
-    }
-
-    let truncated = rendered.len() > max_bytes;
-    let marker = "\n\n[canonical context truncated at configured repository byte budget]";
-    let text = if truncated {
-        let body_cap = max_bytes.saturating_sub(marker.len());
-        let mut text = crate::utils::truncate_bytes(rendered, Some(body_cap));
-        text.push_str(&crate::utils::truncate_bytes(
-            marker.to_string(),
-            Some(max_bytes.saturating_sub(text.len())),
-        ));
-        text
-    } else {
-        rendered
-    };
-    Some(CompiledContext {
-        text,
-        sources,
-        truncated,
-    })
-}
-
 /// Where one `Instructions`-kind layer sits in the deterministic precedence
-/// order a future compiler (issue #44) composes layers in: canonical common
+/// order the context compiler composes layers in: canonical common
 /// content applies first, a harness-specific canonical addition layers on
 /// top of it, and a harness's own native instruction file (CLAUDE.md /
 /// AGENTS.md) composes last -- closest to the session. Within the native
@@ -233,32 +164,6 @@ mod tests {
         assert_eq!(common_path(repo), repo.join(".zirv/context/common.md"));
         assert_eq!(claude_path(repo), repo.join(".zirv/context/claude.md"));
         assert_eq!(codex_path(repo), repo.join(".zirv/context/codex.md"));
-    }
-
-    #[test]
-    fn compiler_layers_common_before_the_selected_harness_and_reports_sources() {
-        let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(repo.path().join(CONTEXT_DIR)).expect("context dir");
-        std::fs::write(common_path(repo.path()), "common rule").expect("common");
-        std::fs::write(claude_path(repo.path()), "claude rule").expect("claude");
-        std::fs::write(codex_path(repo.path()), "codex rule").expect("codex");
-
-        let compiled = compile(repo.path(), "codex", 4096).expect("compiled");
-        assert!(compiled.text.find("common rule") < compiled.text.find("codex rule"));
-        assert!(!compiled.text.contains("claude rule"));
-        assert_eq!(compiled.sources.len(), 2);
-        assert!(!compiled.truncated);
-    }
-
-    #[test]
-    fn compiler_is_bounded() {
-        let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(repo.path().join(CONTEXT_DIR)).expect("context dir");
-        std::fs::write(common_path(repo.path()), "x".repeat(500)).expect("common");
-        let compiled = compile(repo.path(), "claude", 32).expect("compiled");
-        assert!(compiled.truncated);
-        assert!(!compiled.text.is_empty());
-        assert!(compiled.text.len() <= 32);
     }
 
     /// Issue #41's binding requirement: repo-owned canonical context can

@@ -5,8 +5,11 @@ pub mod agent;
 pub mod announce;
 pub mod chat;
 pub mod chrome;
+pub mod compile;
 pub mod config;
 pub mod context;
+pub mod context_cli;
+pub mod context_status;
 pub mod dash;
 pub mod drift;
 pub mod event;
@@ -17,6 +20,7 @@ pub mod log;
 pub mod mail;
 pub mod memory;
 pub mod memory_cli;
+pub mod memory_optimize;
 pub mod optimize;
 pub mod pace;
 pub mod policy;
@@ -65,6 +69,11 @@ pub(crate) mod testenv {
     pub(crate) fn repo() -> TestRepo {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = std::fs::canonicalize(dir.path()).expect("resolve tempdir");
+        #[cfg(windows)]
+        let path = {
+            let rendered = path.to_string_lossy();
+            PathBuf::from(rendered.strip_prefix(r"\\?\").unwrap_or(rendered.as_ref()))
+        };
         TestRepo { _dir: dir, path }
     }
 

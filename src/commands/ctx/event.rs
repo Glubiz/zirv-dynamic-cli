@@ -40,6 +40,14 @@ pub struct SessionRef {
     pub cwd: PathBuf,
 }
 
+/// Cumulative token usage read from a harness transcript. Adapters return
+/// `None` when their transcript does not expose a verified usage shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// The only currency the rot engine and supervisors understand.
 ///
 /// `AssistantFinal` is emitted for every assistant message: `text` holds the

@@ -17,8 +17,12 @@ use crate::commands::ctx::state::{StateDir, now_secs};
 const MAX_REVIEW_DIFF_BYTES: usize = 96 * 1024;
 const MAX_REVIEW_EVIDENCE: usize = 16;
 const MAX_REVIEW_FINDINGS: usize = 256;
+const MAX_FINDINGS_PER_RUN: usize = 64;
 const MAX_FINDING_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_FINDING_PATH_BYTES: usize = 4 * 1024;
+const MAX_REVIEW_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_FIX_REVIEW_ROUNDS: u8 = 3;
+const REVIEW_RESULT_PREFIX: &str = "ZIRV_REVIEW_RESULT ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -49,6 +53,8 @@ pub struct ReviewFinding {
     pub line: Option<u32>,
     #[serde(default)]
     pub disposition: FindingDisposition,
+    #[serde(default)]
+    pub recommended_disposition: Option<FindingDisposition>,
     pub created_at: u64,
 }
 
@@ -66,6 +72,48 @@ pub fn required_independent_reviews(risk: RiskBand) -> usize {
         ReviewDepth::OneIndependentReviewer => 1,
         ReviewDepth::StrongIndependentReview => 2,
     }
+}
+
+pub fn required_independent_reviews_for(state: &WorkflowState) -> usize {
+    let baseline = required_independent_reviews(state.classification.risk);
+    if baseline > 0 && has_repeated_meaningful_finding(&state.review_findings) {
+        baseline.max(2)
+    } else {
+        baseline
+    }
+}
+
+fn finding_key(finding: &ReviewFinding) -> String {
+    if let Some(path) = &finding.path {
+        format!(
+            "{}:{}",
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase(),
+            finding.line.unwrap_or(0)
+        )
+    } else {
+        finding
+            .summary
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+    }
+}
+
+fn has_repeated_meaningful_finding(findings: &[ReviewFinding]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    findings
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.severity,
+                FindingSeverity::Major | FindingSeverity::Critical
+            ) && finding.disposition != FindingDisposition::Dismissed
+        })
+        .map(finding_key)
+        .any(|key| !seen.insert(key))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +169,8 @@ pub struct ReviewPackage {
     pub task: String,
     pub classification: super::classify::Classification,
     pub review_depth: ReviewDepth,
+    pub required_independent_reviews: usize,
+    pub escalation_reason: Option<String>,
     pub base_sha: String,
     pub head_sha: String,
     pub change_fingerprint: u64,
@@ -130,6 +180,30 @@ pub struct ReviewPackage {
     pub verification: Option<VerificationEvidence>,
     pub existing_findings: Vec<ReviewFinding>,
     pub review_round: u8,
+    pub max_review_rounds: u8,
+}
+
+fn review_round(state: &WorkflowState, current_fingerprint: u64) -> u8 {
+    let latest = state
+        .review_evidence
+        .iter()
+        .map(|evidence| evidence.review_round)
+        .max()
+        .unwrap_or(0);
+    let current = state
+        .review_evidence
+        .iter()
+        .filter(|evidence| evidence.change_fingerprint == current_fingerprint)
+        .map(|evidence| evidence.review_round)
+        .max();
+    let evidence_round = current.unwrap_or_else(|| latest.saturating_add(1).max(1));
+    let attempt_round = state
+        .current()
+        .and_then(|step| state.attempts.get(&step.id))
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
+    evidence_round.max(attempt_round)
 }
 
 fn git(repo: &Path, args: &[&str]) -> CtxResult<String> {
@@ -397,24 +471,29 @@ pub fn package(
     let current_fingerprint = verification::change_fingerprint(&state.repo)?;
     let verification = verification::load_latest(state_dir, &state.repo)?
         .map(|report| VerificationEvidence::from_report(report, current_fingerprint));
-    // The current step's own id, not the literal "review": a workflow whose
-    // review step is named anything else reported fix_round 0 forever.
-    let review_step = state
-        .current()
-        .map(|step| step.id.as_str())
-        .unwrap_or("review");
-    let review_round = state
-        .attempts
-        .get(review_step)
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(1);
+    let review_round = review_round(state, current_fingerprint);
+    if review_round > MAX_FIX_REVIEW_ROUNDS {
+        return Err(format!(
+            "review/fix loop reached the bounded limit of {MAX_FIX_REVIEW_ROUNDS} rounds; record residual dispositions or start a new workflow"
+        )
+        .into());
+    }
+    let required_reviews = required_independent_reviews_for(state);
+    let escalated = required_reviews > required_independent_reviews(state.classification.risk);
     Ok(ReviewPackage {
         schema_version: 1,
         workflow_id: state.id.clone(),
         task: state.task.clone(),
         classification: state.classification.clone(),
-        review_depth: depth_for_risk(state.classification.risk),
+        review_depth: if required_reviews >= 2 {
+            ReviewDepth::StrongIndependentReview
+        } else {
+            depth_for_risk(state.classification.risk)
+        },
+        required_independent_reviews: required_reviews,
+        escalation_reason: escalated.then(|| {
+            "a major/critical finding recurred; require a second independent review".into()
+        }),
         base_sha,
         head_sha,
         change_fingerprint: current_fingerprint,
@@ -424,6 +503,7 @@ pub fn package(
         verification,
         existing_findings: state.review_findings.clone(),
         review_round,
+        max_review_rounds: MAX_FIX_REVIEW_ROUNDS,
     })
 }
 
@@ -549,6 +629,91 @@ struct ReviewerRun {
     /// line, exit 0). The review has not happened yet, so this exit 0 is not
     /// evidence of anything.
     dashboard_spawn: bool,
+    /// `Some` only for the real harness launch. Injected tests and legacy
+    /// launch shims use `None`; real output must satisfy the structured
+    /// result contract before it can become review evidence.
+    output: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewerResponse {
+    findings: Vec<ReviewerFinding>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewerFinding {
+    severity: FindingSeverity,
+    summary: String,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    recommended_disposition: Option<FindingDisposition>,
+}
+
+fn parse_reviewer_output(output: &str) -> CtxResult<Vec<ReviewerFinding>> {
+    if output.len() > MAX_REVIEW_OUTPUT_BYTES {
+        return Err(format!("reviewer output exceeds {MAX_REVIEW_OUTPUT_BYTES} bytes").into());
+    }
+    let mut result = None;
+    for line in output.lines() {
+        if let Some(json) = line.trim().strip_prefix(REVIEW_RESULT_PREFIX) {
+            if result.is_some() {
+                return Err("reviewer emitted more than one structured result".into());
+            }
+            result = Some(serde_json::from_str::<ReviewerResponse>(json)?);
+        }
+    }
+    let response = result.ok_or("reviewer did not emit a structured Zirv review result")?;
+    if response.findings.len() > MAX_FINDINGS_PER_RUN {
+        return Err(format!(
+            "reviewer returned more than {MAX_FINDINGS_PER_RUN} findings in one run"
+        )
+        .into());
+    }
+    for finding in &response.findings {
+        let summary = finding.summary.trim();
+        if summary.is_empty() || summary.len() > MAX_FINDING_SUMMARY_BYTES {
+            return Err("reviewer returned an empty or oversized finding summary".into());
+        }
+        if finding
+            .path
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy().len() > MAX_FINDING_PATH_BYTES)
+        {
+            return Err("reviewer returned an oversized finding path".into());
+        }
+    }
+    Ok(response.findings)
+}
+
+fn append_reviewer_findings(
+    state: &mut WorkflowState,
+    findings: Vec<ReviewerFinding>,
+) -> CtxResult<()> {
+    if state.review_findings.len().saturating_add(findings.len()) > MAX_REVIEW_FINDINGS {
+        return Err(format!(
+            "review results would exceed the workflow limit of {MAX_REVIEW_FINDINGS} findings"
+        )
+        .into());
+    }
+    let created_at = now_secs();
+    state
+        .review_findings
+        .extend(findings.into_iter().map(|finding| ReviewFinding {
+            id: uuid::Uuid::new_v4().to_string(),
+            severity: finding.severity,
+            summary: finding.summary.trim().to_string(),
+            path: finding.path,
+            line: finding.line,
+            disposition: FindingDisposition::Open,
+            recommended_disposition: finding.recommended_disposition,
+            created_at,
+        }));
+    Ok(())
 }
 
 /// One delegated run's stdout line, read as "the dashboard took this request".
@@ -629,7 +794,7 @@ fn records_evidence(run: &ReviewerRun, fingerprint_unchanged: bool) -> bool {
 fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
     let argv = reviewer_argv(agent)?;
     let prompt = format!(
-        "Review the following compact Zirv review package. Return only confirmed concrete findings with severity, file/location, reasoning, and disposition recommendation. Do not modify files.\n\n{}",
+        "Review the following compact Zirv review package. Do not modify files. Return exactly one single-line result prefixed `{REVIEW_RESULT_PREFIX}` followed by JSON shaped as {{\"findings\":[{{\"severity\":\"major\",\"summary\":\"concrete reasoning\",\"path\":\"src/file.rs\",\"line\":12,\"recommended_disposition\":\"accepted\"}}]}}. Use an empty findings array when no concrete issue exists. Do not emit another result line.\n\n{}",
         serde_json::to_string(package)?
     );
     let mut child = Command::new(std::env::current_exe()?)
@@ -647,9 +812,20 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
     });
     let dash_active = dash_channel_active();
     let mut dashboard_spawn = false;
+    let mut output = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         relay_lines(stdout, |line| {
             dashboard_spawn |= dash_active && is_dashboard_ack(line);
+            if output.len() < MAX_REVIEW_OUTPUT_BYTES.saturating_add(1) {
+                let remaining = MAX_REVIEW_OUTPUT_BYTES
+                    .saturating_add(1)
+                    .saturating_sub(output.len());
+                let bytes = line.as_bytes();
+                output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+                if output.len() < MAX_REVIEW_OUTPUT_BYTES.saturating_add(1) {
+                    output.push(b'\n');
+                }
+            }
             println!("{line}");
         });
     }
@@ -658,6 +834,7 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
     Ok(ReviewerRun {
         code,
         dashboard_spawn,
+        output: Some(String::from_utf8_lossy(&output).into_owned()),
     })
 }
 
@@ -694,6 +871,15 @@ fn run_independent_review(
     // by definition, so the evidence is appended to freshly loaded state --
     // writing the old snapshot back used to erase every finding the reviewer
     // had just recorded.
+    let parsed_findings = if records_evidence(&run, fingerprint_unchanged) {
+        run.output
+            .as_deref()
+            .map(parse_reviewer_output)
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut state = engine::load(&state_dir, &state.repo, &args.id)?;
     if run.dashboard_spawn {
         writeln!(
@@ -702,6 +888,7 @@ fn run_independent_review(
              run, so none was recorded"
         )?;
     } else if records_evidence(&run, fingerprint_unchanged) {
+        append_reviewer_findings(&mut state, parsed_findings)?;
         state.review_evidence.push(ReviewRunEvidence {
             id: uuid::Uuid::new_v4().to_string(),
             change_fingerprint: package.change_fingerprint,
@@ -821,6 +1008,7 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 path: args.path.clone(),
                 line: args.line,
                 disposition: FindingDisposition::Open,
+                recommended_disposition: None,
                 created_at: now_secs(),
             };
             state.review_findings.push(finding.clone());
@@ -951,12 +1139,14 @@ mod tests {
                 path: None,
                 line: None,
                 disposition: FindingDisposition::Open,
+                recommended_disposition: None,
                 created_at: now_secs(),
             });
             engine::save(&state_dir, &theirs, true)?;
             Ok(ReviewerRun {
                 code: 0,
                 dashboard_spawn: false,
+                output: None,
             })
         };
 
@@ -1009,6 +1199,7 @@ mod tests {
             Ok(ReviewerRun {
                 code: 0,
                 dashboard_spawn: true,
+                output: None,
             })
         });
         unsafe {
@@ -1078,21 +1269,24 @@ mod tests {
         assert!(!records_evidence(
             &ReviewerRun {
                 code: 0,
-                dashboard_spawn: true
+                dashboard_spawn: true,
+                output: None,
             },
             true
         ));
         assert!(records_evidence(
             &ReviewerRun {
                 code: 0,
-                dashboard_spawn: false
+                dashboard_spawn: false,
+                output: None,
             },
             true
         ));
         assert!(!records_evidence(
             &ReviewerRun {
                 code: 0,
-                dashboard_spawn: false
+                dashboard_spawn: false,
+                output: None,
             },
             false
         ));
@@ -1197,5 +1391,79 @@ mod tests {
         assert_eq!(required_independent_reviews(RiskBand::Medium), 1);
         assert_eq!(required_independent_reviews(RiskBand::High), 1);
         assert_eq!(required_independent_reviews(RiskBand::Critical), 2);
+    }
+
+    #[test]
+    fn structured_reviewer_results_are_validated_and_persistable() {
+        let output = format!(
+            "progress\n{REVIEW_RESULT_PREFIX}{{\"findings\":[{{\"severity\":\"major\",\"summary\":\"missing bounds check\",\"path\":\"src/main.rs\",\"line\":7,\"recommended_disposition\":\"accepted\"}}]}}\n"
+        );
+        let findings = parse_reviewer_output(&output).expect("structured result");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::Major);
+        assert_eq!(findings[0].path.as_deref(), Some(Path::new("src/main.rs")));
+        assert_eq!(findings[0].line, Some(7));
+        assert_eq!(
+            findings[0].recommended_disposition,
+            Some(FindingDisposition::Accepted)
+        );
+        assert!(parse_reviewer_output("review complete").is_err());
+        assert!(parse_reviewer_output(&format!(
+            "{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}\n{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn repeated_major_findings_escalate_but_dismissals_do_not() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = review_workflow(repo.path(), &state_dir);
+        let finding = |id: &str, disposition| ReviewFinding {
+            id: id.into(),
+            severity: FindingSeverity::Major,
+            summary: "same defect".into(),
+            path: Some(PathBuf::from("src/lib.rs")),
+            line: Some(12),
+            disposition,
+            recommended_disposition: None,
+            created_at: now_secs(),
+        };
+        state
+            .review_findings
+            .push(finding("one", FindingDisposition::Fixed));
+        state
+            .review_findings
+            .push(finding("two", FindingDisposition::Open));
+        assert_eq!(required_independent_reviews_for(&state), 2);
+        state.review_findings[1].disposition = FindingDisposition::Dismissed;
+        assert_eq!(required_independent_reviews_for(&state), 1);
+    }
+
+    #[test]
+    fn fix_review_rounds_advance_only_for_a_changed_fingerprint() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = review_workflow(repo.path(), &state_dir);
+        assert_eq!(review_round(&state, 10), 1);
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "first".into(),
+            change_fingerprint: 10,
+            adapter: "claude".into(),
+            review_round: 1,
+            completed_at: now_secs(),
+        });
+        assert_eq!(review_round(&state, 10), 1);
+        assert_eq!(review_round(&state, 11), 2);
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "second".into(),
+            change_fingerprint: 11,
+            adapter: "codex".into(),
+            review_round: 2,
+            completed_at: now_secs(),
+        });
+        assert_eq!(review_round(&state, 12), 3);
     }
 }

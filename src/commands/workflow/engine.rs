@@ -1,7 +1,7 @@
 //! Versioned workflow definitions and durable execution state.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -16,6 +16,8 @@ use crate::commands::ctx::state::{
 
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
 const MAX_STEP_ATTEMPTS: u8 = 3;
+const MAX_PHASE_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
+const USAGE_SNAPSHOT_TAIL_BYTES: u64 = 256 * 1024;
 
 fn default_true() -> bool {
     true
@@ -367,6 +369,10 @@ pub struct WorkflowState {
     pub review_findings: Vec<super::review::ReviewFinding>,
     #[serde(default)]
     pub review_evidence: Vec<super::review::ReviewRunEvidence>,
+    #[serde(default)]
+    pub usage_checkpoint: Option<UsageCheckpoint>,
+    #[serde(default)]
+    pub phase_started_at: u64,
     pub status: WorkflowStatus,
     pub created_at: u64,
     pub updated_at: u64,
@@ -409,11 +415,22 @@ impl WorkflowState {
             attempts: BTreeMap::new(),
             review_findings: Vec::new(),
             review_evidence: Vec::new(),
+            usage_checkpoint: None,
+            phase_started_at: now,
             status,
             created_at: now,
             updated_at: now,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageCheckpoint {
+    pub session_id: String,
+    pub adapter: String,
+    pub transcript_bytes: u64,
+    pub cumulative_input_tokens: u64,
+    pub cumulative_output_tokens: u64,
 }
 
 fn repo_dir(state: &StateDir, repo: &Path) -> PathBuf {
@@ -480,7 +497,167 @@ pub struct TransitionEvidence {
     pub role: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub token_usage_source: Option<String>,
     pub worker_count: u32,
+}
+
+fn session_identity() -> Option<(String, String)> {
+    let session_id = std::env::var(crate::commands::ctx::adapters::SESSION_ENV).ok()?;
+    let adapter = std::env::var(crate::commands::ctx::adapters::AGENT_ENV).ok()?;
+    let valid_session = !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-');
+    let valid_adapter = !adapter.is_empty()
+        && adapter.len() <= 64
+        && adapter.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        });
+    (valid_session && valid_adapter).then_some((session_id, adapter))
+}
+
+fn adapter_by_name(name: &str) -> Option<Box<dyn crate::commands::ctx::adapters::AgentAdapter>> {
+    crate::commands::ctx::adapters::ADAPTERS
+        .iter()
+        .find(|(adapter_name, _)| *adapter_name == name)
+        .map(|(_, constructor)| constructor(None))
+}
+
+fn transcript_path(repo: &Path, session_id: &str, adapter: &str) -> Option<PathBuf> {
+    let adapter = adapter_by_name(adapter)?;
+    Some(
+        adapter.transcript_path(&crate::commands::ctx::event::SessionRef {
+            id: crate::commands::ctx::event::SessionId::parse(session_id),
+            cwd: repo.to_path_buf(),
+        }),
+    )
+}
+
+fn read_transcript_range(path: &Path, start: u64, end: u64) -> Option<String> {
+    let length = end.checked_sub(start)?;
+    if length > MAX_PHASE_TRANSCRIPT_BYTES {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut body = Vec::with_capacity(usize::try_from(length).ok()?);
+    file.take(length).read_to_end(&mut body).ok()?;
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn cumulative_snapshot(
+    path: &Path,
+    transcript_bytes: u64,
+    adapter: &dyn crate::commands::ctx::adapters::AgentAdapter,
+) -> crate::commands::ctx::event::TranscriptUsage {
+    if !adapter.transcript_usage_is_cumulative() || transcript_bytes == 0 {
+        return Default::default();
+    }
+    let start = transcript_bytes.saturating_sub(USAGE_SNAPSHOT_TAIL_BYTES);
+    read_transcript_range(path, start, transcript_bytes)
+        .as_deref()
+        .and_then(|body| adapter.transcript_usage(body))
+        .unwrap_or_default()
+}
+
+fn usage_checkpoint(repo: &Path) -> Option<UsageCheckpoint> {
+    let (session_id, adapter_name) = session_identity()?;
+    let adapter = adapter_by_name(&adapter_name)?;
+    let path = transcript_path(repo, &session_id, &adapter_name)?;
+    let transcript_bytes = std::fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let usage = cumulative_snapshot(&path, transcript_bytes, adapter.as_ref());
+    Some(UsageCheckpoint {
+        session_id,
+        adapter: adapter_name,
+        transcript_bytes,
+        cumulative_input_tokens: usage.input_tokens,
+        cumulative_output_tokens: usage.output_tokens,
+    })
+}
+
+fn usage_since(
+    repo: &Path,
+    checkpoint: &UsageCheckpoint,
+) -> Option<crate::commands::ctx::event::TranscriptUsage> {
+    let adapter = adapter_by_name(&checkpoint.adapter)?;
+    let path = transcript_path(repo, &checkpoint.session_id, &checkpoint.adapter)?;
+    let end = std::fs::metadata(&path).ok()?.len();
+    if end < checkpoint.transcript_bytes {
+        return None;
+    }
+    let body = read_transcript_range(&path, checkpoint.transcript_bytes, end)?;
+    let usage = adapter.transcript_usage(&body)?;
+    if adapter.transcript_usage_is_cumulative() {
+        Some(crate::commands::ctx::event::TranscriptUsage {
+            input_tokens: usage
+                .input_tokens
+                .saturating_sub(checkpoint.cumulative_input_tokens),
+            output_tokens: usage
+                .output_tokens
+                .saturating_sub(checkpoint.cumulative_output_tokens),
+        })
+    } else {
+        Some(usage)
+    }
+}
+
+fn enrich_transition_evidence(
+    state: &mut WorkflowState,
+    mut evidence: TransitionEvidence,
+) -> TransitionEvidence {
+    if evidence.duration_ms.is_none() {
+        let started = if state.phase_started_at == 0 {
+            state.updated_at
+        } else {
+            state.phase_started_at
+        };
+        evidence.duration_ms = Some(now_secs().saturating_sub(started).saturating_mul(1000));
+    }
+    let previous = state.usage_checkpoint.clone();
+    let current = usage_checkpoint(&state.repo);
+    let mut observed = previous
+        .as_ref()
+        .and_then(|checkpoint| usage_since(&state.repo, checkpoint));
+    if let (Some(previous), Some(current)) = (&previous, &current)
+        && (previous.session_id != current.session_id || previous.adapter != current.adapter)
+    {
+        let beginning = UsageCheckpoint {
+            transcript_bytes: 0,
+            cumulative_input_tokens: 0,
+            cumulative_output_tokens: 0,
+            ..current.clone()
+        };
+        if let Some(next) = usage_since(&state.repo, &beginning) {
+            let total = observed.get_or_insert_default();
+            total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+            total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
+        }
+    }
+    if let Some(usage) = observed {
+        if evidence.input_tokens.is_none() {
+            evidence.input_tokens = Some(usage.input_tokens);
+        }
+        if evidence.output_tokens.is_none() {
+            evidence.output_tokens = Some(usage.output_tokens);
+        }
+        if evidence.token_usage_source.is_none() {
+            evidence.token_usage_source = Some("harness-transcript-delta".into());
+        }
+    }
+    if evidence.adapter.is_none() {
+        evidence.adapter = current
+            .as_ref()
+            .map(|checkpoint| checkpoint.adapter.clone())
+            .or_else(|| state.adapter.clone());
+    }
+    if evidence.model.is_none() {
+        evidence.model = std::env::var(crate::commands::ctx::adapters::SEAT_MODEL_ENV).ok();
+    }
+    state.usage_checkpoint = current;
+    evidence
 }
 
 /// Re-measure risk when a workflow reaches a gated step, and never lower it.
@@ -644,8 +821,7 @@ pub fn advance_with_evidence(
                             .into(),
                     );
                 }
-                let required =
-                    super::review::required_independent_reviews(state.classification.risk);
+                let required = super::review::required_independent_reviews_for(&state);
                 if required > 0 {
                     if state.review_evidence.is_empty() {
                         return Err(format!(
@@ -704,6 +880,7 @@ pub fn advance_with_evidence(
         }
     }
     state.updated_at = now_secs();
+    state.phase_started_at = state.updated_at;
     let active = matches!(
         state.status,
         WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
@@ -728,6 +905,7 @@ pub fn advance_with_evidence(
     event.role = evidence.role;
     event.input_tokens = evidence.input_tokens;
     event.output_tokens = evidence.output_tokens;
+    event.token_usage_source = evidence.token_usage_source;
     event.succeeded = Some(outcome == StepOutcome::Success);
     event.findings_total = findings_total;
     event.findings_meaningful = findings_meaningful;
@@ -1079,6 +1257,8 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         WorkflowSubcommand::Start(args) => {
             let repo = resolve_repo(args.repo.as_deref())?;
+            let inherited_agent = session_identity().map(|(_, adapter)| adapter);
+            let selected_agent = args.agent.clone().or(inherited_agent);
             let classify_args = classify::ClassifyArgs {
                 task: args.task.clone(),
                 paths: args.paths.clone(),
@@ -1099,25 +1279,26 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
             let definition = definition(args.kind);
             let profile = WorkflowProfile::for_classification(&classification);
-            if let Some(agent) = &args.agent {
+            if let Some(agent) = &selected_agent {
                 let registry = SkillRegistry::load_for_repo(
                     &repo,
                     dirs::home_dir().as_deref(),
                     !args.built_in_only,
                 )?;
-                let report = super::capability::CapabilityReport::for_adapter(agent);
+                let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
                 for step in materialize(definition.kind, &classification, profile) {
                     registry.ensure_supported(&step.skill, &report)?;
                 }
             }
-            let state = WorkflowState::start(
+            let mut state = WorkflowState::start(
                 repo,
                 args.task.clone(),
                 args.kind,
-                args.agent.clone(),
+                selected_agent,
                 !args.built_in_only,
                 classification,
             );
+            state.usage_checkpoint = usage_checkpoint(&state.repo);
             save(&state_dir, &state, true)?;
             let mut event = super::telemetry::TelemetryEvent::new(
                 super::telemetry::TelemetryKind::WorkflowStarted,
@@ -1178,21 +1359,23 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         WorkflowSubcommand::Advance(args) => {
             let repo = resolve_repo(args.repo.as_deref())?;
             let state_dir = resolve_state()?;
-            let evidence = TransitionEvidence {
-                duration_ms: args.duration_ms,
-                adapter: args.agent.clone(),
-                model: args.model.clone(),
-                role: args.role.clone(),
-                input_tokens: args.input_tokens,
-                output_tokens: args.output_tokens,
-                worker_count: args.workers,
-            };
-            let state = advance_with_evidence(
-                &state_dir,
-                load(&state_dir, &repo, &args.id)?,
-                args.outcome,
-                Some(&evidence),
-            )?;
+            let mut state = load(&state_dir, &repo, &args.id)?;
+            let evidence = enrich_transition_evidence(
+                &mut state,
+                TransitionEvidence {
+                    duration_ms: args.duration_ms,
+                    adapter: args.agent.clone(),
+                    model: args.model.clone(),
+                    role: args.role.clone(),
+                    input_tokens: args.input_tokens,
+                    output_tokens: args.output_tokens,
+                    token_usage_source: (args.input_tokens.is_some()
+                        || args.output_tokens.is_some())
+                    .then(|| "operator-reported".into()),
+                    worker_count: args.workers,
+                },
+            );
+            let state = advance_with_evidence(&state_dir, state, args.outcome, Some(&evidence))?;
             write_state(writer, &state, args.json)?;
         }
         WorkflowSubcommand::Review(args) => {
@@ -1492,6 +1675,48 @@ mod tests {
     }
 
     #[test]
+    fn phase_usage_reads_only_the_appended_claude_transcript() {
+        let home = tempdir().unwrap();
+        let repo = crate::commands::ctx::testenv::repo();
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let path = transcript_path(repo.path(), session_id, "claude").expect("path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let checkpoint = UsageCheckpoint {
+            session_id: session_id.into(),
+            adapter: "claude".into(),
+            transcript_bytes: std::fs::metadata(&path).unwrap().len(),
+            cumulative_input_tokens: 0,
+            cumulative_output_tokens: 0,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":7,"cache_read_input_tokens":5,"output_tokens":3}}}}}}"#
+        )
+        .unwrap();
+
+        assert_eq!(
+            usage_since(repo.path(), &checkpoint),
+            Some(crate::commands::ctx::event::TranscriptUsage {
+                input_tokens: 12,
+                output_tokens: 3,
+            })
+        );
+    }
+
+    #[test]
     fn switching_steps_replaces_ephemeral_skill_context() {
         let repo = tempdir().unwrap();
         let mut state = WorkflowState::start(
@@ -1563,6 +1788,7 @@ mod tests {
                 path: None,
                 line: None,
                 disposition: super::super::review::FindingDisposition::Open,
+                recommended_disposition: None,
                 created_at: now_secs(),
             });
         let error =

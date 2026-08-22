@@ -86,31 +86,6 @@ fn prompt_delivery_via_stdin(
     super::adapters::launch_reparses_through_shim(&probe)
 }
 
-/// Each cycle's Worker prompt composition: `memory_entries` (already
-/// rendered by the caller, re-read fresh every cycle) folded through
-/// `prompt::compose` as a Worker, capped by `cfg.memory.core_max_bytes`,
-/// with no harness roster (a Worker never hears about other harnesses).
-/// Pulled out for the same reason `prompt_delivery_via_stdin` above was:
-/// testable without spawning the real supervised process `run_with`
-/// launches inside its loop.
-fn compose_cycle_prompt(
-    memory_entries: &[super::prompt::MemoryLine],
-    repo: &Path,
-    cfg: &CtxConfig,
-    simple: bool,
-) -> Option<super::prompt::ComposedPrompt> {
-    super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        simple,
-        &cfg.prompt,
-        super::prompt::PromptRole::Worker,
-        memory_entries,
-        cfg.memory.core_max_bytes,
-        &[],
-    )
-}
-
 pub fn run_with<W: Write>(
     args: &LoopArgs,
     w: &mut W,
@@ -188,23 +163,25 @@ pub fn run_with<W: Write>(
         );
 
         let mail_slug = super::state::repo_slug(repo);
-        // N5: re-read every cycle, same as mail below -- each cycle is a
-        // fresh, stateless session, so a fact remembered or verified since
-        // the previous cycle must be picked up too, not a snapshot taken
-        // once before the loop started.
-        let memory_entries = super::memory::render_for_prompt(&state, repo, &mail_slug, &cfg);
         // Recomposed every cycle -- the same seam as `injection_args_for_
         // session` a few lines down -- because each cycle is a fresh,
         // stateless session: it must pick up whatever mail has arrived since
         // the previous cycle, not a snapshot taken once before the loop
-        // started.
-        let composed = compose_cycle_prompt(&memory_entries, repo, &cfg, args.simple);
-        let composed = super::prompt::with_context_layer(
-            composed,
+        // started. Issue #44: `compile::compile` also re-reads the memory
+        // bank fresh every call (N5's own reasoning -- a fact remembered or
+        // verified since the previous cycle must be picked up too), adds the
+        // canonical `.zirv/context/` layer, and attaches the policy report.
+        let composed = super::compile::compile(
+            crate::utils::home_dir().ok().as_deref(),
             repo,
-            adapter.name(),
-            cfg.prompt.max_repo_bytes,
-        );
+            args.simple,
+            &cfg,
+            adapter.as_ref(),
+            super::prompt::PromptRole::Worker,
+            &state,
+            now_fn(),
+        )
+        .composed;
         // A fresh session id per cycle is the whole point: the orchestrator
         // never accumulates context across cycles. Minted here, ahead of
         // mail listing and the nudge-marker check below, both of which need
@@ -310,23 +287,23 @@ pub fn run_with<W: Write>(
             cwd: repo.to_path_buf(),
         });
 
-        // The session conventions (`DEFAULT_PROMPT`) are the first task-
-        // prompt-text fallback applied, ahead of mail: gated identically to
-        // composition (`composed.is_some()`), unlike mail's own gate just
-        // below, which deliberately does not depend on `composed` for an
-        // uninjectable adapter (see the `mail_entries` gate above).
-        let prompt = if composed.is_some() {
-            super::prompt::task_prompt_with_conventions_fallback(&prompt, system_prompt_supported)
-        } else {
-            prompt.clone()
-        };
+        // When argv injection is unsafe, the complete compiled context moves
+        // to the task-prompt channel ahead of mail.
+        let prompt = super::prompt::task_prompt_with_composed_fallback(
+            &prompt,
+            system_prompt_supported,
+            composed.as_ref(),
+        );
+        let mail_in_composed = composed
+            .as_ref()
+            .is_some_and(|prompt| prompt.sources.contains(&super::prompt::PromptSource::Mail));
         // Mail is the one composed layer that still has somewhere to go for
         // an adapter with no system-prompt mechanism: the task prompt text
         // itself. A capable adapter (claude) gets the unchanged `prompt`
         // back, since its mail already rode the `composed` fold above.
         let prompt = super::prompt::task_prompt_with_mail_fallback(
             &prompt,
-            system_prompt_supported && composed.is_some(),
+            (system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
         );
@@ -635,7 +612,7 @@ mod tests {
             ),
             (
                 "ZIRV_CTX_AGENT_BIN".to_string(),
-                fixture("fake-agent.sh").display().to_string(),
+                format!("sh {}", fixture("fake-agent.sh").display()),
             ),
             ("ZIRV_CTX_POLL_MS".to_string(), "50".to_string()),
         ]
@@ -699,12 +676,7 @@ mod tests {
         );
     }
 
-    /// Issue #34 seam coverage (memory review, fix round): each cycle's
-    /// Worker prompt must carry the memory core layer, bounded by the
-    /// CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded default.
-    /// `run_with` itself supervises a real child process inside its loop, so
-    /// this exercises `compose_cycle_prompt` directly: the exact composition
-    /// step that call site uses.
+    /// The compiler seam used by every cycle must carry the bounded memory core.
     #[test]
     fn compose_cycle_prompt_carries_the_memory_layer_under_its_configured_cap() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -734,10 +706,19 @@ mod tests {
         )
         .expect("remember");
 
-        let memory_entries =
-            crate::commands::ctx::memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
-        let composed = compose_cycle_prompt(&memory_entries, repo.path(), &cfg, false)
-            .expect("a cycle still composes a prompt");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+        let composed = crate::commands::ctx::compile::compile(
+            Some(&home),
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            super::super::prompt::PromptRole::Worker,
+            &state,
+            1,
+        )
+        .composed
+        .expect("a cycle still composes a prompt");
 
         assert!(
             composed.text.contains("seam-fact"),

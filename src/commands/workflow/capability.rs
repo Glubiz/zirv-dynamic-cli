@@ -5,7 +5,12 @@
 //! narrow these reports through [`PolicyDecision`] without changing skill
 //! manifests or teaching them provider tool names.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
+
+use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::policy::{Capability as PolicyCapability, EffectivePolicy, Stance};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CapabilityId {
@@ -89,8 +94,8 @@ impl std::fmt::Display for SupportLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Integration seam for the canonical policy work in issue #43.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum PolicyDecision {
     Allow,
     Ask,
@@ -101,7 +106,8 @@ pub enum PolicyDecision {
 pub struct CapabilityStatus {
     pub capability: CapabilityId,
     pub support: SupportLevel,
-    pub reason: &'static str,
+    pub authorization: PolicyDecision,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -117,10 +123,11 @@ impl CapabilityReport {
     /// of a vendor's native tool vocabulary.
     pub fn for_adapter(adapter: &str) -> Self {
         let known = matches!(adapter, "claude" | "codex");
-        let status = |capability, support, reason| CapabilityStatus {
+        let status = |capability, support, reason: &'static str| CapabilityStatus {
             capability,
             support,
-            reason,
+            authorization: PolicyDecision::Allow,
+            reason: reason.to_string(),
         };
         let statuses = if known {
             vec![
@@ -196,12 +203,35 @@ impl CapabilityReport {
             .unwrap_or(SupportLevel::Unsupported)
     }
 
+    pub fn authorization(&self, capability: CapabilityId) -> PolicyDecision {
+        self.statuses
+            .iter()
+            .find(|status| status.capability == capability)
+            .map(|status| status.authorization)
+            .unwrap_or(PolicyDecision::Deny)
+    }
+
+    /// Resolve logical workflow capabilities against the effective canonical
+    /// policy for `repo`. Policy loading uses the same asymmetric operator /
+    /// repository fold as every AI launch, so repository content can narrow
+    /// permissions but cannot grant itself a capability.
+    pub fn for_repo(adapter: &str, repo: &Path) -> CtxResult<Self> {
+        let config =
+            crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())?;
+        Ok(Self::for_policy(adapter, &config.policy))
+    }
+
+    pub fn for_policy(adapter: &str, policy: &EffectivePolicy) -> Self {
+        Self::for_adapter(adapter).with_policy(|capability| policy_decision(policy, capability))
+    }
+
     /// Policy may narrow support, never widen it. `Ask` remains explicitly
     /// operator-controlled; `Deny` is unsupported for this run.
-    #[allow(dead_code)] // Called by EffectivePolicy once issue #43 lands; tests pin narrowing now.
     pub fn with_policy(mut self, policy: impl Fn(CapabilityId) -> PolicyDecision) -> Self {
         for status in &mut self.statuses {
-            status.support = match policy(status.capability) {
+            let decision = policy(status.capability);
+            status.authorization = decision;
+            status.support = match decision {
                 PolicyDecision::Deny => SupportLevel::Unsupported,
                 PolicyDecision::Ask if status.support.satisfies_requirement() => {
                     SupportLevel::OperatorControlled
@@ -209,8 +239,40 @@ impl CapabilityReport {
                 PolicyDecision::Allow => status.support,
                 PolicyDecision::Ask => status.support,
             };
+            match decision {
+                PolicyDecision::Deny => {
+                    status.reason = "denied by Zirv's effective canonical policy".into();
+                }
+                PolicyDecision::Ask if status.support.satisfies_requirement() => {
+                    status.reason =
+                        "requires operator approval under Zirv's effective canonical policy".into();
+                }
+                PolicyDecision::Allow | PolicyDecision::Ask => {}
+            }
         }
         self
+    }
+}
+
+fn policy_decision(policy: &EffectivePolicy, capability: CapabilityId) -> PolicyDecision {
+    let relevant: &[PolicyCapability] = match capability {
+        CapabilityId::ShellExec | CapabilityId::TestRun | CapabilityId::BrowserOpen => {
+            &[PolicyCapability::ShellExec]
+        }
+        CapabilityId::RepoWrite | CapabilityId::ArtifactRender => &[PolicyCapability::RepoFsWrite],
+        CapabilityId::GitWorktree => &[PolicyCapability::ShellExec, PolicyCapability::RepoFsWrite],
+        CapabilityId::NetworkAccess => &[PolicyCapability::Network],
+        CapabilityId::RepoRead | CapabilityId::AgentSpawn => &[],
+    };
+    let stance = relevant
+        .iter()
+        .map(|capability| policy.stance(*capability))
+        .max()
+        .unwrap_or(Stance::Allow);
+    match stance {
+        Stance::Allow => PolicyDecision::Allow,
+        Stance::Ask => PolicyDecision::Ask,
+        Stance::Deny => PolicyDecision::Deny,
     }
 }
 
@@ -252,6 +314,36 @@ mod tests {
         assert_eq!(
             unknown.support(CapabilityId::RepoRead),
             SupportLevel::Unsupported
+        );
+    }
+
+    #[test]
+    fn canonical_policy_maps_to_provider_neutral_prerequisites() {
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Deny,
+            repo_fs_write: Stance::Ask,
+            ..EffectivePolicy::default()
+        };
+        let report = CapabilityReport::for_policy("claude", &policy);
+        assert_eq!(
+            report.support(CapabilityId::ShellExec),
+            SupportLevel::Unsupported
+        );
+        assert_eq!(
+            report.support(CapabilityId::TestRun),
+            SupportLevel::Unsupported
+        );
+        assert_eq!(
+            report.support(CapabilityId::GitWorktree),
+            SupportLevel::Unsupported
+        );
+        assert_eq!(
+            report.support(CapabilityId::RepoWrite),
+            SupportLevel::OperatorControlled
+        );
+        assert_eq!(
+            report.support(CapabilityId::RepoRead),
+            SupportLevel::OperatorControlled
         );
     }
 }

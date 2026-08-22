@@ -248,31 +248,6 @@ fn build_command(command: &[String], repo: &Path) -> CtxResult<Command> {
     Ok(cmd)
 }
 
-/// The Worker prompt composition `run_with`'s two call sites share (the
-/// initial launch, and a nudge-restart recompose): `memory_entries` (already
-/// rendered by the caller) folded through `prompt::compose` as a Worker,
-/// capped by `cfg.memory.core_max_bytes`, with no harness roster (a Worker
-/// never hears about other harnesses). Pulled out for the same reason
-/// `prompt_delivery_via_stdin` above was: testable without spawning the real
-/// supervised process `run_with` launches.
-fn compose_worker_launch_prompt(
-    memory_entries: &[super::prompt::MemoryLine],
-    repo: &Path,
-    cfg: &CtxConfig,
-    skip_injection: bool,
-) -> Option<super::prompt::ComposedPrompt> {
-    super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        skip_injection,
-        &cfg.prompt,
-        super::prompt::PromptRole::Worker,
-        memory_entries,
-        cfg.memory.core_max_bytes,
-        &[],
-    )
-}
-
 /// Whether this run's own headless launch reparses its downstream argv on a
 /// Windows launcher -- `cmd.exe /c <shim>` (an npm-installed `.cmd`) or
 /// `powershell -NoProfile -File <script>` (a `.ps1`) -- so the prompt has to
@@ -311,18 +286,11 @@ pub fn run_with<W: Write>(
     let distiller_model =
         handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
     let state = StateDir::resolve(env)?;
-    // Computed early (`mail_slug` further down reuses this exact value)
-    // because both the memory layer below and the mail layer need a slug,
-    // and the memory layer's own read has to happen before the first
-    // `compose` call.
+    // Still needed standalone: the mail layer below needs a slug, and issue
+    // #44's `compile::compile` (which now owns reading the memory bank; see
+    // its own call below) computes this same slug internally but callers
+    // still need their own copy for mail listing.
     let mail_slug = super::state::repo_slug(repo);
-    // N5: this run's memory bank, already rendered (age included) so
-    // `prompt::compose` itself never has to read a clock. Loaded once, here,
-    // and reused verbatim by the nudge-restart recompose below -- unlike
-    // mail, which is deliberately re-listed narrowly by session on that
-    // path, the memory bank is repo-wide and does not go stale within one
-    // `run_with` call the way a specific session's mailbox does.
-    let memory_entries = super::memory::render_for_prompt(&state, repo, &mail_slug, &cfg);
 
     // A wrapped command that matches no adapter (no explicit `--agent`,
     // detection came up empty) is not actually the agent whose flags we would
@@ -333,15 +301,21 @@ pub fn run_with<W: Write>(
             agent_name.is_some(),
             &args.command,
         );
-    // A Worker session never hears about other harnesses; see
-    // `prompt::PromptSource::Harnesses`.
-    let composed = compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
-    let composed = super::prompt::with_context_layer(
-        composed,
+    // Issue #44: gathers memory, the canonical `.zirv/context/` layer, and
+    // attaches the policy report -- see `compile::compile`'s own doc
+    // comment. A Worker session never hears about the derived harness
+    // roster either way; see `prompt::PromptSource::Harnesses`.
+    let composed = super::compile::compile(
+        crate::utils::home_dir().ok().as_deref(),
         repo,
-        adapter.name(),
-        cfg.prompt.max_repo_bytes,
-    );
+        skip_injection,
+        &cfg,
+        adapter.as_ref(),
+        super::prompt::PromptRole::Worker,
+        &state,
+        now_secs(),
+    )
+    .composed;
     // Known before argv is touched, because it decides how argv is read: the
     // token holding this exact text is the prompt, whatever it looks like.
     let prompt = args
@@ -687,6 +661,7 @@ pub fn run_with<W: Write>(
     // affects claude too, not just codex), just widened by wave 5's own fix
     // making relaunches reachable in more shapes than before.
     let prompt_via_stdin = prompt_delivery_via_stdin(adapter.as_ref(), &session);
+    let relaunch_system_prompt_supported = adapter.system_prompt_supported(&[]);
     let build_headless =
         |prompt_text: &str, session: &SessionId, extra: &[String]| -> (Command, Option<String>) {
             if prompt_via_stdin && let Some(command) = adapter.headless_cmd_stdin(session, extra) {
@@ -704,17 +679,17 @@ pub fn run_with<W: Write>(
             "no command to supervise; pass the agent command after --, \
              or --prompt to have zirv build the launch itself",
         )?;
-        let prompt_text = if composed.is_some() {
-            super::prompt::task_prompt_with_conventions_fallback(
-                prompt_text,
-                system_prompt_supported,
-            )
-        } else {
-            prompt_text.to_string()
-        };
+        let prompt_text = super::prompt::task_prompt_with_composed_fallback(
+            prompt_text,
+            system_prompt_supported,
+            composed.as_ref(),
+        );
+        let mail_in_composed = composed
+            .as_ref()
+            .is_some_and(|prompt| prompt.sources.contains(&super::prompt::PromptSource::Mail));
         let prompt_text = super::prompt::task_prompt_with_mail_fallback(
             &prompt_text,
-            system_prompt_supported && composed.is_some(),
+            (system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
         );
@@ -872,6 +847,28 @@ pub fn run_with<W: Write>(
 
         match outcome {
             Outcome::Exited(code) if !limit_hit => {
+                // Issue #37: a clean session end -- no rot, no timeout, no
+                // restart -- previously never harvested at all. Gated on
+                // `cfg.memory.harvest` here too, before the transcript is
+                // even read, so an operator who left harvesting off never
+                // pays for the read or the distiller call this seam can
+                // make. Best-effort, discarded via `let _ =`: a harvest
+                // failure must never turn a successful exit into a failed
+                // one.
+                if cfg.memory.enabled && cfg.memory.harvest {
+                    let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
+                    let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+                    let _ = super::memory::harvest_at_session_end(
+                        adapter.as_ref(),
+                        &distiller_model,
+                        &ctx,
+                        Duration::from_secs(cfg.handoff.timeout_secs),
+                        repo,
+                        &state,
+                        &mail_slug,
+                        &cfg,
+                    );
+                }
                 session_guard.release();
                 return Ok(code);
             }
@@ -911,13 +908,29 @@ pub fn run_with<W: Write>(
             // re-listing mail for the session that was just nudged and
             // folding it in through `with_mail_layer` delivers it with zero
             // new injection machinery.
-            let fresh = compose_worker_launch_prompt(&memory_entries, repo, &cfg, skip_injection);
-            let mut fresh = super::prompt::with_context_layer(
-                fresh,
+            //
+            // Issue #44: goes through `compile::compile` a second time here,
+            // same as the launch-time call above. One small, deliberate
+            // behavior refinement over the pre-compiler code this replaces:
+            // `compile` re-reads the memory bank fresh (it is a pure function
+            // of `state` at call time) rather than reusing the launch-time
+            // `memory_entries` snapshot the old duplicated call passed in
+            // verbatim. The bank is repo-wide and does not go stale *within*
+            // one `run_with` call either way (see the removed comment this
+            // replaced), so this is not a correctness change -- a nudge that
+            // lands after something new was remembered now picks it up
+            // instead of seeing the launch-time snapshot.
+            let mut fresh = super::compile::compile(
+                crate::utils::home_dir().ok().as_deref(),
                 repo,
-                adapter.name(),
-                cfg.prompt.max_repo_bytes,
-            );
+                skip_injection,
+                &cfg,
+                adapter.as_ref(),
+                super::prompt::PromptRole::Worker,
+                &state,
+                now_secs(),
+            )
+            .composed;
             // C7: `registry_short`, not `short_id(session)` -- `session`
             // has just been rotated above, and the nudge's own payload was
             // addressed to the stable registry address the sender resolved.
@@ -953,9 +966,7 @@ pub fn run_with<W: Write>(
             // unconditionally -- reusing the original launch's `mail_
             // deliverable` here understated what a relaunch can actually
             // deliver.
-            let nudge_mail: Vec<(PathBuf, super::mail::Message)> = if cfg.mail.enabled
-                && (fresh.is_some() || adapter_builds_launch)
-            {
+            let nudge_mail: Vec<(PathBuf, super::mail::Message)> = if cfg.mail.enabled {
                 // Read back off the guard, which is the one thing that
                 // demonstrably did not rotate when `refresh_session` ran
                 // a few lines above.
@@ -984,7 +995,7 @@ pub fn run_with<W: Write>(
             // (`task_prompt_with_mail_fallback`, which already gates on
             // this same flag internally) is that adapter's one real
             // channel.
-            fresh = if system_prompt_supported {
+            fresh = if relaunch_system_prompt_supported {
                 super::prompt::with_mail_layer(
                     fresh,
                     &nudge_mail_msgs,
@@ -1006,7 +1017,7 @@ pub fn run_with<W: Write>(
             composed = fresh;
             prompt_args = super::prompt::injection_args_for_session(
                 adapter.as_ref(),
-                probe_target,
+                &[],
                 composed.as_ref(),
                 &state,
                 session.as_str(),
@@ -1030,11 +1041,11 @@ pub fn run_with<W: Write>(
                 "exec",
                 session.as_str(),
                 composed.as_ref(),
-                system_prompt_supported,
+                relaunch_system_prompt_supported,
             );
             announcer.emit(&super::prompt::injection_event(
                 composed.as_ref(),
-                system_prompt_supported,
+                relaunch_system_prompt_supported,
             ));
             announcer.emit(&super::announce::Event::Nudge {
                 from: nudged_from,
@@ -1061,20 +1072,20 @@ pub fn run_with<W: Write>(
             )?;
 
             let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
-            let combined = if composed.is_some() {
-                super::prompt::task_prompt_with_conventions_fallback(
-                    &combined,
-                    system_prompt_supported,
-                )
-            } else {
-                combined
-            };
+            let combined = super::prompt::task_prompt_with_composed_fallback(
+                &combined,
+                relaunch_system_prompt_supported,
+                composed.as_ref(),
+            );
+            let mail_in_composed = composed
+                .as_ref()
+                .is_some_and(|prompt| prompt.sources.contains(&super::prompt::PromptSource::Mail));
             // A nudge relaunch re-lists mail fresh (`nudge_mail_msgs` above),
             // so the fallback for an uninjectable adapter has to use that
             // same fresh listing, not the launch-time `mail_messages`.
             let combined = super::prompt::task_prompt_with_mail_fallback(
                 &combined,
-                system_prompt_supported && composed.is_some(),
+                (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
                 &nudge_mail_msgs,
                 cfg.mail.max_delivered_bytes,
             );
@@ -1146,6 +1157,13 @@ pub fn run_with<W: Write>(
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
+            prompt_args = super::prompt::injection_args_for_session(
+                adapter.as_ref(),
+                &[],
+                composed.as_ref(),
+                &state,
+                session.as_str(),
+            )?;
             // M2: a park mints a new session id, just like a restart, so the
             // injection attribution is re-logged under it rather than only
             // ever naming the first session this run started with.
@@ -1154,11 +1172,11 @@ pub fn run_with<W: Write>(
                 "exec",
                 session.as_str(),
                 composed.as_ref(),
-                system_prompt_supported,
+                relaunch_system_prompt_supported,
             );
             announcer.emit(&super::prompt::injection_event(
                 composed.as_ref(),
-                system_prompt_supported,
+                relaunch_system_prompt_supported,
             ));
             // M8: the user's own extra flags survive the relaunch too, not
             // just zirv's own (the system prompt args).
@@ -1167,14 +1185,14 @@ pub fn run_with<W: Write>(
                 .cloned()
                 .chain(prompt_args.iter().cloned())
                 .collect();
-            let prompt_text = if composed.is_some() {
-                super::prompt::task_prompt_with_conventions_fallback(
-                    &prompt_text,
-                    system_prompt_supported,
-                )
-            } else {
-                prompt_text
-            };
+            let prompt_text = super::prompt::task_prompt_with_composed_fallback(
+                &prompt_text,
+                relaunch_system_prompt_supported,
+                composed.as_ref(),
+            );
+            let mail_in_composed = composed
+                .as_ref()
+                .is_some_and(|prompt| prompt.sources.contains(&super::prompt::PromptSource::Mail));
             // A park does not itself re-list mail (matching every other
             // value it reuses here), so the fallback for an uninjectable
             // adapter reuses whatever `mail_messages` currently holds --
@@ -1184,7 +1202,7 @@ pub fn run_with<W: Write>(
             // reassigns it).
             let prompt_text = super::prompt::task_prompt_with_mail_fallback(
                 &prompt_text,
-                system_prompt_supported && composed.is_some(),
+                (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
                 &mail_messages,
                 cfg.mail.max_delivered_bytes,
             );
@@ -1273,10 +1291,11 @@ pub fn run_with<W: Write>(
         // harvest failure must never turn a successful restart into a
         // failed one.
         if source == "distilled" {
-            let _ = super::memory::harvest_from_handoff(
+            let _ = super::memory::harvest_durable(
                 adapter.as_ref(),
                 &distiller_model,
                 &note,
+                repo,
                 &state,
                 &mail_slug,
                 &cfg,
@@ -1310,6 +1329,13 @@ pub fn run_with<W: Write>(
         // The new session writes somewhere new, so the next iteration's watcher
         // must follow it rather than the file the killed child left behind.
         transcript = derive_transcript(&session);
+        prompt_args = super::prompt::injection_args_for_session(
+            adapter.as_ref(),
+            &[],
+            composed.as_ref(),
+            &state,
+            session.as_str(),
+        )?;
         // M2: README promises injection attribution "at every session
         // start"; a restart mints a new session id, so it needs its own
         // log entry rather than leaving attribution pinned to the first one.
@@ -1318,25 +1344,28 @@ pub fn run_with<W: Write>(
             "exec",
             session.as_str(),
             composed.as_ref(),
-            system_prompt_supported,
+            relaunch_system_prompt_supported,
         );
         announcer.emit(&super::prompt::injection_event(
             composed.as_ref(),
-            system_prompt_supported,
+            relaunch_system_prompt_supported,
         ));
         let combined = format!("{prompt_text}\n\n{}", note.to_markdown());
-        let combined = if composed.is_some() {
-            super::prompt::task_prompt_with_conventions_fallback(&combined, system_prompt_supported)
-        } else {
-            combined
-        };
+        let combined = super::prompt::task_prompt_with_composed_fallback(
+            &combined,
+            relaunch_system_prompt_supported,
+            composed.as_ref(),
+        );
+        let mail_in_composed = composed
+            .as_ref()
+            .is_some_and(|prompt| prompt.sources.contains(&super::prompt::PromptSource::Mail));
         // A rot/timeout restart, like a park, does not itself re-list mail,
         // so the fallback for an uninjectable adapter reuses whatever
         // `mail_messages` currently holds -- the launch-time listing, or a
         // nudge's own fresher one if this run was nudged first (Medium 4).
         let combined = super::prompt::task_prompt_with_mail_fallback(
             &combined,
-            system_prompt_supported && composed.is_some(),
+            (relaunch_system_prompt_supported && composed.is_some()) || mail_in_composed,
             &mail_messages,
             cfg.mail.max_delivered_bytes,
         );
@@ -1493,7 +1522,7 @@ mod tests {
             ),
             (
                 "ZIRV_CTX_AGENT_BIN".to_string(),
-                fixture("fake-agent.sh").display().to_string(),
+                format!("sh {}", fixture("fake-agent.sh").display()),
             ),
         ]
         .into()
@@ -1547,13 +1576,7 @@ mod tests {
         );
     }
 
-    /// Issue #34 seam coverage (memory review, fix round): `run_with`'s
-    /// launch-time Worker prompt must carry the memory core layer, bounded
-    /// by the CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded
-    /// default. `run_with` itself spawns a real supervised process, so this
-    /// exercises `compose_worker_launch_prompt` directly: the exact
-    /// composition step both of `run_with`'s call sites (launch, and a
-    /// nudge-restart recompose) share.
+    /// The compiler seam used by `run_with` must carry the bounded memory core.
     #[test]
     fn compose_worker_launch_prompt_carries_the_memory_layer_under_its_configured_cap() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -1583,10 +1606,19 @@ mod tests {
         )
         .expect("remember");
 
-        let memory_entries =
-            crate::commands::ctx::memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
-        let composed = compose_worker_launch_prompt(&memory_entries, repo.path(), &cfg, false)
-            .expect("a worker launch still composes a prompt");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+        let composed = crate::commands::ctx::compile::compile(
+            Some(&home),
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            super::super::prompt::PromptRole::Worker,
+            &state,
+            1,
+        )
+        .composed
+        .expect("a worker launch still composes a prompt");
 
         assert!(
             composed.text.contains("seam-fact"),

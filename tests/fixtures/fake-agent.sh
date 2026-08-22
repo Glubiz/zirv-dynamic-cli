@@ -35,6 +35,17 @@
 # stays alive long enough to be scored while a healthy one exits promptly.
 set -eu
 
+head_bin=head
+tail_bin=tail
+sleep_bin=sleep
+mv_bin=mv
+[ ! -x /usr/bin/head ] || head_bin=/usr/bin/head
+[ ! -x /usr/bin/tail ] || tail_bin=/usr/bin/tail
+[ ! -x /usr/bin/sleep ] || sleep_bin=/usr/bin/sleep
+[ ! -x /bin/sleep ] || sleep_bin=/bin/sleep
+[ ! -x /usr/bin/mv ] || mv_bin=/usr/bin/mv
+[ ! -x /bin/mv ] || mv_bin=/bin/mv
+
 [ -z "${FAKE_AGENT_ARGV_LOG:-}" ] || printf '%s\n' "$*" >> "$FAKE_AGENT_ARGV_LOG"
 
 session=""
@@ -52,13 +63,17 @@ fi
 
 mode="${FAKE_AGENT_MODE:-healthy}"
 if [ -n "${FAKE_AGENT_MODE_FILE:-}" ] && [ -s "${FAKE_AGENT_MODE_FILE}" ]; then
-  mode=$(head -n 1 "$FAKE_AGENT_MODE_FILE")
-  tail -n +2 "$FAKE_AGENT_MODE_FILE" > "$FAKE_AGENT_MODE_FILE.next"
-  mv "$FAKE_AGENT_MODE_FILE.next" "$FAKE_AGENT_MODE_FILE"
+  mode=$("$head_bin" -n 1 "$FAKE_AGENT_MODE_FILE")
+  "$tail_bin" -n +2 "$FAKE_AGENT_MODE_FILE" > "$FAKE_AGENT_MODE_FILE.next"
+  "$mv_bin" "$FAKE_AGENT_MODE_FILE.next" "$FAKE_AGENT_MODE_FILE"
 fi
 turns="${FAKE_AGENT_TURNS:-12}"
 
-slug=$(printf '%s' "$(pwd)" | tr -c 'A-Za-z0-9-' '-')
+cwd=$(pwd)
+if windows_cwd=$(pwd -W 2>/dev/null); then
+  cwd="$windows_cwd"
+fi
+slug=$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9-' '-')
 dir="$HOME/.claude/projects/$slug"
 mkdir -p "$dir"
 t="$dir/$session.jsonl"
@@ -84,11 +99,11 @@ done
 
 sleep_secs="${FAKE_AGENT_SLEEP:-0}"
 if [ "$mode" = "rot" ] && [ "$sleep_secs" != "0" ]; then
-  sleep "$sleep_secs"
+  "$sleep_bin" "$sleep_secs"
 fi
 
 case "$mode" in
-  hang) while true; do sleep 1; done ;;
+  hang) while true; do "$sleep_bin" 1; done ;;
   fail) exit 3 ;;
   limit)
     printf "You've hit your session limit · resets 3:45pm\n"

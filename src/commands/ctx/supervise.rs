@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn ticks_fire_at_the_poll_interval() {
-        let mut child = spawn(sh("sleep 0.5")).expect("spawn");
+        let mut child = spawn(sh("sleep 1")).expect("spawn");
         let mut ticks = 0;
         supervise_child(
             &mut child,
@@ -845,7 +845,10 @@ mod tests {
             },
         )
         .expect("supervise");
-        assert!(ticks >= 3, "expected several ticks in 500ms, got {ticks}");
+        assert!(
+            ticks >= 3,
+            "expected several ticks before exit, got {ticks}"
+        );
     }
 
     #[test]

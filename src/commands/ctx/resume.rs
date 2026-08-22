@@ -84,6 +84,18 @@ redo work marked as done.\n\n{}",
 /// `PromptRole::Worker`, which silently coached an operator's own interactive
 /// session as a delegated worker and dropped their user layer.
 ///
+/// Issue #44: goes through `compile::compile_with_harness_roster` rather than
+/// calling `prompt::compose` directly, so a resumed session gets the same
+/// memory gathering and canonical `.zirv/context/` layer every other launch
+/// path gets -- this used to assemble context independently, the exact
+/// duplication issue #44 exists to remove. It calls the `_with_harness_
+/// roster` variant, not plain `compile::compile`, to keep one piece of
+/// pre-existing behavior unchanged: a resumed session has never composed a
+/// harness roster (`include_harness_roster: false`), even though it composes
+/// as `PromptRole::Orchestrator`, because it is picking up one specific piece
+/// of handoff work, not opening a fresh orchestrator seat that might go spawn
+/// other harnesses. See `compile_with_harness_roster`'s own doc comment.
+///
 /// Split out of `run_with` for the same reason `launch_command` is: `run_with`
 /// `exec`s over itself on unix, so composition needs its own seam a test can
 /// call without launching an agent.
@@ -93,27 +105,26 @@ fn compose_prompt(
     home: Option<&Path>,
     repo: &Path,
     simple: bool,
-    cfg: &super::config::PromptConfig,
-    memory_entries: &[super::prompt::MemoryLine],
-    memory_cap: usize,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    now: u64,
     extra: &[String],
 ) -> (Vec<String>, Option<super::prompt::ComposedPrompt>) {
-    let composed = super::prompt::compose(
+    let compiled = super::compile::compile_with_harness_roster(
         home,
         repo,
         simple,
         cfg,
+        adapter,
         super::prompt::PromptRole::Orchestrator,
-        memory_entries,
-        memory_cap,
-        &[],
+        state,
+        now,
+        false,
     );
-    let composed =
-        super::prompt::with_context_layer(composed, repo, adapter.name(), cfg.max_repo_bytes);
     super::prompt::merge_command_line_prompt(
         adapter,
         extra,
-        composed,
+        compiled.composed,
         None,
         super::prompt::PromptRole::Orchestrator,
     )
@@ -158,16 +169,14 @@ pub fn run_with<W: Write>(
 
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
 
-    let memory_slug = super::state::repo_slug(repo);
-    let memory_entries = super::memory::render_for_prompt(&state, repo, &memory_slug, &cfg);
     let (user_extra, composed) = compose_prompt(
         adapter.as_ref(),
         crate::utils::home_dir().ok().as_deref(),
         repo,
         args.simple,
-        &cfg.prompt,
-        &memory_entries,
-        cfg.memory.core_max_bytes,
+        &cfg,
+        &state,
+        super::state::now_secs(),
         &args.extra,
     );
     // M2: attribution is logged per session, not once per verb. A resumed run
@@ -596,8 +605,18 @@ mod tests {
 
         let adapter =
             crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some("/tmp/fake-claude"));
-        let cfg = crate::commands::ctx::config::PromptConfig::default();
-        let (_, composed) = compose_prompt(&adapter, Some(&home), &repo, false, &cfg, &[], 0, &[]);
+        let cfg = CtxConfig::default();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (_, composed) = compose_prompt(
+            &adapter,
+            Some(&home),
+            &repo,
+            false,
+            &cfg,
+            &state,
+            crate::commands::ctx::state::now_secs(),
+            &[],
+        );
         let composed = composed.expect("composed");
 
         assert!(
@@ -627,50 +646,78 @@ mod tests {
         );
     }
 
-    /// Issue #34 seam coverage (memory review, fix round): `run_with` passes
-    /// `memory_entries` and `cfg.memory.core_max_bytes` into `compose_prompt`
-    /// (line ~161) -- this proves that composition step actually carries the
-    /// memory core layer, bounded by whatever cap is handed in, rather than
-    /// dropping it or ignoring the cap. `run_with` itself `exec`s over
-    /// itself on unix, so it is `compose_prompt` (already split out for that
-    /// reason) that gets exercised directly here.
+    /// Issue #44: `resume` is the sixth launch seam wired through the launch-
+    /// time context compiler (`compile::compile_with_harness_roster`), not
+    /// through its own independent `prompt::compose` call. Proves it by
+    /// rebuilding the expected result straight from the compiler's own output
+    /// (compiled directly, then merged with the operator's command line the
+    /// exact same way `compose_prompt` does) and asserting the two match
+    /// byte-for-byte -- including the canonical `.zirv/context/` layer a
+    /// resumed session never carried before this change, since the old
+    /// direct `prompt::compose` call had no path to it at all.
     #[test]
-    fn compose_prompt_carries_the_memory_layer_under_its_configured_cap() {
+    fn a_resumed_sessions_prompt_matches_what_the_compiler_produces() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&home).expect("mkdir home");
-        std::fs::create_dir_all(&repo).expect("mkdir repo");
-
-        let entries = [crate::commands::ctx::prompt::MemoryLine {
-            key: "seam-fact".to_string(),
-            body: format!("{}TAIL_MARKER_NOT_TRUNCATED", "z".repeat(200)),
-            verified: 1,
-            written: 1,
-            shared: false,
-        }];
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::create_dir_all(repo.join(".zirv/context")).expect("mkdir repo context");
+        std::fs::write(
+            repo.join(".zirv/context/common.md"),
+            "canonical instruction for every harness",
+        )
+        .expect("write canonical context");
 
         let adapter =
             crate::commands::ctx::adapters::claude::ClaudeAdapter::new(Some("/tmp/fake-claude"));
-        let cfg = crate::commands::ctx::config::PromptConfig::default();
-        let (_, composed) =
-            compose_prompt(&adapter, Some(&home), &repo, false, &cfg, &entries, 40, &[]);
-        let composed = composed.expect("composed");
+        let cfg = CtxConfig::default();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+
+        let (_, actual) =
+            compose_prompt(&adapter, Some(&home), &repo, false, &cfg, &state, now, &[]);
+        let actual = actual.expect("composed");
 
         assert!(
-            composed.text.contains("seam-fact"),
-            "the memory core layer must reach the composed prompt: {}",
-            composed.text
+            actual
+                .text
+                .contains("canonical instruction for every harness"),
+            "a resumed session must now carry the canonical .zirv/context/ layer, exactly like \
+             every other launch path: {}",
+            actual.text
         );
         assert!(
-            !composed.text.contains("TAIL_MARKER_NOT_TRUNCATED"),
-            "a tiny configured cap must actually bound the delivered memory layer: {}",
-            composed.text
+            !actual.text.contains("zirv harness roster"),
+            "resume's pre-existing exception -- no harness roster, even though it composes as \
+             Orchestrator -- must survive the move to the compiler: {}",
+            actual.text
         );
-        assert!(
-            composed.text.contains("[memory truncated:"),
-            "the truncation must be visible, not silent: {}",
-            composed.text
+
+        let compiled = crate::commands::ctx::compile::compile_with_harness_roster(
+            Some(&home),
+            &repo,
+            false,
+            &cfg,
+            &adapter,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+            &state,
+            now,
+            false,
+        );
+        let (_, expected) = crate::commands::ctx::prompt::merge_command_line_prompt(
+            &adapter,
+            &[],
+            compiled.composed,
+            None,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        );
+        let expected = expected.expect("composed");
+
+        assert_eq!(
+            actual.text, expected.text,
+            "compose_prompt must produce exactly what compiling directly and merging the same \
+            way produces -- proving it actually routes through the compiler rather than \
+             re-deriving similar output"
         );
     }
 

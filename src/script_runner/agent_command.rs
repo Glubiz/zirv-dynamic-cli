@@ -313,15 +313,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unready_adapter_fails_with_its_own_error() {
+    async fn codex_runs_as_a_supported_script_agent() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let agent_bin = format!("sh {}", fixture("fake-codex-agent.sh").display());
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            (STATE_ENV, state.to_str()),
+            ("ZIRV_CTX_AGENT_BIN", Some(&agent_bin)),
+        ]);
+
         let mut cmd = agent_step("go");
         cmd.agent = "codex".to_string();
         let mut context = HashMap::new();
-        let err = cmd
-            .execute(&mut context)
-            .await
-            .expect_err("codex is not ready yet");
-        assert!(err.contains("codex"), "got {err}");
+        context.insert("cwd".to_string(), tmp.path().display().to_string());
+        let result = cmd.execute(&mut context).await.expect("codex is supported");
+        assert!(
+            result.is_none(),
+            "a successful agent step has no skip message"
+        );
     }
 
     /// Task A6: `validate()` stays registry-only (it only checks the agent
@@ -366,7 +377,10 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var(STATE_ENV, &state);
-            std::env::set_var("ZIRV_CTX_AGENT_BIN", fixture("fake-agent.sh"));
+            std::env::set_var(
+                "ZIRV_CTX_AGENT_BIN",
+                format!("sh {}", fixture("fake-agent.sh").display()),
+            );
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
         }
 
@@ -393,7 +407,10 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var(STATE_ENV, &state);
-            std::env::set_var("ZIRV_CTX_AGENT_BIN", fixture("fake-agent.sh"));
+            std::env::set_var(
+                "ZIRV_CTX_AGENT_BIN",
+                format!("sh {}", fixture("fake-agent.sh").display()),
+            );
             std::env::set_var("FAKE_AGENT_MODE", "fail");
         }
 
@@ -421,7 +438,10 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var(STATE_ENV, &state);
-            std::env::set_var("ZIRV_CTX_AGENT_BIN", fixture("fake-agent.sh"));
+            std::env::set_var(
+                "ZIRV_CTX_AGENT_BIN",
+                format!("sh {}", fixture("fake-agent.sh").display()),
+            );
             std::env::set_var("FAKE_AGENT_MODE", "fail");
         }
 

@@ -592,7 +592,7 @@ mod tests {
             ),
             (
                 "ZIRV_CTX_AGENT_BIN".to_string(),
-                fixture("fake-agent.sh").display().to_string(),
+                format!("sh {}", fixture("fake-agent.sh").display()),
             ),
         ]
         .into()

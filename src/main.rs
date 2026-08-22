@@ -70,6 +70,20 @@ fn is_top_level_setup(argv: &[String]) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("setup"))
 }
 
+/// True when argv[1] names the `context` built-in (issue #45, "Context
+/// 7/8"): a top-level command family sibling to `ctx`, not one of its verbs
+/// (see `commands::ctx::context_cli`'s module doc for why), so it gets its
+/// own interception here rather than routing through `ctx::dispatch`.
+/// Case-insensitive for the same reason `is_top_level_ctx` is: NTFS/APFS
+/// resolve a script file `Context.yaml` the same as `context.yaml`, and
+/// `.zirv/context/` (the canonical instruction directory `context.rs` reads)
+/// already sits at this exact name -- both are guarded the same way
+/// `utils::RESERVED_COMMANDS` guards every other built-in.
+fn is_top_level_context(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|s| s.eq_ignore_ascii_case("context"))
+}
+
 /// `zirv chat` and `zirv agent` are top-level aliases for `zirv ctx chat`
 /// and `zirv ctx agent`, checked against raw argv (like the `ctx`
 /// interception above) so they run before clap ever sees `Input`. Returns
@@ -150,6 +164,10 @@ async fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if is_top_level_ctx(&argv) {
         std::process::exit(ctx::dispatch(&argv[1..]));
+    }
+
+    if is_top_level_context(&argv) {
+        std::process::exit(ctx::context_cli::dispatch(&argv[1..]));
     }
 
     if is_top_level_workflow_command(&argv) {
@@ -497,5 +515,76 @@ mod tests {
             text.contains("status") && text.contains("remember"),
             "built-in memory help expected, got: {text}"
         );
+    }
+
+    /// Issue #45: `context` is a new top-level built-in, sibling to `ctx`
+    /// rather than a verb under it (see `commands::ctx::context_cli`'s
+    /// module doc). It gets its own interception, matched case-insensitively
+    /// like every other one, and is reserved so a script can never shadow it.
+    #[test]
+    fn context_is_intercepted_case_insensitively_and_reserved() {
+        assert!(is_top_level_context(&argv(&["zirv", "context", "sync"])));
+        assert!(is_top_level_context(&argv(&["zirv", "CONTEXT", "sync"])));
+        assert!(is_top_level_context(&argv(&["zirv", "Context"])));
+        assert!(!is_top_level_context(&argv(&["zirv", "ctx"])));
+        assert!(!is_top_level_context(&argv(&["zirv"])));
+
+        assert!(utils::is_reserved_command("context"));
+        assert!(utils::is_reserved_command("Context"));
+    }
+
+    /// `.zirv/context/` is a *directory* holding canonical instructions
+    /// (`commands::ctx::context::CONTEXT_DIR`) that already exists before
+    /// this feature; a script file named `context.yaml` sitting next to it
+    /// is a completely different thing and must be reported as shadowed
+    /// (unreachable, since the built-in wins), never silently confused with
+    /// the directory or allowed to run instead of the built-in.
+    #[test]
+    fn a_context_directory_and_a_shadowed_context_script_coexist_in_listing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path = temp_dir.path().to_path_buf();
+        let zirv_dir = temp_path.join(".zirv");
+        std::fs::create_dir_all(zirv_dir.join("context"))?;
+        std::fs::write(
+            zirv_dir.join("context").join("common.md"),
+            "Always run tests.",
+        )?;
+        std::fs::write(
+            zirv_dir.join("context.yaml"),
+            "name: \"My Context Script\"\ncommands: []\n",
+        )?;
+        std::fs::write(
+            zirv_dir.join("build.yaml"),
+            "name: \"Build\"\ncommands: []\n",
+        )?;
+
+        let _cwd = commands::ctx::testenv::CwdGuard::enter(&temp_path)?;
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        commands::help::show_help(&mut buffer)?;
+        let output = String::from_utf8(buffer.into_inner())?;
+
+        // The directory itself must never be listed as an invocable script.
+        assert!(
+            !output.contains("File: context\n") && !output.contains("File: context "),
+            "the context/ directory must not appear as a script entry: {output}"
+        );
+        let context_line = output
+            .lines()
+            .find(|l| l.starts_with("File: context.yaml"))
+            .unwrap_or("");
+        assert!(
+            context_line.contains("shadowed") || context_line.contains("unreachable"),
+            "expected 'context.yaml' to be marked unreachable, got: {context_line}"
+        );
+        let build_line = output
+            .lines()
+            .find(|l| l.starts_with("File: build.yaml"))
+            .unwrap_or("");
+        assert!(
+            !build_line.contains("shadowed"),
+            "an ordinary script must not be marked shadowed, got: {build_line}"
+        );
+        Ok(())
     }
 }

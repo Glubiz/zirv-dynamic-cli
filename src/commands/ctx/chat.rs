@@ -396,12 +396,12 @@ fn announce_model_choice<E: Write>(stderr: &mut E, cfg: &CtxConfig, quiet: bool)
 /// delegate.
 ///
 /// This is `wrap::run_with`'s own recipe, in its order and with its
-/// arguments: memory lines, the derived harness roster
-/// (`adapters::harness_prompt_lines`, only for an `Orchestrator` launch),
-/// `prompt::compose` (as an `Orchestrator`), `merge_command_line_prompt` so
-/// an operator's own `--append-system-prompt` in `--` extras is folded in
-/// rather than silently duplicated, `injection_args_for_session`, then
-/// `log_injection`.
+/// arguments: `compile::compile` (memory, the derived harness roster --
+/// `adapters::harness_prompt_lines`, only for an `Orchestrator` launch --
+/// `prompt::compose` as an `Orchestrator`, and the canonical `.zirv/context/`
+/// layer on top, issue #44), `merge_command_line_prompt` so an operator's own
+/// `--append-system-prompt` in `--` extras is folded in rather than silently
+/// duplicated, `injection_args_for_session`, then `log_injection`.
 ///
 /// Deliberately **no** `prompt::with_mail_layer`, exactly like the `wrap`
 /// path it mirrors: an interactive Orchestrator session is never given mail
@@ -418,35 +418,23 @@ pub(crate) fn dash_orchestrator_pane(
     session: &str,
     simple: bool,
 ) -> CtxResult<PaneSpec> {
-    let slug = super::state::repo_slug(repo);
-    let memory_entries = super::memory::render_for_prompt(state, repo, &slug, cfg);
-    // Only an Orchestrator session hears about other harnesses at all; see
-    // `prompt::PromptSource::Harnesses`.
-    let harness_lines = if launch.role == PromptRole::Orchestrator {
-        adapters::harness_prompt_lines(cfg, adapter.name())
-    } else {
-        Vec::new()
-    };
-    let composed = super::prompt::compose(
+    // Issue #44: gathers memory, the derived harness roster and the
+    // canonical `.zirv/context/` layer, and attaches the policy report --
+    // see `compile::compile`'s own doc comment.
+    let compiled = super::compile::compile(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         simple,
-        &cfg.prompt,
+        cfg,
+        adapter,
         launch.role,
-        &memory_entries,
-        cfg.memory.core_max_bytes,
-        &harness_lines,
-    );
-    let composed = super::prompt::with_context_layer(
-        composed,
-        repo,
-        adapter.name(),
-        cfg.prompt.max_repo_bytes,
+        state,
+        super::state::now_secs(),
     );
     let (mut argv, composed) = super::prompt::merge_command_line_prompt(
         adapter,
         &launch.argv,
-        composed,
+        compiled.composed,
         None,
         launch.role,
     );

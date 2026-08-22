@@ -1094,32 +1094,6 @@ fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
-/// This launch's composed prompt: `memory_entries` (already rendered by the
-/// caller) and the derived harness roster (only for an Orchestrator role)
-/// folded through `prompt::compose`, capped by `cfg.memory.core_max_bytes`.
-/// Pulled out of `run_with` (which opens a real pty) for the same reason
-/// other pure composition seams in this codebase are: testable without
-/// spawning anything.
-fn compose_launch_prompt(
-    memory_entries: &[super::prompt::MemoryLine],
-    harness_lines: &[String],
-    repo: &Path,
-    cfg: &CtxConfig,
-    role: PromptRole,
-    skip_injection: bool,
-) -> Option<super::prompt::ComposedPrompt> {
-    super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        skip_injection,
-        &cfg.prompt,
-        role,
-        memory_entries,
-        cfg.memory.core_max_bytes,
-        harness_lines,
-    )
-}
-
 /// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
 /// not something a user ever types on the `wrap` command line, only something
 /// another verb (`zirv ctx chat`) decides on the caller's behalf. Both callers
@@ -1228,28 +1202,22 @@ pub fn run_with(
             agent_name.is_some(),
             &args.command,
         );
+    // Still needed standalone below: `pump`'s own best-effort memory-harvest
+    // call on a restart (unrelated to prompt composition, which `compile`
+    // now owns) reads this same slug.
     let memory_slug = super::state::repo_slug(repo);
-    let memory_entries = super::memory::render_for_prompt(&state_dir, repo, &memory_slug, &cfg);
-    // Only an Orchestrator session hears about other harnesses at all: see
-    // `prompt::PromptSource::Harnesses`.
-    let harness_lines = if role == PromptRole::Orchestrator {
-        adapters::harness_prompt_lines(&cfg, adapter.name())
-    } else {
-        Vec::new()
-    };
-    let composed = compose_launch_prompt(
-        &memory_entries,
-        &harness_lines,
+    // Issue #44: gathers memory, the derived harness roster and the
+    // canonical `.zirv/context/` layer, and attaches the policy report --
+    // see `compile::compile`'s own doc comment.
+    let compiled = super::compile::compile(
+        crate::utils::home_dir().ok().as_deref(),
         repo,
-        &cfg,
-        role,
         skip_injection,
-    );
-    let composed = super::prompt::with_context_layer(
-        composed,
-        repo,
-        adapter.name(),
-        cfg.prompt.max_repo_bytes,
+        &cfg,
+        adapter.as_ref(),
+        role,
+        &state_dir,
+        super::state::now_secs(),
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -1257,7 +1225,7 @@ pub fn run_with(
     let (launch_command, composed) = super::prompt::merge_command_line_prompt(
         adapter.as_ref(),
         &args.command,
-        composed,
+        compiled.composed,
         None,
         role,
     );
@@ -1954,6 +1922,50 @@ fn redraw_bar_if_due(
     }
 }
 
+/// Issue #37: the clean-session-end companion to the pre-existing rot/
+/// timeout-restart harvest call in the `Action::Restart` arm inside `pump`
+/// below. Called from both places `pump` reports a genuinely clean
+/// `SessionEnded` (a `try_wait` exit and a `PtyClosed` event) -- never from
+/// the relaunch-failed exit further down, which already ran a harvest as
+/// part of its own `Action::Restart` handling just above it: two harvest
+/// model calls at the same boundary is exactly what issue #37's "one entry
+/// point" rule forbids. Gated on `cfg.memory.harvest` here too, before the
+/// transcript is even read, so an operator who left harvesting off never
+/// pays for the read or either model call `memory::harvest_at_session_end`
+/// can make. Best-effort: any failure is discarded, never surfaced to the
+/// caller, so it can never turn a clean exit into a failed one.
+#[allow(clippy::too_many_arguments)]
+fn harvest_at_clean_exit(
+    adapter: &dyn AgentAdapter,
+    transcript: &TranscriptSource,
+    tail_items: usize,
+    distiller_model: &str,
+    distiller_timeout: Duration,
+    repo: &Path,
+    state_dir: &super::state::StateDir,
+    memory_slug: &str,
+    cfg: &CtxConfig,
+) {
+    if !cfg.memory.enabled || !cfg.memory.harvest {
+        return;
+    }
+    let jsonl = transcript
+        .path()
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .unwrap_or_default();
+    let ctx = adapter.structural_context(&jsonl, tail_items);
+    let _ = super::memory::harvest_at_session_end(
+        adapter,
+        distiller_model,
+        &ctx,
+        distiller_timeout,
+        repo,
+        state_dir,
+        memory_slug,
+        cfg,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pump(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -2008,6 +2020,17 @@ fn pump(
                 agent: adapter.name().to_string(),
                 code,
             });
+            harvest_at_clean_exit(
+                adapter,
+                transcript,
+                tail_items,
+                distiller_model,
+                distiller_timeout,
+                repo,
+                state_dir,
+                memory_slug,
+                cfg,
+            );
             return Ok(code);
         }
 
@@ -2019,6 +2042,17 @@ fn pump(
                     agent: adapter.name().to_string(),
                     code,
                 });
+                harvest_at_clean_exit(
+                    adapter,
+                    transcript,
+                    tail_items,
+                    distiller_model,
+                    distiller_timeout,
+                    repo,
+                    state_dir,
+                    memory_slug,
+                    cfg,
+                );
                 return Ok(code);
             }
             supervision.on_event(event, Instant::now());
@@ -2173,10 +2207,11 @@ fn pump(
                 // structural fallback. Best-effort: a harvest failure must
                 // never turn a successful restart into a failed one.
                 if source == "distilled" {
-                    let _ = super::memory::harvest_from_handoff(
+                    let _ = super::memory::harvest_durable(
                         adapter,
                         distiller_model,
                         &note,
+                        repo,
                         state_dir,
                         memory_slug,
                         cfg,
@@ -5197,13 +5232,7 @@ mod tests {
         assert!(!prompt.contains('\u{2014}'));
     }
 
-    /// Issue #34 seam coverage (memory review, fix round): `run_with`'s
-    /// launch prompt must carry the memory core layer, bounded by the
-    /// CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded default.
-    /// `run_with` itself opens a real pty (the `commands::ctx::wrap::tests`
-    /// pty family wedges on this machine, per this repo's own test
-    /// convention), so this exercises `compose_launch_prompt` directly: the
-    /// exact, pure composition step that call site uses -- no pty involved.
+    /// The compiler seam used by `run_with` must carry the bounded memory core.
     #[test]
     fn compose_launch_prompt_carries_the_memory_layer_under_its_configured_cap() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -5233,16 +5262,18 @@ mod tests {
         )
         .expect("remember");
 
-        let memory_entries =
-            crate::commands::ctx::memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
-        let composed = compose_launch_prompt(
-            &memory_entries,
-            &[],
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+        let composed = crate::commands::ctx::compile::compile(
+            Some(&home),
             repo.path(),
-            &cfg,
-            PromptRole::Worker,
             false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            1,
         )
+        .composed
         .expect("a launch still composes a prompt");
 
         assert!(
@@ -5386,7 +5417,7 @@ mod tests {
         let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(20));
         assert!(seen.contains("stub-tui ready"), "relaunched: {seen:?}");
 
-        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        let log = wait_for_log(&state, "\"action\":\"restart\"", Duration::from_secs(10));
         assert!(
             log.contains("\"action\":\"restart\""),
             "old child quit and relaunch succeeded: {log}"
