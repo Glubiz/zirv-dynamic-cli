@@ -673,8 +673,8 @@ pub fn run_verify<W: Write>(args: &VerifyArgs, w: &mut W) -> CtxResult<i32> {
 /// Issue #38. REPORT-FIRST: `analyze`/`gather_candidates` (both read-only)
 /// run and print unconditionally; the model-driven consolidation pass only
 /// runs when `args.apply && !args.dry_run` -- `--dry-run` always overrides
-/// `--apply`, the same "safety wins" rule `memory::InitOptions::dry_run`
-/// already follows for `zirv memory init`. Resolving an adapter is deferred
+/// `--apply`, the same "safety wins" rule `zirv memory init --dry-run`
+/// follows. Resolving an adapter is deferred
 /// until a consolidation pass is actually about to run, so a plain report
 /// (the common case) never fails just because no agent is configured or
 /// available -- mirrors `optimize::run_with`'s own graceful degradation
@@ -1660,6 +1660,7 @@ mod tests {
                 query: "release process".to_string(),
                 shared: false,
                 json: false,
+                include_archived: false,
             },
             &mut out,
             repo.path(),
@@ -1878,6 +1879,9 @@ mod tests {
                 key: key.to_string(),
                 text: text.to_string(),
                 shared: true,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
             },
             &mut Vec::new(),
             repo,
@@ -2036,6 +2040,7 @@ mod tests {
     /// `os error 193` here) -- it is the CI-only counterpart to the
     /// model-free tests above, the same split `memory.rs`'s own harvest/init
     /// model tests already accept.
+    #[cfg(unix)]
     #[test]
     fn apply_consolidates_a_duplicate_group_as_an_ordinary_working_tree_change() {
         let repo = crate::commands::ctx::testenv::repo();
