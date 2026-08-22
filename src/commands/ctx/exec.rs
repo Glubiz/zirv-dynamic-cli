@@ -248,32 +248,6 @@ fn build_command(command: &[String], repo: &Path) -> CtxResult<Command> {
     Ok(cmd)
 }
 
-/// The Worker prompt composition `run_with`'s two call sites share (the
-/// initial launch, and a nudge-restart recompose): `memory_entries` (already
-/// rendered by the caller) folded through `prompt::compose` as a Worker,
-/// capped by `cfg.memory.core_max_bytes`, with no harness roster (a Worker
-/// never hears about other harnesses). Pulled out for the same reason
-/// `prompt_delivery_via_stdin` above was: testable without spawning the real
-/// supervised process `run_with` launches.
-fn compose_worker_launch_prompt(
-    memory_entries: &[super::prompt::MemoryLine],
-    repo: &Path,
-    cfg: &CtxConfig,
-    skip_injection: bool,
-) -> Option<super::prompt::ComposedPrompt> {
-    super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        skip_injection,
-        &cfg.prompt,
-        super::prompt::PromptRole::Worker,
-        memory_entries,
-        cfg.memory.core_max_bytes,
-        &[],
-        cfg.context.max_harness_roster_bytes,
-    )
-}
-
 /// Whether this run's own headless launch reparses its downstream argv on a
 /// Windows launcher -- `cmd.exe /c <shim>` (an npm-installed `.cmd`) or
 /// `powershell -NoProfile -File <script>` (a `.ps1`) -- so the prompt has to
@@ -1586,13 +1560,7 @@ mod tests {
         );
     }
 
-    /// Issue #34 seam coverage (memory review, fix round): `run_with`'s
-    /// launch-time Worker prompt must carry the memory core layer, bounded
-    /// by the CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded
-    /// default. `run_with` itself spawns a real supervised process, so this
-    /// exercises `compose_worker_launch_prompt` directly: the exact
-    /// composition step both of `run_with`'s call sites (launch, and a
-    /// nudge-restart recompose) share.
+    /// The compiler seam used by `run_with` must carry the bounded memory core.
     #[test]
     fn compose_worker_launch_prompt_carries_the_memory_layer_under_its_configured_cap() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -1622,10 +1590,19 @@ mod tests {
         )
         .expect("remember");
 
-        let memory_entries =
-            crate::commands::ctx::memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
-        let composed = compose_worker_launch_prompt(&memory_entries, repo.path(), &cfg, false)
-            .expect("a worker launch still composes a prompt");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+        let composed = crate::commands::ctx::compile::compile(
+            Some(&home),
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            super::super::prompt::PromptRole::Worker,
+            &state,
+            1,
+        )
+        .composed
+        .expect("a worker launch still composes a prompt");
 
         assert!(
             composed.text.contains("seam-fact"),

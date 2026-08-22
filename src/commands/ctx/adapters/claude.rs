@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::super::CtxResult;
 use super::super::event::input_hash;
 use super::super::event::{
-    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext,
+    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
 };
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
@@ -200,6 +200,35 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
     }
 
     events
+}
+
+pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
+    let mut usage = TranscriptUsage::default();
+    let mut observed = false;
+    for line in jsonl.lines() {
+        let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("assistant")
+            || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(current) = row.get("message").and_then(|message| message.get("usage")) else {
+            continue;
+        };
+        observed = true;
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(context_tokens_of(current));
+        usage.output_tokens = usage.output_tokens.saturating_add(
+            current
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+    observed.then_some(usage)
 }
 
 const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
@@ -801,6 +830,10 @@ impl AgentAdapter for ClaudeAdapter {
         structural_context(jsonl, last_n)
     }
 
+    fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
+        transcript_usage(jsonl)
+    }
+
     fn compact_command(&self) -> Option<&'static str> {
         Some("/compact")
     }
@@ -1009,6 +1042,25 @@ mod tests {
             "output_tokens": 577
         });
         assert_eq!(context_tokens_of(&usage), 108_886);
+    }
+
+    #[test]
+    fn transcript_usage_sums_actual_main_session_usage() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5,"output_tokens":7}}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":100,"output_tokens":100}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":11,"output_tokens":13}}}"#,
+        );
+        assert_eq!(
+            transcript_usage(jsonl),
+            Some(TranscriptUsage {
+                input_tokens: 21,
+                output_tokens: 20,
+            })
+        );
+        assert_eq!(transcript_usage("not json"), None);
     }
 
     #[test]

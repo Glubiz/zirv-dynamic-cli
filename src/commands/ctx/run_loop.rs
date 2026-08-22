@@ -86,32 +86,6 @@ fn prompt_delivery_via_stdin(
     super::adapters::launch_reparses_through_shim(&probe)
 }
 
-/// Each cycle's Worker prompt composition: `memory_entries` (already
-/// rendered by the caller, re-read fresh every cycle) folded through
-/// `prompt::compose` as a Worker, capped by `cfg.memory.core_max_bytes`,
-/// with no harness roster (a Worker never hears about other harnesses).
-/// Pulled out for the same reason `prompt_delivery_via_stdin` above was:
-/// testable without spawning the real supervised process `run_with`
-/// launches inside its loop.
-fn compose_cycle_prompt(
-    memory_entries: &[super::prompt::MemoryLine],
-    repo: &Path,
-    cfg: &CtxConfig,
-    simple: bool,
-) -> Option<super::prompt::ComposedPrompt> {
-    super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        simple,
-        &cfg.prompt,
-        super::prompt::PromptRole::Worker,
-        memory_entries,
-        cfg.memory.core_max_bytes,
-        &[],
-        cfg.context.max_harness_roster_bytes,
-    )
-}
-
 pub fn run_with<W: Write>(
     args: &LoopArgs,
     w: &mut W,
@@ -702,12 +676,7 @@ mod tests {
         );
     }
 
-    /// Issue #34 seam coverage (memory review, fix round): each cycle's
-    /// Worker prompt must carry the memory core layer, bounded by the
-    /// CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded default.
-    /// `run_with` itself supervises a real child process inside its loop, so
-    /// this exercises `compose_cycle_prompt` directly: the exact composition
-    /// step that call site uses.
+    /// The compiler seam used by every cycle must carry the bounded memory core.
     #[test]
     fn compose_cycle_prompt_carries_the_memory_layer_under_its_configured_cap() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -737,10 +706,19 @@ mod tests {
         )
         .expect("remember");
 
-        let memory_entries =
-            crate::commands::ctx::memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
-        let composed = compose_cycle_prompt(&memory_entries, repo.path(), &cfg, false)
-            .expect("a cycle still composes a prompt");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+        let composed = crate::commands::ctx::compile::compile(
+            Some(&home),
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            super::super::prompt::PromptRole::Worker,
+            &state,
+            1,
+        )
+        .composed
+        .expect("a cycle still composes a prompt");
 
         assert!(
             composed.text.contains("seam-fact"),

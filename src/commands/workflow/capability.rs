@@ -94,7 +94,8 @@ impl std::fmt::Display for SupportLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum PolicyDecision {
     Allow,
     Ask,
@@ -105,6 +106,7 @@ pub enum PolicyDecision {
 pub struct CapabilityStatus {
     pub capability: CapabilityId,
     pub support: SupportLevel,
+    pub authorization: PolicyDecision,
     pub reason: String,
 }
 
@@ -124,6 +126,7 @@ impl CapabilityReport {
         let status = |capability, support, reason: &'static str| CapabilityStatus {
             capability,
             support,
+            authorization: PolicyDecision::Allow,
             reason: reason.to_string(),
         };
         let statuses = if known {
@@ -200,6 +203,14 @@ impl CapabilityReport {
             .unwrap_or(SupportLevel::Unsupported)
     }
 
+    pub fn authorization(&self, capability: CapabilityId) -> PolicyDecision {
+        self.statuses
+            .iter()
+            .find(|status| status.capability == capability)
+            .map(|status| status.authorization)
+            .unwrap_or(PolicyDecision::Deny)
+    }
+
     /// Resolve logical workflow capabilities against the effective canonical
     /// policy for `repo`. Policy loading uses the same asymmetric operator /
     /// repository fold as every AI launch, so repository content can narrow
@@ -219,6 +230,7 @@ impl CapabilityReport {
     pub fn with_policy(mut self, policy: impl Fn(CapabilityId) -> PolicyDecision) -> Self {
         for status in &mut self.statuses {
             let decision = policy(status.capability);
+            status.authorization = decision;
             status.support = match decision {
                 PolicyDecision::Deny => SupportLevel::Unsupported,
                 PolicyDecision::Ask if status.support.satisfies_requirement() => {

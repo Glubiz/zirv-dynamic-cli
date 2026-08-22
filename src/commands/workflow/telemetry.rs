@@ -99,6 +99,8 @@ pub struct TelemetryEvent {
     pub role: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub token_usage_source: Option<String>,
     pub succeeded: Option<bool>,
     pub findings_total: u32,
     pub findings_meaningful: u32,
@@ -127,6 +129,7 @@ impl TelemetryEvent {
             role: None,
             input_tokens: None,
             output_tokens: None,
+            token_usage_source: None,
             succeeded: None,
             findings_total: 0,
             findings_meaningful: 0,
@@ -157,6 +160,7 @@ pub fn record(
         &mut event.adapter,
         &mut event.model,
         &mut event.role,
+        &mut event.token_usage_source,
     ]
     .into_iter()
     .flatten()
@@ -252,6 +256,7 @@ pub fn clear(state: &StateDir, repo: &Path) -> CtxResult<usize> {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PhaseStats {
     pub events: usize,
+    pub token_events: usize,
     pub duration_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -261,6 +266,7 @@ pub struct PhaseStats {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AdapterStats {
     pub events: usize,
+    pub token_events: usize,
     pub duration_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -272,6 +278,7 @@ pub struct StatsReport {
     pub events: usize,
     pub phases: BTreeMap<String, PhaseStats>,
     pub adapters: BTreeMap<String, AdapterStats>,
+    pub token_sources: BTreeMap<String, usize>,
     pub slowest_phase: Option<String>,
     pub most_token_expensive_phase: Option<String>,
     pub verification_runs: usize,
@@ -290,6 +297,7 @@ pub struct StatsReport {
 pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut phases: BTreeMap<String, PhaseStats> = BTreeMap::new();
     let mut adapters: BTreeMap<String, AdapterStats> = BTreeMap::new();
+    let mut token_sources: BTreeMap<String, usize> = BTreeMap::new();
     let mut verification_runs = 0usize;
     let mut verification_failures = 0usize;
     let mut frontend_detector_runs = 0usize;
@@ -312,6 +320,9 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
             entry.output_tokens = entry
                 .output_tokens
                 .saturating_add(event.output_tokens.unwrap_or(0));
+            if event.input_tokens.is_some() || event.output_tokens.is_some() {
+                entry.token_events += 1;
+            }
             if event.succeeded == Some(false) {
                 entry.failures += 1;
             }
@@ -328,9 +339,15 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
             entry.output_tokens = entry
                 .output_tokens
                 .saturating_add(event.output_tokens.unwrap_or(0));
+            if event.input_tokens.is_some() || event.output_tokens.is_some() {
+                entry.token_events += 1;
+            }
             if event.succeeded == Some(false) {
                 entry.failures += 1;
             }
+        }
+        if let Some(source) = &event.token_usage_source {
+            *token_sources.entry(source.clone()).or_default() += 1;
         }
         if event.kind == TelemetryKind::VerificationRun {
             verification_runs += 1;
@@ -409,6 +426,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         events: events.len(),
         phases,
         adapters,
+        token_sources,
         slowest_phase,
         most_token_expensive_phase,
         verification_runs,
@@ -478,21 +496,35 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
         for (phase, stats) in &report.phases {
             writeln!(
                 writer,
-                "{phase}: {} events, {} ms, {} tokens, {} failures",
+                "{phase}: {} events, {} ms, {} tokens ({} measured events), {} failures",
                 stats.events,
                 stats.duration_ms,
                 stats.input_tokens.saturating_add(stats.output_tokens),
+                stats.token_events,
                 stats.failures
             )?;
         }
         for (adapter, stats) in &report.adapters {
             writeln!(
                 writer,
-                "adapter {adapter}: {} events, {} ms, {} tokens, {} failures",
+                "adapter {adapter}: {} events, {} ms, {} tokens ({} measured events), {} failures",
                 stats.events,
                 stats.duration_ms,
                 stats.input_tokens.saturating_add(stats.output_tokens),
+                stats.token_events,
                 stats.failures
+            )?;
+        }
+        if !report.token_sources.is_empty() {
+            writeln!(
+                writer,
+                "token sources: {}",
+                report
+                    .token_sources
+                    .iter()
+                    .map(|(source, events)| format!("{source}={events}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )?;
         }
         writeln!(
@@ -616,6 +648,7 @@ mod tests {
         implement.phase = Some(WorkflowPhase::Implement);
         implement.duration_ms = Some(500);
         implement.input_tokens = Some(10);
+        implement.token_usage_source = Some("harness-transcript-delta".into());
         implement.adapter = Some("claude".into());
         let mut review = TelemetryEvent::new(TelemetryKind::ReviewRun);
         review.phase = Some(WorkflowPhase::Review);
@@ -627,6 +660,9 @@ mod tests {
         assert_eq!(stats.most_token_expensive_phase.as_deref(), Some("review"));
         assert_eq!(stats.adapters["claude"].duration_ms, 500);
         assert_eq!(stats.adapters["codex"].input_tokens, 1000);
+        assert_eq!(stats.phases["implement"].token_events, 1);
+        assert_eq!(stats.adapters["codex"].token_events, 1);
+        assert_eq!(stats.token_sources["harness-transcript-delta"], 1);
     }
 
     #[test]

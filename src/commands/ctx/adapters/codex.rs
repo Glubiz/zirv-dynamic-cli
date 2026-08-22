@@ -3,7 +3,7 @@ use std::process::Command;
 
 use super::super::CtxResult;
 use super::super::event::{
-    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext,
+    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
 };
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
@@ -398,6 +398,39 @@ impl AgentAdapter for CodexAdapter {
         StructuralContext::default()
     }
 
+    fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
+        let mut latest = None;
+        for line in jsonl.lines() {
+            let Ok(row) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            let Some(total) = row
+                .get("payload")
+                .filter(|payload| {
+                    payload.get("type").and_then(serde_json::Value::as_str) == Some("token_count")
+                })
+                .and_then(|payload| payload.pointer("/info/total_token_usage"))
+            else {
+                continue;
+            };
+            latest = Some(TranscriptUsage {
+                input_tokens: total
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                output_tokens: total
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            });
+        }
+        latest
+    }
+
+    fn transcript_usage_is_cumulative(&self) -> bool {
+        true
+    }
+
     fn compact_command(&self) -> Option<&'static str> {
         None
     }
@@ -706,6 +739,24 @@ mod tests {
             adapter.review_model_below(Some("GPT-5.4-Mini")),
             "gpt-5.4-mini"
         );
+    }
+
+    #[test]
+    fn transcript_usage_uses_the_latest_cumulative_token_snapshot() {
+        let adapter = CodexAdapter::new(None);
+        let jsonl = concat!(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"output_tokens":6}}}}"#,
+        );
+        assert_eq!(
+            adapter.transcript_usage(jsonl),
+            Some(TranscriptUsage {
+                input_tokens: 25,
+                output_tokens: 6,
+            })
+        );
+        assert!(adapter.transcript_usage_is_cumulative());
     }
 
     /// B: `--sandbox read-only` (verified against `codex exec --help` on

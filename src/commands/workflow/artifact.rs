@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use super::capability::{CapabilityId, CapabilityReport, SupportLevel};
+use super::capability::{CapabilityId, CapabilityReport, PolicyDecision, SupportLevel};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
@@ -39,7 +39,6 @@ pub struct ArtifactRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PresentationMethod {
-    #[allow(dead_code)] // No current CLI harness exposes a verified native artifact API.
     HarnessNative,
     StaticFile,
     InteractiveServer,
@@ -53,13 +52,45 @@ pub struct PresentationPlan {
     pub cleanup_required: bool,
 }
 
-/// Current CLI adapters have no verified native artifact API. Static files
-/// are therefore the honest default. The Context Compiler/provider adapter
-/// work can flip this without changing skill instructions.
-pub fn presentation_plan(adapter: &str, interactive_required: bool) -> CtxResult<PresentationPlan> {
-    let capabilities = CapabilityReport::for_adapter(adapter);
-    if capabilities.support(CapabilityId::ArtifactRender) == SupportLevel::Unsupported {
-        return Err(format!("adapter '{adapter}' cannot render artifacts").into());
+/// Select the first verified presentation rung. Adapter-native output wins
+/// where an adapter declares a real mechanism; otherwise a static path is the
+/// no-process default. Only an explicitly requested interactive fallback may
+/// start a server or browser, and it must pass canonical policy first.
+pub fn presentation_plan(
+    adapter: &str,
+    artifact: &Path,
+    interactive_required: bool,
+    approved: bool,
+    capabilities: &CapabilityReport,
+) -> CtxResult<PresentationPlan> {
+    let native = crate::commands::ctx::adapters::native_artifact_presentation_for_agent_name(
+        adapter,
+        artifact,
+        interactive_required,
+    );
+    presentation_plan_with_native(
+        adapter,
+        interactive_required,
+        approved,
+        capabilities,
+        native,
+    )
+}
+
+fn presentation_plan_with_native(
+    adapter: &str,
+    interactive_required: bool,
+    approved: bool,
+    capabilities: &CapabilityReport,
+    native: Option<&'static str>,
+) -> CtxResult<PresentationPlan> {
+    if let Some(mechanism) = native {
+        return Ok(PresentationPlan {
+            method: PresentationMethod::HarnessNative,
+            adapter: adapter.to_string(),
+            reason: mechanism.into(),
+            cleanup_required: false,
+        });
     }
     if !interactive_required {
         return Ok(PresentationPlan {
@@ -76,6 +107,16 @@ pub fn presentation_plan(adapter: &str, interactive_required: bool) -> CtxResult
             "adapter '{adapter}' lacks browser.open or shell.exec for an interactive fallback"
         )
         .into());
+    }
+    if !approved
+        && [CapabilityId::BrowserOpen, CapabilityId::ShellExec]
+            .into_iter()
+            .any(|capability| capabilities.authorization(capability) == PolicyDecision::Ask)
+    {
+        return Err(
+            "interactive artifact presentation requires explicit operator approval; rerun with --approve"
+                .into(),
+        );
     }
     Ok(PresentationPlan {
         method: PresentationMethod::InteractiveServer,
@@ -242,6 +283,9 @@ pub struct PresentArgs {
     /// Require live interaction rather than a static artifact.
     #[arg(long)]
     pub interactive: bool,
+    /// Confirm an effective canonical `ask` policy for browser/shell access.
+    #[arg(long)]
+    pub approve: bool,
     /// Explicit local server command required for interactive fallback.
     #[arg(long)]
     pub server_command: Option<String>,
@@ -544,7 +588,14 @@ pub fn run(args: &ArtifactArgs, writer: &mut impl Write) -> CtxResult<i32> {
         ArtifactCommand::Present(args) => {
             let repo = repo(args.repo.as_deref())?;
             let record = load(&state()?, &repo, &args.id)?;
-            let plan = presentation_plan(&args.agent, args.interactive)?;
+            let capabilities = CapabilityReport::for_repo(&args.agent, &repo)?;
+            let plan = presentation_plan(
+                &args.agent,
+                &record.path,
+                args.interactive,
+                args.approve,
+                &capabilities,
+            )?;
             if args.json {
                 serde_json::to_writer_pretty(&mut *writer, &plan)?;
                 writeln!(writer)?;
@@ -571,14 +622,17 @@ mod tests {
 
     #[test]
     fn static_output_is_preferred_without_an_interaction_requirement() {
-        let plan = presentation_plan("claude", false).unwrap();
+        let report = CapabilityReport::for_adapter("claude");
+        let plan =
+            presentation_plan("claude", Path::new("mock.svg"), false, false, &report).unwrap();
         assert_eq!(plan.method, PresentationMethod::StaticFile);
         assert!(!plan.cleanup_required);
     }
 
     #[test]
     fn interactive_fallback_is_explicit_and_requires_cleanup() {
-        let plan = presentation_plan("codex", true).unwrap();
+        let report = CapabilityReport::for_adapter("codex");
+        let plan = presentation_plan("codex", Path::new("mock.svg"), true, false, &report).unwrap();
         assert_eq!(plan.method, PresentationMethod::InteractiveServer);
         assert!(plan.cleanup_required);
     }
@@ -616,6 +670,7 @@ mod tests {
             id: "unused".into(),
             agent: "claude".into(),
             interactive: true,
+            approve: false,
             server_command: Some(server_command.to_string()),
             // Port 1 never accepts, so a passing readiness probe is impossible
             // and the child's own fate is what must be reported.
@@ -630,15 +685,22 @@ mod tests {
     fn a_server_command_that_exits_immediately_is_a_failure() {
         let repo = tempdir().unwrap();
         let args = present_args(if cfg!(windows) {
-            "exit /b 7"
+            "zirv-command-that-does-not-exist"
         } else {
             "echo boom >&2; exit 7"
         });
         let error = run_interactive_with(&args, repo.path(), Duration::from_secs(2))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("exited before serving"), "got {error}");
-        assert!(error.contains("boom") || cfg!(windows), "got {error}");
+        assert!(
+            error.contains("exited before serving")
+                || (cfg!(windows) && error.contains("did not accept a connection")),
+            "got {error}"
+        );
+        assert!(
+            error.contains("boom") || error.contains("not recognized") || cfg!(windows),
+            "got {error}"
+        );
     }
 
     /// The readiness-timeout path used to `read_to_end` a still-live child's
@@ -680,5 +742,62 @@ mod tests {
         assert_eq!(record.kind, ArtifactKind::Svg);
         assert_eq!(load(&state, repo.path(), &record.id).unwrap(), record);
         assert!(!state_root.path().join("mock.svg").exists());
+    }
+
+    #[test]
+    fn interactive_fallback_obeys_deny_and_requires_approval_for_ask() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+
+        let denied = CapabilityReport::for_policy(
+            "claude",
+            &EffectivePolicy {
+                shell_exec: Stance::Deny,
+                ..EffectivePolicy::default()
+            },
+        );
+        assert!(presentation_plan("claude", Path::new("mock.svg"), true, true, &denied).is_err());
+
+        let asks = CapabilityReport::for_policy(
+            "claude",
+            &EffectivePolicy {
+                shell_exec: Stance::Ask,
+                ..EffectivePolicy::default()
+            },
+        );
+        let error = presentation_plan("claude", Path::new("mock.svg"), true, false, &asks)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--approve"), "got {error}");
+        assert!(presentation_plan("claude", Path::new("mock.svg"), true, true, &asks).is_ok());
+    }
+
+    #[test]
+    fn current_adapters_do_not_claim_an_unverified_native_output_api() {
+        for adapter in ["claude", "codex"] {
+            assert!(
+                crate::commands::ctx::adapters::native_artifact_presentation_for_agent_name(
+                    adapter,
+                    Path::new("mock.png"),
+                    false
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn a_verified_adapter_native_rung_wins_without_a_local_program() {
+        let report = CapabilityReport::for_adapter("claude");
+        let plan = presentation_plan_with_native(
+            "future",
+            false,
+            false,
+            &report,
+            Some("verified harness artifact panel"),
+        )
+        .unwrap();
+        assert_eq!(plan.method, PresentationMethod::HarnessNative);
+        assert!(!plan.cleanup_required);
+        assert_eq!(plan.reason, "verified harness artifact panel");
     }
 }

@@ -1094,33 +1094,6 @@ fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
-/// This launch's composed prompt: `memory_entries` (already rendered by the
-/// caller) and the derived harness roster (only for an Orchestrator role)
-/// folded through `prompt::compose`, capped by `cfg.memory.core_max_bytes`.
-/// Pulled out of `run_with` (which opens a real pty) for the same reason
-/// other pure composition seams in this codebase are: testable without
-/// spawning anything.
-fn compose_launch_prompt(
-    memory_entries: &[super::prompt::MemoryLine],
-    harness_lines: &[String],
-    repo: &Path,
-    cfg: &CtxConfig,
-    role: PromptRole,
-    skip_injection: bool,
-) -> Option<super::prompt::ComposedPrompt> {
-    super::prompt::compose(
-        crate::utils::home_dir().ok().as_deref(),
-        repo,
-        skip_injection,
-        &cfg.prompt,
-        role,
-        memory_entries,
-        cfg.memory.core_max_bytes,
-        harness_lines,
-        cfg.context.max_harness_roster_bytes,
-    )
-}
-
 /// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
 /// not something a user ever types on the `wrap` command line, only something
 /// another verb (`zirv ctx chat`) decides on the caller's behalf. Both callers
@@ -5259,13 +5232,7 @@ mod tests {
         assert!(!prompt.contains('\u{2014}'));
     }
 
-    /// Issue #34 seam coverage (memory review, fix round): `run_with`'s
-    /// launch prompt must carry the memory core layer, bounded by the
-    /// CONFIGURED `cfg.memory.core_max_bytes` -- not a hardcoded default.
-    /// `run_with` itself opens a real pty (the `commands::ctx::wrap::tests`
-    /// pty family wedges on this machine, per this repo's own test
-    /// convention), so this exercises `compose_launch_prompt` directly: the
-    /// exact, pure composition step that call site uses -- no pty involved.
+    /// The compiler seam used by `run_with` must carry the bounded memory core.
     #[test]
     fn compose_launch_prompt_carries_the_memory_layer_under_its_configured_cap() {
         let repo = crate::commands::ctx::testenv::repo();
@@ -5295,16 +5262,18 @@ mod tests {
         )
         .expect("remember");
 
-        let memory_entries =
-            crate::commands::ctx::memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
-        let composed = compose_launch_prompt(
-            &memory_entries,
-            &[],
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+        let composed = crate::commands::ctx::compile::compile(
+            Some(&home),
             repo.path(),
-            &cfg,
-            PromptRole::Worker,
             false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            1,
         )
+        .composed
         .expect("a launch still composes a prompt");
 
         assert!(
