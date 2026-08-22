@@ -838,7 +838,12 @@ pub fn run(args: &SkillArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 .into_iter()
                 .map(|skill| skill.manifest.id.as_str())
                 .collect();
-            let capability_report = args.agent.as_deref().map(CapabilityReport::for_adapter);
+            let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
+            let capability_report = args
+                .agent
+                .as_deref()
+                .map(|adapter| CapabilityReport::for_repo(adapter, &repo))
+                .transpose()?;
             if let Some(report) = &capability_report {
                 registry.ensure_supported(&args.id, report)?;
             }

@@ -644,8 +644,7 @@ pub fn advance_with_evidence(
                             .into(),
                     );
                 }
-                let required =
-                    super::review::required_independent_reviews(state.classification.risk);
+                let required = super::review::required_independent_reviews_for(&state);
                 if required > 0 {
                     if state.review_evidence.is_empty() {
                         return Err(format!(
@@ -1105,7 +1104,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     dirs::home_dir().as_deref(),
                     !args.built_in_only,
                 )?;
-                let report = super::capability::CapabilityReport::for_adapter(agent);
+                let report = super::capability::CapabilityReport::for_repo(agent, &repo)?;
                 for step in materialize(definition.kind, &classification, profile) {
                     registry.ensure_supported(&step.skill, &report)?;
                 }
@@ -1563,6 +1562,7 @@ mod tests {
                 path: None,
                 line: None,
                 disposition: super::super::review::FindingDisposition::Open,
+                recommended_disposition: None,
                 created_at: now_secs(),
             });
         let error =
