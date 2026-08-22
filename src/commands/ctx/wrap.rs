@@ -5417,7 +5417,7 @@ mod tests {
         let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(20));
         assert!(seen.contains("stub-tui ready"), "relaunched: {seen:?}");
 
-        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        let log = wait_for_log(&state, "\"action\":\"restart\"", Duration::from_secs(10));
         assert!(
             log.contains("\"action\":\"restart\""),
             "old child quit and relaunch succeeded: {log}"
