@@ -738,11 +738,7 @@ zirv workflow status
 zirv frontend profile
 zirv frontend check
 zirv frontend render
-zirv frontend review --verdict pass \
-  --product-specificity 4 --user-journey 4 --hierarchy 4 \
-  --system-coherence 4 --typography 4 --color-contrast 4 \
-  --layout-rhythm 4 --interaction-affordance 4 --state-completeness 4 \
-  --responsive-composition 4 --accessibility 4 --content-clarity 4 --resilience 4
+zirv frontend review --agent codex
 zirv frontend benchmark
 zirv test changed
 zirv verify
@@ -763,10 +759,17 @@ the work; a 44-rule offline detector checks deterministic accessibility, UX,
 responsive, content, motion, internationalization, media, performance, and
 anti-slop hazards. Zirv starts and cleans up the discovered dev server, captures
 narrow/intermediate/wide screenshots, and requires a fresh AI review with 13
-explicit UI/UX scores, each at least 4/5. There is no frontend init command or
-questionnaire: the active agent owns routine design, rendering, and review
-decisions. Missing, stale, truncated, unavailable, weak, or failed evidence
-cannot advance frontend test, review, or verify gates.
+explicit UI/UX scores, each at least 4/5. The score is produced by an isolated,
+read-only Zirv reviewer rather than accepted from CLI arguments. There is no
+frontend init command or questionnaire: the active agent owns routine design,
+rendering, and review decisions. Missing, stale, truncated, unavailable, weak,
+or failed evidence cannot advance frontend test, review, or verify gates.
+
+Detector waivers are schema-versioned TOML in `.zirv/frontend-waivers.toml` or
+the operator-owned `~/.zirv/frontend-waivers.toml`. Every waiver names a rule,
+an exact path or `/**` prefix, an optional evidence value, and a reason.
+Repository waivers can disposition advisory craft findings; only the
+operator-owned file can waive a blocking accessibility finding.
 
 Optional repository checks live in `.zirv/verify.toml`. Custom skills may be
 shared under `.zirv/skills/` or kept operator-global under

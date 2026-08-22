@@ -87,7 +87,7 @@ pub enum FrontendSubcommand {
     Check(super::frontend_detector::DetectorArgs),
     /// Start the app and capture bounded narrow/intermediate/wide evidence.
     Render(super::frontend_render::RenderArgs),
-    /// Record the active AI agent's bounded review of fresh render evidence.
+    /// Launch an isolated AI review of fresh render evidence.
     Review(super::frontend_render::VisualReviewArgs),
     /// Inspect provider-neutral frontend capability and skill provenance.
     Capabilities(FrontendCapabilitiesArgs),
@@ -136,7 +136,7 @@ fn capabilities_for(adapter: &str, probe_browser: bool) -> FrontendCapabilities 
         adapter: adapter.to_string(),
         profile: "frontend-profile@1 + quality-contract@2 (built-in)",
         quality_contract_version: FRONTEND_QUALITY_CONTRACT_VERSION,
-        detector: "frontend-detector@2 (built-in, offline)",
+        detector: "frontend-detector@3 (built-in, offline)",
         detector_rules: super::frontend_detector::detector_rule_count(),
         review_dimensions: super::frontend_render::REVIEW_DIMENSIONS.to_vec(),
         surface_modes: vec!["persuade", "operate", "read", "experience"],

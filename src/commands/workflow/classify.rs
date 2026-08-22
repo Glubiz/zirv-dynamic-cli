@@ -763,4 +763,23 @@ mod tests {
 
         assert_eq!(classification.work_domain.domain, WorkDomain::Frontend);
     }
+
+    #[test]
+    fn mixed_monorepository_backend_only_work_does_not_select_frontend_methodology() {
+        let classification = classify(&ClassificationInput {
+            task: "Fix database retry handling in the API service".into(),
+            paths: vec![
+                PathBuf::from("services/api/src/retry.rs"),
+                PathBuf::from("services/api/tests/retry.rs"),
+            ],
+            changed_lines: 24,
+            tests_changed: true,
+            intent_override: None,
+            complexity_override: None,
+            risk_override: None,
+        })
+        .expect("classification");
+
+        assert_eq!(classification.work_domain.domain, WorkDomain::General);
+    }
 }

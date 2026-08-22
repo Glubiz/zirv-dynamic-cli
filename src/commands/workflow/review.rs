@@ -571,7 +571,7 @@ fn dash_channel_active() -> bool {
 /// The argv a reviewer is launched with, after the program itself. The
 /// adapter's read-only pin travels as trailing `-- flags`, which `zirv agent`
 /// passes through to the harness's own CLI.
-fn reviewer_argv(agent: &str) -> CtxResult<Vec<String>> {
+pub(crate) fn reviewer_argv(agent: &str) -> CtxResult<Vec<String>> {
     if agent.is_empty()
         || agent.len() > 64
         || !agent

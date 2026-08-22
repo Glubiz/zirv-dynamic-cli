@@ -581,11 +581,21 @@ pub fn advance_with_evidence(
                 )
                 && !super::frontend_detector::latest_is_fresh_and_passing(state_dir, &state.repo)?
             {
-                return Err(format!(
-                    "frontend step '{}' requires a fresh, non-truncated detector report with no blocking findings for the current change set; run `zirv frontend check` (or `zirv frontend check --all` when the change is already committed)",
-                    current.id
-                )
-                .into());
+                let report = super::frontend_detector::detect_for_workflow(
+                    state_dir,
+                    &state.repo,
+                    matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify),
+                )?;
+                if !report.passed() || report.truncated || report.analyzed_files.is_empty() {
+                    return Err(format!(
+                        "frontend step '{}' automatically ran the detector, but evidence did not pass ({} blocking, {} files, truncated={}); inspect with `zirv frontend check --all`",
+                        current.id,
+                        report.blocking_count(),
+                        report.analyzed_files.len(),
+                        report.truncated
+                    )
+                    .into());
+                }
             }
             if state.profile == WorkflowProfile::Frontend
                 && matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify)
@@ -594,11 +604,34 @@ pub fn advance_with_evidence(
                     &state.repo,
                 )?
             {
-                return Err(format!(
-                    "frontend step '{}' requires fresh narrow/intermediate/wide render evidence and a passing scored AI visual review for the current change set; run `zirv frontend render`, inspect every capture, then use `zirv frontend review --help` to record every required score with your verdict",
-                    current.id
-                )
-                .into());
+                let render = super::frontend_render::render(state_dir, &state.repo)?;
+                if !render.passed() {
+                    return Err(format!(
+                        "frontend step '{}' could not collect automatic rendered evidence: {}; inspect with `zirv frontend render`",
+                        current.id,
+                        render.notes.join("; ")
+                    )
+                    .into());
+                }
+                let review = super::frontend_render::review(
+                    state_dir,
+                    &state.repo,
+                    &super::frontend_render::VisualReviewArgs {
+                        repo: Some(state.repo.clone()),
+                        agent: None,
+                        model: None,
+                        json: false,
+                    },
+                )?;
+                if review.verdict != super::frontend_render::VisualVerdict::Pass {
+                    return Err(format!(
+                        "frontend step '{}' failed automatic visual review round {}: {}",
+                        current.id,
+                        review.review_round,
+                        review.findings.join("; ")
+                    )
+                    .into());
+                }
             }
             if current.phase == WorkflowPhase::Review {
                 if state
@@ -1306,11 +1339,15 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("zirv frontend check"));
+        assert!(
+            error.contains("automatically ran the detector")
+                || error.contains("cannot inspect changed paths"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn frontend_review_step_names_the_autonomous_visual_evidence_commands() {
+    fn frontend_review_step_collects_visual_evidence_automatically_and_fails_closed() {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
@@ -1357,6 +1394,8 @@ mod tests {
             analyzed_bytes: 64,
             truncated: false,
             findings: Vec::new(),
+            waivers_loaded: 0,
+            waivers_rejected: 0,
         };
         super::super::frontend_detector::save_report(&state_dir, &detector).unwrap();
         let mut classification = low_classification();
@@ -1381,8 +1420,9 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("zirv frontend render"));
-        assert!(error.contains("zirv frontend review --help"));
+        assert!(error.contains("automatic rendered evidence"), "{error}");
+        assert!(error.contains("zirv frontend render"), "{error}");
+        assert!(!error.contains("frontend review --help"), "{error}");
     }
 
     #[test]

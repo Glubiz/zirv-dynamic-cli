@@ -18,15 +18,24 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
 };
 
-pub const DETECTOR_REPORT_SCHEMA_VERSION: u32 = 2;
+pub const DETECTOR_REPORT_SCHEMA_VERSION: u32 = 3;
 const MAX_FILES: usize = 256;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FINDINGS: usize = 256;
 const MAX_SCAN_DEPTH: usize = 32;
+const MAX_WAIVERS: usize = 128;
+const MAX_WAIVER_BYTES: u64 = 64 * 1024;
+const MAX_WAIVER_REASON_BYTES: usize = 512;
+const MAX_EVIDENCE_BYTES: usize = 256;
 
 static IMAGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)<img\b[^>]*>").expect("valid image regex"));
+static DIOXUS_IMAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)\bimg\s*\{(?P<body>[^}]*)\}").expect("valid Dioxus image regex")
+});
+static DIOXUS_ALT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\balt\s*:").expect("valid Dioxus alt regex"));
 static ALT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)(?:^|\s)alt\s*="#).expect("valid alt attribute regex"));
 static CLICK_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -129,6 +138,29 @@ pub enum FindingSeverity {
     Blocking,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FindingDisposition {
+    #[default]
+    Active,
+    Waived,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WaiverSource {
+    Operator,
+    Repository,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaiverProvenance {
+    pub source: WaiverSource,
+    pub config_path: PathBuf,
+    pub reason: String,
+    pub applied: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum DetectorScope {
@@ -145,6 +177,18 @@ pub struct DetectorFinding {
     pub line: usize,
     pub summary: String,
     pub remediation: String,
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(default)]
+    pub disposition: FindingDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiver: Option<WaiverProvenance>,
+}
+
+impl DetectorFinding {
+    fn blocks(&self) -> bool {
+        self.severity == FindingSeverity::Blocking && self.disposition == FindingDisposition::Active
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,22 +204,45 @@ pub struct DetectorReport {
     pub analyzed_bytes: usize,
     pub truncated: bool,
     pub findings: Vec<DetectorFinding>,
+    #[serde(default)]
+    pub waivers_loaded: usize,
+    #[serde(default)]
+    pub waivers_rejected: usize,
 }
 
 impl DetectorReport {
     pub fn passed(&self) -> bool {
-        !self
-            .findings
-            .iter()
-            .any(|finding| finding.severity == FindingSeverity::Blocking)
+        !self.findings.iter().any(DetectorFinding::blocks)
     }
 
     pub fn blocking_count(&self) -> usize {
         self.findings
             .iter()
-            .filter(|finding| finding.severity == FindingSeverity::Blocking)
+            .filter(|finding| finding.blocks())
             .count()
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WaiverDocument {
+    schema_version: u32,
+    #[serde(default)]
+    waivers: Vec<WaiverRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WaiverRule {
+    rule_id: String,
+    path: Option<String>,
+    value: Option<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedWaiver {
+    source: WaiverSource,
+    config_path: PathBuf,
+    rule: WaiverRule,
 }
 
 #[derive(Debug, Args)]
@@ -285,7 +352,7 @@ pub fn detect(
             super::verification::changed_paths(&repo)?,
         )
     };
-    paths.retain(|path| is_frontend_source(path));
+    paths.retain(|path| is_frontend_source(&repo, path));
     paths.sort();
     paths.dedup();
     truncated |= paths.len() > MAX_FILES;
@@ -335,6 +402,8 @@ pub fn detect(
             .then(left.line.cmp(&right.line))
             .then(left.rule_id.cmp(&right.rule_id))
     });
+    let waivers = load_waivers(&repo)?;
+    let waivers_rejected = apply_waivers(&mut findings, &waivers);
 
     let change_fingerprint = super::verification::change_fingerprint(&repo)?;
     let report = DetectorReport {
@@ -349,6 +418,8 @@ pub fn detect(
         analyzed_bytes,
         truncated,
         findings,
+        waivers_loaded: waivers.len(),
+        waivers_rejected,
     };
     save_report(state, &report)?;
     let mut event =
@@ -369,6 +440,23 @@ pub fn detect(
         &super::telemetry::TelemetryConfig::for_repo(&report.repo),
     );
     Ok(report)
+}
+
+pub fn detect_for_workflow(
+    state: &StateDir,
+    repo: &Path,
+    require_full_surface: bool,
+) -> CtxResult<DetectorReport> {
+    let changed = super::verification::changed_paths(repo)?;
+    let has_existing_frontend_change = changed
+        .iter()
+        .any(|path| repo.join(path).is_file() && is_frontend_source(repo, path));
+    detect(
+        state,
+        repo,
+        &[],
+        require_full_surface || !has_existing_frontend_change,
+    )
 }
 
 fn resolve_file(repo: &Path, requested: &Path) -> CtxResult<(PathBuf, PathBuf)> {
@@ -446,7 +534,7 @@ fn collect_directory(
             }
         } else if metadata.is_file() {
             let relative = path.strip_prefix(repo).unwrap_or(&path).to_path_buf();
-            if is_frontend_source(&relative) {
+            if is_frontend_source(repo, &relative) {
                 paths.push(relative);
             }
         }
@@ -454,13 +542,45 @@ fn collect_directory(
     Ok(())
 }
 
-fn is_frontend_source(path: &Path) -> bool {
-    matches!(
+fn is_frontend_source(repo: &Path, path: &Path) -> bool {
+    if matches!(
         path.extension().and_then(|value| value.to_str()),
         Some(
             "css" | "scss" | "sass" | "less" | "html" | "tsx" | "jsx" | "vue" | "svelte" | "astro"
         )
-    )
+    ) {
+        return true;
+    }
+    path.extension().and_then(|value| value.to_str()) == Some("rs")
+        && dioxus_root_for(repo, path).is_some()
+}
+
+fn dioxus_root_for(repo: &Path, path: &Path) -> Option<PathBuf> {
+    let absolute = repo.join(path);
+    let mut directory = absolute.parent()?;
+    loop {
+        let dioxus = directory.join("Dioxus.toml");
+        let cargo = directory.join("Cargo.toml");
+        if dioxus.is_file() && bounded_manifest_contains(&cargo, "dioxus") {
+            return Some(directory.to_path_buf());
+        }
+        if directory == repo {
+            break;
+        }
+        directory = directory.parent()?;
+    }
+    None
+}
+
+fn bounded_manifest_contains(path: &Path, needle: &str) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_WAIVER_BYTES
+    {
+        return false;
+    }
+    std::fs::read_to_string(path).is_ok_and(|text| text.to_ascii_lowercase().contains(needle))
 }
 
 fn line_for(text: &str, offset: usize) -> usize {
@@ -487,10 +607,14 @@ fn finding(
         line,
         summary: summary.into(),
         remediation: remediation.into(),
+        evidence: String::new(),
+        disposition: FindingDisposition::Active,
+        waiver: None,
     });
 }
 
 fn analyze(path: &Path, text: &str, findings: &mut Vec<DetectorFinding>) {
+    let first_new = findings.len();
     let lower = text.to_ascii_lowercase();
     for image in IMAGE_RE.find_iter(text) {
         let tag = image.as_str();
@@ -516,6 +640,36 @@ fn analyze(path: &Path, text: &str, findings: &mut Vec<DetectorFinding>) {
                 "Image dimensions are not explicit in the element.",
                 "Provide intrinsic width and height or the framework's equivalent to prevent layout shift.",
             );
+        }
+    }
+    if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+        for image in DIOXUS_IMAGE_RE.captures_iter(text) {
+            let Some(whole) = image.get(0) else {
+                continue;
+            };
+            let body = image.name("body").map(|value| value.as_str()).unwrap_or("");
+            if !DIOXUS_ALT_RE.is_match(body) {
+                finding(
+                    findings,
+                    "a11y/image-alt",
+                    FindingSeverity::Blocking,
+                    path,
+                    line_for(text, whole.start()),
+                    "Dioxus image element has no alt contract.",
+                    "Add an alt attribute with meaningful text, or an empty value for decorative imagery.",
+                );
+            }
+            if !(body.contains("width:") && body.contains("height:")) {
+                finding(
+                    findings,
+                    "media/image-dimensions",
+                    FindingSeverity::Advisory,
+                    path,
+                    line_for(text, whole.start()),
+                    "Dioxus image dimensions are not explicit in the element.",
+                    "Provide intrinsic width and height to prevent layout shift.",
+                );
+            }
         }
     }
     for target in CLICK_RE.find_iter(text) {
@@ -1140,6 +1294,164 @@ fn analyze(path: &Path, text: &str, findings: &mut Vec<DetectorFinding>) {
             );
         }
     }
+    for finding in &mut findings[first_new..] {
+        let line = text
+            .lines()
+            .nth(finding.line.saturating_sub(1))
+            .unwrap_or("");
+        finding.evidence =
+            crate::utils::truncate_bytes(line.trim().to_string(), Some(MAX_EVIDENCE_BYTES));
+    }
+}
+
+fn read_waiver_document(path: &Path, source: WaiverSource) -> CtxResult<Vec<LoadedWaiver>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "frontend waiver file '{}' must be a regular non-symlink file",
+            path.display()
+        )
+        .into());
+    }
+    if metadata.len() > MAX_WAIVER_BYTES {
+        return Err(format!(
+            "frontend waiver file '{}' exceeds {MAX_WAIVER_BYTES} bytes",
+            path.display()
+        )
+        .into());
+    }
+    let document: WaiverDocument = toml::from_str(&std::fs::read_to_string(path)?)?;
+    if document.schema_version != 1 {
+        return Err(format!(
+            "frontend waiver file '{}': unsupported schema_version {}",
+            path.display(),
+            document.schema_version
+        )
+        .into());
+    }
+    if document.waivers.len() > MAX_WAIVERS {
+        return Err(format!(
+            "frontend waiver file '{}' has more than {MAX_WAIVERS} entries",
+            path.display()
+        )
+        .into());
+    }
+    document
+        .waivers
+        .into_iter()
+        .map(|rule| {
+            if !DETECTOR_RULE_IDS.contains(&rule.rule_id.as_str()) {
+                return Err(
+                    format!("frontend waiver references unknown rule '{}'", rule.rule_id).into(),
+                );
+            }
+            let reason = rule.reason.trim();
+            if reason.is_empty() || reason.len() > MAX_WAIVER_REASON_BYTES {
+                return Err(format!(
+                    "frontend waiver reason must contain 1..={MAX_WAIVER_REASON_BYTES} bytes"
+                )
+                .into());
+            }
+            if let Some(path) = rule.path.as_deref() {
+                let candidate = Path::new(path);
+                if candidate.is_absolute()
+                    || candidate.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(format!(
+                        "frontend waiver path '{path}' must stay repository-relative"
+                    )
+                    .into());
+                }
+            }
+            if rule
+                .value
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err("frontend waiver value must not be empty".into());
+            }
+            Ok(LoadedWaiver {
+                source,
+                config_path: path.to_path_buf(),
+                rule: WaiverRule {
+                    reason: reason.to_string(),
+                    ..rule
+                },
+            })
+        })
+        .collect()
+}
+
+fn load_waivers(repo: &Path) -> CtxResult<Vec<LoadedWaiver>> {
+    let mut waivers = Vec::new();
+    if let Ok(home) = crate::utils::home_dir() {
+        waivers.extend(read_waiver_document(
+            &home.join(".zirv/frontend-waivers.toml"),
+            WaiverSource::Operator,
+        )?);
+    }
+    waivers.extend(read_waiver_document(
+        &repo.join(".zirv/frontend-waivers.toml"),
+        WaiverSource::Repository,
+    )?);
+    Ok(waivers)
+}
+
+fn waiver_matches(waiver: &WaiverRule, finding: &DetectorFinding) -> bool {
+    if waiver.rule_id != finding.rule_id {
+        return false;
+    }
+    if let Some(pattern) = waiver.path.as_deref() {
+        let finding_path = finding.path.to_string_lossy().replace('\\', "/");
+        let pattern = pattern.replace('\\', "/");
+        let matches = pattern.strip_suffix("/**").map_or_else(
+            || finding_path == pattern,
+            |prefix| finding_path == prefix || finding_path.starts_with(&format!("{prefix}/")),
+        );
+        if !matches {
+            return false;
+        }
+    }
+    waiver
+        .value
+        .as_ref()
+        .is_none_or(|value| finding.evidence.contains(value))
+}
+
+fn apply_waivers(findings: &mut [DetectorFinding], waivers: &[LoadedWaiver]) -> usize {
+    let mut rejected = 0;
+    for finding in findings {
+        for waiver in waivers {
+            if !waiver_matches(&waiver.rule, finding) {
+                continue;
+            }
+            let applied = waiver.source == WaiverSource::Operator
+                || finding.severity != FindingSeverity::Blocking;
+            finding.waiver = Some(WaiverProvenance {
+                source: waiver.source,
+                config_path: waiver.config_path.clone(),
+                reason: waiver.rule.reason.clone(),
+                applied,
+            });
+            if applied {
+                finding.disposition = FindingDisposition::Waived;
+            } else {
+                rejected += 1;
+            }
+            break;
+        }
+    }
+    rejected
 }
 
 fn is_emoji(value: char) -> bool {
@@ -1173,6 +1485,20 @@ fn write_report(writer: &mut impl Write, report: &DetectorReport, json: bool) ->
             finding.rule_id,
             finding.summary
         )?;
+        if let Some(waiver) = &finding.waiver {
+            writeln!(
+                writer,
+                "  waiver: {} {:?} {} ({})",
+                if waiver.applied {
+                    "applied"
+                } else {
+                    "rejected"
+                },
+                waiver.source,
+                waiver.reason,
+                waiver.config_path.display()
+            )?;
+        }
     }
     if report.truncated {
         writeln!(writer, "warning: detector input or findings were truncated")?;
@@ -1190,6 +1516,36 @@ pub fn run(args: &DetectorArgs, writer: &mut impl Write) -> CtxResult<i32> {
     } else {
         1
     })
+}
+
+fn push_benchmark_case(
+    results: &mut Vec<BenchmarkCaseResult>,
+    covered: &mut BTreeSet<String>,
+    name: &str,
+    path: &Path,
+    source: &str,
+    expected: &[&str],
+) {
+    let mut findings = Vec::new();
+    analyze(path, source, &mut findings);
+    let mut observed_rules = findings
+        .into_iter()
+        .map(|finding| finding.rule_id)
+        .collect::<Vec<_>>();
+    observed_rules.sort();
+    observed_rules.dedup();
+    let mut expected_rules = expected
+        .iter()
+        .map(|rule| (*rule).to_string())
+        .collect::<Vec<_>>();
+    expected_rules.sort();
+    covered.extend(expected_rules.iter().cloned());
+    results.push(BenchmarkCaseResult {
+        name: name.into(),
+        passed: observed_rules == expected_rules,
+        expected_rules,
+        observed_rules,
+    });
 }
 
 pub fn benchmark() -> BenchmarkReport {
@@ -1356,29 +1712,113 @@ pub fn benchmark() -> BenchmarkReport {
             &["ux/autofocus"],
         ),
     ];
+    let framework_cases: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "plain-html-clean",
+            "index.html",
+            "<img src=\"logo.png\" alt=\"Zirv\" width=\"64\" height=\"64\">",
+            &[],
+        ),
+        (
+            "react-semantic-hazard",
+            "src/App.tsx",
+            "export function App() { return <div onClick={save}>Save</div>; }",
+            &["a11y/semantic-action"],
+        ),
+        (
+            "vue-clean",
+            "src/App.vue",
+            "<template><button type=\"button\">Save changes</button></template>",
+            &[],
+        ),
+        (
+            "vue-image-hazard",
+            "src/App.vue",
+            "<template><img src=\"/hero.png\"></template>",
+            &["a11y/image-alt", "media/image-dimensions"],
+        ),
+        (
+            "svelte-clean",
+            "src/routes/+page.svelte",
+            "<button type=\"button\" on:click={save}>Save changes</button>",
+            &[],
+        ),
+        (
+            "svelte-semantic-hazard",
+            "src/routes/+page.svelte",
+            "<div on:click={save}>Save</div>",
+            &["a11y/semantic-action"],
+        ),
+        (
+            "astro-clean",
+            "src/pages/index.astro",
+            "<img src={hero} alt=\"Product overview\" width=\"1200\" height=\"630\">",
+            &[],
+        ),
+        (
+            "astro-layout-shift-hazard",
+            "src/pages/index.astro",
+            "<img src={hero} alt=\"Product overview\">",
+            &["media/image-dimensions"],
+        ),
+        (
+            "dioxus-clean",
+            "src/main.rs",
+            "rsx! { img { src: \"logo.png\", alt: \"Zirv\", width: \"64\", height: \"64\" } }",
+            &[],
+        ),
+        (
+            "dioxus-image-hazard",
+            "src/main.rs",
+            "rsx! { img { src: \"logo.png\" } }",
+            &["a11y/image-alt", "media/image-dimensions"],
+        ),
+        (
+            "next-clean",
+            "app/page.tsx",
+            "export default function Page() { return <button type=\"button\">Create project</button>; }",
+            &[],
+        ),
+        (
+            "nuxt-image-hazard",
+            "pages/index.vue",
+            "<template><img src=\"/cover.png\" alt=\"Release cover\"></template>",
+            &["media/image-dimensions"],
+        ),
+        (
+            "tailwind-touch-target-clean",
+            "src/components/Menu.tsx",
+            "<button className=\"min-w-11 min-h-11\">Open menu</button>",
+            &[],
+        ),
+        (
+            "tailwind-touch-target-hazard",
+            "src/components/Menu.tsx",
+            "<button className=\"w-8 h-8\">Menu</button>",
+            &["touch/small-target"],
+        ),
+    ];
     let mut results = Vec::new();
     let mut covered = BTreeSet::new();
     for &(name, source, expected) in cases {
-        let mut findings = Vec::new();
-        analyze(Path::new("benchmark.tsx"), source, &mut findings);
-        let mut observed_rules = findings
-            .into_iter()
-            .map(|finding| finding.rule_id)
-            .collect::<Vec<_>>();
-        observed_rules.sort();
-        observed_rules.dedup();
-        let mut expected_rules = expected
-            .iter()
-            .map(|rule| (*rule).to_string())
-            .collect::<Vec<_>>();
-        expected_rules.sort();
-        covered.extend(expected_rules.iter().cloned());
-        results.push(BenchmarkCaseResult {
-            name: name.into(),
-            passed: observed_rules == expected_rules,
-            expected_rules,
-            observed_rules,
-        });
+        push_benchmark_case(
+            &mut results,
+            &mut covered,
+            name,
+            Path::new("benchmark.tsx"),
+            source,
+            expected,
+        );
+    }
+    for &(name, path, source, expected) in framework_cases {
+        push_benchmark_case(
+            &mut results,
+            &mut covered,
+            name,
+            Path::new(path),
+            source,
+            expected,
+        );
     }
     let passed = results.iter().filter(|result| result.passed).count();
     let inventory = DETECTOR_RULE_IDS
@@ -1556,5 +1996,138 @@ mod tests {
                 .iter()
                 .any(|finding| finding.rule_id == "motion/layout-properties")
         );
+    }
+
+    #[test]
+    fn dioxus_rsx_is_discovered_and_analyzed_as_frontend_source() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(
+            repo.path().join("Dioxus.toml"),
+            "[application]\nname='demo'\n",
+        )
+        .expect("dioxus");
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n[dependencies]\ndioxus='0.7'\n",
+        )
+        .expect("cargo");
+        std::fs::create_dir_all(repo.path().join("src")).expect("src");
+        let relative = Path::new("src/main.rs");
+        assert!(is_frontend_source(repo.path(), relative));
+
+        let mut findings = Vec::new();
+        analyze(
+            relative,
+            r#"fn app() -> Element { rsx! { img { src: asset!("/hero.png") } } }"#,
+            &mut findings,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == "a11y/image-alt" && finding.severity == FindingSeverity::Blocking
+        }));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "media/image-dimensions")
+        );
+    }
+
+    #[test]
+    fn repository_waivers_are_value_scoped_and_cannot_hide_blocking_rules() {
+        let root = tempfile::tempdir().expect("root");
+        let config = root.path().join("frontend-waivers.toml");
+        std::fs::write(
+            &config,
+            r#"schema_version = 1
+
+[[waivers]]
+rule_id = "craft/gradient-text"
+path = "src/Hero.css"
+value = "linear-gradient"
+reason = "Established campaign treatment approved by design."
+
+[[waivers]]
+rule_id = "a11y/image-alt"
+path = "src/Hero.tsx"
+reason = "Repository cannot waive operator-required accessibility rules."
+"#,
+        )
+        .expect("waivers");
+        let waivers = read_waiver_document(&config, WaiverSource::Repository).expect("load");
+        let mut findings = Vec::new();
+        analyze(
+            Path::new("src/Hero.css"),
+            ".title { background: linear-gradient(red, blue); background-clip: text; }",
+            &mut findings,
+        );
+        analyze(
+            Path::new("src/Hero.tsx"),
+            "<img src={hero} width=\"10\" height=\"10\">",
+            &mut findings,
+        );
+
+        assert_eq!(apply_waivers(&mut findings, &waivers), 1);
+        let advisory = findings
+            .iter()
+            .find(|finding| finding.rule_id == "craft/gradient-text")
+            .expect("advisory");
+        assert_eq!(advisory.disposition, FindingDisposition::Waived);
+        assert!(
+            advisory
+                .waiver
+                .as_ref()
+                .is_some_and(|waiver| waiver.applied)
+        );
+        let blocking = findings
+            .iter()
+            .find(|finding| finding.rule_id == "a11y/image-alt")
+            .expect("blocking");
+        assert!(blocking.blocks());
+        assert!(
+            blocking
+                .waiver
+                .as_ref()
+                .is_some_and(|waiver| !waiver.applied)
+        );
+    }
+
+    #[test]
+    fn operator_waiver_can_explicitly_dispose_a_blocking_finding() {
+        let root = tempfile::tempdir().expect("root");
+        let config = root.path().join("frontend-waivers.toml");
+        std::fs::write(
+            &config,
+            r#"schema_version = 1
+
+[[waivers]]
+rule_id = "a11y/image-alt"
+path = "src/decorative.tsx"
+reason = "Operator accepted this generated decorative surface temporarily."
+"#,
+        )
+        .expect("waivers");
+        let waivers = read_waiver_document(&config, WaiverSource::Operator).expect("load");
+        let mut findings = Vec::new();
+        analyze(
+            Path::new("src/decorative.tsx"),
+            "<img src={decoration} width=\"10\" height=\"10\">",
+            &mut findings,
+        );
+        assert_eq!(apply_waivers(&mut findings, &waivers), 0);
+        assert!(!findings[0].blocks());
+        assert_eq!(findings[0].disposition, FindingDisposition::Waived);
+    }
+
+    #[test]
+    fn waiver_reasons_are_mandatory() {
+        let root = tempfile::tempdir().expect("root");
+        let config = root.path().join("frontend-waivers.toml");
+        std::fs::write(
+            &config,
+            "schema_version=1\n[[waivers]]\nrule_id='craft/gradient-text'\nreason='  '\n",
+        )
+        .expect("waivers");
+        let error = read_waiver_document(&config, WaiverSource::Repository)
+            .expect_err("blank reason must fail");
+        assert!(error.to_string().contains("reason"));
     }
 }
