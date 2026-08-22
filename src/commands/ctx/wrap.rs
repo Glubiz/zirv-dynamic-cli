@@ -1245,6 +1245,12 @@ pub fn run_with(
         role,
         skip_injection,
     );
+    let composed = super::prompt::with_context_layer(
+        composed,
+        repo,
+        adapter.name(),
+        cfg.prompt.max_repo_bytes,
+    );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
     // silently override it with a second occurrence.
@@ -1267,11 +1273,11 @@ pub fn run_with(
         "wrap",
         session.as_str(),
         composed.as_ref(),
-        adapter.capabilities().system_prompt,
+        adapter.system_prompt_supported(&launch_command),
     );
     announcer.emit(&super::prompt::injection_event(
         composed.as_ref(),
-        adapter.capabilities().system_prompt,
+        adapter.system_prompt_supported(&launch_command),
     ));
     // Stripping the user's own --append-system-prompt (see
     // merge_command_line_prompt) can empty the argv even though args.command

@@ -222,11 +222,11 @@ fallback: `codex exec` with `[PROMPT]` omitted reads from stdin) instead of
 as an argv token cmd.exe would reparse. `codex::ready()` no longer hard-errors
 either -- it mirrors `ClaudeAdapter::ready` (`resolve_program(&self.program)?`)
 -- so codex is a selectable, launchable adapter, just with no event parsing
-wired up yet (`parse_events`/`structural_context` stay empty; no rot score, no
-usage source, no turn signal, no injected system prompt). There is no
-`system_prompt_file_flag` override because there is still no verified
-per-run system-prompt mechanism at all for codex, so nothing is ever put on
-argv for that flag to move off of. Full event support is tracked in
+wired up yet (`parse_events`/`structural_context` stay empty; no rot score).
+Direct launches carry composed context through the official
+`developer_instructions` config override; shell-shim launches fail closed and
+use task-text fallbacks only. `zirv setup` also registers the documented Codex
+lifecycle hooks, while full rollout event support remains tracked in
 [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11). See [[Ctx
 Adapters]].
 

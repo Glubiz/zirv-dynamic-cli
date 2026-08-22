@@ -437,6 +437,12 @@ pub(crate) fn dash_orchestrator_pane(
         cfg.memory.core_max_bytes,
         &harness_lines,
     );
+    let composed = super::prompt::with_context_layer(
+        composed,
+        repo,
+        adapter.name(),
+        cfg.prompt.max_repo_bytes,
+    );
     let (mut argv, composed) = super::prompt::merge_command_line_prompt(
         adapter,
         &launch.argv,
@@ -456,7 +462,7 @@ pub(crate) fn dash_orchestrator_pane(
         "chat",
         session,
         composed.as_ref(),
-        adapter.capabilities().system_prompt,
+        adapter.system_prompt_supported(&argv),
     );
     argv.extend(prompt_args);
     // R1: a dashboard pane -- and only a dashboard pane -- pins the harness's

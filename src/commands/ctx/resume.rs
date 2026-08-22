@@ -108,6 +108,8 @@ fn compose_prompt(
         memory_cap,
         &[],
     );
+    let composed =
+        super::prompt::with_context_layer(composed, repo, adapter.name(), cfg.max_repo_bytes);
     super::prompt::merge_command_line_prompt(
         adapter,
         extra,
@@ -188,7 +190,7 @@ pub fn run_with<W: Write>(
         "resume",
         session.as_str(),
         composed.as_ref(),
-        adapter.capabilities().system_prompt,
+        adapter.system_prompt_supported(&[]),
     );
     let extra: Vec<String> = user_extra
         .into_iter()

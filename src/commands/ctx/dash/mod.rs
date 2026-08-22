@@ -2117,7 +2117,9 @@ fn compose_worker_prompt(
         cfg.memory.core_max_bytes,
         &[],
     );
-    let system_prompt_supported = adapter.capabilities().system_prompt;
+    let composed =
+        prompt::with_context_layer(composed, repo, adapter.name(), cfg.prompt.max_repo_bytes);
+    let system_prompt_supported = adapter.system_prompt_supported(&[]);
     let should_list_mail = cfg.mail.enabled && (composed.is_some() || !system_prompt_supported);
     let mail_entries: Vec<(PathBuf, mail::Message)> = if should_list_mail {
         mail::list(
@@ -2228,12 +2230,11 @@ fn strip_leading_separator_for_an_empty_prompt(req_prompt: &str, text: String) -
 /// for a fact that cannot have changed between the two call sites.
 fn worker_task_prompt(
     req: &spawnreq::SpawnRequest,
-    adapter: &dyn AgentAdapter,
     mail_messages: &[mail::Message],
     cfg: &CtxConfig,
+    system_prompt_supported: bool,
     fallback_is_safe: bool,
 ) -> String {
-    let system_prompt_supported = adapter.capabilities().system_prompt;
     if !system_prompt_supported && !fallback_is_safe {
         return req.prompt.clone();
     }
@@ -2341,7 +2342,7 @@ fn fulfill_spawn_request(
         "dash",
         &session_id,
         composed.as_ref(),
-        adapter.capabilities().system_prompt,
+        adapter.system_prompt_supported(&[]),
     );
 
     // I: on a Windows `cmd.exe /c <shim>` launch, neither fallback block has
@@ -2364,7 +2365,7 @@ fn fulfill_spawn_request(
     // walk is skipped for it entirely rather than paid on every spawn
     // request for an answer nothing reads. `true` is a safe placeholder for
     // the unused case, matching what `||` short-circuiting already gives.
-    let system_prompt_supported = adapter.capabilities().system_prompt;
+    let system_prompt_supported = adapter.system_prompt_supported(&[]);
     let fallback_is_safe =
         system_prompt_supported || task_prompt_fallback_is_safe(adapter.as_ref());
     if !system_prompt_supported && !fallback_is_safe {
@@ -2403,8 +2404,13 @@ fn fulfill_spawn_request(
         mail_messages.clear();
     }
 
-    let effective_prompt =
-        worker_task_prompt(req, adapter.as_ref(), &mail_messages, cfg, fallback_is_safe);
+    let effective_prompt = worker_task_prompt(
+        req,
+        &mail_messages,
+        cfg,
+        system_prompt_supported,
+        fallback_is_safe,
+    );
 
     let mut extra = pane_model_args(req, cfg, adapter.as_ref());
     extra.extend(pane_launch_extra(
@@ -7675,18 +7681,14 @@ mod tests {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt =
-            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+        let prompt = worker_task_prompt(&req, &[a_mail_message()], &cfg, true, fallback_is_safe);
         assert_eq!(prompt, "do the work");
     }
 
-    /// The bug this exists to close: codex has no system-prompt injection
-    /// mechanism at all, so `compose_worker_prompt`'s `composed` never
-    /// reaches the launched process (`injection_args_for_session` always
-    /// returns an empty argv for it). Without this fallback, a codex worker
-    /// pane never received its mail and was never told to report back --
-    /// the requesting session would then wait forever for a reply that was
-    /// never sent.
+    /// A Codex shell-shim launch cannot safely carry `developer_instructions`,
+    /// so it falls back to the task prompt when that positional channel is
+    /// safe. Without this fallback, a worker pane would receive neither its
+    /// mail nor the report-back instruction.
     #[test]
     fn worker_task_prompt_appends_mail_and_report_back_for_an_uninjectable_adapter() {
         let req = spawn_request("do the work", Path::new("/repo"));
@@ -7698,8 +7700,7 @@ mod tests {
         let adapter = super::super::adapters::codex::CodexAdapter::new(Some("/tmp/fake-codex"));
         let cfg = CtxConfig::default();
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt =
-            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+        let prompt = worker_task_prompt(&req, &[a_mail_message()], &cfg, false, fallback_is_safe);
 
         assert!(prompt.starts_with("do the work"), "got {prompt}");
         assert!(
@@ -7734,8 +7735,7 @@ mod tests {
         let adapter = super::super::adapters::codex::CodexAdapter::new(Some("/tmp/fake-codex"));
         let cfg = CtxConfig::default();
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt =
-            worker_task_prompt(&req, &adapter, &[a_mail_message()], &cfg, fallback_is_safe);
+        let prompt = worker_task_prompt(&req, &[a_mail_message()], &cfg, false, fallback_is_safe);
 
         assert!(
             !prompt.trim_start().starts_with("---"),
@@ -7761,7 +7761,7 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.mail.enabled = false;
         let fallback_is_safe = task_prompt_fallback_is_safe(&adapter);
-        let prompt = worker_task_prompt(&req, &adapter, &[], &cfg, fallback_is_safe);
+        let prompt = worker_task_prompt(&req, &[], &cfg, false, fallback_is_safe);
         // The conventions layer still rides along when the fallback channel
         // is safe (it is gated on the prompt config and the shim guard, not
         // on mail) -- `fallback_is_safe` is platform-dependent: false on a
@@ -8038,13 +8038,11 @@ mod tests {
         );
     }
 
-    /// Codex has no system-prompt injection mechanism at all, so `compose_
-    /// worker_prompt` must not fold mail or the report-back instruction into
-    /// `composed` for it -- `injection_args_for_session` would turn that into
-    /// an empty argv and silently destroy both. `worker_task_prompt`'s own
-    /// tests cover where they land instead (the task prompt text).
+    /// A direct Codex launch supports `developer_instructions`, so worker
+    /// mail and report-back guidance belong in the composed prompt. Separate
+    /// shim tests cover the task-prompt fallback.
     #[test]
-    fn compose_worker_prompt_leaves_mail_and_report_back_out_of_composed_for_codex() {
+    fn compose_worker_prompt_includes_mail_and_report_back_for_direct_codex() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -8067,21 +8065,21 @@ mod tests {
 
         let composed = composed.expect("codex still gets the agent-neutral layers");
         assert!(
-            !composed.text.contains("heads up: the webhook route moved"),
-            "mail must not be folded into a composed prompt codex never receives:\n{}",
+            composed.text.contains("heads up: the webhook route moved"),
+            "direct codex must receive mail in developer instructions:\n{}",
             composed.text
         );
-        assert!(!composed.sources.contains(&prompt::PromptSource::Mail));
+        assert!(composed.sources.contains(&prompt::PromptSource::Mail));
         assert!(
-            !composed.text.contains("zirv ctx send --to-session"),
-            "nor the report-back instruction:\n{}",
+            composed.text.contains("zirv ctx send --to-session"),
+            "direct codex must receive the report-back instruction:\n{}",
             composed.text
         );
-        assert!(!composed.sources.contains(&prompt::PromptSource::ReportBack));
+        assert!(composed.sources.contains(&prompt::PromptSource::ReportBack));
         assert_eq!(
             mail_entries.len(),
             1,
-            "the mail is still listed, so the caller can fold it into the task prompt instead"
+            "the caller still needs the listed paths to consume delivered mail"
         );
     }
 

@@ -419,6 +419,14 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
 
+    /// Whether this concrete launch has a safe system-prompt channel. Most
+    /// adapters are launch-invariant; adapters using shell shims can narrow
+    /// their advertised capability for the unsafe launch shape.
+    fn system_prompt_supported(&self, launch: &[String]) -> bool {
+        let _ = launch;
+        self.capabilities().system_prompt
+    }
+
     /// What this harness can actually deliver for one of zirv's own policy
     /// capabilities at one requested stance -- the per-adapter half of
     /// `policy::evaluate`, which is the only caller.
@@ -1674,8 +1682,8 @@ mod tests {
         );
     }
 
-    /// F: codex is ready (its own `ready()` no longer hard-errors) but still
-    /// honestly all-`false` in `capabilities()`, so `--help`'s about text
+    /// F: codex is ready (its own `ready()` no longer hard-errors) but its
+    /// event/usage/turn capabilities remain degraded, so `--help`'s about text
     /// must keep disclosing the degraded surface even though codex no longer
     /// shows up in the "not ready yet" clause at all.
     #[test]
@@ -1689,7 +1697,7 @@ mod tests {
         assert!(note.contains("rot score"), "got {note}");
         assert!(note.contains("usage"), "got {note}");
         assert!(note.contains("turn signal"), "got {note}");
-        assert!(note.contains("injected prompt"), "got {note}");
+        assert!(!note.contains("injected prompt"), "got {note}");
         assert!(note.contains("issue #11"), "got {note}");
         assert!(
             !note.contains("claude (launch-level"),

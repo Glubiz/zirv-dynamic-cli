@@ -16,7 +16,7 @@ pub const SCRIPT_DIR_NAME: &str = ".zirv";
 /// shortcut sharing one of these names can never be reached.
 pub const RESERVED_COMMANDS: &[&str] = &[
     "help", "h", "version", "v", "init", "i", "create", "c", "ctx", "chat", "agent", "memory",
-    "skill", "workflow", "test", "verify", "artifact", "frontend",
+    "setup", "skill", "workflow", "test", "verify", "artifact", "frontend",
 ];
 
 /// Compared case-insensitively, the same way `is_reserved_zirv_file` compares
@@ -374,6 +374,7 @@ mod tests {
         assert!(is_reserved_command("help"));
         assert!(is_reserved_command("c"));
         assert!(is_reserved_command("frontend"));
+        assert!(is_reserved_command("setup"));
         assert!(!is_reserved_command("build"));
     }
 
@@ -388,6 +389,7 @@ mod tests {
         assert!(is_reserved_command("Agent"));
         assert!(is_reserved_command("CtX"));
         assert!(is_reserved_command("FRONTEND"));
+        assert!(is_reserved_command("SeTuP"));
         assert!(!is_reserved_command("Build"));
     }
 

@@ -94,6 +94,10 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     writeln!(writer, "  create, c      Create a new script")?;
     writeln!(
         writer,
+        "  setup          Configure AI context, memory, hooks, migration, and safe resets"
+    )?;
+    writeln!(
+        writer,
         "  skill          Inspect model-agnostic engineering skills"
     )?;
     writeln!(
@@ -123,7 +127,7 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     )?;
     writeln!(
         writer,
-        "  memory         Manage the memory bank without an AI session (status, list, recall,"
+        "  memory         Manage the memory bank without an AI session (init, status, list, recall,"
     )?;
     writeln!(writer, "                 remember, forget, verify)")?;
     writeln!(
