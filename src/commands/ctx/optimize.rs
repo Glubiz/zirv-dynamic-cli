@@ -2375,7 +2375,7 @@ mod tests {
             finding
                 .evidence
                 .iter()
-                .any(|e| e.contains(".zirv/context/common.md")),
+                .any(|e| e.replace('\\', "/").contains(".zirv/context/common.md")),
             "{finding:?}"
         );
         assert!(
@@ -4272,7 +4272,10 @@ mod tests {
                 crate::commands::ctx::state::STATE_ENV.to_string(),
                 state.display().to_string(),
             ),
-            ("ZIRV_CTX_AGENT_BIN".to_string(), bin.display().to_string()),
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                format!("sh {}", bin.display()),
+            ),
         ]
         .into()
     }

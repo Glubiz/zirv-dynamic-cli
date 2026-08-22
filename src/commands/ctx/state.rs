@@ -509,7 +509,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().to_path_buf());
         let path = state.socket_for("00000000-0000-4000-8000-000000000001");
         assert!(
-            path.to_string_lossy().ends_with("/s/00000000.sock"),
+            path.ends_with(std::path::Path::new("s").join("00000000.sock")),
             "got {}",
             path.display()
         );
