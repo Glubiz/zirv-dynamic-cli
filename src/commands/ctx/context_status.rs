@@ -477,6 +477,21 @@ fn render_per_harness_section<W: Write>(
 
         writeln!(
             w,
+            "    core memory: {} selected, {}B delivered, {} omitted",
+            compiled.core_memory.selected_entries,
+            compiled.core_memory.injected_bytes,
+            compiled.core_memory.omitted_entries
+        )?;
+        writeln!(
+            w,
+            "    retrieved memory: {} selected, {}B delivered, {} omitted",
+            compiled.retrieved_memory.selected_entries,
+            compiled.retrieved_memory.injected_bytes,
+            compiled.retrieved_memory.omitted_entries
+        )?;
+
+        writeln!(
+            w,
             "    policy alignment (no false equivalence across harnesses):"
         )?;
         for line in compiled.policy.render().lines() {
@@ -522,8 +537,18 @@ fn render_budgets_section<W: Write>(w: &mut W, cfg: &CtxConfig) -> CtxResult<()>
     )?;
     writeln!(
         w,
-        "  memory.max_injected_bytes = {} (memory bank injection)",
-        cfg.memory.max_injected_bytes
+        "  memory.core_max_bytes = {} (always-present core memory)",
+        cfg.memory.core_max_bytes
+    )?;
+    writeln!(
+        w,
+        "  memory.retrieval_max_bytes = {} (context-ranked memory)",
+        cfg.memory.retrieval_max_bytes
+    )?;
+    writeln!(
+        w,
+        "  memory.retrieval_max_entries = {} (context-ranked memory entry cap)",
+        cfg.memory.retrieval_max_entries
     )?;
     Ok(())
 }
@@ -903,7 +928,15 @@ mod tests {
         );
         assert!(out.contains("mail.max_delivered_bytes = 4096"), "got {out}");
         assert!(
-            out.contains("memory.max_injected_bytes = 2048"),
+            out.contains("memory.core_max_bytes = 2048"),
+            "got {out}"
+        );
+        assert!(
+            out.contains("memory.retrieval_max_bytes = 2048"),
+            "got {out}"
+        );
+        assert!(
+            out.contains("memory.retrieval_max_entries = 6"),
             "got {out}"
         );
     }

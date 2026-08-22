@@ -93,6 +93,8 @@ pub struct CompiledContext {
     pub composed: Option<ComposedPrompt>,
     pub policy: PolicyReport,
     pub provenance: Vec<ContextProvenance>,
+    pub core_memory: prompt::MemoryInjectionSummary,
+    pub retrieved_memory: prompt::MemoryInjectionSummary,
     /// `None` when no roster layer was actually added: a Worker role,
     /// `cfg.prompt.harnesses` off, an empty roster, or no composed prompt at
     /// all (`--simple`/`prompt.enabled = false`) -- mirroring `prompt::
@@ -377,6 +379,9 @@ pub fn compile_with_harness_roster(
 ) -> CompiledContext {
     let slug = super::state::repo_slug(repo);
     let (memory_entries, retrieved_memory) = gather_memory(state, repo, &slug, cfg, now);
+    let core_memory = prompt::memory_injection_summary(&memory_entries, cfg.memory.core_max_bytes);
+    let retrieved_memory_summary =
+        prompt::memory_injection_summary(&retrieved_memory, cfg.memory.retrieval_max_bytes);
     let harness_lines = if include_harness_roster {
         super::adapters::harness_prompt_lines(cfg, adapter.name())
     } else {
@@ -424,6 +429,8 @@ pub fn compile_with_harness_roster(
         composed,
         policy,
         provenance,
+        core_memory,
+        retrieved_memory: retrieved_memory_summary,
         harness_roster,
     }
 }
@@ -748,5 +755,90 @@ mod tests {
             .expect("claude has a registered harness-specific file");
         assert_eq!(layer, Layer::ContextClaude);
         assert_eq!(path, context::claude_path(repo.path()));
+    }
+
+    #[test]
+    fn changed_paths_select_relevant_memory_on_top_of_the_core_budget() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn changed() {}\n")
+            .expect("write changed path");
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .arg("init")
+            .output()
+            .expect("git init");
+        assert!(init.status.success());
+
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let slug = super::super::state::repo_slug(repo.path());
+        let mut cfg = CtxConfig::default();
+        cfg.memory.core_max_bytes = 32;
+        cfg.memory.retrieval_max_bytes = 1024;
+        cfg.memory.retrieval_max_entries = 4;
+
+        let filler = memory::Entry {
+            key: "recent-filler".to_string(),
+            body: "recent but unrelated filler memory".to_string(),
+            written: 300,
+            verified: 300,
+            written_by: "test".to_string(),
+            source: "explicit".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        let relevant = memory::Entry {
+            key: "path-specific-fact".to_string(),
+            body: "lib changes require the compatibility check".to_string(),
+            written: 100,
+            verified: 100,
+            written_by: "test".to_string(),
+            source: "explicit".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: vec!["src/lib.rs".to_string()],
+        };
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &filler,
+        )
+        .expect("store filler");
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &relevant,
+        )
+        .expect("store relevant");
+
+        let compiled = compile(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Worker,
+            &state,
+            now_secs(),
+        );
+        assert_eq!(compiled.core_memory.selected_entries, 1);
+        assert_eq!(compiled.retrieved_memory.selected_entries, 1);
+        let text = compiled.composed.expect("composed").text;
+        assert!(text.contains("path-specific-fact"), "got {text}");
+        assert!(
+            text.contains("lib changes require the compatibility check"),
+            "got {text}"
+        );
     }
 }
