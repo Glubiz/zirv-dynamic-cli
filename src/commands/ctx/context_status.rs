@@ -927,10 +927,7 @@ mod tests {
             "the new harness/orchestration budget must be reported too: {out}"
         );
         assert!(out.contains("mail.max_delivered_bytes = 4096"), "got {out}");
-        assert!(
-            out.contains("memory.core_max_bytes = 2048"),
-            "got {out}"
-        );
+        assert!(out.contains("memory.core_max_bytes = 2048"), "got {out}");
         assert!(
             out.contains("memory.retrieval_max_bytes = 2048"),
             "got {out}"
