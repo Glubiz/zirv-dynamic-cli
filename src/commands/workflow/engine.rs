@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use super::classify::{self, Classification, Complexity, Intent, RiskBand};
+use super::classify::{self, Classification, Complexity, Intent, RiskBand, WorkDomain};
 use super::skill::{SkillRegistry, WorkflowPhase};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{
@@ -289,6 +289,57 @@ pub enum WorkflowStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowProfile {
+    #[default]
+    Standard,
+    Frontend,
+}
+
+impl WorkflowProfile {
+    fn for_classification(classification: &Classification) -> Self {
+        match classification.work_domain.domain {
+            WorkDomain::Frontend => Self::Frontend,
+            WorkDomain::General => Self::Standard,
+        }
+    }
+}
+
+fn apply_profile(profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
+    if profile != WorkflowProfile::Frontend {
+        return;
+    }
+    for step in steps {
+        step.skill = match step.phase {
+            WorkflowPhase::Design => "frontend-design",
+            WorkflowPhase::Plan => "frontend-plan",
+            WorkflowPhase::Implement => "frontend-implement",
+            WorkflowPhase::Debug => "frontend-debug",
+            WorkflowPhase::Test => "frontend-test",
+            WorkflowPhase::Review => "frontend-review",
+            WorkflowPhase::Verify => "frontend-verify",
+            WorkflowPhase::Delegate | WorkflowPhase::Present => continue,
+        }
+        .into();
+        // The agent owns routine visual decisions. The workflow still
+        // enforces evidence gates; it never pauses for a theme vote.
+        if step.phase == WorkflowPhase::Design {
+            step.approval = false;
+        }
+    }
+}
+
+fn materialize(
+    kind: WorkflowKind,
+    classification: &Classification,
+    profile: WorkflowProfile,
+) -> Vec<WorkflowStep> {
+    let mut steps = definition(kind).materialize(classification);
+    apply_profile(profile, &mut steps);
+    steps
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowState {
     pub schema_version: u32,
@@ -296,6 +347,10 @@ pub struct WorkflowState {
     pub repo: PathBuf,
     pub task: String,
     pub kind: WorkflowKind,
+    /// Automatically selected methodology overlay. This is derived from the
+    /// task and change surface; there is deliberately no initialization flag.
+    #[serde(default)]
+    pub profile: WorkflowProfile,
     #[serde(default)]
     pub adapter: Option<String>,
     /// Whether operator-global and repository skills may override built-ins.
@@ -330,7 +385,8 @@ impl WorkflowState {
         include_custom_skills: bool,
         classification: Classification,
     ) -> Self {
-        let steps = definition(kind).materialize(&classification);
+        let profile = WorkflowProfile::for_classification(&classification);
+        let steps = materialize(kind, &classification, profile);
         let status = if steps.first().is_some_and(|step| step.approval) {
             WorkflowStatus::AwaitingApproval
         } else {
@@ -343,6 +399,7 @@ impl WorkflowState {
             repo,
             task,
             kind,
+            profile,
             adapter,
             include_custom_skills,
             classification,
@@ -452,7 +509,19 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
     let Ok(measured) = classify::classify(&input) else {
         return;
     };
+    if measured.work_domain.domain == WorkDomain::Frontend
+        && state.profile == WorkflowProfile::Standard
+    {
+        state.profile = WorkflowProfile::Frontend;
+        state.classification.work_domain = measured.work_domain.clone();
+        apply_profile(state.profile, &mut state.steps);
+        state.classification.reasons.push(format!(
+            "frontend workflow profile selected at step '{}'",
+            step.id
+        ));
+    }
     if measured.risk <= state.classification.risk {
+        state.classification.reasons.sort();
         return;
     }
     state.classification.risk = measured.risk;
@@ -472,8 +541,7 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
         .filter_map(|id| state.steps.iter().find(|step| &step.id == id).cloned())
         .collect();
     steps.extend(
-        definition(state.kind)
-            .materialize(&state.classification)
+        materialize(state.kind, &state.classification, state.profile)
             .into_iter()
             .filter(|step| {
                 !completed.contains(&step.id)
@@ -506,6 +574,65 @@ pub fn advance_with_evidence(
         .ok_or("workflow has no current step")?;
     match outcome {
         StepOutcome::Success => {
+            if state.profile == WorkflowProfile::Frontend
+                && matches!(
+                    current.phase,
+                    WorkflowPhase::Test | WorkflowPhase::Review | WorkflowPhase::Verify
+                )
+                && !super::frontend_detector::latest_is_fresh_and_passing(state_dir, &state.repo)?
+            {
+                let report = super::frontend_detector::detect_for_workflow(
+                    state_dir,
+                    &state.repo,
+                    matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify),
+                )?;
+                if !report.passed() || report.truncated || report.analyzed_files.is_empty() {
+                    return Err(format!(
+                        "frontend step '{}' automatically ran the detector, but evidence did not pass ({} blocking, {} files, truncated={}); inspect with `zirv frontend check --all`",
+                        current.id,
+                        report.blocking_count(),
+                        report.analyzed_files.len(),
+                        report.truncated
+                    )
+                    .into());
+                }
+            }
+            if state.profile == WorkflowProfile::Frontend
+                && matches!(current.phase, WorkflowPhase::Review | WorkflowPhase::Verify)
+                && !super::frontend_render::latest_visual_is_fresh_and_passing(
+                    state_dir,
+                    &state.repo,
+                )?
+            {
+                let render = super::frontend_render::render(state_dir, &state.repo)?;
+                if !render.passed() {
+                    return Err(format!(
+                        "frontend step '{}' could not collect automatic rendered evidence: {}; inspect with `zirv frontend render`",
+                        current.id,
+                        render.notes.join("; ")
+                    )
+                    .into());
+                }
+                let review = super::frontend_render::review(
+                    state_dir,
+                    &state.repo,
+                    &super::frontend_render::VisualReviewArgs {
+                        repo: Some(state.repo.clone()),
+                        agent: None,
+                        model: None,
+                        json: false,
+                    },
+                )?;
+                if review.verdict != super::frontend_render::VisualVerdict::Pass {
+                    return Err(format!(
+                        "frontend step '{}' failed automatic visual review round {}: {}",
+                        current.id,
+                        review.review_round,
+                        review.findings.join("; ")
+                    )
+                    .into());
+                }
+            }
             if current.phase == WorkflowPhase::Review {
                 if state
                     .review_findings
@@ -594,6 +721,7 @@ pub fn advance_with_evidence(
     event.intent = Some(state.classification.intent);
     event.complexity = Some(state.classification.complexity);
     event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
     event.duration_ms = evidence.duration_ms;
     event.adapter = evidence.adapter;
     event.model = evidence.model;
@@ -620,6 +748,7 @@ pub fn advance_with_evidence(
         completed.intent = Some(state.classification.intent);
         completed.complexity = Some(state.classification.complexity);
         completed.risk = Some(state.classification.risk);
+        completed.work_domain = Some(state.classification.work_domain.domain);
         completed.succeeded = Some(true);
         completed.findings_total = findings_total;
         completed.findings_meaningful = findings_meaningful;
@@ -663,13 +792,34 @@ pub fn render_current_context(
     }
     let registry = SkillRegistry::load_for_repo(repo, home, state.include_custom_skills)?;
     let stack = registry.resolve_stack(&step.skill)?;
+    let task = state
+        .task
+        .chars()
+        .take(1_024)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
     let mut rendered = format!(
-        "zirv workflow step\nworkflow: {}\nstep: {}\nphase: {}\nstate: {:?}\n",
+        "zirv workflow step\nworkflow: {}\nprofile: {:?}\ntask: {}\nstep: {}\nphase: {}\nstate: {:?}\n",
         state.kind.as_str(),
+        state.profile,
+        task,
         step.id,
         step.phase,
         state.status
     );
+    if state.profile == WorkflowProfile::Frontend {
+        let state_dir = StateDir::resolve(&|key| std::env::var(key).ok())?;
+        let profile = super::frontend::ensure_profile(&state_dir, repo)?;
+        rendered.push('\n');
+        rendered.push_str(&super::frontend::render_profile(&profile));
+        rendered.push('\n');
+    }
     for skill in stack {
         rendered.push_str(&format!(
             "\n[skill {}@{}; source={}]\n{}\n",
@@ -844,6 +994,7 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
     } else {
         writeln!(writer, "workflow: {}", state.id)?;
         writeln!(writer, "kind: {}", state.kind.as_str())?;
+        writeln!(writer, "profile: {:?}", state.profile)?;
         writeln!(writer, "status: {:?}", state.status)?;
         writeln!(
             writer,
@@ -914,8 +1065,12 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             } else {
                 writeln!(
                     writer,
-                    "intent={:?} complexity={:?} risk={:?} score={}",
-                    value.intent, value.complexity, value.risk, value.risk_score
+                    "intent={:?} domain={:?} complexity={:?} risk={:?} score={}",
+                    value.intent,
+                    value.work_domain.domain,
+                    value.complexity,
+                    value.risk,
+                    value.risk_score
                 )?;
                 for reason in value.reasons {
                     writeln!(writer, "- {reason}")?;
@@ -936,7 +1091,14 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 json: false,
             };
             let classification = classify::from_args(&classify_args)?;
+            let state_dir = resolve_state()?;
+            if classification.work_domain.domain == WorkDomain::Frontend {
+                // Eager zero-touch bootstrap. Prompt rendering refreshes this
+                // derived profile as repository evidence evolves.
+                super::frontend::ensure_profile(&state_dir, &repo)?;
+            }
             let definition = definition(args.kind);
+            let profile = WorkflowProfile::for_classification(&classification);
             if let Some(agent) = &args.agent {
                 let registry = SkillRegistry::load_for_repo(
                     &repo,
@@ -944,7 +1106,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     !args.built_in_only,
                 )?;
                 let report = super::capability::CapabilityReport::for_adapter(agent);
-                for step in definition.materialize(&classification) {
+                for step in materialize(definition.kind, &classification, profile) {
                     registry.ensure_supported(&step.skill, &report)?;
                 }
             }
@@ -956,7 +1118,6 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 !args.built_in_only,
                 classification,
             );
-            let state_dir = resolve_state()?;
             save(&state_dir, &state, true)?;
             let mut event = super::telemetry::TelemetryEvent::new(
                 super::telemetry::TelemetryKind::WorkflowStarted,
@@ -965,6 +1126,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             event.intent = Some(state.classification.intent);
             event.complexity = Some(state.classification.complexity);
             event.risk = Some(state.classification.risk);
+            event.work_domain = Some(state.classification.work_domain.domain);
             let _ = super::telemetry::record(
                 &state_dir,
                 &state.repo,
@@ -1057,6 +1219,7 @@ mod tests {
             changed_files: 1,
             changed_lines: 5,
             declared_scope: false,
+            work_domain: Default::default(),
             reasons: vec!["small".into()],
         }
     }
@@ -1094,6 +1257,172 @@ mod tests {
                 .first()
                 .is_some_and(|step| step.id == "design" && step.approval)
         );
+    }
+
+    #[test]
+    fn frontend_classification_selects_the_frontend_profile_automatically() {
+        let repo = tempdir().unwrap();
+        let mut classification = low_classification();
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "build a responsive dashboard UI".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+
+        assert_eq!(state.profile, WorkflowProfile::Frontend);
+        assert_eq!(state.current().unwrap().skill, "frontend-implement");
+    }
+
+    #[test]
+    fn frontend_design_is_autonomous_but_keeps_the_evidence_phases() {
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::High;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+
+        let state = WorkflowState::start(
+            PathBuf::from("repo"),
+            "build a frontend design system".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+
+        assert_eq!(state.status, WorkflowStatus::Running);
+        assert_eq!(state.steps[0].skill, "frontend-design");
+        assert!(!state.steps[0].approval);
+        assert!(
+            state
+                .steps
+                .iter()
+                .any(|step| step.skill == "frontend-review")
+        );
+        assert!(
+            state
+                .steps
+                .iter()
+                .any(|step| step.skill == "frontend-verify")
+        );
+    }
+
+    #[test]
+    fn frontend_test_step_fails_closed_without_detector_evidence() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut classification = low_classification();
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "build a frontend component".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("automatically ran the detector")
+                || error.contains("cannot inspect changed paths"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn frontend_review_step_collects_visual_evidence_automatically_and_fails_closed() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.path().join("App.tsx"),
+            "export const App = () => <main />;\n",
+        )
+        .unwrap();
+        git(&["add", "App.tsx"]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(
+            repo.path().join("App.tsx"),
+            "export const App = () => <main><h1>Settings</h1></main>;\n",
+        )
+        .unwrap();
+        let profile = super::super::frontend::ensure_profile(&state_dir, repo.path()).unwrap();
+        let detector = super::super::frontend_detector::DetectorReport {
+            schema_version: super::super::frontend_detector::DETECTOR_REPORT_SCHEMA_VERSION,
+            id: uuid::Uuid::new_v4().to_string(),
+            repo: repo.path().canonicalize().unwrap(),
+            change_fingerprint: super::super::verification::change_fingerprint(repo.path())
+                .unwrap(),
+            profile_fingerprint: profile.source_fingerprint,
+            scope: super::super::frontend_detector::DetectorScope::Changed,
+            generated_at: now_secs(),
+            analyzed_files: vec![PathBuf::from("App.tsx")],
+            analyzed_bytes: 64,
+            truncated: false,
+            findings: Vec::new(),
+            waivers_loaded: 0,
+            waivers_rejected: 0,
+        };
+        super::super::frontend_detector::save_report(&state_dir, &detector).unwrap();
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Review)
+            .unwrap();
+
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("automatic rendered evidence"), "{error}");
+        assert!(error.contains("zirv frontend render"), "{error}");
+        assert!(!error.contains("frontend review --help"), "{error}");
     }
 
     #[test]
@@ -1176,6 +1505,7 @@ mod tests {
         let implement = render_current_context(&state, repo.path(), None)
             .unwrap()
             .unwrap();
+        assert!(implement.contains("task: small feature"));
         state.completed_steps.push("implement".into());
         state.current_step += 1;
         let testing = render_current_context(&state, repo.path(), None)

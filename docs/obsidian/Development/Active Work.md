@@ -16,7 +16,9 @@ Entries use the format:
 
 ## In Progress
 
-_None right now — see Recently Completed below for the latest completed implementation._
+### Frontend quality workflow — nine-commit draft PR green (`feat/frontend-quality`, 2026-08-21, v2.19.0, PR #78)
+**Status (2026-08-21):** Issues #70–#77 plus the focused quality-contract v2 enhancement are implemented as nine dependency-ordered commits in draft PR #78 targeting `main`. Surface modes, product/design thesis and whole-journey reasoning, a 44-rule detector with complete inventory coverage, narrow/intermediate/wide evidence, a mandatory 13-dimension ≥4/5 AI-review gate, and durable task context all remain zero-touch. GitHub CI run 224 passed versioning, build, all 1,945 tests, rustfmt, Linux clippy, and Windows-target clippy.
+**Next:** maintainer review; mark PR #78 ready and merge the top stack PR when desired.
 
 ## Recently Completed
 

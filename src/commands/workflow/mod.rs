@@ -15,6 +15,9 @@ pub mod artifact;
 pub mod capability;
 pub mod classify;
 pub mod engine;
+pub mod frontend;
+pub mod frontend_detector;
+pub mod frontend_render;
 pub mod review;
 pub mod skill;
 pub mod telemetry;
@@ -23,7 +26,9 @@ pub mod verification;
 /// Reserved top-level names handled by this command tree. Later workflow
 /// layers add implementations for every name; reserving the complete surface
 /// now prevents a repository script from taking one over between releases.
-pub const TOP_LEVEL_COMMANDS: &[&str] = &["skill", "workflow", "test", "verify", "artifact"];
+pub const TOP_LEVEL_COMMANDS: &[&str] = &[
+    "skill", "workflow", "test", "verify", "artifact", "frontend",
+];
 
 /// The two operator gates over repository-provided workflow input:
 /// `workflow.repo_checks_enabled` (may `.zirv/verify.toml` and `package.json`
@@ -160,6 +165,8 @@ enum WorkflowCommand {
     Verify(verification::VerifyArgs),
     /// Register and present workflow artifacts.
     Artifact(artifact::ArtifactArgs),
+    /// Infer and inspect autonomous frontend quality state.
+    Frontend(frontend::FrontendArgs),
 }
 
 fn run(cli: &WorkflowCli, writer: &mut impl std::io::Write) -> CtxResult<i32> {
@@ -169,6 +176,7 @@ fn run(cli: &WorkflowCli, writer: &mut impl std::io::Write) -> CtxResult<i32> {
         WorkflowCommand::Test(args) => verification::run_test(args, writer),
         WorkflowCommand::Verify(args) => verification::run_verify(args, writer),
         WorkflowCommand::Artifact(args) => artifact::run(args, writer),
+        WorkflowCommand::Frontend(args) => frontend::run(args, writer),
     }
 }
 
@@ -230,5 +238,12 @@ mod tests {
         let cli = WorkflowCli::try_parse_from(normalized_args(&args))
             .expect("uppercase reserved workflow command should parse");
         assert!(matches!(cli.command, WorkflowCommand::Skill(_)));
+    }
+
+    #[test]
+    fn frontend_profile_command_parses_without_an_init_verb() {
+        let cli = WorkflowCli::try_parse_from(["zirv", "frontend", "profile"])
+            .expect("frontend profile should parse");
+        assert!(matches!(cli.command, WorkflowCommand::Frontend(_)));
     }
 }

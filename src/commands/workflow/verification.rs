@@ -916,6 +916,7 @@ fn persist(report: &VerificationReport, repo: &Path, mode: VerificationMode) -> 
         event.intent = Some(workflow.classification.intent);
         event.complexity = Some(workflow.classification.complexity);
         event.risk = Some(workflow.classification.risk);
+        event.work_domain = Some(workflow.classification.work_domain.domain);
     }
     let _ = super::telemetry::record(
         &state,

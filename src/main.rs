@@ -331,6 +331,8 @@ mod tests {
 
         assert!(is_top_level_workflow_command(&argv(&["zirv", "skill"])));
         assert!(is_top_level_workflow_command(&argv(&["zirv", "SKILL"])));
+        assert!(is_top_level_workflow_command(&argv(&["zirv", "frontend"])));
+        assert!(is_top_level_workflow_command(&argv(&["zirv", "FRONTEND"])));
         assert!(!is_top_level_workflow_command(&argv(&["zirv", "build"])));
     }
 

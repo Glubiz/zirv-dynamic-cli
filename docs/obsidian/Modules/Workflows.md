@@ -6,9 +6,9 @@ last-verified: 2026-08-21
 
 ## Quick Reference
 
-- **Files:** `src/commands/workflow/{mod,skill,capability,classify,engine,verification,review,artifact,telemetry}.rs`
-- **Commands:** `zirv skill`, `zirv workflow`, `zirv test`, `zirv verify`, `zirv artifact`
-- **State:** private platform state under `workflows/`, `verification/`, `artifacts/`, and `workflow-telemetry/`, each repository-scoped by the existing deterministic repo slug
+- **Files:** `src/commands/workflow/{mod,skill,capability,classify,engine,verification,review,artifact,telemetry,frontend,frontend_detector,frontend_render}.rs`
+- **Commands:** `zirv skill`, `zirv workflow`, `zirv test`, `zirv verify`, `zirv artifact`, `zirv frontend`
+- **State:** private platform state under `workflows/`, `verification/`, `artifacts/`, `workflow-telemetry/`, and `frontend/`, each repository-scoped by the existing deterministic repo slug
 - **Repository inputs:** `.zirv/skills/*.yaml|yml|toml` and optional `.zirv/verify.toml` — both untrusted, and both gated by an operator-only `[workflow]` config key
 - **Operator config:** `[workflow]` in `ctx.toml` — `repo_checks_enabled`, `repo_skills_enabled`, `telemetry_enabled`, `telemetry_max_events`, `telemetry_retention_days`, every one `REPO_FORBIDDEN`
 - **If changed:** [[Built-in Commands]], [[Architecture Overview]], [[Utilities]] when prompt-layer behavior changes, and [[Untrusted Configuration]] when trust/capability rules change
@@ -27,7 +27,7 @@ The current prompt integration is a narrow seam in `ctx::prompt::compose`. The f
 
 ## Skills
 
-`SkillManifest` schema version 1 includes a stable id/version, triggers, applicable phases, required/optional logical capabilities, context budget, dependencies, and an instruction body. Built-ins are embedded in the binary: `design`, `plan`, `implement`, `systematic-debugging`, `testing`, `tdd`, `review`, `verify`, `delegate`, and `parallelize`.
+`SkillManifest` schema version 1 includes a stable id/version, triggers, applicable phases, required/optional logical capabilities, context budget, dependencies, and an instruction body. General built-ins are embedded in the binary: `design`, `plan`, `implement`, `systematic-debugging`, `testing`, `tdd`, `review`, `verify`, `delegate`, and `parallelize`. Frontend work adds the built-in, repository-non-overridable `frontend-craft` floor and phase skills `frontend-{design,plan,implement,debug,test,review,verify}`. Every phase stack resolves the craft floor and its corresponding general engineering skill before the phase-specific frontend instructions.
 
 Registry precedence is deterministic and asymmetric: an operator-global manifest (`~/.zirv/skills`) may replace a built-in, because the operator is trusted; a repository manifest (`.zirv/skills`) may only **add** an id it does not already occupy. A repository id that collides with a built-in or operator-global skill is ignored, and the collision is reported as a warning naming both sides (`SkillRegistry::warnings`, printed by `zirv skill list/show`) rather than silently replacing trusted methodology text. `zirv skill list/show --built-in-only` disables both custom layers; `zirv workflow start --built-in-only` persists that trust choice in the workflow state, so resume and prompt rendering cannot silently re-enable an override; and the operator-only `workflow.repo_skills_enabled` (`REPO_FORBIDDEN`, see [[Untrusted Configuration]]) drops the repository layer entirely. Both gates fail **closed**: a `ctx.toml` that will not parse — a file a checkout controls one layer of — disables repo-provided skills *and* repo-provided checks and says so on the `zirv ▸` channel, rather than leaving either open or failing the command outright. Files, directory entry counts, individual instructions, and dependency-resolved stacks are bounded; unknown schema fields/versions fail; symlinked manifests or parent directories and path escapes are refused; dependency cycles/missing dependencies fail before resolution.
 
@@ -56,14 +56,51 @@ zirv workflow advance <id> --outcome success|failure
 zirv workflow resume <id>
 ```
 
-Classification separates intent, complexity (`trivial`, `bounded`, `substantial`, `architectural`), and risk (`low`, `medium`, `high`, `critical`). Identical path/line/task inputs produce the same score and sorted reasons. Both tracked and untracked change surfaces contribute paths and size signals, measured against the same merge-base diff base `review` uses (`origin/main`, then `main`, then `HEAD^`), so classification and review agree on what "the change" is. Sensitive auth/security or database/schema surfaces raise a High floor; an explicit `--risk` below that floor is refused outright, and every other input can only ever be *raised* toward it:
+Classification separates intent, work domain (`general` or `frontend`), complexity (`trivial`, `bounded`, `substantial`, `architectural`), and risk (`low`, `medium`, `high`, `critical`). Frontend selection is automatic from task language and changed frontend paths; there is no `--frontend` or init flag. Identical path/line/task inputs produce the same score and sorted reasons. Both tracked and untracked change surfaces contribute paths and size signals, measured against the same merge-base diff base `review` uses (`origin/main`, then `main`, then `HEAD^`), so classification and review agree on what "the change" is. Sensitive auth/security or database/schema surfaces raise a High floor; an explicit `--risk` below that floor is refused outright, and every other input can only ever be *raised* toward it:
 
 - Declared inputs (`--path`, `--changed-lines`) no longer switch Git measurement off. Both are computed and the higher band wins — for risk *and* for complexity, since complexity selects the plan step on its own — with `declared_scope: true` recorded on the classification so a consumer can tell a stated surface from a measured one. When Git cannot be measured at all, the declared band stands and the reason says so.
 - Classification is re-measured when a workflow advances *into* a review or verify step, and the band never drops (`engine::reclassify_at_gate`). Freezing it at `workflow start` measured an empty tree for the usual order of work — decide the plan, then write the code — so the review step was chosen before the change existed. If the new measurement requires a review or verify step the original materialization omitted, it is added; completed steps are never re-run, and no approval gate appears retroactively.
 
 Low-risk work omits design/reviewer ceremony; substantial or high-risk feature/refactor work keeps an approval-gated design step, and medium/high risk adds the explicit review depth defined by `review::depth_for_risk`.
 
+The frontend profile overlays those same durable workflows rather than creating a parallel engine. Design/plan/implement/debug/test/review/verify steps select their frontend phase skill; frontend design does not pause for a theme vote or initialization approval. Existing risk-based independent code review and all permission policy still apply.
+
 State files are atomic private JSON. The `active` pointer names one running/approval-pending workflow. Completion/failure clears it, so a later session cannot redispatch finished work. A failed step stops after three attempts.
+
+## Autonomous frontend quality
+
+`zirv frontend` is zero-touch by construction: the ordinary workflow/task classification is the trigger, and every missing routine design decision belongs to the active AI agent. No human has to run an initializer, answer a questionnaire, create a context file, select among generated themes, start a dev server, register screenshots, or perform the visual review.
+
+```text
+zirv frontend profile [--refresh] [--json]
+zirv frontend capabilities --agent claude|codex [--json]
+zirv frontend check [--all] [--path <file>] [--json]
+zirv frontend render [--json]
+zirv frontend review [--agent <id>] [--model <id>] [--json]
+zirv frontend benchmark [--json]
+```
+
+The profile scanner reads a deterministic, bounded subset of local frontend evidence (maximum 256 files, 64 KiB each, 1 MiB total), ignores dependency/build/state trees and symlinks, extracts compact type/color/geometry/motion signals, and persists only the synthesized profile plus capped evidence paths. Its fingerprint refreshes the profile automatically as the repository changes. Existing product language wins; a sparse repository gets an autonomous product-specific baseline, never a generic dashboard template. The prompt receives only the compact profile, the bounded task, and active skill stack. Quality contract v2 makes the agent classify the current surface as `persuade`, `operate`, `read`, or `experience`, then commit to the concrete subject/audience/job, product truth, design thesis, one signature, one justified risk, an anti-reference, a compact visual system, and the whole journey/state matrix. It preserves an established design world unless redesign is explicit and uses a counterfactual interchangeable-product test against generic output.
+
+The offline detector is model- and network-free. Its 44 versioned rules report structured blocking accessibility hazards plus advisory high-signal problems across forms, content, visual craft, internationalization, media, motion, performance, responsive layout, touch, typography, and UX. Examples include missing alt/semantic controls, hostile zoom/paste/tab order, heading and live-region defects, generic actions/copy, gradient/glass/card/pill/glow monoculture, weak form and media contracts, brittle widths/safe areas/overflow masks, costly motion/layout reads, manual plurals/physical CSS properties, touch targets, and placeholder-only controls. Inputs, files, bytes, findings, and finding text are capped; symlinks and repository escapes are refused. `zirv frontend benchmark` runs 41 focused and framework-specific fixtures and fails if observed findings drift or any inventory rule loses coverage. A detector report is passing workflow evidence only when it is non-truncated, analyzed at least one file, matches the current change and profile fingerprints, and has no active blocking findings; advisory findings remain context for the scored review rather than false-positive blockers.
+
+Waivers use schema-versioned TOML in the repository's `.zirv/frontend-waivers.toml` or the operator-owned `~/.zirv/frontend-waivers.toml`. Each entry requires `rule_id` and `reason`, and can narrow by an exact repository-relative `path` or `/**` prefix plus an exact evidence `value`. Applied and rejected waivers are persisted with source, config path, reason, and disposition. Repository configuration can waive advisory findings but cannot hide blocking accessibility findings; only the operator-owned file has that authority.
+
+```toml
+schema_version = 1
+
+[[waivers]]
+rule_id = "craft/gradient-text"
+path = "src/marketing/**"
+value = "linear-gradient"
+reason = "The established campaign identity intentionally uses this treatment."
+```
+
+`zirv frontend render` performs bounded recursive discovery for plain HTML, Vite-based React/Vue/Svelte applications, Next, Astro, Nuxt, and Dioxus web targets, including packages nested in monorepositories. Plain HTML is captured directly; executable repository scripts remain behind the operator-only `workflow.repo_checks_enabled` gate. Known adapters receive direct argv loopback flags, while an unknown generic script is refused because Zirv cannot prove its binding contract. Zirv selects a free loopback port, starts and tree-cleans the process under hard timeouts, discovers up to eight static routes, and captures fixed 390×844, 768×1024, and 1440×1000 PNGs with a local Chromium-family browser. It parses each PNG and requires its actual dimensions to match the requested viewport. Browser DNS is mapped away from external hosts. Missing runners/browsers/scripts produce explicit `unavailable` evidence, not a pass; dynamic/authenticated routes are not guessed.
+
+Zirv launches a configured agent as an isolated read-only reviewer; the caller cannot submit a verdict, scores, rubric, or findings. The bounded review package contains the task, profile, every emitted capture path and fingerprint, and detector evidence, and requires one strict JSON response. The required 1–5 rubric covers product specificity, user journey, hierarchy, system coherence, typography, color/contrast, layout rhythm, interaction affordance, state completeness, responsive composition, accessibility, content clarity, and resilience. A pass requires every score to be at least 4 and cannot contain an unresolved finding; a fail must name at least one. Review and verify steps automatically collect missing detector, render, and review evidence, then fail closed unless all evidence matches the current change and profile fingerprints and the review references the current render id. Test requires the detector; review/verify require all three. The workflow allows one batched fix pass and one confirmation review, preventing an unbounded self-polish loop.
+
+Profiles, detector reports, render reports, captures, and visual reviews stay in private state under `frontend/<repo_slug>/`. Provenance records built-in schema versions, evidence paths/fingerprints, server argv origin, browser, capture fingerprints/dimensions, reviewer adapter/model, and render linkage. `zirv frontend capabilities` renders the same provider-neutral skill/provenance contract and logical capability matrix for Claude and Codex; permissions still come from adapter/policy resolution, never from skill text.
 
 ## Verification
 
@@ -103,6 +140,6 @@ Findings are persisted with severity, optional path/line, and disposition (`open
 
 ## Telemetry
 
-`zirv workflow stats` aggregates local structured events by phase: duration, exposed token counts, verification failures, finding disposition, fix rounds, artifact counts, and worker counts. `--clear` removes this repository's telemetry. Controls live in the `[workflow]` config section — `telemetry_enabled`, `telemetry_max_events`, `telemetry_retention_days`, with `ZIRV_CTX_WORKFLOW_TELEMETRY*` as the operator's environment override — and all three are `REPO_FORBIDDEN`. They were previously plain `ZIRV_WORKFLOW_TELEMETRY*` environment reads, which any repository script could set for itself, and the boolean parse turned `0` into "enabled" because `bool::from_str` rejected it; `0`/`1` are now accepted alongside `true`/`false`, and anything else is a loud error.
+`zirv workflow stats` aggregates local structured events by phase: duration, exposed token counts, verification failures, finding disposition, fix rounds, artifact counts, worker counts, and frontend detector/render/visual-review run and failure counts. `--clear` removes this repository's telemetry. Controls live in the `[workflow]` config section — `telemetry_enabled`, `telemetry_max_events`, `telemetry_retention_days`, with `ZIRV_CTX_WORKFLOW_TELEMETRY*` as the operator's environment override — and all three are `REPO_FORBIDDEN`. They were previously plain `ZIRV_WORKFLOW_TELEMETRY*` environment reads, which any repository script could set for itself, and the boolean parse turned `0` into "enabled" because `bool::from_str` rejected it; `0`/`1` are now accepted alongside `true`/`false`, and anything else is a loud error.
 
 Each event is a separate private bounded JSON file, which avoids concurrent-writer corruption. Default retention is 1,000 events/30 days, with hard upper bounds even when configuration asks for more; free-form labels are capped before serialization. One unreadable event file is skipped with a warning rather than failing the whole `stats` command. Aggregates include per-adapter duration/token/failure comparisons and use each workflow's latest finding snapshot instead of double-counting the same findings across phases. The schema has no prompt, source-code, diff, model-response, or command-output field. Telemetry reports evidence; it does not silently weaken safety or review policy.

@@ -705,7 +705,7 @@ marks it as shadowed in the listing.
 ## Reserved Command Names
 
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `chat`, `agent`, `skill`,
-`workflow`, `test`, `verify`, `artifact`, and their short aliases `h`, `v`,
+`workflow`, `test`, `verify`, `artifact`, `frontend`, and their short aliases `h`, `v`,
 `i`, `c`, are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
 just as much as `chat`, matching how NTFS/APFS resolve script filenames), so
@@ -735,6 +735,11 @@ zirv workflow classify --task "fix authentication race"
 zirv workflow start bugfix --task "fix authentication race" --agent codex
 zirv workflow start feature --task "use only shipped methodology" --built-in-only
 zirv workflow status
+zirv frontend profile
+zirv frontend check
+zirv frontend render
+zirv frontend review --agent codex
+zirv frontend benchmark
 zirv test changed
 zirv verify
 zirv workflow stats
@@ -744,6 +749,27 @@ Built-in workflows cover `feature`, `bugfix`, `refactor`, `spike`, and
 `review`. Deterministic intent/complexity/risk classification selects
 proportional design, approval, test, and review depth; sensitive auth/security
 and database/schema changes cannot be downgraded below High risk.
+
+Frontend tasks are selected automatically from task and path evidence. Zirv
+derives a repository-specific design profile, classifies each surface as
+persuade/operate/read/experience, and requires a product-grounded design thesis,
+signature, justified risk, system, complete user journey, and resilient state
+matrix before implementation. A built-in craft floor plus phase skills drive
+the work; a 44-rule offline detector checks deterministic accessibility, UX,
+responsive, content, motion, internationalization, media, performance, and
+anti-slop hazards. Zirv starts and cleans up the discovered dev server, captures
+narrow/intermediate/wide screenshots, and requires a fresh AI review with 13
+explicit UI/UX scores, each at least 4/5. The score is produced by an isolated,
+read-only Zirv reviewer rather than accepted from CLI arguments. There is no
+frontend init command or questionnaire: the active agent owns routine design,
+rendering, and review decisions. Missing, stale, truncated, unavailable, weak,
+or failed evidence cannot advance frontend test, review, or verify gates.
+
+Detector waivers are schema-versioned TOML in `.zirv/frontend-waivers.toml` or
+the operator-owned `~/.zirv/frontend-waivers.toml`. Every waiver names a rule,
+an exact path or `/**` prefix, an optional evidence value, and a reason.
+Repository waivers can disposition advisory craft findings; only the
+operator-owned file can waive a blocking accessibility finding.
 
 Optional repository checks live in `.zirv/verify.toml`. Custom skills may be
 shared under `.zirv/skills/` or kept operator-global under

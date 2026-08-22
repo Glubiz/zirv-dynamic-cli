@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-20
+last-verified: 2026-08-21
 ---
 
 # Built-in Commands
@@ -11,18 +11,18 @@ last-verified: 2026-08-20
 - **Depends on:** [[Script Runner]] (`execute`), [[Utilities]] (`file_to_script`, `home_dir`, `Shortcuts`, `is_reserved_command`, `candidate_names_in_dir`, `suggest_matches`), [[Workflows]] (`workflow::dispatch`), [[Ctx Subsystem]] (`ctx::dispatch`, `ctx::memory_cli::dispatch`, both intercepted before clap runs at all)
 - **Tests:** inline `#[cfg(test)] mod tests` in each file (`main::tests`, `input::tests`, `create::tests`, `init::tests`, `help::tests`; `version.rs` has no dedicated module dependency beyond its own version string)
 - **If changed:** [[Script Resolution]], [[Shortcuts]], [[Getting Started]], [[Ctx Supervisors]] (the dashboard `zirv chat` opens on a capable terminal)
-- **Gotchas:** `zirv ctx …`, `zirv memory …`, `zirv chat`/`zirv agent`, `zirv skill`/`workflow`/`test`/`verify`/`artifact`, a bare `zirv`, and top-level `zirv --help`/`-h` are all matched against raw `argv` *before* clap parses anything — a `.zirv/ctx.yaml` (or `memory.yaml`/`chat.yaml`/`agent.yaml`/`workflow.yaml`) script is permanently shadowed, and clap's own auto-generated help for the `Input` struct never fires. A bare `zirv` used to be a clap usage error (exit 2, missing the required `command` argument) — it is now an alias, a deliberate behavior change (see below).
+- **Gotchas:** `zirv ctx …`, `zirv memory …`, `zirv chat`/`zirv agent`, `zirv skill`/`workflow`/`test`/`verify`/`artifact`/`frontend`, a bare `zirv`, and top-level `zirv --help`/`-h` are all matched against raw `argv` *before* clap parses anything — a `.zirv/ctx.yaml` (or `memory.yaml`/`chat.yaml`/`agent.yaml`/`workflow.yaml`) script is permanently shadowed, and clap's own auto-generated help for the `Input` struct never fires. A bare `zirv` used to be a clap usage error (exit 2, missing the required `command` argument) — it is now an alias, a deliberate behavior change (see below).
 
 ## Purpose
 
-`main.rs` is the CLI's dispatch table: a fixed set of built-ins (`help`, `version`, `init`, `create`, `ctx`, `memory`, `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`) checked before anything falls through to "treat this word as a script name in `.zirv/`".
+`main.rs` is the CLI's dispatch table: a fixed set of built-ins (`help`, `version`, `init`, `create`, `ctx`, `memory`, `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`) checked before anything falls through to "treat this word as a script name in `.zirv/`".
 
 ## How It Works
 
 ### Dispatch order (`main.rs`)
 
 1. **Raw-argv `ctx` check** — `argv[1] == "ctx"` routes straight to `commands::ctx::dispatch`, bypassing `Input`/clap entirely. This is why `.zirv/ctx.yaml` can never be reached as a script (see `help.rs`'s "shadowed" marker below) and why a malformed `.zirv/ctx.toml` never breaks script lookup — `main.rs` never gets that far for `ctx`.
-2. **Raw-argv workflow command check** (`is_top_level_workflow_command`) — `skill`, `workflow`, `test`, `verify` and `artifact` route to `commands::workflow::dispatch`, whose clap tree is independent of both `CtxCli` and the legacy script surface. These names are reserved, and `.zirv/verify.toml` is excluded from script resolution and listing.
+2. **Raw-argv workflow command check** (`is_top_level_workflow_command`) — `skill`, `workflow`, `test`, `verify`, `artifact`, and `frontend` route to `commands::workflow::dispatch`, whose clap tree is independent of both `CtxCli` and the legacy script surface. These names are reserved, and `.zirv/verify.toml` is excluded from script resolution and listing.
 3. **Raw-argv `memory` check** (`is_top_level_memory`) — `argv[1] == "memory"` routes straight to `commands::ctx::memory_cli::dispatch`, the same bypass-clap-entirely treatment as `ctx` above. Unlike the `chat`/`agent` aliases below, `memory` is not a 1:1 rewrite into a single `ctx` verb — it carries its own verb tree (`status`/`list`/`recall`/`remember`/`forget`/`verify`) and its own `clap::Parser` (`MemoryCli`), dispatched independently of `CtxCli`. See [[Ctx Subsystem]] for the verb-level detail.
 4. **Raw-argv `chat`/`agent` alias check** (`top_level_ctx_alias`) — `argv[1] == "chat"` or `"agent"` rewrites argv (`rewrite_ctx_alias_args`) into `["ctx", <verb>, ...rest]` and routes through the same `ctx::dispatch` the raw `ctx` check above uses, so the alias gets the full ctx verb tree for free: subcommand parsing, `--help` exiting 0, and the same parse-failure classification `zirv ctx chat --help` would get.
 5. **Bare invocation** (`argv.len() == 1`, i.e. no arguments at all) — `bare_invocation_target(zirv_dir_exists, stdin_is_tty)` is a pure function of two caller-supplied facts (`zirv_dir_present` checks `./.zirv` and `~/.zirv`; `std::io::IsTerminal` checks stdin) deciding `BareTarget::Chat` (routes to `ctx::dispatch(["ctx", "chat"])`) or `BareTarget::Help` (prints `show_help`, **exit 0**). This is the deliberate behavior change: before this, `Input::command` being a required positional meant a bare `zirv` was a clap usage error exiting 2. As of the dashboard sweep, the `chat` this routes to is no longer always a plain `wrap` passthrough — see the note below.
@@ -50,11 +50,15 @@ An explicit `zirv chat`/`zirv agent` (step 4) is not subject to the bare-invocat
 
 ### `help` (`commands/help.rs`)
 
-`show_help` writes: a builtins/usage block (hardcoded, not generated from clap — intercepting `--help` took away clap's auto-generated help, so this exists specifically to keep every flag discoverable), then local `.zirv/` scripts and shortcuts, then global `~/.zirv` scripts and shortcuts. The builtins block names `chat`/`agent` alongside the older built-ins and states the bare-invocation rule in one line, so both are discoverable from `zirv help` and not just from this page. Script listing skips every name in `utils::RESERVED_ZIRV_FILES` (`.shortcuts.yaml`, `ctx.toml`, `.settings.toml`, `verify.toml`), compared case-insensitively (`utils::is_reserved_zirv_file`, since NTFS/APFS resolve file names case-insensitively too) — parsing one of these as a `Script` used to fail the whole listing. Any script file or shortcut whose name collides with a reserved built-in (`utils::RESERVED_COMMANDS`: `help`/`h`, `version`/`v`, `init`/`i`, `create`/`c`, `ctx`, `memory`, `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`) is annotated `(shadowed by a built-in command, unreachable)`, since `main.rs`'s built-in match runs before `.zirv/` is ever consulted.
+`show_help` writes: a builtins/usage block (hardcoded, not generated from clap — intercepting `--help` took away clap's auto-generated help, so this exists specifically to keep every flag discoverable), then local `.zirv/` scripts and shortcuts, then global `~/.zirv` scripts and shortcuts. The builtins block names `chat`/`agent` alongside the older built-ins and states the bare-invocation rule in one line, so both are discoverable from `zirv help` and not just from this page. Script listing skips every name in `utils::RESERVED_ZIRV_FILES` (`.shortcuts.yaml`, `ctx.toml`, `.settings.toml`, `verify.toml`), compared case-insensitively (`utils::is_reserved_zirv_file`, since NTFS/APFS resolve file names case-insensitively too) — parsing one of these as a `Script` used to fail the whole listing. Any script file or shortcut whose name collides with a reserved built-in (`utils::RESERVED_COMMANDS`: `help`/`h`, `version`/`v`, `init`/`i`, `create`/`c`, `ctx`, `memory`, `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`) is annotated `(shadowed by a built-in command, unreachable)`, since `main.rs`'s built-in match runs before `.zirv/` is ever consulted.
 
 ### `version` (`commands/version.rs`)
 
 One line: `Version: {CARGO_PKG_VERSION}`.
+
+### `zirv frontend` (`commands/workflow/frontend*.rs`)
+
+The reserved `frontend` family is an autonomous workflow-quality surface, not an initializer. `profile` lazily infers or refreshes bounded product/design evidence and adds the built-in quality contract; `capabilities --agent <name>` reports provider-neutral skill, surface-mode, detector, rubric, and capability provenance; `check` runs the 44-rule offline detector; `render` discovers a package script, starts/cleans the loopback server, and captures narrow/intermediate/wide PNGs; `review` stores the active AI agent's bounded verdict plus all 13 required UI/UX scores; and `benchmark` mutation-checks the detector corpus and complete rule inventory. A frontend workflow selects and runs these requirements automatically through its phase skills and evidence gates. See [[Workflows]] for trust boundaries, caps, freshness, and known rendering limits.
 
 ### `zirv memory` (`commands/ctx/memory_cli.rs`)
 

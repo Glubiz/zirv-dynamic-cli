@@ -24,6 +24,13 @@ last-verified: 2026-08-21
 
 ## Decisions
 
+### 2026-08-21 — Frontend quality combines autonomous design judgment with deterministic and scored evidence
+**Context:** AI-generated frontends need stronger taste, product reasoning, UX completeness, and enforcement, but a profile wizard, server handoff, screenshot registration, or human theme vote breaks unattended use. Source rules alone cannot prove visual quality, while an unconstrained model verdict is too easy to wave through.
+**Decision:** Derive a bounded repository profile and have the AI classify each surface mode, preserve product truth, commit to a thesis/signature/risk/system, and design the whole journey. Enforce a 44-rule offline detector at test/review/verify; at review/verify require fresh three-width renders and 13 explicit UI/UX scores, all ≥4/5 with no unresolved finding and current change/profile/render provenance.
+**Rejected:** Instructions alone — no freshness or completion guarantee. Making subjective heuristics blocking — established systems legitimately use some flagged techniques. Model calls inside the detector — no longer deterministic, offline, or adapter-neutral. Missing browser as pass — turns unavailable evidence into a false quality claim.
+**Consequences:** Contextual detector findings feed rather than replace AI judgment; the scored contract makes that judgment auditable but cannot prove attention. Package scripts remain checkout-authored and run only behind the operator gate with direct argv, loopback binding, timeouts, and tree cleanup. The whole path stays automatic and uses a bounded two-pass render loop.
+**Spec / link:** issues #70–#77; `src/commands/workflow/frontend*.rs`; [[Workflows]], [[Known Issues]].
+
 ### 2026-08-21 — Stacked topic branches merge by retargeting to `main` and merging only the stack's top PR
 **Context:** The memory and context reworks were each developed as a stack of small, reviewable PRs (memory: #57→#58→#62→#64→#66; context: #60→#61→#63→#65, then #67 on top of that). Merging each PR into `main` in sequence would cost one version bump and one release per PR — five releases for one coherent topic.
 **Decision:** Retarget every PR in a stack's base to `main`, then merge only the top PR; GitHub resolves the lower PRs in the stack as merged too, since their commits are already ancestors of the top's once the stack lands. One version bump and one CI/release cycle per topic, not per PR.
@@ -344,4 +351,3 @@ last-verified: 2026-08-21
 **Rejected:** A single combined write (message text inside the marker file itself) — couples the fast path (wake-up) to the durable path (message); losing or racing the one file loses both, and the message would no longer show up in `zirv ctx inbox` independent of whether the wake-up was ever claimed. A dedicated notification channel (new socket message type) — turn signals already exist for a different purpose (transcript-derived verdicts from *inside* the agent); a nudge originates *outside* it, from an operator, and reusing the socket would conflate the two origins.
 **Consequences:** Losing the marker (a crash between the two writes, or nobody claiming it before the state dir is swept) never loses the message — it's just picked up at the next natural poll or cycle instead of immediately. `exec`'s nudge-restart is budget-free by the same design split: it is not rot, so it must never spend the rot-restart budget.
 **Spec / link:** `src/commands/ctx/sessions.rs`'s N4 module doc comment; [[Ctx Subsystem]], [[Ctx Supervisors]].
-

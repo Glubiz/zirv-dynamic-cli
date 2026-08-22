@@ -528,6 +528,7 @@ fn record_finding_update(state_dir: &StateDir, state: &WorkflowState) {
     event.intent = Some(state.classification.intent);
     event.complexity = Some(state.classification.complexity);
     event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
     event.findings_total = total;
     event.findings_meaningful = meaningful;
     event.findings_dismissed = dismissed;
@@ -570,7 +571,7 @@ fn dash_channel_active() -> bool {
 /// The argv a reviewer is launched with, after the program itself. The
 /// adapter's read-only pin travels as trailing `-- flags`, which `zirv agent`
 /// passes through to the harness's own CLI.
-fn reviewer_argv(agent: &str) -> CtxResult<Vec<String>> {
+pub(crate) fn reviewer_argv(agent: &str) -> CtxResult<Vec<String>> {
     if agent.is_empty()
         || agent.len() > 64
         || !agent
@@ -726,6 +727,7 @@ fn run_independent_review(
     event.intent = Some(state.classification.intent);
     event.complexity = Some(state.classification.complexity);
     event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
     event.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
     event.adapter = Some(args.agent.clone());
     event.succeeded = Some(records_evidence(&run, fingerprint_unchanged));
@@ -903,6 +905,7 @@ mod tests {
             changed_files: 1,
             changed_lines: 10,
             declared_scope: false,
+            work_domain: Default::default(),
             reasons: vec![],
         };
         let state = WorkflowState::start(
