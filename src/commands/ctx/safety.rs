@@ -946,6 +946,54 @@ mod tests {
         }
     }
 
+    /// Issue #104: zirv's own injected prompt routinely instructs a session
+    /// to run `zirv ctx ...`/`zirv agent ...` -- the shipped default must
+    /// actually allow zirv's own CLI, not deny it by omission the same way
+    /// `dontAsk` denies anything unlisted (issue #98).
+    #[test]
+    fn prompt_mandated_zirv_commands_are_allowed_by_the_shipped_posture() {
+        let policy = SafetyPolicy::default();
+        for command in ["zirv ctx status", "zirv agent codex \"do the thing\""] {
+            let outcome = evaluate(&policy, command);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "{command}: expected Allow, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    /// Issue #104's own worked examples, evaluated against the real shipped
+    /// default (not a hand-built `policy_with`, unlike `evaluate_table_
+    /// matches_the_issues_own_examples` above) -- this is the end-to-end
+    /// check that the whole-family allow entries plus the new deny
+    /// additions actually classify the way the issue describes.
+    #[test]
+    fn evaluate_shipped_default_matches_issue_104_examples() {
+        let policy = SafetyPolicy::default();
+        let cases: &[(&str, Verdict)] = &[
+            ("gh pr create --title x", Verdict::Allow),
+            ("cargo run -- version", Verdict::Allow),
+            ("cat src/main.rs", Verdict::Allow),
+            ("cat ~/.aws/credentials", Verdict::Deny),
+            ("gh repo delete x", Verdict::Deny),
+            ("cargo publish", Verdict::Deny),
+            ("git clean -fdx", Verdict::Deny),
+            ("git push --delete origin x", Verdict::Deny),
+            ("npm publish", Verdict::Deny),
+            ("some-unknown-tool --flag", Verdict::Ask),
+        ];
+        for (command, expected) in cases {
+            let outcome = evaluate(&policy, command);
+            assert_eq!(
+                outcome.verdict, *expected,
+                "{command}: expected {expected:?}, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
     #[test]
     fn evaluate_first_match_wins_within_a_category() {
         let policy = policy_with(
@@ -1105,7 +1153,22 @@ mod tests {
         let allow = builtin_allow();
         assert!(!allow.iter().any(|r| r.pattern.contains("Read(")));
         assert!(!allow.iter().any(|r| r.pattern.contains("Edit(")));
-        assert!(allow.iter().any(|r| r.pattern == "git status *"));
+        assert!(!allow.iter().any(|r| r.pattern == "WebFetch"));
+        assert!(!allow.iter().any(|r| r.pattern == "WebSearch"));
+        assert!(allow.iter().any(|r| r.pattern == "git *"));
+    }
+
+    /// The deny side gained its own non-`Bash` entries too (issue #104):
+    /// `command_pattern_from_bash_rule` is the single, general gate both
+    /// `builtin_allow`/`builtin_deny` share, not a hard-coded skip of the
+    /// two original file-scope rules -- this pins that a `Read(...)`/
+    /// `Edit(...)` deny entry is skipped exactly the same way.
+    #[test]
+    fn builtin_deny_skips_the_non_command_file_scope_rules_too() {
+        let deny = builtin_deny();
+        assert!(!deny.iter().any(|r| r.pattern.contains("Read(")));
+        assert!(!deny.iter().any(|r| r.pattern.contains("Edit(")));
+        assert!(deny.iter().any(|r| r.pattern == "rm -rf *"));
     }
 
     // -- resolve: the repo-narrowing trust boundary --------------------

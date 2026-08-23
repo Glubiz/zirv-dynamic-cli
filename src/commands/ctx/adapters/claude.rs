@@ -840,42 +840,74 @@ impl AgentAdapter for ClaudeAdapter {
     /// the same `--allowedTools=`/`--disallowedTools=` argv, and the
     /// underlying CLI mechanism does not distinguish their origin.
     /// Projects `safety` (issue #83's harness-neutral command policy) onto
-    /// claude's own `--allowedTools=`/`--disallowedTools=` vocabulary:
-    /// `Read(./**)`/`Edit(./**)` are prepended directly (file-scope rules,
-    /// not commands -- outside `[safety]`'s own domain, see `safety::
-    /// command_pattern_from_bash_rule`'s doc comment), then every `safety`
-    /// rule is re-wrapped as `Bash(<pattern>)`, then `sandbox.extra_allow`/
-    /// `extra_deny` are appended last, unchanged from before this method
-    /// took a `SafetyPolicy` parameter.
+    /// claude's own `--allowedTools=`/`--disallowedTools=` vocabulary: every
+    /// `SHIPPED_POSTURE_ALLOW` entry that is not a `Bash(...)` rule (file-
+    /// scope and bare-tool rules -- outside `[safety]`'s own domain, see
+    /// `safety::command_pattern_from_bash_rule`'s doc comment) is prepended
+    /// directly, in declared order, then every `safety` rule is re-wrapped
+    /// as `Bash(<pattern>)`, then `sandbox.extra_allow`/`extra_deny` are
+    /// appended last, unchanged from before this method took a
+    /// `SafetyPolicy` parameter.
     ///
     /// Byte-identical to the pre-#83 hardcoded projection under the shipped
-    /// default: `safety::builtin_deny`/`builtin_allow` strip exactly
-    /// `SHIPPED_POSTURE_DENY`/`_ALLOW`'s own `Bash(...)` wrapper and this
-    /// method re-adds it, so the round trip reproduces the original strings
-    /// verbatim, in the original order -- pinned by
+    /// default, modulo the scratchpad rules below: `safety::builtin_deny`/
+    /// `builtin_allow` strip exactly `SHIPPED_POSTURE_DENY`/`_ALLOW`'s own
+    /// `Bash(...)` wrapper and this method re-adds it, so the round trip
+    /// reproduces the original strings verbatim, in the original order --
+    /// pinned by
     /// `default_sandbox_args_stays_byte_identical_to_the_pre_safety_shipped_
     /// default` below.
+    ///
+    /// **Fix round 4 (2026-08-23, issue #104):** `SHIPPED_POSTURE_ALLOW`
+    /// gained more non-`Bash` entries (`Read(~/.claude/**)`, `Edit(~/.claude
+    /// /projects/**)`, `Read(~/.zirv/**)`, `WebFetch`, `WebSearch`), all
+    /// filtered out of `safety.allow` the same way `Read(./**)`/`Edit(./**)`
+    /// always were (outside `[safety]`'s own command-only domain -- see
+    /// `safety::command_pattern_from_bash_rule`). Rather than hand-list each
+    /// one here too, every non-`Bash(` entry in the constant is now
+    /// prepended in its original declared order, which also reproduces
+    /// `Read(./**)`/`Edit(./**)` first exactly as before. The two scratchpad
+    /// rules (`adapters::scratchpad_rules`) are computed here, from the real
+    /// `std::env::temp_dir()`, rather than baked into the constant -- the
+    /// path is per-machine, and the constant has to stay `&'static`.
+    /// Appended after the safety-derived allow entries, before the
+    /// operator's own `sandbox.extra_allow`.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
         safety: &crate::commands::ctx::safety::SafetyPolicy,
     ) -> Vec<String> {
-        let mut allow_entries: Vec<String> =
-            vec!["Read(./**)".to_string(), "Edit(./**)".to_string()];
+        let mut allow_entries: Vec<String> = super::SHIPPED_POSTURE_ALLOW
+            .iter()
+            .filter(|(rule, _)| !rule.starts_with("Bash("))
+            .map(|(rule, _)| rule.to_string())
+            .collect();
         allow_entries.extend(
             safety
                 .allow
                 .iter()
                 .map(|rule| format!("Bash({})", rule.pattern)),
         );
+        allow_entries.extend(super::scratchpad_rules(&std::env::temp_dir()));
         allow_entries.extend(sandbox.extra_allow.iter().cloned());
         let allow = allow_entries.join(",");
 
-        let mut deny_entries: Vec<String> = safety
-            .deny
+        // `SHIPPED_POSTURE_DENY` gained two non-`Bash` entries of its own
+        // (issue #104): `Edit(~/.zirv/**)`/`Read(~/.claude/.credentials.json)`,
+        // filtered out of `safety.deny` the same way the allow side's
+        // non-`Bash` entries are -- prepended directly, same treatment as
+        // `allow_entries` above.
+        let mut deny_entries: Vec<String> = super::SHIPPED_POSTURE_DENY
             .iter()
-            .map(|rule| format!("Bash({})", rule.pattern))
+            .filter(|(rule, _)| !rule.starts_with("Bash("))
+            .map(|(rule, _)| rule.to_string())
             .collect();
+        deny_entries.extend(
+            safety
+                .deny
+                .iter()
+                .map(|rule| format!("Bash({})", rule.pattern)),
+        );
         deny_entries.extend(sandbox.extra_deny.iter().cloned());
         let deny = deny_entries.join(",");
 
@@ -1654,23 +1686,25 @@ mod tests {
     /// `Default::default()` values every other test in this file already
     /// passes -- the generated argv must stay byte-for-byte identical to
     /// what a hand-built projection straight from `SHIPPED_POSTURE_ALLOW`/
-    /// `_DENY` would produce, so this refactor could not have silently
-    /// changed a live-verified permission set.
+    /// `_DENY` (plus the scratchpad rules, issue #104) would produce, so
+    /// this refactor could not have silently changed a live-verified
+    /// permission set.
     #[test]
     fn default_sandbox_args_stays_byte_identical_to_the_pre_safety_shipped_default() {
         let adapter = ClaudeAdapter::new(None);
         let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
 
-        // `SHIPPED_POSTURE_ALLOW`'s own first two entries already are
-        // `Read(./**)`/`Edit(./**)` -- the projection prepends them
-        // separately only because `safety::builtin_allow` filters them out
-        // (they are not `Bash(...)`-wrapped commands), so iterating the
+        // `SHIPPED_POSTURE_ALLOW`'s own non-`Bash(...)` entries (`Read(./
+        // **)`/`Edit(./**)` and the rest) are prepended separately only
+        // because `safety::builtin_allow` filters them out, so iterating the
         // original constant directly reproduces the exact same order with
-        // no duplication.
-        let expected_allow: Vec<String> = super::super::SHIPPED_POSTURE_ALLOW
+        // no duplication; the scratchpad rules (computed from the real temp
+        // dir, not part of the `&'static` constant) are appended after.
+        let mut expected_allow: Vec<String> = super::super::SHIPPED_POSTURE_ALLOW
             .iter()
             .map(|(rule, _)| rule.to_string())
             .collect();
+        expected_allow.extend(super::super::scratchpad_rules(&std::env::temp_dir()));
         let expected_deny: Vec<String> = super::super::SHIPPED_POSTURE_DENY
             .iter()
             .map(|(rule, _)| rule.to_string())
@@ -1743,6 +1777,45 @@ mod tests {
             "a bare/unscoped Write rule was verified live to leak outside the workspace: \
              {allow_arg}"
         );
+    }
+
+    /// Issue #104: the scratchpad is a real per-machine directory (`Claude
+    /// Code`'s own temp-file scratchpad), and the harness's own memory dir
+    /// is writable so a session can update its own auto-memory under
+    /// `~/.claude/projects/<slug>/memory/` (see `adapters::scratchpad_rules`
+    /// and `SHIPPED_POSTURE_ALLOW`'s own doc comment).
+    #[test]
+    fn default_sandbox_args_allows_the_scratchpad_and_claude_memory_dir() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        for rule in super::super::scratchpad_rules(&std::env::temp_dir()) {
+            assert!(
+                allow_arg.contains(&rule),
+                "missing scratchpad rule {rule} from {allow_arg}"
+            );
+        }
+        assert!(allow_arg.contains("WebFetch"), "got {allow_arg}");
+        assert!(
+            allow_arg.contains("Edit(~/.claude/projects/**)"),
+            "got {allow_arg}"
+        );
+    }
+
+    /// Issue #104: a session must never widen its own posture -- the
+    /// operator layer is readable (allowed above) but never editable.
+    #[test]
+    fn default_sandbox_args_denies_editing_the_operator_zirv_layer() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let deny_arg = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        assert!(deny_arg.contains("Edit(~/.zirv/**)"), "got {deny_arg}");
     }
 
     /// Must never be the dangerous bypass, under any circumstance.

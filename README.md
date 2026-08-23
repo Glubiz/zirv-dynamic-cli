@@ -1528,16 +1528,26 @@ the explicit opt-out below do.
   makes a fresh install *inert*, not merely safe: it cannot write a file at
   all. The generated set (one shared source, `adapters::SHIPPED_POSTURE_ALLOW`/
   `_DENY`, also documented against codex's own flags) is what makes it usable:
-  allow reading/writing/editing inside the workspace and the common
-  git/list/search/build/test verbs; deny recursive force-delete, force-push and
-  history rewriting, `curl`/`wget`, `sudo`/`su`, and the macOS keychain CLI,
-  regardless of anything on the allow side. Verified live against the real
-  `claude 2.1.240`: an in-repo write and a `cargo test` both run with no
-  prompt; a write outside the workspace and a `rm -rf` are both refused.
-  Still an honest **partial**: general credential-file reads are denied only
-  by omission (nothing pre-approves `cat`), not by a targeted rule. The
-  harness-neutral command classifier that generates both harnesses' rule
-  sets is `[safety]`, described next.
+  allow reading/writing/editing inside the workspace; reading the harness's own
+  settings/memory (`~/.claude/**`) and writing its auto-memory
+  (`~/.claude/projects/**`); reading the operator's own `~/.zirv/**` layer
+  (editing it is denied — a session must never widen its own posture);
+  `WebFetch`/`WebSearch`; a per-session scratchpad under the real temp
+  directory; whole toolchain command families (`git`, `gh`, `cargo`, `npm`,
+  `npx`, `node`, `python`/`python3`, `pip`, `go`, `dotnet`, `make`, `gradle`,
+  `mvn`, `pytest`, and zirv's own CLI) rather than a hand-picked subset of
+  subcommands; and a set of read-only shell utilities (`ls`, `grep`, `rg`,
+  `cat`, `head`, `tail`, `wc`, `find`, `echo`, `pwd`, `which`, `where`,
+  `diff`, `sort`, `uniq`, `tr`, `cut`). Deny still wins over allow regardless
+  of family breadth: recursive force-delete, force-push and history
+  rewriting, `git clean`, `curl`/`wget`, `sudo`/`su`, the macOS keychain CLI,
+  `cargo publish`/`npm publish`, `gh repo delete`/`gh release delete`/`gh
+  auth`, credential-path reads, and editing the operator's own `~/.zirv/**`
+  layer are all denied regardless of anything on the allow side. Verified
+  live against the real `claude 2.1.240`: an in-repo write and a `cargo
+  test` both run with no prompt; a write outside the workspace and a `rm
+  -rf` are both refused. The harness-neutral command classifier that
+  generates both harnesses' rule sets is `[safety]`, described next.
 
 An operator's own explicit `--sandbox`/`--ask-for-approval`/`--permission-mode`/
 `--disallowedTools` (passed after `--`, or via `worker.claude`/`worker.codex`'s
