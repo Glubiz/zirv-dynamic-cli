@@ -302,6 +302,15 @@ fn render_memory_section<W: Write>(
 /// agent/session filter -- the same broad, idempotent view `zirv ctx
 /// status`/`zirv ctx inbox --peek` already use), so running this report
 /// never consumes a message a real session would otherwise have seen.
+///
+/// Issue #100 (2026-08-23): the one exception is a message whose
+/// `To-session` names a session that no longer exists at all -- nothing
+/// will ever read it, so `mail::sweep_undeliverable` moves it into `read/`
+/// (the same move an ordinary read does) before the count below, and the
+/// swept count is reported separately rather than folded into "pending".
+/// This does not weaken the non-destructive promise above: it is cleanup of
+/// mail no live session could ever have seen, not a read on any session's
+/// behalf.
 fn render_mail_section<W: Write>(
     w: &mut W,
     state: &StateDir,
@@ -312,6 +321,7 @@ fn render_mail_section<W: Write>(
         w,
         "\nmail (pending, read non-destructively -- this report never consumes a message):"
     )?;
+    let swept = mail::sweep_undeliverable(state, slug);
     let messages = match mail::list(state, slug, None, None) {
         Ok(messages) => messages,
         Err(e) => {
@@ -320,15 +330,24 @@ fn render_mail_section<W: Write>(
         }
     };
     if messages.is_empty() {
-        writeln!(w, "  none pending")?;
+        if swept > 0 {
+            writeln!(w, "  none pending ({swept} undeliverable, swept)")?;
+        } else {
+            writeln!(w, "  none pending")?;
+        }
         return Ok(());
     }
 
     let bytes: usize = messages.iter().map(|(_, m)| m.body.len()).sum();
     let exceeds = bytes > cfg.mail.max_delivered_bytes;
+    let swept_note = if swept > 0 {
+        format!(" ({swept} undeliverable, swept)")
+    } else {
+        String::new()
+    };
     writeln!(
         w,
-        "  {} message(s) pending, {bytes} raw body bytes (~{} tok, est.) -- \
+        "  {} message(s) pending{swept_note}, {bytes} raw body bytes (~{} tok, est.) -- \
          mail.max_delivered_bytes budget: {} ({} budget)",
         messages.len(),
         estimate_tokens(bytes),
@@ -1041,6 +1060,49 @@ mod tests {
             after.len(),
             1,
             "the report must never consume the mail it reports on"
+        );
+    }
+
+    /// Issue #100 (2026-08-23): a message addressed to a session that no
+    /// longer exists is swept out of "pending" and reported separately --
+    /// this is cleanup of mail no live session could ever read, distinct
+    /// from the non-destructive promise the test above pins for ordinary
+    /// mail.
+    #[test]
+    fn mail_addressed_to_a_dead_session_is_swept_and_reported_separately() {
+        let fixture = Fixture::new();
+        let state = StateDir::resolve(&|k| fixture.env.get(k).cloned()).expect("state");
+        let slug = repo_slug(&fixture.repo);
+        let dead = mail::Message {
+            from_session: "sess1".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: Some("deadbeef".to_string()),
+            sent: 1_700_000_000,
+            body: "nobody will ever read this".to_string(),
+        };
+        let pending = mail::Message {
+            from_session: "sess2".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 1_700_000_100,
+            body: "still pending".to_string(),
+        };
+        mail::store(&state, &slug, &dead, &CtxConfig::default()).expect("store dead");
+        mail::store(&state, &slug, &pending, &CtxConfig::default()).expect("store pending");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            out.contains("1 message(s) pending (1 undeliverable, swept)"),
+            "got {out}"
+        );
+
+        let after = mail::list(&state, &slug, None, None).expect("list after");
+        assert_eq!(
+            after.len(),
+            1,
+            "the swept message is gone; the still-pending one remains"
         );
     }
 }

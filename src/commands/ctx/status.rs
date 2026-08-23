@@ -233,12 +233,22 @@ pub fn run_with<W: Write>(
     // would actually consume never disagree.
     let mail_agent = env(AGENT_ENV);
     let mail_session = mail::session_identity(env);
+    // Issue #100 (2026-08-23): a message whose `To-session` names a session
+    // that no longer exists used to inflate "unread" forever -- swept here,
+    // before the count below, and reported separately so an operator can
+    // tell a stale addressee from a message actually waiting to be read.
+    let mail_swept = mail::sweep_undeliverable(&state, &mail_slug);
     match mail::list(
         &state,
         &mail_slug,
         mail_agent.as_deref(),
         mail_session.as_deref(),
     ) {
+        Ok(messages) if mail_swept > 0 => writeln!(
+            w,
+            "mail: {} unread ({mail_swept} undeliverable, swept)",
+            messages.len()
+        )?,
         Ok(messages) => writeln!(w, "mail: {} unread", messages.len())?,
         Err(_) => writeln!(w, "mail: (unreadable)")?,
     }
@@ -761,6 +771,14 @@ mod tests {
     /// as a message queued for one idle pane showing as unread to every
     /// session in the repo. Broadcast mail (no `to_session`) and mail
     /// directed at this exact session still count.
+    ///
+    /// Both `aaaa1111` and `bbbb2222` are registered as live sessions here
+    /// (issue #100, 2026-08-23): this test is pinning the *visibility*
+    /// filter specifically, and without a live record for each, the new
+    /// undeliverable-mail sweep would remove the "directed elsewhere"
+    /// message before the visibility filter ever got a chance to -- a
+    /// different mechanism reaching the same count, which would leave this
+    /// test unable to tell a filtering regression from a sweeping one.
     #[test]
     fn status_mail_count_ignores_mail_directed_at_a_different_session() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -768,6 +786,25 @@ mod tests {
         state.ensure().expect("ensure");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().to_path_buf();
+        let _asking_guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "aaaa1111-2222-4333-8444-555555555555",
+                "claude",
+                &repo,
+                crate::commands::ctx::sessions::Verb::Exec,
+            ),
+        );
+        let _elsewhere_guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "bbbb2222-2222-4333-8444-555555555555",
+                "claude",
+                &repo,
+                crate::commands::ctx::sessions::Verb::Exec,
+            ),
+        );
 
         let slug = repo_slug(tmp.path());
         let cfg = CtxConfig::default();
@@ -834,6 +871,63 @@ mod tests {
             text.contains("mail: 2 unread"),
             "only the broadcast and the directed-here message count, not the one \
              directed at bbbb2222: {text}"
+        );
+    }
+
+    /// Issue #100 (2026-08-23): a message addressed to a session that no
+    /// longer exists at all (no live registry record was ever registered for
+    /// it in this test) must be swept out of the unread count, and reported
+    /// separately rather than silently dropped.
+    #[test]
+    fn status_reports_undeliverable_mail_as_swept_and_excludes_it_from_unread() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let slug = repo_slug(tmp.path());
+        let cfg = CtxConfig::default();
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "sender-one".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: Some("deadbeef".to_string()),
+                sent: 1_700_000_000,
+                body: "nobody will ever read this".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store directed at a dead session");
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "sender-two".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1_700_000_100,
+                body: "still pending".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store undirected");
+
+        let env = env_for(state.root());
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            text.contains("mail: 1 unread (1 undeliverable, swept)"),
+            "got {text}"
         );
     }
 
@@ -1212,6 +1306,41 @@ mod tests {
         assert!(
             line.contains("no record"),
             "a socket with no registry entry is still listed: {line}"
+        );
+    }
+
+    /// Issue #99 (2026-08-23): a dead endpoint marker (nothing is listening
+    /// behind it, and no registry record ever named it) must not accumulate
+    /// as a permanent `(no record)` line -- `sessions::list`'s own orphan
+    /// sweep, exercised here through `status` end to end, removes it.
+    #[test]
+    fn status_no_longer_lists_a_dead_socket_that_has_no_registry_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        crate::commands::ctx::state::create_private_dir_all(&state.sockets()).expect("mkdir");
+        std::fs::write(
+            state.sockets().join("dead12ab.sock"),
+            "leftover, nothing is listening",
+        )
+        .expect("write leftover marker");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            !text.contains("dead12ab"),
+            "a swept dead marker must no longer be listed: {text}"
+        );
+        assert!(
+            !state.sockets().join("dead12ab.sock").exists(),
+            "and the leftover file itself is removed from disk"
         );
     }
 
