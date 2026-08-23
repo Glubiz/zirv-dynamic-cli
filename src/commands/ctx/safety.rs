@@ -468,6 +468,20 @@ fn normalize_segments(command: &str) -> Vec<String> {
 /// stack-depth or exponential-blowup DoS surface. Worst case is `O(pattern
 /// * command)` with no recursion.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
+    // Issue #106: claude's own documented prefix semantics for a
+    // `<verb> *`-style rule match the bare verb too (`Bash(git *)` "matches
+    // git, git status, git commit" -- adapters/mod.rs's own doc comment),
+    // but the star here otherwise only matches text *after* the literal
+    // space that precedes it, so `"git push --force *"` matched `"git push
+    // --force x"` yet not the bare `"git push --force"` a real invocation
+    // sends with nothing following. Every `verb *` deny pattern was
+    // therefore inert against exactly that bare form. A pattern ending in
+    // `" *"` also matches its own prefix with the trailing `" *"` stripped.
+    if let Some(prefix) = pattern.strip_suffix(" *")
+        && text == prefix
+    {
+        return true;
+    }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -917,6 +931,24 @@ mod tests {
         assert!(!glob_match("*a*b*c*", "xaxbx"));
     }
 
+    /// Issue #106: claude's own documented prefix semantics (`adapters/
+    /// mod.rs`'s doc comment on `Bash(git *)`: "matches git, git status,
+    /// git commit") match the bare verb with no trailing space too, but
+    /// `glob_match`'s literal star semantics did not -- `"git push
+    /// --force *"` matched `"git push --force x"` but not the bare `"git
+    /// push --force"` a real invocation actually sends. Every `verb *`
+    /// deny pattern was therefore inert against exactly the bare form an
+    /// attacker (or an honest mistake) would type.
+    #[test]
+    fn glob_match_trailing_space_star_also_matches_the_bare_prefix() {
+        assert!(glob_match("git push --force *", "git push --force"));
+        assert!(glob_match("git *", "git"));
+        assert!(!glob_match("git *", "gitx"));
+        // No trailing space before the star: unaffected, still prefix-only.
+        assert!(glob_match("cargo publish*", "cargo publish"));
+        assert!(glob_match("cat *.aws*", "cat .aws/credentials"));
+    }
+
     // -- evaluate: destructive families the issue lists --------------
 
     fn policy_with(deny: &[&str], ask: &[&str], allow: &[&str], default: Verdict) -> SafetyPolicy {
@@ -1013,6 +1045,10 @@ mod tests {
             ("git clean -fdx", Verdict::Deny),
             ("git push --delete origin x", Verdict::Deny),
             ("npm publish", Verdict::Deny),
+            // Issue #106: the bare form (no trailing args) of a `verb *`
+            // deny pattern must be denied too, not only one carrying flags.
+            ("git push --force", Verdict::Deny),
+            ("git reset --hard", Verdict::Deny),
             ("some-unknown-tool --flag", Verdict::Ask),
         ];
         for (command, expected) in cases {

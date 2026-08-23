@@ -181,7 +181,7 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// utilities -- the deny list, not per-verb narrowing, is what still keeps
 /// each family's destructive half blocked (`git clean *`, `git push
 /// --delete *`, `gh repo delete *`, `gh release delete *`, `gh auth *`,
-/// `cargo publish*`, `npm publish*`, added to `SHIPPED_POSTURE_DENY`
+/// `cargo publish *`, `npm publish *`, added to `SHIPPED_POSTURE_DENY`
 /// alongside the pre-existing force-push/reset/rebase/curl/wget/sudo/su/
 /// security entries -- deny still wins, verified live in fix round 2).
 ///
@@ -320,10 +320,11 @@ pub(crate) fn scratchpad_rules(temp_dir: &Path) -> [String; 2] {
 /// [`SHIPPED_POSTURE_ALLOW`]'s own non-`Bash` entries, see `ClaudeAdapter::
 /// default_sandbox_args`. Plus the destructive halves of the toolchain
 /// families [`SHIPPED_POSTURE_ALLOW`] widened to whole `Bash(<tool> *)`
-/// entries: `cargo publish*`/`npm publish*` (irreversible; no trailing
-/// space, so the bare invocation is denied too, not only one carrying
-/// flags), `gh repo delete *`/`gh release delete *`/`gh auth *`, `git clean
-/// *`, `git push --delete *`.
+/// entries: `cargo publish *`/`npm publish *` (irreversible), `gh repo
+/// delete *`/`gh release delete *`/`gh auth *`, `git clean *`, `git push
+/// --delete *`. A trailing `" *"` denies the bare invocation too, not only
+/// one carrying flags (issue #106's `glob_match` fix -- a claude `Bash(<x>
+/// *)` rule is documented to match the bare `<x>` as well).
 pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     (
         "Edit(~/.zirv/**)",
@@ -380,8 +381,8 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ("Bash(cat *.aws*)", "reads AWS credential files"),
     ("Bash(cat *.ssh*)", "reads SSH private keys"),
     ("Bash(cat *.netrc*)", "reads stored HTTP credentials"),
-    ("Bash(cargo publish*)", "publishes a crate; irreversible"),
-    ("Bash(npm publish*)", "publishes a package; irreversible"),
+    ("Bash(cargo publish *)", "publishes a crate; irreversible"),
+    ("Bash(npm publish *)", "publishes a package; irreversible"),
     (
         "Bash(gh repo delete *)",
         "irreversibly deletes a GitHub repository",
