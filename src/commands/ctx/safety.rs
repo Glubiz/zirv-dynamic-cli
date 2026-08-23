@@ -1061,6 +1061,61 @@ mod tests {
         }
     }
 
+    /// Issue #111 (PR #107's review of issue #104's round): the old
+    /// `git push`/`git reset` deny entries were flag-anchored and so were
+    /// bypassed by simple argument reordering (`git push origin --force`)
+    /// or a sibling spelling (`-f`/`-d`, an empty-src refspec, a
+    /// force-refspec push); `find`, `head`, `tail`, `diff`, and `gh` had
+    /// their own uncovered sibling escapes. This asserts the fixed shipped
+    /// default catches every bypass form and still allows the ordinary,
+    /// non-destructive uses of the same command families (2026-08-23,
+    /// issue #111).
+    #[test]
+    fn evaluate_deny_survives_argument_reordering_issue_111() {
+        let policy = SafetyPolicy::default();
+        let cases: &[(&str, Verdict)] = &[
+            // Reordered / sibling git push forms.
+            ("git push origin --force", Verdict::Deny),
+            ("git push origin -f", Verdict::Deny),
+            ("git push origin --delete x", Verdict::Deny),
+            ("git push origin -d x", Verdict::Deny),
+            ("git push origin :x", Verdict::Deny),
+            ("git push origin +x", Verdict::Deny),
+            ("git push --force-with-lease origin x", Verdict::Deny),
+            ("git reset HEAD~1 --hard", Verdict::Deny),
+            // find's own -delete/-exec/-ok actions.
+            ("find . -type f -delete", Verdict::Deny),
+            ("find . -name x -exec rm {} ;", Verdict::Deny),
+            // head/tail/diff credential-path parity with cat.
+            ("head ~/.ssh/id_rsa", Verdict::Deny),
+            ("tail -c 40 ~/.aws/credentials", Verdict::Deny),
+            ("diff ~/.ssh/id_rsa /dev/null", Verdict::Deny),
+            // gh escapes.
+            ("gh api -X DELETE /repos/o/r", Verdict::Deny),
+            ("gh secret set X", Verdict::Deny),
+            ("gh codespace ssh", Verdict::Deny),
+            // Ordinary, non-destructive uses must stay Allow -- in
+            // particular, the space-anchored `-f`/`-d` patterns must not
+            // fire on an unrelated `-u` flag or a branch name that merely
+            // contains a hyphen.
+            ("git push origin feature-branch", Verdict::Allow),
+            ("git push -u origin feature-branch", Verdict::Allow),
+            ("git push -u origin x", Verdict::Allow),
+            ("find . -name foo.rs", Verdict::Allow),
+            ("head src/main.rs", Verdict::Allow),
+            ("gh api /repos/o/r", Verdict::Allow),
+            ("gh pr create --fill", Verdict::Allow),
+        ];
+        for (command, expected) in cases {
+            let outcome = evaluate(&policy, command);
+            assert_eq!(
+                outcome.verdict, *expected,
+                "{command}: expected {expected:?}, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
     #[test]
     fn evaluate_first_match_wins_within_a_category() {
         let policy = policy_with(

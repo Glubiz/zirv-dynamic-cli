@@ -267,7 +267,10 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Bash(head *)", "read the start of a file, read-only"),
     ("Bash(tail *)", "read the end of a file, read-only"),
     ("Bash(wc *)", "count lines, words or bytes, read-only"),
-    ("Bash(find *)", "search for files by name, read-only"),
+    (
+        "Bash(find *)",
+        "search for files by name; read-only DENIED into -delete/-exec/-ok by the entries below",
+    ),
     ("Bash(echo *)", "print text, read-only, no side effects"),
     ("Bash(pwd)", "print the working directory, read-only"),
     ("Bash(which *)", "locate a command on PATH, read-only"),
@@ -325,6 +328,27 @@ pub(crate) fn scratchpad_rules(temp_dir: &Path) -> [String; 2] {
 /// --delete *`. A trailing `" *"` denies the bare invocation too, not only
 /// one carrying flags (issue #106's `glob_match` fix -- a claude `Bash(<x>
 /// *)` rule is documented to match the bare `<x>` as well).
+///
+/// **Fix round 5 (2026-08-23, issue #111): argument-reordering and
+/// sibling-utility bypasses.** PR #107's review found the round-4 `git
+/// push`/`git reset` entries were flag-anchored (`Bash(git push --force *)`)
+/// and so matched only when the dangerous flag came first -- `git push
+/// origin --force` slipped through untouched, as did the short-flag
+/// spellings (`-f`, `-d`), an empty-src refspec delete (`git push origin
+/// :branch`), and a force-refspec push (`git push origin +branch`). Those
+/// entries are replaced with mid-string-wildcard patterns below (`glob_
+/// match` already supports `*` anywhere, not only as a suffix). `find`'s
+/// own `-delete`/`-exec`/`-ok` actions, and the credential-path reads
+/// `head`/`tail`/`diff` can perform just as well as the already-denied
+/// `cat`, are closed the same way, plus three `gh` escapes (`gh api -X
+/// DELETE`, `gh secret`, `gh codespace ssh`). **With arbitrary-code
+/// toolchains (`python *`, `node *`, ...) allowed by
+/// [`SHIPPED_POSTURE_ALLOW`], this list is a tripwire for named
+/// destructive/credential command families, not a security boundary** -- a
+/// session can always reach the same effect through an interpreter one-liner
+/// this list cannot enumerate in advance; the README already frames the
+/// shipped posture as an honest partial, and this round narrows the gap
+/// without pretending to close it.
 pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     (
         "Edit(~/.zirv/**)",
@@ -339,18 +363,50 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "Bash(rm -fr *)",
         "recursive force-delete, flag-order variant",
     ),
+    // Git push destructive-argument family (2026-08-23, issue #111):
+    // mid-string wildcards close the argument-reordering bypass the old
+    // flag-anchored patterns had (`git push origin --force` slipped past
+    // `Bash(git push --force *)`). `git push*--force*` also covers
+    // `--force-with-lease`, since that flag's own text contains `--force`
+    // as a substring. The short-flag forms are matched with a leading
+    // space (`" -f"`/`" -d"`) so a branch literally named `feature-fix` or
+    // similar is never mistaken for the flag -- see this constant's own
+    // doc comment.
     (
-        "Bash(git push --force *)",
-        "force-push, overwrites remote history",
+        "Bash(git push*--force*)",
+        "force-push (covers --force-with-lease too), any argument position",
     ),
-    ("Bash(git push -f *)", "force-push, short-flag form"),
     (
-        "Bash(git push --force-with-lease *)",
-        "force-push, lease-checked variant",
+        "Bash(git push* -f *)",
+        "force-push, short-flag form, followed by more arguments",
     ),
     (
-        "Bash(git reset --hard *)",
-        "destroys uncommitted work and can discard commits",
+        "Bash(git push* -f)",
+        "force-push, short-flag form, as the final argument",
+    ),
+    (
+        "Bash(git push*--delete*)",
+        "deletes a remote branch, any argument position",
+    ),
+    (
+        "Bash(git push* -d *)",
+        "deletes a remote branch, short-flag form, followed by more arguments",
+    ),
+    (
+        "Bash(git push* -d)",
+        "deletes a remote branch, short-flag form, as the final argument",
+    ),
+    (
+        "Bash(git push* :*)",
+        "empty-src refspec delete (git push origin :branch)",
+    ),
+    (
+        "Bash(git push* +*)",
+        "force-refspec push (git push origin +branch)",
+    ),
+    (
+        "Bash(git reset*--hard*)",
+        "destroys uncommitted work and can discard commits, any argument position",
     ),
     ("Bash(git rebase *)", "rewrites commit history"),
     ("Bash(git filter-branch *)", "rewrites commit history"),
@@ -381,6 +437,44 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ("Bash(cat *.aws*)", "reads AWS credential files"),
     ("Bash(cat *.ssh*)", "reads SSH private keys"),
     ("Bash(cat *.netrc*)", "reads stored HTTP credentials"),
+    // Credential-path reads, head/tail/diff parity (2026-08-23, issue
+    // #111): `head`/`tail`/`diff` can read the same credential paths `cat`
+    // can, and were not covered by the `cat`-anchored entries above.
+    (
+        "Bash(head *credentials*)",
+        "reads a file conventionally named for stored credentials",
+    ),
+    ("Bash(head *.aws*)", "reads AWS credential files"),
+    ("Bash(head *.ssh*)", "reads SSH private keys"),
+    ("Bash(head *.netrc*)", "reads stored HTTP credentials"),
+    (
+        "Bash(tail *credentials*)",
+        "reads a file conventionally named for stored credentials",
+    ),
+    ("Bash(tail *.aws*)", "reads AWS credential files"),
+    ("Bash(tail *.ssh*)", "reads SSH private keys"),
+    ("Bash(tail *.netrc*)", "reads stored HTTP credentials"),
+    (
+        "Bash(diff *credentials*)",
+        "reads a file conventionally named for stored credentials",
+    ),
+    ("Bash(diff *.aws*)", "reads AWS credential files"),
+    ("Bash(diff *.ssh*)", "reads SSH private keys"),
+    ("Bash(diff *.netrc*)", "reads stored HTTP credentials"),
+    // `find`'s own delete/exec actions (2026-08-23, issue #111): the
+    // read-only `Bash(find *)` allow above is only read-only up to these.
+    (
+        "Bash(find*-delete*)",
+        "find's own delete action; not covered by the read-only find allow above",
+    ),
+    (
+        "Bash(find*-exec*)",
+        "find's own exec action can run an arbitrary command",
+    ),
+    (
+        "Bash(find*-ok*)",
+        "find's own interactive-exec action can run an arbitrary command",
+    ),
     ("Bash(cargo publish *)", "publishes a crate; irreversible"),
     ("Bash(npm publish *)", "publishes a package; irreversible"),
     (
@@ -395,8 +489,14 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "Bash(gh auth *)",
         "changes or reveals the operator's own GitHub authentication",
     ),
+    // gh escapes (2026-08-23, issue #111).
+    (
+        "Bash(gh api*DELETE*)",
+        "covers both -X DELETE and --method DELETE",
+    ),
+    ("Bash(gh secret *)", "reads or writes repository secrets"),
+    ("Bash(gh codespace ssh*)", "opens a shell into a codespace"),
     ("Bash(git clean *)", "irreversibly deletes untracked files"),
-    ("Bash(git push --delete *)", "deletes a remote branch"),
 ];
 
 /// The last model-flag occurrence in `flags`, in any form `classify_model_
