@@ -295,6 +295,8 @@ Issue #45 adds the sibling top-level `zirv context sync` family in `src/commands
 
 Issue #46 adds `zirv context status` in `src/commands/ctx/context_status.rs`: a session-free report of every compiler contribution, raw and delivered byte counts, estimated tokens, truncation, oversize findings, configured limits, and per-harness policy support without overstating provider enforcement.
 
+Issue #105: both `zirv context status` and `zirv context sync --report` run `drift::analyze` over `context_cli::surfaces_for_drift(surfaces)` rather than the raw `collect_surfaces` output -- a native CLAUDE.md/AGENTS.md that is itself zirv-managed (`context_cli::is_managed`, i.e. rendered verbatim from `.zirv/context/` by `--generate`) is excluded from the duplicate/precedence-level comparison, since diffing a file against the canonical text it was rendered from is a tautology, not real drift; it still appears in `status`'s surfaces listing (sizes/budgets unaffected) with a `(zirv-managed, rendered from .zirv/context/)` note.
+
 - [[Ctx Supervisors]] — `run_loop`/`exec`/`wrap` process supervision, plus `signal`/`supervise`/`term` primitives
 - [[Ctx Adapters]] — the `AgentAdapter` trait and the claude/codex implementations these verbs dispatch through
 - [[Rot Engine]] — `event.rs`/`rot.rs` scoring internals that `score` and `hook Stop` call into

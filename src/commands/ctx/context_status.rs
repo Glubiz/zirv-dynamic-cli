@@ -52,6 +52,7 @@ use super::CtxResult;
 use super::adapters;
 use super::compile;
 use super::config::{ContextConfig, CtxConfig, EnvLookup, env_from_process};
+use super::context_cli;
 use super::drift;
 use super::handoff;
 use super::mail;
@@ -135,9 +136,21 @@ fn render_surface_line<W: Write>(
     let tokens = estimate_tokens(bytes);
     let oversized = oversized_threshold(surface.layer, cfg).is_some_and(|budget| bytes > budget);
     let flag = if oversized { "  [OVERSIZED]" } else { "" };
+    // Issue #105: a managed native file is still listed here -- its size
+    // still counts toward budgets -- but is excluded from the duplicate/
+    // precedence-level drift analysis below (`context_cli::
+    // surfaces_for_drift`), since it is a verbatim render of the canonical
+    // layer it would otherwise be reported as "duplicating". The note
+    // explains that exclusion right where a reader would otherwise wonder
+    // why this file never shows up in a drift finding.
+    let managed_note = if context_cli::is_managed(&surface.text) {
+        "  (zirv-managed, rendered from .zirv/context/)"
+    } else {
+        ""
+    };
     writeln!(
         w,
-        "{indent}{} ({}) -- {bytes}B, ~{tokens} tok (est.){flag}",
+        "{indent}{} ({}) -- {bytes}B, ~{tokens} tok (est.){flag}{managed_note}",
         surface.path.display(),
         surface.layer.label()
     )?;
@@ -606,7 +619,7 @@ pub fn run_with<W: Write>(
         optimize::collect_surfaces(home.as_deref(), repo, cfg.optimize.max_surface_bytes);
     render_instruction_surfaces(w, &surfaces, &cfg.context)?;
 
-    let findings = drift::analyze(&surfaces);
+    let findings = drift::analyze(&context_cli::surfaces_for_drift(&surfaces));
     render_drift_section(w, &findings, args.verbose)?;
 
     render_memory_section(w, &state, repo, &slug, &cfg)?;
@@ -843,6 +856,83 @@ mod tests {
         assert!(
             out.contains("duplicate / conflict findings"),
             "the section header names what this is: {out}"
+        );
+    }
+
+    /// Issue #105: a native `CLAUDE.md` that is itself zirv-managed
+    /// (rendered verbatim from `.zirv/context/` by `zirv context sync
+    /// --generate`) is a tautological "duplicate" of the canonical layer it
+    /// was rendered from -- pairing it against `common.md` in a drift
+    /// finding is noise, not real drift.
+    #[test]
+    fn a_zirv_managed_native_claude_md_produces_no_duplicate_or_precedence_findings() {
+        let fixture = Fixture::new();
+        fixture.write_canonical("common.md", "- always run the full test suite\n");
+        std::fs::write(
+            fixture.repo.join("CLAUDE.md"),
+            format!(
+                "{}\n\n- always run the full test suite\n",
+                crate::commands::ctx::context_cli::MANAGED_MARKER
+            ),
+        )
+        .expect("write");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            !out.contains("duplicate-redundant-with-canonical"),
+            "a zirv-managed native file must not be diffed against the canonical layer it was \
+             rendered from: {out}"
+        );
+        assert!(
+            !out.contains("precedence-shadowing"),
+            "nor treated as a precedence conflict with it: {out}"
+        );
+        assert!(out.contains("duplicate / conflict findings"), "got {out}");
+        assert!(out.contains("  none found"), "got {out}");
+    }
+
+    /// Companion to the test above: the SAME content, minus the managed
+    /// marker, is a real hand-authored duplicate and must still be flagged
+    /// -- proves the exclusion is keyed on the marker, not merely on the
+    /// path being `CLAUDE.md`.
+    #[test]
+    fn the_same_content_without_the_managed_marker_still_gets_the_duplicate_finding() {
+        let fixture = Fixture::new();
+        fixture.write_canonical("common.md", "- always run the full test suite\n");
+        std::fs::write(
+            fixture.repo.join("CLAUDE.md"),
+            "- always run the full test suite\n",
+        )
+        .expect("write");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            out.contains("duplicate-redundant-with-canonical"),
+            "an unmanaged native file duplicating canonical content is still real drift: {out}"
+        );
+    }
+
+    /// The exclusion narrows the drift *analysis* only -- the surfaces
+    /// listing (sizes/budgets) must still show the managed file, now with a
+    /// note explaining why it never appears as a duplicate above.
+    #[test]
+    fn the_surfaces_section_still_lists_a_managed_native_file_with_its_note() {
+        let fixture = Fixture::new();
+        fixture.write_canonical("common.md", "- always run the full test suite\n");
+        std::fs::write(
+            fixture.repo.join("CLAUDE.md"),
+            format!(
+                "{}\n\n- always run the full test suite\n",
+                crate::commands::ctx::context_cli::MANAGED_MARKER
+            ),
+        )
+        .expect("write");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            out.contains("CLAUDE.md")
+                && out.contains("(zirv-managed, rendered from .zirv/context/)"),
+            "the managed native file must still be listed, with its note: {out}"
         );
     }
 
