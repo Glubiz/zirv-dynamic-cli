@@ -661,11 +661,19 @@ fn read_stdin() -> String {
 /// Every field optional with a zero default, the same rule `hook.rs`'s own
 /// `PreToolPayload` follows: a hook that fails to parse must fail open, not
 /// crash or silently deny everything.
+///
+/// `permission_mode` carries claude's own session mode (documented values:
+/// `"default"`, `"plan"`, `"acceptEdits"`, `"auto"`, `"dontAsk"`,
+/// `"bypassPermissions"`, https://code.claude.com/docs/en/hooks) and defaults
+/// to the empty string on an older payload that omits it entirely -- treated
+/// the same as any mode other than `"dontAsk"` by `hook_output` below
+/// (2026-08-23, issue #102).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct HookToolPayload {
     tool_name: String,
     tool_input: HookToolInput,
+    permission_mode: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -724,9 +732,23 @@ fn explain_text(command: &str, outcome: &Outcome) -> String {
 /// nothing is claude's own "no opinion, fall through to the normal
 /// permission flow" reading, the same convention `pretool_output`'s own
 /// caller (`run_pretool`) already relies on.
-fn hook_output(command: &str, outcome: &Outcome) -> Option<String> {
+///
+/// Under `--permission-mode dontAsk`, claude's own docs say a hook decision
+/// never bypasses permission rules ("Hook decisions don't bypass permission
+/// rules", https://code.claude.com/docs/en/permissions) and that `dontAsk`
+/// itself means "deny if not pre-approved" -- so an active `"ask"` in that
+/// mode is not a prompt, it is an unsatisfiable denial that would strip the
+/// operator's own `permissions.allow` entries from every zirv-launched
+/// session. `permission_mode` therefore also gates `Verdict::Ask`: under
+/// `dontAsk` it falls through to `None` (nothing emitted, same as `Allow`),
+/// letting claude's own permission flow -- and the operator's `allow` list --
+/// decide. Every other mode (including the empty/unknown default) keeps
+/// emitting `"ask"` unchanged, and `Deny` is unaffected by mode: it always
+/// emits `"deny"` (2026-08-23, issue #102).
+fn hook_output(command: &str, outcome: &Outcome, permission_mode: &str) -> Option<String> {
     let decision = match outcome.verdict {
         Verdict::Deny => "deny",
+        Verdict::Ask if permission_mode == "dontAsk" => return None,
         Verdict::Ask => "ask",
         Verdict::Allow => return None,
     };
@@ -767,7 +789,16 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
         return Ok(outcome.verdict.exit_code());
     }
 
-    let Some(payload) = HookToolPayload::parse(&read_stdin()) else {
+    run_check_hook_mode(&cfg, w, &read_stdin())
+}
+
+/// The hook-mode core of `run_check`, split out so it can be tested by
+/// feeding it a raw stdin payload directly rather than the process's actual
+/// stdin (which `run_check` only reads lazily, once it knows this is hook
+/// mode -- reading it eagerly here would make CLI mode block waiting on
+/// stdin that never arrives).
+fn run_check_hook_mode<W: Write>(cfg: &CtxConfig, w: &mut W, stdin: &str) -> CtxResult<i32> {
+    let Some(payload) = HookToolPayload::parse(stdin) else {
         return Ok(0);
     };
     if payload.tool_name != "Bash" {
@@ -778,7 +809,7 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
         return Ok(0);
     }
     let outcome = evaluate(&cfg.safety, command);
-    if let Some(output) = hook_output(command, &outcome) {
+    if let Some(output) = hook_output(command, &outcome, &payload.permission_mode) {
         writeln!(w, "{output}")?;
     }
     Ok(0)
@@ -1250,7 +1281,7 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        assert!(hook_output("ls", &allow).is_none());
+        assert!(hook_output("ls", &allow, "default").is_none());
 
         let deny = Outcome {
             verdict: Verdict::Deny,
@@ -1259,7 +1290,7 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("rm -rf /", &deny).expect("deny produces output");
+        let output = hook_output("rm -rf /", &deny, "default").expect("deny produces output");
         assert!(output.contains("\"permissionDecision\":\"deny\""));
         assert!(output.contains("\"hookEventName\":\"PreToolUse\""));
 
@@ -1270,8 +1301,150 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("git push", &ask).expect("ask produces output");
+        let output = hook_output("git push", &ask, "default").expect("ask produces output");
         assert!(output.contains("\"permissionDecision\":\"ask\""));
+    }
+
+    // -- dontAsk fall-through (issue #102) -------------------------------
+    //
+    // A hook "ask" is an unsatisfiable prompt under `--permission-mode
+    // dontAsk` (claude treats it as "deny if not pre-approved"), so it must
+    // fall through and emit nothing rather than strip the operator's own
+    // `permissions.allow` entries. `Deny` still denies in every mode, and
+    // every mode other than `dontAsk` keeps emitting `"ask"`.
+
+    #[test]
+    fn hook_output_ask_under_dont_ask_falls_through_to_nothing() {
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "git push*".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        assert!(hook_output("git push", &ask, "dontAsk").is_none());
+    }
+
+    #[test]
+    fn hook_output_deny_still_denies_under_dont_ask() {
+        let deny = Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(Rule {
+                pattern: "rm -rf *".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let output = hook_output("rm -rf /", &deny, "dontAsk").expect("deny still denies");
+        assert!(output.contains("\"permissionDecision\":\"deny\""));
+    }
+
+    #[test]
+    fn hook_output_ask_with_no_permission_mode_still_asks() {
+        // Backward compatible: an older claude CLI (or any payload that
+        // omits `permission_mode`) parses to the empty string default, which
+        // must not be treated as `dontAsk`.
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "git push*".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let output = hook_output("git push", &ask, "").expect("ask still asks");
+        assert!(output.contains("\"permissionDecision\":\"ask\""));
+    }
+
+    #[test]
+    fn hook_tool_payload_parses_the_permission_mode_field() {
+        let payload = HookToolPayload::parse(
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"permission_mode":"dontAsk"}"#,
+        )
+        .expect("parses");
+        assert_eq!(payload.permission_mode, "dontAsk");
+
+        // Absent entirely: defaults to empty, not an error.
+        let payload =
+            HookToolPayload::parse(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)
+                .expect("parses");
+        assert_eq!(payload.permission_mode, "");
+    }
+
+    /// End-to-end through `run_check_hook_mode`, the same core `run_check`'s
+    /// hook branch delegates to once the stdin payload is in hand -- pinned
+    /// separately from `run_check` itself because `run_check` reads real
+    /// process stdin lazily (only in hook mode) and must not be made to block
+    /// on stdin in CLI mode just to be testable.
+    #[test]
+    fn run_check_hook_mode_dont_ask_with_unmatched_command_emits_nothing() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let stdin =
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"permission_mode":"dontAsk"}"#;
+        let mut out = Vec::new();
+        let code = run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "expected no output, got {out:?}");
+    }
+
+    #[test]
+    fn run_check_hook_mode_default_mode_with_unmatched_ask_command_emits_ask() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"git push"},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        let code = run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\"permissionDecision\":\"ask\""),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn run_check_hook_mode_denied_command_denies_under_both_modes() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        for mode in ["dontAsk", "default"] {
+            let stdin = format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"rm -rf x"}},"permission_mode":"{mode}"}}"#
+            );
+            let mut out = Vec::new();
+            let code = run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+            assert_eq!(code, 0);
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.contains("\"permissionDecision\":\"deny\""),
+                "mode {mode}: got {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_check_hook_mode_missing_permission_mode_still_asks() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"git push"}}"#;
+        let mut out = Vec::new();
+        let code = run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\"permissionDecision\":\"ask\""),
+            "got {text}"
+        );
     }
 
     #[test]
