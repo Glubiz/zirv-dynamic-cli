@@ -712,6 +712,68 @@ fn looks_like_path(token: &str) -> bool {
     has_extension && (token.contains('/') || token.contains('.'))
 }
 
+/// Whether `token` has a `<...>` placeholder segment, e.g. `<repo>` in
+/// `<repo>/.zirv/ctx.toml` -- documentation notation for "substitute the
+/// real value here", not a literal path any checkout actually has (issue
+/// #109).
+fn has_placeholder_segment(token: &str) -> bool {
+    token
+        .split(['/', '\\'])
+        .any(|segment| segment.starts_with('<') && segment.ends_with('>') && segment.len() > 1)
+}
+
+/// Whether `token` is a bare `*.exe` name with no directory component, e.g.
+/// `zirv.exe` -- prose naming a built binary in the abstract, not a literal
+/// path to check against this checkout (issue #109). A token that still
+/// names a directory (`bin/zirv.exe`) is left to the ordinary candidate
+/// check.
+fn is_bare_exe_name(token: &str) -> bool {
+    !token.contains('/')
+        && !token.contains('\\')
+        && Path::new(token)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+}
+
+/// A once-per-run index of every file's bare basename under `repo`, up to
+/// `MAX_NESTED_DEPTH` (issue #109): lets a bare basename token in prose
+/// (`rot.rs`, no `/` or `\` in it) be recognised as a real file living
+/// somewhere in the tree, without checking it only against the repo root or
+/// the evidence file's own directory. Same skip list and symlink posture as
+/// `nested_instruction_files`'s own walk.
+fn repo_basename_index(repo: &Path) -> hashbrown::HashSet<String> {
+    let mut names = hashbrown::HashSet::new();
+    let mut stack = vec![(repo.to_path_buf(), 0usize)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= MAX_NESTED_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() {
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            } else {
+                names.insert(name.to_string());
+            }
+        }
+    }
+
+    names
+}
+
 fn backticked(line: &str) -> Vec<&str> {
     let mut found = Vec::new();
     let mut rest = line;
@@ -807,7 +869,17 @@ fn resolve_candidates(
         return candidates;
     }
     if surface.layer.is_repo_owned() {
-        return vec![repo.join(token)];
+        let mut candidates = vec![repo.join(token)];
+        // (2026-08-23, issue #109) A relative token in prose is sometimes
+        // written from a documentation page's own vantage point (an
+        // Obsidian vault cross-reference like `Concepts/Shortcuts.md`), not
+        // the repo root's -- try the evidence surface's own directory and
+        // the vault root before giving up.
+        if let Some(dir) = surface.path.parent() {
+            candidates.push(dir.join(token));
+        }
+        candidates.push(repo.join("docs").join("obsidian").join(token));
+        return candidates;
     }
     if let Some(rest) = token.strip_prefix("~/") {
         return home.map(|home| vec![home.join(rest)]).unwrap_or_default();
@@ -828,6 +900,11 @@ pub fn lint_dead_references(
     on_path: &dyn Fn(&str) -> bool,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
+    // (2026-08-23, issue #109) Built once per run, not per token: a bare
+    // basename in prose (`rot.rs`) is checked against every real file in the
+    // tree instead of only the repo root or the evidence file's own
+    // directory.
+    let basename_index = repo_basename_index(repo);
 
     for surface in surfaces {
         // Claude's own settings schema (JSON `hooks` block); derived from the
@@ -865,6 +942,29 @@ pub fn lint_dead_references(
         for (index, line) in surface.text.lines().enumerate() {
             for token in backticked(line) {
                 if !looks_like_path(token) {
+                    continue;
+                }
+                // (2026-08-23, issue #109) A `<...>` placeholder segment is
+                // documentation notation, not a literal path this checkout
+                // has. A leading `~` in a repo-owned surface (CLAUDE.md,
+                // AGENTS.md, the canonical `.zirv/context/` layer) is prose
+                // describing the general home-directory convention, not a
+                // literal token that surface's own repo-relative resolution
+                // could ever check correctly -- but a `~`-anchored token in a
+                // non-repo-owned surface (the *global* CLAUDE.md/AGENTS.md)
+                // is still meaningfully resolved against the real home below
+                // (I4), so it must not be skipped here.
+                if has_placeholder_segment(token) {
+                    continue;
+                }
+                if token.starts_with('~') && surface.layer.is_repo_owned() {
+                    continue;
+                }
+                if is_bare_exe_name(token) {
+                    continue;
+                }
+                let is_bare_basename = !token.contains('/') && !token.contains('\\');
+                if is_bare_basename && basename_index.contains(token) {
                     continue;
                 }
                 let candidates = resolve_candidates(surface, token, repo, home);
@@ -3465,6 +3565,37 @@ mod tests {
         )];
         let findings = lint_dead_references(&surfaces, repo, None, &|_| true);
         assert_eq!(findings.len(), 1, "got {findings:?}");
+    }
+
+    /// Issue #109: prose commonly names a real source file by its bare
+    /// basename (`rot.rs`, found by walking the actual tree rather than only
+    /// the repo root or the evidence file's own directory), a home-anchored
+    /// convention (`~/.zirv/ctx.toml`), a documentation placeholder segment
+    /// (`<repo>/.zirv/ctx.toml`), or a bare built-binary name (`zirv.exe`)
+    /// with no directory component at all. None of these name a literal path
+    /// this repo can check, so none should be flagged -- only the file that
+    /// is genuinely gone.
+    #[test]
+    fn prose_basenames_tilde_paths_and_placeholders_are_not_flagged_as_missing_paths() {
+        // (2026-08-23, issue #109)
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "- see `rot.rs` for the rot engine\n\
+             - config lives at `~/.zirv/ctx.toml`\n\
+             - or at `<repo>/.zirv/ctx.toml`\n\
+             - the built binary is `zirv.exe`\n\
+             - but `truly-gone.rs` was removed a while back\n",
+        )];
+
+        let findings = lint_dead_references(&surfaces, repo, None, &|_| true);
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert!(
+            findings[0].detail.contains("truly-gone.rs"),
+            "the only real dead reference should be truly-gone.rs: {:?}",
+            findings[0]
+        );
     }
 
     #[test]
