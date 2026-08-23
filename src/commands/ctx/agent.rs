@@ -411,7 +411,7 @@ pub fn run_with<W: Write>(
     // run_with` below loads its own copy internally (the same pattern
     // `chat.rs` already uses ahead of `wrap::run_with`), so this costs one
     // extra read of the same layered config rather than a new code path.
-    let cfg = CtxConfig::load(repo, env)?;
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
     let announcer = Announcer::new(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
@@ -482,7 +482,7 @@ mod tests {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let flags = vec!["--model".to_string(), "opus".to_string()];
-        let mut expected = adapter.default_sandbox_args(&Default::default());
+        let mut expected = adapter.default_sandbox_args(&Default::default(), &Default::default());
         expected.extend(flags.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &adapter, &flags),
@@ -491,7 +491,8 @@ mod tests {
         );
 
         let joined = vec!["--model=opus".to_string()];
-        let mut expected_joined = adapter.default_sandbox_args(&Default::default());
+        let mut expected_joined =
+            adapter.default_sandbox_args(&Default::default(), &Default::default());
         expected_joined.extend(joined.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &adapter, &joined),
@@ -623,7 +624,7 @@ mod tests {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let mut expected = vec!["--model".to_string(), "sonnet".to_string()];
-        expected.extend(adapter.default_sandbox_args(&Default::default()));
+        expected.extend(adapter.default_sandbox_args(&Default::default(), &Default::default()));
         assert_eq!(worker_launch_flags(&cfg, "claude", &adapter, &[]), expected);
     }
 
@@ -668,7 +669,8 @@ mod tests {
 
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         let mut expected_claude = vec!["--model".to_string(), "sonnet".to_string()];
-        expected_claude.extend(claude.default_sandbox_args(&Default::default()));
+        expected_claude
+            .extend(claude.default_sandbox_args(&Default::default(), &Default::default()));
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &claude, &[]),
             expected_claude
@@ -729,11 +731,13 @@ mod tests {
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         let claude_flags = worker_launch_flags(&cfg, "claude", &claude, &[]);
         let mut expected_claude = vec!["--model".to_string(), "sonnet".to_string()];
-        expected_claude.extend(claude.default_sandbox_args(&Default::default()));
+        expected_claude
+            .extend(claude.default_sandbox_args(&Default::default(), &Default::default()));
         expected_claude.push("--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string());
         assert_eq!(claude_flags, expected_claude);
 
-        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let codex =
+            super::super::adapters::codex::CodexAdapter::new(None).with_ignore_flags_forced(false);
         let codex_flags = worker_launch_flags(&cfg, "codex", &codex, &[]);
         assert_eq!(
             codex_flags,
@@ -765,7 +769,8 @@ mod tests {
             },
             ..CtxConfig::default()
         };
-        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let codex =
+            super::super::adapters::codex::CodexAdapter::new(None).with_ignore_flags_forced(false);
         let flags = vec!["--verbose".to_string()];
         let out = worker_launch_flags(&cfg, "codex", &codex, &flags);
         assert_eq!(

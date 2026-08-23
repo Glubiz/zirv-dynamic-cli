@@ -1734,6 +1734,26 @@ pub fn run_with<W: Write>(
         &on_path,
     ));
     findings.extend(friction_findings(&evidence, &cfg.optimize));
+    // A layer that failed to *parse* degraded to defaults rather than
+    // aborting `CtxConfig::load` (see `config::UnparsableLayer`), so it never
+    // reaches the `Err` arm above -- this is the one surface a report-only
+    // run has to name it on. `Warning`, not `High`: the load itself already
+    // fell back safely (defaults are the safe posture), this is telling the
+    // operator their intent for that layer was not honoured, not that
+    // anything is broken right now.
+    findings.extend(cfg.unparsable_layers.iter().map(|layer| Finding {
+        kind: "config",
+        severity: Severity::Warning,
+        title: format!("ctx config layer unparsable: {}", layer.path.display()),
+        evidence: vec![layer.path.display().to_string()],
+        detail: format!(
+            "{} could not be parsed as TOML and was skipped; the remaining layers and defaults \
+             were used instead. {}",
+            layer.path.display(),
+            layer.message
+        ),
+        proposed_diff: None,
+    }));
 
     // One model call, and only if the caller wants one and an adapter is
     // available. A dead model degrades the report; it never fails the run.
@@ -1747,6 +1767,8 @@ pub fn run_with<W: Write>(
                     cfg.optimize.model.clone()
                 };
                 let prompt = judgment_prompt(&surfaces, &evidence, DEFAULT_EXCERPT_LINES);
+                // Issue #89.
+                adapters::announce_sandbox_residual_once(adapter.as_ref(), cfg.chrome.events);
                 match handoff::run_model(adapter.as_ref(), &model, &prompt, JUDGMENT_TIMEOUT) {
                     Ok(answer) => {
                         findings.extend(parse_judgment(&answer));
@@ -4560,6 +4582,12 @@ mod tests {
         );
     }
 
+    /// An unparseable repo `ctx.toml` layer degrades to defaults inside
+    /// `CtxConfig::load` itself now (`config::UnparsableLayer`), rather than
+    /// making the whole load fail -- so this run never reaches the
+    /// `run_with`'s own "config load failed" fallback branch at all. It must
+    /// still be visible somewhere in a report-only run: as a `Finding`
+    /// naming the broken file.
     #[test]
     fn a_malformed_repo_config_falls_back_to_defaults_instead_of_failing() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4589,8 +4617,12 @@ mod tests {
             "the report still renders with defaults: {printed}"
         );
         assert!(
-            printed.to_lowercase().contains("config load failed"),
-            "the report admits the config could not be read: {printed}"
+            printed.contains("ctx.toml"),
+            "the report names the unparsable layer as a finding: {printed}"
+        );
+        assert!(
+            printed.to_lowercase().contains("unparsable"),
+            "the report says the layer was skipped, not that the whole load failed: {printed}"
         );
     }
 

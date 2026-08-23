@@ -304,7 +304,7 @@ pub(crate) fn run_with_clock<W: Write>(
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
-    let cfg = CtxConfig::load(repo, env)?;
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
     // Gated only by `cfg.chrome.events` (which already folds in `--quiet` on
     // `zirv ctx agent`, `ZIRV_CTX_QUIET` and `[chrome] events`), independent
     // of whatever terminal (if any) is attached: a headless supervised run
@@ -981,6 +981,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 &distiller_model,
                 &ctx,
                 Duration::from_secs(cfg.handoff.timeout_secs),
+                cfg.chrome.events,
             );
             let stored = handoff::store(&state, repo, session.as_str(), &note)?;
 
@@ -1375,6 +1376,7 @@ pub(crate) fn run_with_clock<W: Write>(
             &distiller_model,
             &ctx,
             Duration::from_secs(cfg.handoff.timeout_secs),
+            cfg.chrome.events,
         );
         let stored = handoff::store(&state, repo, session.as_str(), &note)?;
         // N6: opt-in (`cfg.memory.harvest`, default off) and only from a
@@ -2429,6 +2431,41 @@ mod tests {
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
             .expect_err("nothing to supervise");
         assert!(err.to_string().contains("command"), "got {err}");
+    }
+
+    /// Finding #1: `exec` launches/supervises a harness, so a syntax error in
+    /// the operator's own HOME `ctx.toml` must refuse outright rather than
+    /// silently falling back to permissive pacing/policy/sandbox defaults --
+    /// unlike a repo-layer parse failure (still skipped, see `CtxConfig::
+    /// load_for_launch`'s own doc comment) and unlike `status`, which stays
+    /// on plain `load` and keeps reporting instead of refusing.
+    #[test]
+    fn a_home_layer_syntax_error_refuses_to_launch_naming_the_file() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(home.join(".zirv/ctx.toml"), "[score\n").expect("write broken home layer");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let env = base_env(&tmp.path().join("state"));
+        let args = ExecArgs {
+            agent: None,
+            session_id: None,
+            transcript: None,
+            prompt: None,
+            max_restarts: None,
+            timeout_secs: None,
+            simple: false,
+            command: vec!["true".to_string()],
+        };
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("a broken home layer must refuse to launch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&home.join(".zirv").join("ctx.toml").display().to_string()),
+            "names the broken file: {msg}"
+        );
     }
 
     use crate::commands::ctx::rot::Verdict;

@@ -281,7 +281,7 @@ pub fn run_with<W: Write, E: Write>(
         return Ok(1);
     }
 
-    let cfg = CtxConfig::load(repo, env)?;
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
     // Held for the rest of this function: dropping it early would restore
     // the console's original VT mode before `wrap`'s own raw-mode session
     // (which relies on VT already being on) even opens.
@@ -1251,7 +1251,7 @@ mod tests {
         // R1: the session pin is launch plumbing, not injected instruction --
         // `--simple` promises the agent no zirv-authored text, and a pane that
         // cannot be resumed after a quit is not what it is asking for.
-        expected.extend(adapter.default_sandbox_args(&Default::default()));
+        expected.extend(adapter.default_sandbox_args(&Default::default(), &Default::default()));
         expected.extend(adapter.session_pin_args("11111111-2222-4333-8444-555555555555"));
         assert_eq!(
             pane.argv, expected,

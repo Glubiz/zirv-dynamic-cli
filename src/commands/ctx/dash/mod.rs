@@ -41,7 +41,7 @@ use super::event::{SessionId, SessionRef};
 use super::state::StateDir;
 use super::term;
 use super::window;
-use super::{mail, memory, prompt, score, sessions};
+use super::{handoff, handover, mail, memory, prompt, score, sessions};
 
 pub(crate) use pane::{Pane, PaneSpec, PaneState, ScrollOutcome};
 
@@ -71,6 +71,12 @@ pub enum DashAction {
     Nudge,
     Mail,
     Memory,
+    /// `Ctrl+A o` (issue #84) -- opens the handover picker: swap the focused
+    /// pane's model or harness in place. Not `m`: that key already opens
+    /// `Mail`, and `M` already opens `Memory` -- `o` ("orchestrator") is the
+    /// nearest free mnemonic, a deliberate deviation from the issue's own
+    /// literal "Ctrl+A m" wording to avoid silently breaking either binding.
+    Handover,
     Zoom,
     Quit,
     /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
@@ -148,6 +154,7 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Char('n') => Some(DashAction::Nudge),
         KeyCode::Char('m') => Some(DashAction::Mail),
         KeyCode::Char('M') => Some(DashAction::Memory),
+        KeyCode::Char('o') => Some(DashAction::Handover),
         KeyCode::Char('z') => Some(DashAction::Zoom),
         KeyCode::Char('v') => Some(DashAction::ToggleSelectMode),
         KeyCode::Char('q') => Some(DashAction::Quit),
@@ -345,6 +352,7 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::QuitConfirm(_) => "quit-confirm",
         ui::Overlay::Spawn(_) => "spawn",
         ui::Overlay::Nudge(_) => "nudge",
+        ui::Overlay::Handover(_) => "handover",
         ui::Overlay::Mail(_) => "mail",
         ui::Overlay::Memory(_) => "memory",
         ui::Overlay::Restore(_) => "restore",
@@ -1243,6 +1251,64 @@ fn push_error(errors: &mut Vec<String>, message: String) {
     if errors.len() > MAX_KEPT_ERRORS {
         let drop = errors.len() - MAX_KEPT_ERRORS;
         errors.drain(0..drop);
+    }
+}
+
+/// Issue #84: the `Ctrl+A o` picker's confirm action. Distills a handoff
+/// packet through the exact same machinery `wrap::perform_handover_swap`
+/// uses (`handoff::distill_or_structural` against the pane's own current
+/// adapter/transcript, never a parallel format), then hands it to `Pane::
+/// handover`, which resolves the new adapter/argv/turn-env and performs the
+/// actual pty swap. The pane keeps its registry short id throughout (`Pane::
+/// handover` never re-registers), which is what keeps mail and `zirv ctx
+/// nudge` addressed to it valid across the swap.
+fn handover_pane(
+    pane: &mut Pane,
+    target_agent: &str,
+    target_model: &str,
+    cfg: &CtxConfig,
+    repo: &Path,
+    errors: &mut Vec<String>,
+) {
+    let old_agent_name = pane.agent().to_string();
+    let Ok(old_adapter) = adapters::select(Some(&old_agent_name), &[], cfg) else {
+        push_error(
+            errors,
+            format!("handover: could not resolve this pane's own agent '{old_agent_name}'"),
+        );
+        return;
+    };
+    let transcript_path = old_adapter.transcript_path(&SessionRef {
+        id: SessionId::parse(pane.session_id()),
+        cwd: repo.to_path_buf(),
+    });
+    let jsonl = std::fs::read_to_string(&transcript_path).unwrap_or_default();
+    let ctx = old_adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+    let distiller_model =
+        handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), old_adapter.as_ref());
+    let (note, _source) = handoff::distill_or_structural(
+        old_adapter.as_ref(),
+        &distiller_model,
+        &ctx,
+        Duration::from_secs(cfg.handoff.timeout_secs),
+        cfg.chrome.events,
+    );
+
+    let req = handover::HandoverRequest {
+        target_agent: target_agent.to_string(),
+        target_model: Some(target_model.to_string()),
+        force: false,
+        requested_at: super::state::now_secs(),
+    };
+    let role = if pane.verb() == sessions::Verb::Chat {
+        prompt::PromptRole::Orchestrator
+    } else {
+        prompt::PromptRole::Worker
+    };
+    let size = pane.screen().size();
+    match pane.handover(cfg, &req, &note, role, repo, (size.1, size.0)) {
+        Ok(()) => {}
+        Err(e) => push_error(errors, format!("handover: {e}")),
     }
 }
 
@@ -4564,6 +4630,55 @@ pub fn run_dashboard(
                                         }
                                         _ => overlay = ui::Overlay::Nudge(draft),
                                     },
+                                    // Issue #84.
+                                    ui::Overlay::Handover(mut draft) => match key.code {
+                                        KeyCode::Esc => {}
+                                        KeyCode::Up => {
+                                            draft.cursor = draft.cursor.saturating_sub(1);
+                                            overlay = ui::Overlay::Handover(draft);
+                                        }
+                                        KeyCode::Down => {
+                                            if draft.cursor + 1 < draft.items.len() {
+                                                draft.cursor += 1;
+                                            }
+                                            overlay = ui::Overlay::Handover(draft);
+                                        }
+                                        KeyCode::Enter => {
+                                            let choice = draft.items.get(draft.cursor).cloned();
+                                            let idx = panes
+                                                .iter()
+                                                .position(|p| p.short() == draft.target_short);
+                                            match (choice, idx) {
+                                                (
+                                                    Some((target_agent, _tier, target_model)),
+                                                    Some(idx),
+                                                ) if panes[idx].state() == PaneState::Idle => {
+                                                    handover_pane(
+                                                        &mut panes[idx],
+                                                        &target_agent,
+                                                        &target_model,
+                                                        cfg,
+                                                        repo,
+                                                        &mut errors,
+                                                    );
+                                                }
+                                                (Some(_), Some(_)) => push_error(
+                                                    &mut errors,
+                                                    format!(
+                                                        "handover: pane {} is not idle; retry \
+                                                         once it is",
+                                                        draft.target_short
+                                                    ),
+                                                ),
+                                                _ => push_error(
+                                                    &mut errors,
+                                                    "handover: target pane no longer exists"
+                                                        .to_string(),
+                                                ),
+                                            }
+                                        }
+                                        _ => overlay = ui::Overlay::Handover(draft),
+                                    },
                                     // Any key closes it (tmux's own key-list
                                     // convention): `overlay` was already reset
                                     // to `None` by the `mem::take` above, so
@@ -4778,6 +4893,54 @@ pub fn run_dashboard(
                                             target,
                                             input: String::new(),
                                         });
+                                    }
+                                    // Issue #84: the target is always the
+                                    // *focused* pane -- the one whose grid is
+                                    // on screen and would receive the swap's
+                                    // own fresh child -- not merely the
+                                    // sidebar's `selected` row, which can sit
+                                    // on a view-only session no pane object
+                                    // backs at all.
+                                    InputVerdict::Dash(DashAction::Handover) => {
+                                        match panes.get(focused).map(|p| p.short().to_string()) {
+                                            Some(target_short) => {
+                                                let mut items = Vec::new();
+                                                for agent in adapters::available_adapter_names(cfg)
+                                                {
+                                                    for tier in handover::TIERS {
+                                                        // An adapter with no
+                                                        // tier ladder and no
+                                                        // configured override
+                                                        // (finding #6) has
+                                                        // nothing to offer for
+                                                        // this tier -- skip
+                                                        // it rather than
+                                                        // showing a picker
+                                                        // entry that would
+                                                        // fail the swap.
+                                                        if let Ok(model) = handover::resolve_model(
+                                                            agent, tier, cfg,
+                                                        ) {
+                                                            items.push((
+                                                                agent.to_string(),
+                                                                tier.to_string(),
+                                                                model,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                overlay =
+                                                    ui::Overlay::Handover(ui::HandoverDraft {
+                                                        items,
+                                                        cursor: 0,
+                                                        target_short,
+                                                    });
+                                            }
+                                            None => push_error(
+                                                &mut errors,
+                                                "handover: no focused pane".to_string(),
+                                            ),
+                                        }
                                     }
                                     InputVerdict::Dash(DashAction::Mail) => {
                                         overlay = ui::Overlay::Mail(build_mail_view(state, repo));

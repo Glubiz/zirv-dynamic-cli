@@ -4,8 +4,10 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 
 use clap::{Args, Subcommand, ValueEnum};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::classify::RiskBand;
@@ -338,6 +340,134 @@ fn is_sensitive_name(path: &Path) -> bool {
         || name.contains("secret")
 }
 
+/// Second, content-based gate behind the filename denylist above. A file
+/// named `token.txt`/`api_key.txt`/`notes.md` matches no filename pattern but
+/// can still hold a pasted credential -- and since the whole point of a
+/// review package is to hand a diff to an external model, a false negative
+/// here is expensive and unrecoverable. Deterministic and dependency-free of
+/// any network/service call (the `regex` crate is already a workspace
+/// dependency, used the same way by `frontend_detector.rs`): known
+/// credential shapes first, then a conservative entropy check.
+///
+/// One pattern per high-confidence, low-false-positive family. Each is
+/// anchored so it cannot fire in the middle of an ordinary word (`risk-`,
+/// `desk-check`, ...): the character immediately before the marker must not
+/// itself be alphanumeric.
+static TOKEN_SHAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?:^|[^A-Za-z0-9])(?P<openai>sk-[A-Za-z0-9_-]{20,})",
+        r"|(?:^|[^A-Za-z0-9])(?P<ghp>ghp_[A-Za-z0-9]{20,})",
+        r"|(?:^|[^A-Za-z0-9])(?P<gho>gho_[A-Za-z0-9]{20,})",
+        r"|(?:^|[^A-Za-z0-9])(?P<ghpat>github_pat_[A-Za-z0-9_]{20,})",
+        r"|(?:^|[^A-Za-z0-9])(?P<slack>xox[baprs]-[A-Za-z0-9-]{10,})",
+        r"|(?:^|[^A-Za-z0-9])(?P<aws>A[SK]IA[0-9A-Z]{16})",
+        r"|(?P<pem>-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)",
+        r"|(?:^|[^A-Za-z0-9])(?P<jwt>eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})",
+    ))
+    .expect("valid secret token-shape regex")
+});
+
+const TOKEN_SHAPE_FAMILIES: &[(&str, &str)] = &[
+    ("openai", "OpenAI-style secret key (sk-...)"),
+    ("ghp", "GitHub personal access token (ghp_...)"),
+    ("gho", "GitHub OAuth token (gho_...)"),
+    (
+        "ghpat",
+        "GitHub fine-grained personal access token (github_pat_...)",
+    ),
+    ("slack", "Slack token (xox[baprs]-...)"),
+    ("aws", "AWS access key id (AKIA/ASIA...)"),
+    ("pem", "PEM private key block"),
+    ("jwt", "JSON Web Token"),
+];
+
+fn detect_token_shape(text: &str) -> Option<&'static str> {
+    let caps = TOKEN_SHAPE_RE.captures(text)?;
+    TOKEN_SHAPE_FAMILIES
+        .iter()
+        .find(|(name, _)| caps.name(name).is_some())
+        .map(|(_, label)| *label)
+}
+
+/// Conservative Shannon-entropy check on long unbroken base64/hex-ish runs,
+/// tuned so ordinary source identifiers, prose, minified bundle content, and
+/// hex lockfile hashes do not trip it. Two independent guards keep this
+/// narrow: a 16-symbol hex alphabet caps out at 4.0 bits/char, so a run that
+/// is pure hex is excluded outright regardless of length (lockfile/commit
+/// hashes); and `_` is deliberately not a run character here, so a long
+/// `snake_case_identifier` breaks into its component words at each
+/// underscore rather than reading as one long candidate run. The threshold
+/// and minimum length are both set well above what a real credential's
+/// entropy floor requires (a random base64-ish secret of this length sits
+/// close to that alphabet's ~6 bit/char ceiling) and above what natural
+/// language or identifier text realistically reaches.
+const ENTROPY_MIN_RUN: usize = 40;
+const ENTROPY_THRESHOLD: f64 = 4.5;
+
+fn shannon_entropy(bytes: &[u8]) -> f64 {
+    let mut counts = [0u32; 256];
+    for &byte in bytes {
+        counts[byte as usize] += 1;
+    }
+    let len = bytes.len() as f64;
+    counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let p = f64::from(count) / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+fn is_run_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-')
+}
+
+fn is_hex_run(run: &[u8]) -> bool {
+    run.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn has_digit_and_letter(run: &[u8]) -> bool {
+    run.iter().any(u8::is_ascii_digit) && run.iter().any(u8::is_ascii_alphabetic)
+}
+
+fn detect_high_entropy_run(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !is_run_char(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && is_run_char(bytes[index]) {
+            index += 1;
+        }
+        let run = &bytes[start..index];
+        if run.len() >= ENTROPY_MIN_RUN && !is_hex_run(run) && has_digit_and_letter(run) {
+            let entropy = shannon_entropy(run);
+            if entropy >= ENTROPY_THRESHOLD {
+                return Some(format!(
+                    "high-entropy token ({} chars, {entropy:.2} bits/char)",
+                    run.len()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The content-based gate itself: a known credential shape first (cheap,
+/// specific), then the entropy fallback for an unlabeled high-entropy secret.
+fn detect_content_secret(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    if let Some(label) = detect_token_shape(&text) {
+        return Some(format!("content matches {label}"));
+    }
+    detect_high_entropy_run(&text)
+}
+
 /// Untracked files contribute their path always, their body only when it is
 /// safe: text (no NUL in the first [`BINARY_SNIFF_BYTES`]), small, and not
 /// matching a sensitive name. Exclusions are stated in the package so a
@@ -389,6 +519,15 @@ fn append_untracked(
             append_capped(
                 diff,
                 "[untracked file body omitted: binary]\n",
+                MAX_REVIEW_DIFF_BYTES,
+                truncated,
+            );
+            continue;
+        }
+        if let Some(reason) = detect_content_secret(&bytes) {
+            append_capped(
+                diff,
+                &format!("[untracked file body omitted: {reason}]\n"),
                 MAX_REVIEW_DIFF_BYTES,
                 truncated,
             );
@@ -1094,6 +1233,7 @@ mod tests {
             changed_lines: 10,
             declared_scope: false,
             work_domain: Default::default(),
+            risk_measurement: super::super::classify::RiskMeasurement::Measured,
             reasons: vec![],
         };
         let state = WorkflowState::start(
@@ -1308,9 +1448,21 @@ mod tests {
                 "--disallowedTools=Write,Edit,Bash,NotebookEdit"
             ]
         );
+        // Issue #89: the two `--ignore-*` flags ride along only when the
+        // codex binary actually installed on this machine advertises them
+        // (CI has no codex at all, a developer box may have 0.147.0), so
+        // assert the invariant -- the read-only pin is always present and
+        // the optional flags can only ever trail it -- not one machine's
+        // exact argv.
+        let codex = reviewer_argv("codex").unwrap();
         assert_eq!(
-            reviewer_argv("codex").unwrap(),
+            &codex[..6],
             ["agent", "codex", "-", "--", "--sandbox", "read-only"]
+        );
+        let trailing = &codex[6..];
+        assert!(
+            trailing.is_empty() || trailing == ["--ignore-rules", "--ignore-user-config"],
+            "unexpected trailing reviewer flags: {trailing:?}"
         );
         let error = reviewer_argv("nope").unwrap_err().to_string();
         assert!(
@@ -1373,6 +1525,166 @@ mod tests {
         }
         for name in ["main.rs", "README.md", "keyboard.ts", "environment.yml"] {
             assert!(!is_sensitive_name(Path::new(name)), "{name} is ordinary");
+        }
+    }
+
+    /// Deterministic token-shape fixture builder. GitHub push protection scans
+    /// committed *content* for exactly the secret shapes `detect_content_secret`
+    /// is built to catch, so the test fixtures below must never contain an
+    /// assembled secret-shaped literal in source: each is built at test-run time
+    /// from small, individually-innocuous pieces (a short prefix plus a body
+    /// generated from a fixed alphabet, no randomness -- fully reproducible).
+    const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const UPPER_DIGIT: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    fn fixture(prefix: &str, body_len: usize, alphabet: &[u8]) -> String {
+        let mut out = String::with_capacity(prefix.len() + body_len);
+        out.push_str(prefix);
+        for i in 0..body_len {
+            out.push(alphabet[i % alphabet.len()] as char);
+        }
+        out
+    }
+
+    fn pem_fixture(kind: &str) -> String {
+        format!(
+            "-----BEGIN {kind} PRIVATE KEY-----\nMIIEowIBAAKCAQEA{}\n-----END {kind} PRIVATE KEY-----\n",
+            fixture("", 24, ALNUM)
+        )
+    }
+
+    fn jwt_fixture() -> String {
+        let header = fixture("eyJ", 20, ALNUM);
+        let payload = fixture("eyJ", 30, ALNUM);
+        let signature = fixture("", 40, ALNUM);
+        format!("{header}.{payload}.{signature}\n")
+    }
+
+    /// #90: the content-based gate applied to a file whose *name* matches
+    /// nothing on the filename denylist -- a realistic key pasted into
+    /// `token.txt` must still be excluded, with a reason distinct from the
+    /// filename-based exclusions.
+    #[test]
+    fn a_plain_token_txt_is_excluded_by_content_not_name() {
+        let repo = tempdir().unwrap();
+        assert!(!is_sensitive_name(Path::new("token.txt")));
+        let secret = fixture("sk-", 46, ALNUM);
+        std::fs::write(
+            repo.path().join("token.txt"),
+            format!("OPENAI_KEY={secret}\n"),
+        )
+        .unwrap();
+
+        let mut diff = String::new();
+        let mut truncated = false;
+        append_untracked(
+            &mut diff,
+            &mut truncated,
+            repo.path(),
+            &[PathBuf::from("token.txt")],
+        )
+        .unwrap();
+
+        assert!(!diff.contains(&secret));
+        assert!(diff.contains("token.txt"), "the path itself stays visible");
+        assert!(
+            diff.contains("content matches OpenAI-style secret key"),
+            "got {diff}"
+        );
+    }
+
+    /// #90: table test -- one positive sample per detected family, plus a
+    /// negative set (ordinary Rust source, a README, a lockfile with long hex
+    /// hashes, and a minified bundle) that must produce zero false positives.
+    #[test]
+    fn content_based_secret_detection_covers_every_family_with_no_false_positives() {
+        let positives: Vec<(&str, String)> = vec![
+            (
+                "openai",
+                format!("OPENAI_KEY={}\n", fixture("sk-", 46, ALNUM)),
+            ),
+            (
+                "github ghp_",
+                format!("export GITHUB_TOKEN={}\n", fixture("ghp_", 36, ALNUM)),
+            ),
+            (
+                "github gho_",
+                format!("export GITHUB_OAUTH={}\n", fixture("gho_", 36, ALNUM)),
+            ),
+            (
+                "github fine-grained pat",
+                format!("{}\n", fixture("github_pat_", 54, ALNUM)),
+            ),
+            (
+                "slack",
+                format!("SLACK_BOT_TOKEN={}\n", fixture("xoxb-", 47, ALNUM)),
+            ),
+            (
+                "aws",
+                format!("AWS_ACCESS_KEY_ID={}\n", fixture("AKIA", 16, UPPER_DIGIT)),
+            ),
+            ("pem", pem_fixture("RSA")),
+            ("jwt", jwt_fixture()),
+        ];
+        for (family, sample) in &positives {
+            assert!(
+                detect_content_secret(sample.as_bytes()).is_some(),
+                "{family}: expected a hit for {sample:?}"
+            );
+        }
+
+        let negatives: &[(&str, &str)] = &[
+            (
+                "rust source",
+                r#"
+pub fn resolved_repo(path: Option<&Path>) -> CtxResult<PathBuf> {
+    Ok(match path {
+        Some(path) => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+        None => std::env::current_dir()?,
+    })
+}
+
+const MAX_CONFIGURED_RETENTION_DAYS: u64 = 3650;
+const DEFAULT_MAX_EVENTS: usize = 1000;
+"#,
+            ),
+            (
+                "readme",
+                r#"
+# Zirv Dynamic CLI
+
+Cross-platform CLI for executing developer-defined YAML/JSON/TOML scripts.
+Run `cargo build` then `cargo test --verbose -- --test-threads=1` before
+opening a pull request. See docs/obsidian/_system-context.md for the full
+module map and architecture overview.
+"#,
+            ),
+            (
+                "lockfile hashes",
+                r#"
+[[package]]
+name = "example"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cee0ac6d301d0f6c3e1b0a3b3d5e6f4a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d"
+
+[[package]]
+name = "other"
+version = "0.4.1"
+checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
+"#,
+            ),
+            (
+                "minified bundle",
+                "!function(e,t){\"object\"==typeof exports?module.exports=t():\"function\"==typeof define&&define.amd?define(t):e.myLib=t()}(this,function(){function a(b,c){return b+c}function d(e){return e*2}var f=a(1,2),g=d(f);return{sum:a,double:d,run:function(){return g}}});\n",
+            ),
+        ];
+        for (name, sample) in negatives {
+            assert!(
+                detect_content_secret(sample.as_bytes()).is_none(),
+                "{name}: expected no false positive, got {:?}",
+                detect_content_secret(sample.as_bytes())
+            );
         }
     }
 

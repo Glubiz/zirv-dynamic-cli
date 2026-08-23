@@ -491,20 +491,107 @@ pub fn windows_from_rate_limits(
     (out.five_hour.is_some() || out.seven_day.is_some()).then_some(out)
 }
 
-/// One codex session-rollout JSONL line -> usage windows, if it is a
-/// token_count event carrying rate limits.
+/// The cumulative token totals codex reports on a `token_count` event's
+/// `info.total_token_usage` node, when that node is present at all (it is
+/// `null` on some snapshots -- verified in the real rate-limits fixture).
+/// Individual subfields default to `0` when the node exists but a specific
+/// field is missing, matching `CodexAdapter::transcript_usage`'s
+/// pre-existing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RolloutTokenTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// One decoded record from a single codex rollout JSONL line, shared by the
+/// usage-window collector below (`parse_rollout_line`/
+/// `windows_from_rate_limits`) and `CodexAdapter::parse_events`/
+/// `structural_context` (issue #86), so the file is parsed once per line
+/// instead of independently by two separate readers that could drift apart.
+///
+/// Only the shapes verified in
+/// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md` are represented:
+/// "Turn boundary" (`task_started`/`task_complete` bracket a turn and share
+/// a `turn_id`) and "Token usage" (`token_count`'s `rate_limits`/
+/// `info.total_token_usage`). Assistant text outside `last_agent_message`,
+/// tool calls, tool results, and any compaction/summarization boundary have
+/// no verified rollout shape and are deliberately not modeled here -- see
+/// that note and Known Issues.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RolloutRecord {
+    /// `event_msg` / `payload.type == "token_count"`.
+    TokenCount {
+        /// `0` when the line carries no parseable `timestamp` -- the token
+        /// totals below need no timestamp at all, only the usage windows do,
+        /// so a missing timestamp does not disqualify the whole record the
+        /// way it disqualifies `windows`.
+        observed_at: u64,
+        /// `None` whenever `observed_at` could not be parsed, or the
+        /// `rate_limits` node is absent/unrecognized; distinct from
+        /// `windows_from_rate_limits` returning `None` for a shape it does
+        /// not understand.
+        windows: Option<UsageWindows>,
+        totals: Option<RolloutTokenTotals>,
+    },
+    /// `event_msg` / `payload.type == "task_started"`.
+    TaskStarted,
+    /// `event_msg` / `payload.type == "task_complete"`; `last_agent_message`
+    /// is `None` on a failed turn (observed as JSON `null`).
+    TaskComplete { last_agent_message: Option<String> },
+}
+
+/// Parses one rollout line into the record shapes above. `None` for garbage
+/// JSON, a non-`event_msg` top-level type, or a `payload.type` this codebase
+/// has no verified mapping for.
 #[allow(dead_code)]
-pub fn parse_rollout_line(line: &str) -> Option<UsageWindows> {
-    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+pub fn parse_rollout_record(line: &str) -> Option<RolloutRecord> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
     if v.get("type")?.as_str()? != "event_msg" {
         return None;
     }
     let payload = v.get("payload")?;
-    if payload.get("type")?.as_str()? != "token_count" {
-        return None;
+    match payload.get("type")?.as_str()? {
+        "token_count" => {
+            let observed_at = v
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_utc);
+            let windows = observed_at.and_then(|at| {
+                payload
+                    .get("rate_limits")
+                    .and_then(|rl| windows_from_rate_limits(rl, at))
+            });
+            let totals = payload
+                .pointer("/info/total_token_usage")
+                .map(|t| RolloutTokenTotals {
+                    input_tokens: t.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    output_tokens: t.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+                });
+            Some(RolloutRecord::TokenCount {
+                observed_at: observed_at.unwrap_or(0),
+                windows,
+                totals,
+            })
+        }
+        "task_started" => Some(RolloutRecord::TaskStarted),
+        "task_complete" => Some(RolloutRecord::TaskComplete {
+            last_agent_message: payload
+                .get("last_agent_message")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        _ => None,
     }
-    let observed_at = parse_rfc3339_utc(v.get("timestamp")?.as_str()?)?;
-    windows_from_rate_limits(payload.get("rate_limits")?, observed_at)
+}
+
+/// One codex session-rollout JSONL line -> usage windows, if it is a
+/// token_count event carrying rate limits and a parseable timestamp.
+#[allow(dead_code)]
+pub fn parse_rollout_line(line: &str) -> Option<UsageWindows> {
+    match parse_rollout_record(line)? {
+        RolloutRecord::TokenCount { windows, .. } => windows,
+        RolloutRecord::TaskStarted | RolloutRecord::TaskComplete { .. } => None,
+    }
 }
 
 /// The account the codex provider's usage is attributed to.

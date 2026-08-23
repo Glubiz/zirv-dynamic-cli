@@ -181,6 +181,58 @@ pub enum Event {
     /// reason when it did not (`--sandbox.enabled = false`, or the
     /// operator's own flags already pinned the same concern).
     SandboxPosture { detail: String },
+    /// A ctx config layer (`~/.zirv/ctx.toml` or `<repo>/.zirv/ctx.toml`)
+    /// failed to *parse* as TOML and was skipped rather than aborting the
+    /// whole load (`config::CtxConfig::load`, `config::UnparsableLayer`) --
+    /// distinct from a `REPO_FORBIDDEN` rejection, which still fails the load
+    /// outright. Never silent: a stray keystroke in an untrusted repo file
+    /// must not become a silently-skipped layer with no operator-visible
+    /// sign of it. `detail` is pre-rendered by the caller (`config::
+    /// announce_unparsable_layers_once`), naming every unparsable layer's
+    /// path, line:col and parse message -- more than one layer can fail at
+    /// once (home and repo both malformed), but this announces once per
+    /// process regardless, the same one-time-latch discipline `poll.rs`'s
+    /// `announce_keychain_prompt_once` uses.
+    ConfigUnparsable { detail: String },
+    /// Issue #89: this session's resolved distiller or workflow reviewer is
+    /// an adapter whose own report-only sandbox pin
+    /// (`AgentAdapter::read_only_args`) has a known, recorded gap on the
+    /// operator's currently-installed binary
+    /// (`AgentAdapter::sandbox_residual_note`) -- e.g. codex's `--sandbox
+    /// read-only` not being paired with `--ignore-rules
+    /// --ignore-user-config` on an older codex-cli, so the child still
+    /// reads the repo's `.rules` execpolicy files and the operator's own
+    /// `~/.codex/config.toml`. Fired at most once per process
+    /// (`adapters::announce_sandbox_residual_once`); `note` is the
+    /// adapter's own one-line explanation, pre-rendered by the caller.
+    SandboxResidual { note: String },
+    /// Issue #87: a durable memory harvest ran at a session boundary
+    /// (restart or clean exit, `memory::harvest_durable` -- the single
+    /// choke point every one of the four call sites in `exec.rs`/`wrap.rs`
+    /// funnels through) and finished. `count` is the number of entries
+    /// actually accepted and written into the shared scope
+    /// (`write_durable`'s own return), which can legitimately be zero when
+    /// the model proposed nothing durable or every candidate was filtered
+    /// out -- still worth a one-line signal, so an operator watching the
+    /// `zirv ▸` channel can see that memory harvesting ran at all, not just
+    /// silently infer it from a diff in `.zirv/memory/` days later.
+    MemoryHarvested { count: usize },
+    /// Issue #84: the orchestrator seat's model or harness was swapped in
+    /// place via `zirv ctx handover`, carrying a handoff packet across the
+    /// swap while the session kept its registry short id. Both models are
+    /// named, matching the decision-log entry's own contract.
+    Handover {
+        from_agent: String,
+        from_model: String,
+        to_agent: String,
+        to_model: String,
+        stored: String,
+    },
+    /// A `zirv ctx handover` request was refused rather than acted on --
+    /// most commonly "mid-turn, and no `--force` was given" (see
+    /// `wrap::may_inject`, the same quiesce check every other injection
+    /// already gates on).
+    HandoverRefused { reason: String },
 }
 
 /// What the nudged session is actually going to do about it -- the three
@@ -230,6 +282,11 @@ impl Event {
             Event::InjectionComposed { layers } => format!("system prompt composed ({layers})"),
             Event::InjectionSkipped { reason } => format!("system prompt skipped: {reason}"),
             Event::SandboxPosture { detail } => format!("sandbox posture: {detail}"),
+            Event::ConfigUnparsable { detail } => format!(
+                "config layer(s) could not be parsed and were skipped, defaults used instead: \
+                 {detail}"
+            ),
+            Event::SandboxResidual { note } => format!("sandbox residual: {note}"),
             Event::VerdictChanged { from, to, score } => {
                 format!(
                     "context health {} -> {} (score {score})",
@@ -312,12 +369,27 @@ impl Event {
                     format!("nudged by {from}; run `zirv ctx inbox` to read it")
                 }
             },
+            Event::Handover {
+                from_agent,
+                from_model,
+                to_agent,
+                to_model,
+                stored,
+            } => format!(
+                "handover: {from_agent} ({from_model}) -> {to_agent} ({to_model}), same session \
+                 id; handoff stored at {stored}"
+            ),
+            Event::HandoverRefused { reason } => format!("handover refused: {reason}"),
             Event::MacosKeychainPromptExpected => {
                 "macOS may prompt for Keychain access to read Claude Code's usage token \
                  ('Claude Code-credentials'); choose 'Always Allow' to make that a one-time cost \
                  -- on a headless/SSH session with nobody to answer it, this attempt will time \
                  out and usage stays unknown rather than hang"
                     .to_string()
+            }
+            Event::MemoryHarvested { count } => {
+                let noun = if *count == 1 { "entry" } else { "entries" };
+                format!("memory harvest wrote {count} durable {noun}")
             }
         }
     }
@@ -505,6 +577,61 @@ mod tests {
         );
     }
 
+    /// Issue #89: the sandbox-residual announcement must name the resolved
+    /// distiller/reviewer's own recorded gap plainly, not just gesture at
+    /// "something is degraded".
+    #[test]
+    fn the_sandbox_residual_announcement_names_the_gap() {
+        let event = Event::SandboxResidual {
+            note: "codex's report-only sandbox (--sandbox read-only) could not add \
+                   --ignore-rules --ignore-user-config on this installed codex-cli"
+                .to_string(),
+        };
+        assert!(
+            event.line().contains("sandbox residual:"),
+            "got {}",
+            event.line()
+        );
+        assert!(
+            event.line().contains("--ignore-rules"),
+            "got {}",
+            event.line()
+        );
+    }
+
+    /// Issue #87: a durable memory harvest must announce a one-line summary
+    /// on the `zirv ▸` channel, singular/plural and zero-count included --
+    /// a harvest that ran and accepted nothing is still worth reporting, not
+    /// silently indistinguishable from a harvest that never ran.
+    #[test]
+    fn the_memory_harvested_announcement_names_the_count() {
+        let none = Event::MemoryHarvested { count: 0 };
+        assert!(
+            none.line().contains("wrote 0 durable entries"),
+            "got {}",
+            none.line()
+        );
+
+        let one = Event::MemoryHarvested { count: 1 };
+        assert!(
+            one.line().contains("wrote 1 durable entry"),
+            "got {}",
+            one.line()
+        );
+        assert!(
+            !one.line().contains("entries"),
+            "singular must not also say entries: {}",
+            one.line()
+        );
+
+        let many = Event::MemoryHarvested { count: 3 };
+        assert!(
+            many.line().contains("wrote 3 durable entries"),
+            "got {}",
+            many.line()
+        );
+    }
+
     /// Bug B (harness/model parity, 2026-08-22): the shipped-default
     /// sandbox posture must be visible on the same channel every other
     /// launch-time decision already narrates through -- both the applied
@@ -548,6 +675,27 @@ mod tests {
             event.line().contains("chat model 'fable' (from config)"),
             "got {}",
             event.line()
+        );
+    }
+
+    /// A stray keystroke in an untrusted repo `ctx.toml` must never be a
+    /// silent full-permissive fallback: the announcement names the file(s)
+    /// and the parse message, and never claims the config load failed
+    /// outright (it degraded to defaults, it did not abort).
+    #[test]
+    fn a_config_unparsable_announcement_names_the_layer_and_the_parse_message() {
+        let event = Event::ConfigUnparsable {
+            detail: ".zirv/ctx.toml: TOML parse error at line 1, column 2: key with no value, \
+                      expected `=`"
+                .to_string(),
+        };
+        let line = event.line();
+        assert!(line.contains(".zirv/ctx.toml"), "got {line}");
+        assert!(line.contains("line 1, column 2"), "got {line}");
+        assert!(line.contains("skipped"), "got {line}");
+        assert!(
+            line.contains("defaults used"),
+            "must read as a degrade, not a hard failure: {line}"
         );
     }
 
@@ -850,6 +998,9 @@ mod tests {
                 disposition: NudgeDisposition::Relaunching,
             },
             Event::MacosKeychainPromptExpected,
+            Event::ConfigUnparsable {
+                detail: ".zirv/ctx.toml: TOML parse error at line 1, column 2: bad".to_string(),
+            },
         ];
         for event in sample {
             let line = event.line();

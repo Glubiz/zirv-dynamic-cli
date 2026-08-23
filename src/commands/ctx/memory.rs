@@ -1619,11 +1619,22 @@ pub fn harvest_durable(
         return Ok(0);
     }
     let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
+    // Issue #89.
+    super::adapters::announce_sandbox_residual_once(adapter, cfg.chrome.events);
     let answer =
         super::handoff::run_model(adapter, model, &durable_harvest_prompt(handoff), timeout)?;
     let candidates = parse_harvest(&answer);
     let accepted = filter_durable_candidates(&candidates, cfg);
-    write_durable(repo, state, slug, &accepted, cfg, now_secs())
+    let written = write_durable(repo, state, slug, &accepted, cfg, now_secs())?;
+    // Issue #87: a one-line summary on the `zirv ▸` channel every time a
+    // harvest actually ran (this function is the single choke point every
+    // call site funnels through), so harvesting is visible rather than a
+    // silent diff under `.zirv/memory/` days later. Fired even at
+    // `written == 0` -- that is still a real outcome, distinct from a
+    // harvest that never ran at all.
+    super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr())
+        .emit(&super::announce::Event::MemoryHarvested { count: written });
+    Ok(written)
 }
 
 /// The clean-session-end companion to `harvest_durable` (issue #37): a
@@ -1658,8 +1669,13 @@ pub fn harvest_at_session_end(
     if !cfg.memory.enabled || !cfg.memory.harvest || !cfg.memory.shared_enabled {
         return Ok(0);
     }
-    let (note, source) =
-        super::handoff::distill_or_structural(adapter, model, ctx, handoff_timeout);
+    let (note, source) = super::handoff::distill_or_structural(
+        adapter,
+        model,
+        ctx,
+        handoff_timeout,
+        cfg.chrome.events,
+    );
     if source != "distilled" {
         return Ok(0);
     }

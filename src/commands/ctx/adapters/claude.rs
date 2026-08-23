@@ -839,22 +839,46 @@ impl AgentAdapter for ClaudeAdapter {
     /// which list (shipped or operator) an entry came from: both end up in
     /// the same `--allowedTools=`/`--disallowedTools=` argv, and the
     /// underlying CLI mechanism does not distinguish their origin.
+    /// Projects `safety` (issue #83's harness-neutral command policy) onto
+    /// claude's own `--allowedTools=`/`--disallowedTools=` vocabulary:
+    /// `Read(./**)`/`Edit(./**)` are prepended directly (file-scope rules,
+    /// not commands -- outside `[safety]`'s own domain, see `safety::
+    /// command_pattern_from_bash_rule`'s doc comment), then every `safety`
+    /// rule is re-wrapped as `Bash(<pattern>)`, then `sandbox.extra_allow`/
+    /// `extra_deny` are appended last, unchanged from before this method
+    /// took a `SafetyPolicy` parameter.
+    ///
+    /// Byte-identical to the pre-#83 hardcoded projection under the shipped
+    /// default: `safety::builtin_deny`/`builtin_allow` strip exactly
+    /// `SHIPPED_POSTURE_DENY`/`_ALLOW`'s own `Bash(...)` wrapper and this
+    /// method re-adds it, so the round trip reproduces the original strings
+    /// verbatim, in the original order -- pinned by
+    /// `default_sandbox_args_stays_byte_identical_to_the_pre_safety_shipped_
+    /// default` below.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
+        safety: &crate::commands::ctx::safety::SafetyPolicy,
     ) -> Vec<String> {
-        let allow = super::SHIPPED_POSTURE_ALLOW
+        let mut allow_entries: Vec<String> =
+            vec!["Read(./**)".to_string(), "Edit(./**)".to_string()];
+        allow_entries.extend(
+            safety
+                .allow
+                .iter()
+                .map(|rule| format!("Bash({})", rule.pattern)),
+        );
+        allow_entries.extend(sandbox.extra_allow.iter().cloned());
+        let allow = allow_entries.join(",");
+
+        let mut deny_entries: Vec<String> = safety
+            .deny
             .iter()
-            .map(|(rule, _)| rule.to_string())
-            .chain(sandbox.extra_allow.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(",");
-        let deny = super::SHIPPED_POSTURE_DENY
-            .iter()
-            .map(|(rule, _)| rule.to_string())
-            .chain(sandbox.extra_deny.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(",");
+            .map(|rule| format!("Bash({})", rule.pattern))
+            .collect();
+        deny_entries.extend(sandbox.extra_deny.iter().cloned());
+        let deny = deny_entries.join(",");
+
         vec![
             "--permission-mode".to_string(),
             "dontAsk".to_string(),
@@ -1578,7 +1602,7 @@ mod tests {
     #[test]
     fn default_sandbox_args_uses_the_verified_dont_ask_mode() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default());
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
         assert_eq!(
             &args[0..2],
             &["--permission-mode".to_string(), "dontAsk".to_string()]
@@ -1594,7 +1618,7 @@ mod tests {
     #[test]
     fn default_sandbox_args_generates_the_allow_and_deny_lists_from_the_shared_source() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default());
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
         assert_eq!(args.len(), 4, "got {args:?}");
         let allow_arg = args
             .iter()
@@ -1623,6 +1647,46 @@ mod tests {
         assert!(deny_arg.starts_with("--disallowedTools="));
     }
 
+    /// Issue #83: `default_sandbox_args` now projects `safety::SafetyPolicy`
+    /// (derived from `SHIPPED_POSTURE_ALLOW`/`_DENY`) instead of iterating
+    /// those constants directly. Under the shipped default -- no
+    /// `[safety]`/`sandbox.extra_*` configured, i.e. exactly the two
+    /// `Default::default()` values every other test in this file already
+    /// passes -- the generated argv must stay byte-for-byte identical to
+    /// what a hand-built projection straight from `SHIPPED_POSTURE_ALLOW`/
+    /// `_DENY` would produce, so this refactor could not have silently
+    /// changed a live-verified permission set.
+    #[test]
+    fn default_sandbox_args_stays_byte_identical_to_the_pre_safety_shipped_default() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+
+        // `SHIPPED_POSTURE_ALLOW`'s own first two entries already are
+        // `Read(./**)`/`Edit(./**)` -- the projection prepends them
+        // separately only because `safety::builtin_allow` filters them out
+        // (they are not `Bash(...)`-wrapped commands), so iterating the
+        // original constant directly reproduces the exact same order with
+        // no duplication.
+        let expected_allow: Vec<String> = super::super::SHIPPED_POSTURE_ALLOW
+            .iter()
+            .map(|(rule, _)| rule.to_string())
+            .collect();
+        let expected_deny: Vec<String> = super::super::SHIPPED_POSTURE_DENY
+            .iter()
+            .map(|(rule, _)| rule.to_string())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode".to_string(),
+                "dontAsk".to_string(),
+                format!("--allowedTools={}", expected_allow.join(",")),
+                format!("--disallowedTools={}", expected_deny.join(",")),
+            ]
+        );
+    }
+
     /// Fix round 3 (2026-08-22): an operator's own `sandbox.extra_allow`/
     /// `extra_deny` (`SandboxConfig`, `config.rs`) are appended after the
     /// shipped lists, never replacing them -- the shipped entries must
@@ -1635,7 +1699,7 @@ mod tests {
             extra_allow: vec!["Bash(just test *)".to_string()],
             extra_deny: vec!["Bash(terraform apply *)".to_string()],
         };
-        let args = adapter.default_sandbox_args(&sandbox);
+        let args = adapter.default_sandbox_args(&sandbox, &Default::default());
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1668,7 +1732,7 @@ mod tests {
     #[test]
     fn default_sandbox_args_scopes_file_edits_to_the_workspace_not_bare_write() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default());
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1685,7 +1749,7 @@ mod tests {
     #[test]
     fn default_sandbox_args_never_emits_the_dangerous_bypass_flag() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default());
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
         assert!(
             !args
                 .iter()

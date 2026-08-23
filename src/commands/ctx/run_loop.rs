@@ -119,7 +119,7 @@ pub(crate) fn run_with_clock<W: Write>(
     }
 
     let prompt = resolve_prompt(args)?;
-    let cfg = CtxConfig::load(repo, env)?;
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
     let announcer =
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;

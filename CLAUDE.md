@@ -41,6 +41,7 @@ cargo clippy --all-targets -- -D warnings
   - `signal.rs` / `supervise.rs` / `term.rs` — Turn-signal sockets, process primitives, raw mode
   - `pace.rs` / `usage.rs` / `window.rs` — Usage pacing gate, the `usage` verb (and statusline tee), rolling usage-window state
   - `optimize.rs` / `prompt.rs` — Configuration analysis and the injected session prompt
+  - `policy.rs` / `safety.rs` — Canonical per-capability permissions policy (`[policy]`) and the harness-neutral command safety classifier (`[safety]`, `zirv ctx safety check|list|explain`), each translated per adapter
   - `chat.rs` — `zirv ctx chat`: an interactive orchestrator session built from the resolved adapter and driven through `wrap`
   - `agent.rs` — `zirv ctx agent <name> <prompt>`: one-shot delegation to a supervised headless worker, driven through `exec`
   - `mail.rs` — `zirv ctx send`/`zirv ctx inbox`: repo-scoped inter-session notes, read once then moved to `read/`
@@ -260,6 +261,7 @@ Update vault pages when a **change in behavior, contract, or architecture** land
 | Shortcut resolution change | `Concepts/Shortcuts.md` |
 | ctx verb added/removed/changed | `Modules/Ctx Subsystem.md` plus the specific module page |
 | Adapter behavior change (claude/codex) | `Modules/Ctx Adapters.md` |
+| Command safety policy change (`[safety]`, `safety.rs`, the wired `PreToolUse` hook) | `Modules/Command Safety.md`, `Modules/Ctx Adapters.md`, `Concepts/Untrusted Configuration.md` |
 | Rot engine event or verdict change | `Modules/Rot Engine.md`, `Concepts/Context Management.md` |
 | Supervisor behavior change (loop/exec/wrap, signals, raw mode) | `Modules/Ctx Supervisors.md` |
 | Pacing/usage/window change | `Modules/Usage and Pacing.md` |

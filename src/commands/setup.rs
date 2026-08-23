@@ -18,6 +18,31 @@ const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
     ("PreToolUse", Some("Agent|Task"), "zirv ctx hook pretool"),
 ];
 
+/// Issue #83's command safety hook: `zirv ctx safety check`, matched on
+/// `Bash` calls only (a distinct `PreToolUse` matcher from `HARNESS_HOOKS`'s
+/// own `Agent|Task` entry above -- both coexist in the same event array,
+/// `ensure_harness_hook` pushes a new entry per distinct command string
+/// rather than replacing). Wired into **claude only**
+/// (`install_claude_integration`), not `HARNESS_HOOKS` itself: unlike the
+/// four hooks above, codex has no verified equivalent of claude's
+/// `hookSpecificOutput.permissionDecision` PreToolUse contract this hook
+/// relies on (see `safety::hook_output`'s own doc comment), so wiring it
+/// into `install_codex_hooks` too -- which shares `HARNESS_HOOKS` with the
+/// claude path -- would write a hook codex has no verified way to honor.
+/// With no trailing command, `zirv ctx safety check` reads the hook's JSON
+/// payload from stdin (`tool_name`/`tool_input.command`) instead of `--
+/// <command>` argv, and always exits 0 -- see `safety::run_check`'s own doc
+/// comment for why (the decision is expressed in the JSON envelope, not the
+/// exit code, mirroring `hook::run_pretool`).
+const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) =
+    ("PreToolUse", Some("Bash"), "zirv ctx safety check");
+
+/// Total claude hooks `zirv setup` installs/reports on: `HARNESS_HOOKS`
+/// (shared with codex) plus `CLAUDE_SAFETY_HOOK` (claude-only, see its own
+/// doc comment above). Codex's own total stays `HARNESS_HOOKS.len()`
+/// unchanged -- the safety hook is not wired into `install_codex_hooks`.
+const CLAUDE_HOOKS_TOTAL: usize = HARNESS_HOOKS.len() + 1;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "zirv setup",
@@ -153,6 +178,15 @@ enum TargetState {
     Differs,
 }
 
+fn describe_statusline(state: StatuslineStatus) -> &'static str {
+    match state {
+        StatuslineStatus::Absent => "not configured",
+        StatuslineStatus::TeeInstalled => "tee installed",
+        StatuslineStatus::TeeWrappingCustom => "tee wrapping a custom command",
+        StatuslineStatus::CustomNotWrapped => "custom statusline present, tee not installed",
+    }
+}
+
 fn describe_state(state: TargetState) -> &'static str {
     match state {
         TargetState::Absent => "currently absent",
@@ -227,8 +261,22 @@ struct SetupStatus {
     context_codex: bool,
     shared_memory_entries: usize,
     claude_hooks_installed: usize,
-    claude_statusline_installed: bool,
+    /// Total claude hooks `zirv setup apply` may install, i.e.
+    /// `CLAUDE_HOOKS_TOTAL` (issue #83 added a 5th, the safety hook, so this
+    /// is no longer always `HARNESS_HOOKS.len()`). Added alongside
+    /// `codex_hooks_total` in schema_version 2 so a JSON consumer never has
+    /// to hardcode the denominator itself.
+    claude_hooks_total: usize,
+    /// Issue #93: distinguishes "tee installed" from "tee wrapping a custom
+    /// command" from "custom statusLine present, tee not installed" -- the
+    /// old plain bool collapsed the first two together and could not name
+    /// the third at all.
+    claude_statusline: StatuslineStatus,
     codex_hooks_installed: usize,
+    /// Total codex hooks `zirv setup apply` may install (`HARNESS_HOOKS.len()`
+    /// -- the safety hook is claude-only, see `CLAUDE_SAFETY_HOOK`'s doc
+    /// comment). Schema_version 2, same as `claude_hooks_total`.
+    codex_hooks_total: usize,
     claude: HarnessStatus,
     codex: HarnessStatus,
 }
@@ -329,6 +377,145 @@ fn ensure_harness_hook(
     Ok(true)
 }
 
+/// Issue #93: how a Claude `statusLine.command` string relates to zirv's own
+/// usage tee. Computed purely from the string itself (no filesystem, no
+/// process spawn), so it stays testable and reusable between `zirv setup
+/// status` and the guided apply flow's own detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum StatuslineStatus {
+    /// No `statusLine` key at all.
+    Absent,
+    /// `command` is exactly zirv's own tee, unwrapped.
+    TeeInstalled,
+    /// `command` is zirv's tee wrapping some other command after `--`.
+    TeeWrappingCustom,
+    /// `command` is present and is neither of the above.
+    CustomNotWrapped,
+}
+
+const TEE_COMMAND: &str = "zirv ctx usage tee";
+/// `zirv ctx usage tee -- <original>` is documented (see `usage.rs`'s own
+/// help text and `poll.rs`'s hint) as the manual way an operator chains a
+/// pre-existing statusline through the tee. Wrapping is deliberately plain
+/// string concatenation, not re-quoting: `run_chained` (`usage.rs`) never
+/// re-parses this text through a shell of its own -- the platform shell that
+/// already invokes Claude's configured `statusLine.command` string is the
+/// only shell that ever splits it into argv, exactly as it would have split
+/// the original command on its own. Prefixing rather than re-encoding is
+/// what makes both directions trivial: wrapping never risks breaking a
+/// command containing spaces, quotes, or shell metacharacters (nothing
+/// about that text is touched), and unwrapping is an exact prefix strip,
+/// byte-for-byte reversible on both POSIX shells and cmd.exe.
+const TEE_WRAP_PREFIX: &str = "zirv ctx usage tee -- ";
+
+fn classify_statusline_command(command: Option<&str>) -> StatuslineStatus {
+    match command {
+        None => StatuslineStatus::Absent,
+        Some(command) if command == TEE_COMMAND => StatuslineStatus::TeeInstalled,
+        Some(command) if command.starts_with(TEE_WRAP_PREFIX) => {
+            StatuslineStatus::TeeWrappingCustom
+        }
+        Some(_) => StatuslineStatus::CustomNotWrapped,
+    }
+}
+
+fn wrap_statusline_command(existing: &str) -> String {
+    format!("{TEE_WRAP_PREFIX}{existing}")
+}
+
+#[cfg(test)]
+fn unwrap_statusline_command(wrapped: &str) -> Option<&str> {
+    wrapped.strip_prefix(TEE_WRAP_PREFIX)
+}
+
+/// Wraps an existing custom Claude `statusLine.command` with zirv's usage
+/// tee, backing up the pre-wrap `settings.json` first (via the same
+/// `write_backup_run` every other backup uses, so `zirv setup restore` is
+/// the unwrap path -- see the module doc comment on backups). Callers must
+/// classify first: this errors if the current command is not
+/// `CustomNotWrapped`, rather than silently double-wrapping or overwriting
+/// an already-tee-installed line.
+fn wrap_claude_statusline_command(home: &Path) -> SetupResult<(String, String)> {
+    let settings_path = claude_config_dir(home).join("settings.json");
+    let mut settings = load_json_object(&settings_path)?;
+    let existing = settings
+        .pointer("/statusLine/command")
+        .and_then(Value::as_str)
+        .ok_or("no existing statusLine command to wrap")?
+        .to_string();
+    if classify_statusline_command(Some(&existing)) != StatuslineStatus::CustomNotWrapped {
+        return Err("statusLine is not an unwrapped custom command".into());
+    }
+    let wrapped = wrap_statusline_command(&existing);
+    write_backup_run(
+        &home.join(".zirv/backups/ai-reset"),
+        BackupKind::Apply,
+        ResetProvider::Claude,
+        ResetScope::Global,
+        &claude_config_dir(home),
+        std::slice::from_ref(&settings_path),
+    )?;
+    settings["statusLine"]["command"] = Value::String(wrapped.clone());
+    std::fs::create_dir_all(claude_config_dir(home))?;
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings)? + "\n",
+    )?;
+    Ok((existing, wrapped))
+}
+
+/// Pure "should the guided flow prompt right now" decision, factored out of
+/// `maybe_offer_statusline_wrap` so the "not re-asked" rule is testable
+/// without a real terminal or a `dialoguer` interaction.
+fn should_offer_statusline_wrap(
+    already_offered: bool,
+    command_state: StatuslineStatus,
+    is_interactive: bool,
+) -> bool {
+    is_interactive && !already_offered && command_state == StatuslineStatus::CustomNotWrapped
+}
+
+const STATUSLINE_WRAP_PROMPT: &str = "A custom Claude statusLine is already configured. Wrap it \
+     with zirv's usage tee so zirv can observe usage while your statusline keeps rendering \
+     unchanged? This is reversible: `zirv setup restore --latest` can bring the exact original \
+     command back at any time.";
+
+fn maybe_offer_statusline_wrap<W: Write>(
+    repo: &Path,
+    home: &Path,
+    writer: &mut W,
+) -> SetupResult<()> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let env = ctx::config::env_from_process();
+    let cfg = ctx::config::CtxConfig::load(repo, &env)?;
+    let settings_path = claude_config_dir(home).join("settings.json");
+    let settings = load_json_object(&settings_path)?;
+    let command = settings
+        .pointer("/statusLine/command")
+        .and_then(Value::as_str);
+    let state = classify_statusline_command(command);
+    if !should_offer_statusline_wrap(cfg.setup.statusline_wrap_offered, state, interactive) {
+        return Ok(());
+    }
+    let existing = command.expect("CustomNotWrapped implies Some").to_string();
+    let wrapped = wrap_statusline_command(&existing);
+    writeln!(writer, "current statusLine command:\n  {existing}")?;
+    writeln!(writer, "proposed statusLine command:\n  {wrapped}")?;
+    let accept = dialoguer::Confirm::new()
+        .with_prompt(STATUSLINE_WRAP_PROMPT)
+        .default(false)
+        .interact()?;
+    if accept {
+        wrap_claude_statusline_command(home)?;
+        writeln!(writer, "statusline wrapped with zirv's usage tee")?;
+    } else {
+        writeln!(writer, "statusline left unchanged")?;
+    }
+    set_home_ctx_toml_bool(home, "setup", "statusline_wrap_offered", true)?;
+    Ok(())
+}
+
 fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize, bool)> {
     let settings_path = claude_config_dir(home).join("settings.json");
     if std::fs::symlink_metadata(&settings_path)
@@ -342,6 +529,10 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
         if ensure_harness_hook(&mut settings, event, matcher, command)? {
             hooks_added += 1;
         }
+    }
+    let (safety_event, safety_matcher, safety_command) = CLAUDE_SAFETY_HOOK;
+    if ensure_harness_hook(&mut settings, safety_event, safety_matcher, safety_command)? {
+        hooks_added += 1;
     }
     let root = settings.as_object_mut().expect("validated object");
     let statusline_added = if root.contains_key("statusLine") {
@@ -405,6 +596,84 @@ fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupRe
 
 fn install_codex_integration(home: &Path, dry_run: bool) -> SetupResult<usize> {
     install_codex_hooks(home, &codex_config_dir(home).join("hooks.json"), dry_run)
+}
+
+/// Writes one boolean key into the operator's global `~/.zirv/ctx.toml`,
+/// creating the file and the `[table]` section if necessary and leaving
+/// every other key in the file untouched. Issues #87 and #93 both require
+/// the guided flow's answer to land only in the operator's own config, never
+/// a repo layer -- this always targets `home`, never `repo`.
+fn set_home_ctx_toml_bool(home: &Path, table: &str, key: &str, value: bool) -> SetupResult<()> {
+    let path = home
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join(ctx::config::CTX_CONFIG_FILE);
+    let mut root: toml::Table = if path.is_file() {
+        toml::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        toml::Table::new()
+    };
+    let section = root
+        .entry(table.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let section_table = section
+        .as_table_mut()
+        .ok_or_else(|| format!("{} `[{table}]` is not a table", path.display()))?;
+    section_table.insert(key.to_string(), toml::Value::Boolean(value));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+    Ok(())
+}
+
+/// Issue #87: applies the operator's answer to the memory-harvest offer.
+/// The config default (`memory.harvest = false`) is never changed by a
+/// decline -- only `accept` writes it on, and `memory_harvest_offered` is
+/// always written so the question is not re-asked either way.
+fn apply_memory_harvest_decision(home: &Path, accept: bool) -> SetupResult<()> {
+    if accept {
+        set_home_ctx_toml_bool(home, "memory", "harvest", true)?;
+    }
+    set_home_ctx_toml_bool(home, "setup", "memory_harvest_offered", true)?;
+    Ok(())
+}
+
+/// Pure "should the guided flow prompt right now" decision, mirroring
+/// `should_offer_statusline_wrap`.
+fn should_offer_memory_harvest(already_offered: bool, is_interactive: bool) -> bool {
+    is_interactive && !already_offered
+}
+
+const MEMORY_HARVEST_PROMPT: &str = "Enable automatic memory harvest? At a rot/timeout restart \
+     or a clean session end, zirv will ask the model to propose a bounded number of durable \
+     facts and store them in the shared memory bank under this repository's .zirv/memory/ -- \
+     visible any time via `zirv memory recall`/`zirv ctx recall`.";
+
+fn maybe_offer_memory_harvest<W: Write>(
+    repo: &Path,
+    home: &Path,
+    writer: &mut W,
+) -> SetupResult<()> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let env = ctx::config::env_from_process();
+    let cfg = ctx::config::CtxConfig::load(repo, &env)?;
+    if !should_offer_memory_harvest(cfg.setup.memory_harvest_offered, interactive) {
+        return Ok(());
+    }
+    let accept = dialoguer::Confirm::new()
+        .with_prompt(MEMORY_HARVEST_PROMPT)
+        .default(false)
+        .interact()?;
+    apply_memory_harvest_decision(home, accept)?;
+    if accept {
+        writeln!(
+            writer,
+            "memory: automatic harvest enabled (see `zirv memory recall`)"
+        )?;
+    } else {
+        writeln!(writer, "memory: automatic harvest left off")?;
+    }
+    Ok(())
 }
 
 fn read_regular(path: &Path) -> Option<String> {
@@ -1038,7 +1307,65 @@ fn write_backup_run(
         backup_dir.join("manifest.json"),
         serde_json::to_string_pretty(&manifest)? + "\n",
     )?;
+    // Issue #95: prune on write only -- `restore --list` (`print_restore_
+    // list`/`all_runs`) never calls this, so listing stays read-only. `base`
+    // is reused rather than threading a fresh config-lookup path through
+    // every one of this function's four call sites: for a project-scope run
+    // it already IS the repo, and for a global-scope run it is some
+    // subdirectory of the operator's own home, which resolves the same
+    // operator-layer config either way (`CtxConfig::load` always reads the
+    // real home layer via `crate::utils::home_dir()` regardless of the
+    // `repo` argument passed to it).
+    prune_backup_runs(backup_root, resolve_backup_retention_runs(base));
     Ok(backup_dir)
+}
+
+/// Issue #95: count-cap retention on `.zirv/backups/ai-reset`, mirroring
+/// `workflow::telemetry::prune_expired`'s "prune after every write, using
+/// the run's own timestamp, best-effort" shape and `memory::prune_to_cap`'s
+/// "never delete an entry whose timestamp we can't parse" caution, rather
+/// than adding a third pruning implementation from scratch (`discover_runs`
+/// is reused for enumeration). The run with the OLDEST `manifest.created` is
+/// NEVER a deletion candidate and does not count against `keep` -- it is the
+/// only copy of the operator's original, pre-zirv configuration, the run
+/// someone reaching for `restore` most wants, and a naive "keep the newest
+/// N" would delete exactly that one. See
+/// `pruning_a_backup_run_never_deletes_the_pinned_oldest_run_even_past_the_cap`.
+fn prune_backup_runs(backup_root: &Path, keep: usize) {
+    let mut runs = discover_runs(backup_root);
+    if runs.len() <= 1 {
+        return;
+    }
+    runs.sort_by_key(|run| run.manifest.created);
+    // runs[0] is the pinned oldest; `prunable` excludes it entirely, so
+    // `keep` bounds only the runs after it.
+    let prunable = &runs[1..];
+    if prunable.len() <= keep {
+        return;
+    }
+    let excess = prunable.len() - keep;
+    for run in prunable.iter().take(excess) {
+        let _ = std::fs::remove_dir_all(&run.dir);
+    }
+}
+
+const DEFAULT_BACKUP_RETENTION_RUNS: usize = 20;
+const MAX_CONFIGURED_BACKUP_RETENTION_RUNS: usize = 500;
+
+/// Mirrors `TelemetryConfig::from_config`'s own clamp (`workflow/
+/// telemetry.rs`): `0` keeps the built-in default rather than meaning
+/// "unlimited", and anything above the ceiling is clamped down rather than
+/// honored outright. A config that fails to load falls back to the default
+/// instead of failing the backup write it guards -- retention is
+/// best-effort, unlike the write itself.
+fn resolve_backup_retention_runs(config_repo: &Path) -> usize {
+    match ctx::config::CtxConfig::load(config_repo, &ctx::config::env_from_process()) {
+        Ok(cfg) => match cfg.setup.backup_retention_runs {
+            0 => DEFAULT_BACKUP_RETENTION_RUNS,
+            value => value.min(MAX_CONFIGURED_BACKUP_RETENTION_RUNS),
+        },
+        Err(_) => DEFAULT_BACKUP_RETENTION_RUNS,
+    }
 }
 
 fn reset_one<W: Write>(
@@ -1108,16 +1435,18 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
     let claude_hooks_installed = HARNESS_HOOKS
         .iter()
         .filter(|(_, _, command)| contains_command(&claude_settings, command))
-        .count();
+        .count()
+        + usize::from(contains_command(&claude_settings, CLAUDE_SAFETY_HOOK.2));
     let codex_hooks = load_json_object(&codex_dir.join("hooks.json")).unwrap_or_else(|_| json!({}));
     let codex_hooks_installed = HARNESS_HOOKS
         .iter()
         .filter(|(_, _, command)| contains_command(&codex_hooks, command))
         .count();
-    let claude_statusline_installed = claude_settings
-        .pointer("/statusLine/command")
-        .and_then(Value::as_str)
-        .is_some_and(|command| command.starts_with("zirv ctx usage tee"));
+    let claude_statusline = classify_statusline_command(
+        claude_settings
+            .pointer("/statusLine/command")
+            .and_then(Value::as_str),
+    );
     let shared_memory_entries = std::fs::read_dir(repo.join(".zirv/memory"))
         .map(|entries| {
             entries
@@ -1132,7 +1461,7 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
         })
         .unwrap_or(0);
     Ok(SetupStatus {
-        schema_version: 1,
+        schema_version: 2,
         repo: repo.to_path_buf(),
         zirv_initialized: repo.join(".zirv").is_dir(),
         context_common: ctx::context::common_path(repo).is_file(),
@@ -1140,8 +1469,10 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
         context_codex: ctx::context::codex_path(repo).is_file(),
         shared_memory_entries,
         claude_hooks_installed,
-        claude_statusline_installed,
+        claude_hooks_total: CLAUDE_HOOKS_TOTAL,
+        claude_statusline,
         codex_hooks_installed,
+        codex_hooks_total: HARNESS_HOOKS.len(),
         claude: HarnessStatus {
             installed: executable_exists("claude"),
             settings_present: claude_settings_path.is_file(),
@@ -1192,14 +1523,13 @@ fn run_status<W: Write>(args: &StatusArgs, writer: &mut W) -> SetupResult<i32> {
         writer,
         "  Claude integration: {}/{} hooks, statusline={}",
         status.claude_hooks_installed,
-        HARNESS_HOOKS.len(),
-        status.claude_statusline_installed
+        status.claude_hooks_total,
+        describe_statusline(status.claude_statusline)
     )?;
     writeln!(
         writer,
         "  Codex integration: {}/{} hooks",
-        status.codex_hooks_installed,
-        HARNESS_HOOKS.len()
+        status.codex_hooks_installed, status.codex_hooks_total
     )?;
     Ok(0)
 }
@@ -1253,6 +1583,9 @@ fn run_apply<W: Write>(args: &ApplyArgs, writer: &mut W) -> SetupResult<i32> {
             )?,
             Err(error) => return Err(error),
         }
+        if !args.dry_run {
+            maybe_offer_memory_harvest(&repo, &home_dir()?, writer)?;
+        }
     }
     if !args.no_claude_hooks {
         let (hooks, statusline) = install_claude_integration(&home_dir()?, args.dry_run)?;
@@ -1271,6 +1604,9 @@ fn run_apply<W: Write>(args: &ApplyArgs, writer: &mut W) -> SetupResult<i32> {
                 "preserved"
             }
         )?;
+        if !args.dry_run {
+            maybe_offer_statusline_wrap(&repo, &home_dir()?, writer)?;
+        }
     }
     if !args.no_codex_hooks {
         let hooks = install_codex_integration(&home_dir()?, args.dry_run)?;
@@ -1739,10 +2075,9 @@ fn human_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// Makes unbounded backup growth visible instead of invisible until a disk
-/// fills: nothing here prunes old runs (that is separate, filed work), but
-/// every listing states the running count and on-disk size so an operator
-/// can see it accumulating.
+/// Makes backup growth visible: every listing states the running count and
+/// on-disk size, so an operator can see it before it becomes a problem, even
+/// though `prune_backup_runs` (issue #95) now bounds it on every write.
 fn backup_summary_line<'a>(runs: impl IntoIterator<Item = &'a BackupRun>) -> String {
     let mut count = 0usize;
     let mut total_bytes: u64 = 0;
@@ -1751,8 +2086,8 @@ fn backup_summary_line<'a>(runs: impl IntoIterator<Item = &'a BackupRun>) -> Str
         total_bytes += dir_size(&run.dir);
     }
     format!(
-        "{count} backup run(s), {} on disk under .zirv/backups/ai-reset (old runs are never \
-         automatically pruned)",
+        "{count} backup run(s), {} on disk under .zirv/backups/ai-reset (retention is \
+         count-capped per `setup.backup_retention_runs`; the oldest run is always kept)",
         human_bytes(total_bytes)
     )
 }
@@ -2131,6 +2466,45 @@ mod tests {
         assert!(contains_command(&settings, "zirv ctx hook stop"));
     }
 
+    /// Issue #83: `zirv setup apply` wires `zirv ctx safety check` into
+    /// claude's `PreToolUse` hooks, matched on `Bash` (distinct from the
+    /// existing `Agent|Task`-matched `PreToolUse` entry `HARNESS_HOOKS`
+    /// already installs -- both must coexist in the same event array), and
+    /// idempotently (a second `apply` adds nothing more, backed up via the
+    /// same manifest system every other hook write already uses).
+    #[test]
+    fn install_claude_integration_wires_the_safety_hook_idempotently() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        let (hooks_added, _statusline) =
+            install_claude_integration(home.path(), false).expect("apply");
+        assert!(hooks_added > HARNESS_HOOKS.len());
+
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        let settings = load_json_object(&settings_path).expect("settings");
+        assert!(contains_command(&settings, "zirv ctx safety check"));
+        let pretool_entries = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse array");
+        assert!(
+            pretool_entries
+                .iter()
+                .any(|entry| entry["matcher"] == "Bash"),
+            "the safety hook must be its own Bash-matched entry: {pretool_entries:?}"
+        );
+        assert!(
+            pretool_entries
+                .iter()
+                .any(|entry| entry["matcher"] == "Agent|Task"),
+            "the existing Agent|Task PreToolUse hook must still be present too: {pretool_entries:?}"
+        );
+
+        let (hooks_added_again, _) =
+            install_claude_integration(home.path(), false).expect("re-apply");
+        assert_eq!(hooks_added_again, 0, "a second apply must add nothing more");
+    }
+
     #[test]
     fn memory_init_is_bounded_dry_runnable_and_refuses_silent_overwrite() {
         let repo = tempfile::tempdir().expect("repo");
@@ -2456,18 +2830,45 @@ mod tests {
         )
         .expect("status");
         let value: Value = serde_json::from_slice(&output).expect("status json");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         for key in [
             "repo",
             "zirv_initialized",
             "shared_memory_entries",
             "claude_hooks_installed",
+            "claude_hooks_total",
             "codex_hooks_installed",
+            "codex_hooks_total",
             "claude",
             "codex",
         ] {
             assert!(value.get(key).is_some(), "missing stable status key {key}");
         }
+    }
+
+    /// Issue #83's safety hook (`CLAUDE_SAFETY_HOOK`) must count toward
+    /// claude's own installed/total, but never codex's -- codex has no
+    /// verified equivalent of claude's `PreToolUse` permission-decision
+    /// contract, so `install_codex_hooks` never writes it (see
+    /// `CLAUDE_SAFETY_HOOK`'s own doc comment).
+    #[test]
+    fn status_counts_the_safety_hook_toward_claude_only() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        let before = status(repo.path()).expect("status before apply");
+        assert_eq!(before.claude_hooks_total, HARNESS_HOOKS.len() + 1);
+        assert_eq!(before.codex_hooks_total, HARNESS_HOOKS.len());
+        assert_eq!(before.claude_hooks_installed, 0);
+
+        install_claude_integration(home.path(), false).expect("apply");
+        let after = status(repo.path()).expect("status after apply");
+        assert_eq!(
+            after.claude_hooks_installed, after.claude_hooks_total,
+            "every claude hook, including the safety hook, is now installed"
+        );
+        assert_eq!(after.claude_hooks_installed, HARNESS_HOOKS.len() + 1);
     }
 
     fn restore_args(repo: &Path) -> RestoreArgs {
@@ -3039,5 +3440,421 @@ mod tests {
         let runs = all_runs(&[repo.path().join(".zirv/backups/ai-reset")]);
         // manifest.json + files/CLAUDE.md, both non-empty.
         assert!(dir_size(&runs[0].dir) >= 11);
+    }
+
+    // -- Issue #95: backup retention -----------------------------------
+
+    fn write_fake_run(root: &Path, id: &str, created: u64) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        let manifest = json!({
+            "schema_version": SUPPORTED_MANIFEST_SCHEMA_VERSION,
+            "kind": "reset",
+            "provider": "claude",
+            "scope": "project",
+            "base": "/repo",
+            "created": created,
+            "targets": [],
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&manifest).expect("manifest json"),
+        )
+        .expect("write manifest");
+    }
+
+    #[test]
+    fn pruning_a_backup_run_never_deletes_the_pinned_oldest_run_even_past_the_cap() {
+        let root = tempfile::tempdir().expect("root");
+        for (id, created) in [("a", 100), ("b", 200), ("c", 300), ("d", 400), ("e", 500)] {
+            write_fake_run(root.path(), id, created);
+        }
+
+        prune_backup_runs(root.path(), 2);
+
+        let remaining: BTreeSet<String> = discover_runs(root.path())
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        // "a" is the oldest and must survive regardless of the cap; the cap
+        // of 2 then applies only to the rest, keeping the two newest ("d",
+        // "e") and pruning "b"/"c".
+        assert_eq!(
+            remaining,
+            BTreeSet::from(["a".to_string(), "d".to_string(), "e".to_string()]),
+            "the oldest run must survive even though the cap alone would have excluded it"
+        );
+    }
+
+    #[test]
+    fn pruning_is_a_no_op_when_the_run_count_is_already_within_the_cap() {
+        let root = tempfile::tempdir().expect("root");
+        for (id, created) in [("a", 100), ("b", 200)] {
+            write_fake_run(root.path(), id, created);
+        }
+        prune_backup_runs(root.path(), 10);
+        assert_eq!(discover_runs(root.path()).len(), 2);
+    }
+
+    #[test]
+    fn backup_retention_zero_falls_back_to_the_built_in_default() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        assert_eq!(
+            resolve_backup_retention_runs(home.path()),
+            DEFAULT_BACKUP_RETENTION_RUNS
+        );
+    }
+
+    #[test]
+    fn backup_retention_is_clamped_like_telemetrys_own_retention() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("zirv dir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[setup]\nbackup_retention_runs = 999999\n",
+        )
+        .expect("ctx.toml");
+        assert_eq!(
+            resolve_backup_retention_runs(home.path()),
+            MAX_CONFIGURED_BACKUP_RETENTION_RUNS
+        );
+    }
+
+    #[test]
+    fn write_backup_run_prunes_to_the_configured_retention_on_every_write() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("zirv dir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[setup]\nbackup_retention_runs = 1\n",
+        )
+        .expect("ctx.toml");
+
+        let backup_root = repo.path().join(".zirv/backups/ai-reset");
+        let target = repo.path().join("CLAUDE.md");
+        for i in 0..4u64 {
+            std::fs::write(&target, format!("content {i}\n")).expect("target");
+            write_backup_run(
+                &backup_root,
+                BackupKind::Reset,
+                ResetProvider::Claude,
+                ResetScope::Project,
+                repo.path(),
+                std::slice::from_ref(&target),
+            )
+            .expect("backup");
+        }
+        // 4 writes, retention=1 excludes the pinned oldest, so 1 (pinned) + 1
+        // (newest of the rest) = 2 survive; `restore --list` performs no
+        // pruning of its own, so this reflects only the writes above.
+        assert_eq!(all_runs(&[backup_root]).len(), 2);
+    }
+
+    #[test]
+    fn restore_list_never_prunes_anything() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("zirv dir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[setup]\nbackup_retention_runs = 1\n",
+        )
+        .expect("ctx.toml");
+
+        let backup_root = repo.path().join(".zirv/backups/ai-reset");
+        let target = repo.path().join("CLAUDE.md");
+        for i in 0..3u64 {
+            std::fs::write(&target, format!("content {i}\n")).expect("target");
+            write_backup_run(
+                &backup_root,
+                BackupKind::Reset,
+                ResetProvider::Claude,
+                ResetScope::Project,
+                repo.path(),
+                std::slice::from_ref(&target),
+            )
+            .expect("backup");
+        }
+        let before = all_runs(std::slice::from_ref(&backup_root)).len();
+
+        let mut output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                list: true,
+                ..restore_args(repo.path())
+            },
+            &mut output,
+        )
+        .expect("list");
+
+        assert_eq!(
+            all_runs(&[backup_root]).len(),
+            before,
+            "--list must not prune"
+        );
+    }
+
+    // -- Issue #87: guided memory-harvest offer -------------------------
+
+    #[test]
+    fn should_offer_memory_harvest_only_when_interactive_and_not_yet_offered() {
+        assert!(should_offer_memory_harvest(false, true));
+        assert!(!should_offer_memory_harvest(true, true));
+        assert!(!should_offer_memory_harvest(false, false));
+    }
+
+    #[test]
+    fn declining_memory_harvest_leaves_the_default_off_but_remembers_it_was_asked() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        apply_memory_harvest_decision(home.path(), false).expect("decline");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert!(!cfg.memory.harvest, "declining must not turn harvest on");
+        assert!(
+            cfg.setup.memory_harvest_offered,
+            "a decline must still be remembered so it is not re-asked"
+        );
+        assert!(!should_offer_memory_harvest(
+            cfg.setup.memory_harvest_offered,
+            true
+        ));
+    }
+
+    #[test]
+    fn accepting_memory_harvest_writes_only_to_the_home_layer_never_the_repo() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        apply_memory_harvest_decision(home.path(), true).expect("accept");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert!(cfg.memory.harvest);
+        assert!(cfg.setup.memory_harvest_offered);
+        assert!(
+            !repo.path().join(".zirv/ctx.toml").exists(),
+            "the repo layer must never be written by the guided flow"
+        );
+    }
+
+    // -- Issue #93: wrap an existing custom statusLine -------------------
+
+    #[test]
+    fn classify_statusline_command_distinguishes_all_four_states() {
+        assert_eq!(classify_statusline_command(None), StatuslineStatus::Absent);
+        assert_eq!(
+            classify_statusline_command(Some("zirv ctx usage tee")),
+            StatuslineStatus::TeeInstalled
+        );
+        assert_eq!(
+            classify_statusline_command(Some("zirv ctx usage tee -- ccusage statusline")),
+            StatuslineStatus::TeeWrappingCustom
+        );
+        assert_eq!(
+            classify_statusline_command(Some("ccusage statusline")),
+            StatuslineStatus::CustomNotWrapped
+        );
+    }
+
+    #[test]
+    fn should_offer_statusline_wrap_only_for_an_unwrapped_custom_command_interactively_once() {
+        assert!(should_offer_statusline_wrap(
+            false,
+            StatuslineStatus::CustomNotWrapped,
+            true
+        ));
+        assert!(!should_offer_statusline_wrap(
+            true,
+            StatuslineStatus::CustomNotWrapped,
+            true
+        ));
+        assert!(!should_offer_statusline_wrap(
+            false,
+            StatuslineStatus::CustomNotWrapped,
+            false
+        ));
+        assert!(!should_offer_statusline_wrap(
+            false,
+            StatuslineStatus::TeeInstalled,
+            true
+        ));
+        assert!(!should_offer_statusline_wrap(
+            false,
+            StatuslineStatus::TeeWrappingCustom,
+            true
+        ));
+        assert!(!should_offer_statusline_wrap(
+            false,
+            StatuslineStatus::Absent,
+            true
+        ));
+    }
+
+    #[test]
+    fn wrapping_a_posix_statusline_command_round_trips_byte_for_byte() {
+        let originals = [
+            "ccusage statusline",
+            r#"/usr/local/bin/my script.sh --flag "quoted value" | tee -a 'log file.txt'"#,
+            r#"bash -c 'echo "hi $USER" && printf "%s\n" $PWD'"#,
+            "script.sh --name=O'Brien",
+        ];
+        for original in originals {
+            let wrapped = wrap_statusline_command(original);
+            assert_eq!(
+                classify_statusline_command(Some(&wrapped)),
+                StatuslineStatus::TeeWrappingCustom
+            );
+            assert_eq!(
+                unwrap_statusline_command(&wrapped),
+                Some(original),
+                "unwrap must restore the original POSIX command byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_a_cmd_exe_statusline_command_round_trips_byte_for_byte() {
+        let originals = [
+            r"C:\Users\me\ccusage.exe statusline",
+            r#""C:\Program Files\zirv\script.cmd" --flag "quoted value""#,
+            r#"cmd /c "echo %USERNAME% & echo done""#,
+            r#"powershell -NoProfile -Command "Write-Output 'hi & bye'""#,
+        ];
+        for original in originals {
+            let wrapped = wrap_statusline_command(original);
+            assert_eq!(
+                classify_statusline_command(Some(&wrapped)),
+                StatuslineStatus::TeeWrappingCustom
+            );
+            assert_eq!(
+                unwrap_statusline_command(&wrapped),
+                Some(original),
+                "unwrap must restore the original cmd.exe command byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_a_custom_statusline_is_idempotent_and_reversible_via_restore() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("dir");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": "ccusage statusline --flag \"quoted value\""
+                }
+            }))
+            .expect("settings json"),
+        )
+        .expect("write settings");
+
+        let (original, wrapped) = wrap_claude_statusline_command(home.path()).expect("wrap");
+        assert_eq!(original, "ccusage statusline --flag \"quoted value\"");
+        assert_eq!(wrapped, format!("{TEE_WRAP_PREFIX}{original}"));
+
+        let after = load_json_object(&settings_path).expect("settings after");
+        assert_eq!(
+            after.pointer("/statusLine/command").and_then(Value::as_str),
+            Some(wrapped.as_str())
+        );
+
+        // Idempotent: a second wrap attempt refuses (already wrapped) and the
+        // file is left exactly as the first wrap left it.
+        assert!(wrap_claude_statusline_command(home.path()).is_err());
+        let unchanged = load_json_object(&settings_path).expect("settings unchanged");
+        assert_eq!(
+            unchanged
+                .pointer("/statusLine/command")
+                .and_then(Value::as_str),
+            Some(wrapped.as_str())
+        );
+
+        // Reversible: the pre-wrap backup restores the settings file exactly.
+        let backup_root = home.path().join(".zirv/backups/ai-reset");
+        let runs = all_runs(&[backup_root]);
+        assert_eq!(runs.len(), 1);
+        let id = runs[0].id.clone();
+        let repo = tempfile::tempdir().expect("repo");
+        run_restore(
+            &RestoreArgs {
+                id: Some(id),
+                yes: true,
+                ..restore_args(repo.path())
+            },
+            &mut Vec::new(),
+        )
+        .expect("restore");
+        let restored = load_json_object(&settings_path).expect("restored settings");
+        assert_eq!(
+            restored
+                .pointer("/statusLine/command")
+                .and_then(Value::as_str),
+            Some(original.as_str()),
+            "unwrapping via restore must recover the original command exactly"
+        );
+    }
+
+    #[test]
+    fn status_distinguishes_tee_installed_wrapping_custom_and_custom_not_wrapped() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("zirv dir");
+
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("dir");
+
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({"statusLine": {"command": "zirv ctx usage tee"}}))
+                .expect("json"),
+        )
+        .expect("write");
+        assert_eq!(
+            status(repo.path()).expect("status").claude_statusline,
+            StatuslineStatus::TeeInstalled
+        );
+
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({
+                "statusLine": {"command": "zirv ctx usage tee -- ccusage statusline"}
+            }))
+            .expect("json"),
+        )
+        .expect("write");
+        assert_eq!(
+            status(repo.path()).expect("status").claude_statusline,
+            StatuslineStatus::TeeWrappingCustom
+        );
+
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({"statusLine": {"command": "ccusage statusline"}}))
+                .expect("json"),
+        )
+        .expect("write");
+        assert_eq!(
+            status(repo.path()).expect("status").claude_statusline,
+            StatuslineStatus::CustomNotWrapped
+        );
+
+        std::fs::remove_file(&settings_path).expect("remove");
+        assert_eq!(
+            status(repo.path()).expect("status").claude_statusline,
+            StatuslineStatus::Absent
+        );
     }
 }

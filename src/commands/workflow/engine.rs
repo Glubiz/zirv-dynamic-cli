@@ -670,8 +670,10 @@ fn enrich_transition_evidence(
 /// appearing after the implementation is finished would be ceremony, not
 /// safety -- and completed steps are never re-run.
 ///
-/// Silent when Git cannot be measured (not a repository, no commits): the
-/// classification recorded at start stands, exactly as before.
+/// Fails safe, not silently, when Git cannot be measured (not a repository,
+/// no commits): the band is escalated one step (`classify::mark_unavailable`)
+/// rather than left standing unchallenged -- see the Decision Log entry
+/// "Unmeasurable risk fails safe, not open".
 fn reclassify_at_gate(state: &mut WorkflowState) {
     let Some(step) = state.current().cloned() else {
         return;
@@ -679,11 +681,24 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
     if !matches!(step.phase, WorkflowPhase::Review | WorkflowPhase::Verify) {
         return;
     }
-    let Ok(mut input) = classify::git_change_input(&state.repo, state.task.clone()) else {
-        return;
-    };
-    input.intent_override = Some(state.classification.intent);
-    let Ok(measured) = classify::classify(&input) else {
+    let measured = classify::git_change_input(&state.repo, state.task.clone())
+        .ok()
+        .map(|mut input| {
+            input.intent_override = Some(state.classification.intent);
+            input
+        })
+        .and_then(|input| classify::classify(&input).ok());
+    let Some(measured) = measured else {
+        let raised = classify::mark_unavailable(
+            &mut state.classification,
+            format!(
+                "git measurement unavailable at step '{}' (not a repository, or no commits)",
+                step.id
+            ),
+        );
+        if raised {
+            rematerialize_after_risk_increase(state);
+        }
         return;
     };
     if measured.work_domain.domain == WorkDomain::Frontend
@@ -710,7 +725,14 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
         step.id, measured.risk
     ));
     state.classification.reasons.sort();
+    rematerialize_after_risk_increase(state);
+}
 
+/// Adds any Review/Verify step the just-raised risk band newly requires,
+/// without re-running or reordering completed steps. Shared by the measured
+/// re-classification above and by the fail-safe escalation applied when Git
+/// measurement is unavailable at a gate.
+fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
     let completed = state.completed_steps.clone();
     let known: Vec<String> = state.steps.iter().map(|step| step.id.clone()).collect();
     let mut steps: Vec<WorkflowStep> = completed
@@ -1182,6 +1204,11 @@ fn write_state(writer: &mut impl Write, state: &WorkflowState, json: bool) -> Ct
             state.classification.risk_score,
             state.classification.risk
         )?;
+        if let classify::RiskMeasurement::Unavailable { reason } =
+            &state.classification.risk_measurement
+        {
+            writeln!(writer, "risk measurement: unavailable ({reason})")?;
+        }
         if let Some(step) = state.current() {
             writeln!(
                 writer,
@@ -1403,6 +1430,7 @@ mod tests {
             changed_lines: 5,
             declared_scope: false,
             work_domain: Default::default(),
+            risk_measurement: classify::RiskMeasurement::Measured,
             reasons: vec!["small".into()],
         }
     }
@@ -1672,6 +1700,144 @@ mod tests {
         }
         assert_eq!(state.status, WorkflowStatus::Failed);
         assert!(load_active(&state_dir, repo.path()).unwrap().is_none());
+    }
+
+    /// #88: outside a git repository, `reclassify_at_gate` used to silently
+    /// leave the risk band exactly as declared/measured at `workflow start`
+    /// -- the safety net that exists specifically to catch a mismatch was
+    /// inert exactly where it mattered most. It must now report the
+    /// unmeasured state and escalate the band one step, adding whatever
+    /// Review/Verify step the escalated band newly requires.
+    #[test]
+    fn reclassify_at_gate_fails_safe_when_git_is_unavailable_outside_a_repository() {
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        assert!(
+            !state.steps.iter().any(|step| step.id == "review"),
+            "the Low-risk fast path starts with no review step: {:?}",
+            state.steps
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+            .unwrap();
+
+        reclassify_at_gate(&mut state);
+
+        assert!(
+            matches!(
+                state.classification.risk_measurement,
+                classify::RiskMeasurement::Unavailable { .. }
+            ),
+            "{:?}",
+            state.classification
+        );
+        assert_eq!(state.classification.risk, RiskBand::Medium);
+        assert!(
+            state
+                .classification
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("risk escalated"))
+        );
+        assert!(
+            state.steps.iter().any(|step| step.id == "review"),
+            "the escalated band newly requires review: {:?}",
+            state.steps
+        );
+    }
+
+    /// #88: a repository that exists but has no commits fails the same Git
+    /// calls a non-repository does, and must fail the same safe way.
+    #[test]
+    fn reclassify_at_gate_fails_safe_when_the_repository_has_no_commits() {
+        let repo = tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+            .unwrap();
+
+        reclassify_at_gate(&mut state);
+
+        assert!(
+            matches!(
+                state.classification.risk_measurement,
+                classify::RiskMeasurement::Unavailable { .. }
+            ),
+            "{:?}",
+            state.classification
+        );
+        assert_eq!(state.classification.risk, RiskBand::Medium);
+    }
+
+    /// No change to behavior when measurement succeeds: reclassification
+    /// with a real Git history still reports `Measured`.
+    #[test]
+    fn reclassify_at_gate_stays_measured_when_git_succeeds() {
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "hello\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+            .unwrap();
+
+        reclassify_at_gate(&mut state);
+
+        assert_eq!(
+            state.classification.risk_measurement,
+            classify::RiskMeasurement::Measured
+        );
     }
 
     #[test]
