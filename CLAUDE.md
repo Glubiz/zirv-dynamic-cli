@@ -81,13 +81,14 @@ release. No "Co-Authored-By" or "Generated with Claude Code" lines.
 
 ## This Windows dev machine
 
-- Around 50 cargo tests fail on `main` itself here: Windows `os error 193`
-  from fake test child binaries, a `%TEMP%` path-length socket test, and a
-  test that reads the operator's real `~/.zirv/ctx.toml`. The COUNT drifts;
-  the sorted failure-NAME list from actual `main` is the baseline. Do not
-  chase them, and never use `git stash` as the baseline -- it diffs the
-  branch's own HEAD, so failures introduced by earlier commits on the same
-  branch get misclassified as pre-existing.
+- 7 cargo tests fail on `main` itself here (as of 2026-08-23), all in
+  `commands::ctx::wrap::tests` (4 nesting-guard/echo + 3 `win::` exit-code/
+  turn-signal). The COUNT drifts; the sorted failure-NAME list from actual
+  `main` is the baseline. Do not chase them, and never use `git stash` as
+  the baseline -- it diffs the branch's own HEAD, so failures introduced by
+  earlier commits on the same branch get misclassified as pre-existing. One
+  wrap test flakes "could not determine a platform state directory" only in
+  FILTERED (`cargo test <filter>`) runs; it passes in the full suite.
 - A crashed run looks like a clean one: on `STATUS_ACCESS_VIOLATION` cargo
   prints no `test result:` line and no `failures:` block, so a grep for
   failure names returns EMPTY. Confirm the `test result:` line exists before
