@@ -87,6 +87,14 @@ pub enum DashAction {
     /// The prefix key pressed again while armed: the operator meant to send
     /// the child a literal `Ctrl+A`, not invoke a dashboard command.
     LiteralPrefix,
+    /// `Ctrl+A v` -- toggles the dashboard's own mouse reporting off (and
+    /// back on), handing mouse control back to the terminal so its native
+    /// click-drag text selection reaches a pane whose child has enabled its
+    /// own mouse reporting -- the one case the dashboard's own in-pane
+    /// click-drag selection cannot cover, since that only ever engages for a
+    /// child that does *not* want mouse (`Pane::wants_mouse`, see
+    /// `Selection`'s doc comment). See `term::dash_mouse_off_bytes`.
+    ToggleSelectMode,
 }
 
 /// Matches `PREFIX` in either shape a real terminal can deliver it in: the
@@ -141,6 +149,7 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Char('m') => Some(DashAction::Mail),
         KeyCode::Char('M') => Some(DashAction::Memory),
         KeyCode::Char('z') => Some(DashAction::Zoom),
+        KeyCode::Char('v') => Some(DashAction::ToggleSelectMode),
         KeyCode::Char('q') => Some(DashAction::Quit),
         KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Some(DashAction::Help),
         _ => None,
@@ -789,6 +798,7 @@ const fn follow_focus(selected: usize, focused: usize, pane_count: usize) -> usi
 /// without a state dir. Mirrors `ui`'s own `HeaderFacts` field order.
 fn assemble_header_facts(
     harness: String,
+    select_mode: bool,
     score: Option<u32>,
     mail: Option<(usize, usize)>,
     memory_count: usize,
@@ -798,6 +808,7 @@ fn assemble_header_facts(
     let (mail_broadcast, mail_direct) = mail.unwrap_or((0, 0));
     ui::HeaderFacts {
         harness,
+        select_mode,
         score,
         mail_broadcast,
         mail_direct,
@@ -1959,6 +1970,35 @@ fn pane_launch_extra(
     prompt_args
 }
 
+/// The full trailing-extras argv a dashboard-spawned worker pane launches
+/// with: the resolved worker model, then the shipped-default "sandboxed, no
+/// prompts" posture plus any explicit `[policy]` restriction (`adapters::
+/// policy_launch_args`, the same seam every real launch now calls), then the
+/// system-prompt injection args and the session pin. Extracted as its own
+/// function (2026-08-22, Bug B seam coverage, fix round 3) specifically so
+/// this composition is unit-testable directly -- `fulfill_spawn_request`'s
+/// own wiring previously rested on full-suite-green plus log inspection, the
+/// exact shape of regression that would not fail any existing test if this
+/// seam silently lost its policy prefix.
+///
+/// A dashboard-spawned worker pane's own join protocol structurally admits
+/// only a lone `--model` pin (see `try_join_dashboard` in `agent.rs`) --
+/// there is no generic trailing-flags channel here for an operator to pin a
+/// conflicting `--sandbox`/`--ask-for-approval` through, so `flags_pin_
+/// policy` (inside `policy_launch_args`) is checked against an empty slice.
+fn worker_pane_extra_args(
+    req: &spawnreq::SpawnRequest,
+    cfg: &CtxConfig,
+    adapter: &dyn adapters::AgentAdapter,
+    prompt_args: Vec<String>,
+    session_id: &str,
+) -> Vec<String> {
+    let mut extra = pane_model_args(req, cfg, adapter);
+    extra.extend(adapters::policy_launch_args(cfg, adapter, &[]));
+    extra.extend(pane_launch_extra(adapter, prompt_args, session_id));
+    extra
+}
+
 /// Re-validates and fulfils one spawn request: the argv-safety guard, the
 /// requesting repo, the pane cap, the agent gate and adapter resolution
 /// first (a request is data, never authority -- the same checks an
@@ -2419,12 +2459,7 @@ fn fulfill_spawn_request(
         fallback_is_safe,
     );
 
-    let mut extra = pane_model_args(req, cfg, adapter.as_ref());
-    extra.extend(pane_launch_extra(
-        adapter.as_ref(),
-        prompt_args,
-        &session_id,
-    ));
+    let extra = worker_pane_extra_args(req, cfg, adapter.as_ref(), prompt_args, &session_id);
     let argv = flatten_command(adapter.interactive_cmd(Some(&effective_prompt), &extra));
     let spec = PaneSpec {
         agent_name: req.agent.clone(),
@@ -2443,6 +2478,41 @@ fn fulfill_spawn_request(
         spawnreq::DASH_REQUESTS_ENV.to_string(),
         requests_dir.display().to_string(),
     ));
+
+    // T10: the same launch-time pacing gate `wrap::run_with`/this dashboard's
+    // own first pane apply, but *non-interactively* here: this spawn happens
+    // during the dashboard's own live event loop (raw mode and the
+    // alternate screen already active), so a blocking `crossterm` keypress
+    // read -- the orchestrator pane's own gate uses one, see `run_dashboard`
+    // -- would collide with the dashboard's own input loop reading the same
+    // stream. `Launch` spawns normally; the soft band (`Pause`) is advisory
+    // here, not a wait -- it spawns anyway with a visible notice through the
+    // same `errors`/notice channel a withheld-mail advisory already uses a
+    // few lines up; the hard ceiling (`Refuse`) declines the spawn outright
+    // through the existing refusal channel, with no confirmation prompt
+    // possible from this call site -- an operator who wants to force it can
+    // still run `zirv ctx wrap --force-pace` directly, outside the
+    // dashboard.
+    {
+        // Finding 1 (review): `poll: false` -- this call happens on the
+        // dashboard's single UI thread, during its own live event loop, so
+        // a live `HttpPoller` (a synchronous ureq request, or a macOS
+        // Keychain shell-out) would freeze every pane and all input. Passive
+        // collector reading only; see `pace::build_gate`.
+        let gate = super::pace::interactive_gate(state, cfg, adapter.provider(), false);
+        match gate {
+            super::pace::InteractiveGate::Launch => {}
+            super::pace::InteractiveGate::Pause { message, .. } => {
+                push_error(
+                    errors,
+                    format!("{} pane for {}: {message}", req.agent, req.requested_by),
+                );
+            }
+            super::pace::InteractiveGate::Refuse { message } => {
+                return Err(SpawnRefusal::policy(message));
+            }
+        }
+    }
 
     // O2: retryable. A pty that could not be opened is an environment
     // failure, not a policy one -- the headless path has no pty to open.
@@ -3302,9 +3372,10 @@ fn sweep_one_pane<I: Injector>(
 }
 
 /// Pure: the exact advisory body an orchestrator pane's mail advisory
-/// carries -- `"{count} unread from {agent}/{short} — zirv ctx inbox"`, wrapped
-/// by `Pane::inject_visible` into `"[zirv ▸ mail] {body}"`. Names the sender
-/// of the *newest* unread message (the one that triggered this advisory, per
+/// carries -- `"{count} unread from {agent}/{short} — run `zirv ctx inbox`
+/// now to read (not --peek, which leaves them unread)"`, wrapped by
+/// `Pane::inject_visible` into `"[zirv ▸ mail] {body}"`. Names the sender of
+/// the *newest* unread message (the one that triggered this advisory, per
 /// `advise_one_pane`'s own dedup) and the total unread count, but never a
 /// body: an orchestrator session is never handed message text directly, only
 /// pointed at `zirv ctx inbox` to read it -- the same trust split
@@ -3314,9 +3385,21 @@ fn sweep_one_pane<I: Injector>(
 /// session, adapted to the pane-injection seam (this one is typed visibly
 /// into the pane's own pty, not emitted on stderr, since a dashboard
 /// orchestrator pane has no stderr of its own an operator is watching).
+///
+/// Imperative, not merely informational, and explicit about the flag. The
+/// original wording (`"... -- zirv ctx inbox"`) only named the command and
+/// left the model to infer that seeing the name meant "run it now" -- a step
+/// models routinely do not take, so a delivered, unconsumed message could
+/// sit forever while the advisory itself kept re-announcing nothing new (the
+/// count cannot move without a real `zirv ctx inbox` call): to the operator
+/// this looked identical to the message never having arrived. Naming
+/// `--peek` explicitly, rather than assuming the model already knows the
+/// bare default consumes, closes the other half of the same failure: a
+/// model that reaches for `--peek` out of caution re-reads the same message
+/// on every future sweep and never actually clears it.
 fn orchestrator_mail_advisory_body(count: usize, from_agent: &str, from_session: &str) -> String {
     format!(
-        "{count} unread from {}/{} \u{2014} zirv ctx inbox",
+        "{count} unread from {}/{} \u{2014} run `zirv ctx inbox` now to read (not --peek, which leaves them unread)",
         pane::body_for_injection(from_agent, MAX_SENDER_NAME_BYTES),
         sessions::short_id(from_session),
     )
@@ -3328,13 +3411,22 @@ fn orchestrator_mail_advisory_body(count: usize, from_agent: &str, from_session:
 /// the one-line [`orchestrator_mail_advisory_body`].
 ///
 /// Deduplicated against `advised` (keyed by the pane's own zirv session id,
-/// valued by the newest unread message's own file name -- `mail::list`
-/// already sorts by the zero-padded-seconds prefix in that name, so it is a
-/// chronological high-water mark): re-advises only once a message whose file
-/// name sorts *past* whatever was last advised has actually arrived, so an
-/// unchanged inbox is not re-typed into the pane on every ~1s sweep tick, and
-/// an operator who has not yet run `zirv ctx inbox` still gets nudged again
-/// once something genuinely new shows up.
+/// valued by a [`mail::AdvisedIds`] set of ids already advised): re-advises
+/// only once the newest unread message's own file name is not already in
+/// that set, so an unchanged inbox is not re-typed into the pane on every
+/// ~1s sweep tick, and an operator who has not yet run `zirv ctx inbox`
+/// still gets nudged again once something genuinely new shows up.
+///
+/// Finding 3 (review): this used to be a single never-pruned high-water-mark
+/// filename rather than a pruned set, so a new message that reused a
+/// *consumed* message's exact filename (`claim_and_write`'s same-second
+/// collision suffix can reissue a freed name) compared equal to the stale
+/// watermark and was silently never advised. The set is pruned
+/// (`forget_missing`) against the freshly-listed unread ids on every call,
+/// including when the mailbox is momentarily empty -- the same shape
+/// `wrap::MailWatch` already used, which is why it never had this bug -- so
+/// a consumed id is forgotten the moment it disappears, and a later message
+/// reusing that name reads as new again.
 ///
 /// Takes an `Injector` rather than a `Pane`, the same seam `sweep_one_pane`
 /// already uses, so the dedup/formatting logic is testable without a real
@@ -3347,7 +3439,7 @@ fn advise_one_pane<I: Injector>(
     slug: &str,
     agent: &str,
     short: &str,
-    advised: &mut HashMap<String, String>,
+    advised: &mut HashMap<String, mail::AdvisedIds>,
     errors: &mut Vec<String>,
 ) -> bool {
     let messages = match mail::list(state, slug, Some(agent), Some(short)) {
@@ -3357,6 +3449,15 @@ fn advise_one_pane<I: Injector>(
             return false;
         }
     };
+    let ids: Vec<String> = messages
+        .iter()
+        .filter_map(|(path, _)| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    // Pruned every call, even with `messages` empty: an emptied mailbox is
+    // exactly the moment a later filename reuse needs the old id gone.
+    let entry = advised.entry(session_id.to_string()).or_default();
+    entry.forget_missing(ids.iter().map(String::as_str));
+
     let Some((newest_path, newest_msg)) = messages.last() else {
         return false;
     };
@@ -3364,7 +3465,7 @@ fn advise_one_pane<I: Injector>(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if advised.get(session_id).map(String::as_str) == Some(newest_name.as_str()) {
+    if entry.contains(&newest_name) {
         return false;
     }
     let body = orchestrator_mail_advisory_body(
@@ -3374,7 +3475,7 @@ fn advise_one_pane<I: Injector>(
     );
     match injector.try_inject("mail", &body) {
         Ok(()) => {
-            advised.insert(session_id.to_string(), newest_name);
+            entry.insert(&newest_name);
             true
         }
         Err(e) => {
@@ -3401,7 +3502,7 @@ fn mail_sweep(
     cfg: &CtxConfig,
     state: &StateDir,
     repo: &Path,
-    advised: &mut HashMap<String, String>,
+    advised: &mut HashMap<String, mail::AdvisedIds>,
     errors: &mut Vec<String>,
 ) {
     if !cfg.mail.enabled {
@@ -3688,6 +3789,7 @@ pub fn run_dashboard(
     env: EnvLookup<'_>,
     state: &StateDir,
     first: PaneSpec,
+    force_pace: bool,
 ) -> CtxResult<i32> {
     let mut errors: Vec<String> = Vec::new();
 
@@ -3765,6 +3867,25 @@ pub fn run_dashboard(
     // we just wrote and is alive, is never swept.
     sweep_stale_token_dirs(state);
 
+    // T10: the same launch-time pacing gate `wrap::run_with` now applies,
+    // reused here for the orchestrator's own first pane -- this is the one
+    // dashboard spawn point that is genuinely safe to block interactively:
+    // it runs before `enable_raw_mode`/`EnterAlternateScreen` below, so
+    // there is no live dashboard input loop yet for a blocking `crossterm`
+    // keypress read to collide with. `fulfill_spawn_request` (worker panes
+    // spawned *during* the live loop) cannot reuse this same blocking
+    // treatment -- see its own call site's comment -- and gates
+    // non-interactively instead.
+    {
+        let provider = super::adapters::provider_for_agent_name(Some(&agent_name));
+        // Before raw mode / the dashboard's own event loop starts (see the
+        // comment above), so a blocking keypress read here cannot collide
+        // with anything -- this is the one dashboard spawn point that may
+        // keep a live poller (`poll: true`), unlike `fulfill_spawn_request`.
+        let gate = super::pace::interactive_gate(state, cfg, provider, true);
+        super::wrap::apply_interactive_gate(gate, force_pace)?;
+    }
+
     let size = (main.width.max(1), main.height.max(1));
     // O7: the request directory exists from here on, so the one startup step
     // that can still fail outright owes it the same cleanup every other exit
@@ -3839,7 +3960,11 @@ pub fn run_dashboard(
     // `Ctrl+A PageUp`/`Home`, so a failure here is a header notice, never a
     // failed launch. Undone by `term::dash_reset_bytes` on every exit path --
     // the ordinary teardown, the panic hook and the external-kill handler
-    // alike -- so it cannot be left switched on.
+    // alike -- so it cannot be left switched on. Also undone, mid-session and
+    // reversibly, by `Ctrl+A v` (`DashAction::ToggleSelectMode`,
+    // `term::dash_mouse_off_bytes`) -- the operator's own escape hatch for a
+    // pane whose child wants mouse itself, which the dashboard's own
+    // click-drag selection cannot help (see `Selection`'s doc comment).
     if cfg.dash.mouse {
         let mut stdout = io::stdout();
         if let Err(e) = stdout
@@ -3920,6 +4045,23 @@ pub fn run_dashboard(
     let mut focused: usize = 0;
     let mut zoomed = false;
     let mut prefix_armed = false;
+    // `Ctrl+A v` (`DashAction::ToggleSelectMode`)'s own state: whether the
+    // dashboard's mouse reporting is currently on. Seeded from `cfg.dash.mouse`
+    // itself -- when config never turned it on in the first place, the toggle
+    // is a no-op (see that arm) rather than reaching for bytes that were never
+    // written. Flipped, and the corresponding on/off bytes written to the
+    // terminal, only by that one `DashAction` arm below.
+    let mut mouse_capture = cfg.dash.mouse;
+    // T-discover: latched once per dashboard session (never re-armed by the
+    // toggle either direction) so an operator who drags over a pane whose
+    // child has grabbed the mouse -- the exact gesture that silently does
+    // nothing, which is what filed this bug -- learns the escape hatch
+    // exists without having to already know it or open the help overlay.
+    // Deliberately a notice, never an automatic mode switch: entering select
+    // mode on the gesture's own say-so would break a legitimate drag the
+    // operator meant for the child TUI itself (a text editor's own selection,
+    // a resize handle, ...).
+    let mut mouse_capture_hint_shown = false;
     // Tmux-style in-dashboard click-drag text selection (`Selection`'s own
     // doc comment). `None` whenever nothing is selected or highlighted;
     // `Some` both while a drag is in progress and, after release, for
@@ -3969,7 +4111,7 @@ pub fn run_dashboard(
     // (`advise_one_pane`), keyed by a pane's own zirv session id. Lives for
     // the whole dashboard run, not just one tick, so an unchanged inbox is
     // advised once and then left alone until genuinely new mail arrives.
-    let mut advised_mail: HashMap<String, String> = HashMap::new();
+    let mut advised_mail: HashMap<String, mail::AdvisedIds> = HashMap::new();
     // R8: see `input_stream_is_dead`.
     let mut input_errors: usize = 0;
     // D4: set by the "every pane ended" exit arm, so the closing line is
@@ -4647,6 +4789,58 @@ pub fn run_dashboard(
                                     InputVerdict::Dash(DashAction::Help) => {
                                         overlay = ui::Overlay::Help;
                                     }
+                                    InputVerdict::Dash(DashAction::ToggleSelectMode) => {
+                                        if !cfg.dash.mouse {
+                                            // Nothing was ever turned on: this
+                                            // operator already has native
+                                            // selection everywhere, by config.
+                                            push_notice(
+                                                &mut notices,
+                                                Instant::now(),
+                                                "dash.mouse is off -- text selection is \
+                                                 already native"
+                                                    .to_string(),
+                                            );
+                                        } else {
+                                            mouse_capture = !mouse_capture;
+                                            // A selection's `(row, col)`
+                                            // coordinates are only meaningful
+                                            // under the mouse mode that produced
+                                            // them (see
+                                            // `cancel_selection_on_resize`'s own
+                                            // reasoning); flipping modes is
+                                            // treated the same conservative way.
+                                            selection = None;
+                                            let bytes = if mouse_capture {
+                                                term::dash_mouse_on_bytes()
+                                            } else {
+                                                term::dash_mouse_off_bytes()
+                                            };
+                                            let mut stdout = io::stdout();
+                                            if let Err(e) = stdout
+                                                .write_all(bytes)
+                                                .and_then(|()| stdout.flush())
+                                            {
+                                                push_error(
+                                                    &mut errors,
+                                                    format!("dashboard: mouse toggle failed: {e}"),
+                                                );
+                                            } else {
+                                                push_notice(
+                                                    &mut notices,
+                                                    Instant::now(),
+                                                    if mouse_capture {
+                                                        "mouse reporting back on".to_string()
+                                                    } else {
+                                                        "select mode on -- drag with the \
+                                                         mouse to select text natively, \
+                                                         Ctrl+A v to resume"
+                                                            .to_string()
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4687,6 +4881,15 @@ pub fn run_dashboard(
                         // beyond "do nothing when the pointer is on the left",
                         // which is a worse wheel, not a better one. Revisit only if
                         // panes are ever tiled.
+                        //
+                        // Nothing in this arm checks `mouse_capture` directly: once
+                        // `DashAction::ToggleSelectMode` has written
+                        // `term::dash_mouse_off_bytes()`, the terminal itself stops
+                        // reporting mouse events at all, so `event::read` simply
+                        // never produces `Event::Mouse` while select mode is on --
+                        // the same reason nothing gates on it after
+                        // `dash_reset_bytes` either. This arm is only ever reached
+                        // with `mouse_capture` true.
                         Ok(Event::Mouse(mouse)) => {
                             input_errors = 0;
                             let delta = match mouse.kind {
@@ -4818,19 +5021,48 @@ pub fn run_dashboard(
                                     }
                                 }
                                 MouseEventKind::Drag(MouseButton::Left) => {
-                                    // No scrollback check here -- a wheel
-                                    // notch spun mid-drag arrives as its own
-                                    // `ScrollUp`/`ScrollDown` event, not a
-                                    // `Drag`, and already cancelled the
-                                    // selection at the point it happened (see
-                                    // `scroll_cancels_selection`'s callers).
-                                    // If a selection is still `Some` here, its
-                                    // pane has not scrolled since.
-                                    if let Some(sel) = selection.as_mut()
+                                    let wants_mouse = panes
+                                        .get(focused)
+                                        .map(|p| p.wants_mouse())
+                                        .unwrap_or(false);
+                                    if wants_mouse {
+                                        // The precise gesture that silently
+                                        // does nothing: a press-then-move over
+                                        // a pane whose child already owns the
+                                        // mouse, so neither zirv's own
+                                        // click-drag selection (gated on
+                                        // `!wants_mouse` the same as the
+                                        // `Down` arm above) nor the
+                                        // terminal's native one can see it.
+                                        // One notice, ever, per session --
+                                        // never re-armed, and never an
+                                        // automatic mode switch (see
+                                        // `mouse_capture_hint_shown`'s own doc
+                                        // comment).
+                                        if !mouse_capture_hint_shown {
+                                            mouse_capture_hint_shown = true;
+                                            push_notice(
+                                                &mut notices,
+                                                Instant::now(),
+                                                "text selection is off while this pane owns \
+                                                 the mouse -- press Ctrl+A v"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    } else if let Some(sel) = selection.as_mut()
                                         && let Some(pane) = panes.get(focused)
                                         && pane.short() == sel.pane_short
-                                        && !pane.wants_mouse()
                                     {
+                                        // No scrollback check here -- a wheel
+                                        // notch spun mid-drag arrives as its
+                                        // own `ScrollUp`/`ScrollDown` event,
+                                        // not a `Drag`, and already cancelled
+                                        // the selection at the point it
+                                        // happened (see
+                                        // `scroll_cancels_selection`'s
+                                        // callers). If a selection is still
+                                        // `Some` here, its pane has not
+                                        // scrolled since.
                                         let main = effective_main(full, sidebar_cols, zoomed);
                                         let (rows, cols) = pane.screen().size();
                                         if let Some(cell) = pane_local_cell(
@@ -4995,6 +5227,7 @@ pub fn run_dashboard(
         // rather than off disk: this runs on every frame.
         let facts = assemble_header_facts(
             harness,
+            !mouse_capture,
             focused_pane.and_then(|pane| facts_cache.disk.scores.get(pane.short()).copied()),
             facts_cache.disk.mail,
             facts_cache.disk.memory_count,
@@ -5280,6 +5513,10 @@ mod tests {
         assert!(matches!(
             filter_key(true, key(KeyCode::Char('z'), KeyModifiers::NONE)).1,
             InputVerdict::Dash(DashAction::Zoom)
+        ));
+        assert!(matches!(
+            filter_key(true, key(KeyCode::Char('v'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::ToggleSelectMode)
         ));
         assert!(matches!(
             filter_key(true, key(KeyCode::Char('q'), KeyModifiers::NONE)).1,
@@ -6250,17 +6487,20 @@ mod tests {
 
     #[test]
     fn assemble_header_facts_omits_mail_when_none() {
-        let facts = assemble_header_facts("claude".to_string(), None, None, 3, 5, Vec::new());
+        let facts =
+            assemble_header_facts("claude".to_string(), false, None, None, 3, 5, Vec::new());
         assert_eq!(facts.mail_broadcast, 0);
         assert_eq!(facts.mail_direct, 0);
         assert_eq!(facts.memory_count, 3);
         assert_eq!(facts.sessions, 5);
+        assert!(!facts.select_mode);
     }
 
     #[test]
     fn assemble_header_facts_carries_the_broadcast_direct_split_through() {
         let facts = assemble_header_facts(
             "claude".to_string(),
+            false,
             Some(12),
             Some((2, 1)),
             0,
@@ -6270,6 +6510,12 @@ mod tests {
         assert_eq!(facts.mail_broadcast, 2);
         assert_eq!(facts.mail_direct, 1);
         assert_eq!(facts.score, Some(12));
+    }
+
+    #[test]
+    fn assemble_header_facts_carries_select_mode_through() {
+        let facts = assemble_header_facts("claude".to_string(), true, None, None, 0, 1, Vec::new());
+        assert!(facts.select_mode);
     }
 
     /// Task 7: `refresh_if_due` fills `disk.usage` with one entry per enabled
@@ -7188,11 +7434,37 @@ mod tests {
     fn orchestrator_mail_advisory_body_names_the_count_and_the_newest_sender() {
         assert_eq!(
             orchestrator_mail_advisory_body(3, "claude", "aaaa1111-2222-4333-8444-555555555555"),
-            "3 unread from claude/aaaa1111 \u{2014} zirv ctx inbox"
+            "3 unread from claude/aaaa1111 \u{2014} run `zirv ctx inbox` now to read \
+             (not --peek, which leaves them unread)"
         );
         assert_eq!(
             orchestrator_mail_advisory_body(1, "codex", "bbbb2222"),
-            "1 unread from codex/bbbb2222 \u{2014} zirv ctx inbox"
+            "1 unread from codex/bbbb2222 \u{2014} run `zirv ctx inbox` now to read \
+             (not --peek, which leaves them unread)"
+        );
+    }
+
+    /// The rewrite (this task): imperative, names the exact command, and
+    /// excludes `--peek` explicitly rather than assuming the model already
+    /// knows a bare `zirv ctx inbox` is the consuming default -- see
+    /// `orchestrator_mail_advisory_body`'s own doc comment for why the old
+    /// wording (a bare "... -- zirv ctx inbox") let a delivered-but-never-
+    /// fetched message look identical, to an operator, to one that never
+    /// arrived at all.
+    #[test]
+    fn orchestrator_mail_advisory_body_is_imperative_and_excludes_peek() {
+        let body = orchestrator_mail_advisory_body(1, "claude", "aaaa1111");
+        assert!(
+            body.contains("run `zirv ctx inbox` now"),
+            "must tell the model to act, not merely name the command: {body}"
+        );
+        assert!(
+            body.contains("not --peek"),
+            "must rule out the non-consuming read explicitly: {body}"
+        );
+        assert!(
+            !body.contains('\n'),
+            "the advisory must stay one line: {body:?}"
         );
     }
 
@@ -7369,6 +7641,93 @@ mod tests {
         );
         assert!(!delivered);
         assert!(injector.calls.is_empty());
+    }
+
+    /// Finding 3 (review): a brand-new message that reuses the exact
+    /// filename of a message this pane already advised about and that has
+    /// since been consumed must still be advised -- a single never-pruned
+    /// high-water-mark filename cannot see this, since the reused name
+    /// compares equal to what it already remembers. `mail::store`'s own
+    /// naming (`claim_and_write`) can produce exactly this: consuming a
+    /// message frees its base name in the *unread* directory for the next
+    /// same-second, same-sender message. Simulated directly here (write
+    /// straight to the freed path) rather than relying on two real
+    /// `mail::store` calls landing in the same wall-clock second, which
+    /// `now_secs()`'s one-second granularity makes inherently racy for a
+    /// test.
+    #[test]
+    fn advise_one_pane_advises_a_message_that_reuses_a_consumed_filename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "first");
+
+        let mut advised = HashMap::new();
+        let mut injector = SucceedingInjector { calls: Vec::new() };
+        assert!(advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut Vec::new(),
+        ));
+
+        // Consume the message (an orchestrator's own `zirv ctx inbox` would
+        // do this) and capture the now-freed path.
+        let (path, _) = mail::list(&state, slug, None, None)
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("one message");
+        mail::consume(&state, slug, &path).expect("consume");
+
+        // One sweep over the now-empty mailbox -- the tick that must prune
+        // the stale id out of the dedup set.
+        assert!(!advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut Vec::new(),
+        ));
+
+        // A brand-new message that reuses the first message's exact freed
+        // filename.
+        let reused = mail::Message {
+            from_session: "s2".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: super::super::state::now_secs(),
+            body: "second, same filename".to_string(),
+        };
+        std::fs::write(&path, reused.to_markdown()).expect("write reused filename");
+
+        assert!(
+            advise_one_pane(
+                &mut injector,
+                "session-a",
+                &state,
+                slug,
+                "claude",
+                "short0000",
+                &mut advised,
+                &mut Vec::new(),
+            ),
+            "a message reusing a consumed message's filename must still be advised"
+        );
+        assert_eq!(
+            injector.calls.len(),
+            2,
+            "the reused-filename message got its own advisory"
+        );
     }
 
     // F8: one mail message per pane per tick.
@@ -8145,6 +8504,66 @@ mod tests {
         assert!(reason.contains("dash.max_panes"), "got {reason}");
     }
 
+    /// T10: the coverage gap this closes -- a worker pane spawn request
+    /// arriving while the account is genuinely at the pacing ceiling must be
+    /// refused, the same way `wrap`'s own launch-time gate now refuses (see
+    /// `wrap::apply_interactive_gate`). This spawn point cannot block on a
+    /// confirmation keypress (the dashboard's own live input loop already
+    /// owns the terminal -- see `fulfill_spawn_request`'s own comment), so
+    /// the ceiling is a plain, non-overridable refusal here, checked before
+    /// `Pane::spawn` is ever reached (no real agent binary needed to prove
+    /// it, mirroring `refusal_for`'s own "every assertion is on a refusal
+    /// before any spawn" contract).
+    #[test]
+    fn fulfill_spawn_request_refuses_a_worker_pane_when_usage_is_at_the_ceiling() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+        window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 99.9,
+                    resets_at: now + 600,
+                    observed_at: now,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store collector state at the ceiling");
+
+        let cfg = CtxConfig::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let result = fulfill_spawn_request(
+            &spawn_request("do the work", &repo),
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+
+        let refusal = result.expect_err("usage at the ceiling must refuse the spawn");
+        assert!(
+            refusal.reason.contains("refusing to launch"),
+            "got {}",
+            refusal.reason
+        );
+        assert!(
+            refusal.reason.contains("99.9%"),
+            "names the actual usage: {}",
+            refusal.reason
+        );
+        assert!(!refusal.retryable, "not a channel failure -- policy");
+        assert!(panes.is_empty(), "no pane was ever spawned");
+    }
+
     /// I, the High-severity regression this round closes: before
     /// `task_prompt_fallback_is_safe` existed, every dashboard-spawned codex
     /// worker on a real Windows npm install (a `.cmd` shim) failed outright
@@ -8172,6 +8591,15 @@ mod tests {
 
         let cfg = CtxConfig {
             agent_bin: Some(shim.display().to_string()),
+            // T10: this test is about the argv-shim mail-withholding
+            // behavior, not pacing -- a fresh temp state dir has no usage
+            // source by construction, which would otherwise add its own
+            // blind-pace notice to `errors` and break the exact-count
+            // assertion below.
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..CtxConfig::default()
         };
         mail::store(&state, &slug, &a_mail_message(), &cfg).expect("store mail");
@@ -8225,6 +8653,90 @@ mod tests {
         }
     }
 
+    /// Bug B seam coverage (2026-08-22, fix round 3): the dashboard's own
+    /// worker-pane seam is one of the three that had only full-suite-green
+    /// plus log inspection backing its `policy_launch_args` wiring. Exercises
+    /// `worker_pane_extra_args` directly -- the exact function `fulfill_
+    /// spawn_request` calls to build a pane's trailing argv -- for both
+    /// adapters, from the same `cfg`.
+    #[test]
+    fn worker_pane_extra_args_carries_the_shipped_sandbox_posture_on_both_adapters() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let cfg = CtxConfig::default();
+        let repo = tmp.path().to_path_buf();
+        let req = spawn_request("do the work", &repo);
+
+        let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let claude_extra = worker_pane_extra_args(
+            &req,
+            &cfg,
+            &claude,
+            Vec::new(),
+            "cccccccc-1111-4333-8444-555555555555",
+        );
+        assert!(
+            claude_extra.contains(&"--permission-mode".to_string())
+                && claude_extra.contains(&"dontAsk".to_string()),
+            "got {claude_extra:?}"
+        );
+        assert!(
+            claude_extra
+                .iter()
+                .any(|a| a.starts_with("--allowedTools=") && a.contains("Edit(./**)")),
+            "got {claude_extra:?}"
+        );
+
+        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let codex_extra = worker_pane_extra_args(
+            &req,
+            &cfg,
+            &codex,
+            Vec::new(),
+            "cccccccc-2222-4333-8444-555555555555",
+        );
+        assert!(
+            codex_extra
+                .windows(2)
+                .any(|w| w == ["--sandbox", "workspace-write"]),
+            "got {codex_extra:?}"
+        );
+        assert!(
+            codex_extra
+                .windows(2)
+                .any(|w| w == ["--ask-for-approval", "never"]),
+            "got {codex_extra:?}"
+        );
+    }
+
+    /// `[sandbox] enabled = false` restores the pre-2026-08-22 behaviour for
+    /// a worker pane too: no posture argv from this seam at all.
+    #[test]
+    fn worker_pane_extra_args_carries_nothing_when_the_sandbox_posture_is_opted_out() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let cfg = CtxConfig {
+            sandbox: crate::commands::ctx::config::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+        let repo = tmp.path().to_path_buf();
+        let req = spawn_request("do the work", &repo);
+        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let extra = worker_pane_extra_args(
+            &req,
+            &cfg,
+            &codex,
+            Vec::new(),
+            "cccccccc-3333-4333-8444-555555555555",
+        );
+        assert!(!extra.contains(&"--sandbox".to_string()), "got {extra:?}");
+    }
+
     /// Medium 1: the other Windows launcher form `guard_cmd_shim_reparse`
     /// covers (`powershell -NoProfile -File <script>`, for a `.ps1` `agent_
     /// bin`) must degrade exactly the way the `.cmd` shim does above --
@@ -8248,6 +8760,15 @@ mod tests {
 
         let cfg = CtxConfig {
             agent_bin: Some(shim.display().to_string()),
+            // T10: this test is about the argv-shim mail-withholding
+            // behavior, not pacing -- a fresh temp state dir has no usage
+            // source by construction, which would otherwise add its own
+            // blind-pace notice to `errors` and break the exact-count
+            // assertion below.
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..CtxConfig::default()
         };
         mail::store(&state, &slug, &a_mail_message(), &cfg).expect("store mail");
@@ -9691,18 +10212,18 @@ mod tests {
         // (it is not idle right after its own injection, but even once it is,
         // an unchanged inbox stays quiet -- checked directly against
         // `advised` rather than waiting out a real turn signal here).
-        assert_eq!(
-            advised.get(panes[0].session_id()).cloned(),
-            Some(
-                mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
-                    .expect("list")[0]
-                    .0
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            ),
-            "the dedup map records the advised message's own file name"
+        let advised_name = mail::list(&state, &slug, Some("test-agent"), Some(panes[0].short()))
+            .expect("list")[0]
+            .0
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            advised
+                .get(panes[0].session_id())
+                .is_some_and(|ids| ids.contains(&advised_name)),
+            "the dedup set records the advised message's own file name"
         );
 
         for pane in panes.iter_mut() {

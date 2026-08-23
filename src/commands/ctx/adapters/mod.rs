@@ -85,6 +85,219 @@ pub(crate) fn classify_model_flag(arg: &str) -> Option<ModelFlagForm<'_>> {
     None
 }
 
+/// Whether `flags` already pins one of the CLI-level policy flags
+/// `AgentAdapter::policy_args`/`default_sandbox_args` might otherwise
+/// prepend: claude's `--disallowedTools`/`--allowedTools`/`--permission-
+/// mode`, or codex's `-s/--sandbox` and `-a/--ask-for-approval`. Exact match
+/// or the `=`-joined form only (`--sandbox=read-only`) -- unlike `classify_
+/// model_flag`, this deliberately does not also recognise an attached short
+/// form (`-sread-only`): that spelling was never verified for these flags
+/// the way `-mvalue` was for `--model` (`-m`'s own attached form is a
+/// dedicated, tested case in this file), and a false positive here means
+/// silently *withholding* zirv's own restriction rather than merely
+/// mis-ordering a model flag, so precision matters more than coverage.
+///
+/// Mirrors `agent.rs`'s own `flags_pin_model` in spirit: the operator's own
+/// explicit choice must demonstrably win over a zirv-computed default, not
+/// merely happen to survive because a CLI takes the last occurrence of a
+/// repeated flag. `policy_launch_args` is the sole caller that acts on this.
+pub fn flags_pin_policy(flags: &[String]) -> bool {
+    const POLICY_FLAG_NAMES: &[&str] = &[
+        "--disallowedTools",
+        "--allowedTools",
+        "--permission-mode",
+        "--sandbox",
+        "-s",
+        "--ask-for-approval",
+        "-a",
+    ];
+    flags.iter().any(|f| {
+        POLICY_FLAG_NAMES
+            .iter()
+            .any(|name| f == name || f.starts_with(&format!("{name}=")))
+    })
+}
+
+/// One family of in-repo-development or destructive actions zirv's own
+/// shipped-default "sandboxed, no prompts" posture takes a position on --
+/// the single source both `ClaudeAdapter::default_sandbox_args` (which
+/// projects every entry onto a concrete `Bash(...)`/`Read(...)`/`Edit(...)`
+/// permission rule) and codex's own `default_sandbox_args` (a coarse
+/// `--sandbox workspace-write --ask-for-approval never` pair, documented
+/// against this same list -- see that method's own doc comment) are
+/// expressions of, so the two harnesses' postures cannot independently
+/// drift into disagreement about what "sandboxed, no prompts" means.
+///
+/// **Why `dontAsk` alone is not enough (2026-08-22, fix round 2):** a fresh
+/// install with no operator-configured `permissions.allow` denies every
+/// `Write`/`Edit`/`Bash` call outright -- safe, but inert, not the "session
+/// works and stays safe" posture the operator actually asked for. This list
+/// is what makes `--permission-mode dontAsk` *usable* out of the box.
+///
+/// **Verified live, not guessed**, against the installed `claude 2.1.240`:
+/// - `Edit(./**)` (not bare `Write`) is the rule that actually scopes a
+///   write to the workspace -- the CLI's own runtime error is explicit
+///   about this: `"Write(./**) is not matched by file permission checks --
+///   only Edit(path) rules are. ... Edit rules cover all file-editing
+///   tools."` A bare `Write` allow rule, tested live, let a write reach the
+///   *parent* directory of the workspace with no denial at all.
+/// - `Read(./**)` genuinely scopes reads to the workspace (a read outside
+///   it was denied); a bare `Read` rule, tested live, did not (it read a
+///   file one directory above the workspace).
+/// - A `disallowedTools` entry wins over a broader, unrelated `allowedTools`
+///   entry even when both could apply to the same command family (`Bash(git
+///   push --force *)` denied while a broader `Bash(git *)` allow was also
+///   configured) -- Claude Code's own settings.json schema documents `deny`
+///   winning over `allow` as the contract, and this was reproduced live, not
+///   assumed from the docs alone.
+/// - `Bash(<verb> *)` is prefix matching (Claude Code's own embedded schema
+///   docs: `"Prefix wildcard: \"Bash(git *)\" - matches git, git status, git
+///   commit, etc."`), reproduced live for both the space-separated form
+///   (`Bash(git status *)`, the documented spelling) and a colon-separated
+///   form that also happened to work; this list uses the documented
+///   spelling.
+///
+/// **What is deliberately NOT in this list, and why:** "writes outside the
+/// workspace" is not a separate deny rule -- `Edit(./**)`'s own scoping
+/// already denies it by omission (verified live above), and a second rule
+/// trying to express the same negative space would be redundant and harder
+/// to audit. General credential-file reads via `Bash(cat ...)` are denied
+/// the same way: no allow rule pre-approves `cat`/`Bash` in general, so
+/// `dontAsk` denies it by omission; `Bash(security *)` is still listed
+/// explicitly (the one credential-reading *command family* worth naming on
+/// its own, since zirv's own macOS keychain fallback already documents it
+/// as the concrete vector -- see `poll.rs`).
+pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
+    ("Read(./**)", "read anything inside the workspace"),
+    (
+        "Edit(./**)",
+        "create or modify files inside the workspace (covers both the Write and Edit tools)",
+    ),
+    (
+        "Bash(git status *)",
+        "inspect working tree state, read-only",
+    ),
+    ("Bash(git diff *)", "inspect changes, read-only"),
+    ("Bash(git log *)", "inspect history, read-only"),
+    ("Bash(ls *)", "list directory contents, read-only"),
+    ("Bash(grep *)", "search file contents, read-only"),
+    ("Bash(rg *)", "search file contents, read-only"),
+    // Non-destructive git writes (2026-08-22, fix round 3): under `dontAsk`
+    // a denial is final for the whole session -- there is no prompt to
+    // escalate to, so omitting these left a session that could read and
+    // build the repo but never record a single change. The destructive
+    // variants (force-push, hard reset, rebase, filter-branch) stay denied
+    // below, and deny wins over a broader overlapping allow, verified live.
+    (
+        "Bash(git add *)",
+        "stage a change; undoable with a plain reset",
+    ),
+    (
+        "Bash(git commit *)",
+        "record a change -- the basic unit of version control work",
+    ),
+    (
+        "Bash(git checkout *)",
+        "switch branches or restore a working-tree file to a known state",
+    ),
+    (
+        "Bash(git switch *)",
+        "switch branches, the non-overloaded successor to checkout",
+    ),
+    (
+        "Bash(git branch *)",
+        "create, list, or delete a local branch",
+    ),
+    (
+        "Bash(git stash *)",
+        "shelve and restore uncommitted changes",
+    ),
+    ("Bash(git pull *)", "fetch and integrate remote changes"),
+    ("Bash(git merge *)", "integrate another branch's history"),
+    (
+        "Bash(git push *)",
+        "publish committed history to the remote; force variants are denied below and win",
+    ),
+    ("Bash(cargo build *)", "build with the Rust toolchain"),
+    ("Bash(cargo test *)", "test with the Rust toolchain"),
+    ("Bash(cargo check *)", "typecheck with the Rust toolchain"),
+    ("Bash(npm test *)", "test with the Node toolchain"),
+    ("Bash(npm run build *)", "build with the Node toolchain"),
+    ("Bash(make test *)", "test with a Makefile-based toolchain"),
+    (
+        "Bash(make build *)",
+        "build with a Makefile-based toolchain",
+    ),
+    ("Bash(pytest *)", "test with the Python toolchain"),
+    ("Bash(go test *)", "test with the Go toolchain"),
+    ("Bash(go build *)", "build with the Go toolchain"),
+    ("Bash(mvn test *)", "test with the Java/Maven toolchain"),
+    ("Bash(mvn package *)", "build with the Java/Maven toolchain"),
+    (
+        "Bash(gradle test *)",
+        "test with the Java/Kotlin/Gradle toolchain",
+    ),
+    (
+        "Bash(gradle build *)",
+        "build with the Java/Kotlin/Gradle toolchain",
+    ),
+    ("Bash(dotnet test *)", "test with the .NET toolchain"),
+    ("Bash(dotnet build *)", "build with the .NET toolchain"),
+];
+
+/// The destructive families this posture denies regardless of anything on
+/// [`SHIPPED_POSTURE_ALLOW`] -- verified live to win over a broader,
+/// overlapping allow entry (see that constant's own doc comment).
+pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
+    ("Bash(rm -rf *)", "recursive force-delete"),
+    (
+        "Bash(rm -fr *)",
+        "recursive force-delete, flag-order variant",
+    ),
+    (
+        "Bash(git push --force *)",
+        "force-push, overwrites remote history",
+    ),
+    ("Bash(git push -f *)", "force-push, short-flag form"),
+    (
+        "Bash(git push --force-with-lease *)",
+        "force-push, lease-checked variant",
+    ),
+    (
+        "Bash(git reset --hard *)",
+        "destroys uncommitted work and can discard commits",
+    ),
+    ("Bash(git rebase *)", "rewrites commit history"),
+    ("Bash(git filter-branch *)", "rewrites commit history"),
+    (
+        "Bash(curl *)",
+        "can pipe a remote download straight into a shell",
+    ),
+    (
+        "Bash(wget *)",
+        "can pipe a remote download straight into a shell",
+    ),
+    ("Bash(sudo *)", "privilege escalation"),
+    ("Bash(su *)", "privilege escalation"),
+    (
+        "Bash(security *)",
+        "macOS keychain CLI; reads stored credentials",
+    ),
+    // Credential-path reads (2026-08-22, fix round 3): the allow list never
+    // grants a broad `cat`/`Bash`, so these were already denied by
+    // omission -- explicit here so the guarantee does not rest on that
+    // remaining true as the allow list grows. A mid-string wildcard was
+    // verified live to be honored (`Bash(cat *.aws*)` denied `cat
+    // .aws/credentials`), not assumed from the prefix-only doc example.
+    (
+        "Bash(cat *credentials*)",
+        "reads a file conventionally named for stored credentials",
+    ),
+    ("Bash(cat *.aws*)", "reads AWS credential files"),
+    ("Bash(cat *.ssh*)", "reads SSH private keys"),
+    ("Bash(cat *.netrc*)", "reads stored HTTP credentials"),
+];
+
 /// The last model-flag occurrence in `flags`, in any form `classify_model_
 /// flag` recognises -- CLI last-wins semantics, the same rule a real argv
 /// parser applies when a flag is repeated, honored across mixed spellings
@@ -498,6 +711,70 @@ pub trait AgentAdapter: std::fmt::Debug {
     ) -> super::policy::CapabilityDescriptor {
         let _ = (capability, stance);
         super::policy::CapabilityDescriptor::advisory_only()
+    }
+
+    /// Argv that applies zirv's canonical `[policy]` (`policy::
+    /// EffectivePolicy`) to a REAL session launch -- not the honest report
+    /// `policy_support`/`policy::evaluate` produce for `zirv context status`,
+    /// but the actual flags a launch command carries, so one operator setting
+    /// produces equivalent behaviour on every registered adapter.
+    ///
+    /// Default is empty: the same "nothing verified to guess" shape every
+    /// other optional method on this trait uses, and also the *correct*
+    /// answer for the shipped default -- `EffectivePolicy::default()` is
+    /// all-`Allow` (`Stance::Allow`'s own doc comment: "zirv declares no
+    /// restriction of its own"), so an operator who has set no `[policy]`
+    /// table at all gets byte-for-byte the same argv as before this method
+    /// existed, on every adapter. Anything more restrictive requires an
+    /// explicit `[policy]` stance, and anything more *permissive* than the
+    /// default cannot come from this method at all: there is no `Stance`
+    /// value that widens past `Allow`, and a repo checkout cannot set one
+    /// stricter than the operator's own layer either (`policy::resolve`'s
+    /// narrow-only fold -- see that module's doc comment).
+    ///
+    /// Only a capability this adapter also names `Enforced`/`Degraded` for in
+    /// `policy_support` may ever change this launch's argv: `Ask`/`Allow`
+    /// stay `OperatorControlled` (the harness's own native config decides,
+    /// exactly as before this method existed) -- this trait has no verified
+    /// per-run mechanism to make a headless worker request approval that
+    /// isn't already asking, only to suppress or deny it. Both registered
+    /// adapters override this for `Deny` on `RepoFsWrite`/`ShellExec` only,
+    /// the same pair `read_only_args`/`distiller_cmd` already pin.
+    fn policy_args(&self, policy: &super::policy::EffectivePolicy) -> Vec<String> {
+        let _ = policy;
+        Vec::new()
+    }
+
+    /// argv for zirv's own shipped-default launch posture (2026-08-22
+    /// decision, harness/model parity round): **sandboxed, no prompts**.
+    /// Commands run freely inside the repository workspace; anything
+    /// reaching outside it fails rather than prompting a human -- both
+    /// halves are load-bearing (a posture that stops prompting by removing
+    /// the sandbox is not this). Applied by `policy_launch_args` whenever
+    /// `cfg.sandbox.enabled` is true (the default; an operator opts out with
+    /// `[sandbox] enabled = false` or `ZIRV_CTX_SANDBOX=false`), independent
+    /// of whether `[policy]` itself is configured -- `EffectivePolicy`'s own
+    /// default stays all-`Allow` ("zirv's per-capability policy declares
+    /// nothing"; unchanged by this), so this is a **separate** baseline
+    /// layered underneath it, not a change to what `Allow` means.
+    ///
+    /// Default empty (no verified mechanism); both registered adapters
+    /// override it -- unlike `policy_args`, this takes no `EffectivePolicy`
+    /// input, since the shipped baseline is the same argv regardless of
+    /// what (if anything) `[policy]` says.
+    ///
+    /// `sandbox` (fix round 3, 2026-08-22) carries the operator's own
+    /// `extra_allow`/`extra_deny` (`SandboxConfig`, `config.rs`) -- claude's
+    /// own implementation appends both to the shipped `SHIPPED_POSTURE_
+    /// ALLOW`/`_DENY` lists before rendering the generated `--allowedTools=`/
+    /// `--disallowedTools=` argv, so an operator whose project needs one
+    /// more build command is not forced to discard the whole generated deny
+    /// list by pinning their own flags instead (`flags_pin_policy` still
+    /// covers that path). Codex has no per-command mechanism to receive
+    /// these and ignores the parameter.
+    fn default_sandbox_args(&self, sandbox: &super::config::SandboxConfig) -> Vec<String> {
+        let _ = sandbox;
+        Vec::new()
     }
 
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup;
@@ -1289,6 +1566,39 @@ pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter
     }
 }
 
+/// The argv `policy_launch_args` prepends ahead of an operator's own
+/// trailing flags, at every real-launch seam this codebase builds
+/// (`agent.rs::worker_launch_flags`, `exec.rs`, `run_loop.rs`, `wrap.rs`,
+/// `chat.rs::dash_orchestrator_pane`, `dash::mod::fulfill_spawn_request`) --
+/// the one function all six call, so "operator's own choice always wins" and
+/// the shipped-default posture can never drift between seams.
+///
+/// `Vec::new()` when `flags_pin_policy(flags)`: the operator's own explicit
+/// flag wins outright, nothing of zirv's own is prepended at all. Otherwise:
+/// `adapter.default_sandbox_args()` when `cfg.sandbox.enabled` (the shipped
+/// default -- see that method's own doc comment for the exact posture),
+/// followed by `adapter.policy_args(&cfg.policy)` for any *additional*
+/// restriction an explicit `[policy]` `Deny` stance asks for on top of the
+/// baseline. The more specific choice comes last, so it wins if it overlaps
+/// with the baseline (both adapters' relevant flags are single-value; the
+/// underlying CLI takes the last occurrence).
+pub fn policy_launch_args(
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+    flags: &[String],
+) -> Vec<String> {
+    if flags_pin_policy(flags) {
+        return Vec::new();
+    }
+    let mut out = if cfg.sandbox.enabled {
+        adapter.default_sandbox_args(&cfg.sandbox)
+    } else {
+        Vec::new()
+    };
+    out.extend(adapter.policy_args(&cfg.policy));
+    out
+}
+
 /// The trailing "- code review: ..." line `harness_prompt_lines` appends
 /// after its per-harness lines: names every *enabled* harness's resolved
 /// review model (an operator override or the ladder default, each marked as
@@ -2018,6 +2328,41 @@ mod tests {
         assert!(
             !claude_line.contains("zirv agent"),
             "a binary that is not there must never be offered for delegation: {claude_line}"
+        );
+    }
+
+    /// Bug A (harness/model parity): two harnesses in the identical state --
+    /// here, both absent, behind the same missing `agent_bin` override --
+    /// must render the identical templated line, differing only by their own
+    /// name. No adapter may get softer or harsher wording than another for
+    /// the same underlying fact; `harness_prompt_lines` renders every entry
+    /// through one shared format, never an adapter-specific one, and this
+    /// pins that down behaviourally rather than only by code inspection.
+    #[test]
+    fn harness_prompt_lines_render_the_same_template_for_two_adapters_in_the_same_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nonexistent-agent-binary");
+        let cfg = CtxConfig {
+            agent_bin: Some(missing.display().to_string()),
+            ..permissive_cfg()
+        };
+
+        let lines = harness_prompt_lines(&cfg, "");
+        let claude_line = lines
+            .iter()
+            .find(|l| l.starts_with("- claude:"))
+            .expect("claude line present");
+        let codex_line = lines
+            .iter()
+            .find(|l| l.starts_with("- codex:"))
+            .expect("codex line present");
+
+        let normalize = |line: &str, name: &str| line.replacen(name, "{name}", 1);
+        assert_eq!(
+            normalize(claude_line, "claude"),
+            normalize(codex_line, "codex"),
+            "both adapters are equally absent and must render the identical template, \
+             differing only by name:\nclaude: {claude_line}\ncodex: {codex_line}"
         );
     }
 
@@ -3128,5 +3473,74 @@ mod tests {
         assert_eq!(model_only_flags(&flags(&["--model", "  "])), None);
         assert_eq!(model_only_flags(&flags(&["--model="])), None);
         assert_eq!(model_only_flags(&flags(&["--model", "--verbose"])), None);
+    }
+
+    // `AgentAdapter::policy_args`: one `EffectivePolicy` input, equivalent
+    // real-launch restriction on both registered adapters (Bug B).
+
+    /// The default, all-`Allow` policy must launch every adapter exactly as
+    /// before this method existed: empty argv on both.
+    #[test]
+    fn policy_args_agree_on_no_restriction_under_the_default_policy() {
+        let policy = crate::commands::ctx::policy::EffectivePolicy::default();
+        assert!(
+            claude::ClaudeAdapter::new(None)
+                .policy_args(&policy)
+                .is_empty()
+        );
+        assert!(
+            codex::CodexAdapter::new(None)
+                .policy_args(&policy)
+                .is_empty()
+        );
+    }
+
+    /// The same `EffectivePolicy` (`shell_exec = deny`) must carry an
+    /// equivalent restriction to both adapters' real launch argv: claude's
+    /// tool-deny pin, and codex's read-only sandbox paired with a suppressed
+    /// approval prompt (the pairing that actually stops it escalating to a
+    /// human -- see `CodexAdapter::policy_args`'s own doc comment). Neither
+    /// is empty, and neither ever names the dangerous full-bypass flag.
+    #[test]
+    fn policy_args_carry_an_equivalent_restriction_to_both_adapters_from_the_same_policy() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+
+        let claude_args = claude::ClaudeAdapter::new(None).policy_args(&policy);
+        let codex_args = codex::CodexAdapter::new(None).policy_args(&policy);
+
+        assert!(
+            !claude_args.is_empty(),
+            "claude must restrict: {claude_args:?}"
+        );
+        assert!(
+            !codex_args.is_empty(),
+            "codex must restrict too: {codex_args:?}"
+        );
+        assert!(
+            claude_args.iter().any(|a| a.contains("Bash")),
+            "claude denies shell execution via its tool pin: {claude_args:?}"
+        );
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|w| w == ["--sandbox", "read-only"]),
+            "codex denies it via the read-only sandbox: {codex_args:?}"
+        );
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|w| w == ["--ask-for-approval", "never"]),
+            "and must not merely fall back to prompting for it: {codex_args:?}"
+        );
+        for args in [&claude_args, &codex_args] {
+            assert!(
+                !args.iter().any(|a| a.contains("dangerously-bypass")),
+                "an equivalent-restriction mapping must never widen: {args:?}"
+            );
+        }
     }
 }

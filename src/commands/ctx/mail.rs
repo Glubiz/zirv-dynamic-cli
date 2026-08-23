@@ -638,7 +638,22 @@ pub fn run_send_with<W: Write>(
             "zirv ctx send: message queued for {} ({}) in {}",
             record.short, msg.to, record.repo_slug
         )?,
-        None => writeln!(w, "zirv ctx send: message queued for {}", msg.to)?,
+        // Undirected (`--to-session` omitted): the confirmation used to read
+        // "message queued for {to}" as though every session matching `to`
+        // would see it. `mail::list`'s own `session_visible` rule does make
+        // it visible to all of them, but every consumer (a worker's own
+        // sweep, this session's own `zirv ctx inbox`, ...) removes it on
+        // first read, so exactly one of them actually claims it -- see the
+        // 2026-08-22 Decision Log entry above `run_send_with`. The
+        // confirmation now says so plainly, and names `--to-session` as the
+        // way to mean one specific session instead.
+        None => writeln!(
+            w,
+            "zirv ctx send: message queued for {} -- claimed by exactly one matching session, \
+             not every one that could see it; pass --to-session <short> to address one specific \
+             session",
+            msg.to
+        )?,
     }
     Ok(0)
 }
@@ -727,6 +742,50 @@ pub fn run_inbox<W: Write>(args: &InboxArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
     run_inbox_with(args, w, &repo, &env)
+}
+
+/// Finding 3 (review): a set of message ids (`store`/`store_to`'s own
+/// unique file names) already advised about, pruned against what is
+/// actually still unread every time it is consulted -- shared by
+/// `wrap::MailWatch` (which keeps two: `injected` and `announced`) and the
+/// dashboard's own orchestrator advisory (`dash::mod::advise_one_pane`), so
+/// the two paths cannot drift into two different dedup strategies again.
+///
+/// A pruned id-*set*, not a single never-invalidated high-water-mark
+/// filename: `claim_and_write`'s `_NNN` same-second-collision suffix can
+/// reissue a filename a *consumed* message already used, once that message
+/// is gone from the unread directory. A watermark that is never pruned then
+/// reads the reused name as "already advised" and silently drops the
+/// genuinely-new message behind it. `forget_missing`, called against the
+/// caller's freshly-listed unread ids on every check (including when the
+/// mailbox has gone empty), instead forgets a consumed id the moment it
+/// disappears, so a later message reusing that same name reads as new
+/// again.
+#[derive(Debug, Default, Clone)]
+pub struct AdvisedIds(std::collections::BTreeSet<String>);
+
+impl AdvisedIds {
+    pub fn contains(&self, id: &str) -> bool {
+        self.0.contains(id)
+    }
+
+    pub fn insert(&mut self, id: &str) {
+        self.0.insert(id.to_string());
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        self.0.remove(id);
+    }
+
+    /// Drops ids that are not present in `current` -- consumed, or pruned by
+    /// `store_to`'s own `keep` cap. Call this against the freshly-listed
+    /// unread ids before consulting/inserting, every time, even when
+    /// `current` is empty: an emptied mailbox is exactly the moment a later
+    /// filename reuse needs the old id gone from the set.
+    pub fn forget_missing<'a, I: IntoIterator<Item = &'a str>>(&mut self, current: I) {
+        let live: std::collections::BTreeSet<&str> = current.into_iter().collect();
+        self.0.retain(|id| live.contains(id.as_str()));
+    }
 }
 
 #[cfg(test)]
@@ -1334,6 +1393,45 @@ This should not appear in the body.\n";
         assert_eq!(listed[0].1.from_agent, "claude");
         assert_eq!(listed[0].1.to, "any");
         assert_eq!(listed[0].1.body, "heads up: the webhook route moved");
+    }
+
+    /// This task: the confirmation for an undirected send (`--to-session`
+    /// omitted) used to read "message queued for {to}" as though every
+    /// session matching `to` would receive it. `mail::list`'s own
+    /// `session_visible` rule does make the message *visible* to all of
+    /// them, but consumption is first-come-first-served -- exactly one
+    /// session claims it, on whichever read reaches it first -- so the
+    /// printed confirmation must say so and name `--to-session` as the way
+    /// to mean one specific session instead. See the 2026-08-22 Decision Log
+    /// entry above `run_send_with`.
+    #[test]
+    fn an_undirected_sends_confirmation_says_exactly_one_session_claims_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_send_with(
+            &send_args("status update"),
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("claimed by exactly one matching session"),
+            "got {text:?}"
+        );
+        assert!(
+            text.contains("--to-session"),
+            "must point at the way to address one specific session: {text:?}"
+        );
     }
 
     #[test]

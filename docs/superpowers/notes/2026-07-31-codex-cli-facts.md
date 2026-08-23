@@ -228,3 +228,45 @@ verified: `codex debug models` (a local catalog render, works without auth) list
 ## Follow-up
 
 Filed as a follow-up rather than guessed at: **"codex adapter: parse rollout events and map notify payload once codex authentication and the real hooks-notify contract are available."** Two independent blockers must clear before Task A10 can be attempted for real: (1) authenticated access to run a real `codex exec` turn (to observe assistant/tool-call/tool-result/token-usage shapes), and (2) understanding of the replacement `hooks` mechanism (`--dangerously-bypass-hook-trust`, `features list` shows `hooks: stable`) since the plan's assumed `notify = [...]` config array does not exist in this codex version.
+
+**Addendum (2026-08-22, approval-policy flag, harness/model parity round):**
+verified against the actually-installed `codex-cli 0.147.0` at
+`~\AppData\Local\Programs\OpenAI\Codex\bin` (a real standalone install, not
+npm or brew -- `codex.exe --version`), both `codex --help` (top-level,
+interactive launch) and `codex exec --help` (headless launch) were captured
+in full. Both now show:
+
+```
+  -a, --ask-for-approval <APPROVAL_POLICY>
+          Configure when the model requires human approval before executing a command
+
+          Possible values:
+          - untrusted:  Only run "trusted" commands (e.g. ls, cat, sed) without asking for user approval. Will escalate to the user if the model proposes a command
+            that is not in the "trusted" set
+          - on-request: The model decides when to ask the user for approval
+          - never:      Never ask for user approval Execution failures are immediately returned to the model
+```
+
+This flag is **not** in this file's original 2026-07-31 verbatim capture of
+`codex exec --help` (0.146.0, brew) above, and the notes for that capture
+explicitly enumerate every flag it *did* find -- `-a`/`--ask-for-approval` is
+absent from that list, not merely unquoted. So this flag postdates 0.146.0;
+treat this addendum, not the original block, as authoritative for its
+existence and exact values. (The top-level `codex --help` also gained
+`--approve-for-me` and `--remote`/`--remote-auth-token-env` since the
+original capture; recorded here for completeness, not used by any adapter
+code.) `-s, --sandbox <read-only|workspace-write|danger-full-access>` and
+`-m, --model <MODEL>` are unchanged and still present identically on both
+subcommands.
+
+**Why this matters:** `-s, --sandbox` alone does not stop codex from
+*asking* -- it only scopes what an executed command may touch. A command the
+sandbox would refuse still triggers the `untrusted` policy's own "escalate
+to the user" behaviour first (per the value's own description above) unless
+`--ask-for-approval never` is also set. `CodexAdapter::policy_args`
+(`src/commands/ctx/adapters/codex.rs`) pins `--sandbox read-only
+--ask-for-approval never` together for exactly this reason when zirv's own
+`[policy]` denies `shell_exec`/`repo_fs_write` for a launch -- `never` here
+only suppresses the *prompt*, it does not widen what the sandbox allows, and
+is not `--dangerously-bypass-approvals-and-sandbox` (the one flag verified to
+remove sandboxing entirely, never emitted by this codebase).

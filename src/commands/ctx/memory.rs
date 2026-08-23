@@ -96,18 +96,6 @@ impl Entry {
     }
 }
 
-/// Splits a comma-separated header value (`Tags`/`Paths`) into trimmed,
-/// non-empty items -- the same "tolerant, never fails" spirit as the rest of
-/// this parser: a stray comma or extra space is normalized away rather than
-/// producing an empty tag.
-fn split_csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
-        .collect()
-}
-
 /// Same bullet styles `mail::strip_bullet` accepts. Duplicated locally
 /// (rather than made `pub(crate)` elsewhere) to keep this file's edits
 /// isolated from files other tasks are actively working in.
@@ -181,8 +169,8 @@ pub fn parse_markdown(md: &str) -> Entry {
                     "source" => entry.source = value.trim().to_string(),
                     "importance" => entry.importance = Some(value.trim().to_string()),
                     "confidence" => entry.confidence = Some(value.trim().to_string()),
-                    "tags" => entry.tags = split_csv(value),
-                    "paths" => entry.paths = split_csv(value),
+                    "tags" => entry.tags = super::config::split_csv_list(value),
+                    "paths" => entry.paths = super::config::split_csv_list(value),
                     // Unknown header inside the block: skipped, not an error.
                     _ => {}
                 }

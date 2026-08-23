@@ -1498,11 +1498,7 @@ pub fn parse_judgment(markdown: &str) -> Vec<Finding> {
                 "title" => title = value.to_string(),
                 "detail" => detail = value.to_string(),
                 "evidence" => {
-                    evidence = value
-                        .split(',')
-                        .map(|item| item.trim().to_string())
-                        .filter(|item| !item.is_empty())
-                        .collect();
+                    evidence = super::config::split_csv_list(value);
                 }
                 _ => {}
             }

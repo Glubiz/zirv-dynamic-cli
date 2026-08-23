@@ -203,3 +203,55 @@ delegation. Codex is out of scope for this fix: it has no verified
 per-run permission-restriction flag any more than it has a verified
 system-prompt flag (see the BLOCKED codex sections above), and its adapter
 is not touched.
+
+## Addendum (2026-08-22, harness/model parity fix round 2): the generated permission set
+
+Probed live on a Windows machine against the actually-installed `claude 2.1.240`
+(newer than the 2.1.220 above), building `AgentAdapter::default_sandbox_args`'s
+`--permission-mode dontAsk` + generated `--allowedTools=`/`--disallowedTools=`
+pair (`adapters::SHIPPED_POSTURE_ALLOW`/`_DENY`, `adapters/mod.rs`).
+
+**`Write(./**)` is not a valid path-scoping rule.** Probed live: passing
+`--allowedTools="Write(./**)"` and asking the model to write a file produced
+this verbatim CLI warning before any tool call: `"Permission allow rule
+(--allowed-tools): Write(./**) is not matched by file permission checks --
+only Edit(path) rules are. Use Edit(./**) instead (Edit rules cover all
+file-editing tools)."` A bare, unscoped `Write` allow rule was then probed and
+verified to let a write reach the *parent* directory of the launch cwd with no
+denial at all -- confirming this is a real gap, not a hypothetical one.
+`Edit(./**)` (not `Write(./**)`, not bare `Write`) was then verified to
+correctly scope both an in-repo write (succeeded) and an outside-workspace
+write (denied, with the CLI's own explanatory denial text). `Read(./**)` was
+independently verified the same way: a bare `Read` rule read a file one
+directory above the workspace; `Read(./**)` denied the identical read.
+
+**Deny wins over a broader, overlapping allow**, reproduced live, not just
+read off the settings.json schema: with `Bash(git *)` allowed and `Bash(git
+push --force *)` denied, `git push --force` was refused
+(`"Permission to use Bash with command git push --force . has been denied"`)
+even though the broader allow rule also matched. `rm -rf` was refused the
+same way alongside an unrelated broader allow.
+
+**Prefix-wildcard syntax**: the CLI's own embedded settings.json schema
+documentation (extracted via `strings` on the installed binary) states
+`"Prefix wildcard: \"Bash(git *)\" - matches git, git status, git commit,
+etc."` and gives `"deny": ["Bash(rm -rf *)"]` as a worked example -- the
+space-before-`*` form is the documented spelling; a colon-before-`*` form
+(`Bash(git status:*)`) was also probed and found to work identically, but the
+documented spelling is what `SHIPPED_POSTURE_ALLOW`/`_DENY` use.
+
+**Rejected candidates, both probed live in headless `-p` mode (no TTY)**:
+`--permission-mode acceptEdits` silently *allowed* both a `Write` and a
+destructive `rm <file>` with no denial and no prompt -- as permissive as
+`--dangerously-skip-permissions` in this launch shape. Neither is used
+anywhere in this fix.
+
+**WebFetch under `dontAsk`, no allow rule**: denied outright, not prompted --
+`"The WebFetch tool was blocked by permissions. Claude Code is running in
+'don't ask mode' and the WebFetch permission hasn't been granted."` Consistent
+with every other tool type probed (Write/Edit/Bash/Read): `dontAsk` denies
+uniformly, no tool-specific exception found. **MCP tools were not directly
+probed**: no MCP server was configured in the verification environment, so
+this is inference from the uniform mechanism observed across every other tool
+type, not a literal live test -- flagged as a residual, not claimed as
+verified.

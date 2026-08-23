@@ -763,6 +763,106 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
+    /// The one stance this adapter has a verified per-run mechanism for
+    /// (`policy_support` above): `RepoFsWrite`/`ShellExec` at `Deny` gets the
+    /// exact same `--disallowedTools=...` pin `read_only_args`/
+    /// `distiller_cmd` already use -- reusing `self.read_only_args()`
+    /// directly rather than a second literal keeps the two from ever drifting
+    /// on the exact flag spelling the "I6 fix round" verified matters (see
+    /// `distiller_cmd`'s own doc comment). Every other stance is
+    /// `OperatorControlled` per `policy_support` and stays untouched: the
+    /// shipped default (`EffectivePolicy::default()`, all `Allow`) returns
+    /// empty, so a launch with no `[policy]` configured is byte-for-byte
+    /// unaffected.
+    fn policy_args(&self, policy: &crate::commands::ctx::policy::EffectivePolicy) -> Vec<String> {
+        use crate::commands::ctx::policy::Stance;
+        if policy.repo_fs_write == Stance::Deny || policy.shell_exec == Stance::Deny {
+            self.read_only_args()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The claude side of the shipped-default "sandboxed, no prompts"
+    /// posture (2026-08-22) -- verified against the actually-installed
+    /// `claude 2.1.240` (`claude --help`, and confirmed at runtime against a
+    /// real authenticated `-p` launch; both quoted in full in the
+    /// 2026-08-22 addendum below and in [[Ctx Adapters]]). Claude has **no**
+    /// real sandbox mechanism analogous to codex's `--sandbox
+    /// workspace-write`: there is no flag that scopes writes/execution to
+    /// the workspace while still allowing them freely. The two candidates
+    /// that came closest were probed for real, not guessed:
+    ///
+    /// - `--dangerously-skip-permissions`/`bypassPermissions` removes the
+    ///   permission system entirely -- explicitly excluded, per this fix's
+    ///   own hard constraint: it satisfies "no prompts" only by also
+    ///   satisfying "dangerous commands run", which this posture must never
+    ///   do.
+    /// - `--permission-mode acceptEdits` was probed live in headless `-p`
+    ///   mode and, with no TTY to prompt through, silently **allowed**
+    ///   both a `Write` and a destructive `rm <file>` `Bash` call with no
+    ///   denial and no prompt -- effectively as permissive as the bypass
+    ///   flag above in this launch shape. Disqualified for the same
+    ///   reason.
+    ///
+    /// `--permission-mode dontAsk` is the one verified-safe match: probed
+    /// live, it silently **denies** `Write`/`Bash` calls that are not
+    /// pre-approved (`.claude/settings.json`'s own `permissions.allow`,
+    /// which zirv reads and never writes) rather than prompting *or*
+    /// running them, and its own embedded `--help` text (extracted from the
+    /// installed binary) confirms this by design: `"'dontAsk' - Don't
+    /// prompt for permissions, deny if not pre-approved."` This closes both
+    /// halves of the posture's hard requirement (no prompts, nothing
+    /// dangerous auto-runs), but `dontAsk` **alone**, with no pre-approved
+    /// rules, is not "runs freely inside the workspace" -- it is inert: a
+    /// legitimate in-repo `Write`/`Edit`/`Bash` action is denied outright.
+    ///
+    /// **Fix round 2 (2026-08-22): `SHIPPED_POSTURE_ALLOW`/`_DENY`**
+    /// (`adapters/mod.rs`) is what makes `dontAsk` usable rather than merely
+    /// safe -- generated `--allowedTools=...`/`--disallowedTools=...` argv,
+    /// derived from that one shared list so this and codex's own posture
+    /// cannot independently drift. Passed at launch, never written to
+    /// `.claude/settings.json`: the operator's own file is untouched, and
+    /// their own `permissions.allow`/`deny` there still governs anything
+    /// this list is silent on. Verified live against the installed `claude
+    /// 2.1.240` (see `SHIPPED_POSTURE_ALLOW`'s own doc comment for the
+    /// specific findings -- `Edit(./**)` vs. bare `Write`, deny-over-allow
+    /// precedence, prefix-wildcard semantics): an in-repo write succeeds
+    /// with no prompt, a `cargo test` runs with no prompt, a write outside
+    /// the workspace is refused, and `rm -rf` is refused even alongside a
+    /// broader unrelated allow rule.
+    ///
+    /// **Fix round 3 (2026-08-22): `sandbox.extra_allow`/`extra_deny`**
+    /// are appended after the shipped pair, not merged into it, so an
+    /// operator's own addition can never silently replace a shipped entry --
+    /// only add to either side. Deny still wins over allow regardless of
+    /// which list (shipped or operator) an entry came from: both end up in
+    /// the same `--allowedTools=`/`--disallowedTools=` argv, and the
+    /// underlying CLI mechanism does not distinguish their origin.
+    fn default_sandbox_args(
+        &self,
+        sandbox: &crate::commands::ctx::config::SandboxConfig,
+    ) -> Vec<String> {
+        let allow = super::SHIPPED_POSTURE_ALLOW
+            .iter()
+            .map(|(rule, _)| rule.to_string())
+            .chain(sandbox.extra_allow.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(",");
+        let deny = super::SHIPPED_POSTURE_DENY
+            .iter()
+            .map(|(rule, _)| rule.to_string())
+            .chain(sandbox.extra_deny.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(",");
+        vec![
+            "--permission-mode".to_string(),
+            "dontAsk".to_string(),
+            format!("--allowedTools={allow}"),
+            format!("--disallowedTools={deny}"),
+        ]
+    }
+
     /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
     /// own spawn-request pane variant) used to silently inherit whatever the
     /// operator's own interactive default model happened to be -- often a
@@ -1409,6 +1509,189 @@ mod tests {
             deny.contains("Bash"),
             "Bash alone bypasses a Write/Edit-only deny list via a shell \
              redirect, verified against the real CLI: {deny}"
+        );
+    }
+
+    /// Bug B (harness parity): the shipped default `[policy]` (all `Allow`)
+    /// must leave a real launch byte-for-byte unaffected -- `policy_args` is
+    /// new, but an operator who never touched `[policy]` must see no argv
+    /// change at all.
+    #[test]
+    fn policy_args_is_empty_under_the_default_all_allow_policy() {
+        let adapter = ClaudeAdapter::new(None);
+        assert!(
+            adapter
+                .policy_args(&crate::commands::ctx::policy::EffectivePolicy::default())
+                .is_empty()
+        );
+    }
+
+    /// A `[policy] shell_exec = "deny"` (or `repo_fs_write = "deny"`) must
+    /// reach a real launch as the exact same `--disallowedTools=...` pin the
+    /// distiller already relies on -- reusing `read_only_args()` rather than
+    /// a second literal is what guarantees the two can never drift.
+    #[test]
+    fn policy_args_pins_the_verified_tool_deny_when_shell_exec_is_denied() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = ClaudeAdapter::new(None);
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        assert_eq!(
+            adapter.policy_args(&policy),
+            adapter.read_only_args(),
+            "policy_args must reuse read_only_args verbatim, never a second literal"
+        );
+    }
+
+    #[test]
+    fn policy_args_pins_the_verified_tool_deny_when_repo_fs_write_is_denied() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = ClaudeAdapter::new(None);
+        let policy = EffectivePolicy {
+            repo_fs_write: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        assert_eq!(adapter.policy_args(&policy), adapter.read_only_args());
+    }
+
+    /// `Ask` stays `OperatorControlled` (see `policy_support`): claude has no
+    /// verified per-run mechanism for it, so `policy_args` must not invent
+    /// one.
+    #[test]
+    fn policy_args_leaves_ask_untouched() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = ClaudeAdapter::new(None);
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Ask,
+            ..EffectivePolicy::default()
+        };
+        assert!(adapter.policy_args(&policy).is_empty());
+    }
+
+    /// The shipped-default posture (2026-08-22): verified against the real
+    /// installed binary (see this method's own doc comment) as the one
+    /// claude mode that both suppresses prompts and never auto-runs an
+    /// unapproved action -- `bypassPermissions`/`acceptEdits` were probed
+    /// and rejected for doing the opposite.
+    #[test]
+    fn default_sandbox_args_uses_the_verified_dont_ask_mode() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default());
+        assert_eq!(
+            &args[0..2],
+            &["--permission-mode".to_string(), "dontAsk".to_string()]
+        );
+    }
+
+    /// Fix round 2 (2026-08-22): `dontAsk` alone denies every unapproved
+    /// action, including a legitimate in-repo write -- inert, not "runs
+    /// freely inside the workspace". `SHIPPED_POSTURE_ALLOW`/`_DENY` is
+    /// what makes it usable; this pins the generated argv shape and that
+    /// every entry from the shared list actually landed, so the two lists
+    /// (source of truth and generated argv) can never silently drift.
+    #[test]
+    fn default_sandbox_args_generates_the_allow_and_deny_lists_from_the_shared_source() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default());
+        assert_eq!(args.len(), 4, "got {args:?}");
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        let deny_arg = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        for (rule, _) in super::super::SHIPPED_POSTURE_ALLOW {
+            assert!(
+                allow_arg.contains(rule),
+                "allow rule '{rule}' missing from {allow_arg}"
+            );
+        }
+        for (rule, _) in super::super::SHIPPED_POSTURE_DENY {
+            assert!(
+                deny_arg.contains(rule),
+                "deny rule '{rule}' missing from {deny_arg}"
+            );
+        }
+        // Both single `=`-bound tokens, the same discipline `read_only_args`
+        // already holds `--disallowedTools` to (the "I6 fix round": a
+        // two-token form was verified to swallow the next argv entry).
+        assert!(allow_arg.starts_with("--allowedTools="));
+        assert!(deny_arg.starts_with("--disallowedTools="));
+    }
+
+    /// Fix round 3 (2026-08-22): an operator's own `sandbox.extra_allow`/
+    /// `extra_deny` (`SandboxConfig`, `config.rs`) are appended after the
+    /// shipped lists, never replacing them -- the shipped entries must
+    /// still be present alongside the operator's own addition.
+    #[test]
+    fn default_sandbox_args_appends_the_operators_own_extra_allow_and_deny() {
+        let adapter = ClaudeAdapter::new(None);
+        let sandbox = crate::commands::ctx::config::SandboxConfig {
+            enabled: true,
+            extra_allow: vec!["Bash(just test *)".to_string()],
+            extra_deny: vec!["Bash(terraform apply *)".to_string()],
+        };
+        let args = adapter.default_sandbox_args(&sandbox);
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        let deny_arg = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        assert!(allow_arg.contains("Bash(just test *)"), "got {allow_arg}");
+        assert!(
+            allow_arg.contains("Read(./**)"),
+            "the shipped entries must still be present, not replaced: {allow_arg}"
+        );
+        assert!(
+            deny_arg.contains("Bash(terraform apply *)"),
+            "got {deny_arg}"
+        );
+        assert!(
+            deny_arg.contains("Bash(rm -rf *)"),
+            "the shipped deny entries must still be present, not replaced: {deny_arg}"
+        );
+    }
+
+    /// The scoping rule verified live to actually confine a write to the
+    /// workspace is `Edit(./**)`, not a bare `Write` -- see `SHIPPED_
+    /// POSTURE_ALLOW`'s own doc comment for the exact CLI error that
+    /// disqualified `Write(./**)`. A bare, unscoped `Write`/`Edit` must
+    /// never appear: it was verified live to let a write reach the
+    /// directory *above* the workspace with no denial at all.
+    #[test]
+    fn default_sandbox_args_scopes_file_edits_to_the_workspace_not_bare_write() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default());
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        assert!(allow_arg.contains("Edit(./**)"), "got {allow_arg}");
+        assert!(
+            !allow_arg.contains("Write(") && !allow_arg.split(',').any(|t| t == "Write"),
+            "a bare/unscoped Write rule was verified live to leak outside the workspace: \
+             {allow_arg}"
+        );
+    }
+
+    /// Must never be the dangerous bypass, under any circumstance.
+    #[test]
+    fn default_sandbox_args_never_emits_the_dangerous_bypass_flag() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default());
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("dangerously-skip-permissions")
+                    || a.contains("bypassPermissions")),
+            "must never widen: {args:?}"
         );
     }
 

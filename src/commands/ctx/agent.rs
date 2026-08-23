@@ -108,16 +108,38 @@ fn flags_pin_model(flags: &[String]) -> bool {
 /// ctx exec`/`zirv ctx loop`, whose trailing command the operator typed
 /// verbatim, nor `chat`/`wrap`, whose model comes from the orchestrator seat
 /// (`chat.model`) instead.
+///
+/// Bug B (harness/model parity): also prepends `adapters::policy_launch_
+/// args`, the same argv one `cfg.policy`/`cfg.sandbox` produces on whichever
+/// adapter this delegates to -- since 2026-08-22 that includes the shipped-
+/// default "sandboxed, no prompts" posture (`AgentAdapter::default_sandbox_
+/// args`), not only an explicit `[policy]` `Deny`. A delegated headless
+/// worker has nobody present to answer an approval prompt, which is exactly
+/// why this seam -- not only the interactive `wrap`/`chat` launches, which
+/// still have an operator watching -- is where this is wired into a real
+/// launch first; see `config.rs`'s `a_repo_cannot_widen_its_way_to_a_
+/// permissive_launch_on_either_adapter` for the end-to-end repo-narrow-only
+/// guarantee `cfg.policy` carries, and `SandboxConfig`'s own doc comment for
+/// `cfg.sandbox`'s identical guarantee. `policy_launch_args` itself declines
+/// to prepend anything when the operator's own `flags` already pin one of
+/// the same CLI flags (`adapters::flags_pin_policy`), so an operator's own
+/// explicit `--sandbox`/`--ask-for-approval`/`--permission-mode`/
+/// `--disallowedTools` demonstrably wins rather than merely surviving
+/// because a CLI takes the last occurrence of a repeated flag.
 fn worker_launch_flags(
     cfg: &CtxConfig,
     name: &str,
     adapter: &dyn AgentAdapter,
     flags: &[String],
 ) -> Vec<String> {
+    let policy_extra = adapters::policy_launch_args(cfg, adapter, flags);
     if flags_pin_model(flags) {
-        return flags.to_vec();
+        let mut out = policy_extra;
+        out.extend_from_slice(flags);
+        return out;
     }
     let mut out = adapters::worker_model_args(cfg, name, adapter);
+    out.extend(policy_extra);
     out.extend_from_slice(flags);
     out
 }
@@ -449,21 +471,31 @@ mod tests {
     // `worker_launch_flags`/`flags_pin_model`: pure, so these are testable
     // against a plain adapter without spawning anything.
 
+    /// The `--permission-mode`/`--sandbox`/`--ask-for-approval` prefix these
+    /// assertions expect is the shipped-default "sandboxed, no prompts"
+    /// posture (2026-08-22) -- see `SandboxConfig`'s own doc comment. It is
+    /// independent of the model pin: an operator's own `--model` still wins
+    /// over the *model* prepend, but the policy/sandbox prepend is a
+    /// separate concern and still applies.
     #[test]
     fn flag_passthrough_wins_over_the_configured_or_default_worker_model() {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let flags = vec!["--model".to_string(), "opus".to_string()];
+        let mut expected = adapter.default_sandbox_args(&Default::default());
+        expected.extend(flags.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &adapter, &flags),
-            flags,
-            "the operator's own --model must reach argv unchanged"
+            expected,
+            "the operator's own --model must reach argv unchanged (after the sandbox prefix)"
         );
 
         let joined = vec!["--model=opus".to_string()];
+        let mut expected_joined = adapter.default_sandbox_args(&Default::default());
+        expected_joined.extend(joined.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &adapter, &joined),
-            joined,
+            expected_joined,
             "the --model=value joined form must also be recognised as already pinned"
         );
     }
@@ -481,18 +513,30 @@ mod tests {
             },
             ..CtxConfig::default()
         };
+        let sandbox_prefix = || {
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ]
+        };
 
         let bare = vec!["-m".to_string(), "opus".to_string()];
+        let mut expected = sandbox_prefix();
+        expected.extend(bare.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "codex", &adapter, &bare),
-            bare,
+            expected,
             "the operator's own -m must reach argv unchanged, not gain a conflicting --model"
         );
 
         let joined = vec!["-m=opus".to_string()];
+        let mut expected_joined = sandbox_prefix();
+        expected_joined.extend(joined.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "codex", &adapter, &joined),
-            joined,
+            expected_joined,
             "the -m=value joined form must also be recognised as already pinned"
         );
 
@@ -501,9 +545,11 @@ mod tests {
         // codex "p" -- -mopus` with `worker.codex` configured gets a
         // conflicting `--model` prepended ahead of the operator's own flag.
         let attached = vec!["-mopus".to_string()];
+        let mut expected_attached = sandbox_prefix();
+        expected_attached.extend(attached.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "codex", &adapter, &attached),
-            attached,
+            expected_attached,
             "the attached -mvalue short form must also be recognised as already pinned"
         );
     }
@@ -528,13 +574,22 @@ mod tests {
             vec![
                 "--model".to_string(),
                 "gpt-5.6-terra".to_string(),
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
                 "--model-foo".to_string(),
                 "opus".to_string(),
             ],
-            "an unrelated flag must not suppress the configured-model prepend"
+            "an unrelated flag must not suppress the configured-model prepend, and the \
+             shipped-default sandbox prefix still applies"
         );
     }
 
+    /// `--allowedTools` is itself one of the flags `adapters::flags_pin_
+    /// policy` recognises, so the shipped-default sandbox prefix is
+    /// correctly withheld here -- the operator's own explicit tool-access
+    /// flag already pins the same concern.
     #[test]
     fn a_configured_worker_model_is_prepended_ahead_of_the_operators_own_flags() {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
@@ -553,27 +608,205 @@ mod tests {
                 "opus".to_string(),
                 "--allowedTools".to_string(),
                 "Bash".to_string(),
+            ],
+            "flags_pin_policy withholds the sandbox prefix: the operator's own \
+             --allowedTools already pins the same concern"
+        );
+    }
+
+    /// The shipped default (2026-08-22) is no longer empty: `cfg.sandbox.
+    /// enabled` defaults `true`, so `default_sandbox_args` prepends the
+    /// posture's own flags ahead of the model default.
+    #[test]
+    fn claude_gets_the_sonnet_default_and_the_shipped_sandbox_posture_when_nothing_is_configured_or_passed()
+     {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let mut expected = vec!["--model".to_string(), "sonnet".to_string()];
+        expected.extend(adapter.default_sandbox_args(&Default::default()));
+        assert_eq!(worker_launch_flags(&cfg, "claude", &adapter, &[]), expected);
+    }
+
+    /// No model flag (codex has no adapter-owned worker-model default), but
+    /// the shipped-default sandbox posture still applies.
+    #[test]
+    fn codex_gets_no_model_flag_but_still_gets_the_shipped_sandbox_posture() {
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let out = worker_launch_flags(&cfg, "codex", &adapter, &[]);
+        assert!(
+            !out.contains(&"--model".to_string()),
+            "codex has no adapter-owned default, so its own config default applies untouched: {out:?}"
+        );
+        assert_eq!(
+            out,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
             ]
         );
     }
 
+    /// Bug B, 2026-08-22 revision: the shipped default is now the
+    /// "sandboxed, no prompts" posture, not an empty argv -- this test used
+    /// to assert byte-for-byte silence under the default; it is inverted
+    /// (per instruction, not deleted) to assert the exact new-default argv
+    /// per adapter, plus the explicit opt-out (`[sandbox] enabled = false`)
+    /// restoring the old, empty-by-default behaviour.
     #[test]
-    fn claude_gets_the_sonnet_default_when_nothing_is_configured_or_passed() {
-        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+    fn worker_launch_flags_emits_the_shipped_sandbox_posture_by_default_and_nothing_when_opted_out()
+    {
         let cfg = CtxConfig::default();
         assert_eq!(
-            worker_launch_flags(&cfg, "claude", &adapter, &[]),
-            vec!["--model".to_string(), "sonnet".to_string()]
+            cfg.policy,
+            crate::commands::ctx::policy::EffectivePolicy::default(),
+            "[policy] itself is untouched by this posture"
+        );
+        assert!(cfg.sandbox.enabled, "the shipped default is sandboxed");
+
+        let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let mut expected_claude = vec!["--model".to_string(), "sonnet".to_string()];
+        expected_claude.extend(claude.default_sandbox_args(&Default::default()));
+        assert_eq!(
+            worker_launch_flags(&cfg, "claude", &claude, &[]),
+            expected_claude
+        );
+        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &codex, &[]),
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ]
+        );
+
+        // The opt-out: an operator who explicitly disables the posture gets
+        // the pre-2026-08-22 behaviour back -- an empty argv from this seam,
+        // with no `[policy]` configured either.
+        let opted_out = CtxConfig {
+            sandbox: crate::commands::ctx::config::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+        assert!(
+            worker_launch_flags(&opted_out, "codex", &codex, &[]).is_empty(),
+            "codex has no worker-model default either, so an opted-out launch is silent"
+        );
+        assert_eq!(
+            worker_launch_flags(&opted_out, "claude", &claude, &[]),
+            vec!["--model".to_string(), "sonnet".to_string()],
+            "claude still gets its own worker-model default; only the sandbox prefix is gone"
         );
     }
 
+    /// A `[policy] shell_exec = "deny"` must reach a delegated headless
+    /// worker's real launch argv on both adapters *on top of* the shipped
+    /// sandbox baseline, from the same `cfg.policy` -- claude's tool-deny
+    /// pin, and codex's `policy_args` restating (more strictly) the same
+    /// `--sandbox`/`--ask-for-approval` flags `default_sandbox_args` already
+    /// emitted. The duplication is intentional and harmless: both CLIs take
+    /// the last occurrence of a single-value flag, and the later, explicit
+    /// `Deny`-driven values (`read-only`) are strictly stricter than the
+    /// baseline (`workspace-write`), so they are the ones that end up
+    /// governing the launch.
     #[test]
-    fn codex_gets_no_model_flag_when_nothing_is_configured_or_passed() {
-        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
-        let cfg = CtxConfig::default();
-        assert!(
-            worker_launch_flags(&cfg, "codex", &adapter, &[]).is_empty(),
-            "codex has no adapter-owned default, so its own config default applies untouched"
+    fn worker_launch_flags_layers_an_explicit_policy_deny_on_top_of_the_sandbox_baseline() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let cfg = CtxConfig {
+            policy: EffectivePolicy {
+                shell_exec: Stance::Deny,
+                ..EffectivePolicy::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let claude_flags = worker_launch_flags(&cfg, "claude", &claude, &[]);
+        let mut expected_claude = vec!["--model".to_string(), "sonnet".to_string()];
+        expected_claude.extend(claude.default_sandbox_args(&Default::default()));
+        expected_claude.push("--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string());
+        assert_eq!(claude_flags, expected_claude);
+
+        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let codex_flags = worker_launch_flags(&cfg, "codex", &codex, &[]);
+        assert_eq!(
+            codex_flags,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ],
+            "the later, stricter --sandbox read-only is the one that wins (last occurrence)"
+        );
+    }
+
+    /// The operator's own trailing flags still reach argv unchanged (and
+    /// still win, since both CLIs take the last occurrence of a single-value
+    /// flag) even under the sandbox baseline plus a configured `[policy]`
+    /// restriction.
+    #[test]
+    fn worker_launch_flags_keeps_the_operators_own_flags_after_a_configured_policy() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let cfg = CtxConfig {
+            policy: EffectivePolicy {
+                shell_exec: Stance::Deny,
+                ..EffectivePolicy::default()
+            },
+            ..CtxConfig::default()
+        };
+        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let flags = vec!["--verbose".to_string()];
+        let out = worker_launch_flags(&cfg, "codex", &codex, &flags);
+        assert_eq!(
+            out,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+                "--verbose".to_string(),
+            ]
+        );
+    }
+
+    /// An operator's own explicit `--sandbox`/`--ask-for-approval`/
+    /// `--permission-mode`/`--disallowedTools` pin (any spelling `adapters::
+    /// flags_pin_policy` recognises) suppresses the *entire* zirv-computed
+    /// prefix -- baseline sandbox posture and any explicit `[policy]` Deny
+    /// alike -- not merely the baseline half of it. The operator's own
+    /// choice must demonstrably win, not merely happen to survive because a
+    /// CLI takes the last occurrence.
+    #[test]
+    fn an_operators_own_sandbox_flag_suppresses_the_entire_zirv_computed_prefix() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let cfg = CtxConfig {
+            policy: EffectivePolicy {
+                shell_exec: Stance::Deny,
+                ..EffectivePolicy::default()
+            },
+            ..CtxConfig::default()
+        };
+        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let flags = vec!["--sandbox".to_string(), "danger-full-access".to_string()];
+        assert_eq!(
+            worker_launch_flags(&cfg, "codex", &codex, &flags),
+            flags,
+            "the operator's own --sandbox pin must reach argv completely unaugmented"
         );
     }
 

@@ -64,8 +64,20 @@ pub struct HarnessUsage {
 }
 
 /// One entry per enabled harness in the roster (`cfg.agents`).
+///
+/// `select_mode` is `Ctrl+A v`'s own state (`dash::DashAction::
+/// ToggleSelectMode`): `true` while the dashboard has turned its own mouse
+/// reporting off so the terminal's native click-drag text selection reaches
+/// a pane whose child wants mouse events itself -- the one case the
+/// dashboard's own in-pane click-drag selection cannot cover (see
+/// `dash::Selection`'s doc comment). It renders near the front of
+/// [`header_line`], not buried after the incidental counts, because it
+/// changes how *every* click and wheel notch behaves for as long as it is
+/// on -- an operator who forgets it is set would otherwise wonder why panes
+/// stopped switching or scrolling under the mouse.
 pub struct HeaderFacts {
     pub harness: String,
+    pub select_mode: bool,
     pub score: Option<u32>,
     pub mail_broadcast: usize,
     pub mail_direct: usize,
@@ -345,6 +357,13 @@ pub fn score_text(score: Option<u32>) -> String {
 /// trade the line already made before the score segment existed.
 pub fn header_line(facts: &HeaderFacts, cols: u16) -> String {
     let mut parts = vec![facts.harness.clone()];
+    // Right after the harness, ahead of even the rot score: for as long as
+    // this is on, clicks and wheel notches stop reaching the dashboard at
+    // all (native terminal selection instead), which is a bigger behavior
+    // change than any incidental count below it.
+    if facts.select_mode {
+        parts.push("SELECT (Ctrl+A v to resume)".to_string());
+    }
     parts.push(format!("rot {}", score_text(facts.score)));
     if facts.mail_broadcast > 0 || facts.mail_direct > 0 {
         parts.push(format!(
@@ -373,6 +392,16 @@ pub fn header_line(facts: &HeaderFacts, cols: u16) -> String {
                 (None, None) => format!("{name} {PLACEHOLDER}"),
             }
         });
+    }
+    // Last, deliberately: this is the one segment that exists only so an
+    // operator who has never opened the help overlay still learns the chord
+    // exists, not because it is urgent -- `right_truncate` keeps the
+    // leftmost characters, so appending it last means it is the first thing
+    // dropped once the line is tight, with no new truncation rule needed.
+    // Omitted while `select_mode` is already on: its own segment above says
+    // the same chord resumes normal mouse behavior.
+    if !facts.select_mode {
+        parts.push("Ctrl+A v select".to_string());
     }
     right_truncate(&parts.join("  "), cols as usize)
 }
@@ -1050,6 +1079,15 @@ static HELP_BINDINGS: &[HelpBinding] = &[
         )],
     },
     HelpBinding {
+        label: "v",
+        description: "toggle text selection",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            DashAction::ToggleSelectMode,
+        )],
+    },
+    HelpBinding {
         label: "q",
         description: "quit",
         section: HelpSection::Prefixed,
@@ -1471,6 +1509,7 @@ mod tests {
     fn base_facts() -> HeaderFacts {
         HeaderFacts {
             harness: "claude".to_string(),
+            select_mode: false,
             score: None,
             mail_broadcast: 0,
             mail_direct: 0,
@@ -1478,6 +1517,60 @@ mod tests {
             sessions: 1,
             usage: Vec::new(),
         }
+    }
+
+    /// `Ctrl+A v`'s own state renders a visible reminder while it is on, since
+    /// it changes how every click and wheel notch behaves until toggled back.
+    #[test]
+    fn header_shows_select_mode_only_while_active() {
+        let facts = base_facts();
+        let area = Rect::new(0, 0, 80, 1);
+        let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
+        assert!(!text.contains("SELECT"), "header text was: {text}");
+
+        let mut facts = base_facts();
+        facts.select_mode = true;
+        let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
+        assert!(text.contains("SELECT"), "header text was: {text}");
+    }
+
+    /// The discoverability half of the same chord: a user who has never
+    /// opened the help overlay still has to learn `Ctrl+A v` exists somehow,
+    /// so the off state shows a low-emphasis hint rather than nothing at all.
+    /// It disappears once selection mode is actually on, since the SELECT
+    /// segment above already names the same chord for resuming.
+    #[test]
+    fn header_hints_the_select_chord_only_while_it_is_off() {
+        let facts = base_facts();
+        let area = Rect::new(0, 0, 80, 1);
+        let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
+        assert!(text.contains("Ctrl+A v select"), "header text was: {text}");
+
+        let mut facts = base_facts();
+        facts.select_mode = true;
+        let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
+        assert!(!text.contains("Ctrl+A v select"), "header text was: {text}");
+    }
+
+    /// The hint costs a few columns and is not urgent -- appended last so
+    /// `right_truncate`'s existing leftmost-keeping rule drops it before any
+    /// other segment once the terminal is narrow, with no new truncation
+    /// logic needed.
+    #[test]
+    fn the_select_hint_is_the_first_thing_dropped_under_truncation() {
+        let facts = base_facts();
+        let full = header_line(&facts, 200);
+        assert!(full.contains("Ctrl+A v select"), "full line: {full}");
+
+        let tight = header_line(&facts, (full.len() - "Ctrl+A v select".len()) as u16);
+        assert!(
+            !tight.contains("Ctrl+A v select"),
+            "hint should be gone once the line is tight: {tight}"
+        );
+        assert!(
+            tight.contains("rot"),
+            "everything else must still be there: {tight}"
+        );
     }
 
     fn render_and_capture_text(area: Rect, draw: impl FnOnce(&mut Frame, Rect)) -> String {
@@ -1617,7 +1710,7 @@ mod tests {
         let without_usage = header_line(&facts_no_usage, 80);
         assert_eq!(with_usage, without_usage);
         assert!(!with_usage.contains("credits"));
-        assert_eq!(with_usage, "claude  rot --  sessions 1");
+        assert_eq!(with_usage, "claude  rot --  sessions 1  Ctrl+A v select");
     }
 
     /// "Unknown" and "healthy" are opposite things to tell an operator, so an
@@ -1646,7 +1739,7 @@ mod tests {
 
         let line = header_line(&facts, cols);
         assert_eq!(
-            line, "claude  rot 34  mail 2+1  mem 3  sessions 4",
+            line, "claude  rot 34  mail 2+1  mem 3  sessions 4  Ctrl+A v select",
             "nothing is cut at 80 columns for an ordinary header"
         );
         assert!(line.chars().count() <= cols as usize);
@@ -2270,6 +2363,7 @@ mod tests {
         scroll_live: bool,
         literal_prefix: bool,
         help: bool,
+        toggle_select_mode: bool,
     }
 
     /// Completeness, not just correctness: the test above proves every
@@ -2297,6 +2391,7 @@ mod tests {
                     DashAction::ScrollLive => cov.scroll_live = true,
                     DashAction::LiteralPrefix => cov.literal_prefix = true,
                     DashAction::Help => cov.help = true,
+                    DashAction::ToggleSelectMode => cov.toggle_select_mode = true,
                 }
             }
         }
@@ -2316,7 +2411,8 @@ mod tests {
                 && cov.scroll_top
                 && cov.scroll_live
                 && cov.literal_prefix
-                && cov.help,
+                && cov.help
+                && cov.toggle_select_mode,
             "help table is missing a row for at least one DashAction variant"
         );
     }

@@ -904,16 +904,22 @@ mod tests {
         assert!(descriptor.mechanism.contains("write"));
     }
 
-    /// The sandbox flag is not codex's approval mechanism at all -- that is
-    /// codex's own `approval` setting in `~/.codex/config.toml`, which zirv
-    /// reads but never rewrites, and which has no verified `Deny`-shaped
-    /// flag. `Approval` at `Deny` must be `Unsupported`, not `Degraded`.
+    /// Revised 2026-08-22: `-a, --ask-for-approval never` is real and
+    /// verified against the installed `codex-cli 0.147.0` (the original
+    /// `Unsupported` verdict here predates that finding -- see the
+    /// 2026-08-22 addendum to `docs/superpowers/notes/2026-07-31-codex-cli-
+    /// facts.md`). Not `Enforced`: in isolation it only suppresses the
+    /// escalation prompt, it does not by itself decide what the sandbox
+    /// blocks -- see `CodexAdapter::policy_support`'s own doc comment for
+    /// why the pairing with `--sandbox read-only` is what actually closes
+    /// the loop. `Approval` at `Deny` is therefore `Degraded`, not
+    /// `Unsupported` or `Enforced`.
     #[test]
-    fn codex_approval_at_deny_is_unsupported_not_degraded() {
+    fn codex_approval_at_deny_is_degraded_not_unsupported_or_enforced() {
         let codex = CodexAdapter::new(None);
         let descriptor = codex.policy_support(Capability::Approval, Stance::Deny);
-        assert_eq!(descriptor.support, Support::Unsupported);
-        assert!(descriptor.mechanism.contains("approval mechanism"));
+        assert_eq!(descriptor.support, Support::Degraded);
+        assert!(descriptor.mechanism.contains("ask-for-approval"));
     }
 
     /// Codex has no verified per-tool deny and no verified network control, so

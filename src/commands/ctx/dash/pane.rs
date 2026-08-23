@@ -146,7 +146,19 @@ pub(crate) fn output_quiescent(output_at: Option<Instant>, now: Instant, quiet: 
     let Some(output) = output_at else {
         return false;
     };
-    now.duration_since(output) >= quiet
+    quiescent_since(output, now, quiet)
+}
+
+/// Finding 5 (review): the elapsed-time arithmetic shared by every
+/// idleness-by-clock decision in this codebase -- `now` counts as quiescent
+/// relative to `latest` once at least `quiet` has passed. [`output_quiescent`]
+/// (above, `Option<Instant>`: "no output ever recorded" reads as not-quiet)
+/// and `wrap::signal_less_mail_ready` (always a concrete `Instant`, already
+/// folded via `.max()`) each wrap this with their own "what counts as
+/// `latest`" logic; the formula itself is kept in exactly one place so the
+/// two could not silently drift out of sync with each other again.
+pub(crate) fn quiescent_since(latest: Instant, now: Instant, quiet: Duration) -> bool {
+    now.duration_since(latest) >= quiet
 }
 
 /// Pure: the more recent of two optional instants, the one present when only

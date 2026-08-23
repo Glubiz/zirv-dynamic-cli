@@ -263,11 +263,46 @@ fn prompt_delivery_via_stdin(adapter: &dyn adapters::AgentAdapter, session: &Ses
     adapters::launch_reparses_through_shim(&probe)
 }
 
+/// T11: real-clock wrapper. `run_with_clock` (below) does the actual work;
+/// this hands it the two real-world functions -- `state::now_secs` and a
+/// genuine `std::thread::sleep` -- so every caller outside this module
+/// (`script_runner::AgentCommand`, `agent.rs`, `dash`'s headless spawn
+/// fallback) keeps calling `run_with` exactly as before, with no signature
+/// change to ripple through.
 pub fn run_with<W: Write>(
     args: &ExecArgs,
     w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    run_with_clock(
+        args,
+        w,
+        repo,
+        env,
+        &super::state::now_secs,
+        &|d: Duration| std::thread::sleep(d),
+    )
+}
+
+/// T11 (sleep injection): identical to the former `run_with` in every way
+/// except `now_fn`/`sleep_fn` are now parameters instead of a real-clock
+/// closure hardcoded two calls deep in the body. Before this, the pacing
+/// gate's fail-safe delay (`blind_delay_secs`, T8) was verifiable at the
+/// unit level (`pace.rs`'s own `FakeClock` tests) but not at this
+/// integration level -- exec's own tests had to zero the delay out via
+/// `base_env` just to stay fast, which meant nothing here proved the delay
+/// actually reaches a real `sleep_fn` call with the right duration. Tests
+/// now inject a recording closure the same way `pace.rs`'s `FakeClock` does,
+/// so a future refactor that silently drops the sleep call is a test
+/// failure, not a shipped no-op.
+pub(crate) fn run_with_clock<W: Write>(
+    args: &ExecArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
     // Gated only by `cfg.chrome.events` (which already folds in `--quiet` on
@@ -501,6 +536,54 @@ pub fn run_with<W: Write>(
     // rebuild the command from scratch with only zirv's own added flags,
     // silently dropping these.
     let user_extra = extra_launch_flags(&launch_command, prefix, prompt.as_deref());
+    // Bug B (harness/model parity, 2026-08-22): the shipped-default
+    // "sandboxed, no prompts" posture (`SandboxConfig`) plus any explicit
+    // `[policy]` restriction, from the same seam every other real launch now
+    // calls (`adapters::policy_launch_args`). Computed once here, ahead of
+    // `user_extra` at every one of this function's four launch-building
+    // sites (initial launch, nudge/park/rot-timeout relaunches), the same
+    // discipline `user_extra` itself already follows -- see that binding's
+    // own comment. `flags_pin_policy` (inside `policy_launch_args`) reads
+    // `user_extra`, not the raw wrapped command, so an operator's own
+    // `--sandbox`/`--ask-for-approval`/`--permission-mode`/
+    // `--disallowedTools` anywhere in their own trailing flags still wins.
+    //
+    // Deliberately **not** gated on `skip_injection` (which also folds in
+    // `args.simple`): `--simple` promises no *injected instruction text*,
+    // and the sandbox posture is a safety flag layer, not instruction text
+    // (mirrors `wrap.rs`'s identical `policy_skip` reasoning, and `chat.rs`'s
+    // own `--simple` test). It is still gated on the one reason `skip_
+    // injection` exists that *does* apply here: a wrapped command that does
+    // not actually match this adapter must never receive this adapter's
+    // flags -- the same leakage risk `skip_injection` exists to prevent for
+    // `prompt_args`. `adapter_builds_launch` is exempt from that check
+    // entirely: when zirv builds the launch itself (from `--prompt`, no
+    // explicit `-- <command>`), there is no wrapped command to mismatch --
+    // it is unconditionally this adapter's own launch.
+    let policy_skip = !adapter_builds_launch
+        && !adapters::command_matches_adapter(
+            adapter.as_ref(),
+            agent_name.is_some(),
+            &args.command,
+        );
+    let policy_extra = if policy_skip {
+        Vec::new()
+    } else {
+        adapters::policy_launch_args(&cfg, adapter.as_ref(), &user_extra)
+    };
+    // Visible, not silent: the shipped-default posture (or the operator's
+    // own opt-out/override) is announced once, here, at session start --
+    // not re-announced on a nudge/rot/park relaunch, since `policy_extra`
+    // itself is computed once above and simply reused by every relaunch arm.
+    announcer.emit(&super::announce::Event::SandboxPosture {
+        detail: if policy_extra.is_empty() {
+            "not applied (operator flags, --simple/command mismatch is irrelevant here, or \
+             [sandbox] enabled = false)"
+                .to_string()
+        } else {
+            policy_extra.join(" ")
+        },
+    });
 
     // The probe has to hit the binary that will actually be spawned. When the
     // argv names no program the adapter builds the launch, so there is nothing
@@ -693,17 +776,25 @@ pub fn run_with<W: Write>(
             &mail_messages,
             cfg.mail.max_delivered_bytes,
         );
-        let extra: Vec<String> = user_extra
+        let extra: Vec<String> = policy_extra
             .iter()
             .cloned()
+            .chain(user_extra.iter().cloned())
             .chain(prompt_args.iter().cloned())
             .collect();
         let (mut command, stdin_prompt) = build_headless(&prompt_text, &session, &extra);
         command.current_dir(repo);
         (command, stdin_prompt)
     } else {
+        // An explicit `-- <command>` is the operator's own fixed argv: there
+        // is no `user_extra` slot to prepend `policy_extra` ahead of, so
+        // both zirv-owned additions are appended the same way `prompt_args`
+        // already was here, before this fix -- see `policy_extra`'s own
+        // comment for why `flags_pin_policy` still consulted the launch's
+        // own trailing flags (folded into `user_extra` above) rather than
+        // this branch's fixed command.
         let mut command = build_command(&launch_command, repo)?;
-        for arg in &prompt_args {
+        for arg in policy_extra.iter().chain(prompt_args.iter()) {
             command.arg(arg);
         }
         (command, None)
@@ -717,8 +808,6 @@ pub fn run_with<W: Write>(
     // is claimed but ignored, the same as being over the cap.
     let mut nudge_restarts = 0u32;
     let can_restart = prompt.is_some();
-    let now_fn = now_secs;
-    let sleep_fn = |d: Duration| std::thread::sleep(d);
 
     // Best-effort registration: covers a hand-typed `zirv ctx exec` as well
     // as `zirv ctx agent` and a script `agent:` step, both of which delegate
@@ -739,10 +828,10 @@ pub fn run_with<W: Write>(
 
     // Item 10: owned across every cycle of the loop below (the pre-flight
     // check and, on a usage-limit park, the second call further down), so
-    // the no-usage-source skip line and `PacingSkipped` announce once for
-    // the whole run rather than once per restart.
+    // the no-usage-source blind-delay line and `PacingBlind` announce once
+    // for the whole run rather than once per restart.
     let mut pace_flags = pace::PaceGateFlags::default();
-    let http_poller = super::poll::HttpPoller;
+    let http_poller = super::poll::HttpPoller::new(cfg.chrome.events);
 
     loop {
         pace::wait_for_window(
@@ -751,8 +840,8 @@ pub fn run_with<W: Write>(
             &cfg.pace,
             "exec",
             session.as_str(),
-            &now_fn,
-            &sleep_fn,
+            now_fn,
+            sleep_fn,
             Some(&announcer),
             adapter.provider(),
             pace::PaceGate {
@@ -1089,9 +1178,10 @@ pub fn run_with<W: Write>(
                 &nudge_mail_msgs,
                 cfg.mail.max_delivered_bytes,
             );
-            let extra: Vec<String> = user_extra
+            let extra: Vec<String> = policy_extra
                 .iter()
                 .cloned()
+                .chain(user_extra.iter().cloned())
                 .chain(prompt_args.iter().cloned())
                 .collect();
             let (mut rebuilt, sp) = build_headless(&combined, &session, &extra);
@@ -1126,8 +1216,8 @@ pub fn run_with<W: Write>(
                 &cfg.pace,
                 "exec",
                 session.as_str(),
-                &now_fn,
-                &sleep_fn,
+                now_fn,
+                sleep_fn,
                 Some(&announcer),
                 adapter.provider(),
                 pace::PaceGate {
@@ -1179,10 +1269,12 @@ pub fn run_with<W: Write>(
                 relaunch_system_prompt_supported,
             ));
             // M8: the user's own extra flags survive the relaunch too, not
-            // just zirv's own (the system prompt args).
-            let extra: Vec<String> = user_extra
+            // just zirv's own (the system prompt args, and now the
+            // sandbox/policy prepend).
+            let extra: Vec<String> = policy_extra
                 .iter()
                 .cloned()
+                .chain(user_extra.iter().cloned())
                 .chain(prompt_args.iter().cloned())
                 .collect();
             let prompt_text = super::prompt::task_prompt_with_composed_fallback(
@@ -1370,10 +1462,12 @@ pub fn run_with<W: Write>(
             cfg.mail.max_delivered_bytes,
         );
         // M8: the user's own extra flags survive the restart too, not just
-        // zirv's own (the system prompt args) -- this used to be asymmetric.
-        let extra: Vec<String> = user_extra
+        // zirv's own (the system prompt args, and now the sandbox/policy
+        // prepend) -- this used to be asymmetric.
+        let extra: Vec<String> = policy_extra
             .iter()
             .cloned()
+            .chain(user_extra.iter().cloned())
             .chain(prompt_args.iter().cloned())
             .collect();
         let (mut rebuilt, sp) = build_headless(&combined, &session, &extra);
@@ -1523,6 +1617,19 @@ mod tests {
             (
                 "ZIRV_CTX_AGENT_BIN".to_string(),
                 format!("sh {}", fixture("fake-agent.sh").display()),
+            ),
+            // T8: `run_with`'s `sleep_fn` is real `std::thread::sleep` (not
+            // test-injectable -- see its own call site), and a fresh temp
+            // state dir has no usage source by construction, so every test
+            // built on this helper would otherwise pay the real, wall-clock
+            // fail-safe delay (default 60s) on every call into `wait_for_
+            // window`. Zeroed here, not by lowering the production default:
+            // pace.rs's own unit tests already cover the delay's correctness
+            // with a `FakeClock`, so exec.rs's tests (which are not testing
+            // pacing) should not pay it in real time.
+            (
+                "ZIRV_CTX_PACE_BLIND_DELAY_SECS".to_string(),
+                "0".to_string(),
             ),
         ]
         .into()
@@ -1975,6 +2082,64 @@ mod tests {
         }
 
         assert_eq!(code.expect("runs"), 0);
+    }
+
+    /// T11: the fail-safe blind delay (T8) actually reaches the injected
+    /// `sleep_fn` with the right duration -- proof this path is real, not
+    /// just claimed by `pace.rs`'s own unit tests, which never touch this
+    /// integration seam at all. `base_env` zeros `ZIRV_CTX_PACE_BLIND_DELAY_
+    /// SECS` for every other test in this file (see its own doc comment);
+    /// this test overrides it back to a small nonzero value specifically so
+    /// there is something real to observe, then verifies the observation
+    /// through a recording `sleep_fn` rather than actually blocking --
+    /// exactly the seam `pace.rs`'s own `FakeClock` tests already use, now
+    /// available one layer up.
+    #[test]
+    fn the_blind_delay_reaches_the_injected_sleep_fn_with_the_right_duration() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let session = "33333333-2222-4333-8444-555555555555";
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert(
+            "ZIRV_CTX_PACE_BLIND_DELAY_SECS".to_string(),
+            "2".to_string(),
+        );
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(2),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let code = run_with_clock(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|d: Duration| slept.borrow_mut().push(d.as_secs()),
+        );
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), 0);
+        assert_eq!(
+            slept.borrow().first().copied(),
+            Some(2),
+            "the blind-mode delay must actually be slept via the injected sleep_fn, got {:?}",
+            slept.borrow()
+        );
     }
 
     #[test]
@@ -2642,6 +2807,55 @@ mod tests {
         );
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
+    }
+
+    /// Bug B seam coverage (2026-08-22, fix round 3): `exec.rs` is one of
+    /// the three seams that had only full-suite-green plus log inspection
+    /// backing its own `policy_extra` wiring, not a dedicated exact-argv
+    /// test -- exactly the shape of regression that would not fail any
+    /// existing test if this seam silently lost its policy prefix. Asserts
+    /// the real argv the launched child receives (`FAKE_AGENT_ARGV_LOG`),
+    /// not merely that the run succeeded.
+    #[test]
+    fn the_initial_launch_carries_the_shipped_sandbox_posture() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let session = "cccccccc-3333-4333-8444-555555555555";
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("--permission-mode") && argv.contains("dontAsk"),
+            "the shipped-default posture must reach the real launched argv: {argv}"
+        );
+        assert!(
+            argv.contains("--allowedTools=") && argv.contains("Edit(./**)"),
+            "the generated permission set must reach it too: {argv}"
+        );
     }
 
     #[test]

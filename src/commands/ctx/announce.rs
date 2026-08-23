@@ -72,13 +72,17 @@ pub enum Event {
         window: String,
         reset_at: Option<u64>,
     },
-    /// E: the pacing gate never ran a single decision for this session,
-    /// because the resolved adapter's provider has no usage source at all
-    /// (`window::load_for` returned `None` and it is not the legacy
-    /// anthropic file) -- naming the provider so an operator watching a
-    /// codex session does not wonder why no pacing lines ever appear, and
-    /// does not mistake the silence for "usage is healthy".
-    PacingSkipped { provider: String },
+    /// T8 (fail-SAFE, not open): the pacing gate has no usable data at all
+    /// for this provider -- no binding collector reading (ever recorded, or
+    /// gone stale below the ceiling with nothing fresher), and no configured
+    /// estimator to fall back on -- so instead of the old behavior (skip the
+    /// gate outright, proceed at full speed forever) it applies a bounded
+    /// `delay_secs` safety delay every cycle until real data shows up --
+    /// pacing is now degraded, not off, and this event says so.
+    /// See `zirv ctx status`'s `poll::usage_source_hint` for the reason and
+    /// remedy (file absent, macOS Keychain access needed, or the statusline
+    /// tee never wired).
+    PacingBlind { provider: String, delay_secs: u64 },
     /// Item 4: the pacing gate is inside the soft-throttle band, delaying
     /// cycles rather than hard-pausing (`PaceDecision::Slow`). Unlike
     /// `PacingWait`, this is a recurring per-cycle delay rather than a wait
@@ -147,6 +151,36 @@ pub enum Event {
         from: String,
         disposition: NudgeDisposition,
     },
+    /// macOS only: about to shell out to `security find-generic-password` for
+    /// the claude OAuth token, which -- unlike a plain file read -- can pop a
+    /// GUI "zirv wants to access key 'Claude Code-credentials'" dialog, since
+    /// zirv is not in that keychain item's ACL. Emitted once per process
+    /// (`poll`'s own one-time latch, the same discipline `pace_no_source_
+    /// announced` already follows for its own once-per-run line) right before
+    /// the first such attempt, so an operator on a headless/SSH session -- who
+    /// cannot click the dialog -- learns *why* usage data is stalling instead
+    /// of just seeing a bounded timeout expire in silence, and one running a
+    /// real terminal learns that "Always Allow" makes the prompt a one-time
+    /// cost rather than a recurring interruption.
+    ///
+    /// `poll::anthropic_token_from_keychain` (the only production
+    /// constructor) is itself `#[cfg(target_os = "macos")]`, so on every
+    /// other target this variant is genuinely unreachable outside its own
+    /// test below -- `#[allow(dead_code)]` documents that as deliberate
+    /// rather than an oversight, the same way `poll.rs`'s own macOS-only
+    /// items are marked.
+    #[allow(dead_code)]
+    MacosKeychainPromptExpected,
+    /// The shipped-default "sandboxed, no prompts" launch posture
+    /// (2026-08-22, `adapters::policy_launch_args`/`AgentAdapter::default_
+    /// sandbox_args`) applied -- or explicitly not applied -- to this
+    /// launch, so the behaviour change is visible on the one channel every
+    /// other launch-time decision already narrates through, not silent.
+    /// `detail` is pre-rendered by the caller: the joined argv when the
+    /// posture (or an explicit `[policy]` restriction) applied, or a short
+    /// reason when it did not (`--sandbox.enabled = false`, or the
+    /// operator's own flags already pinned the same concern).
+    SandboxPosture { detail: String },
 }
 
 /// What the nudged session is actually going to do about it -- the three
@@ -195,6 +229,7 @@ impl Event {
         match self {
             Event::InjectionComposed { layers } => format!("system prompt composed ({layers})"),
             Event::InjectionSkipped { reason } => format!("system prompt skipped: {reason}"),
+            Event::SandboxPosture { detail } => format!("sandbox posture: {detail}"),
             Event::VerdictChanged { from, to, score } => {
                 format!(
                     "context health {} -> {} (score {score})",
@@ -234,9 +269,13 @@ impl Event {
                 Some(at) => format!("pacing: waiting on the {window} window, resets at unix {at}"),
                 None => format!("pacing: waiting on the {window} window, reset time unknown"),
             },
-            Event::PacingSkipped { provider } => {
-                format!("pacing off: {provider} has no usage source")
-            }
+            Event::PacingBlind {
+                provider,
+                delay_secs,
+            } => format!(
+                "pacing degraded: {provider} has no usage source; applying a {delay_secs}s \
+                 safety delay per cycle -- run `zirv ctx status` for the reason and remedy"
+            ),
             Event::PacingThrottled {
                 window,
                 delay_secs,
@@ -273,6 +312,13 @@ impl Event {
                     format!("nudged by {from}; run `zirv ctx inbox` to read it")
                 }
             },
+            Event::MacosKeychainPromptExpected => {
+                "macOS may prompt for Keychain access to read Claude Code's usage token \
+                 ('Claude Code-credentials'); choose 'Always Allow' to make that a one-time cost \
+                 -- on a headless/SSH session with nobody to answer it, this attempt will time \
+                 out and usage stays unknown rather than hang"
+                    .to_string()
+            }
         }
     }
 }
@@ -459,6 +505,38 @@ mod tests {
         );
     }
 
+    /// Bug B (harness/model parity, 2026-08-22): the shipped-default
+    /// sandbox posture must be visible on the same channel every other
+    /// launch-time decision already narrates through -- both the applied
+    /// case (the exact argv) and the not-applied case (a short reason).
+    #[test]
+    fn the_sandbox_posture_announcement_names_the_applied_argv() {
+        let event = Event::SandboxPosture {
+            detail: "--sandbox workspace-write --ask-for-approval never".to_string(),
+        };
+        assert!(
+            event
+                .line()
+                .contains("sandbox posture: --sandbox workspace-write --ask-for-approval never"),
+            "got {}",
+            event.line()
+        );
+    }
+
+    #[test]
+    fn the_sandbox_posture_announcement_names_why_it_was_not_applied() {
+        let event = Event::SandboxPosture {
+            detail: "not applied ([sandbox] enabled = false)".to_string(),
+        };
+        assert!(
+            event
+                .line()
+                .contains("sandbox posture: not applied ([sandbox] enabled = false)"),
+            "got {}",
+            event.line()
+        );
+    }
+
     /// The disclosure a repo cannot silence: `chrome.events` is
     /// `REPO_FORBIDDEN`, `chrome.banner` is not.
     #[test]
@@ -533,16 +611,24 @@ mod tests {
         assert!(unknown.line().contains("unknown"), "got {}", unknown.line());
     }
 
-    /// E: names the provider so an operator watching a codex session does
-    /// not mistake pacing's silence for "usage is healthy".
+    /// T8: names the provider and the delay, and points at the remedy --
+    /// this must never read as "pacing is off"/"skipped" any more, since it
+    /// is a fail-SAFE degrade, not a fail-open skip.
     #[test]
-    fn a_pacing_skipped_announcement_names_the_provider() {
-        let event = Event::PacingSkipped {
+    fn a_pacing_blind_announcement_names_the_provider_delay_and_remedy() {
+        let event = Event::PacingBlind {
             provider: "openai".to_string(),
+            delay_secs: 60,
         };
         let line = event.line();
         assert!(line.contains("openai"), "got {line}");
         assert!(line.contains("no usage source"), "got {line}");
+        assert!(line.contains("60s"), "got {line}");
+        assert!(line.contains("zirv ctx status"), "got {line}");
+        assert!(
+            !line.to_lowercase().contains("pacing off"),
+            "must not read as fully off: {line}"
+        );
     }
 
     /// Item 4: `Slow` used to be invisible on the `zirv ▸` channel -- only
@@ -694,6 +780,18 @@ mod tests {
         );
     }
 
+    /// The macOS Keychain-prompt heads-up: names both halves of the promise
+    /// (approve once with "Always Allow", or a headless run times out rather
+    /// than hangs) so an operator reading only this one line still knows what
+    /// to do either way.
+    #[test]
+    fn a_macos_keychain_prompt_announcement_explains_both_outcomes() {
+        let line = Event::MacosKeychainPromptExpected.line();
+        assert!(line.contains("Claude Code-credentials"), "got {line}");
+        assert!(line.contains("Always Allow"), "got {line}");
+        assert!(line.contains("time out"), "got {line}");
+    }
+
     #[test]
     fn announcements_never_touch_the_reserved_bar_row() {
         let sample = [
@@ -720,8 +818,9 @@ mod tests {
                 window: "five_hour".to_string(),
                 reset_at: None,
             },
-            Event::PacingSkipped {
+            Event::PacingBlind {
                 provider: "openai".to_string(),
+                delay_secs: 60,
             },
             Event::PacingThrottled {
                 window: "five_hour".to_string(),
@@ -750,6 +849,7 @@ mod tests {
                 from: "aaaa1111".to_string(),
                 disposition: NudgeDisposition::Relaunching,
             },
+            Event::MacosKeychainPromptExpected,
         ];
         for event in sample {
             let line = event.line();

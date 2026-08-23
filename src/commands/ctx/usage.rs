@@ -316,7 +316,7 @@ pub fn run_with<W: Write>(
             // command is the manual end-to-end check: it must actually try
             // to acquire data, not just report whatever happened to already
             // be on disk.
-            let http_poller = poll::HttpPoller;
+            let http_poller = poll::HttpPoller::new(cfg.chrome.events);
             if provider == window::CODEX_USAGE_PROVIDER {
                 // See `pace::refresh_sources`'s own doc comment: resolved via
                 // `crate::utils::home_dir()`, not left to `refresh_codex_
