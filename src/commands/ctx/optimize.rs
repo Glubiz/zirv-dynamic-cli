@@ -652,7 +652,17 @@ fn is_eligible_deletion_target(layer: Layer, spans_multiple_surfaces: bool) -> b
 /// target at all (e.g. a rule stated only in an operator's global file and
 /// the canonical layer) still gets a finding, just without a diff.
 pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
-    let all = all_instructions(surfaces);
+    // (2026-08-23, issue #110) A zirv-generated render of the canonical
+    // `.zirv/context/` layer (`context_cli::is_managed`) restates its own
+    // canonical source by design (`zirv context sync --generate`) -- that is
+    // not a duplicate a human created. Its instructions are excluded from
+    // this analysis entirely: never flagged as "stated in more than one
+    // layer", and never a candidate for the proposed deletion diff (editing
+    // it is futile, since the next `--generate` overwrites it again).
+    let all: Vec<Instruction> = all_instructions(surfaces)
+        .into_iter()
+        .filter(|instruction| !context_cli::is_managed(&surfaces[instruction.surface].text))
+        .collect();
     let (order, groups) = group_by_normalized(&all);
 
     let mut findings = Vec::new();
@@ -1730,7 +1740,7 @@ use std::time::Duration;
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::state::{now_secs, repo_slug};
-use super::{CtxResult, adapters, handoff, window};
+use super::{CtxResult, adapters, context_cli, handoff, window};
 
 /// Long enough for a careful answer over a few excerpted files, short enough
 /// that a wedged model does not own the terminal.
@@ -2099,6 +2109,7 @@ pub fn queue_recommendation(
 mod tests {
     use super::*;
     use crate::commands::ctx::adapters::claude;
+    use crate::commands::ctx::context_cli;
     use crate::commands::ctx::event::{SessionId, SessionRef, StructuralContext};
     use clap::Parser;
 
@@ -2500,6 +2511,102 @@ mod tests {
             finding.evidence.iter().any(|e| e.contains("CLAUDE.md")),
             "{finding:?}"
         );
+    }
+
+    /// Issue #110: after `zirv context sync --generate`, a native CLAUDE.md
+    /// is a zirv-generated render of the canonical `.zirv/context/` layer,
+    /// not a second hand-authored copy of the same rule -- restating the
+    /// canonical text is the whole point of `--generate`. It must not be
+    /// flagged as "stated in more than one layer", and (per
+    /// `a_managed_render_is_never_a_proposed_deletion_target_even_in_a_three_way_duplicate`
+    /// below) must never be the target of a proposed diff either, since
+    /// `zirv context sync --generate` overwrites it again on the next run.
+    #[test]
+    fn a_managed_render_of_the_canonical_layer_is_not_flagged_as_a_layer_duplicate() {
+        // (2026-08-23, issue #110)
+        let generated = format!("{}\n\n- always run tests\n", context_cli::MANAGED_MARKER);
+        let surfaces = vec![
+            surface_of(
+                Layer::ContextCommon,
+                "/repo/.zirv/context/common.md",
+                "- always run tests\n",
+            ),
+            surface_of(Layer::RepoClaudeMd, "/repo/CLAUDE.md", &generated),
+        ];
+
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
+        assert!(
+            findings.iter().all(|f| f.kind != "redundancy"),
+            "a zirv-generated render restating its own canonical source is not a duplicate: \
+             {findings:?}"
+        );
+    }
+
+    /// The same content, minus the managed marker (i.e. a human wrote
+    /// CLAUDE.md by hand and it happens to match common.md verbatim): this
+    /// is a genuine duplicate and must still be flagged, so the #110 fix is
+    /// scoped to zirv's own generated renders and does not silently swallow
+    /// real hand-authored duplication.
+    #[test]
+    fn a_hand_authored_claude_md_matching_the_canonical_layer_is_still_flagged() {
+        // (2026-08-23, issue #110)
+        let surfaces = vec![
+            surface_of(
+                Layer::ContextCommon,
+                "/repo/.zirv/context/common.md",
+                "- always run tests\n",
+            ),
+            surface_of(
+                Layer::RepoClaudeMd,
+                "/repo/CLAUDE.md",
+                "- always run tests\n",
+            ),
+        ];
+
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
+        assert!(
+            findings.iter().any(|f| f.kind == "redundancy"),
+            "a hand-authored duplicate with no managed marker must still be flagged: {findings:?}"
+        );
+    }
+
+    /// Even when a third, hand-authored surface (AGENTS.md) keeps the
+    /// duplicate finding alive, the managed CLAUDE.md render must never
+    /// appear as evidence or as the proposed diff's target: editing it is
+    /// futile, since `zirv context sync --generate` overwrites it again.
+    #[test]
+    fn a_managed_render_is_never_a_proposed_deletion_target_even_in_a_three_way_duplicate() {
+        // (2026-08-23, issue #110)
+        let generated = format!("{}\n\n- always run tests\n", context_cli::MANAGED_MARKER);
+        let surfaces = vec![
+            surface_of(
+                Layer::ContextCommon,
+                "/repo/.zirv/context/common.md",
+                "- always run tests\n",
+            ),
+            surface_of(Layer::RepoClaudeMd, "/repo/CLAUDE.md", &generated),
+            surface_of(
+                Layer::RepoAgentsMd,
+                "/repo/AGENTS.md",
+                "- always run tests\n",
+            ),
+        ];
+
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
+        let finding = findings
+            .iter()
+            .find(|f| f.kind == "redundancy")
+            .expect("still duplicated via the hand-authored AGENTS.md");
+        assert!(
+            finding.evidence.iter().all(|e| !e.contains("CLAUDE.md")),
+            "the managed render must not appear as evidence: {finding:?}"
+        );
+        if let Some(diff) = &finding.proposed_diff {
+            assert!(
+                !diff.contains("CLAUDE.md"),
+                "a proposed diff must never target the managed render: {diff}"
+            );
+        }
     }
 
     /// `ALL_LAYERS` is hand-maintained, and so is the match below -- so what
