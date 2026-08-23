@@ -3107,6 +3107,30 @@ mod tests {
         }
         cmd.env_remove("CLAUDE_PID");
         cmd.env_remove("CLAUDECODE");
+        // T10 fix regression (2026-08-23): every one of these harnesses spawns
+        // a *real* `zirv ctx wrap` attached to a real pty on both stdin and
+        // stdout, which is exactly the condition the launch-time interactive
+        // pacing gate (`pace::interactive_gate`, applied in `run_with` right
+        // before spawn) is gated on. With a fresh, isolated state dir (no
+        // usage source has ever been observed) that gate resolves to a blind
+        // `pace.blind_delay_secs` (60s) pause on every single test, which is
+        // both why this suite took 31 minutes in CI and why the pty output
+        // these tests assert on exactly (argv, prompt text, `--sandbox`/
+        // `--ask-for-approval` flags) had the pause's own banner text mixed
+        // into it -- `read_until`'s fixed budget elapses mid-pause and the
+        // assertions see nothing, or the wrong thing. Neither the pacing gate
+        // nor the shipped sandbox posture is what these tests exist to cover
+        // (`force_pace_skips_the_wait_or_confirmation_for_both_pause_and_
+        // refuse` and `a_supervised_wrap_carries_the_shipped_sandbox_posture_
+        // for_codex` are, and opt back in explicitly via `extra_env`, applied
+        // after these two and so free to override them), so both are off by
+        // default here -- the same `base_env`-defaults-it-once shape
+        // `exec.rs`/`run_loop.rs` already use to zero their own blind delay,
+        // just disabling the gate outright rather than zeroing its delay,
+        // since this harness spawns a real subprocess and cannot inject a
+        // `FakeClock`.
+        cmd.env("ZIRV_CTX_PACE", "false");
+        cmd.env("ZIRV_CTX_SANDBOX", "false");
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -3850,7 +3874,15 @@ mod tests {
     #[test]
     fn a_supervised_wrap_carries_the_shipped_sandbox_posture_for_codex() {
         let script = fixture("stub-tui.sh").display().to_string();
-        let mut h = spawn_wrap_with_flags(&[], &["--agent", "codex"], &["sh", &script]);
+        // This is the one test in the suite the shipped sandbox posture must
+        // actually reach, so it opts back in over the harness's own default
+        // (see `spawn_wrap_with_flags`'s `ZIRV_CTX_SANDBOX=false`) rather than
+        // relying on whatever `[sandbox]` happens to default to.
+        let mut h = spawn_wrap_with_flags(
+            &[("ZIRV_CTX_SANDBOX", "true".to_string())],
+            &["--agent", "codex"],
+            &["sh", &script],
+        );
 
         let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
         assert!(
