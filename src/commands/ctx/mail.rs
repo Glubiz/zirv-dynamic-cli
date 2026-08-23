@@ -567,6 +567,7 @@ fn consume_reading(
                 std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
+                    .truncate(true)
                     .mode(0o600)
                     .open(&marker)?;
             }
