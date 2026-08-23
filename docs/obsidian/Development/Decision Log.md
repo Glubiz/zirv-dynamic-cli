@@ -24,6 +24,13 @@ last-verified: 2026-08-23
 
 ## Decisions
 
+### 2026-08-23 — A hook `ask` under `dontAsk` falls through (issue #102)
+**Context:** `hook_output` mapped `Verdict::Ask` to an active `"ask"` `permissionDecision` unconditionally. Claude's own docs say a hook decision never bypasses permission rules, and `--permission-mode dontAsk` itself means "deny if not pre-approved" — so an `"ask"` there is an unsatisfiable denial, silently stripping the operator's own `permissions.allow` entries from every zirv-launched session.
+**Decision:** The stdin payload now carries `permission_mode`; `hook_output` emits nothing (falls through, same as `Allow`) for `Ask` specifically when `permission_mode == "dontAsk"`, letting claude's own flow and the operator's `allow` list decide. `Deny` is unaffected in every mode; every other mode, including a payload with no `permission_mode` at all, keeps emitting `"ask"`.
+**Rejected:** Mapping `Ask` to `"deny"` under `dontAsk` — more honest about the outcome, but throws away the "just needs deliberate approval" signal a non-`dontAsk` session would still get from the same rule.
+**Consequences:** `permission_mode` is now load-bearing input to the hook, not decorative; a future claude mode with similar "no prompting" semantics needs the same carve-out.
+**Spec / link:** `src/commands/ctx/safety.rs`'s `hook_output`/`HookToolPayload`; [[Command Safety]]; issue #102.
+
 ### 2026-08-23 — `zirv ctx handover` swaps in place via the same `SessionGuard`, never `refresh_session` (issue #84)
 **Context:** Swapping the orchestrator seat's model or harness needed the successor to keep the predecessor's registry short id -- otherwise mail sent to the seat and `zirv ctx nudge <id>` both go stale the instant the swap lands. `wrap`'s own rot-triggered restart (`Action::Restart`) already proved the pattern for a same-adapter relaunch; the question was whether a *different* adapter needed a second identity mechanism.
 **Decision:** `wrap::perform_handover_swap` (and the dashboard's `Pane::handover`) reuse the exact same `SessionGuard::adopt_child_pid` calls a same-harness restart already makes -- parked on zirv's own pid for the swap's duration, then the fresh child's -- and never call `refresh_session`. The short id is therefore identical before and after a swap from e.g. claude/sonnet to codex/gpt-5.6-terra, by construction rather than by a check. Cross-harness argv/turn-env assembly is factored into `handover::resolve_swap_launch`/`build_turn_env`, called by both live-swap sites so they cannot drift.
