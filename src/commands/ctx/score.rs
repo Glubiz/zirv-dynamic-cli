@@ -25,7 +25,9 @@ pub struct ScoreArgs {
 /// reference every incremental pass has to agree with.
 ///
 /// D: `Err` when the adapter cannot produce events at all
-/// (`capabilities().events == false`, codex today): scoring an always-empty
+/// (`capabilities().events == false`; no registered adapter today, but a
+/// future one could ship without event parsing the way codex used to):
+/// scoring an always-empty
 /// parse would compute `Score { score: 0, verdict: Healthy, .. }`, which
 /// reads to every caller as a genuine "this session is healthy" rather than
 /// the honest "there is no data to score this session with" -- exactly the
@@ -107,7 +109,7 @@ impl IncrementalScorer {
     /// leaves the caller's previous verdict standing. Also `None` -- rather
     /// than a `Score` folded from an always-empty parse -- for an adapter
     /// with no verified event parsing at all (`capabilities().events ==
-    /// false`, codex today): the alternative, feeding zero real events
+    /// false`): the alternative, feeding zero real events
     /// through the fold every poll, reads to every caller (in particular
     /// `exec`/`loop`'s own rot-restart gate, which checks `verdict ==
     /// Restart`) as a genuine `Healthy`/`0`, not the honest "no data" it
@@ -315,12 +317,15 @@ struct CachedScore {
     /// the transcript is missing -- see [`RESOLVE_RETRY_POLLS`].
     polls_since_resolve: u32,
     /// Item 12: set once this session's adapter is known to have no verified
-    /// event parsing at all (`capabilities().events == false`, codex
-    /// today), the same fact `full_score` itself refuses on. Terminal, not
-    /// retried like `polls_since_resolve`: an adapter's capabilities do not
-    /// change between polls, so no future poll -- no matter how many times
-    /// the transcript's own stamp changes -- will ever produce a score for
-    /// it. Without this, a codex pane's `scored` stayed permanently `None`
+    /// event parsing at all (`capabilities().events == false` -- no
+    /// registered adapter today, since issue #86 gave codex real event
+    /// parsing too, but the guard stays live for any future adapter that
+    /// ships without it), the same fact `full_score` itself refuses on.
+    /// Terminal, not retried like `polls_since_resolve`: an adapter's
+    /// capabilities do not change between polls, so no future poll -- no
+    /// matter how many times the transcript's own stamp changes -- will
+    /// ever produce a score for it. Before codex's own event parsing
+    /// landed, a codex pane's `scored` stayed permanently `None`
     /// (`full_score`'s own `Err` collapses to `None` here), which never
     /// matches any `stamp_of` reading, so every single poll fell all the way
     /// through to `CtxConfig::load` + `adapters::select` +
@@ -435,11 +440,13 @@ fn cached_score_with(
     let cfg = CtxConfig::load(repo, env).ok()?;
     let adapter = adapters::select(cfg.agent.as_deref(), &[], &cfg).ok()?;
 
-    // Item 12: an eventless adapter (`capabilities().events == false`,
-    // codex today) never produces a score, on this transcript or any other
-    // -- `transcript_path` is not even worth resolving for it. Cached as
-    // terminal so every later poll returns off this cheap check above
-    // rather than reaching this same conclusion, the expensive way, again.
+    // Item 12: an eventless adapter (`capabilities().events == false`; no
+    // registered adapter today, but the guard has to hold for any future
+    // one that ships without event parsing) never produces a score, on
+    // this transcript or any other -- `transcript_path` is not even worth
+    // resolving for it. Cached as terminal so every later poll returns off
+    // this cheap check above rather than reaching this same conclusion,
+    // the expensive way, again.
     if !adapter.capabilities().events {
         let mut cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(
@@ -533,6 +540,106 @@ mod tests {
             .join(name)
     }
 
+    /// A minimal adapter with no verified event parsing at all, for the
+    /// eventless-guard tests below. Both registered adapters (claude, codex)
+    /// now report `capabilities().events == true` (issue #86), so this is no
+    /// longer a fact about any real, name-selectable adapter -- these tests
+    /// exercise the guard's own logic directly rather than through
+    /// `adapters::select`. Mirrors `memory.rs`'s local `PanicOnDistillAdapter`
+    /// pattern.
+    #[derive(Debug)]
+    struct EventlessAdapter;
+
+    impl super::adapters::AgentAdapter for EventlessAdapter {
+        fn name(&self) -> &'static str {
+            "eventless"
+        }
+
+        fn program(&self) -> &str {
+            "eventless"
+        }
+
+        fn provider(&self) -> &'static str {
+            "eventless"
+        }
+
+        fn ready(&self) -> CtxResult<()> {
+            Ok(())
+        }
+
+        fn detect(&self, _command: &[String]) -> bool {
+            false
+        }
+
+        fn headless_cmd(
+            &self,
+            _prompt: &str,
+            _session: &super::super::event::SessionId,
+            _extra: &[String],
+        ) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn interactive_cmd(
+            &self,
+            _initial_prompt: Option<&str>,
+            _extra: &[String],
+        ) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn distiller_cmd(&self, _model: &str) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn read_only_args(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn transcript_path(&self, _session: &super::super::event::SessionRef) -> PathBuf {
+            PathBuf::new()
+        }
+
+        fn parse_events(&self, _jsonl: &str) -> Vec<super::super::event::NormalizedEvent> {
+            Vec::new()
+        }
+
+        fn structural_context(
+            &self,
+            _jsonl: &str,
+            _last_n: usize,
+        ) -> super::super::event::StructuralContext {
+            super::super::event::StructuralContext::default()
+        }
+
+        fn compact_command(&self) -> Option<&'static str> {
+            None
+        }
+
+        fn quit_sequence(&self) -> &'static str {
+            ""
+        }
+
+        fn capabilities(&self) -> super::super::event::Capabilities {
+            super::super::event::Capabilities::default()
+        }
+
+        fn register_turn_signal(
+            &self,
+            _session: &super::super::event::SessionRef,
+            _socket: &Path,
+        ) -> super::adapters::TurnSignalSetup {
+            super::adapters::TurnSignalSetup {
+                env: Vec::new(),
+                instructions: String::new(),
+            }
+        }
+    }
+
     /// A state dir of its own per test: the checkpoints are real files.
     fn state_env(dir: &Path) -> HashMap<String, String> {
         [(
@@ -542,22 +649,24 @@ mod tests {
         .into()
     }
 
-    /// D: an adapter with no verified event parsing (`capabilities().events
-    /// == false`, codex today) must refuse rather than compute a `Score`
-    /// from an always-empty parse -- that would read to every caller as a
-    /// genuine `Healthy`/`0`, not the honest "no data" it actually is. A
-    /// transcript with real, healthy-looking content is used deliberately:
-    /// the point is that `full_score` refuses *before* it ever gets to
-    /// parsing, on the adapter alone, not because this particular file
-    /// happened to be empty or unreadable.
+    /// D: an adapter with no verified event parsing at all must refuse
+    /// rather than compute a `Score` from an always-empty parse -- that
+    /// would read to every caller as a genuine `Healthy`/`0`, not the
+    /// honest "no data" it actually is. A transcript with real,
+    /// healthy-looking content is used deliberately: the point is that
+    /// `full_score` refuses *before* it ever gets to parsing, on the
+    /// adapter alone, not because this particular file happened to be empty
+    /// or unreadable. (Both registered adapters now report
+    /// `capabilities().events == true` -- issue #86 -- so this exercises
+    /// the guard directly against a local fake rather than codex.)
     #[test]
     fn full_score_refuses_an_adapter_with_no_event_parsing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = write_transcript(dir.path(), 12, true, 20_000);
-        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let adapter = EventlessAdapter;
         let err = full_score(&adapter, &transcript, &ScoreConfig::default())
-            .expect_err("codex has no verified event parsing");
-        assert!(err.to_string().contains("codex"), "got {err}");
+            .expect_err("no verified event parsing");
+        assert!(err.to_string().contains("eventless"), "got {err}");
     }
 
     /// D: the incremental fold's bounded-state path never calls `full_score`
@@ -568,7 +677,7 @@ mod tests {
     fn incremental_poll_reports_nothing_for_an_adapter_with_no_event_parsing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = write_transcript(dir.path(), 12, true, 20_000);
-        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let adapter = EventlessAdapter;
         let mut scorer = IncrementalScorer::new(transcript);
         assert_eq!(
             scorer
@@ -579,21 +688,23 @@ mod tests {
         );
     }
 
-    /// D end to end: `score_transcript_cached` -- the Stop hook's own entry
-    /// point, and what `score::cached_score` (the dashboard's sidebar/header
-    /// score) falls back to via `score_with_checkpoint` -- must refuse for
-    /// codex the same way `full_score` does directly, even though a real
-    /// transcript file exists and is readable.
+    /// D end to end: the checkpointed path -- the Stop hook's own entry
+    /// point (`score_transcript_cached`), and what `score::cached_score`
+    /// (the dashboard's sidebar/header score) falls back to -- must refuse
+    /// for an eventless adapter the same way `full_score` does directly,
+    /// even though a real transcript file exists and is readable. Exercised
+    /// via `score_with_checkpoint` directly (rather than the public,
+    /// name-based `score_transcript_cached`) since neither registered
+    /// adapter name resolves to an eventless one any more (issue #86).
     #[test]
-    fn score_transcript_cached_refuses_an_adapter_with_no_event_parsing() {
+    fn score_with_checkpoint_refuses_an_adapter_with_no_event_parsing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = write_transcript(dir.path(), 12, true, 20_000);
-        let env = state_env(dir.path());
-        let err = score_transcript_cached(&transcript, Some("codex"), dir.path(), &|k| {
-            env.get(k).cloned()
-        })
-        .expect_err("codex has no verified event parsing");
-        assert!(err.to_string().contains("codex"), "got {err}");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let adapter = EventlessAdapter;
+        let err = score_with_checkpoint(&state, &transcript, &adapter, &ScoreConfig::default())
+            .expect_err("no verified event parsing");
+        assert!(err.to_string().contains("eventless"), "got {err}");
     }
 
     /// Grows `transcript` towards `body` in `chunks` appends cut at line
@@ -1017,37 +1128,53 @@ mod tests {
         );
     }
 
-    /// Item 12: a codex pane's `scored` stayed permanently `None` (`full_
-    /// score`'s own refusal collapses to `None` through `.ok()`), which
-    /// never matched any `stamp_of` reading, so every poll fell through to
-    /// `CtxConfig::load` + `adapters::select` + `transcript_path` again --
-    /// at the dashboard's refresh rate, forever. The eventless cache entry
-    /// must bound that to exactly one resolution for the whole session,
-    /// same as `RESOLVE_RETRY_POLLS` already bounds the missing-transcript
-    /// case.
+    /// Item 12: before an eventless adapter's `scored` was cached as
+    /// terminal, it stayed permanently `None` (`full_score`'s own refusal
+    /// collapses to `None` through `.ok()`), which never matched any
+    /// `stamp_of` reading, so every poll fell through to `CtxConfig::load` +
+    /// `adapters::select` + `transcript_path` again -- at the dashboard's
+    /// refresh rate, forever. The `eventless` cache entry bounds that: once
+    /// set, `cached_score_with`'s fast path short-circuits before ever
+    /// resolving again. Both registered adapters now report
+    /// `capabilities().events == true` (issue #86), so there is no longer a
+    /// real, name-selectable adapter that reaches this state through
+    /// resolution -- the terminal cache state is seeded directly instead,
+    /// which is exactly the state a future eventless adapter would produce.
     #[test]
-    fn a_codex_session_resolves_its_eventless_fact_once_then_never_again() {
+    fn an_eventless_sessions_cache_entry_stays_terminal_and_never_resolves_again() {
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(home.path().join("state"));
-        let mut env: HashMap<String, String> = HashMap::new();
-        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+        let env: HashMap<String, String> = HashMap::new();
         let lookup = |k: &str| env.get(k).cloned();
         let session = "5c0d0099-1111-4222-8333-444444444444";
+
+        {
+            let mut cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(
+                session.to_string(),
+                CachedScore {
+                    transcript: PathBuf::new(),
+                    scored: None,
+                    polls_since_resolve: 0,
+                    eventless: true,
+                },
+            );
+        }
 
         let before = RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
         for poll in 0..12 {
             assert_eq!(
                 cached_score_with(&state, repo.path(), session, &lookup),
                 None,
-                "poll {poll}: codex has no event parsing, never a fabricated score"
+                "poll {poll}: an eventless session never reports a fabricated score"
             );
         }
         assert_eq!(
             RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) - before,
-            1,
-            "one resolution for the whole session, not one per poll"
+            0,
+            "the terminal cache entry must short-circuit before any resolution at all"
         );
     }
 

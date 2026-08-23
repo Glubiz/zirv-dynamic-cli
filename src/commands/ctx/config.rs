@@ -9,6 +9,10 @@ pub const CTX_CONFIG_FILE: &str = "ctx.toml";
 /// The one `ctx.toml` table `CtxConfig` never deep-merges -- see the `policy`
 /// field's own doc and `super::policy`'s module doc.
 const POLICY_SECTION: &str = "policy";
+/// The other `ctx.toml` table `CtxConfig` never deep-merges, for the
+/// identical reason -- see the `safety` field's own doc and
+/// `super::safety`'s module doc.
+const SAFETY_SECTION: &str = "safety";
 
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
@@ -489,6 +493,44 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Bookkeeping for the guided `zirv setup` flow (issues #87, #93, #95). Not
+/// `REPO_FORBIDDEN`: unlike the workflow/memory tables above, nothing here
+/// gates execution of repository content or spend on the operator's
+/// behalf -- `memory_harvest_offered`/`statusline_wrap_offered` only decide
+/// whether `zirv setup` re-asks a question it already asked, and
+/// `backup_retention_runs` only bounds local disk usage under
+/// `.zirv/backups/ai-reset`. `setup.rs` is the only writer, and it writes
+/// exclusively to the operator's own global `~/.zirv/ctx.toml`, never a
+/// repo layer -- see `setup::set_home_ctx_toml_bool`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupConfig {
+    /// Count cap on `.zirv/backups/ai-reset` runs, applied on the next
+    /// backup write (never on `restore --list`, which stays read-only). The
+    /// single oldest run is always pinned outside this cap -- see
+    /// `setup::prune_backup_runs`. Clamped like `workflow.
+    /// telemetry_max_events`: `0` keeps the built-in default, anything above
+    /// the ceiling is clamped down.
+    pub backup_retention_runs: usize,
+    /// Set once the guided flow has asked whether to turn on automatic
+    /// memory harvest, whichever way the operator answered -- so a decline
+    /// is not re-asked on every `zirv setup` run.
+    pub memory_harvest_offered: bool,
+    /// Set once the guided flow has asked whether to wrap an existing
+    /// custom Claude statusLine with zirv's usage tee.
+    pub statusline_wrap_offered: bool,
+}
+
+impl Default for SetupConfig {
+    fn default() -> Self {
+        Self {
+            backup_retention_runs: 20,
+            memory_harvest_offered: false,
+            statusline_wrap_offered: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChromeConfig {
@@ -656,6 +698,41 @@ pub struct WorkerConfig {
     pub codex: Option<String>,
 }
 
+/// One harness's three generic tiers (`handover::TIERS`), each an optional
+/// literal model id overriding that harness's own built-in ladder entry
+/// (`handover::tier_default`). `None` -- the default for all three -- defers
+/// to the built-in ladder.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandoverTierConfig {
+    pub cheap: Option<String>,
+    pub standard: Option<String>,
+    pub deep: Option<String>,
+}
+
+/// Per-agent model-id overrides for `zirv ctx handover`'s generic tiers
+/// (issue #84), keyed by harness the same way `ReviewConfig`/`WorkerConfig`
+/// are. Previously env-var-only (`ZIRV_CTX_HANDOVER_<AGENT>_<TIER>`, see the
+/// module doc comment on `handover.rs` for why this table did not exist at
+/// first); this is the layered `ctx.toml` counterpart, resolved by
+/// `handover::resolve_model` with the identical "operator env always wins"
+/// precedence every other model choice in this codebase already follows.
+///
+/// `REPO_FORBIDDEN` as a whole table, the same trust asymmetry as
+/// `review.*`/`worker.*` right above and `agent` itself: swapping the
+/// orchestrator seat's harness or model is picking which vendor account gets
+/// spent, and a repo checkout must not be able to choose that for the
+/// operator. `value_at` matches a table node the same way it matches a leaf
+/// (see `pace.use_credits`/`review`/`worker` above), so one entry in
+/// `REPO_FORBIDDEN` blocks the whole `[handover]` table, both agents, all
+/// three tiers.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandoverConfig {
+    pub claude: HandoverTierConfig,
+    pub codex: HandoverTierConfig,
+}
+
 /// zirv's own shipped-default launch posture (2026-08-22 decision,
 /// harness/model parity round): **sandboxed, no prompts**. Commands run
 /// freely inside the repository workspace; anything reaching outside it
@@ -744,11 +821,13 @@ pub struct CtxConfig {
     pub mail: MailConfig,
     pub workflow: WorkflowConfig,
     pub memory: MemoryConfig,
+    pub setup: SetupConfig,
     pub chrome: ChromeConfig,
     pub dash: DashConfig,
     pub chat: ChatConfig,
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
+    pub handover: HandoverConfig,
     pub sandbox: SandboxConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
@@ -766,6 +845,46 @@ pub struct CtxConfig {
     /// (all-or-nothing per key) cannot express "may narrow, never widen".
     #[serde(skip)]
     pub policy: super::policy::EffectivePolicy,
+    /// zirv's harness-neutral command safety policy (issue #83), from
+    /// `ctx.toml`'s `[safety]` table. `skip`ped for the same reason `policy`
+    /// is: `[safety]` is lifted out of each layer before the deep merge and
+    /// folded by `safety::resolve` instead -- see that module's doc comment
+    /// for the fold (repo may add `deny`/`ask` entries; `allow`/`default`
+    /// are operator-only, enforced via `REPO_FORBIDDEN` upstream of the
+    /// fold rather than by the fold itself).
+    #[serde(skip)]
+    pub safety: super::safety::SafetyPolicy,
+    /// Layers that failed to *parse* as TOML (not a schema/`REPO_FORBIDDEN`
+    /// rejection -- see `read_layer`) and were skipped rather than aborting
+    /// the whole load. Empty on the ordinary path. `skip`ped for the same
+    /// reason `agents`/`policy` are: it is populated by `load` directly, not
+    /// deserialized from any layer. `zirv ctx status` renders one line per
+    /// entry and `zirv ctx optimize` reports one finding per entry; `load`
+    /// itself announces once per process on the `zirv \u{25b8}` channel (see
+    /// `announce_unparsable_layers_once`).
+    #[serde(skip)]
+    pub unparsable_layers: Vec<UnparsableLayer>,
+}
+
+/// One `ctx.toml` layer (`~/.zirv/ctx.toml` or `<repo>/.zirv/ctx.toml`) that
+/// failed to parse as TOML at all -- a syntax error, not a rejected key or an
+/// unknown field. `message` is a single line: the parser's own "at line X,
+/// column Y" location plus its description, so the operator can find and fix
+/// the byte without needing the multi-line diagram `toml::de::Error`'s
+/// `Display` renders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnparsableLayer {
+    pub path: std::path::PathBuf,
+    pub message: String,
+    /// `true` for the operator's own `~/.zirv/ctx.toml`, `false` for the
+    /// repo's `<repo>/.zirv/ctx.toml`. `load` (the plain, diagnostic-safe
+    /// entry point) treats both the same -- skip and continue. `load_for_
+    /// launch` (used by every verb that actually launches or supervises a
+    /// harness) refuses outright when this is `true`: a broken *home* layer
+    /// silently falling back to permissive pacing/policy/sandbox defaults
+    /// right before a harness spawns is a security regression, not a mere
+    /// inconvenience -- see `load_for_launch`'s own doc comment.
+    pub is_home: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1095,6 +1214,36 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_WORKER_MODEL_CODEX",
         &["worker", "codex"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP",
+        &["handover", "claude", "cheap"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HANDOVER_CLAUDE_STANDARD",
+        &["handover", "claude", "standard"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HANDOVER_CLAUDE_DEEP",
+        &["handover", "claude", "deep"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HANDOVER_CODEX_CHEAP",
+        &["handover", "codex", "cheap"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HANDOVER_CODEX_STANDARD",
+        &["handover", "codex", "standard"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HANDOVER_CODEX_DEEP",
+        &["handover", "codex", "deep"],
         EnvKind::Str,
     ),
 ];
@@ -1496,6 +1645,24 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // same way it matches a leaf (see `pace.use_credits`/`review` above), so
     // this one entry blocks both `worker.claude` and `worker.codex` together.
     (&["worker"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+    // `handover.*` (issue #84): a repo checkout must not be able to pick
+    // which model -- and so which vendor account -- the orchestrator seat
+    // swaps onto via `zirv ctx handover`, the same trust asymmetry as
+    // `agent`/`review.*`/`worker.*` above. `value_at` matches a table node
+    // the same way it matches a leaf (see `pace.use_credits`/`review`/
+    // `worker` above), so this one entry blocks the whole `[handover]`
+    // table -- both agents, all three tiers -- together.
+    (&["handover"], "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP"),
+    // `safety.allow`/`safety.default` (issue #83): unlike `safety.deny`/
+    // `safety.ask` (lifted out and unioned across layers -- see
+    // `super::safety`'s module doc, the identical narrowing-fold treatment
+    // `sandbox.extra_deny` gets), adding an `allow` entry or changing the
+    // unmatched-command `default` can only ever make the effective policy
+    // *looser*, never stricter -- there is no narrowing reading of either,
+    // so both are forbidden outright rather than folded, mirroring
+    // `sandbox.extra_allow` right above.
+    (&["safety", "allow"], "ZIRV_CTX_SAFETY_ALLOW"),
+    (&["safety", "default"], "ZIRV_CTX_SAFETY_DEFAULT"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -1507,13 +1674,40 @@ fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value
     value_at(value.as_table()?, rest)
 }
 
+/// Marker error for a `REPO_FORBIDDEN` rejection (`reject_untrusted_keys`),
+/// distinct from every other way `CtxConfig::load` can fail (a bad env value,
+/// an unknown/mistyped key, an unreadable file). A **security refusal**, not
+/// a degrade-and-continue case like a layer that merely failed to parse (see
+/// `UnparsableLayer`) -- callers that need to tell the two apart (`zirv ctx
+/// status`'s exit code) use `is_repo_forbidden` rather than matching on the
+/// message text.
+#[derive(Debug)]
+struct RepoForbiddenError(String);
+
+impl std::fmt::Display for RepoForbiddenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RepoForbiddenError {}
+
+/// Whether `error` (as returned by `CtxConfig::load`) is a `REPO_FORBIDDEN`
+/// rejection rather than any other load failure. `zirv ctx status` uses this
+/// to decide its exit code: non-zero for a security refusal, zero for
+/// everything else (including a skipped-unparsable layer, which is not even
+/// an `Err` any more -- see `CtxConfig::load`'s own doc comment).
+pub fn is_repo_forbidden(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<RepoForbiddenError>()
+}
+
 /// Loud rather than silent: a repo that sets one of these gets a message
 /// naming the key and where to put it, which beats wondering why the value in
 /// the file is being ignored.
 fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
     for (key, variable) in REPO_FORBIDDEN {
         if value_at(layer, key).is_some() {
-            return Err(format!(
+            return Err(Box::new(RepoForbiddenError(format!(
                 "{}: `{}` may not be set by a repository config, because it names something zirv \
                  then runs. Set it in ~/{}/{} or with {} instead.",
                 path.display(),
@@ -1521,37 +1715,97 @@ fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
                 crate::utils::SCRIPT_DIR_NAME,
                 CTX_CONFIG_FILE,
                 variable
-            )
-            .into());
+            ))));
         }
     }
     Ok(())
 }
 
-fn read_layer(path: &Path, into: &mut toml::Table) -> CtxResult<()> {
+/// A `toml::de::Error`'s own `Display` renders a multi-line diagram (a
+/// location line, a gutter, the offending source line, a caret, then the
+/// message). `zirv ctx status`/the `zirv \u{25b8}` announcement both want one
+/// line: the location (`"TOML parse error at line X, column Y"`, `Display`'s
+/// own first line) plus `Error::message()`, which is exactly what an
+/// operator needs to find and fix the byte without the diagram. Deliberately
+/// does not include the path -- callers already have it (`UnparsableLayer::
+/// path`) and show it separately.
+fn summarize_parse_error(error: &toml::de::Error) -> String {
+    let rendered = error.to_string();
+    let first_line = rendered.lines().next().unwrap_or("TOML parse error");
+    // `Display` only prints a location line when it actually has a span to
+    // point at; without one (rare -- `toml::de::Error::custom` with no span)
+    // the first line already *is* the message, and prefixing it with itself
+    // would just repeat it.
+    if first_line.starts_with("TOML parse error") {
+        format!("{first_line}: {}", error.message())
+    } else {
+        error.message().to_string()
+    }
+}
+
+/// Reads one config layer, merging it into `into` on success. Returns
+/// `Ok(Some(_))`, not `Err`, when the file exists but fails to *parse* as
+/// TOML: a syntax error in an untrusted layer (either one -- `~/.zirv/
+/// ctx.toml` is operator-owned but still a hand-edited file a stray keystroke
+/// can break) must not abort the whole load, only that layer. `into` is left
+/// unchanged in that case, so the caller's merge sees nothing from it and
+/// defaults/the other layer apply. An I/O error (unreadable file, permission
+/// denied) is a different failure mode and still propagates via `?` -- this
+/// only degrades a *parse* failure.
+fn read_layer(
+    path: &Path,
+    into: &mut toml::Table,
+    is_home: bool,
+) -> CtxResult<Option<UnparsableLayer>> {
     if !path.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let text = std::fs::read_to_string(path)?;
-    let layer: toml::Table =
-        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    merge(into, layer);
-    Ok(())
+    match toml::from_str::<toml::Table>(&text) {
+        Ok(layer) => {
+            merge(into, layer);
+            Ok(None)
+        }
+        Err(e) => Ok(Some(UnparsableLayer {
+            path: path.to_path_buf(),
+            message: summarize_parse_error(&e),
+            is_home,
+        })),
+    }
 }
 
 impl CtxConfig {
     /// Layers `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`, then
     /// `ZIRV_CTX_*`. Flags are applied by each verb after loading.
+    ///
+    /// A layer that fails to *parse* as TOML (either one -- a stray keystroke
+    /// in the untrusted repo file, or a hand-edit gone wrong in the
+    /// operator's own home file) is skipped, not fatal: `read_layer` reports
+    /// it as an `UnparsableLayer` instead of erroring, this function collects
+    /// every one it sees into the returned config's own `unparsable_layers`,
+    /// and the remaining layers plus defaults are used exactly as if the
+    /// broken layer had never existed. Defaults are the safe posture
+    /// (sandboxed, pacing on), so skipping a layer never *widens* anything --
+    /// see the type's own doc comment. This is never silent: `load` announces
+    /// once per process on the `zirv \u{25b8}` channel (`announce_unparsable_
+    /// layers_once`), and `zirv ctx status`/`zirv ctx optimize` both surface
+    /// the same list. A `REPO_FORBIDDEN` rejection is a different thing
+    /// entirely -- a key that *did* parse but names something a repo may not
+    /// set -- and still fails this call outright (see `is_repo_forbidden`).
     pub fn load(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
         let mut merged = toml::Table::new();
+        let mut unparsable_layers: Vec<UnparsableLayer> = Vec::new();
 
-        if let Ok(home) = crate::utils::home_dir() {
-            read_layer(
+        if let Ok(home) = crate::utils::home_dir()
+            && let Some(bad) = read_layer(
                 &home
                     .join(crate::utils::SCRIPT_DIR_NAME)
                     .join(CTX_CONFIG_FILE),
                 &mut merged,
-            )?;
+                true,
+            )?
+        {
+            unparsable_layers.push(bad);
         }
         // `[policy]` is lifted out of every layer before the deep merge: a
         // merge would let the repo layer's stance simply replace the
@@ -1559,6 +1813,10 @@ impl CtxConfig {
         // allow. `policy::resolve` folds the same three layers with `max`
         // instead, so the repo half can only narrow.
         let home_policy = merged.remove(POLICY_SECTION);
+        // `[safety]` (issue #83) gets the identical whole-section lift, for
+        // the identical reason -- see `super::safety`'s module doc and the
+        // `safety` field's own doc comment.
+        let home_safety = merged.remove(SAFETY_SECTION);
         // `sandbox.extra_deny` gets the identical treatment, one level
         // deeper: a repo checkout may *add* deny entries (narrowing is
         // always safe), but the ordinary merge would let its array replace
@@ -1587,11 +1845,23 @@ impl CtxConfig {
             .join(crate::utils::SCRIPT_DIR_NAME)
             .join(CTX_CONFIG_FILE);
         let mut repo_layer = toml::Table::new();
-        read_layer(&repo_path, &mut repo_layer)?;
+        if let Some(bad) = read_layer(&repo_path, &mut repo_layer, false)? {
+            unparsable_layers.push(bad);
+        }
         // Before the lift, so a future `policy.*` entry in `REPO_FORBIDDEN`
         // still gets its loud rejection rather than being quietly folded.
+        // Trivially satisfied when the repo layer above failed to parse:
+        // `repo_layer` is empty in that case, so there is nothing here for it
+        // to reject -- an unparsable repo file can name no forbidden key,
+        // parsed or not.
         reject_untrusted_keys(&repo_layer, &repo_path)?;
         let repo_policy = repo_layer.remove(POLICY_SECTION);
+        // Removed only after the rejection check above has already run, so a
+        // repo file naming `safety.allow`/`safety.default` (both
+        // `REPO_FORBIDDEN`) is still caught loudly here rather than being
+        // silently dropped by this lift -- see `super::safety::resolve`'s
+        // own doc comment for the defense-in-depth half of this guarantee.
+        let repo_safety = repo_layer.remove(SAFETY_SECTION);
         let repo_extra_deny = string_array(take_nested(&mut repo_layer, "sandbox", "extra_deny"));
         let repo_pace_enabled = bool_at(take_nested(&mut repo_layer, "pace", "enabled"));
         let repo_pace_max_percent = float_at(take_nested(&mut repo_layer, "pace", "max_percent"));
@@ -1706,10 +1976,101 @@ impl CtxConfig {
             validate_model_str("worker.codex", model)?;
         }
 
+        // `handover.<agent>.<tier>` reach a real launch argv directly too
+        // (`handover::resolve_swap_launch` -> `AgentAdapter::model_args`),
+        // the same path `worker.claude`/`worker.codex` take, so the same
+        // guard applies to all six leaves.
+        if let Some(model) = cfg.handover.claude.cheap.as_deref() {
+            validate_model_str("handover.claude.cheap", model)?;
+        }
+        if let Some(model) = cfg.handover.claude.standard.as_deref() {
+            validate_model_str("handover.claude.standard", model)?;
+        }
+        if let Some(model) = cfg.handover.claude.deep.as_deref() {
+            validate_model_str("handover.claude.deep", model)?;
+        }
+        if let Some(model) = cfg.handover.codex.cheap.as_deref() {
+            validate_model_str("handover.codex.cheap", model)?;
+        }
+        if let Some(model) = cfg.handover.codex.standard.as_deref() {
+            validate_model_str("handover.codex.standard", model)?;
+        }
+        if let Some(model) = cfg.handover.codex.deep.as_deref() {
+            validate_model_str("handover.codex.deep", model)?;
+        }
+
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
         cfg.policy = super::policy::resolve(home_policy, repo_policy, env)?;
+        cfg.safety = super::safety::resolve(home_safety, repo_safety, env)?;
+        cfg.unparsable_layers = unparsable_layers;
+        announce_unparsable_layers_once(&cfg);
         Ok(cfg)
     }
+
+    /// `load`, plus a refusal a plain `load` deliberately does not make: a
+    /// verb that is about to launch or supervise a harness (`chat`, `wrap`,
+    /// `exec`, `loop`, `agent`, `handover`, and `dash`'s pane spawns, which
+    /// all route through `wrap::run_with`) must not silently fall back to
+    /// permissive `[pace]`/`[policy]`/`[sandbox]` defaults just because the
+    /// operator's own `~/.zirv/ctx.toml` has a syntax error. A REPO-layer
+    /// parse failure is still skipped exactly as `load` does -- that file is
+    /// untrusted, user-reported input, and skipping it can only ever narrow
+    /// (defaults are the safe posture) or leave the operator's own stricter
+    /// home settings in force. Read-only/diagnostic verbs (`status`,
+    /// `optimize`, `safety list`/`explain`, and everything else that never
+    /// spawns a harness) call `load` directly and keep reporting a broken
+    /// home layer inline rather than refusing -- see each call site.
+    pub fn load_for_launch(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
+        let cfg = Self::load(repo, env)?;
+        if let Some(layer) = cfg.unparsable_layers.iter().find(|l| l.is_home) {
+            return Err(format!(
+                "{}: {}\nThis is your own home config (~/{}/{}), not the repo's -- fix the \
+                 syntax error above, or remove the file to fall back to defaults. Refusing to \
+                 launch rather than silently dropping back to permissive pacing/policy/sandbox \
+                 defaults.",
+                layer.path.display(),
+                layer.message,
+                crate::utils::SCRIPT_DIR_NAME,
+                CTX_CONFIG_FILE,
+            )
+            .into());
+        }
+        Ok(cfg)
+    }
+}
+
+/// Emits [`super::announce::Event::ConfigUnparsable`] on the `zirv \u{25b8}`
+/// channel, exactly once per process and only when the operator has not
+/// opted out (`cfg.chrome.events`) -- the same latch discipline `poll.rs`'s
+/// `announce_keychain_prompt_once` uses, applied here as a process-wide
+/// `AtomicBool` for the same reason: `CtxConfig::load` has no per-run state
+/// of its own to carry a flag in, and it is called from dozens of call sites
+/// across one process. A no-op when `cfg.unparsable_layers` is empty, so
+/// every ordinary `load` call pays only the one cheap check.
+fn announce_unparsable_layers_once(cfg: &CtxConfig) {
+    if cfg.unparsable_layers.is_empty() || !cfg.chrome.events {
+        return;
+    }
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let already_announced = ANNOUNCED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err();
+    if already_announced {
+        return;
+    }
+    let detail = cfg
+        .unparsable_layers
+        .iter()
+        .map(|layer| format!("{}: {}", layer.path.display(), layer.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    super::announce::Announcer::new(true, console::colors_enabled_stderr())
+        .emit(&super::announce::Event::ConfigUnparsable { detail });
 }
 
 /// The shared "config failed to load" fallback `optimize.rs` (report-only)
@@ -1886,6 +2247,201 @@ mod tests {
                 "say why it was refused: {msg}"
             );
         }
+    }
+
+    /// The bug this module exists to fix: a stray keystroke in the untrusted
+    /// repo `ctx.toml` (`"1"` is not a table -- it is a bare TOML syntax
+    /// error) must not abort the whole load. `read_layer`/`CtxConfig::load`
+    /// skip the broken layer instead, so the rest of the config -- here, all
+    /// defaults, since there is no home layer -- still loads.
+    #[test]
+    fn a_repo_layer_with_a_toml_syntax_error_is_skipped_not_fatal() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "1").expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a parse failure degrades, it does not abort the load");
+
+        assert_eq!(
+            cfg.score.window,
+            ScoreConfig::default().window,
+            "an unparsable repo layer contributes nothing; defaults apply"
+        );
+        assert_eq!(
+            cfg.unparsable_layers.len(),
+            1,
+            "{:?}",
+            cfg.unparsable_layers
+        );
+        let layer = &cfg.unparsable_layers[0];
+        assert_eq!(layer.path, repo.path().join(".zirv/ctx.toml"));
+        assert!(
+            layer.message.contains("line 1"),
+            "names the location: {}",
+            layer.message
+        );
+    }
+
+    /// Same fix, for the operator's own home layer: a hand-edit gone wrong
+    /// (an unterminated table header) must not brick every invocation either
+    /// -- the repo is not the only file a stray keystroke can land in.
+    #[test]
+    fn a_home_layer_with_a_truncated_table_is_skipped_not_fatal() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "[score\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a parse failure degrades, it does not abort the load");
+
+        assert_eq!(cfg.score.window, ScoreConfig::default().window);
+        assert_eq!(
+            cfg.unparsable_layers.len(),
+            1,
+            "{:?}",
+            cfg.unparsable_layers
+        );
+        assert_eq!(
+            cfg.unparsable_layers[0].path,
+            home.path().join(".zirv/ctx.toml")
+        );
+        assert!(
+            cfg.unparsable_layers[0].is_home,
+            "the home layer must be tagged as such"
+        );
+    }
+
+    /// Finding #1: `load_for_launch` is the entry point every verb that
+    /// actually launches or supervises a harness (chat/wrap/exec/loop/agent/
+    /// handover, and dash via wrap) must use instead of plain `load` -- a
+    /// broken HOME layer must refuse outright, naming the file, rather than
+    /// silently handing back permissive defaults right before a harness
+    /// spawns under them.
+    #[test]
+    fn load_for_launch_refuses_on_a_broken_home_layer() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "[score\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load_for_launch(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a broken home layer must refuse a launching verb");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                &home
+                    .path()
+                    .join(".zirv")
+                    .join("ctx.toml")
+                    .display()
+                    .to_string()
+            ),
+            "names the file: {msg}"
+        );
+        assert!(msg.contains("line 1"), "keeps the location: {msg}");
+    }
+
+    /// The repo layer is untrusted, user-reported input -- unlike the home
+    /// layer, a syntax error there must still just skip and let a launching
+    /// verb proceed, exactly as plain `load` already does.
+    #[test]
+    fn load_for_launch_still_skips_a_broken_repo_layer() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "1").expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load_for_launch(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a broken repo layer must not block a launching verb");
+        assert_eq!(
+            cfg.unparsable_layers.len(),
+            1,
+            "{:?}",
+            cfg.unparsable_layers
+        );
+        assert!(!cfg.unparsable_layers[0].is_home);
+    }
+
+    /// Both layers broken at once must not compound into a harder failure --
+    /// `unparsable_layers` names both, and defaults alone govern the config.
+    #[test]
+    fn both_layers_broken_falls_back_to_defaults_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "not [ valid toml").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "1").expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("both layers failing to parse still degrades, never aborts");
+
+        assert_eq!(cfg.score, ScoreConfig::default());
+        assert_eq!(cfg.pace.enabled, PaceConfig::default().enabled);
+        assert_eq!(cfg.sandbox.enabled, SandboxConfig::default().enabled);
+        assert_eq!(
+            cfg.unparsable_layers.len(),
+            2,
+            "{:?}",
+            cfg.unparsable_layers
+        );
+    }
+
+    /// The security contract must not be blurred by the parse-skip fix above:
+    /// a key a repository may never set is still a hard rejection, distinct
+    /// from a plain parse failure both in kind (`is_repo_forbidden`) and in
+    /// effect (the whole load still fails -- there is no config to hand back
+    /// with a `REPO_FORBIDDEN` key quietly dropped).
+    #[test]
+    fn a_repo_forbidden_key_is_still_rejected_and_distinguishable_from_a_parse_failure() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "agent_bin = \"/tmp/x\"\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to set agent_bin");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "a REPO_FORBIDDEN rejection must be identifiable as such: {err}"
+        );
+
+        // A genuine TOML syntax error is not a `REPO_FORBIDDEN` rejection --
+        // it never reaches `reject_untrusted_keys` as an `Err` at all any
+        // more (see the skip tests above), but the distinguishing predicate
+        // itself must still say no for every other error shape it might see
+        // (an unknown/mistyped key, here).
+        let repo2 = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo2.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo2.path().join(".zirv/ctx.toml"), "[score]\nwindwo = 4\n")
+            .expect("write");
+        let typo_err = CtxConfig::load(repo2.path(), &|k| empty.get(k).cloned())
+            .expect_err("a typo'd key must still be rejected");
+        assert!(
+            !is_repo_forbidden(typo_err.as_ref()),
+            "a schema error is not a REPO_FORBIDDEN rejection: {typo_err}"
+        );
     }
 
     #[test]
@@ -3165,7 +3721,7 @@ mod tests {
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         assert!(
             claude
-                .default_sandbox_args(&Default::default())
+                .default_sandbox_args(&Default::default(), &Default::default())
                 .iter()
                 .any(|a| a.starts_with("--allowedTools=")),
             "the generated permission set must still reach the argv"
@@ -3292,7 +3848,7 @@ mod tests {
             ..CtxConfig::default()
         };
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
-        let args = claude.default_sandbox_args(&cfg.sandbox);
+        let args = claude.default_sandbox_args(&cfg.sandbox, &Default::default());
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -3511,6 +4067,14 @@ mod tests {
         ("chat", "model"),
         ("review", "claude"),
         ("review", "codex"),
+        ("worker", "claude"),
+        ("worker", "codex"),
+        ("handover.claude", "cheap"),
+        ("handover.claude", "standard"),
+        ("handover.claude", "deep"),
+        ("handover.codex", "cheap"),
+        ("handover.codex", "standard"),
+        ("handover.codex", "deep"),
         ("score", "window"),
         ("score", "min_turns"),
         ("score", "token_floor"),
@@ -3582,6 +4146,9 @@ mod tests {
         ("memory", "retrieval_max_entries"),
         ("memory", "harvest_max_entries"),
         ("memory", "harvest_max_bytes"),
+        ("setup", "backup_retention_runs"),
+        ("setup", "memory_harvest_offered"),
+        ("setup", "statusline_wrap_offered"),
         ("chrome", "banner"),
         ("chrome", "bar"),
         ("chrome", "events"),
@@ -3603,6 +4170,10 @@ mod tests {
         ("policy", "approval"),
         ("policy", "git_push_destructive"),
         ("policy", "tool_access"),
+        ("safety", "deny"),
+        ("safety", "ask"),
+        ("safety", "allow"),
+        ("safety", "default"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like

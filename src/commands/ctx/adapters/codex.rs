@@ -1,35 +1,56 @@
+use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::super::CtxResult;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
 };
+use super::super::window::{self, RolloutRecord};
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
 /// Verified facts backing this adapter live in
-/// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`. `parse_events` and
-/// `structural_context` stay empty on purpose (out of scope; tracked in
-/// [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11)): that
-/// file records the assistant/tool-call/token-usage event shapes and the
-/// rollout event parsing as unverified, since codex requires authentication.
-/// Current Codex releases expose both lifecycle hooks and the external
-/// `notify` program; `zirv setup` uses the documented lifecycle-hook schema.
+/// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`. Current Codex
+/// releases expose both lifecycle hooks and the external `notify` program;
+/// `zirv setup` uses the documented lifecycle-hook schema.
 ///
-/// `ready()` no longer hard-errors, though: codex is a supported adapter with
-/// an honestly degraded capability set: rollout event parsing and turn scoring
-/// remain unavailable, while direct launches support developer instructions.
-/// It is selectable and launchable in the common case (`codex` resolves to a
-/// real binary) and also when nothing named `codex` is installed at all --
-/// `resolve_program` fails open for that case, so `--agent codex` on a
-/// machine without it fails at spawn time with the OS's own "not found",
-/// not here. The one launch `ready()` actually refuses is a bare `codex`
-/// that resolves via `PATH` to a file this OS cannot execute at all.
+/// `ready()` no longer hard-errors: codex is a supported adapter with an
+/// honestly degraded capability set, while direct launches support developer
+/// instructions. It is selectable and launchable in the common case (`codex`
+/// resolves to a real binary) and also when nothing named `codex` is
+/// installed at all -- `resolve_program` fails open for that case, so
+/// `--agent codex` on a machine without it fails at spawn time with the OS's
+/// own "not found", not here. The one launch `ready()` actually refuses is a
+/// bare `codex` that resolves via `PATH` to a file this OS cannot execute at
+/// all.
+///
+/// `parse_events`/`structural_context` (issue #86, 2026-08-23) derive real
+/// normalized events from the same rollout JSONL `window.rs` already parses
+/// for usage-window state, via the shared `window::parse_rollout_record`
+/// collector -- see that function's own doc comment and `parse_events`
+/// below for exactly which rollout shapes are verified and mapped. Tool
+/// calls, tool results, compaction boundaries, and assistant text outside
+/// `task_complete.last_agent_message` still have no verified rollout shape
+/// (see `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`) and are not
+/// modeled -- tracked as the residual half of
+/// [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
 #[derive(Debug, Clone)]
 pub struct CodexAdapter {
     program: String,
     bin_args: Vec<String>,
     home: Option<PathBuf>,
+    /// Test seam only: forces `ignore_flags_supported`'s answer instead of
+    /// spawning a real `--help` probe against whatever "codex" happens to
+    /// resolve to on the machine running the test suite -- without this,
+    /// `read_only_args`/`sandbox_residual_note` tests would be
+    /// non-deterministic depending on whether a real codex-cli sits on the
+    /// test machine's `PATH`. Mirrors `ClaudeAdapter`'s own
+    /// `forced_file_support` field exactly.
+    #[cfg(test)]
+    forced_ignore_flags_support: Option<bool>,
 }
 
 impl CodexAdapter {
@@ -43,6 +64,8 @@ impl CodexAdapter {
             program,
             bin_args: parts.collect(),
             home: None,
+            #[cfg(test)]
+            forced_ignore_flags_support: None,
         }
     }
 
@@ -51,6 +74,34 @@ impl CodexAdapter {
     pub fn with_home(mut self, home: PathBuf) -> Self {
         self.home = Some(home);
         self
+    }
+
+    /// Test seam: see the field's own doc comment.
+    #[cfg(test)]
+    pub fn with_ignore_flags_forced(mut self, supported: bool) -> Self {
+        self.forced_ignore_flags_support = Some(supported);
+        self
+    }
+
+    /// Issue #89: whether the installed codex-cli's own `codex exec --help`
+    /// documents BOTH `--ignore-rules` and `--ignore-user-config` -- the two
+    /// flags that would close the residual `sandbox_residual_note`
+    /// describes. Probed rather than guessed from a hardcoded version
+    /// string, the same `--help`-probe-over-version-cutoff choice
+    /// `ClaudeAdapter::supports_system_prompt_file` already made, and for
+    /// the identical reason: the real minimum supporting version is
+    /// unknown (0.105.0, the npm-published build, has neither flag; 0.147.0
+    /// has both -- nothing in between was ever captured), so a live probe
+    /// is the only honest answer. Fails closed (`false`) on any doubt at
+    /// all: binary missing, timeout, or `--help` output missing either
+    /// flag -- see `distiller_cmd`'s own doc comment for why passing just
+    /// one on an unsupporting install is worse than passing neither.
+    fn ignore_flags_supported(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_ignore_flags_support {
+            return forced;
+        }
+        probe_ignore_flags_support(&self.program, &self.bin_args)
     }
 
     /// Every command starts here so the program and its leading arguments are
@@ -81,6 +132,101 @@ impl CodexAdapter {
             .or_else(|| crate::utils::home_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
     }
+}
+
+/// Bounds the `codex exec --help` probe below: a hang here must never hang
+/// a distiller/reviewer spawn. Mirrors `claude.rs`'s own
+/// `HELP_PROBE_TIMEOUT`.
+const IGNORE_FLAGS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Process-wide cache of `detect_ignore_flags`'s answer, keyed by the exact
+/// program invocation -- mirrors `claude.rs`'s own `ProbeKey`/
+/// `SYSTEM_PROMPT_FILE_SUPPORT` for the identical reason: `agent_bin` can
+/// point at a different binary, or a different version resolved off a
+/// different `PATH`, and each has its own answer.
+type ProbeKey = (PathBuf, Vec<String>);
+static IGNORE_FLAGS_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
+
+fn probe_ignore_flags_support(program: &str, bin_args: &[String]) -> bool {
+    let key = (PathBuf::from(program), bin_args.to_vec());
+    let cache = IGNORE_FLAGS_SUPPORT.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = cache.lock() else {
+        return false;
+    };
+    if let Some(cached) = map.get(&key) {
+        return *cached;
+    }
+    let detected = detect_ignore_flags(program, bin_args);
+    map.insert(key, detected);
+    detected
+}
+
+/// Runs `<program> [bin_args] exec --help` and reports whether its output
+/// names BOTH `--ignore-rules` and `--ignore-user-config`. Verified against
+/// the real installed `codex-cli 0.147.0`'s own `codex exec --help`
+/// (2026-08-23), which documents both; the npm-published `0.105.0` most
+/// operators get documents neither (see `distiller_cmd`'s own doc comment).
+/// Any doubt at all -- binary missing, timeout, output missing either flag
+/// -- reads as unsupported: passing just one on an install that does not
+/// recognize it is very likely an unrecognized-argument error that breaks
+/// the distiller/reviewer outright, worse than the residual these flags
+/// exist to close.
+fn detect_ignore_flags(program: &str, bin_args: &[String]) -> bool {
+    // The same resolution the real launch uses, exactly like claude's own
+    // `detect_help_flag` -- otherwise the probe and the spawn could disagree
+    // on Windows about whether this is a `.cmd` shim.
+    let resolved =
+        super::resolve_program(program).unwrap_or_else(|_| ResolvedProgram::direct(program));
+
+    // SECURITY: identical defense to `claude.rs::detect_help_flag` -- run
+    // the fail-closed reparse guard against the exact probe argv before
+    // spawning, since `bin_args` can carry repo-controlled text on some
+    // launch shapes and a shim-resolved probe would otherwise let cmd.exe
+    // reparse it before the real launch's own guard is ever reached.
+    let mut probe_args: Vec<String> =
+        Vec::with_capacity(resolved.prefix.len() + bin_args.len() + 2);
+    probe_args.extend(resolved.prefix.iter().cloned());
+    probe_args.extend(bin_args.iter().cloned());
+    probe_args.push("exec".to_string());
+    probe_args.push("--help".to_string());
+    if super::guard_cmd_shim_reparse(&resolved.program, &probe_args).is_err() {
+        return false;
+    }
+
+    let Ok(mut child) = Command::new(&resolved.program)
+        .args(&resolved.prefix)
+        .args(bin_args)
+        .arg("exec")
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let mut stdout_pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let deadline = Instant::now() + IGNORE_FLAGS_PROBE_TIMEOUT;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+            return text.contains("--ignore-rules") && text.contains("--ignore-user-config");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 /// Codex nests rollout files under `<sessions>/<YYYY>/<MM>/<DD>/`, a depth
@@ -228,30 +374,26 @@ impl AgentAdapter for CodexAdapter {
     /// an executed command do, it does not stop the model from reading that
     /// text or from answering based on it.
     ///
-    /// KNOWN RESIDUAL (checked 2026-08-15, see docs/superpowers/notes/
-    /// 2026-07-31-codex-cli-facts.md's addendum and its `--ignore-rules`/
-    /// `--ignore-user-config` capture): codex-cli 0.146.0's `codex exec
-    /// --help` (the brew-installed capture that note quotes verbatim) *does*
-    /// document `--ignore-rules` (skip project/user execpolicy `.rules`
-    /// files) and `--ignore-user-config` (skip `$CODEX_HOME/config.toml`),
-    /// which would close this distiller's remaining "still reads repo/
-    /// operator config" gap the same way `guard_cmd_shim_reparse`-style
-    /// fixes close others. They are deliberately **not** added here: the
-    /// version most operators actually get (`npm install -g @openai/codex`,
-    /// verified as `codex-cli 0.105.0` on a real Windows machine, the exact
-    /// version this whole function is verified against) has neither flag on
-    /// its own `codex exec --help` -- passing either would very likely be an
-    /// unrecognized-argument error on 0.105.0, breaking every distiller call
-    /// for the common install rather than sandboxing it further. So: a
-    /// repo's own `.rules` execpolicy files and the operator's own
-    /// `~/.codex/config.toml` still shape this judgment child's behavior
-    /// (unlike claude's distiller, whose CLAUDE.md-reading is the one thing
-    /// `--disallowedTools` cannot touch either, so the two residuals are not
-    /// symmetric: claude's is "still reads the file", codex's is "still
-    /// reads the file *and* still honors config it did not ask for"). Add
-    /// `--ignore-rules --ignore-user-config` once 0.105.0 (or whatever the
-    /// npm-published version is by then) ships them too, verified the same
-    /// way `-s, --sandbox` was.
+    /// ISSUE #89 UPDATE (2026-08-23): `read_only_args` below now adds
+    /// `--ignore-rules --ignore-user-config` automatically, but only once a
+    /// live `--help` probe (`ignore_flags_supported`) confirms the installed
+    /// codex-cli actually documents both. codex-cli 0.146.0's `codex exec
+    /// --help` (the brew-installed capture in `docs/superpowers/notes/
+    /// 2026-07-31-codex-cli-facts.md`) documents both; the npm-published
+    /// `0.105.0` most operators get documents neither, and passing either on
+    /// an install that does not recognize it would very likely be an
+    /// unrecognized-argument error, breaking every distiller call for that
+    /// install rather than sandboxing it further -- which is exactly why
+    /// this is probed live rather than gated on a hardcoded version cutoff
+    /// (see `ignore_flags_supported`'s own doc comment). On an install
+    /// where the probe says "no", the operator's own `.rules` execpolicy
+    /// files and `~/.codex/config.toml` still shape this judgment child's
+    /// behavior (unlike claude's distiller, whose CLAUDE.md-reading is the
+    /// one thing `--disallowedTools` cannot touch either, so the two
+    /// residuals are not symmetric: claude's is "still reads the file",
+    /// codex's un-upgraded residual is "still reads the file *and* still
+    /// honors config it did not ask for") -- `sandbox_residual_note` names
+    /// this for the operator via a one-time `zirv ▸` announcement.
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("exec");
@@ -262,8 +404,40 @@ impl AgentAdapter for CodexAdapter {
         cmd
     }
 
+    /// `--sandbox read-only` plus, when `ignore_flags_supported()` confirms
+    /// the installed codex-cli documents them, `--ignore-rules
+    /// --ignore-user-config` (issue #89). Shared by `distiller_cmd` above
+    /// and the workflow reviewer (`workflow::review::reviewer_argv`, via
+    /// `adapters::read_only_args_for_agent_name`), so both consumers of
+    /// this pin get the stronger guarantee together, on the same installed
+    /// binary's own verified capability, rather than drifting apart.
     fn read_only_args(&self) -> Vec<String> {
-        vec!["--sandbox".to_string(), "read-only".to_string()]
+        let mut args = vec!["--sandbox".to_string(), "read-only".to_string()];
+        if self.ignore_flags_supported() {
+            args.push("--ignore-rules".to_string());
+            args.push("--ignore-user-config".to_string());
+        }
+        args
+    }
+
+    /// Issue #89: names the residual for the operator when the installed
+    /// codex-cli's `codex exec --help` does not document `--ignore-rules`/
+    /// `--ignore-user-config` (see `read_only_args`/`ignore_flags_supported`
+    /// above) -- `None` once it does, which is what stops
+    /// `adapters::announce_sandbox_residual_once` from firing for an
+    /// operator on a newer build.
+    fn sandbox_residual_note(&self) -> Option<String> {
+        if self.ignore_flags_supported() {
+            return None;
+        }
+        Some(
+            "codex's report-only sandbox (--sandbox read-only) could not add --ignore-rules \
+             --ignore-user-config on this installed codex-cli, so the distiller/reviewer child \
+             still reads this repo's .rules execpolicy files and your ~/.codex/config.toml on \
+             top of AGENTS.md. Upgrade codex-cli to a version whose `codex exec --help` \
+             documents both flags to close this automatically."
+                .to_string(),
+        )
     }
 
     /// Codex's own model ladder, top to bottom: `gpt-5.6-sol` (the default
@@ -447,12 +621,15 @@ impl AgentAdapter for CodexAdapter {
     /// `sandbox.extra_allow`/`extra_deny` (fix round 3, 2026-08-22) are
     /// claude permission-rule strings (`Bash(...)`/`Edit(...)`/`Read(...)`);
     /// codex has no per-command mechanism to receive them and ignores the
-    /// parameter, exactly like the trait default.
+    /// parameter, exactly like the trait default. `safety` (issue #83) is
+    /// the same story: codex has no per-command classifier to project
+    /// `[safety]` rules onto, so this stays the fixed pair it always was.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
+        safety: &crate::commands::ctx::safety::SafetyPolicy,
     ) -> Vec<String> {
-        let _ = sandbox;
+        let _ = (sandbox, safety);
         vec![
             "--sandbox".to_string(),
             "workspace-write".to_string(),
@@ -472,39 +649,124 @@ impl AgentAdapter for CodexAdapter {
             .unwrap_or_else(|| sessions_root.join(format!("rollout{suffix}")))
     }
 
-    fn parse_events(&self, _jsonl: &str) -> Vec<NormalizedEvent> {
-        Vec::new()
+    /// Derives normalized rot/usage events from the same rollout JSONL
+    /// `window.rs` already parses for usage-window state (issue #86) --
+    /// `window::parse_rollout_record` is the single shared parse both draw
+    /// from, so the transcript is read once, not by two independent
+    /// readers. Only the two shapes verified in
+    /// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md` ("Turn
+    /// boundary", "Token usage") are mapped, onto the EXISTING
+    /// `NormalizedEvent` vocabulary -- no codex-specific variant:
+    ///
+    /// - `task_started` -> `TurnStart` ("task_started and task_complete
+    ///   bracket a turn and share a turn_id").
+    /// - `task_complete` -> `AssistantFinal { text: last_agent_message
+    ///   .unwrap_or_default(), input_tokens: <most recent cumulative total
+    ///   this parse has seen> }`. `last_agent_message` is `None` on a
+    ///   failed turn (observed as JSON `null`), which reads as empty text --
+    ///   honest, since there is nothing to report, not a guess.
+    /// - `token_count` (whenever `info.total_token_usage` is present) -> its
+    ///   own `AssistantFinal { text: String::new(), input_tokens }`, so the
+    ///   rot engine's token gate (`rot::context_tokens`, "the most recent
+    ///   AssistantFinal's `input_tokens`") tracks codex's real cumulative
+    ///   context size between turn boundaries too, not just at them. The
+    ///   empty text never counts as a "turn" (`rot::turn_final_texts` only
+    ///   counts non-empty text) and never touches the marker signal, which
+    ///   stays capability-gated off for codex regardless
+    ///   (`capabilities().marker_signal == false`) -- so this mapping has no
+    ///   effect on `marker_miss_rate`/the weighted score's marker term.
+    ///
+    /// NOT mapped, deliberately, because no verified rollout shape exists
+    /// for them: tool calls, tool results, and any compaction/summarization
+    /// boundary. `ToolCall`/`ToolResult`/`Compaction` are simply never
+    /// emitted, so `tool_failure_rate`/`repetition_hits` always read `0.0`
+    /// for a codex session and the token gate's "at or above token_ceiling"
+    /// rule is the only escalation path that still fires -- see Known
+    /// Issues.
+    ///
+    /// The one bit of cross-line state (`last_tokens`, local to this single
+    /// call) is a deliberate, bounded residual against the trait's
+    /// "line-local" ideal: if an incremental poll's chunk boundary happens
+    /// to split between a `token_count` line and the `task_complete` line
+    /// for the same turn, that turn's `AssistantFinal` reports whatever
+    /// `last_tokens` this call has seen so far (`0` if nothing yet) rather
+    /// than the true cumulative count -- self-correcting at the very next
+    /// `token_count` line, which arrives frequently in practice. `rot.rs`
+    /// itself never sees or knows about this: it only ever receives the
+    /// resulting `NormalizedEvent`s.
+    fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent> {
+        let mut events = Vec::new();
+        let mut last_tokens: u64 = 0;
+        for line in jsonl.lines() {
+            match window::parse_rollout_record(line) {
+                Some(RolloutRecord::TaskStarted) => {
+                    events.push(NormalizedEvent::TurnStart);
+                }
+                Some(RolloutRecord::TaskComplete { last_agent_message }) => {
+                    events.push(NormalizedEvent::AssistantFinal {
+                        text: last_agent_message.unwrap_or_default(),
+                        input_tokens: last_tokens,
+                    });
+                }
+                Some(RolloutRecord::TokenCount {
+                    totals: Some(totals),
+                    ..
+                }) => {
+                    last_tokens = totals.input_tokens;
+                    events.push(NormalizedEvent::AssistantFinal {
+                        text: String::new(),
+                        input_tokens: last_tokens,
+                    });
+                }
+                _ => {}
+            }
+        }
+        events
     }
 
-    fn structural_context(&self, _jsonl: &str, _last_n: usize) -> StructuralContext {
-        StructuralContext::default()
+    /// Only `assistant_texts` is populated, from verified
+    /// `task_complete.last_agent_message` lines -- the one piece of real
+    /// transcript content the rollout format gives a verified shape for
+    /// (see `parse_events`'s own doc comment).
+    /// `user_messages`/`files_touched`/`tool_errors` stay empty: no
+    /// verified rollout shape carries them, and inventing one would be
+    /// exactly the fabricated-content class `handoff.rs`'s own eventless
+    /// guard exists to prevent -- this is a real, if partial, structural
+    /// context now, not the permanent empty stub it used to be.
+    /// `last_n` truncation mirrors `claude::structural_context`'s own
+    /// `keep_last`: `last_n == 0` keeps nothing at all.
+    fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext {
+        let mut assistant_texts: Vec<String> = jsonl
+            .lines()
+            .filter_map(|line| match window::parse_rollout_record(line) {
+                Some(RolloutRecord::TaskComplete {
+                    last_agent_message: Some(text),
+                }) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            })
+            .collect();
+        if assistant_texts.len() > last_n {
+            assistant_texts.drain(..assistant_texts.len() - last_n);
+        }
+        StructuralContext {
+            assistant_texts,
+            ..StructuralContext::default()
+        }
     }
 
     fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
         let mut latest = None;
         for line in jsonl.lines() {
-            let Ok(row) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-                continue;
-            };
-            let Some(total) = row
-                .get("payload")
-                .filter(|payload| {
-                    payload.get("type").and_then(serde_json::Value::as_str) == Some("token_count")
-                })
-                .and_then(|payload| payload.pointer("/info/total_token_usage"))
-            else {
-                continue;
-            };
-            latest = Some(TranscriptUsage {
-                input_tokens: total
-                    .get("input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                output_tokens: total
-                    .get("output_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            });
+            if let Some(RolloutRecord::TokenCount {
+                totals: Some(totals),
+                ..
+            }) = window::parse_rollout_record(line)
+            {
+                latest = Some(TranscriptUsage {
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                });
+            }
         }
         latest
     }
@@ -523,18 +785,25 @@ impl AgentAdapter for CodexAdapter {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            // Codex still gets no marker signal (spec-mandated, unrelated to
+            // event parsing) and `token_usage` describes a different,
+            // separate mechanism -- see `window::refresh_codex_usage`'s own
+            // doc comment on that nuance. `turn_signal` stays false too:
+            // `register_turn_signal` is still a no-op, unrelated to whether
+            // a transcript can be parsed after the fact.
             marker_signal: false,
             token_usage: false,
             turn_signal: false,
             // The adapter supports this generally. `system_prompt_supported`
             // narrows the answer for Windows shell-shim launch shapes.
             system_prompt: true,
-            // D: parse_events/structural_context are stubbed to empty/default
-            // (out of scope, issue #11) -- an honest `false` here is what
-            // keeps score.rs from reading that emptiness as a real
-            // `Healthy`/`0` verdict. See the doc comment on `Capabilities::
-            // events`.
-            events: false,
+            // Issue #86 (2026-08-23): `parse_events`/`structural_context`
+            // now derive real turn-boundary and token data from the rollout
+            // JSON (see their own doc comments for exactly what is and is
+            // not mapped), so this is honestly `true` -- rot scoring,
+            // `zirv ctx status`'s usage/rot cells, and the pacing gate all
+            // light up for a codex session.
+            events: true,
         }
     }
 
@@ -600,6 +869,104 @@ mod tests {
     fn codex_has_no_marker_signal() {
         let caps = CodexAdapter::new(None).capabilities();
         assert!(!caps.marker_signal, "the spec gives codex no marker signal");
+    }
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join(name),
+        )
+        .expect("fixture must be committed")
+    }
+
+    /// Issue #86 acceptance: capabilities().events is honestly true now that
+    /// parse_events derives real data from the rollout JSON.
+    #[test]
+    fn codex_now_reports_verified_event_parsing() {
+        assert!(CodexAdapter::new(None).capabilities().events);
+    }
+
+    /// Issue #86: the exact normalized event sequence a recorded two-turn
+    /// codex rollout fixture must produce -- turn boundaries from
+    /// task_started/task_complete, tokens from every token_count snapshot,
+    /// and a failed turn's null last_agent_message reading as empty text
+    /// rather than being skipped or guessed at.
+    #[test]
+    fn parse_events_derives_turn_boundaries_and_token_updates_from_the_rollout_json() {
+        let jsonl = fixture("codex-rollout-turn-events.jsonl");
+        let adapter = CodexAdapter::new(None);
+        let events = adapter.parse_events(&jsonl);
+        assert_eq!(
+            events,
+            vec![
+                NormalizedEvent::TurnStart,
+                NormalizedEvent::AssistantFinal {
+                    text: String::new(),
+                    input_tokens: 1200,
+                },
+                NormalizedEvent::AssistantFinal {
+                    text: "[zirv] wired the webhook route".to_string(),
+                    input_tokens: 1200,
+                },
+                NormalizedEvent::TurnStart,
+                NormalizedEvent::AssistantFinal {
+                    text: String::new(),
+                    input_tokens: 3400,
+                },
+                NormalizedEvent::AssistantFinal {
+                    text: String::new(),
+                    input_tokens: 3400,
+                },
+            ],
+            "got {events:?}"
+        );
+    }
+
+    /// Issue #86: the derived stream must actually light up the rot engine
+    /// end to end -- a real context-token reading and a real (here,
+    /// healthy: everything is well under the default token_floor) verdict,
+    /// not the "no data" refusal an eventless adapter gets.
+    #[test]
+    fn a_derived_event_stream_scores_through_the_rot_engine() {
+        let jsonl = fixture("codex-rollout-turn-events.jsonl");
+        let adapter = CodexAdapter::new(None);
+        let events = adapter.parse_events(&jsonl);
+        assert_eq!(crate::commands::ctx::rot::context_tokens(&events), 3400);
+
+        let score = crate::commands::ctx::rot::score_events(
+            &events,
+            adapter.capabilities(),
+            &crate::commands::ctx::config::ScoreConfig::default(),
+        );
+        assert_eq!(score.context_tokens, 3400);
+        assert_eq!(
+            score.verdict,
+            crate::commands::ctx::rot::Verdict::Healthy,
+            "well under the default token_floor: {score:?}"
+        );
+    }
+
+    /// Issue #86: `structural_context` is no longer the permanent empty
+    /// stub -- a successful turn's `last_agent_message` shows up as real
+    /// assistant text, while a failed turn's `null` message contributes
+    /// nothing (never a fabricated empty-string entry).
+    #[test]
+    fn structural_context_carries_the_verified_assistant_text_only() {
+        let jsonl = fixture("codex-rollout-turn-events.jsonl");
+        let adapter = CodexAdapter::new(None);
+        let ctx = adapter.structural_context(&jsonl, 10);
+        assert_eq!(
+            ctx.assistant_texts,
+            vec!["[zirv] wired the webhook route".to_string()]
+        );
+        assert!(
+            ctx.user_messages.is_empty()
+                && ctx.files_touched.is_empty()
+                && ctx.tool_errors.is_empty(),
+            "no verified rollout shape backs these fields yet: {ctx:?}"
+        );
     }
 
     #[test]
@@ -693,7 +1060,7 @@ mod tests {
     /// stdin when omitted, so the distiller never needs an argv prompt.
     #[test]
     fn distiller_cmd_uses_exec_with_a_cheap_model_and_reads_stdin() {
-        let adapter = CodexAdapter::new(None);
+        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(false);
         let cmd = adapter.distiller_cmd("gpt-5.6-luna");
         assert_eq!(
             built_args(&adapter, &cmd),
@@ -713,7 +1080,7 @@ mod tests {
     /// then applies instead of zirv guessing a model name.
     #[test]
     fn distiller_cmd_omits_the_model_flag_when_none_is_given() {
-        let adapter = CodexAdapter::new(None);
+        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(false);
         let cmd = adapter.distiller_cmd("");
         let args = built_args(&adapter, &cmd);
         assert!(
@@ -850,12 +1217,70 @@ mod tests {
     /// flag without a test failing here specifically.
     #[test]
     fn the_distiller_is_pinned_to_the_read_only_sandbox() {
-        let adapter = CodexAdapter::new(None);
+        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(false);
         let cmd = adapter.distiller_cmd("gpt-5.6-luna");
         let args = built_args(&adapter, &cmd);
         assert!(
             args.windows(2).any(|w| w == ["--sandbox", "read-only"]),
             "the distiller must be pinned to codex's own read-only sandbox: {args:?}"
+        );
+    }
+
+    /// Issue #89: with a codex version known to support them, `--ignore-
+    /// rules --ignore-user-config` must appear in the constructed argv,
+    /// both directly (`read_only_args`) and through `distiller_cmd`, which
+    /// builds on it.
+    #[test]
+    fn read_only_args_adds_the_ignore_flags_when_the_installed_codex_supports_them() {
+        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(true);
+        assert_eq!(
+            adapter.read_only_args(),
+            vec![
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "--ignore-rules".to_string(),
+                "--ignore-user-config".to_string(),
+            ]
+        );
+
+        let cmd = adapter.distiller_cmd("gpt-5.6-luna");
+        let args = built_args(&adapter, &cmd);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--ignore-rules", "--ignore-user-config"]),
+            "got {args:?}"
+        );
+    }
+
+    /// Issue #89: with an unknown or older codex version, the ignore flags
+    /// must not appear at all -- passing either on an install that does not
+    /// recognize it is very likely an unrecognized-argument error.
+    #[test]
+    fn read_only_args_omits_the_ignore_flags_when_unsupported() {
+        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(false);
+        assert_eq!(
+            adapter.read_only_args(),
+            vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+    }
+
+    /// Issue #89: `sandbox_residual_note` is the flip side of the flags
+    /// above -- present (naming the residual) exactly when the flags are
+    /// absent, `None` exactly when they are present.
+    #[test]
+    fn sandbox_residual_note_tracks_ignore_flag_support() {
+        let unsupported = CodexAdapter::new(None).with_ignore_flags_forced(false);
+        let note = unsupported
+            .sandbox_residual_note()
+            .expect("a residual to report");
+        assert!(note.contains("--ignore-rules"), "got {note}");
+        assert!(note.contains("--ignore-user-config"), "got {note}");
+
+        let supported = CodexAdapter::new(None).with_ignore_flags_forced(true);
+        assert_eq!(
+            supported.sandbox_residual_note(),
+            None,
+            "nothing to disclose once the installed codex-cli supports both flags"
         );
     }
 
@@ -884,7 +1309,7 @@ mod tests {
     fn policy_args_pins_the_read_only_sandbox_and_suppresses_approval_prompts_when_shell_exec_is_denied()
      {
         use crate::commands::ctx::policy::{EffectivePolicy, Stance};
-        let adapter = CodexAdapter::new(None);
+        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(false);
         let policy = EffectivePolicy {
             shell_exec: Stance::Deny,
             ..EffectivePolicy::default()
@@ -904,7 +1329,7 @@ mod tests {
     fn policy_args_pins_the_read_only_sandbox_and_suppresses_approval_prompts_when_repo_fs_write_is_denied()
      {
         use crate::commands::ctx::policy::{EffectivePolicy, Stance};
-        let adapter = CodexAdapter::new(None);
+        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(false);
         let policy = EffectivePolicy {
             repo_fs_write: Stance::Deny,
             ..EffectivePolicy::default()
@@ -972,7 +1397,7 @@ mod tests {
     fn default_sandbox_args_pairs_workspace_write_with_never_ask() {
         let adapter = CodexAdapter::new(None);
         assert_eq!(
-            adapter.default_sandbox_args(&Default::default()),
+            adapter.default_sandbox_args(&Default::default(), &Default::default()),
             vec![
                 "--sandbox".to_string(),
                 "workspace-write".to_string(),
@@ -986,7 +1411,7 @@ mod tests {
     #[test]
     fn default_sandbox_args_never_emits_the_dangerous_bypass_flag() {
         let adapter = CodexAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default());
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
         assert!(
             !args
                 .iter()

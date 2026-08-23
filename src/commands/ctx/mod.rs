@@ -15,6 +15,7 @@ pub mod drift;
 pub mod event;
 pub mod exec;
 pub mod handoff;
+pub mod handover;
 pub mod hook;
 pub mod log;
 pub mod mail;
@@ -30,6 +31,7 @@ pub mod resume;
 pub mod retrieval;
 pub mod rot;
 pub mod run_loop;
+pub mod safety;
 pub mod score;
 pub mod sessions;
 pub mod signal;
@@ -293,6 +295,10 @@ pub enum CtxVerb {
     Forget(memory::ForgetArgs),
     /// Interrupt a live session with a message: durable mail plus a wake-up.
     Nudge(sessions::NudgeArgs),
+    /// Evaluate, list or explain zirv's harness-neutral command safety policy.
+    Safety(safety::SafetyArgs),
+    /// Swap the orchestrator seat's model or harness in place, same session id.
+    Handover(handover::HandoverArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -378,6 +384,8 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Recall(a) => memory::run_recall(a, &mut out),
         CtxVerb::Forget(a) => memory::run_forget(a, &mut out),
         CtxVerb::Nudge(a) => sessions::run_nudge(a, &mut out),
+        CtxVerb::Safety(a) => safety::run(a, &mut out),
+        CtxVerb::Handover(a) => handover::run(a, &mut out),
     };
 
     match result {

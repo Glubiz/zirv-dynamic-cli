@@ -314,6 +314,22 @@ pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> b
         && cooldown_cleared(state)
 }
 
+/// Issue #84: whether a pending `zirv ctx handover` request may be acted on
+/// right now, versus refused with "mid-turn; retry once idle, or pass
+/// --force". `force` always wins outright (the operator asked to interrupt
+/// whatever the session is doing); otherwise this is exactly `may_inject`'s
+/// own "verified-idle turn boundary" precondition -- the same quiesce check
+/// every other injection in this module already gates on, reused rather than
+/// reinvented for this seam.
+pub fn handover_may_act(
+    state: &InjectionState,
+    now: Instant,
+    debounce: Duration,
+    force: bool,
+) -> bool {
+    force || may_inject(state, now, debounce)
+}
+
 /// Whether a session with no turn-signal mechanism at all (codex today) has
 /// been quiet long enough for T13's live mail advisory to be typed into it.
 ///
@@ -338,11 +354,14 @@ pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> b
 /// Deliberately **not** folded
 /// into `may_inject` itself: that function also gates `Compact`/`Restart`,
 /// and a debounce-only idle guess is not something this codebase wants
-/// deciding whether to type `/compact` into a session the rot engine cannot
-/// even score in the first place (every adapter that lacks a turn signal
-/// today also has `capabilities().events == false`, so `action_for` never
-/// reaches `Verdict::Compact`/`Verdict::Restart` for one regardless) -- this
-/// is scoped to the one caller that actually needs it.
+/// deciding whether to type `/compact` into a session. `may_inject`'s own
+/// `state.signals_seen > 0` precondition is what actually protects that path
+/// for a signal-less adapter (codex today): `register_turn_signal` is a
+/// no-op for it regardless of `capabilities().events` (issue #86 gave codex
+/// real event *parsing*, which is a separate mechanism from turn-signal
+/// *posting*), so `signals_seen` never advances and `may_inject` stays
+/// permanently false -- this is scoped to the one caller that actually
+/// needs the quiet-time-only question.
 pub fn signal_less_mail_ready(state: &InjectionState, now: Instant, quiet: Duration) -> bool {
     !state.degraded
         && super::dash::pane::quiescent_since(state.last_output.max(state.last_input), now, quiet)
@@ -818,6 +837,16 @@ impl MailWatch {
             self.announced.insert(id);
         }
     }
+}
+
+/// Finding #7: `handover::take_request`'s own cadence gate, the same "is it
+/// due yet" shape as [`MailWatch::due`] above but tracked in its own
+/// `Option<Instant>` (the pump loop's `last_handover_poll`) rather than
+/// folded into `MailWatch` itself -- a session with mail polling
+/// disabled/degraded must not also starve its handover-request check, and
+/// vice versa. `None` (never polled yet) is always due, exactly like `due`.
+fn handover_poll_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= MAIL_POLL)
 }
 
 /// Thin delegate to `mail::unread_counts` (moved there in Task 7 so the
@@ -1319,7 +1348,7 @@ pub fn run_with(
         return Err(refusal.into());
     }
 
-    let cfg = CtxConfig::load(repo, env)?;
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
     // Announcements are gated by `cfg.chrome.events` (which already folds in
     // `--quiet`, `ZIRV_CTX_QUIET` and `[chrome] events`), never by whether
     // the terminal is big enough or colour-capable for the banner and bar: a
@@ -1334,7 +1363,13 @@ pub fn run_with(
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     // Selection happens here so an unknown or unverified agent fails before the
     // terminal is touched.
-    let adapter = adapters::select(agent_name, &args.command, &cfg)?;
+    // T84: `adapter` is `mut` so a live `zirv ctx handover` swap (see the
+    // handover request check inside `pump`) can replace the boxed trait
+    // object in place -- every existing `adapter.<method>()` call site below
+    // and inside `pump` keeps working unchanged, since method resolution
+    // auto-derefs through `&mut Box<dyn AgentAdapter>` exactly as it does
+    // through `&dyn AgentAdapter`.
+    let mut adapter = adapters::select(agent_name, &args.command, &cfg)?;
 
     // `select` defaults to claude when detection finds nothing to back it,
     // which is fine for a caller (like `exec`) that already gates every
@@ -1836,6 +1871,13 @@ pub fn run_with(
         .chain(prompt_args.iter().cloned())
         .collect();
 
+    // T84: owned rather than borrowed from `cfg`/`adapter` at the call site,
+    // so a live handover swap inside `pump` can update it in place for
+    // whatever the *new* adapter's own distiller default is -- otherwise a
+    // rot-triggered restart after a handover would keep quoting the
+    // predecessor's model name to a distiller that may not even recognise it.
+    let mut distiller_model =
+        handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
     let exit = pump(
         &mut child,
         &mut child_guard,
@@ -1844,7 +1886,7 @@ pub fn run_with(
         &mut pair,
         &mut supervision,
         server.as_ref(),
-        adapter.as_ref(),
+        &mut adapter,
         &writer,
         &mut transcript,
         &state_dir,
@@ -1853,7 +1895,7 @@ pub fn run_with(
         inject_timeout,
         repo,
         cfg.handoff.tail_items,
-        &handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref()),
+        &mut distiller_model,
         Duration::from_secs(cfg.handoff.timeout_secs),
         &cfg,
         &memory_slug,
@@ -1861,10 +1903,11 @@ pub fn run_with(
         tx,
         generation,
         &relaunch_extra,
-        &turn_env,
+        &mut turn_env,
         &cpr_filter,
         &announcer,
         &mut bar,
+        role,
     );
     // P2/P3: `pump` only ever returns once the child has exited (every arm
     // waits on it), so the pid leaves the console-close registry and the job
@@ -2228,6 +2271,191 @@ fn harvest_at_clean_exit(
     );
 }
 
+/// What a successful [`perform_handover_swap`] changed, for the ack and the
+/// `zirv ▸` announcement -- both models named, matching the decision-log
+/// entry's own contract (CLAUDE.md, "Record in the decision log with both
+/// models named").
+struct HandoverOutcome {
+    from_agent: String,
+    from_model: String,
+    to_agent: String,
+    to_model: String,
+    stored: CtxResult<PathBuf>,
+    source: &'static str,
+}
+
+/// Issue #84: swaps the orchestrator seat's model or harness in place,
+/// mirroring `pump`'s own `Action::Restart` arm (distill via the existing
+/// handoff machinery, quit the old child, open a fresh pty, relaunch) but
+/// generalized to a possibly *different* adapter and model, resolved from
+/// `req`. The caller (`pump`) has already decided this is a safe moment to
+/// act (idle, or `--force`) and has already parked the registry record on
+/// zirv's own pid.
+///
+/// On success, `*adapter`/`*distiller_model`/`*turn_env` are all updated in
+/// place so every later tick of the same `pump` loop -- a subsequent
+/// compact/quit sequence, a capabilities-gated mail delivery, a rot-
+/// triggered restart -- runs against the new harness, not the old one.
+/// `session_guard`/`session` are never touched here beyond `adopt_child_pid`:
+/// the session keeps its existing registry short id throughout, which is
+/// what makes mail sent before the swap still deliverable after it, and
+/// `zirv ctx nudge` still resolve to the same address.
+///
+/// The handoff packet rides the same channel every wrap restart already
+/// uses -- the interactive launch's own positional/task prompt
+/// (`relaunch_command`/`restart_prompt`), never a system-prompt injection --
+/// so a successor with no system-prompt injection mechanism at all (codex)
+/// receives it exactly the same way a same-harness restart already would.
+#[allow(clippy::too_many_arguments)]
+fn perform_handover_swap(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    child_guard: &mut super::supervise::ChildGuard,
+    session_guard: &mut super::sessions::SessionGuard,
+    pair: &mut portable_pty::PtyPair,
+    writer: &std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    generation: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    tx: &mpsc::Sender<PumpEvent>,
+    cpr_filter: &std::sync::Arc<std::sync::Mutex<CprFilter>>,
+    bar: &mut BarRuntime,
+    adapter: &mut Box<dyn AgentAdapter>,
+    distiller_model: &mut String,
+    turn_env: &mut Vec<(String, String)>,
+    transcript: &mut TranscriptSource,
+    server: Option<&super::signal::SignalServer>,
+    session: &super::event::SessionId,
+    repo: &Path,
+    cfg: &CtxConfig,
+    state_dir: &super::state::StateDir,
+    role: PromptRole,
+    memory_slug: &str,
+    grace: Duration,
+    tail_items: usize,
+    distiller_timeout: Duration,
+    last_size: (u16, u16),
+    announcer: &Announcer,
+    req: &super::handover::HandoverRequest,
+) -> CtxResult<HandoverOutcome> {
+    let from_agent = adapter.name().to_string();
+    let from_model = turn_env
+        .iter()
+        .find(|(k, _)| k == adapters::SEAT_MODEL_ENV)
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "default".to_string());
+
+    let jsonl = transcript
+        .path()
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .unwrap_or_default();
+    let ctx = adapter.structural_context(&jsonl, tail_items);
+    let (note, source) = handoff::distill_or_structural(
+        adapter.as_ref(),
+        distiller_model.as_str(),
+        &ctx,
+        distiller_timeout,
+        announcer.enabled,
+    );
+    let stored = handoff::store(state_dir, repo, session.as_str(), &note);
+    // N6: same rule the ordinary restart arm follows -- opt-in, and only
+    // from a genuinely distilled handoff.
+    if source == "distilled" {
+        let _ = super::memory::harvest_durable(
+            adapter.as_ref(),
+            distiller_model.as_str(),
+            &note,
+            repo,
+            state_dir,
+            memory_slug,
+            cfg,
+        );
+    }
+
+    // Everything from here on names the *new* harness. Resolved before the
+    // old child is touched, so an unknown target agent (a race against the
+    // operator's own config change, or a stale request) fails before
+    // anything is torn down.
+    let (new_adapter, new_extra_flags) = super::handover::resolve_swap_launch(cfg, req)?;
+    let new_turn_env = super::handover::build_turn_env(
+        new_adapter.as_ref(),
+        server,
+        session.as_str(),
+        repo,
+        role,
+        req.target_model.as_deref(),
+    );
+
+    let (new_generation, quit) = match writer.lock() {
+        Ok(mut sink) => {
+            let bumped = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let quit = quit_child(&mut *sink, child, adapter.quit_sequence(), grace);
+            (Some(bumped), quit)
+        }
+        Err(_) => (None, Err("pty writer poisoned".into())),
+    };
+    // That session is over, same as an ordinary restart: whatever it was
+    // writing is now a dead file, and the successor reports its own on its
+    // first turn.
+    transcript.forget();
+    quit?;
+    let new_generation = new_generation.ok_or("generation not bumped; pty writer poisoned")?;
+
+    let (fresh_pair, fresh_child, fresh_reader, fresh_writer) = relaunch(
+        new_adapter.as_ref(),
+        repo,
+        &note,
+        &new_extra_flags,
+        &new_turn_env,
+        relaunch_size(bar, last_size),
+    )?;
+    spawn_output_thread(
+        fresh_reader,
+        tx.clone(),
+        generation.clone(),
+        new_generation,
+        bar.stdout_lock.clone(),
+    );
+    if let Ok(mut sink) = writer.lock() {
+        *sink = fresh_writer;
+    }
+    if let Ok(mut filter) = cpr_filter.lock() {
+        filter.arm(Instant::now());
+    }
+    *pair = fresh_pair;
+    *child = fresh_child;
+    // P1/P2/P3: released before the new adoption, same ordering the ordinary
+    // restart arm uses, so a pid the OS has already recycled can never be
+    // deregistered out from under the fresh child.
+    child_guard.release();
+    *child_guard = super::supervise::ChildGuard::adopt(child.process_id());
+    if let Some(child_pid) = child.process_id() {
+        session_guard.adopt_child_pid(child_pid);
+    }
+
+    let to_agent = new_adapter.name().to_string();
+    let to_model = req
+        .target_model
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+
+    // Commit the swap: the boxed adapter and everything derived from it are
+    // replaced together, so the rest of this `pump` loop's life runs against
+    // the new harness consistently.
+    *adapter = new_adapter;
+    *distiller_model =
+        handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
+    *turn_env = new_turn_env;
+    bar.harness = adapter.name().to_string();
+    bar.provider = adapter.provider().to_string();
+
+    Ok(HandoverOutcome {
+        from_agent,
+        from_model,
+        to_agent,
+        to_model,
+        stored,
+        source,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pump(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -2240,7 +2468,13 @@ fn pump(
     pair: &mut portable_pty::PtyPair,
     supervision: &mut InjectionState,
     server: Option<&super::signal::SignalServer>,
-    adapter: &dyn AgentAdapter,
+    // T84: `&mut Box<dyn AgentAdapter>`, not `&dyn AgentAdapter` -- a live
+    // `zirv ctx handover` swap replaces the boxed trait object in place
+    // (`*adapter = new_adapter`) once the swap has actually happened, so
+    // every later tick's `adapter.<method>()` call (unchanged syntax, thanks
+    // to auto-deref through `&mut Box<dyn _>`) resolves against the new
+    // harness. See the handover request check near the top of this loop.
+    adapter: &mut Box<dyn AgentAdapter>,
     writer: &std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     transcript: &mut TranscriptSource,
     state_dir: &super::state::StateDir,
@@ -2249,7 +2483,10 @@ fn pump(
     inject_timeout: Duration,
     repo: &Path,
     tail_items: usize,
-    distiller_model: &str,
+    // T84: `&mut String`, not `&str` -- a handover swap recomputes this for
+    // the new adapter's own distiller default, so a rot-triggered restart
+    // *after* a handover does not keep quoting the predecessor's model name.
+    distiller_model: &mut String,
     distiller_timeout: Duration,
     // N6: read alongside `distiller_model`/`distiller_timeout` at the one
     // restart site below (`Action::Restart`), never anywhere else in the
@@ -2260,15 +2497,25 @@ fn pump(
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     extra: &[String],
-    turn_env: &[(String, String)],
+    // T84: `&mut Vec<_>`, not `&[_]` -- a handover swap rebuilds this for the
+    // new adapter/model (fresh `AGENT_ENV`/`SEAT_MODEL_ENV`/turn-signal env),
+    // so a *later* rot-triggered restart relaunches with the right identity.
+    turn_env: &mut Vec<(String, String)>,
     cpr_filter: &std::sync::Arc<std::sync::Mutex<CprFilter>>,
     announcer: &Announcer,
     bar: &mut BarRuntime,
+    // T84: needed to recompute `SEAT_MODEL_ENV` on a handover swap
+    // (`adapters::seat_model_env`), the same role this session's own first
+    // launch was composed for.
+    role: super::prompt::PromptRole,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
     // T13: the live mail wake-up. See `mail_polling_enabled` for the gates: a
     // session that cannot receive mail at all never reads the mailbox once.
     let mut mail_watch = MailWatch::default();
+    // Finding #7: `handover::take_request`'s own polling cadence, tracked
+    // independently of `mail_watch` -- see the check site's own doc comment.
+    let mut last_handover_poll: Option<Instant> = None;
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -2283,10 +2530,10 @@ fn pump(
                 code,
             });
             harvest_at_clean_exit(
-                adapter,
+                adapter.as_ref(),
                 transcript,
                 tail_items,
-                distiller_model,
+                distiller_model.as_str(),
                 distiller_timeout,
                 repo,
                 state_dir,
@@ -2305,10 +2552,10 @@ fn pump(
                     code,
                 });
                 harvest_at_clean_exit(
-                    adapter,
+                    adapter.as_ref(),
                     transcript,
                     tail_items,
-                    distiller_model,
+                    distiller_model.as_str(),
                     distiller_timeout,
                     repo,
                     state_dir,
@@ -2354,6 +2601,179 @@ fn pump(
             }
         }
 
+        // T84: `zirv ctx handover`. `take_request` is a real file read +
+        // remove, and used to run on *every* ~100ms pump tick for the
+        // session's entire lifetime -- the overwhelming majority of which
+        // find nothing there (finding #7, issue-close review). Gated on the
+        // same `MAIL_POLL` (2s) cadence the mail poll arm below already
+        // uses, tracked independently (`last_handover_poll`) so a session
+        // with mail polling disabled/degraded still gets its own cadence,
+        // and vice versa -- a handover request still answers within one
+        // cadence tick either way, since the request sits in a state-dir
+        // file until this loop notices it regardless of how often it looks.
+        // `may_inject` is exactly the "verified-idle turn boundary" check
+        // every other injection already gates on -- reusing it here is what
+        // "quiesce" means for this feature, per the module's own doc
+        // comment on `handover.rs`.
+        let now = Instant::now();
+        let handover_poll_due = handover_poll_due(last_handover_poll, now);
+        if handover_poll_due {
+            last_handover_poll = Some(now);
+        }
+        if handover_poll_due
+            && let Some(req) = super::handover::take_request(state_dir, &bar.session_short)
+        {
+            let may_act = handover_may_act(supervision, Instant::now(), debounce, req.force);
+            if !may_act {
+                let reason = "mid-turn; retry once idle, or pass --force".to_string();
+                super::handover::write_ack(
+                    state_dir,
+                    &bar.session_short,
+                    &super::handover::HandoverAck {
+                        ok: false,
+                        reason: Some(reason.clone()),
+                        ..Default::default()
+                    },
+                );
+                announcer.emit(&Event::HandoverRefused {
+                    reason: reason.clone(),
+                });
+                let _ = super::log::append(
+                    state_dir,
+                    &super::log::Decision {
+                        ts: super::state::now_secs(),
+                        session: session.as_str(),
+                        verb: "wrap",
+                        verdict: "handover",
+                        score: supervision.score,
+                        action: "handover-refused",
+                        detail: &reason,
+                    },
+                );
+            } else {
+                supervision.cooldown_at_signal = Some(supervision.signals_seen);
+                // Same P5 reasoning as a rot-triggered restart: park the
+                // record on zirv's own (unquestionably alive) pid for the
+                // duration of the swap, since a concurrent `sessions::list`
+                // sweep must never delete this very much live session's
+                // record while its old child is being killed and no new one
+                // exists yet.
+                session_guard.adopt_child_pid(std::process::id());
+                match perform_handover_swap(
+                    child,
+                    child_guard,
+                    session_guard,
+                    pair,
+                    writer,
+                    &generation,
+                    &tx,
+                    cpr_filter,
+                    bar,
+                    adapter,
+                    distiller_model,
+                    turn_env,
+                    transcript,
+                    server,
+                    session,
+                    repo,
+                    cfg,
+                    state_dir,
+                    role,
+                    memory_slug,
+                    grace,
+                    tail_items,
+                    distiller_timeout,
+                    last_size,
+                    announcer,
+                    &req,
+                ) {
+                    Ok(outcome) => {
+                        let stored_text = match &outcome.stored {
+                            Ok(path) => path.display().to_string(),
+                            Err(e) => format!("not stored: {e}"),
+                        };
+                        super::handover::write_ack(
+                            state_dir,
+                            &bar.session_short,
+                            &super::handover::HandoverAck {
+                                ok: true,
+                                reason: None,
+                                from_agent: Some(outcome.from_agent.clone()),
+                                from_model: Some(outcome.from_model.clone()),
+                                to_agent: Some(outcome.to_agent.clone()),
+                                to_model: Some(outcome.to_model.clone()),
+                                stored: Some(stored_text.clone()),
+                            },
+                        );
+                        announcer.emit(&Event::Handover {
+                            from_agent: outcome.from_agent.clone(),
+                            from_model: outcome.from_model.clone(),
+                            to_agent: outcome.to_agent.clone(),
+                            to_model: outcome.to_model.clone(),
+                            stored: stored_text.clone(),
+                        });
+                        let _ = super::log::append(
+                            state_dir,
+                            &super::log::Decision {
+                                ts: super::state::now_secs(),
+                                session: session.as_str(),
+                                verb: "wrap",
+                                verdict: "handover",
+                                score: supervision.score,
+                                action: "handover",
+                                detail: &format!(
+                                    "{}/{} -> {}/{} ({} handoff at {})",
+                                    outcome.from_agent,
+                                    outcome.from_model,
+                                    outcome.to_agent,
+                                    outcome.to_model,
+                                    outcome.source,
+                                    stored_text
+                                ),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let reason = e.to_string();
+                        super::handover::write_ack(
+                            state_dir,
+                            &bar.session_short,
+                            &super::handover::HandoverAck {
+                                ok: false,
+                                reason: Some(reason.clone()),
+                                ..Default::default()
+                            },
+                        );
+                        note_failure(
+                            supervision,
+                            Some((state_dir, session.as_str())),
+                            &reason,
+                            announcer,
+                        );
+                        let _ = super::log::append(
+                            state_dir,
+                            &super::log::Decision {
+                                ts: super::state::now_secs(),
+                                session: session.as_str(),
+                                verb: "wrap",
+                                verdict: "handover",
+                                score: supervision.score,
+                                action: "handover-failed",
+                                detail: &reason,
+                            },
+                        );
+                        let status = child.wait()?;
+                        let code = status.exit_code() as i32;
+                        announcer.emit(&Event::SessionEnded {
+                            agent: adapter.name().to_string(),
+                            code,
+                        });
+                        return Ok(code);
+                    }
+                }
+            }
+        }
+
         // T12b: ticks on the ordinary ~100ms poll, so the bar still
         // refreshes (usage, mail, a still-degrading session) both right
         // after a turn signal and during a long turn with none at all.
@@ -2393,7 +2813,7 @@ fn pump(
                     (Ok(()), Some(path)) => {
                         let seen = verify_compaction(
                             &mut Watcher::new(path.to_path_buf()),
-                            adapter,
+                            adapter.as_ref(),
                             Instant::now() + inject_timeout,
                         )
                         .unwrap_or(false);
@@ -2458,10 +2878,11 @@ fn pump(
                     .unwrap_or_default();
                 let ctx = adapter.structural_context(&jsonl, tail_items);
                 let (note, source) = handoff::distill_or_structural(
-                    adapter,
-                    distiller_model,
+                    adapter.as_ref(),
+                    distiller_model.as_str(),
                     &ctx,
                     distiller_timeout,
+                    announcer.enabled,
                 );
                 let stored = handoff::store(state_dir, repo, session.as_str(), &note);
                 // N6: opt-in (`cfg.memory.harvest`, default off) and only
@@ -2470,8 +2891,8 @@ fn pump(
                 // never turn a successful restart into a failed one.
                 if source == "distilled" {
                     let _ = super::memory::harvest_durable(
-                        adapter,
-                        distiller_model,
+                        adapter.as_ref(),
+                        distiller_model.as_str(),
                         &note,
                         repo,
                         state_dir,
@@ -2520,11 +2941,11 @@ fn pump(
                 let relaunched = match (new_generation, quit.is_ok()) {
                     (Some(new_generation), true) => {
                         match relaunch(
-                            adapter,
+                            adapter.as_ref(),
                             repo,
                             &note,
                             extra,
-                            turn_env,
+                            turn_env.as_slice(),
                             relaunch_size(bar, last_size),
                         ) {
                             Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
@@ -3493,6 +3914,42 @@ mod tests {
         );
     }
 
+    /// Finding #1: `wrap` launches/supervises a harness, so a syntax error
+    /// in the operator's own HOME `ctx.toml` must refuse outright (via
+    /// `CtxConfig::load_for_launch`) rather than silently degrading to
+    /// permissive pacing/policy/sandbox defaults right before a harness
+    /// spawns. Reached before the (later, weaker) undetected-command
+    /// refusal `a_wrap_outside_any_session_is_not_gated` exercises, proving
+    /// the config load itself is what fails here.
+    #[test]
+    fn a_home_layer_syntax_error_refuses_to_launch_naming_the_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(home.join(".zirv/ctx.toml"), "[score\n").expect("write broken home layer");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let mut args = wrap_args_in(&["echo", "hello"], false);
+        args.agent = None;
+
+        let err = run_with(
+            &args,
+            &repo,
+            &|_| None,
+            PromptRole::Worker,
+            None,
+            super::super::sessions::Verb::Wrap,
+        )
+        .expect_err("a broken home layer must refuse to launch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&home.join(".zirv").join("ctx.toml").display().to_string()),
+            "names the broken file: {msg}"
+        );
+    }
+
     // F3: a child never inherits another session's identity.
 
     /// The bind-failure case, which is the one that actually bit: `wrap`
@@ -4107,6 +4564,33 @@ mod tests {
     fn an_idle_user_at_a_turn_boundary_may_be_injected_into() {
         let now = Instant::now();
         assert!(may_inject(&ready_state(now), now, DEBOUNCE));
+    }
+
+    /// Issue #84, acceptance: "a swap mid-turn is refused without --force".
+    /// A fresh state (no turn boundary reported yet -- the same shape a
+    /// session mid-turn actually has, since it never satisfies `may_inject`'s
+    /// own `signals_seen > 0` precondition) refuses a plain handover request,
+    /// but `--force` overrides the refusal outright.
+    #[test]
+    fn a_handover_is_refused_mid_turn_without_force() {
+        let now = Instant::now();
+        let mid_turn = InjectionState::new();
+        assert!(
+            !handover_may_act(&mid_turn, now, DEBOUNCE, false),
+            "mid-turn, no --force: must refuse"
+        );
+        assert!(
+            handover_may_act(&mid_turn, now, DEBOUNCE, true),
+            "--force overrides the mid-turn refusal"
+        );
+    }
+
+    /// The mirror case: an idle session at a verified turn boundary needs no
+    /// `--force` at all.
+    #[test]
+    fn a_handover_at_an_idle_turn_boundary_needs_no_force() {
+        let now = Instant::now();
+        assert!(handover_may_act(&ready_state(now), now, DEBOUNCE, false));
     }
 
     #[test]
@@ -4798,6 +5282,30 @@ mod tests {
             "a 100ms tick must not read the filesystem"
         );
         assert!(watch.due(now + MAIL_POLL));
+    }
+
+    /// Finding #7: `handover::take_request` is a real file read + remove,
+    /// and used to run on every ~100ms pump tick for the session's entire
+    /// lifetime. `handover_poll_due` is the pure gate that now stops that --
+    /// mirrors `the_mailbox_is_not_read_on_every_pump_tick` above for the
+    /// mail poll's own identical cadence.
+    #[test]
+    fn the_handover_request_file_is_not_read_on_every_pump_tick() {
+        let now = Instant::now();
+        assert!(
+            handover_poll_due(None, now),
+            "the first tick, having never polled, must poll"
+        );
+
+        let last = Some(now);
+        assert!(
+            !handover_poll_due(last, now + PUMP_POLL),
+            "a 100ms tick must not read the handover-request file"
+        );
+        assert!(
+            handover_poll_due(last, now + MAIL_POLL),
+            "due again once a full cadence has elapsed"
+        );
     }
 
     #[test]
@@ -5716,6 +6224,61 @@ mod tests {
             &args[1..],
             &["--model".to_string(), "opus".to_string()],
             "`wrap -- claude --model opus` must not restart a bare claude"
+        );
+    }
+
+    /// Issue #84 acceptance: "cross-harness swap works in both directions...
+    /// including the case where the successor has no system-prompt injection
+    /// (codex) and must receive the packet on the task-prompt fallback
+    /// channel." `perform_handover_swap` relaunches through this exact
+    /// function (`relaunch_command`), generic over whichever `&dyn
+    /// AgentAdapter` the operator asked to swap to, with no adapter-specific
+    /// branching of its own. Both directions are exercised: codex receiving
+    /// a handoff distilled while claude was the seat, and claude receiving
+    /// one distilled while codex was. Codex's own `interactive_cmd` puts the
+    /// initial prompt positionally (`adapters/codex.rs::interactive_cmd`),
+    /// not behind any `-c developer_instructions=...` system-prompt flag --
+    /// the same positional channel claude's own restart already uses, so
+    /// this is not special-cased anywhere, only relied on.
+    #[test]
+    fn a_handover_carries_the_packet_on_the_task_prompt_channel_in_both_directions() {
+        use crate::commands::ctx::adapters::codex::CodexAdapter;
+
+        let handoff = Handoff {
+            task: "Wire the webhook".to_string(),
+            next_step: "Write the failing test".to_string(),
+            ..Handoff::default()
+        };
+
+        // claude -> codex
+        let codex = CodexAdapter::new(None);
+        let to_codex = relaunch_command(&codex, &handoff, &[]);
+        let codex_args: Vec<String> = to_codex
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            codex_args.iter().any(|a| a.contains("Wire the webhook")),
+            "codex must receive the packet positionally: {codex_args:?}"
+        );
+        assert!(
+            !codex_args
+                .iter()
+                .any(|a| a.contains("developer_instructions")),
+            "the restart channel is the task prompt, never codex's system-prompt \
+             flag: {codex_args:?}"
+        );
+
+        // codex -> claude
+        let claude = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let to_claude = relaunch_command(&claude, &handoff, &[]);
+        let claude_args: Vec<String> = to_claude
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            claude_args.iter().any(|a| a.contains("Wire the webhook")),
+            "claude must receive the packet positionally too: {claude_args:?}"
         );
     }
 

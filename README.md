@@ -1001,7 +1001,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, `review`, or `worker`; doing so is an error
+`dash.*` key, any `pace.*` key, `review`, `worker`, or `handover`; doing so is an error
 that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
 `ZIRV_CTX_*` variable below, which comes from the operator rather than the
 checkout:
@@ -1047,6 +1047,9 @@ checkout:
 | `pace.blind_delay_secs` | `ZIRV_CTX_PACE_BLIND_DELAY_SECS` |
 | `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
 | `worker` (`worker.claude`, `worker.codex`) | `ZIRV_CTX_WORKER_MODEL_CLAUDE` / `ZIRV_CTX_WORKER_MODEL_CODEX` |
+| `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
+| `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
+| `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
@@ -1076,7 +1079,9 @@ dashboard captures the mouse. `pace.*` closes it for usage pacing: a repo
 must not be able to flip a spend decision, re-enable the active vendor-API
 poll fallback an operator turned off, or change its cadence. `review`/`worker`
 close it for which model spends the operator's tokens running background
-review or delegated-worker sessions. `agent` closes a narrower hole
+review or delegated-worker sessions. `handover` closes the same hole for
+`zirv ctx handover`: a repo checkout must not be able to pick which harness
+or model the orchestrator seat swaps onto mid-session. `agent` closes a narrower hole
 discovered once codex shipped out of the box: an explicit `agent = "codex"`
 reaches `resolve_default`'s *configured* arm, which never consults the
 repo-narrowing guard the no-`agent`-configured fallback loop has (see
@@ -1530,9 +1535,9 @@ the explicit opt-out below do.
   `claude 2.1.240`: an in-repo write and a `cargo test` both run with no
   prompt; a write outside the workspace and a `rm -rf` are both refused.
   Still an honest **partial**: general credential-file reads are denied only
-  by omission (nothing pre-approves `cat`), not by a targeted rule, and this
-  is not a full harness-neutral command classifier — that is proposed, not
-  built, as issue #83.
+  by omission (nothing pre-approves `cat`), not by a targeted rule. The
+  harness-neutral command classifier that generates both harnesses' rule
+  sets is `[safety]`, described next.
 
 An operator's own explicit `--sandbox`/`--ask-for-approval`/`--permission-mode`/
 `--disallowedTools` (passed after `--`, or via `worker.claude`/`worker.codex`'s
@@ -1551,6 +1556,49 @@ enabled = false
 or `ZIRV_CTX_SANDBOX=false`. `sandbox.enabled` is `REPO_FORBIDDEN` (see
 [Trust boundary](#trust-boundary) above): a checkout cannot turn its own
 sandboxing off, only the operator can.
+
+### Command safety policy (issue #83)
+
+`[safety]` is zirv's own harness-neutral classification of shell commands —
+one declaration that both adapters project onto their native mechanism, so
+"never auto-run `rm -rf`, `git push --force`, `curl | sh`" means the same
+thing on claude and codex instead of being encoded twice, unevenly:
+
+```toml
+[safety]
+deny  = ["terraform destroy*"]   # additional deny patterns
+ask   = ["kubectl delete*"]      # additional ask patterns
+allow = ["just test*"]           # operator-only, REPO-FORBIDDEN
+default = "ask"                  # operator-only, REPO-FORBIDDEN
+```
+
+Rules are glob patterns (`*` matches any run of characters); a command is
+matched deny-first, then ask, then allow, first match wins within a
+category. A fresh install already blocks the obvious destructive families
+(recursive force-delete, force-push/history-rewrite, a download piped into
+a shell, `sudo`/`su`, credential-path reads) with no config written at all —
+the same built-in set `adapters::SHIPPED_POSTURE_ALLOW`/`_DENY` already
+verified live against claude, now the single source claude's generated
+`--allowedTools`/`--disallowedTools` pair and codex's `--sandbox`/
+`--ask-for-approval` flags are both derived from.
+
+`deny`/`ask` may be extended by a repo checkout (narrowing is always safe —
+both are checked before `allow`); `allow` and `default` may not (see the
+Trust boundary table above) — a checkout cannot grant itself its own
+approval or change what an unmatched command defaults to.
+
+Three verbs work with the resolved policy directly:
+
+```sh
+zirv ctx safety check -- rm -rf /        # prints the verdict, exits 0/1/2 for allow/ask/deny
+zirv ctx safety list                     # the effective merged policy, with each rule's origin
+zirv ctx safety explain -- git push --force   # why a command got its verdict
+```
+
+`zirv ctx safety check` (with no trailing command) is also what `zirv setup
+apply` wires into claude's `PreToolUse` hook for `Bash` calls, so the same
+evaluator zirv's own CLI uses is what claude consults before running a
+command — see [Context Management](#context-management-zirv-ctx).
 
 ## Supported Platforms
 - Windows (see the platform note under [Context Management](#context-management-zirv-ctx): `zirv ctx` supervision is unix only)

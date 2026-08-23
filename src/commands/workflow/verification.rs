@@ -741,12 +741,66 @@ fn report_dir(state: &StateDir, repo: &Path) -> PathBuf {
     state.verification().join(repo_slug(repo))
 }
 
+/// Default when the operator config cannot even be loaded (mirrors
+/// `TelemetryConfig::for_repo`'s own fail-safe default).
+const DEFAULT_VERIFICATION_RETENTION_DAYS: u64 = 30;
+
+/// Verification's own retention shares `[workflow] telemetry_retention_days`
+/// rather than adding a second `REPO_FORBIDDEN` key: that field lives in
+/// `src/commands/ctx/config.rs`, which was off-limits for this change (a
+/// concurrent branch was mid-edit on that file), and reusing an existing
+/// operator-controlled, already-clamped value is a safer choice than either
+/// hand-adding a parallel config surface later (drift risk) or a raw
+/// environment read (the exact anti-pattern `telemetry_retention_days`
+/// itself replaced -- see CLAUDE.md's workflow-telemetry passage). This
+/// function is the seam if a truly independent `verification_retention_days`
+/// key is added later: only this function's body would need to change.
+/// Recorded in the Decision Log and Known Issues.
+fn resolved_retention_days_from_config(cfg: &crate::commands::ctx::config::WorkflowConfig) -> u64 {
+    super::telemetry::TelemetryConfig::from_config(cfg).retention_days
+}
+
+/// A configuration that will not load at all disables neither reads nor
+/// writes here (verification always runs); it simply falls back to the
+/// default retention rather than an operator's real, unreadable intent.
+fn resolved_retention_days(repo: &Path) -> u64 {
+    match crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok()) {
+        Ok(cfg) => resolved_retention_days_from_config(&cfg.workflow),
+        Err(_) => DEFAULT_VERIFICATION_RETENTION_DAYS,
+    }
+}
+
+/// Zero-padded timestamp prefix, the same shape `telemetry.rs` names its own
+/// event files with, so `telemetry::prune_expired_except`'s filename-prefix
+/// age rule applies unchanged to this directory too -- see `save_report`.
+fn report_filename(report: &VerificationReport) -> String {
+    format!("{:020}-{}.json", report.finished_at, report.id)
+}
+
+/// Persists one report and prunes reports older than the resolved retention
+/// window. Reuses `telemetry::prune_expired_except` rather than adding a
+/// second pruner: this directory holds one file per verification run, named
+/// with the same leading-timestamp shape telemetry's own event files use, so
+/// the same age rule applies unchanged. The just-written report's own
+/// filename is passed as the one entry `prune_expired_except` must never
+/// remove -- `latest` must survive even a stale retention window, and
+/// pruning always runs relative to *this* report's own `finished_at`, so the
+/// report being written can never be older than the cutoff computed from its
+/// own timestamp regardless.
 fn save_report(state: &StateDir, report: &VerificationReport) -> CtxResult<()> {
     let dir = report_dir(state, &report.repo);
     create_private_dir_all(&dir)?;
     let body = serde_json::to_string_pretty(report)?;
-    write_private(&dir.join(format!("{}.json", report.id)), &body)?;
-    write_private(&dir.join("latest"), &report.id)?;
+    let filename = report_filename(report);
+    write_private(&dir.join(&filename), &body)?;
+    write_private(&dir.join("latest"), &filename)?;
+    let retention_days = resolved_retention_days(&report.repo);
+    super::telemetry::prune_expired_except(
+        &dir,
+        report.finished_at,
+        retention_days,
+        &[filename.as_str()],
+    );
     Ok(())
 }
 
@@ -756,8 +810,8 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<Verificati
     if !latest.exists() {
         return Ok(None);
     }
-    let id = std::fs::read_to_string(latest)?;
-    let path = dir.join(format!("{}.json", id.trim()));
+    let filename = std::fs::read_to_string(&latest)?;
+    let path = dir.join(filename.trim());
     let report: VerificationReport = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     if report.schema_version != VERIFY_REPORT_SCHEMA_VERSION {
         return Err(format!(
@@ -1259,12 +1313,17 @@ mod tests {
         assert!(!report.passed(), "a skipped check is not a passing check");
     }
 
-    /// An unparseable repo `ctx.toml` used to do two contradictory wrong
-    /// things: re-enable repo skills (fail open) and hard-error verification
-    /// (bricking `zirv test` in that checkout). Both now fail closed on the
-    /// security decision while the run itself still works.
+    /// A plain TOML *syntax* error in the repo's `ctx.toml` must not brick
+    /// verification (`run_mode` still succeeds). It also no longer disables
+    /// repo-supplied checks: `workflow.repo_checks_enabled` is itself
+    /// `REPO_FORBIDDEN` -- a repo file could never set it either way, parsed
+    /// or not -- so a merely-unparsable repo layer neither widens nor
+    /// narrows this gate (2026-08-23: `config.rs`'s `read_layer`/
+    /// `UnparsableLayer` skip a broken layer instead of failing the whole
+    /// load; see the sibling tests in `skill.rs` for the gate a repo
+    /// genuinely cannot widen, which still fails closed).
     #[test]
-    fn an_unparseable_repo_config_closes_the_check_gate_instead_of_failing_the_run() {
+    fn an_unparseable_repo_config_does_not_disable_a_gate_it_never_controlled() {
         let repo = git_repo();
         let state_root = tempdir().unwrap();
         write_verify_toml(
@@ -1279,8 +1338,12 @@ mod tests {
             run_mode(repo.path(), VerificationMode::Final, &[], false)
                 .expect("a malformed repo config must not brick verification")
         });
-        assert!(!repo.path().join("ran").exists());
-        assert_eq!(report.checks[0].status, CheckStatus::Skipped);
+        assert!(
+            repo.path().join("ran").exists(),
+            "repo_checks_enabled defaults true and a repo file could never set it either way, so \
+             a syntax error in that same file must not disable it"
+        );
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
     }
 
     /// A fingerprint taken *after* the checks records edits made during the
@@ -1428,6 +1491,101 @@ mod tests {
             3,
             "a command's own newline must not start a line of its own: {text:?}"
         );
+    }
+
+    /// #91: mirrors telemetry's own
+    /// `retention_and_event_caps_still_bound_an_operator_value` -- verification
+    /// shares telemetry's own retention config (see `resolved_retention_days_
+    /// from_config`'s doc comment), so an operator value bound for telemetry
+    /// is, by construction, bound the same way here.
+    #[test]
+    fn verification_retention_is_clamped_the_same_way_telemetry_is() {
+        let cfg = crate::commands::ctx::config::WorkflowConfig {
+            telemetry_retention_days: super::super::telemetry::MAX_CONFIGURED_RETENTION_DAYS * 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved_retention_days_from_config(&cfg),
+            super::super::telemetry::MAX_CONFIGURED_RETENTION_DAYS
+        );
+    }
+
+    fn minimal_report(repo: &Path, id: &str, finished_at: u64) -> VerificationReport {
+        VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: id.into(),
+            mode: VerificationMode::Final,
+            source: "configured".into(),
+            repo: repo.to_path_buf(),
+            change_fingerprint: 1,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: finished_at,
+            finished_at,
+            checks: vec![CheckResult {
+                id: "ok".into(),
+                kind: CheckKind::Custom,
+                command: "true".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+            }],
+        }
+    }
+
+    /// #91: after writes spanning past the retention window, the expired
+    /// report is pruned, the current `latest` report survives, and
+    /// `load_latest` still works against the pruned directory.
+    #[test]
+    fn expired_verification_reports_are_pruned_but_latest_survives() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+
+        // Default retention is 30 days (2,592,000s). `new_ts` is set far
+        // enough past `old_ts` that `old_ts` falls outside the window
+        // measured from `new_ts` -- deliberately independent of real
+        // wall-clock time, so the test has no flakiness budget to spend.
+        let old_ts: u64 = 10_000_000;
+        let new_ts: u64 = old_ts + 3_000_000;
+
+        let old = minimal_report(repo.path(), "old-report", old_ts);
+        save_report(&state, &old).unwrap();
+        let old_path = report_dir(&state, repo.path()).join(report_filename(&old));
+        assert!(old_path.exists(), "the first report was written");
+
+        let newest = minimal_report(repo.path(), "new-report", new_ts);
+        save_report(&state, &newest).unwrap();
+
+        assert!(
+            !old_path.exists(),
+            "the expired report must be pruned once a newer one is saved"
+        );
+        let loaded = load_latest(&state, repo.path())
+            .unwrap()
+            .expect("load_latest still succeeds against a pruned directory");
+        assert_eq!(loaded.id, "new-report");
+    }
+
+    /// #91: a lone report older than the retention window is still `latest`
+    /// -- pruning must never remove the file the `latest` pointer names, even
+    /// though nothing else is around to protect it.
+    #[test]
+    fn a_lone_expired_report_is_still_latest() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let report = minimal_report(repo.path(), "only-report", 10_000_000);
+        save_report(&state, &report).unwrap();
+
+        let loaded = load_latest(&state, repo.path())
+            .unwrap()
+            .expect("the only report on disk is still latest");
+        assert_eq!(loaded.id, "only-report");
     }
 
     #[test]

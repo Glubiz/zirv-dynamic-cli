@@ -39,6 +39,16 @@ model = "fable"
 # claude = "opus"                   # model for a delegated headless claude worker (`zirv ctx agent`, and the dashboard's own spawn-request pane). Default: unset (claude's own hard default "sonnet" -- see AgentAdapter::default_worker_model).
 # codex = "gpt-5.6-terra"           # model for a delegated headless codex worker. Default: unset (codex has no adapter-owned default, so its own CLI/config default applies).
 
+# [handover.claude]                 # every key below is REPO-FORBIDDEN (ZIRV_CTX_HANDOVER_CLAUDE_CHEAP / _STANDARD / _DEEP) -- model-id override for `zirv ctx handover`'s generic tiers on a claude target.
+# cheap = "haiku"                   # Default: unset (built-in ladder default "haiku").
+# standard = "sonnet"               # Default: unset (built-in ladder default "sonnet").
+# deep = "opus"                     # Default: unset (built-in ladder default "opus").
+
+# [handover.codex]                  # every key below is REPO-FORBIDDEN (ZIRV_CTX_HANDOVER_CODEX_CHEAP / _STANDARD / _DEEP) -- same, for a codex target.
+# cheap = "gpt-5.4-mini"            # Default: unset (built-in ladder default "gpt-5.4-mini").
+# standard = "gpt-5.6-terra"        # Default: unset (built-in ladder default "gpt-5.6-terra").
+# deep = "gpt-5.6-sol"              # Default: unset (built-in ladder default "gpt-5.6-sol").
+
 # [score]
 # window = 10                        # trailing turns the rolling rot score looks over
 # min_turns = 10                     # turns required before the score is trusted at all
@@ -132,6 +142,11 @@ model = "fable"
 # harvest_max_entries = 5            # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES): most durable entries one session's own automatic harvest may store. Default: 5.
 # harvest_max_bytes = 2048           # REPO-FORBIDDEN (ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES): cumulative byte budget for one session's own automatic harvest. Default: 2048.
 
+# [setup]                            # not REPO-FORBIDDEN: bookkeeping for the guided `zirv setup` flow, written only to ~/.zirv/ctx.toml.
+# backup_retention_runs = 20         # count cap on .zirv/backups/ai-reset runs, applied on the next write; the oldest run is always pinned outside this cap. Default: 20.
+# memory_harvest_offered = false     # set once the guided flow has asked about automatic memory harvest, so a decline is not re-asked. Default: false.
+# statusline_wrap_offered = false    # set once the guided flow has asked about wrapping an existing custom Claude statusLine. Default: false.
+
 # [chrome]
 # banner = true                      # the launch banner naming the resolved harness, the rule that chose it, and the session id
 # bar = true                         # the reserved bottom status bar
@@ -171,3 +186,17 @@ model = "fable"
 # approval = "allow"                 # "allow" = approvals may be bypassed, "ask" = must be requested, "deny" = attempt nothing needing approval (a read-only session). Default: "allow".
 # git_push_destructive = "allow"     # `git push`, and history-rewriting/destructive git. Default: "allow".
 # tool_access = "allow"              # which of the harness's own tools (including MCP servers) may run. Default: "allow".
+
+# [safety]                           # zirv's harness-neutral command safety policy (src/commands/ctx/safety.rs, issue #83).
+# `deny`/`ask` are NOT REPO-FORBIDDEN and do NOT deep-merge: a repo checkout
+# may ADD entries to either (narrowing is always safe -- deny and ask are
+# both checked before allow), unioned with the operator's own home-layer
+# entries and the built-in set derived from adapters::SHIPPED_POSTURE_ALLOW/
+# _DENY (always present regardless of configuration). `allow` and `default`
+# ARE REPO-FORBIDDEN (ZIRV_CTX_SAFETY_ALLOW / ZIRV_CTX_SAFETY_DEFAULT):
+# adding an allow entry or changing the unmatched-command default can only
+# ever widen the effective policy, never narrow it.
+# deny = ["terraform destroy*"]      # additional deny patterns, unioned with the built-in set. Default: [] (built-in set only).
+# ask = ["kubectl delete*"]          # additional ask patterns, unioned with the built-in set. Default: [] (built-in set only).
+# allow = ["just test*"]             # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_ALLOW): additional allow patterns, operator-only. Default: [] (built-in set only).
+# default = "ask"                    # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_DEFAULT): verdict for a command matching no rule. Default: "ask".

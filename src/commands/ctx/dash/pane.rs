@@ -1379,6 +1379,157 @@ impl Pane {
         Ok(())
     }
 
+    /// Issue #84: swaps this pane's harness/model in place, keeping its
+    /// registry short id (the same socket, the same mail/nudge address) --
+    /// only the pty, the child, its job/console-close guard, the writer, the
+    /// reader channel, the vt100 screen, and the turn-signal capability/
+    /// idle-quiet knobs the new adapter carries are replaced. Mirrors
+    /// `Pane::spawn`'s own pty assembly and `wrap::quit_child`'s ask-then-
+    /// escalate shutdown of the old child; resolving the new adapter, its
+    /// argv, and its turn-signal env goes through the exact same
+    /// `handover::resolve_swap_launch`/`build_turn_env` seams
+    /// `wrap::perform_handover_swap` uses, so the two live-swap call sites
+    /// can never drift on what a swap's fresh launch actually carries. The
+    /// handoff packet rides the same positional/task-prompt channel every
+    /// restart already uses (`wrap::restart_prompt` -- never a system-prompt
+    /// injection), so a target adapter with no system-prompt mechanism at
+    /// all (codex) receives it exactly the same way.
+    ///
+    /// The caller has already decided this is a safe moment to act (`Pane::
+    /// state() == PaneState::Idle`, or the operator's own explicit override)
+    /// before calling this -- this method itself does not gate on idleness,
+    /// the same division of responsibility `inject_visible` already follows.
+    pub fn handover(
+        &mut self,
+        cfg: &super::super::config::CtxConfig,
+        req: &super::super::handover::HandoverRequest,
+        handoff_note: &super::super::handoff::Handoff,
+        role: PromptRole,
+        repo: &Path,
+        size: (u16, u16),
+    ) -> CtxResult<()> {
+        let (new_adapter, extra) = super::super::handover::resolve_swap_launch(cfg, req)?;
+        let new_argv: Vec<String> = {
+            let prompt_text = wrap::restart_prompt(handoff_note);
+            let command = new_adapter.interactive_cmd(Some(&prompt_text), &extra);
+            std::iter::once(command.get_program().to_string_lossy().to_string())
+                .chain(command.get_args().map(|a| a.to_string_lossy().to_string()))
+                .collect()
+        };
+        let turn_env = super::super::handover::build_turn_env(
+            new_adapter.as_ref(),
+            self.server.as_ref(),
+            &self.session_id,
+            repo,
+            role,
+            req.target_model.as_deref(),
+        );
+        let quit_sequence = new_adapter.quit_sequence().to_string();
+        let new_agent_name = new_adapter.name().to_string();
+        let turn_signal_capable = new_adapter.capabilities().turn_signal;
+        let idle_quiet = Duration::from_millis(cfg.dash.idle_quiet_ms);
+
+        // Finding #2: every fallible step for the *successor* runs first,
+        // before the old child is touched at all. Previously the old child
+        // was quit and its lifecycle released up front, so a later failure
+        // here (a missing adapter binary hitting `guard_cmd_shim_reparse`,
+        // a pty/spawn failure) left a dead pane still pinned to the
+        // dashboard's own pid with no child to show for it. Now, on any
+        // `?` below, `self` is untouched and the old child keeps running.
+        let (cols, rows) = size;
+        let pair = native_pty_system().openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let (program, rest) = new_argv
+            .split_first()
+            .ok_or("dashboard pane: empty argv, nothing to spawn")?;
+        super::super::adapters::guard_cmd_shim_reparse(program, rest)?;
+        let mut command = CommandBuilder::new(program);
+        for arg in rest {
+            command.arg(arg);
+        }
+        command.cwd(repo);
+        sessions::scrub_supervision_env(&mut command);
+        for (key, value) in &turn_env {
+            command.env(key, value);
+        }
+
+        let mut first_writer = pair.master.take_writer()?;
+        wrap::answer_inherit_cursor_probe(&mut *first_writer);
+        let writer = Arc::new(Mutex::new(first_writer));
+
+        let child = pair.slave.spawn_command(command)?;
+        let lifecycle = supervise::ChildGuard::adopt(child.process_id());
+        drop(pair.slave);
+        let master = pair.master;
+
+        let mut reader = master.try_clone_reader()?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        // The successor is fully assembled and alive now -- only committing
+        // remains, so it is safe to retire the old child.
+        //
+        // P5 (mirrors `wrap`'s own restart/handover arm): park the record on
+        // the dashboard's own (unquestionably alive) pid for the duration of
+        // the swap, so a concurrent `sessions::list` sweep -- the
+        // dashboard's own ~1s refresh included -- can never delete this very
+        // much live pane's record while the old child is being killed and no
+        // new one exists yet.
+        self.guard.adopt_child_pid(std::process::id());
+        {
+            let mut writer_guard = self
+                .writer
+                .lock()
+                .map_err(|_| "dashboard pane: writer lock poisoned")?;
+            let sink: &mut dyn Write = &mut **writer_guard;
+            wrap::quit_child(sink, &mut self.child, &quit_sequence, QUIT_GRACE)?;
+        }
+        // The old child is gone (or as gone as `quit_child` could make it),
+        // so it leaves the console-close registry and its job handle closes
+        // -- the same explicit release `shutdown` performs, except this pane
+        // is not itself ending: the new child's own guard, adopted above, is
+        // committed into `self.lifecycle` right below.
+        self.lifecycle.release();
+
+        if let Some(child_pid) = child.process_id() {
+            self.guard.adopt_child_pid(child_pid);
+        }
+
+        self.agent_name = new_agent_name;
+        self.master = master;
+        self.child = child;
+        self.lifecycle = lifecycle;
+        self.writer = writer;
+        self.rx = rx;
+        self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
+        self.turn_signal_capable = turn_signal_capable;
+        self.idle_quiet = idle_quiet;
+        self.last_signal_at = None;
+        self.last_output_at = None;
+        self.last_local_input_at = None;
+        self.injected_awaiting_turn = false;
+        self.user_typed_since_turn = false;
+        self.exit_code = None;
+
+        Ok(())
+    }
+
     /// Caches the child's exit code the first time it is observed, so
     /// `state()` can stay a cheap, side-effect-free read: `try_wait` needs
     /// `&mut Child`, `state()` does not take `&mut self`, so every mutating
@@ -2447,6 +2598,78 @@ pub(crate) mod tests {
 
         pane.shutdown("").expect("first shutdown");
         pane.shutdown("").expect("shutdown must be idempotent");
+    }
+
+    /// Finding #2: a failure in the *successor's* setup (here, a missing
+    /// adapter binary -- `resolve_program` does not check existence, so
+    /// `ready()`/`resolve_swap_launch` succeed and the OS spawn itself is
+    /// what fails) must leave the old pane running untouched, not dead and
+    /// pinned to the dashboard's own pid. Before the fix, the old child was
+    /// quit and its lifecycle released before this failure could even be
+    /// observed.
+    #[test]
+    fn handover_failure_in_successor_setup_leaves_the_old_pane_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "22222222-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        spec.agent_name = "claude".to_string();
+        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
+            .expect("spawn");
+
+        let old_agent_name = pane.agent().to_string();
+        assert!(
+            !matches!(pane.state(), PaneState::Ended(_)),
+            "the long-lived child must still be alive before the failing handover"
+        );
+
+        let cfg = crate::commands::ctx::config::CtxConfig {
+            agent_bin: Some(
+                tmp.path()
+                    .join("no-such-adapter-binary")
+                    .display()
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let req = crate::commands::ctx::handover::HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+        };
+        let handoff_note = crate::commands::ctx::handoff::Handoff::default();
+
+        let err = pane
+            .handover(
+                &cfg,
+                &req,
+                &handoff_note,
+                PromptRole::Worker,
+                &repo,
+                (80, 24),
+            )
+            .expect_err("a missing adapter binary must fail the swap, not silently succeed");
+        assert!(
+            !err.to_string().is_empty(),
+            "must report why the swap failed"
+        );
+
+        assert_eq!(
+            pane.agent(),
+            old_agent_name,
+            "the old pane's identity must be unchanged after a failed swap"
+        );
+        assert!(
+            !matches!(pane.state(), PaneState::Ended(_)),
+            "the old child must still be running -- it must never have been quit"
+        );
+
+        pane.shutdown("").expect("shutdown");
     }
 
     /// R3, end to end on a real supervised child: an idle pane that is

@@ -295,19 +295,19 @@ pub fn store(
     store_to(state, repo_slug, repo_slug, msg, cfg)
 }
 
-/// Writes `msg` under `<state>/mail/<dest_slug>/`, truncating an oversized
-/// body (never failing the store) and pruning the directory down to the
-/// newest unread messages. `sender_slug` is the storing session's *own* repo
-/// slug: when it differs from `dest_slug` the sender is writing into somebody
-/// else's mailbox and only the neutral limits apply (see `limits_for`).
-pub fn store_to(
-    state: &StateDir,
+/// Shared store body for `store_to`/`store_fanout`: writes `msg` into `dir`,
+/// truncating an oversized body (never failing the store) and pruning the
+/// directory down to the newest unread messages. `dest_slug`/`sender_slug`
+/// feed `limits_for` exactly as they always have; `dir` is the only thing
+/// that differs between an ordinary mailbox and its `fanout/` subdirectory
+/// (see `store_fanout`).
+fn store_into(
+    dir: PathBuf,
     dest_slug: &str,
     sender_slug: &str,
     msg: &Message,
     cfg: &CtxConfig,
 ) -> CtxResult<PathBuf> {
-    let dir = state.mail().join(dest_slug);
     super::state::create_private_dir_all(&dir)?;
 
     let (keep, cap) = limits_for(cfg, dest_slug, sender_slug);
@@ -335,6 +335,51 @@ pub fn store_to(
     Ok(path)
 }
 
+/// Writes `msg` under `<state>/mail/<dest_slug>/`, truncating an oversized
+/// body (never failing the store) and pruning the directory down to the
+/// newest unread messages. `sender_slug` is the storing session's *own* repo
+/// slug: when it differs from `dest_slug` the sender is writing into somebody
+/// else's mailbox and only the neutral limits apply (see `limits_for`).
+pub fn store_to(
+    state: &StateDir,
+    dest_slug: &str,
+    sender_slug: &str,
+    msg: &Message,
+    cfg: &CtxConfig,
+) -> CtxResult<PathBuf> {
+    store_into(
+        state.mail().join(dest_slug),
+        dest_slug,
+        sender_slug,
+        msg,
+        cfg,
+    )
+}
+
+/// `store_to`'s fan-out counterpart (`SendArgs::all`): writes into a
+/// dedicated `fanout/` subdirectory of the same mailbox instead of alongside
+/// ordinary messages. That is deliberately the *only* difference -- same
+/// `Message` shape, same truncation/pruning/collision-suffix behavior via
+/// `store_into` -- so `list`/`consume_reading` can tell a fan-out message
+/// apart from an ordinary one purely from its own path, with no new field on
+/// `Message` and so no change to any of the many existing call sites across
+/// the codebase that build one. See the Decision Log entry on `--all`.
+fn store_fanout(
+    state: &StateDir,
+    dest_slug: &str,
+    sender_slug: &str,
+    msg: &Message,
+    cfg: &CtxConfig,
+) -> CtxResult<PathBuf> {
+    store_into(
+        state.mail().join(dest_slug).join("fanout"),
+        dest_slug,
+        sender_slug,
+        msg,
+        cfg,
+    )
+}
+
 /// Lists unread messages for `repo_slug`, oldest first, visible to
 /// `for_agent` (or every message when `for_agent` is `None`) AND visible to
 /// `for_session`. Individual files that cannot be read or parsed are skipped
@@ -348,6 +393,29 @@ pub fn store_to(
 /// addressed to a specific session (`to_session = Some(s)`) is then visible
 /// only when `short == s`; a message with no `to_session` at all stays
 /// visible to every session regardless.
+fn agent_matches(msg: &Message, for_agent: Option<&str>) -> bool {
+    match for_agent {
+        None => true,
+        Some(agent) => msg.to.eq_ignore_ascii_case("any") || msg.to.eq_ignore_ascii_case(agent),
+    }
+}
+
+/// The `.md` files directly inside `dir`, oldest first. The zero-padded
+/// seconds prefix in each file name sorts lexicographic order into
+/// chronological order, the same convention `state::now_secs` documents for
+/// handoffs and log lines. A sibling directory (`read/`, `fanout/`, a
+/// fan-out message's own `<base>.read/` marker directory) is excluded by the
+/// `is_file` filter, same as it always has been.
+fn scan_md_files(dir: &Path) -> CtxResult<Vec<PathBuf>> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md"))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 pub fn list(
     state: &StateDir,
     repo_slug: &str,
@@ -355,40 +423,61 @@ pub fn list(
     for_session: Option<&str>,
 ) -> CtxResult<Vec<(PathBuf, Message)>> {
     let dir = state.mail().join(repo_slug);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    // The zero-padded seconds prefix in each file name sorts lexicographic
-    // order into chronological order, the same convention `state::now_secs`
-    // documents for handoffs and log lines. `read/`, a directory rather than
-    // a `.md` file, is excluded by the `is_file` filter below.
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md"))
-        .collect();
-    paths.sort();
-
     let mut out = Vec::new();
-    for path in paths {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let msg = parse_markdown(&text);
-        let agent_visible = match for_agent {
-            None => true,
-            Some(agent) => msg.to.eq_ignore_ascii_case("any") || msg.to.eq_ignore_ascii_case(agent),
-        };
-        let session_visible = match (for_session, &msg.to_session) {
-            (None, _) => true,
-            (Some(_), None) => true,
-            (Some(want), Some(addressed)) => addressed == want,
-        };
-        if agent_visible && session_visible {
-            out.push((path, msg));
+
+    if dir.is_dir() {
+        for path in scan_md_files(&dir)? {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let msg = parse_markdown(&text);
+            let session_visible = match (for_session, &msg.to_session) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(want), Some(addressed)) => addressed == want,
+            };
+            if agent_matches(&msg, for_agent) && session_visible {
+                out.push((path, msg));
+            }
         }
     }
+
+    // Fan-out messages (`SendArgs::all`) live in a dedicated `fanout/`
+    // subdirectory, stored by `store_fanout`. They are visible to every
+    // session's broad view (`for_session = None`) exactly like an ordinary
+    // undirected message, but for the narrow, per-session view every real
+    // delivery seam uses, a message this session has already marked read
+    // (its own `<base>.read/<short>` marker exists, see `consume_reading`)
+    // is excluded -- the per-session counterpart to an ordinary message's
+    // single-shot move into `read/`, which would otherwise hide the message
+    // from every OTHER live session too, not just the one that read it. A
+    // session with no marker yet is shown regardless of whether it existed
+    // when the message was sent, which is what lets a session that launches
+    // later still receive it on its first read. See the Decision Log entry
+    // on `--all`.
+    let fanout_dir = dir.join("fanout");
+    if fanout_dir.is_dir() {
+        for path in scan_md_files(&fanout_dir)? {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let msg = parse_markdown(&text);
+            let already_read = match for_session {
+                None => false,
+                Some(short) => {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default();
+                    fanout_dir.join(format!("{stem}.read")).join(short).exists()
+                }
+            };
+            if agent_matches(&msg, for_agent) && !already_read {
+                out.push((path, msg));
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -435,19 +524,80 @@ pub fn consume(state: &StateDir, repo_slug: &str, path: &Path) -> CtxResult<()> 
     Ok(())
 }
 
-/// `consume`, plus a decision-log trail naming the mail file and who claimed
-/// it (issue #30). Every path that consumes mail on a session's *behalf*
-/// -- rather than in answer to that session's own explicit `zirv ctx inbox`
-/// call -- goes through this instead of the bare `consume` above: a
-/// supervisor folding mail into a launch prompt (`exec`/`loop`), a
+/// Consumes `path` on behalf of `reader`. An ordinary message is moved into
+/// `read/`, exactly what `consume` above always did -- unaffected whether
+/// `reader` is known or not.
+///
+/// A **fan-out** message (`SendArgs::all`, stored under the mailbox's
+/// `fanout/` subdirectory by `store_fanout`) is different by design: the
+/// whole point of `--all` is that one session's read must not remove the
+/// message for every other live session, so instead of moving the file this
+/// touches a per-reader marker (`<fanout>/<base>.read/<reader>`) and leaves
+/// the message itself in place for `list` to keep offering to every session
+/// whose own marker is still absent -- including one that only launches
+/// after the send (see the Decision Log entry on `--all`). `reader = None`
+/// -- a caller with no session identity at all -- cannot participate in that
+/// per-session tracking (there is no id to mark against), so it falls back
+/// to the same destructive move an identity-less read of an ordinary message
+/// already gets.
+fn consume_reading(
+    state: &StateDir,
+    repo_slug: &str,
+    path: &Path,
+    reader: Option<&str>,
+) -> CtxResult<()> {
+    if let Some(reader) = reader
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("fanout")
+    {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let read_dir = path.with_file_name(format!("{stem}.read"));
+        super::state::create_private_dir_all(&read_dir)?;
+        let marker = read_dir.join(reader);
+        if !marker.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&marker)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::File::create(&marker)?;
+            }
+        }
+        return Ok(());
+    }
+    consume(state, repo_slug, path)
+}
+
+/// `consume_reading`, plus a decision-log trail naming the mail file and who
+/// claimed it (issue #30). Every path that consumes mail on a session's
+/// *behalf* -- rather than in answer to that session's own explicit `zirv
+/// ctx inbox` call -- goes through this instead of the bare `consume` above:
+/// a supervisor folding mail into a launch prompt (`exec`/`loop`), a
 /// dashboard sweep injecting it into a pane, `fulfill_spawn_request`
 /// consuming what a freshly spawned worker's own prompt already carries,
 /// and the dashboard's mail-overlay `Consume` effect. Without a trail, a
 /// message one of these claimed on a session's behalf simply vanished from
 /// every consumer's view -- `zirv ctx inbox` included -- with nothing
-/// recorded anywhere to say who took it or why.
+/// recorded anywhere to say who took it or why. `session` doubles as the
+/// reader identity `consume_reading` needs to tell a fan-out message's
+/// per-session marker apart from another session's -- every one of the call
+/// sites above already passes the consuming session's own registry short as
+/// `session`, so this needed no new parameter to pick up fan-out awareness.
 ///
-/// `zirv ctx inbox` itself deliberately stays on the bare `consume`: it is
+/// `zirv ctx inbox` itself deliberately stays off this function's own
+/// decision-log trail (it calls `consume_reading` directly instead): it is
 /// the read-once contract's own primary, expected consumer, and logging
 /// every ordinary inbox read would just be noise for the common case this
 /// mechanism exists to make visible.
@@ -460,9 +610,9 @@ pub fn consume(state: &StateDir, repo_slug: &str, path: &Path) -> CtxResult<()> 
 ///
 /// Best-effort like every other piece of state-dir housekeeping: a log
 /// write that fails must never make an already-successful consume look like
-/// it failed, so only `consume`'s own result is returned, and the log write
-/// is attempted (its own failure swallowed) only once that has already
-/// succeeded.
+/// it failed, so only `consume_reading`'s own result is returned, and the
+/// log write is attempted (its own failure swallowed) only once that has
+/// already succeeded.
 pub fn consume_and_log(
     state: &StateDir,
     repo_slug: &str,
@@ -471,7 +621,7 @@ pub fn consume_and_log(
     verb: &str,
     consumer: &str,
 ) -> CtxResult<()> {
-    consume(state, repo_slug, path)?;
+    consume_reading(state, repo_slug, path, Some(session))?;
     let file_id = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -500,8 +650,19 @@ pub struct SendArgs {
     /// the live session registry the same way every other session-prefix
     /// argument in `zirv ctx` is: an unknown or ambiguous prefix refuses
     /// with the resolver's own candidate-naming error.
-    #[arg(long = "to-session")]
+    #[arg(long = "to-session", conflicts_with = "all")]
     pub to_session: Option<String>,
+    /// Fan out to every currently live session independently, instead of
+    /// the default undirected send's first-come-first-served claim (see
+    /// `to`/`to_session` above): each live session receives and consumes
+    /// its own copy, and one session reading it does not remove it for any
+    /// other. A session that has not launched yet still receives it on its
+    /// first read after it does -- read tracking, not a snapshot of who was
+    /// live at send time (see the Decision Log entry on `--all`). Refused
+    /// together with `--to-session`: fanning out to every live session and
+    /// addressing one specific session are contradictory asks.
+    #[arg(long)]
+    pub all: bool,
     /// Message text. When omitted, read from `--message-file`, else from
     /// stdin.
     #[arg(long)]
@@ -599,6 +760,36 @@ pub fn run_send_with<W: Write>(
     }
 
     let state = StateDir::resolve(env)?;
+    let own_slug = repo_slug(repo);
+
+    // `--all`: a fan-out send, deliberately a separate mechanism from the
+    // undirected first-come-first-served claim below rather than a variant
+    // of it -- see the Decision Log entry on `--all`. Refused together with
+    // `--to-session` at the clap level (`conflicts_with`): addressing one
+    // specific session and fanning out to every live one are contradictory
+    // asks, so there is no `resolved` to compute here. Repo-scoped exactly
+    // like the undirected send: it fans out to every live session that
+    // shares this send's own repo mailbox, not to another checkout.
+    if args.all {
+        let msg = Message {
+            from_session: identity_or_unknown(env, SESSION_ENV),
+            from_agent: identity_or_unknown(env, AGENT_ENV),
+            to: args.to.clone().unwrap_or_else(|| "any".to_string()),
+            to_session: None,
+            sent: now_secs(),
+            body,
+        };
+        store_fanout(&state, &own_slug, &own_slug, &msg, &cfg)?;
+        writeln!(
+            w,
+            "zirv ctx send: message fanned out for {} in {} -- every live session receives and \
+             consumes its own independent copy (including one that has not launched yet), unlike \
+             an undirected send",
+            msg.to, own_slug
+        )?;
+        return Ok(0);
+    }
+
     // Resolved before the message is built: delivery must not depend on the
     // registry surviving (a_message_survives_the_registry_record_being_
     // removed), so what gets stored is the resolved short id itself, not a
@@ -624,7 +815,6 @@ pub fn run_send_with<W: Write>(
     // session never reads, and it was never seen again. An undirected
     // (broadcast) message still goes to the sender's own repo, which is the
     // only repo it means anything in.
-    let own_slug = repo_slug(repo);
     let slug = match &resolved {
         Some(record) => record.repo_slug.clone(),
         None => own_slug.clone(),
@@ -713,11 +903,22 @@ pub fn run_inbox_with<W: Write>(
     // Either way `for_agent` still applies, and directed mail for another
     // session is neither shown nor consumed here, with or without an
     // identity.
+    // Also the reader identity for a fan-out message's per-session marker
+    // (`consume_reading`, below): `None` on `--peek` (nothing is consumed
+    // either way) or when the caller has no identity at all, in which case a
+    // fan-out message falls back to the same destructive read every other
+    // identity-less consume already gets.
+    let reader = if args.peek {
+        None
+    } else {
+        session_identity(env)
+    };
+
     let messages = if args.peek {
         list(&state, &slug, for_agent.as_deref(), None)?
     } else {
-        match session_identity(env) {
-            Some(short) => list(&state, &slug, for_agent.as_deref(), Some(&short))?,
+        match &reader {
+            Some(short) => list(&state, &slug, for_agent.as_deref(), Some(short))?,
             None => list(&state, &slug, for_agent.as_deref(), None)?
                 .into_iter()
                 .filter(|(_, msg)| msg.to_session.is_none())
@@ -732,7 +933,11 @@ pub fn run_inbox_with<W: Write>(
             write!(w, "{}", msg.to_markdown())?;
         }
         if !args.peek {
-            consume(&state, &slug, path)?;
+            // A fan-out message (see `list`'s own fan-out scan and
+            // `consume_reading`'s doc comment) is marked read for this
+            // reader alone rather than moved, so another live session's own
+            // `zirv ctx inbox` still finds it.
+            consume_reading(&state, &slug, path, reader.as_deref())?;
         }
     }
     Ok(0)
@@ -1354,6 +1559,7 @@ This should not appear in the body.\n";
         SendArgs {
             to: None,
             to_session: None,
+            all: false,
             message: Some(message.to_string()),
             message_file: None,
         }
@@ -1434,6 +1640,203 @@ This should not appear in the body.\n";
         );
     }
 
+    // Issue #94: `--all` is a genuine fan-out primitive alongside the
+    // undirected first-come-first-served claim exercised above, not a
+    // variant of it. See the Decision Log entry on `--all` for the design
+    // (per-session read tracking against a `fanout/` subdirectory rather
+    // than per-session copies at send time) and the late-joiner rule.
+
+    /// The core of the issue: two live sessions must each receive their own
+    /// independent copy of a fan-out message, and one of them consuming it
+    /// must not remove it for the other.
+    #[test]
+    fn a_fan_out_send_is_received_by_every_live_session_independently() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let slug = repo_slug(&repo);
+
+        let guard_a = sessions::SessionGuard::register(
+            &state,
+            sessions::Record::new(
+                "aaaaaaaa-1111-4111-8111-111111111111",
+                "claude",
+                &repo,
+                sessions::Verb::Exec,
+            ),
+        );
+        let guard_b = sessions::SessionGuard::register(
+            &state,
+            sessions::Record::new(
+                "bbbbbbbb-2222-4222-8222-222222222222",
+                "claude",
+                &repo,
+                sessions::Verb::Exec,
+            ),
+        );
+        let short_a = guard_a.short().to_string();
+        let short_b = guard_b.short().to_string();
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to: None,
+            to_session: None,
+            all: true,
+            message: Some("everyone read this".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_send_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect("fan-out send");
+        let confirmation = String::from_utf8(out).expect("utf8");
+        assert!(
+            confirmation.contains("fanned out"),
+            "the confirmation must name the fan-out mode: {confirmation:?}"
+        );
+
+        let for_a = list(&state, &slug, None, Some(&short_a)).expect("list a");
+        let for_b = list(&state, &slug, None, Some(&short_b)).expect("list b");
+        assert_eq!(for_a.len(), 1, "session a must see the fan-out message");
+        assert_eq!(for_b.len(), 1, "session b must see it too, independently");
+
+        consume_and_log(&state, &slug, &for_a[0].0, &short_a, "exec", "exec:test")
+            .expect("consume for a");
+        assert!(
+            for_a[0].0.exists(),
+            "a fan-out message is marked read per session, never moved or deleted"
+        );
+
+        let for_b_after = list(&state, &slug, None, Some(&short_b)).expect("list b after");
+        assert_eq!(
+            for_b_after.len(),
+            1,
+            "one session consuming a fan-out message must not remove it from another"
+        );
+        let for_a_after = list(&state, &slug, None, Some(&short_a)).expect("list a after");
+        assert!(
+            for_a_after.is_empty(),
+            "but it is gone from the session that already read it"
+        );
+    }
+
+    /// The design decision recorded in the Decision Log: fan-out visibility
+    /// is per-session read tracking, not a snapshot of who was live when the
+    /// message was sent, so a session that only registers afterward still
+    /// receives it on its first read.
+    #[test]
+    fn a_fan_out_message_is_still_visible_to_a_session_that_launches_after_the_send() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+
+        let msg = Message {
+            from_session: "sender01".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 1_700_000_000,
+            body: "heads up, everyone".to_string(),
+        };
+        store_fanout(&state, slug, slug, &msg, &cfg).expect("store fan-out");
+
+        // "late0001" never existed in any registry at send time -- its short
+        // id simply has no read marker yet, which is what makes it visible.
+        let late_joiner = list(&state, slug, None, Some("late0001")).expect("list");
+        assert_eq!(
+            late_joiner.len(),
+            1,
+            "a session that only appears after the send still receives the fan-out message"
+        );
+    }
+
+    /// `zirv ctx inbox` (a session's own explicit read) must apply the same
+    /// per-session marking as the worker delivery paths (`consume_and_log`,
+    /// covered above): consuming a fan-out message through inbox must not
+    /// remove it for a different session.
+    #[test]
+    fn inbox_marks_a_fan_out_message_read_without_removing_it_for_other_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(tmp.path());
+        let msg = Message {
+            from_session: "sender01".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 1,
+            body: "fan-out note".to_string(),
+        };
+        store_fanout(&state, &slug, &slug, &msg, &cfg).expect("store fan-out");
+
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "reader01"),
+            (AGENT_ENV, "claude"),
+        ]);
+        let args = InboxArgs {
+            peek: false,
+            consume: false,
+            json: false,
+        };
+
+        let mut first = Vec::new();
+        run_inbox_with(&args, &mut first, tmp.path(), &|k| env.get(k).cloned())
+            .expect("first inbox read");
+        assert!(!first.is_empty(), "first read prints the fan-out message");
+
+        let mut second = Vec::new();
+        run_inbox_with(&args, &mut second, tmp.path(), &|k| env.get(k).cloned())
+            .expect("second inbox read");
+        assert!(
+            second.is_empty(),
+            "this reader already consumed its own copy: {second:?}"
+        );
+
+        // A different session's own view must be unaffected.
+        let other = list(&state, &slug, None, Some("other001")).expect("list for another session");
+        assert_eq!(
+            other.len(),
+            1,
+            "another session's own read is independent of reader01's"
+        );
+    }
+
+    /// `--all` and `--to-session` are contradictory: fanning out to every
+    /// live session and addressing one specific session cannot both be
+    /// meant at once. Enforced at the clap level (`conflicts_with`), pinned
+    /// here through the real CLI parser rather than by constructing
+    /// `SendArgs` directly (which has no parse-time validation of its own).
+    #[test]
+    fn all_and_to_session_are_refused_together_by_the_cli_parser() {
+        use clap::Parser;
+        let result = crate::commands::ctx::CtxCli::try_parse_from([
+            "zirv-ctx",
+            "send",
+            "--all",
+            "--to-session",
+            "abcd1234",
+            "--message",
+            "hi",
+        ]);
+        assert!(
+            result.is_err(),
+            "--all and --to-session are contradictory asks and must be refused together"
+        );
+    }
+
     #[test]
     fn send_falls_back_to_an_unknown_sender_rather_than_refusing() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1476,6 +1879,7 @@ This should not appear in the body.\n";
         let args = SendArgs {
             to: None,
             to_session: None,
+            all: false,
             message: None,
             message_file: None,
         };
@@ -1730,6 +2134,7 @@ This should not appear in the body.\n";
         let args = SendArgs {
             to: None,
             to_session: Some("abcd".to_string()),
+            all: false,
             message: Some("nudge payload".to_string()),
             message_file: None,
         };
@@ -1800,6 +2205,7 @@ This should not appear in the body.\n";
         let args = SendArgs {
             to: None,
             to_session: Some(short.clone()),
+            all: false,
             message: Some("the webhook route moved".to_string()),
             message_file: None,
         };
@@ -1872,6 +2278,7 @@ This should not appear in the body.\n";
         let args = SendArgs {
             to: None,
             to_session: Some("aaaa".to_string()),
+            all: false,
             message: Some("who gets this?".to_string()),
             message_file: None,
         };
@@ -2389,6 +2796,7 @@ This should not appear in the body.\n";
         let args = SendArgs {
             to: None,
             to_session: Some(short.clone()),
+            all: false,
             message: Some("still deliverable".to_string()),
             message_file: None,
         };

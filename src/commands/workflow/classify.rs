@@ -41,6 +41,75 @@ pub enum RiskBand {
     Critical,
 }
 
+/// Whether the Git-based safety net that re-measures a declared or
+/// previously-classified risk band actually ran. `Unavailable` is a distinct
+/// state from "measured, no escalation needed" -- collapsing the two used to
+/// let a mis-declared low-risk scope stand unchallenged in exactly the case
+/// zirv can see least (outside a repository, or one with no commits).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RiskMeasurement {
+    #[default]
+    Measured,
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// The safer default when the net cannot run at all: raise the band one
+/// step rather than trust an unmeasured declaration. `Critical` has nowhere
+/// further to go.
+pub(crate) fn escalate_one_band(band: RiskBand) -> RiskBand {
+    match band {
+        RiskBand::Low => RiskBand::Medium,
+        RiskBand::Medium => RiskBand::High,
+        RiskBand::High => RiskBand::Critical,
+        RiskBand::Critical => RiskBand::Critical,
+    }
+}
+
+fn score_floor_for_band(band: RiskBand) -> u16 {
+    match band {
+        RiskBand::Low => 0,
+        RiskBand::Medium => 20,
+        RiskBand::High => 45,
+        RiskBand::Critical => 70,
+    }
+}
+
+/// Marks a classification's risk measurement as unavailable and applies the
+/// fail-safe policy: escalate the risk band one step (the ceiling, unmoved,
+/// when already `Critical`). Returns whether the band actually moved, so a
+/// caller that also re-materializes workflow steps on a risk increase can
+/// share that path instead of duplicating it. See the Decision Log entry
+/// "Unmeasurable risk fails safe, not open" for why escalation was chosen
+/// over "keep the declared/prior band but demand its evidence".
+pub(crate) fn mark_unavailable(
+    classification: &mut Classification,
+    reason: impl Into<String>,
+) -> bool {
+    let reason = reason.into();
+    let previous = classification.risk;
+    let escalated = escalate_one_band(previous);
+    let raised = escalated != previous;
+    if raised {
+        classification.reasons.push(format!(
+            "risk escalated to {escalated:?}: measurement unavailable ({reason})"
+        ));
+        classification.risk = escalated;
+        classification.risk_score = classification
+            .risk_score
+            .max(score_floor_for_band(escalated));
+    } else {
+        classification.reasons.push(format!(
+            "measurement unavailable ({reason}); risk already at the Critical ceiling"
+        ));
+    }
+    classification.risk_measurement = RiskMeasurement::Unavailable { reason };
+    classification.reasons.sort();
+    raised
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkDomain {
@@ -75,6 +144,12 @@ pub struct Classification {
     /// permissions; older durable state defaults safely to `general`.
     #[serde(default)]
     pub work_domain: DomainClassification,
+    /// Whether the Git-based re-measurement that backs `risk` actually ran.
+    /// Older durable state defaults safely to `Measured` (its pre-existing,
+    /// unlabeled behavior): this field is additive, not a reinterpretation of
+    /// history.
+    #[serde(default)]
+    pub risk_measurement: RiskMeasurement,
     pub reasons: Vec<String>,
 }
 
@@ -240,6 +315,7 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         changed_lines: input.changed_lines,
         declared_scope: false,
         work_domain,
+        risk_measurement: RiskMeasurement::Measured,
         reasons,
     })
 }
@@ -519,11 +595,18 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     // turned `--path README.md` into a way to talk a real auth-file change
     // down from High to Low and drop the review step with it. Declared and
     // measured are both computed; the risk band is the higher of the two.
+    //
+    // When Git itself cannot be measured (no repository, or one with no
+    // commits) the old behavior silently kept the declared band -- treating
+    // "I could not check" as "I checked and it was fine". That fails open at
+    // exactly the moment a mis-declared low-risk scope is hardest to catch.
+    // `mark_unavailable` fails safe instead: it records the unmeasured state
+    // and escalates the risk band one step.
     let Ok(mut measured_input) = git_change_input(&repo, args.task.clone()) else {
-        classification
-            .reasons
-            .push("declared change scope (Git measurement unavailable)".to_string());
-        classification.reasons.sort();
+        mark_unavailable(
+            &mut classification,
+            "git measurement unavailable (not a repository, or no commits)",
+        );
         return Ok(classification);
     };
     measured_input.intent_override = args.intent;
@@ -717,6 +800,100 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("measured-tree complexity"))
         );
+    }
+
+    /// #88: outside a git repository the old safety net silently kept
+    /// whatever band the declared inputs alone produced. It must now report
+    /// the unmeasured state and escalate the band one step rather than trust
+    /// the declaration.
+    #[test]
+    fn declared_inputs_fail_safe_when_git_is_unavailable_outside_a_repository() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let classification = from_args(&ClassifyArgs {
+            task: "implement feature".into(),
+            paths: vec![PathBuf::from("README.md")],
+            changed_lines: Some(2),
+            tests_changed: true,
+            intent: None,
+            complexity: None,
+            risk: None,
+            repo: Some(dir.path().to_path_buf()),
+            json: false,
+        })
+        .unwrap();
+        assert!(classification.declared_scope);
+        assert!(
+            matches!(
+                classification.risk_measurement,
+                RiskMeasurement::Unavailable { .. }
+            ),
+            "{classification:?}"
+        );
+        // The declared scope alone (README.md, 2 lines, tests changed) scores
+        // Low; fail-safe escalates it one band rather than trusting a
+        // declaration the net could not check.
+        assert_eq!(classification.risk, RiskBand::Medium);
+        assert!(
+            classification
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("risk escalated"))
+        );
+    }
+
+    /// #88: a repository that exists but has no commits fails `git rev-parse
+    /// HEAD` the same way a non-repository does, and must fail the same safe
+    /// way.
+    #[test]
+    fn declared_inputs_fail_safe_when_the_repository_has_no_commits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        let classification = from_args(&ClassifyArgs {
+            task: "implement feature".into(),
+            paths: vec![PathBuf::from("README.md")],
+            changed_lines: Some(2),
+            tests_changed: true,
+            intent: None,
+            complexity: None,
+            risk: None,
+            repo: Some(dir.path().to_path_buf()),
+            json: false,
+        })
+        .unwrap();
+        assert!(
+            matches!(
+                classification.risk_measurement,
+                RiskMeasurement::Unavailable { .. }
+            ),
+            "{classification:?}"
+        );
+        assert_eq!(classification.risk, RiskBand::Medium);
+    }
+
+    /// No change to behavior when measurement succeeds: the existing
+    /// measured-tree tests already cover the risk-band outcome, this pins
+    /// that the new field stays `Measured` alongside them.
+    #[test]
+    fn risk_measurement_stays_measured_when_git_succeeds() {
+        let repo = repo_with_pending_file("src/one.rs");
+        let classification = from_args(&ClassifyArgs {
+            task: "implement feature".into(),
+            paths: vec![PathBuf::from("README.md")],
+            changed_lines: Some(2),
+            tests_changed: true,
+            intent: None,
+            complexity: None,
+            risk: None,
+            repo: Some(repo.path().to_path_buf()),
+            json: false,
+        })
+        .unwrap();
+        assert_eq!(classification.risk_measurement, RiskMeasurement::Measured);
     }
 
     #[test]

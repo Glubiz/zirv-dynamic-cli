@@ -183,6 +183,18 @@ pub enum MailEffect {
     Send(Message),
 }
 
+/// Issue #84: the handover picker's own state. `items` is precomputed by
+/// `dash::mod` (every enabled+ready harness crossed with `handover::TIERS`,
+/// each already tier-resolved to a concrete model label) as `(agent, tier,
+/// resolved model)`; `target_short` names the pane the swap applies to,
+/// captured once when the overlay opens the same way `NudgeTarget` is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HandoverDraft {
+    pub items: Vec<(String, String, String)>,
+    pub cursor: usize,
+    pub target_short: String,
+}
+
 /// The memory overlay's own state: every entry in this repo's bank
 /// (`(key, age, body)`, oldest-written first -- the same order `memory::list`
 /// already returns), which one is selected, and an in-progress edit buffer
@@ -242,6 +254,9 @@ pub enum Overlay {
     Nudge(NudgeDraft),
     Mail(MailView),
     Memory(MemoryView),
+    /// Issue #84: `Ctrl+A o` -- picks an enabled harness/tier to swap the
+    /// target pane's model or harness to in place.
+    Handover(HandoverDraft),
     /// The startup restore dialog, built once from the previous quit's
     /// roster (`dash::mod::run_dashboard`); never re-opened later in a
     /// session's life the way the other overlays are.
@@ -852,6 +867,26 @@ fn render_restore_dialog(f: &mut Frame, area: Rect, view: &RestoreView) {
     render_dialog(f, area, "restore", &lines);
 }
 
+/// Issue #84: `d.items` is already fully resolved (agent/tier/model), so
+/// this only ever formats and marks the cursor row -- no tier resolution or
+/// config reads happen here, matching this module's own no-I/O contract.
+fn render_handover_dialog(f: &mut Frame, area: Rect, draft: &HandoverDraft) {
+    let mut lines = Vec::new();
+    if draft.items.is_empty() {
+        lines.push("no enabled, ready harness available to swap to".to_string());
+    } else {
+        for (i, (agent, tier, model)) in draft.items.iter().enumerate() {
+            let marker = if i == draft.cursor { '>' } else { ' ' };
+            lines.push(format!("{marker} {agent} / {tier} ({model})"));
+        }
+    }
+    lines.push(format!(
+        "target: pane {}  --  Enter to swap, Esc to cancel",
+        draft.target_short
+    ));
+    render_dialog(f, area, "handover", &lines);
+}
+
 fn render_nudge_dialog(f: &mut Frame, area: Rect, draft: &NudgeDraft) {
     let target = match &draft.target {
         NudgeTarget::AttachedPane(short) => format!("pane {short}"),
@@ -1070,6 +1105,15 @@ static HELP_BINDINGS: &[HelpBinding] = &[
         )],
     },
     HelpBinding {
+        label: "o",
+        description: "handover (swap model/harness)",
+        section: HelpSection::Prefixed,
+        checks: &[(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            DashAction::Handover,
+        )],
+    },
+    HelpBinding {
         label: "z",
         description: "zoom",
         section: HelpSection::Prefixed,
@@ -1185,6 +1229,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay) {
         }
         Overlay::Spawn(d) => render_draft_dialog(f, area, "spawn", &d.input, &d.items, d.cursor),
         Overlay::Nudge(d) => render_nudge_dialog(f, area, d),
+        Overlay::Handover(d) => render_handover_dialog(f, area, d),
         Overlay::Mail(d) => render_mail_dialog(f, area, d),
         Overlay::Memory(d) => render_memory_dialog(f, area, d),
         Overlay::Restore(d) => render_restore_dialog(f, area, d),
@@ -2355,6 +2400,7 @@ mod tests {
         nudge: bool,
         mail: bool,
         memory: bool,
+        handover: bool,
         zoom: bool,
         quit: bool,
         scroll_page_up: bool,
@@ -2383,6 +2429,7 @@ mod tests {
                     DashAction::Nudge => cov.nudge = true,
                     DashAction::Mail => cov.mail = true,
                     DashAction::Memory => cov.memory = true,
+                    DashAction::Handover => cov.handover = true,
                     DashAction::Zoom => cov.zoom = true,
                     DashAction::Quit => cov.quit = true,
                     DashAction::ScrollPageUp => cov.scroll_page_up = true,
@@ -2404,6 +2451,7 @@ mod tests {
                 && cov.nudge
                 && cov.mail
                 && cov.memory
+                && cov.handover
                 && cov.zoom
                 && cov.quit
                 && cov.scroll_page_up

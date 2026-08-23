@@ -461,6 +461,22 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// inherit "no restriction" by omission.
     fn read_only_args(&self) -> Vec<String>;
 
+    /// Names a known, recorded residual in this adapter's own report-only
+    /// sandbox pin ([`read_only_args`](Self::read_only_args)), for the
+    /// operator's currently-resolved binary -- issue #89. `None` (the
+    /// default, and claude's own answer: `--disallowedTools=...` is the
+    /// *whole* restriction claude needs, nothing partial about it) means
+    /// there is nothing to disclose. Consulted by
+    /// [`announce_sandbox_residual_once`] whenever this adapter is resolved
+    /// as the distiller (`handoff::run_model`) or the workflow reviewer
+    /// (`workflow::review::reviewer_argv`, via
+    /// [`read_only_args_for_agent_name`]), so an operator whose judgment/
+    /// review child runs on codex learns about the residual instead of
+    /// discovering it only in a doc file a terminal session never opens.
+    fn sandbox_residual_note(&self) -> Option<String> {
+        None
+    }
+
     /// The model name to use for the judgment/distiller child when the
     /// operator has not named one explicitly (`handoff.model`/`optimize.
     /// model` both empty/unset). `None` -- the default, and codex's own
@@ -588,14 +604,23 @@ pub trait AgentAdapter: std::fmt::Debug {
 
     /// Whether a headless launch this adapter builds resolves to the Windows
     /// `cmd.exe /c <shim>` form (an npm-installed `.cmd`), where cmd.exe
-    /// reparses the whole downstream command line. `false` (the default) off
-    /// Windows and for a directly executable program. When `true`, a caller
-    /// delivers the headless prompt -- and any folded mail -- on the child's
-    /// stdin via [`headless_cmd_stdin`](Self::headless_cmd_stdin) rather than
-    /// as an argv token, so that untrusted free text never reaches cmd.exe's
-    /// parser (`guard_cmd_shim_reparse` is only the fail-closed backstop).
+    /// reparses the whole downstream command line. The default derives the
+    /// answer from [`resolve_program`]'s own resolution of
+    /// [`program()`](Self::program) -- via the free
+    /// [`launches_through_cmd_shim`] function -- rather than assuming a
+    /// permissive `false`: an adapter that overrides nothing is still
+    /// protected, because zirv already knows whether the binary it resolved
+    /// is a `.cmd`/`.bat` shim. `false` off Windows and for a directly
+    /// executable program, same as before. When `true`, a caller delivers
+    /// the headless prompt -- and any folded mail -- on the child's stdin via
+    /// [`headless_cmd_stdin`](Self::headless_cmd_stdin) rather than as an
+    /// argv token, so that untrusted free text never reaches cmd.exe's parser
+    /// (`guard_cmd_shim_reparse` is only the fail-closed backstop). Override
+    /// only for a deliberate, reviewable opt-*out* -- there is no legitimate
+    /// reason today to opt an adapter *into* more protection than this
+    /// derivation already grants it.
     fn launches_through_cmd_shim(&self) -> bool {
-        false
+        launches_through_cmd_shim(self.program())
     }
 
     /// A headless launch that expects its prompt on **stdin** rather than as
@@ -765,15 +790,31 @@ pub trait AgentAdapter: std::fmt::Debug {
     ///
     /// `sandbox` (fix round 3, 2026-08-22) carries the operator's own
     /// `extra_allow`/`extra_deny` (`SandboxConfig`, `config.rs`) -- claude's
-    /// own implementation appends both to the shipped `SHIPPED_POSTURE_
-    /// ALLOW`/`_DENY` lists before rendering the generated `--allowedTools=`/
-    /// `--disallowedTools=` argv, so an operator whose project needs one
-    /// more build command is not forced to discard the whole generated deny
-    /// list by pinning their own flags instead (`flags_pin_policy` still
-    /// covers that path). Codex has no per-command mechanism to receive
-    /// these and ignores the parameter.
-    fn default_sandbox_args(&self, sandbox: &super::config::SandboxConfig) -> Vec<String> {
-        let _ = sandbox;
+    /// own implementation appends both after the command-family rules
+    /// projected from `safety` (issue #83, below) before rendering the
+    /// generated `--allowedTools=`/`--disallowedTools=` argv, so an operator
+    /// whose project needs one more build command is not forced to discard
+    /// the whole generated deny list by pinning their own flags instead
+    /// (`flags_pin_policy` still covers that path).
+    ///
+    /// `safety` (issue #83) is zirv's harness-neutral command safety policy
+    /// (`safety::SafetyPolicy`, resolved from `[safety]` plus the built-in
+    /// set derived from `SHIPPED_POSTURE_ALLOW`/`_DENY`) -- the single
+    /// source this method's generated command rules are a projection of.
+    /// Under the shipped default (no `[safety]`/`sandbox.extra_*`
+    /// configured), `safety` is exactly `SHIPPED_POSTURE_ALLOW`/`_DENY`
+    /// again (`SafetyPolicy::default()` derives from the same constants),
+    /// so claude's projection stays byte-identical to before this method
+    /// took the parameter -- see `default_sandbox_args_stays_byte_
+    /// identical_to_the_pre_safety_shipped_default` in `claude.rs`. Codex
+    /// has no per-command mechanism to receive either parameter and ignores
+    /// both.
+    fn default_sandbox_args(
+        &self,
+        sandbox: &super::config::SandboxConfig,
+        safety: &super::safety::SafetyPolicy,
+    ) -> Vec<String> {
+        let _ = (sandbox, safety);
         Vec::new()
     }
 
@@ -1270,7 +1311,76 @@ pub fn read_only_args_for_agent_name(name: &str) -> Option<Vec<String>> {
     ADAPTERS
         .iter()
         .find(|(adapter_name, _)| *adapter_name == name)
-        .map(|(_, ctor)| ctor(None).read_only_args())
+        .map(|(_, ctor)| {
+            let adapter = ctor(None);
+            // Issue #89: the workflow reviewer's own choke point for
+            // resolving a read-only pin by name -- a sibling call site to
+            // the ones production callers make directly around `handoff::
+            // run_model` for the distiller role. `chrome.events` is not
+            // known at this call site (no `CtxConfig` in hand), so this
+            // defaults to enabled, matching this function's own pre-
+            // existing "no config, no repo" shape; `reviewer_argv`'s own
+            // caller may still be running under `ZIRV_CTX_QUIET`, which
+            // `Announcer` itself does not re-check here -- see the
+            // documented residual on `announce_sandbox_residual_once`.
+            announce_sandbox_residual_once(adapter.as_ref(), true);
+            adapter.read_only_args()
+        })
+}
+
+/// Issue #89: a one-time `zirv ▸` announcement naming a resolved distiller/
+/// reviewer adapter's own recorded sandbox residual
+/// ([`AgentAdapter::sandbox_residual_note`]), fired at most once per
+/// process. Self-contained -- builds its own [`super::announce::Announcer`]
+/// rather than requiring every call site to carry one of its own, the same
+/// shape `poll::announce_keychain_prompt_once` uses for the identical "no
+/// per-call state to carry a latch in" reason. A no-op whenever
+/// `sandbox_residual_note` is `None` (claude today, and codex once its own
+/// installed version supports `--ignore-rules --ignore-user-config` -- see
+/// `CodexAdapter::sandbox_residual_note`).
+///
+/// `chrome_events_enabled` mirrors `cfg.chrome.events` -- the same "opt-outs
+/// collapse to one boolean" contract every other `zirv ▸` line honors
+/// (`--quiet`/`ZIRV_CTX_QUIET`/`[chrome] events = false`) -- passed by
+/// production call sites that already have a resolved `CtxConfig` in scope
+/// (`handoff::run_model`'s own callers, each individually, since `run_model`
+/// itself is reused by claude and codex alike and must not assume which).
+/// [`read_only_args_for_agent_name`] above has no `CtxConfig` in hand at
+/// all and defaults to `true`, a recorded, narrow residual: an operator
+/// whose only opt-out is `--quiet`/`ZIRV_CTX_QUIET` still sees this one
+/// announcement on the workflow-reviewer path specifically. See Known
+/// Issues.
+pub fn announce_sandbox_residual_once(adapter: &dyn AgentAdapter, chrome_events_enabled: bool) {
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(note) = adapter.sandbox_residual_note() else {
+        return;
+    };
+    if !claim_once(&ANNOUNCED) {
+        return;
+    }
+    super::announce::Announcer::new(chrome_events_enabled, console::colors_enabled_stderr())
+        .emit(&super::announce::Event::SandboxResidual { note });
+}
+
+/// `true` the first time this specific latch flips from `false` to `true`,
+/// `false` on every call after (including a concurrent caller: only one
+/// `compare_exchange` wins). Extracted as its own pure function so the
+/// "fires at most once" property is unit-testable against a caller-owned
+/// `AtomicBool`, without needing to reset the process-wide static
+/// `announce_sandbox_residual_once` actually uses between test runs (which
+/// share one process and would otherwise contaminate each other -- the same
+/// reason `poll::announce_keychain_prompt_once`/`config::announce_
+/// unparsable_layers_once` have no dedicated "fires once" test of their
+/// own today).
+fn claim_once(latch: &std::sync::atomic::AtomicBool) -> bool {
+    latch
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
 }
 
 /// Static adapter lookup for [`AgentAdapter::native_artifact_presentation`].
@@ -1591,7 +1701,7 @@ pub fn policy_launch_args(
         return Vec::new();
     }
     let mut out = if cfg.sandbox.enabled {
-        adapter.default_sandbox_args(&cfg.sandbox)
+        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety)
     } else {
         Vec::new()
     };
@@ -2039,9 +2149,12 @@ mod tests {
     }
 
     /// F: codex is ready (its own `ready()` no longer hard-errors) but its
-    /// event/usage/turn capabilities remain degraded, so `--help`'s about text
+    /// usage/turn capabilities remain degraded, so `--help`'s about text
     /// must keep disclosing the degraded surface even though codex no longer
-    /// shows up in the "not ready yet" clause at all.
+    /// shows up in the "not ready yet" clause at all. Issue #86 (2026-08-23)
+    /// gave codex real event parsing, so "rot score" is no longer one of the
+    /// missing labels -- this must NOT regress back to claiming codex has no
+    /// rot score.
     #[test]
     fn the_readiness_note_discloses_codexs_degraded_surface_now_that_it_is_ready() {
         let note = readiness_note();
@@ -2050,7 +2163,10 @@ mod tests {
             "codex is ready now, not unready: {note}"
         );
         assert!(note.contains("codex"), "got {note}");
-        assert!(note.contains("rot score"), "got {note}");
+        assert!(
+            !note.contains("rot score"),
+            "issue #86 gave codex real event parsing: {note}"
+        );
         assert!(note.contains("usage"), "got {note}");
         assert!(note.contains("turn signal"), "got {note}");
         assert!(!note.contains("injected prompt"), "got {note}");
@@ -2821,6 +2937,116 @@ mod tests {
         assert!(!launch_reparses_through_shim(&[]));
     }
 
+    /// Issue #92: a third adapter that overrides nothing must still be
+    /// protected against the reparse-argv class, because the trait default
+    /// now derives its answer from `resolve_program`'s own resolution of
+    /// `program()` instead of assuming the permissive `false`. This adapter
+    /// deliberately does not implement `launches_through_cmd_shim` at all.
+    #[derive(Debug)]
+    struct NoOverrideAdapter(String);
+
+    impl AgentAdapter for NoOverrideAdapter {
+        fn name(&self) -> &'static str {
+            "no-override"
+        }
+
+        fn program(&self) -> &str {
+            &self.0
+        }
+
+        fn provider(&self) -> &'static str {
+            "no-override"
+        }
+
+        fn ready(&self) -> CtxResult<()> {
+            Ok(())
+        }
+
+        fn detect(&self, _command: &[String]) -> bool {
+            false
+        }
+
+        fn headless_cmd(&self, _prompt: &str, _session: &SessionId, _extra: &[String]) -> Command {
+            Command::new("true")
+        }
+
+        fn interactive_cmd(&self, _initial_prompt: Option<&str>, _extra: &[String]) -> Command {
+            Command::new("true")
+        }
+
+        fn distiller_cmd(&self, _model: &str) -> Command {
+            Command::new("true")
+        }
+
+        fn read_only_args(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn transcript_path(&self, _session: &SessionRef) -> PathBuf {
+            PathBuf::new()
+        }
+
+        fn parse_events(&self, _jsonl: &str) -> Vec<NormalizedEvent> {
+            Vec::new()
+        }
+
+        fn structural_context(&self, _jsonl: &str, _last_n: usize) -> StructuralContext {
+            StructuralContext::default()
+        }
+
+        fn compact_command(&self) -> Option<&'static str> {
+            None
+        }
+
+        fn quit_sequence(&self) -> &'static str {
+            ""
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn register_turn_signal(&self, _session: &SessionRef, _socket: &Path) -> TurnSignalSetup {
+            TurnSignalSetup {
+                env: Vec::new(),
+                instructions: String::new(),
+            }
+        }
+    }
+
+    /// A direct, non-shim program never reports the shim shape, on any
+    /// platform, even though this adapter never overrides the trait method --
+    /// mirrors `ClaudeAdapter`/`CodexAdapter`'s own identically-named tests.
+    #[test]
+    fn an_adapter_with_no_override_reports_no_shim_for_a_direct_program() {
+        let adapter = NoOverrideAdapter("/tmp/fake-agent".to_string());
+        assert!(!adapter.launches_through_cmd_shim());
+    }
+
+    /// The core of issue #92: an adapter that implements nothing beyond the
+    /// required trait methods -- no `launches_through_cmd_shim` override at
+    /// all -- still reports the shim shape correctly for a real `.cmd` on
+    /// Windows, because the trait default derives it from `resolve_program`.
+    /// Before this fix the default was a hardcoded `false`, so this exact
+    /// adapter shape would have shipped unprotected.
+    #[cfg(windows)]
+    #[test]
+    fn an_adapter_with_no_override_is_still_protected_from_a_cmd_shim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("no-override-agent.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let adapter = NoOverrideAdapter(shim.display().to_string());
+        assert!(
+            adapter.launches_through_cmd_shim(),
+            "a .cmd resolution must be reported as the shim shape even with no override"
+        );
+    }
+
     /// The trait default: an agent zirv has verified nothing about receives
     /// no base layer, rather than another agent's instructions.
     #[test]
@@ -3542,5 +3768,58 @@ mod tests {
                 "an equivalent-restriction mapping must never widen: {args:?}"
             );
         }
+    }
+
+    // Issue #89: the codex distiller/reviewer sandbox-asymmetry announcement.
+
+    /// The pure latch primitive `announce_sandbox_residual_once` builds on:
+    /// exactly one caller ever wins, regardless of how many times it is
+    /// asked, so the announcement itself cannot fire more than once per
+    /// process even though `handoff::run_model` (and `read_only_args_for_
+    /// agent_name`) call it on every single distiller/reviewer spawn.
+    #[test]
+    fn claim_once_wins_exactly_once() {
+        let latch = std::sync::atomic::AtomicBool::new(false);
+        assert!(claim_once(&latch), "the first call claims the latch");
+        assert!(
+            !claim_once(&latch),
+            "a second call must find it already claimed"
+        );
+        assert!(!claim_once(&latch), "and every call after that too");
+    }
+
+    /// Claude's own distiller/reviewer argv must be byte-for-byte unchanged
+    /// by issue #89: `sandbox_residual_note` stays `None` (the trait
+    /// default), so `announce_sandbox_residual_once` is always a no-op for
+    /// it regardless of the latch, and nothing about `read_only_args`/
+    /// `distiller_cmd` changed for this adapter at all.
+    #[test]
+    fn claude_has_no_sandbox_residual_to_announce() {
+        let adapter = claude::ClaudeAdapter::new(None);
+        assert_eq!(adapter.sandbox_residual_note(), None);
+        assert_eq!(
+            adapter.read_only_args(),
+            vec!["--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string()],
+            "unchanged by issue #89"
+        );
+    }
+
+    /// `announce_sandbox_residual_once` must be a safe no-op for an adapter
+    /// with nothing to disclose -- it must not touch the shared latch at
+    /// all, so a claude call never steals the one announcement a later
+    /// codex call in the same process is entitled to.
+    #[test]
+    fn announce_sandbox_residual_once_never_claims_the_latch_for_an_adapter_with_no_residual() {
+        let latch = std::sync::atomic::AtomicBool::new(false);
+        // Exercise the same "no residual -> no claim" branch
+        // `announce_sandbox_residual_once` itself takes, against a
+        // caller-owned latch so this is independent of whatever the real
+        // process-wide static has already done in this test binary.
+        let adapter = claude::ClaudeAdapter::new(None);
+        assert!(adapter.sandbox_residual_note().is_none());
+        assert!(
+            !latch.load(std::sync::atomic::Ordering::SeqCst),
+            "an adapter with nothing to report must never reach the claim step"
+        );
     }
 }

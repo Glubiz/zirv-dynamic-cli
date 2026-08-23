@@ -1,13 +1,14 @@
 #!/bin/sh
 # Stands in for a headless codex CLI in tests. Unlike fake-agent.sh this
 # needs no --session-id (codex's own headless_cmd never emits one -- codex
-# always mints its own session id) and never writes a transcript (codex's
-# own parse_events/structural_context are stubbed to always return
-# empty/default, so nothing ever reads one).
+# always mints its own session id).
 #
 # Invoked through the adapter as:
 #   fake-codex-agent.sh exec <prompt> [extra...]
 #   fake-codex-agent.sh exec [extra...]     (prompt on stdin, shim launches)
+#   fake-codex-agent.sh exec --model <m> --sandbox read-only [...]
+#                                            (the distiller/reviewer child,
+#                                             issue #86 -- see below)
 #
 # Behavior comes from the environment:
 #   FAKE_AGENT_ARGV_LOG=<path>   append the full argv of each run, so a test
@@ -17,17 +18,35 @@
 #                                the only place mail can ever land.
 #   FAKE_AGENT_MODE_FILE=<path>  one mode per line, popped per run
 #                                (hang|limit|healthy, default healthy) --
-#                                codex has no rot scoring at all
-#                                (parse_events/structural_context are
-#                                stubbed empty), so the only way a test
-#                                drives a restart is a nudge or a `limit`
-#                                park. `hang` is what keeps the process
-#                                alive (liveness is a real OS pid check, not
-#                                transcript-derived) long enough for a
-#                                nudge to land; `limit` prints the same
-#                                documented limit-hit notice fake-agent.sh
-#                                uses and exits 1, so a codex run can be
-#                                parked the same way a claude one can.
+#                                the only way a test drives a restart of the
+#                                *main* agent is a nudge or a `limit` park.
+#                                `hang` is what keeps the process alive
+#                                (liveness is a real OS pid check, not
+#                                transcript-derived) long enough for a nudge
+#                                to land; `limit` prints the same documented
+#                                limit-hit notice fake-agent.sh uses and
+#                                exits 1, so a codex run can be parked the
+#                                same way a claude one can.
+#
+# Issue #86 (2026-08-23): codex's own event parsing is no longer stubbed
+# empty, so `distill_or_structural` (on a nudge restart, a rot restart, or a
+# clean-exit harvest) genuinely spawns this same binary again as the
+# distiller/reviewer child (`CodexAdapter::distiller_cmd`: `exec --model <m>
+# --sandbox read-only [...]`, prompt on stdin, no positional prompt token).
+# `ZIRV_CTX_AGENT_BIN` is one binary for the whole session, so that spawn
+# reaches this same script -- and would otherwise silently steal a line off
+# `FAKE_AGENT_MODE_FILE` meant for the *main* agent's next launch, shifting
+# every mode after it by one. Detected here by an adjacent `--sandbox
+# read-only` pair on argv -- NOT a bare `--sandbox` alone, since the
+# shipped-default sandbox posture (2026-08-22) now also puts `--sandbox
+# workspace-write` on every *ordinary* launch, and matching that too would
+# wrongly treat the main agent's own launch as the distiller. `read-only` is
+# the one value only `distiller_cmd`/the workflow reviewer ever pass. Handled
+# as its own case, entirely decoupled from mode-file consumption: still
+# logged to `FAKE_AGENT_ARGV_LOG` like any other call (a test may want to
+# assert on it), but never pops a mode and always answers with a minimal,
+# real, parseable handoff so `distill()` succeeds instead of falling back to
+# the mechanical "structural" extraction.
 set -eu
 
 head_bin=head
@@ -43,13 +62,28 @@ mv_bin=mv
 
 [ -z "${FAKE_AGENT_ARGV_LOG:-}" ] || printf '%s\n' "$*" >> "$FAKE_AGENT_ARGV_LOG"
 
-# Drain stdin so a stdin-delivered prompt (the shim-launch form) does not
-# block the caller's pipe, and log it the same way argv is logged.
+is_distiller=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--sandbox" ] && [ "$arg" = "read-only" ]; then
+    is_distiller=1
+  fi
+  prev="$arg"
+done
+
+# Drain stdin so a stdin-delivered prompt (the shim-launch form, and every
+# distiller/reviewer call) does not block the caller's pipe, and log it the
+# same way argv is logged.
 if [ ! -t 0 ]; then
   stdin_text=$(cat)
   if [ -n "$stdin_text" ] && [ -n "${FAKE_AGENT_ARGV_LOG:-}" ]; then
     printf 'stdin: %s\n' "$stdin_text" >> "$FAKE_AGENT_ARGV_LOG"
   fi
+fi
+
+if [ "$is_distiller" -eq 1 ]; then
+  printf '## Task\nfake distilled task\n\n## Next step\nfake next step\n'
+  exit 0
 fi
 
 mode="healthy"

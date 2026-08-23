@@ -1033,11 +1033,18 @@ mod tests {
         assert!(registry.warnings()[0].contains("built-in"));
     }
 
-    /// The gate resolver failed *open* on an unparseable config, and a
-    /// repository controls one layer of that config -- so a malformed
-    /// `.zirv/ctx.toml` was a way to force the untrusted skill layer back on.
+    /// A plain TOML *syntax* error in the repo's `ctx.toml` (as opposed to a
+    /// `REPO_FORBIDDEN` key rejection, below) no longer collapses
+    /// `CtxConfig::load` into a hard `Err` (2026-08-23: `config.rs`'s
+    /// `read_layer`/`UnparsableLayer` skip a broken layer instead of failing
+    /// the whole load). `workflow.repo_skills_enabled` is itself
+    /// `REPO_FORBIDDEN` -- a repo file could never set it either way, parsed
+    /// or not -- so it resolves from the operator's own home/default value
+    /// regardless of whether the repo layer parsed. A merely-unparsable repo
+    /// `ctx.toml` therefore neither widens nor narrows this gate; it simply
+    /// never controlled it.
     #[test]
-    fn an_unparseable_repo_config_drops_repository_skills_instead_of_keeping_them() {
+    fn an_unparseable_repo_config_does_not_affect_a_gate_it_never_controlled() {
         let repo = tempdir().unwrap();
         let project = repo.path().join(".zirv/skills");
         std::fs::create_dir_all(&project).unwrap();
@@ -1048,13 +1055,35 @@ mod tests {
         std::fs::write(repo.path().join(".zirv/ctx.toml"), "not = = toml\n").unwrap();
         let registry = SkillRegistry::load_for_repo(repo.path(), None, true).unwrap();
         assert!(
-            registry.get("extra").is_err(),
-            "a malformed repo config must not widen what the repo may contribute"
+            registry.get("extra").is_ok(),
+            "repo_skills_enabled defaults true and a repo file could never set it either way, \
+             so a syntax error in that same file must not disable it"
         );
         assert!(
             registry.get("design").is_ok(),
             "zirv's own built-ins keep working"
         );
+    }
+
+    /// The gate a repo genuinely *cannot* widen: explicitly setting the
+    /// `REPO_FORBIDDEN` key itself is a rejected key, not a parse error, and
+    /// still fails `CtxConfig::load` outright (`reject_untrusted_keys`),
+    /// which still closes both workflow gates (`workflow::repo_gates`'s `Err`
+    /// arm, unchanged by the 2026-08-23 parse-skip change above).
+    #[test]
+    fn explicitly_setting_the_repo_forbidden_skills_key_still_fails_the_load() {
+        let repo = tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nrepo_skills_enabled = true\n",
+        )
+        .unwrap();
+        let error = crate::commands::ctx::config::CtxConfig::load(repo.path(), &|_| None)
+            .expect_err("a repo layer must not set workflow.repo_skills_enabled");
+        assert!(crate::commands::ctx::config::is_repo_forbidden(
+            error.as_ref()
+        ));
     }
 
     #[test]

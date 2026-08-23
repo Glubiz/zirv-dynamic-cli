@@ -294,9 +294,9 @@ pub fn run_model(
 /// way out but killing the wrapper.
 ///
 /// D, symmetric with `score::full_score`'s own guard: an adapter with no
-/// verified event parsing (`capabilities().events == false`, codex today)
-/// has `structural_context` stubbed to always return `StructuralContext::
-/// default()` -- there is never anything real in `ctx` to distill. Spawning
+/// verified event parsing (`capabilities().events == false`) has no
+/// verified way to populate `structural_context` with anything real either
+/// -- there is never anything real in `ctx` to distill. Spawning
 /// the judgment-model child anyway would ask it to summarize nothing, and a
 /// plausible-looking answer would then be reported as `"distilled"`, exactly
 /// the fabricated-verdict class `full_score`'s own guard exists to prevent.
@@ -331,15 +331,26 @@ pub fn distill(
 /// not a real mechanical extraction the way it is for an adapter whose
 /// transcript actually populated `ctx`, so it gets its own label, `"no
 /// data"`, rather than borrowing one that implies real (if crude) content.
+/// `chrome_events_enabled` is `cfg.chrome.events` (or, for a caller with no
+/// `CtxConfig` in hand at this point, the same announcer-enabled flag it
+/// already threads elsewhere): every call site that reaches the `distill`
+/// branch below is about to run the distiller model, so the sandbox-residual
+/// announce (issue #89) belongs *here*, once, rather than repeated at each
+/// of this function's eight call sites -- two of which (`dash::
+/// handover_pane`, `handover::preview_packet`) had silently omitted it
+/// altogether before this fold. See `adapters::announce_sandbox_residual_
+/// once`'s own one-time latch semantics, unchanged by this move.
 pub fn distill_or_structural(
     adapter: &dyn AgentAdapter,
     model: &str,
     ctx: &StructuralContext,
     timeout: Duration,
+    chrome_events_enabled: bool,
 ) -> (Handoff, &'static str) {
     if !adapter.capabilities().events {
         return (structural(ctx), "no data");
     }
+    adapters::announce_sandbox_residual_once(adapter, chrome_events_enabled);
     match distill(adapter, model, ctx, timeout) {
         Ok(handoff) => (handoff, "distilled"),
         Err(_) => (structural(ctx), "structural"),
@@ -418,8 +429,7 @@ pub fn run_with<W: Write>(
 
     // Low 6: the eventless check wins regardless of `--no-model`. For an
     // adapter with no verified event parsing (`capabilities().events ==
-    // false`, codex today), `ctx` above is always `StructuralContext::
-    // default()` (`structural_context` is stubbed empty), so labelling it
+    // false`), `ctx` above has nothing real in it, so labelling it
     // `"structural"` here -- as `--no-model` used to do unconditionally --
     // implies a real mechanical extraction that never happened, the same
     // dishonesty `distill_or_structural`'s own `"no data"` label (below)
@@ -435,6 +445,7 @@ pub fn run_with<W: Write>(
             &resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref()),
             &ctx,
             Duration::from_secs(cfg.handoff.timeout_secs),
+            cfg.chrome.events,
         )
     };
 
@@ -623,7 +634,7 @@ mod tests {
     fn distill_or_structural_falls_back_and_reports_which_path_it_took() {
         let adapter = fake_model_adapter();
         let (handoff, source) =
-            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false);
         assert_eq!(source, "distilled");
         assert_eq!(handoff.task, "Ship the webhook");
 
@@ -631,7 +642,7 @@ mod tests {
             std::env::set_var("FAKE_MODEL_MODE", "garbage");
         }
         let (handoff, source) =
-            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false);
         unsafe {
             std::env::remove_var("FAKE_MODEL_MODE");
         }
@@ -643,18 +654,153 @@ mod tests {
         assert!(handoff.is_usable());
     }
 
+    /// Finding #5: the sandbox-residual announce (issue #89) now lives
+    /// *inside* `distill_or_structural`, on the events-capable path every
+    /// caller that reaches `distill` takes -- so a caller can no longer
+    /// forget it the way `dash::handover_pane`/`handover::preview_packet`
+    /// both had before this fold (neither called `announce_sandbox_
+    /// residual_once` at all). This exercises that path for an adapter that
+    /// actually has a residual to report (codex with the ignore flags
+    /// forced unsupported): the call must still complete and fall back to
+    /// "structural" cleanly, rather than requiring every call site to
+    /// remember a separate announce step first. The announce itself uses a
+    /// process-wide, fires-once latch (see `adapters::announce_sandbox_
+    /// residual_once`'s own doc comment), so -- matching this codebase's
+    /// existing precedent for that kind of latch (`poll::announce_
+    /// keychain_prompt_once`, `config::announce_unparsable_layers_once`) --
+    /// this does not assert the announcement's own stderr output.
+    #[test]
+    fn distill_or_structural_reaches_the_announce_path_for_an_adapter_with_a_residual() {
+        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(Some(
+            "/nonexistent/codex-model-binary",
+        ))
+        .with_ignore_flags_forced(false);
+        assert!(
+            adapter.sandbox_residual_note().is_some(),
+            "the test adapter must actually have a residual to report"
+        );
+        let (handoff, source) =
+            distill_or_structural(&adapter, "gpt", &ctx_sample(), TEST_TIMEOUT, false);
+        assert_eq!(
+            source, "structural",
+            "a missing distiller binary falls back"
+        );
+        assert!(handoff.is_usable());
+    }
+
+    /// A minimal adapter with no verified event parsing at all. Both
+    /// registered adapters (claude, codex) now report
+    /// `capabilities().events == true` (issue #86), so the eventless guard
+    /// below is no longer a fact about any real, name-selectable adapter --
+    /// exercised directly against a local fake instead. Mirrors
+    /// `memory.rs`'s local `PanicOnDistillAdapter` pattern.
+    #[derive(Debug)]
+    struct EventlessAdapter;
+
+    impl AgentAdapter for EventlessAdapter {
+        fn name(&self) -> &'static str {
+            "eventless"
+        }
+
+        fn program(&self) -> &str {
+            "eventless"
+        }
+
+        fn provider(&self) -> &'static str {
+            "eventless"
+        }
+
+        fn ready(&self) -> CtxResult<()> {
+            Ok(())
+        }
+
+        fn detect(&self, _command: &[String]) -> bool {
+            false
+        }
+
+        fn headless_cmd(
+            &self,
+            _prompt: &str,
+            _session: &super::super::event::SessionId,
+            _extra: &[String],
+        ) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn interactive_cmd(
+            &self,
+            _initial_prompt: Option<&str>,
+            _extra: &[String],
+        ) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn distiller_cmd(&self, _model: &str) -> std::process::Command {
+            panic!(
+                "an eventless adapter must never reach the distiller: distill/distill_or_structural must refuse first"
+            );
+        }
+
+        fn read_only_args(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn transcript_path(&self, _session: &super::super::event::SessionRef) -> PathBuf {
+            PathBuf::new()
+        }
+
+        fn parse_events(&self, _jsonl: &str) -> Vec<super::super::event::NormalizedEvent> {
+            Vec::new()
+        }
+
+        fn structural_context(
+            &self,
+            _jsonl: &str,
+            _last_n: usize,
+        ) -> super::super::event::StructuralContext {
+            super::super::event::StructuralContext::default()
+        }
+
+        fn compact_command(&self) -> Option<&'static str> {
+            None
+        }
+
+        fn quit_sequence(&self) -> &'static str {
+            ""
+        }
+
+        fn capabilities(&self) -> super::super::event::Capabilities {
+            super::super::event::Capabilities::default()
+        }
+
+        fn register_turn_signal(
+            &self,
+            _session: &super::super::event::SessionRef,
+            _socket: &Path,
+        ) -> super::adapters::TurnSignalSetup {
+            super::adapters::TurnSignalSetup {
+                env: Vec::new(),
+                instructions: String::new(),
+            }
+        }
+    }
+
     /// D, symmetric with `score::full_score_refuses_an_adapter_with_no_
-    /// event_parsing`: codex's `structural_context` is stubbed to always
-    /// return `StructuralContext::default()`, so both `distill` and `distill_
-    /// or_structural` must refuse before ever spawning the judgment-model
-    /// child, and the latter must report `"no data"`, not `"structural"` --
-    /// that label is reserved for an adapter whose `ctx` came from a real
-    /// transcript. A garbage `model` name proves the point: if either
-    /// function tried to spawn it, this would fail some other way (a spawn
-    /// error, or a timeout), not return cleanly.
+    /// event_parsing`: an eventless adapter's `structural_context` never has
+    /// anything real in it, so both `distill` and `distill_or_structural`
+    /// must refuse before ever spawning the judgment-model child, and the
+    /// latter must report `"no data"`, not `"structural"` -- that label is
+    /// reserved for an adapter whose `ctx` came from a real transcript. A
+    /// garbage `model` name proves the point: if either function tried to
+    /// spawn it, this would fail some other way (a spawn error, or a
+    /// timeout), not return cleanly.
     #[test]
     fn an_eventless_adapter_never_spawns_the_distiller_and_reports_no_data() {
-        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let adapter = EventlessAdapter;
         assert!(!adapter.capabilities().events);
 
         let err = distill(
@@ -674,6 +820,7 @@ mod tests {
             "definitely-not-a-real-model-binary",
             &ctx_sample(),
             TEST_TIMEOUT,
+            false,
         );
         assert_eq!(
             source, "no data",
@@ -714,8 +861,13 @@ mod tests {
             std::env::set_var("FAKE_MODEL_MODE", "hang");
         }
         let adapter = fake_model_adapter();
-        let (handoff, source) =
-            distill_or_structural(&adapter, "haiku", &ctx_sample(), Duration::from_millis(300));
+        let (handoff, source) = distill_or_structural(
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            Duration::from_millis(300),
+            false,
+        );
         unsafe {
             std::env::remove_var("FAKE_MODEL_MODE");
         }
@@ -827,7 +979,7 @@ mod tests {
     fn a_missing_distiller_binary_falls_back_instead_of_panicking() {
         let adapter = ClaudeAdapter::new(Some("/nonexistent/model-binary"));
         let (handoff, source) =
-            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT);
+            distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false);
         assert_eq!(source, "structural");
         assert!(handoff.is_usable());
     }
@@ -1133,6 +1285,58 @@ mod tests {
 
         let args = HandoffArgs {
             transcript,
+            agent: Some("claude".to_string()),
+            session_id: None,
+            stdout: false,
+            no_model: true,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
+
+        let log =
+            std::fs::read_to_string(tmp.path().join("state/logs/decisions.jsonl")).expect("log");
+        // A claude transcript has real events, so `--no-model` here correctly
+        // reports "structural" (a real mechanical extraction), never "no
+        // data" -- that label is reserved for a genuinely eventless adapter.
+        assert!(log.contains("\"action\":\"structural\""), "got {log}");
+        assert!(!log.contains("\"action\":\"no data\""), "got {log}");
+    }
+
+    /// Low 6, re-scoped for issue #86: both registered adapters now report
+    /// `capabilities().events == true`, so codex is no longer a real,
+    /// name-selectable example of the eventless case `run_with`'s own
+    /// `!adapter.capabilities().events` branch exists for -- that guard is
+    /// exercised directly (not through the CLI's name-based `adapters::
+    /// select`) by `an_eventless_adapter_never_spawns_the_distiller_and_
+    /// reports_no_data` above instead. This test replaces the old codex-
+    /// specific one and instead pins the new, honest behavior: `--no-model`
+    /// on a codex transcript with a real turn (`task_complete.
+    /// last_agent_message`) now reports "structural" from codex's own
+    /// (no longer permanently empty) `structural_context`.
+    #[test]
+    fn no_model_on_codex_now_reports_structural_since_codex_has_real_structural_context() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript_dir = tmp.path().join("rollout");
+        std::fs::create_dir_all(&transcript_dir).expect("mkdir");
+        let transcript = transcript_dir.join("rollout-test.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"timestamp":"2026-08-20T10:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-20T10:00:07.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"[zirv] shipped the webhook"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write transcript");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+
+        let args = HandoffArgs {
+            transcript,
             agent: Some("codex".to_string()),
             session_id: None,
             stdout: false,
@@ -1143,10 +1347,10 @@ mod tests {
 
         let log =
             std::fs::read_to_string(tmp.path().join("state/logs/decisions.jsonl")).expect("log");
-        assert!(log.contains("\"action\":\"no data\""), "got {log}");
+        assert!(log.contains("\"action\":\"structural\""), "got {log}");
         assert!(
-            !log.contains("\"action\":\"structural\""),
-            "structural implies a real mechanical extraction codex never had: {log}"
+            !log.contains("\"action\":\"no data\""),
+            "codex has real event parsing now (issue #86): {log}"
         );
     }
 }

@@ -19,7 +19,9 @@ const TELEMETRY_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MAX_EVENTS: usize = 1000;
 const DEFAULT_RETENTION_DAYS: u64 = 30;
 const MAX_CONFIGURED_EVENTS: usize = 100_000;
-const MAX_CONFIGURED_RETENTION_DAYS: u64 = 3650;
+/// Also reused by `verification.rs`'s report retention, which follows this
+/// same config shape and clamp (see the Known Issues entry it closes).
+pub(crate) const MAX_CONFIGURED_RETENTION_DAYS: u64 = 3650;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_EVENT_BYTES: usize = 8 * 1024;
 
@@ -175,12 +177,24 @@ pub fn record(
     create_private_dir_all(&dir)?;
     let path = dir.join(format!("{:020}-{}.json", event.timestamp, event.id));
     write_private(&path, &body)?;
-    prune_expired(&dir, event.timestamp, config.retention_days);
+    prune_expired_except(&dir, event.timestamp, config.retention_days, &[]);
     prune_to_newest(&dir, config.max_events);
     Ok(())
 }
 
-fn prune_expired(dir: &Path, now: u64, days: u64) {
+/// Removes every entry in `dir` whose filename starts with a
+/// `{timestamp}-...` prefix older than `now - days`, except any name listed
+/// in `keep` (used by `verification.rs` to protect its `latest` report even
+/// when that report's own age would otherwise make it eligible). `days == 0`
+/// means "keep forever" and is a no-op, matching `telemetry_retention_days`'s
+/// own zero-means-unbounded convention.
+///
+/// Reused as-is by verification report retention (`verification.rs`'s
+/// `save_report`) rather than adding a second pruner: both this module's
+/// events and verification's reports are one file per record under a
+/// per-repository directory, named with a leading zero-padded timestamp, so
+/// the same age rule and cutoff math apply unchanged.
+pub(crate) fn prune_expired_except(dir: &Path, now: u64, days: u64, keep: &[&str]) {
     if days == 0 {
         return;
     }
@@ -190,13 +204,18 @@ fn prune_expired(dir: &Path, now: u64, days: u64) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let timestamp = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.split('-').next())
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if keep.contains(&name) {
+            continue;
+        }
+        let timestamp = name
+            .split('-')
+            .next()
             .and_then(|value| value.parse::<u64>().ok());
         if timestamp.is_some_and(|timestamp| timestamp < cutoff) {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&path);
         }
     }
 }

@@ -14,6 +14,12 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-23 (feat/close-open-issues, review-fix round): recorded that the handover structural (no-model) packet is thin -- see the new entry below; also documented the HOME-layer-vs-REPO-layer parse-failure split (CtxConfig::load vs load_for_launch) in Untrusted Configuration.md -->
+<!-- Updated 2026-08-23 (feat/close-open-issues, vault keeper pass): removed "workflow::repo_gates's fail-closed test no longer matches CtxConfig::load's new parse-skip behaviour" -- verified against src/commands/workflow/{mod,verification}.rs: repo_gates's doc comment and the renamed test (an_unparseable_repo_config_does_not_disable_a_gate_it_never_controlled) already reflect the narrower fails-closed-only-on-Err claim the entry asked for; it described a residual from earlier in the same session's diff that a later part of the same commit (issues #88/#90/#91) already closed -->
+<!-- Updated 2026-08-23 (feat/close-open-issues, issues #86/#85/#89): resolved "codex has no event parsing" -- CodexAdapter::parse_events/structural_context now derive turn boundaries and token totals from the same rollout JSON window.rs already parses (shared via window::parse_rollout_record), capabilities().events is honestly true, and rot scoring/status/pacing all light up for codex; tool calls/tool results/compaction remain unmapped (no verified rollout shape), recorded in the codex-shim-gap entry below. Surfaced (not closed) the Windows-codex context-injection fallback: zirv ctx status now reports "codex: context via task-text fallback" on a shim-resolved launch, and prompt::injection_event's wording matches; investigated and rejected codex's own -p/--profile file-form injection as a closure path (would require writing into the operator's own $CODEX_HOME, a boundary held read-only everywhere else). Surfaced the codex distiller/reviewer sandbox residual: --ignore-rules/--ignore-user-config are now added automatically when a --help probe confirms the installed codex-cli documents them, and a one-time zirv ▸ announcement fires when it does not -- see the rewritten "Codex's distiller/reviewer sandbox residual" entry below -->
+<!-- Updated 2026-08-23 (feat/close-open-issues, ctx.toml parse-skip fix): a repo-only ctx.toml TOML-syntax error no longer fails CtxConfig::load (config.rs's UnparsableLayer, see the Decision Log) -- workflow::repo_gates's fail-closed Err arm therefore no longer fires for that one case, and verification.rs's an_unparseable_repo_config_closes_the_check_gate_instead_of_failing_the_run now fails; recorded below as a residual for the workflow subsystem to reconcile (out of scope for this change, which touched only config.rs/status.rs/announce.rs) -->
+<!-- Updated 2026-08-23 (feat/close-open-issues, issues #88/#90/#91): resolved "Workflow classification's git-based safety net fails open outside a git repository" (classify.rs/engine.rs now fail safe: RiskMeasurement::Unavailable escalates the risk band one step) and "The workflow secret filter is a name denylist" (review.rs gained a second, content-based gate: token-shape + entropy detection behind the filename denylist); updated "Verification reports accumulate with no retention pruning" to record that pruning now runs (reusing telemetry.rs's prune_expired_except) but shares telemetry's own retention config rather than a dedicated key, a scope residual from a concurrent edit on src/commands/ctx/config.rs -- see the Decision Log. Also updated two now-stale tests (skill.rs, verification.rs) that asserted the pre-2026-08-23 all-or-nothing "any unparsable ctx.toml closes both workflow gates" contract; a concurrent, separate change (config.rs's per-layer parse-skip redesign, documented in [[Untrusted Configuration]]) means a plain repo-layer *syntax* error no longer disables repo_checks_enabled/repo_skills_enabled, since both are REPO_FORBIDDEN and were never repo-settable either way -- a REPO_FORBIDDEN key rejection still closes both gates, pinned by a new companion test -->
+<!-- Updated 2026-08-23 (feat/close-open-issues, issue #92): resolved "The Windows cmd.exe-shim defense is opt-in per adapter" -- AgentAdapter::launches_through_cmd_shim's trait default now derives its answer from resolve_program(self.program()) instead of a hardcoded false, so an adapter that overrides nothing is protected; see Ctx Adapters and the Decision Log -->
 <!-- Updated 2026-08-23 (fix/dashboard-and-harness-parity, vault keeper pass): resolved the T8 finding that the pacing gate did not cover interactive sessions at all -- T10 (already shipped in this diff) wired pace::resolve_interactive_gate into wrap's pre-spawn path and the dashboard's first-pane/worker-pane spawn seams, closing exactly the gap this entry described -->
 <!-- Updated 2026-08-22 (fix/dashboard-and-harness-parity, zirv setup restore): recorded that ~/.claude.json (MCP registrations, OAuth/account linkage, project trust state) is out of scope for both `zirv setup reset` and the new `zirv setup restore` -- clearing it would sign the operator out, so it is neither backed up nor touched, and both commands say so in their own output -->
 <!-- Updated 2026-08-22 (fix/dashboard-and-harness-parity): resolved the residual that wrap's own live mail advisory never fired for a signal-less adapter (codex) -- T13's eligibility check now branches on AgentAdapter::capabilities().turn_signal, the same way dash::pane::pane_is_idle already does, via new signal_less_mail_ready/mail_inject_ready and an InjectionState.last_input field -->
@@ -46,6 +52,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## The handover structural (no-model) packet is thin
+
+`zirv ctx handover`'s live swap (and `--dry-run` preview) distills a handoff packet via `handoff::distill_or_structural`. When the target adapter has no verified event parsing, or the distiller model call fails/times out, that function falls back to the mechanical `structural(ctx)` extraction rather than a real model summary. The structural packet carries only a task line (the last user prompt) and the most recent tool error, if any -- no done/remaining/gotchas breakdown, no file list. It is enough for the successor to know roughly what it was doing, not a substitute for a real handoff. The distilled path (a real model call) is the one that actually produces a useful packet; `--dry-run`'s own header prints `packet source: distilled`/`structural`/`no data` so an operator can tell which one a preview actually got, but the live swap's ack (`HandoverAck`) carries no equivalent field today -- a swap that silently fell back to structural is not otherwise surfaced at the point of the swap.
 
 ## `~/.claude.json` is out of scope for `zirv setup reset`/`restore`
 
@@ -87,14 +97,6 @@ Both `optimize.rs`'s `ALL_LAYERS: &[Layer]` and `policy.rs`'s `Capability::ALL` 
 
 `optimize.rs`'s `lint_redundancy` proposes a diff (delete the later copy) for a repeated instruction, but `is_eligible_deletion_target` refuses two kinds of copy as a deletion target: an operator's own global surface, and — when the duplicate spans more than one surface — a `Layer::ContextCommon`/`ContextClaude`/`ContextCodex` copy in the canonical `.zirv/context/` layer. A duplicate group whose only candidates besides the first occurrence are canonical-layer copies therefore still gets a `Finding`, correctly flagging the redundancy, but with `proposed_diff: None` — nothing for an operator to apply, only the observation that it exists.
 
-## The workflow secret filter is a name denylist, and misses a plain `token.txt`/`api_key.txt`
-
-`review.rs`'s `is_sensitive_name` excludes an untracked file's *body* from a review package by matching its filename against fixed prefixes (`.env`, `id_rsa`, `.netrc`, `kubeconfig`, ...), fixed suffixes (`.pem`, `.key`, `.p12`, ...), and the substrings `"credential"`/`"secret"`. A file named `token.txt` or `api_key.txt` matches none of these — no prefix, no suffix, and "token"/"api" aren't in the substring list — so its contents would be included in a review package like any ordinary text file, unlike a same-purpose file spelled `my-secrets.yaml`.
-
-## Workflow classification's git-based safety net fails open outside a git repository
-
-Two independent places in `src/commands/workflow/` treat "Git cannot be measured" (no repository, or one with no commits) as silence rather than an error the operator sees: `classify.rs`'s declared-scope path records "declared change scope (Git measurement unavailable)" and keeps whatever risk band the declared inputs alone produced, and `engine.rs`'s `reclassify_at_gate` (the re-measurement that is supposed to catch a risk band rising mid-flight) simply returns early, by its own doc comment, "exactly as before." Outside a git repository, neither mechanism can ever raise a workflow's risk band beyond what was declared or measured at `workflow start` — the safety net that exists specifically to catch a mismatch is inert exactly where declaring a low-risk scope over real high-risk work would otherwise go unchecked.
-
 ## The verification fingerprint hash is FNV-1a, not a cryptographic hash
 
 `verification.rs`'s `change_fingerprint` (the value that proves a verification report matches the tree it was run against) hashes `git rev-parse HEAD` plus a diff plus every changed path's blob hash through `event::input_hash` — FNV-1a 64, chosen originally for the rot engine's own deterministic-across-compilers event hashing. FNV-1a has no collision resistance against a deliberately constructed input; a party who could already engineer a specific fingerprint collision could already control the diff and paths being fingerprinted, so this is a low-severity, recorded reuse of a non-cryptographic hash for an integrity-adjacent purpose, not a new attack surface.
@@ -103,9 +105,11 @@ Two independent places in `src/commands/workflow/` treat "Git cannot be measured
 
 `verification.rs`'s check discovery reads the whole of a repo's `package.json` into a `String` and parses it as JSON with no byte-size guard, unlike `optimize.rs`'s surface collection (`cfg.optimize.max_surface_bytes`) or `review.rs`'s untracked-file cap (`MAX_UNTRACKED_FILE_BYTES`). An unusually large `package.json` is read and parsed in full before any of its `scripts` are consulted.
 
-## Verification reports accumulate with no retention pruning
+## Verification report retention shares telemetry's config key, not a dedicated one
 
-`verification.rs`'s `save_report` writes one `{report.id}.json` file per verification run under `<state>/verification/<repo_slug>/` and updates a `latest` pointer, but nothing ever deletes an old report — unlike `telemetry.rs`, which prunes events past `retention_days`, or `memory.rs`'s `prune_to_cap`. A long-lived repository accumulates one file per verification run indefinitely.
+**Resolved 2026-08-23 (issue #91), with a scope residual.** `verification.rs`'s `save_report` now names each report file with a leading zero-padded timestamp (`{finished_at:020}-{id}.json`, the same shape `telemetry.rs` already uses) and calls `telemetry::prune_expired_except` after every write, so a long-lived repository no longer accumulates one file per verification run indefinitely; the `latest` report's own filename is always passed as a protected entry, so it survives pruning even when it is itself older than the retention window.
+
+**Residual: the retention value is `[workflow] telemetry_retention_days`, not a dedicated `verification_retention_days`.** The issue asked for a verification-specific `REPO_FORBIDDEN` key following telemetry's shape, but `WorkflowConfig` lives in `src/commands/ctx/config.rs`, which a concurrent branch (`SetupConfig`, issues #87/#93/#95) was actively editing while this change landed — adding a field there risked clobbering that work. `verification.rs`'s `resolved_retention_days_from_config` calls `telemetry::TelemetryConfig::from_config(cfg).retention_days` directly instead, so the same already-`REPO_FORBIDDEN`, already-clamped value governs both. The two windows cannot be tuned independently today; `resolved_retention_days_from_config` is the one seam to change if a genuinely separate key is added later. See the Decision Log entry.
 
 ## A nudge/mail delivery queued for a live codex dashboard pane used to wait forever
 
@@ -228,59 +232,75 @@ the headless prompt via `headless_cmd_stdin` (codex's own verified stdin
 fallback: `codex exec` with `[PROMPT]` omitted reads from stdin) instead of
 as an argv token cmd.exe would reparse. `codex::ready()` no longer hard-errors
 either -- it mirrors `ClaudeAdapter::ready` (`resolve_program(&self.program)?`)
--- so codex is a selectable, launchable adapter, just with no event parsing
-wired up yet (`parse_events`/`structural_context` stay empty; no rot score).
-Direct launches carry composed context through the official
-`developer_instructions` config override; shell-shim launches fail closed and
-use task-text fallbacks only. `zirv setup` also registers the documented Codex
-lifecycle hooks, while full rollout event support remains tracked in
-[issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11). See [[Ctx
-Adapters]].
+-- so codex is a selectable, launchable adapter. Direct launches carry
+composed context through the official `developer_instructions` config
+override; shell-shim launches fail closed and use task-text fallbacks only
+(see the entry below on that fallback now being surfaced, issue #85).
+`zirv setup` also registers the documented Codex lifecycle hooks.
+**Event parsing is no longer empty (issue #86, 2026-08-23):**
+`parse_events`/`structural_context` now derive turn boundaries and token
+totals from the same rollout JSON this file's own collector reads (see [[Ctx
+Adapters]]), so `capabilities().events` is `true` and a codex session gets a
+real rot score. Tool calls, tool results, and any compaction boundary still
+have no verified rollout shape and are not modeled -- the residual half of
+[issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11) (marker
+signal and the turn-signal socket mechanism remain unverified/absent too).
+See [[Ctx Adapters]], [[Rot Engine]].
 
-## The Windows `cmd.exe`-shim defense is opt-in per adapter, not secure by default
+## Codex's distiller/reviewer sandbox residual is now surfaced, and closes itself on a newer codex-cli (issue #89, 2026-08-23)
 
-`AgentAdapter`'s trait defaults for `launches_through_cmd_shim` (`false`) and
-`headless_cmd_stdin` (`None`) are the *insecure* answers -- "this adapter is
-never a shim launch" and "no stdin form, keep the prompt on argv." Both of
-today's adapters override them correctly (`claude.rs`, `codex.rs`, see [[Ctx
-Adapters]]), so the reparse-argv RCE class documented earlier in this file is
-closed for both. But nothing enforces the override: a third adapter that
-implements `AgentAdapter` and simply doesn't override these two methods
-compiles cleanly and passes every existing test, and silently ships with a
-headless prompt (operator task text, plus any mail folded in via `task_
-prompt_with_mail_fallback`) sitting on argv even on a Windows npm `.cmd`
-install -- `guard_cmd_shim_reparse` still catches an actual metacharacter at
-spawn time (the fail-closed backstop holds), but a clean prompt sails through
-unprotected where claude's and codex's own prompts would have moved to
-stdin. Recorded here deliberately as a note, not a fix: making the trait
-default secure (`launches_through_cmd_shim` defaulting to "ask `resolve_
-program`" rather than `false`, or restructuring so an adapter cannot omit
-the override at all) is a real refactor with its own blast radius, out of
-scope for the round that found this gap.
-
-## Codex's distiller sandbox still reads the repo's `.rules` and the operator's `~/.codex/config.toml`
-
-`CodexAdapter::distiller_cmd` pins `--sandbox read-only`, codex's analogue of
-claude's `--disallowedTools` pin backing `zirv ctx optimize`'s report-only
-guarantee -- but unlike claude's `--disallowedTools`, which is the *whole*
-restriction claude needs, codex-cli genuinely ships two more flags that would
-close a gap `--sandbox` does not touch: `--ignore-rules` (skip project/user
-execpolicy `.rules` files) and `--ignore-user-config` (skip
-`$CODEX_HOME/config.toml`). They are documented on `codex exec --help` for
-codex-cli 0.146.0 (the brew-installed capture in
+`CodexAdapter::distiller_cmd` (and, via `AgentAdapter::read_only_args`, the
+workflow reviewer too) pins `--sandbox read-only`, codex's analogue of
+claude's `--disallowedTools` pin -- but unlike claude's, which is the *whole*
+restriction claude needs, codex-cli ships two more flags that close a gap
+`--sandbox` does not touch: `--ignore-rules` (skip project/user execpolicy
+`.rules` files) and `--ignore-user-config` (skip `$CODEX_HOME/config.toml`).
+They are documented on `codex exec --help` for codex-cli 0.146.0 and 0.147.0
+(the brew/standalone captures in
 `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`), but **not** on
-0.105.0, the version `npm install -g @openai/codex` actually publishes
-(verified on a real Windows machine) and the one `distiller_cmd`'s own doc
-comment is written against. Passing either flag on 0.105.0 would very likely
-error as an unrecognized argument, breaking the distiller for the common
-install path. So today, a repo's own `.rules` execpolicy files and the
-operator's own `~/.codex/config.toml` still shape what this "report-only"
-judgment child does, on top of AGENTS.md already being embedded in its
-prompt (the one residual claude's distiller has too, and cannot close either
--- `--disallowedTools` restricts tools, not what text the model reads). Add
-`--ignore-rules --ignore-user-config` to `distiller_cmd` once the
-npm-published codex-cli ships them, verified against that installed CLI the
-same way `-s, --sandbox` was.
+0.105.0, the version `npm install -g @openai/codex` actually publishes.
+Passing either flag on an install that does not recognize it would very
+likely error as an unrecognized argument, breaking the distiller/reviewer
+outright.
+
+`CodexAdapter::read_only_args` now probes the installed binary's own `codex
+exec --help` (`ignore_flags_supported`, cached, the same `--help`-probe
+shape `ClaudeAdapter::supports_system_prompt_file` already uses rather than
+a hardcoded version cutoff -- the real minimum supporting version between
+0.105.0 and 0.146.0 was never captured) and adds both flags only when it
+finds them documented; it fails closed on any doubt (binary missing,
+timeout, only one flag present). When the flags cannot be added,
+`CodexAdapter::sandbox_residual_note` names the residual, and
+`adapters::announce_sandbox_residual_once` fires a one-time `zirv ▸`
+announcement (wired into every production distiller/judgment call site --
+`handoff::run_model`'s callers in `handoff.rs`, `memory.rs`,
+`memory_optimize.rs`, `optimize.rs` -- and the workflow reviewer's own
+`read_only_args_for_agent_name`) so an operator whose judgment/review child
+runs on an un-upgraded codex-cli is told, rather than only finding this in a
+doc file. On an install where the probe finds both flags, the announcement
+stops firing and the operator gets the stronger guarantee automatically.
+**Recorded, narrow residual:** the announcement's opt-out only checks the
+`--quiet`/`ZIRV_CTX_QUIET` env var, not the full layered `cfg.chrome.events`
+(no `CtxConfig`/`repo` path is reliably in hand at every one of these call
+sites) -- an operator whose only opt-out is `~/.zirv/ctx.toml`'s `[chrome]
+events = false` still sees this one announcement.
+
+**File-form injection investigated and rejected, not just deferred (issue
+#89's sibling gap, issue #85).** Closing the residual outright -- rather
+than surfacing it -- would need codex to read `developer_instructions` (or
+an equivalent) from a zirv-controlled file instead of argv, the way claude's
+`--append-system-prompt-file` does. The only candidate on the real installed
+CLI (`codex --help`/`codex exec --help`, codex-cli 0.147.0) is `-p,
+--profile <NAME>`, which layers `$CODEX_HOME/<name>.config.toml` -- but that
+file *must* live inside the operator's own `$CODEX_HOME` (default
+`~/.codex/`), a directory this codebase holds read-only everywhere else
+(`policy_support`'s own `CONFIG` constant: "codex's own `approval` setting
+in `~/.codex/config.toml`, which zirv reads and never rewrites"). Writing a
+profile file there is a new trust-boundary widening, not a narrow local
+seam, and redirecting `$CODEX_HOME` for the launch instead would also move
+`auth.json` (breaking authentication) unless it were copied too -- a
+materially bigger, riskier change. Not implemented; recorded here as the
+investigated-and-rejected option rather than an oversight.
 
 ## `--sandbox read-only` fails outright on a codex-cli install with the Windows sandbox helper missing
 
@@ -801,7 +821,7 @@ The approved design (spec §3/§6, `docs/superpowers/specs/2026-08-16-usage-cred
 
 ## Polling is structurally inert on API-key setups (macOS Keychain fixed 2026-08-22)
 
-`poll::anthropic_token` reads `~/.claude/.credentials.json` first; **as of 2026-08-22 (`fix/dashboard-and-harness-parity`)** it also falls back, on `#[cfg(target_os = "macos")]` builds only, to macOS Keychain (`security find-generic-password -s "Claude Code-credentials" -w`) when that file is absent — Claude Code on macOS is keychain-only, so the file never existed there, which meant the active poll (the only claude usage source for an operator who has not wired the statusline tee) was structurally dead on every macOS machine while working on Windows/Linux; this was the root cause of "the header/bar shows no usage data on macOS" (see [[Usage and Pacing]]'s `poll.rs` section). Unverified against a real macOS host — no Mac was available to confirm the `security` service name or output shape; reasoned from the CLI's own documented behavior and cross-checked externally. An operator authenticating via API key / Bedrock still has no OAuth token anywhere, keychain included, so the active poll remains structurally inert for that setup on every platform. Combined with `has_no_usage_source` being a plain no-data check, such a machine with no statusline tee gets no usage-based pacing at all — the gate announces `pacing off: anthropic has no usage source` once per run (that one-time announcement is the signal; estimator-based pacing, if configured, still applies as of the 2026-08-17 fix round). The remedy on such machines is wiring the statusline tee (`zirv ctx usage tee`), which needs no credentials -- and `zirv setup` already wires it automatically for a Claude Code install that has no pre-existing `statusLine`.
+`poll::anthropic_token` reads `~/.claude/.credentials.json` first; **as of 2026-08-22 (`fix/dashboard-and-harness-parity`)** it also falls back, on `#[cfg(target_os = "macos")]` builds only, to macOS Keychain (`security find-generic-password -s "Claude Code-credentials" -w`) when that file is absent — Claude Code on macOS is keychain-only, so the file never existed there, which meant the active poll (the only claude usage source for an operator who has not wired the statusline tee) was structurally dead on every macOS machine while working on Windows/Linux; this was the root cause of "the header/bar shows no usage data on macOS" (see [[Usage and Pacing]]'s `poll.rs` section). Unverified against a real macOS host — no Mac was available to confirm the `security` service name or output shape; reasoned from the CLI's own documented behavior and cross-checked externally. An operator authenticating via API key / Bedrock still has no OAuth token anywhere, keychain included, so the active poll remains structurally inert for that setup on every platform. Combined with `has_no_usage_source` being a plain no-data check, such a machine with no statusline tee gets no usage-based pacing at all — the gate announces `pacing off: anthropic has no usage source` once per run (that one-time announcement is the signal; estimator-based pacing, if configured, still applies as of the 2026-08-17 fix round). The remedy on such machines is wiring the statusline tee (`zirv ctx usage tee`), which needs no credentials -- `zirv setup` wires it automatically for a Claude Code install with no pre-existing `statusLine`, and (issue #93, 2026-08-23) now also offers to wrap an *existing* custom statusLine (`zirv ctx usage tee -- <existing command>`) at an interactive `apply`, rather than silently skipping that operator.
 
 **The keychain read itself is bounded and announced (2026-08-22 follow-up).** `security find-generic-password` reading an item zirv is not in the ACL of (Claude Code created it) can pop a GUI authorization dialog; there is no documented `security` flag to suppress it, so `anthropic_token_from_keychain` spawns it non-blocking and polls `try_wait` against a `KEYCHAIN_TIMEOUT_SECS` (3s, matching `HTTP_CONNECT_TIMEOUT_SECS`) deadline, killing and abandoning the child past it rather than hanging a headless/SSH session with nobody to answer. A one-time-per-process `zirv ▸` announcement (`Event::MacosKeychainPromptExpected`, gated on `cfg.chrome.events` like every other announcement) fires before the first attempt, naming the service and that "Always Allow" makes it a one-time cost. Structurally unreachable from `wrap`'s status-bar redraw path (`HttpPoller` is never constructed there). `zirv ctx status` also now explains *why* a provider has no usage source (`poll::usage_source_hint`) rather than just saying so — file absent, macOS Keychain access needed, or the tee never wired — each with the concrete next step.
 

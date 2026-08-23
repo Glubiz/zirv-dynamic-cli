@@ -119,6 +119,39 @@ fn describe_chat(cfg: &CtxConfig) -> String {
     }
 }
 
+/// Issue #85: on a launch shape that cannot safely carry an adapter's own
+/// system-prompt injection argv (the Windows `cmd.exe /c <shim>` form an
+/// npm-installed `codex.cmd` resolves to -- `CodexAdapter::system_prompt_
+/// supported` narrows the answer for exactly this shape), zirv falls back
+/// to folding the composed session context onto the task-prompt text
+/// itself (`prompt::task_prompt_with_composed_fallback`). That fallback is
+/// silent otherwise: the operator gets a materially weaker session -- text
+/// a model can drift from mid-session, instead of the harness's own
+/// authoritative-instructions channel -- with nothing telling them why.
+/// This surfaces it as a persistent status line rather than only a
+/// transient `zirv ▸` announcement (`prompt::injection_event`, emitted at
+/// each launch decision).
+///
+/// General over any adapter, not codex-specific: the condition is "this
+/// adapter has a verified injection mechanism in general
+/// (`capabilities().system_prompt`) but not for the launch shape it would
+/// actually use right now (`system_prompt_supported(&[])`)" -- exactly
+/// `injection_event`'s own `(Some(_), false)` branch, minus needing a
+/// composed prompt in hand, since this is a standing fact about the
+/// configuration, not a one-shot launch decision.
+fn describe_injection_fallback(cfg: &CtxConfig) -> Option<String> {
+    let (adapter, _) = adapters::resolve_default(cfg).ok()?;
+    if adapter.capabilities().system_prompt && !adapter.system_prompt_supported(&[]) {
+        Some(format!(
+            "{}: context via task-text fallback (npm shim launch cannot carry the injected \
+             system prompt safely)",
+            adapter.name()
+        ))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, clap::Args)]
 pub struct StatusArgs {
     /// How many recent supervisor decisions to show.
@@ -155,9 +188,37 @@ pub fn run_with<W: Write>(
         Err(e) => writeln!(w, "\nagents: (settings unreadable: {e})")?,
     }
 
+    // `zirv ctx status` is the diagnostic verb, so a config load failure
+    // must still render the rest of the report rather than bailing out --
+    // but the two ways `CtxConfig::load` can fail are not the same kind of
+    // event, and must not read or exit the same way. A layer that merely
+    // failed to *parse* (`cfg.unparsable_layers`, below) is not even an
+    // `Err` any more: it degraded to defaults, so `describe_chat` still runs
+    // normally and the exit code stays 0. A `REPO_FORBIDDEN` rejection is a
+    // security refusal -- a repository checkout tried to set something only
+    // the operator may -- so it gets its own prominent line and a non-zero
+    // exit, unlike every other config-load error (an unreadable file, a
+    // schema/typo error), which keeps the pre-existing "still exit 0, name
+    // it inline" behaviour. See the Decision Log entry on this split.
     let cfg_result = CtxConfig::load(repo, env);
+    let repo_forbidden =
+        matches!(&cfg_result, Err(e) if super::config::is_repo_forbidden(e.as_ref()));
     match &cfg_result {
-        Ok(cfg) => writeln!(w, "\n{}", describe_chat(cfg))?,
+        Ok(cfg) => {
+            writeln!(w, "\n{}", describe_chat(cfg))?;
+            for layer in &cfg.unparsable_layers {
+                writeln!(
+                    w,
+                    "config: {} unparsable ({}) \u{2014} layer ignored",
+                    layer.path.display(),
+                    layer.message
+                )?;
+            }
+            if let Some(line) = describe_injection_fallback(cfg) {
+                writeln!(w, "{line}")?;
+            }
+        }
+        Err(e) if repo_forbidden => writeln!(w, "\nCONFIG REJECTED: {e}")?,
         Err(e) => writeln!(w, "\nchat: unavailable (configuration error: {e})")?,
     }
 
@@ -299,7 +360,11 @@ pub fn run_with<W: Write>(
         }
     }
 
-    Ok(0)
+    // Non-zero only for a `REPO_FORBIDDEN` security refusal -- see the doc
+    // comment above the `cfg_result` match for why every other config-load
+    // outcome (success, a skipped-unparsable layer, or any other load error)
+    // keeps exiting 0.
+    Ok(if repo_forbidden { 1 } else { 0 })
 }
 
 pub fn run<W: Write>(args: &StatusArgs, w: &mut W) -> CtxResult<i32> {
@@ -341,6 +406,110 @@ mod tests {
         );
         assert!(text.contains("no supervised sessions"), "got {text}");
         assert!(text.contains("no handoff"), "got {text}");
+    }
+
+    /// End-to-end exit-code contract for the parse-skip half of the fix: a
+    /// repo `ctx.toml` that fails to *parse* must not fail the command --
+    /// `status` still renders, names the skipped layer, and exits 0.
+    #[test]
+    fn a_repo_layer_that_fails_to_parse_exits_zero_and_names_itself() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir repo");
+        std::fs::write(repo.join(".zirv/ctx.toml"), "1").expect("write");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let env = env_for(&state);
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 10 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+
+        assert_eq!(
+            code, 0,
+            "a skipped-unparsable layer must not fail the command"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("unparsable"), "names the skip: {text}");
+        assert!(text.contains("ctx.toml"), "names the file: {text}");
+        assert!(
+            text.contains("layer ignored"),
+            "says the layer was skipped, not the whole config: {text}"
+        );
+    }
+
+    /// `status` is a read-only/diagnostic verb, so it must keep using plain
+    /// `CtxConfig::load` (skip-and-report), not `load_for_launch`'s fatal
+    /// refusal, even for a broken HOME layer: a security finding fix for the
+    /// launching verbs must not turn every `zirv ctx status` call into a hard
+    /// failure just because `~/.zirv/ctx.toml` has a stray keystroke.
+    #[test]
+    fn a_home_layer_that_fails_to_parse_exits_zero_and_names_itself() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(home.join(".zirv/ctx.toml"), "[score\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let env = env_for(&state);
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 10 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+
+        assert_eq!(
+            code, 0,
+            "a broken home layer must not fail the diagnostic verb"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("unparsable"), "names the skip: {text}");
+        assert!(text.contains("ctx.toml"), "names the file: {text}");
+        assert!(
+            text.contains("layer ignored"),
+            "says the layer was skipped, not the whole config: {text}"
+        );
+    }
+
+    /// End-to-end exit-code contract for the security-refusal half: a
+    /// `REPO_FORBIDDEN` key is a different kind of failure from a parse
+    /// error -- `status` still renders (it is the diagnostic verb) but gets
+    /// its own prominent line and a non-zero exit.
+    #[test]
+    fn a_repo_forbidden_key_exits_nonzero_and_is_named_prominently() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir repo");
+        std::fs::write(repo.join(".zirv/ctx.toml"), "agent_bin = \"/tmp/x\"\n").expect("write");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let env = env_for(&state);
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 10 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+
+        assert_eq!(code, 1, "a REPO_FORBIDDEN rejection must fail the command");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("CONFIG REJECTED"),
+            "the refusal gets its own prominent line: {text}"
+        );
+        assert!(
+            text.contains("agent_bin"),
+            "names the offending key: {text}"
+        );
     }
 
     #[test]
@@ -832,6 +1001,64 @@ mod tests {
         assert!(
             text.contains("openai: no usage source"),
             "the line must still name the configured agent's provider, not disappear: {text}"
+        );
+    }
+
+    /// Issue #85: on a Windows npm-shim codex launch (`codex.cmd`, resolved
+    /// through `cmd.exe /c`), `zirv ctx status` must report the degraded
+    /// injection channel as a persistent line, not just a transient
+    /// announcement -- an operator who only ever runs `zirv ctx status`
+    /// still has to be told the session is running on weaker instructions.
+    #[cfg(windows)]
+    #[test]
+    fn status_reports_the_degraded_injection_channel_for_a_codex_shim_launch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let shim_dir = tempfile::tempdir().expect("tempdir");
+        let shim = shim_dir.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+
+        let mut env = env_for(state.root());
+        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+        env.insert("ZIRV_CTX_AGENT_BIN".to_string(), shim.display().to_string());
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("codex: context via task-text fallback"),
+            "got {text}"
+        );
+    }
+
+    /// A direct (non-shim) codex launch must not report the fallback: its
+    /// own `system_prompt_args`/`-c developer_instructions=...` channel is
+    /// safe there, so the status line must not falsely claim degradation.
+    #[test]
+    fn status_does_not_report_the_fallback_for_a_direct_codex_launch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let mut env = env_for(state.root());
+        env.insert("ZIRV_CTX_AGENT".to_string(), "codex".to_string());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            "/tmp/fake-codex-not-a-real-path".to_string(),
+        );
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("context via task-text fallback"),
+            "got {text}"
         );
     }
 
