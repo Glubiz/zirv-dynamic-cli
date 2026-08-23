@@ -227,8 +227,9 @@ fn claim_and_write(dir: &Path, base: &str, contents: &str) -> std::io::Result<Pa
 
 /// Replaces every character outside `[A-Za-z0-9-]` with `-` and lowercases,
 /// the same rule `state::repo_slug` uses, capped short so filenames stay
-/// reasonable.
-fn slug_key(key: &str) -> String {
+/// reasonable. `pub(crate)` so `setup::memory_section_key` (issue #103) can
+/// reuse it instead of a second slugifier.
+pub(crate) fn slug_key(key: &str) -> String {
     let raw: String = key
         .chars()
         .map(|c| {
@@ -617,7 +618,11 @@ const WINDOWS_RESERVED_NAMES: &[&str] = &[
 /// level: a key restricted to `[a-z0-9-]` can never contain `/`, `\`, `..`,
 /// or a null byte, so `dir.join(format!("{key}.md"))` can never resolve
 /// outside `dir` no matter what `dir` is.
-fn validate_shared_key(key: &str) -> CtxResult<()> {
+///
+/// `pub(crate)` so `setup::memory_section_key` (issue #103) can validate a
+/// vault-derived key against the same rules a shared-scope key must satisfy
+/// anyway, rather than duplicating this charset/length check.
+pub(crate) fn validate_shared_key(key: &str) -> CtxResult<()> {
     if key.is_empty() {
         return Err("a memory key must not be empty".into());
     }
