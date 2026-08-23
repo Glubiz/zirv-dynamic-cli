@@ -221,6 +221,8 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Bash(cargo build *)", "build with the Rust toolchain"),
     ("Bash(cargo test *)", "test with the Rust toolchain"),
     ("Bash(cargo check *)", "typecheck with the Rust toolchain"),
+    ("Bash(cargo fmt *)", "format with the Rust toolchain"),
+    ("Bash(cargo clippy *)", "lint with the Rust toolchain"),
     ("Bash(npm test *)", "test with the Node toolchain"),
     ("Bash(npm run build *)", "build with the Node toolchain"),
     ("Bash(make test *)", "test with a Makefile-based toolchain"),
@@ -243,6 +245,20 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ),
     ("Bash(dotnet test *)", "test with the .NET toolchain"),
     ("Bash(dotnet build *)", "build with the .NET toolchain"),
+    // zirv's own commands (2026-08-23, issue #98): the injected prompt
+    // (`prompt.rs`'s `HARNESS_PROMPT`, `ORCHESTRATOR_PROMPT` in
+    // `adapters::claude`) mandates `zirv ctx status`/`inbox`/`send`/
+    // `nudge`/`remember`/`recall`, `zirv agent <name> "..."`, and
+    // `zirv <script>` for repo-defined work -- but the shipped posture had
+    // no entry for `zirv` at all, so every one of those mandated commands
+    // was silently denied under `dontAsk`. A prompt must never mandate a
+    // command family the posture itself denies. `zirv <script>` runs
+    // repo-defined commands, the same trust class as the already-allowed
+    // `make build`/`npm run build` above.
+    (
+        "Bash(zirv *)",
+        "zirv's own verbs (ctx status/inbox/send/nudge/remember/recall, agent, setup, memory, context) and repo-defined scripts -- the channel the injected prompt mandates",
+    ),
 ];
 
 /// The destructive families this posture denies regardless of anything on

@@ -227,6 +227,17 @@ cargo clippy --all-targets -- -D warnings
   dedicated fast test per file (`ZIRV_CTX_PACE_BLIND_DELAY_SECS` overridden
   back to a small nonzero value, recorded through an injected closure rather
   than actually slept).
+- **The injected prompt must never mandate a command family the shipped
+  posture denies (issue #98, 2026-08-23).** `SHIPPED_POSTURE_ALLOW` had no
+  entry for `zirv` itself, so the injected prompt's own mandated commands
+  (`zirv ctx status`/`inbox`/`send`/`nudge`/`remember`/`recall`, `zirv agent
+  <name> "..."`, `zirv <script>`) were silently denied under `dontAsk` --
+  a denial under that mode is final for the whole session, with no prompt
+  to escalate to. Fixed by adding `Bash(zirv *)` (same trust class as the
+  already-allowed `make build`/`npm run build`) plus `Bash(cargo fmt *)`/
+  `Bash(cargo clippy *)`. The
+  `prompt_mandated_zirv_commands_are_allowed_by_the_shipped_posture` test in
+  `safety.rs` pins this invariant.
 
 ## Using the Obsidian Vault
 

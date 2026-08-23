@@ -946,6 +946,56 @@ mod tests {
         }
     }
 
+    /// Issue #98: the injected prompt (`prompt.rs`'s `HARNESS_PROMPT`,
+    /// `ORCHESTRATOR_PROMPT` in `adapters::claude`) mandates `zirv ctx
+    /// status`/`inbox`/`send`/`nudge`/`remember`/`recall`, `zirv agent
+    /// <name> "..."`, and `zirv <script>` -- a prompt must never mandate a
+    /// command family the shipped posture denies. `SHIPPED_POSTURE_ALLOW`
+    /// now carries `Bash(zirv *)`, `Bash(cargo fmt *)`, `Bash(cargo clippy
+    /// *)`, so all of these must evaluate `Allow` under the shipped default
+    /// policy. Also pins that a destructive family unrelated to `zirv`
+    /// still wins over the new broad allow (deny-before-allow ordering).
+    #[test]
+    fn prompt_mandated_zirv_commands_are_allowed_by_the_shipped_posture() {
+        let policy = SafetyPolicy::default();
+        let must_allow = [
+            "zirv ctx status",
+            "zirv ctx inbox",
+            "zirv ctx send --to-session abcd1234 \"note\"",
+            "zirv ctx nudge abcd1234",
+            "zirv ctx remember key \"fact\"",
+            "zirv ctx recall key",
+            "zirv agent codex \"review the diff\" -- --model gpt-5.4-mini",
+            "zirv commit",
+            "zirv setup apply --dry-run",
+            "zirv memory init --dry-run",
+            "zirv context sync --report",
+            "zirv ctx optimize --no-model",
+            "cargo fmt -- --check",
+            "cargo clippy --all-targets -- -D warnings",
+        ];
+        for command in must_allow {
+            let outcome = evaluate(&policy, command);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "{command} should be allowed, got {:?}",
+                outcome.verdict
+            );
+        }
+
+        let must_still_deny = ["git push --force origin main", "rm -rf target"];
+        for command in must_still_deny {
+            let outcome = evaluate(&policy, command);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Deny,
+                "{command} should still be denied, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
     #[test]
     fn evaluate_first_match_wins_within_a_category() {
         let policy = policy_with(

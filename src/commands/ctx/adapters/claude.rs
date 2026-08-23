@@ -1647,6 +1647,28 @@ mod tests {
         assert!(deny_arg.starts_with("--disallowedTools="));
     }
 
+    /// Issue #98: the injected prompt mandates `zirv ctx status`/`inbox`/
+    /// `send`/`nudge`/`remember`/`recall`, `zirv agent <name> "..."`, and
+    /// `zirv <script>`, plus `cargo fmt`/`cargo clippy` -- all previously
+    /// denied by the shipped posture since `SHIPPED_POSTURE_ALLOW` had no
+    /// entry for any of them. Pins that the generated `--allowedTools=`
+    /// token now carries all three new families.
+    #[test]
+    fn default_sandbox_args_allows_zirvs_own_commands() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        for rule in ["Bash(zirv *)", "Bash(cargo fmt *)", "Bash(cargo clippy *)"] {
+            assert!(
+                allow_arg.contains(rule),
+                "allow rule '{rule}' missing from {allow_arg}"
+            );
+        }
+    }
+
     /// Issue #83: `default_sandbox_args` now projects `safety::SafetyPolicy`
     /// (derived from `SHIPPED_POSTURE_ALLOW`/`_DENY`) instead of iterating
     /// those constants directly. Under the shipped default -- no
