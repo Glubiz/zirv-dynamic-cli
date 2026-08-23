@@ -1528,8 +1528,11 @@ the explicit opt-out below do.
   makes a fresh install *inert*, not merely safe: it cannot write a file at
   all. The generated set (one shared source, `adapters::SHIPPED_POSTURE_ALLOW`/
   `_DENY`, also documented against codex's own flags) is what makes it usable:
-  allow reading/writing/editing inside the workspace and the common
-  git/list/search/build/test verbs; deny recursive force-delete, force-push and
+  allow reading/writing/editing inside the workspace, the common
+  git/list/search/build/test/format/lint verbs, and `zirv` itself (its own
+  `ctx`/`agent`/`setup`/`memory`/`context` verbs and repo-defined scripts --
+  the channel the injected prompt mandates, issue #98); deny recursive
+  force-delete, force-push and
   history rewriting, `curl`/`wget`, `sudo`/`su`, and the macOS keychain CLI,
   regardless of anything on the allow side. Verified live against the real
   `claude 2.1.240`: an in-repo write and a `cargo test` both run with no
