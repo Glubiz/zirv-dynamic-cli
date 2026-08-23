@@ -1448,18 +1448,21 @@ mod tests {
                 "--disallowedTools=Write,Edit,Bash,NotebookEdit"
             ]
         );
+        // Issue #89: the two `--ignore-*` flags ride along only when the
+        // codex binary actually installed on this machine advertises them
+        // (CI has no codex at all, a developer box may have 0.147.0), so
+        // assert the invariant -- the read-only pin is always present and
+        // the optional flags can only ever trail it -- not one machine's
+        // exact argv.
+        let codex = reviewer_argv("codex").unwrap();
         assert_eq!(
-            reviewer_argv("codex").unwrap(),
-            [
-                "agent",
-                "codex",
-                "-",
-                "--",
-                "--sandbox",
-                "read-only",
-                "--ignore-rules",
-                "--ignore-user-config"
-            ]
+            &codex[..6],
+            ["agent", "codex", "-", "--", "--sandbox", "read-only"]
+        );
+        let trailing = &codex[6..];
+        assert!(
+            trailing.is_empty() || trailing == ["--ignore-rules", "--ignore-user-config"],
+            "unexpected trailing reviewer flags: {trailing:?}"
         );
         let error = reviewer_argv("nope").unwrap_err().to_string();
         assert!(
