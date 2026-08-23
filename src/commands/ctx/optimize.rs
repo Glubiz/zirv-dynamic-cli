@@ -1655,16 +1655,16 @@ pub struct OptimizeArgs {
     pub out: Option<PathBuf>,
 }
 
+// (2026-08-23, issue #108) A hand-rolled `PATH` walk here used to check only
+// the bare name, so a program that resolves through `PATHEXT` on Windows
+// (an npm-installed `.cmd`/`.bat` shim -- `zirv`, `bash` under Git for
+// Windows, etc.) was reported "not installed" even though the OS itself
+// launches it fine. `adapters::program_is_present` already does the correct,
+// PATHEXT-aware `PATH` walk (the same resolution `adapters::resolve_program`
+// uses to route a shim through `cmd.exe`); reuse it instead of maintaining a
+// second, extension-blind PATH search here.
 fn on_path(program: &str) -> bool {
-    // An absolute or relative path is checked directly; a bare name is looked
-    // up the way a shell would.
-    if program.contains('/') {
-        return Path::new(program).exists();
-    }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return true;
-    };
-    std::env::split_paths(&paths).any(|dir| dir.join(program).exists())
+    adapters::program_is_present(program)
 }
 
 pub fn run_with<W: Write>(
@@ -3286,6 +3286,35 @@ mod tests {
             "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"zirv ctx hook stop\"}]}]}}",
         )];
         assert!(lint_dead_references(&surfaces, tmp.path(), None, &|_| true).is_empty());
+    }
+
+    /// Issue #108: a hook program that resolves only through `PATHEXT` (an
+    /// npm-installed `.cmd` shim on Windows, or any other extension the OS
+    /// search adds) must not be reported "not installed" just because the
+    /// probe checked for the bare name with no extension. `on_path` is
+    /// production's own hook-binary probe (passed as `&on_path` into
+    /// `lint_dead_references` below), restricted here to a fake `PATH`
+    /// containing only `prog.exe` so the assertion does not depend on what is
+    /// actually installed on the machine running the test.
+    #[test]
+    fn a_hook_program_resolving_only_via_pathext_is_not_reported_missing() {
+        // (2026-08-23, issue #108)
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("prog.exe"), "").expect("write stub");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        #[cfg(windows)]
+        assert!(
+            on_path("prog"),
+            "prog.exe on a restricted PATH must resolve via PATHEXT"
+        );
+        assert!(
+            !on_path("missing"),
+            "a program genuinely absent from PATH must still read as missing"
+        );
     }
 
     /// I4: `~`-prefixed hook commands (`~/.claude/hooks/foo.sh`) are common.
