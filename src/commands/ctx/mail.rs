@@ -481,6 +481,66 @@ pub fn list(
     Ok(out)
 }
 
+/// Issue #100 (2026-08-23): a message whose `To-session` names a session
+/// that no longer exists. Every broad, no-session-filter caller of `list`
+/// (`zirv ctx status`, `zirv context status`) counted such a message as
+/// pending mail forever -- only the `keep` count cap (`store_into`'s own
+/// `prune_to_newest`) ever removed it, which could take days of unrelated
+/// mail traffic.
+///
+/// Reuses `sessions::list`'s own pid-liveness sweep (rather than duplicating
+/// its platform-specific process probing here) to build the set of
+/// currently live short ids, then moves any ordinary (non-fan-out) message
+/// whose `to_session` names a short outside that set into `read/` via the
+/// same `consume` every other single-shot read uses -- so it stops being
+/// counted by every caller of `list` without a second on-disk marker to
+/// track. Undirected mail (`to_session = None`, which includes every
+/// fan-out message: `--all` never sets it) and mail to a session still in
+/// the registry are both left exactly where they are.
+///
+/// `to_session` is matched by exact equality against a live short id, the
+/// same rule `list`'s own `session_visible` filter uses just below -- never
+/// a prefix match, which could otherwise sweep (or spare) the wrong session
+/// on a short-id collision.
+///
+/// Best-effort, like every other piece of state-dir housekeeping in this
+/// module: a message that fails to move is simply left in place and counted
+/// again on the next call. Returns how many messages it swept, so a caller
+/// (`zirv ctx status`, `zirv context status`) can report that count
+/// alongside the remaining unread total.
+pub fn sweep_undeliverable(state: &StateDir, repo_slug: &str) -> usize {
+    let dir = state.mail().join(repo_slug);
+    let Ok(paths) = scan_md_files(&dir) else {
+        return 0;
+    };
+    if paths.is_empty() {
+        return 0;
+    }
+    let live: std::collections::BTreeSet<String> = sessions::list(state)
+        .into_iter()
+        .filter(|(_, liveness)| *liveness == sessions::Liveness::Live)
+        .map(|(record, _)| record.short)
+        .collect();
+
+    let mut swept = 0;
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let msg = parse_markdown(&text);
+        let Some(to_session) = &msg.to_session else {
+            continue;
+        };
+        if live.contains(to_session) {
+            continue;
+        }
+        if consume(state, repo_slug, &path).is_ok() {
+            swept += 1;
+        }
+    }
+    swept
+}
+
 /// N7: unread mail for `repo`, filtered to what `agent`/`session_short`
 /// would see (the same visibility `list` already applies), split into
 /// `(broadcast, direct-to-this-session)` rather than one combined total --
@@ -2109,6 +2169,70 @@ This should not appear in the body.\n";
                 "an undirected message must be visible to session {session}: {listed:?}"
             );
         }
+    }
+
+    // Issue #100 (2026-08-23): mail addressed to a session that no longer
+    // exists.
+
+    #[test]
+    fn sweep_undeliverable_moves_mail_addressed_to_a_dead_session_into_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let msg = session_addressed("sender", "deadbeef", "any");
+        let path = store(&state, "-work-repo", &msg, &cfg).expect("store");
+
+        let swept = sweep_undeliverable(&state, "-work-repo");
+        assert_eq!(swept, 1, "the message to a dead session id is swept");
+
+        assert!(!path.exists(), "moved out of the ordinary mailbox");
+        let read_path = state
+            .mail()
+            .join("-work-repo")
+            .join("read")
+            .join(path.file_name().expect("file name"));
+        assert!(
+            read_path.exists(),
+            "and landed in read/: {}",
+            read_path.display()
+        );
+
+        let remaining = list(&state, "-work-repo", None, None).expect("list");
+        assert!(
+            remaining.is_empty(),
+            "no longer counted as pending: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_undeliverable_leaves_mail_to_a_live_session_and_undirected_mail_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let record = sessions::Record::new(
+            "11112222-3333-4444-8555-666666666666",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+
+        let cfg = CtxConfig::default();
+        let directed = session_addressed("sender", &short, "any");
+        store(&state, "-work-repo", &directed, &cfg).expect("store directed");
+        store(&state, "-work-repo", &sample("sender", 1_700_000_100), &cfg)
+            .expect("store undirected");
+
+        let swept = sweep_undeliverable(&state, "-work-repo");
+        assert_eq!(swept, 0, "nothing is swept: both messages are deliverable");
+
+        let remaining = list(&state, "-work-repo", None, None).expect("list");
+        assert_eq!(
+            remaining.len(),
+            2,
+            "both the directed-to-a-live-session and the undirected message remain: {remaining:?}"
+        );
     }
 
     #[test]
