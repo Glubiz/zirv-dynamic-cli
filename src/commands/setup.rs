@@ -1391,7 +1391,11 @@ fn reset_one<W: Write>(
     }
     if dry_run {
         for path in &existing {
-            writeln!(writer, "would back up and reset {}", path.display())?;
+            writeln!(
+                writer,
+                "would back up and reset {}",
+                ctx::state::display_path(path)
+            )?;
         }
         return Ok(existing.len());
     }
@@ -1416,7 +1420,7 @@ fn reset_one<W: Write>(
         "reset {} {:?} setting(s); backup: {}",
         existing.len(),
         provider,
-        backup_dir.display()
+        ctx::state::display_path(&backup_dir)
     )?;
     Ok(existing.len())
 }
@@ -1494,7 +1498,11 @@ fn run_status<W: Write>(args: &StatusArgs, writer: &mut W) -> SetupResult<i32> {
         writeln!(writer, "{}", serde_json::to_string_pretty(&status)?)?;
         return Ok(0);
     }
-    writeln!(writer, "Zirv AI setup for {}", status.repo.display())?;
+    writeln!(
+        writer,
+        "Zirv AI setup for {}",
+        ctx::state::display_path(&status.repo)
+    )?;
     writeln!(
         writer,
         "  harnesses: Claude {}, Codex {}",
@@ -1558,7 +1566,7 @@ fn run_apply<W: Write>(args: &ApplyArgs, writer: &mut W) -> SetupResult<i32> {
                     } else {
                         "created"
                     },
-                    path.display()
+                    ctx::state::display_path(&path)
                 )?;
             }
         }
@@ -1675,7 +1683,7 @@ fn run_reset<W: Write>(args: &ResetArgs, writer: &mut W) -> SetupResult<i32> {
                         return Err(format!(
                             "refusing global reset because {} is inside repository {}",
                             base.display(),
-                            repo.display()
+                            ctx::state::display_path(&repo)
                         )
                         .into());
                     }
@@ -2229,7 +2237,7 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
             writeln!(
                 writer,
                 "would restore {} [{}]",
-                target.source.display(),
+                ctx::state::display_path(&target.source),
                 describe_state(state)
             )?;
         }
@@ -2237,7 +2245,7 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
             writeln!(
                 writer,
                 "would NOT restore {} (credentials; pass --include-auth)",
-                target.source.display()
+                ctx::state::display_path(&target.source)
             )?;
         }
         return Ok(0);
@@ -2279,26 +2287,26 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
     }
 
     for path in &written {
-        writeln!(writer, "restored {}", path.display())?;
+        writeln!(writer, "restored {}", ctx::state::display_path(path))?;
     }
     for target in &skipped_auth {
         writeln!(
             writer,
             "not restored (credentials; pass --include-auth): {}",
-            target.source.display()
+            ctx::state::display_path(&target.source)
         )?;
     }
     for (path, error) in &failed {
         writeln!(
             writer,
             "NOT restored (error): {} -- {error}",
-            path.display()
+            ctx::state::display_path(path)
         )?;
     }
     writeln!(
         writer,
         "safety backup of the pre-restore state: {}",
-        safety_backup.display()
+        ctx::state::display_path(&safety_backup)
     )?;
 
     if !failed.is_empty() {
@@ -2869,6 +2877,30 @@ mod tests {
             "every claude hook, including the safety hook, is now installed"
         );
         assert_eq!(after.claude_hooks_installed, HARNESS_HOOKS.len() + 1);
+    }
+
+    /// `resolved_repo` canonicalizes, which on Windows yields a `\\?\`
+    /// verbatim-prefixed path; the status header must strip it before
+    /// printing (issue #101) rather than showing an operator something like
+    /// `Zirv AI setup for \\?\D:\...`, which is confusing and often cannot
+    /// even be pasted back into another command.
+    #[test]
+    fn run_status_header_names_the_repo_without_a_windows_verbatim_prefix() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        let args = StatusArgs {
+            repo: repo.path().to_path_buf(),
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_status(&args, &mut out).expect("runs");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains(r"\\?\"),
+            "status header must not leak the Windows verbatim prefix: {text}"
+        );
     }
 
     fn restore_args(repo: &Path) -> RestoreArgs {
