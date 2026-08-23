@@ -87,6 +87,7 @@ model = "fable"
 # soft_percent = 80.0                # start of the soft-throttle band (delays scale linearly up to max_percent)
 # poll_enabled = true                # REPO-FORBIDDEN (ZIRV_CTX_PACE_POLL): active API-poll fallback when the collector is stale. Default: true.
 # poll_min_interval_secs = 60        # REPO-FORBIDDEN (ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS): floor between poll attempts. Default: 60.
+# blind_delay_secs = 60              # REPO-FORBIDDEN (ZIRV_CTX_PACE_BLIND_DELAY_SECS): fail-SAFE per-cycle delay applied when the gate has no usable data at all (no binding collector reading, no configured estimator) instead of proceeding unthrottled. Default: 60.
 
 # [pace.use_credits]                 # REPO-FORBIDDEN (ZIRV_CTX_PACE_USE_CREDITS_CLAUDE / _CODEX): skip pace gating for a harness whose vendor plan covers overage.
 # claude = false                     # Default: false.

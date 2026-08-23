@@ -326,14 +326,28 @@ impl AgentAdapter for CodexAdapter {
     ///   `cat ~/.aws/credentials` -- reading is untouched by a write-scoping
     ///   flag, so claiming `Degraded` here would overstate what the sandbox
     ///   does.
-    /// - **Approval** is `Unsupported` at `Deny`: the sandbox flag is not
-    ///   codex's approval mechanism at all. Only codex's own `approval`
-    ///   setting in `~/.codex/config.toml` governs that (it appears in
-    ///   `codex exec`'s stdout preamble as `approval: never`), which zirv
-    ///   reads and never rewrites -- so an `Ask` stance is
-    ///   operator-controlled, but a `Deny` stance has no verified per-run pin
-    ///   at all (the only bypass flag verified on the CLI,
-    ///   `--dangerously-bypass-approvals-and-sandbox`, only ever *widens*).
+    /// - **Approval** is `Degraded` at `Deny` (2026-08-22, revised from
+    ///   `Unsupported`): `-a, --ask-for-approval <untrusted|on-request|
+    ///   never>` is real and verified against the installed `codex-cli
+    ///   0.147.0` (`codex --help`/`codex exec --help`, both quoted in full in
+    ///   the 2026-08-22 addendum to `docs/superpowers/notes/2026-07-31-
+    ///   codex-cli-facts.md`) -- `never` suppresses the escalation prompt for
+    ///   anything the sandbox would otherwise ask about, with the failure
+    ///   reported straight back to the model instead. Not `Enforced`: in
+    ///   isolation (this capability alone, at whatever sandbox mode a launch
+    ///   happens to carry) it only ever changes whether a blocked action
+    ///   escalates, never what the sandbox blocks in the first place --
+    ///   pairing it with `--sandbox read-only` (what `AgentAdapter::
+    ///   policy_args` actually does when `repo_fs_write`/`shell_exec` are
+    ///   also denied) is what makes "must not attempt anything needing
+    ///   approval" hold in practice; `Approval` alone, with no accompanying
+    ///   sandbox restriction, would suppress prompts without necessarily
+    ///   preventing anything. An `Ask` stance is `OperatorControlled` via
+    ///   codex's own `approval` setting in `~/.codex/config.toml` (it appears
+    ///   in `codex exec`'s stdout preamble as `approval: <value>`), which
+    ///   zirv reads and never rewrites (the only bypass flag verified on the
+    ///   CLI, `--dangerously-bypass-approvals-and-sandbox`, only ever
+    ///   *widens*, and is never emitted by this codebase).
     /// - **Network** and **MCP/tool access** have no verified per-run flag.
     ///   `--disable <FEATURE>` is a feature-flag switch, not a tool deny-list.
     /// - **git push / destructive git** has none either, same as claude.
@@ -355,9 +369,10 @@ impl AgentAdapter for CodexAdapter {
              all -- a command still executes under it and can read anything the process can \
              reach (e.g. `cat ~/.aws/credentials`); codex has no verified per-run flag that \
              denies shell execution itself";
-        const APPROVAL_DENY_UNSUPPORTED: &str = "--sandbox read-only is not codex's approval mechanism; only codex's own \
-             `approval` setting in ~/.codex/config.toml governs that, and zirv reads it but \
-             never rewrites it";
+        const APPROVAL_DENY_DEGRADED: &str = "-a, --ask-for-approval never (verified on codex-cli 0.147.0), which suppresses the \
+             escalation prompt for a blocked action but does not by itself decide what the \
+             sandbox blocks -- paired with --sandbox read-only when repo_fs_write/shell_exec \
+             are also denied, which is what actually makes this hold";
 
         match (capability, stance) {
             (Capability::RepoFsWrite, Stance::Deny) => CapabilityDescriptor::degraded(SANDBOX),
@@ -368,7 +383,7 @@ impl AgentAdapter for CodexAdapter {
                 CapabilityDescriptor::unsupported(SHELL_EXEC_DENY_UNSUPPORTED)
             }
             (Capability::Approval, Stance::Deny) => {
-                CapabilityDescriptor::unsupported(APPROVAL_DENY_UNSUPPORTED)
+                CapabilityDescriptor::degraded(APPROVAL_DENY_DEGRADED)
             }
             (Capability::ShellExec | Capability::Approval, Stance::Ask) => {
                 CapabilityDescriptor::operator_controlled(CONFIG)
@@ -377,6 +392,73 @@ impl AgentAdapter for CodexAdapter {
             // codex has no verified mechanism for -- see this method's own doc.
             _ => CapabilityDescriptor::advisory_only(),
         }
+    }
+
+    /// The one stance this adapter has a verified per-run mechanism for
+    /// (mirroring `ClaudeAdapter::policy_args`): `RepoFsWrite`/`ShellExec` at
+    /// `Deny` gets `self.read_only_args()` (`--sandbox read-only`, the same
+    /// pin `distiller_cmd` already uses) **plus** `-a/--ask-for-approval
+    /// never`.
+    ///
+    /// The second flag is new information, not in `policy_support`'s own doc
+    /// comment above: `-a, --ask-for-approval <untrusted|on-request|never>`
+    /// is real on both the top-level `codex [PROMPT]` launch and `codex exec`,
+    /// verified against the actually-installed `codex-cli 0.147.0` at
+    /// `~\AppData\Local\Programs\OpenAI\Codex\bin` (`codex --help` / `codex
+    /// exec --help`, both quoted verbatim in the 2026-08-22 addendum to
+    /// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`) -- the original
+    /// 2026-07-31 capture of `codex exec --help` (codex-cli 0.146.0, brew) did
+    /// **not** show this flag at all, so it postdates that capture; treat the
+    /// addendum, not the original block, as authoritative for this flag.
+    /// `never` alone would only silence the *prompt*, not what is allowed
+    /// (`--dangerously-bypass-approvals-and-sandbox` is the only flag that
+    /// removes the sandbox, and this never emits it); paired with `--sandbox
+    /// read-only` it is what actually closes the gap `policy_support`'s own
+    /// `Capability::Approval` arm now describes (`Degraded`, revised
+    /// 2026-08-22 from the stale `Unsupported` this constant's name once
+    /// matched): without it, a sandbox-blocked command still escalates to a
+    /// human before failing, which is exactly the "codex prompts far more
+    /// than claude" symptom this exists to close for a launch that has no
+    /// human present to answer (a headless worker).
+    fn policy_args(&self, policy: &crate::commands::ctx::policy::EffectivePolicy) -> Vec<String> {
+        use crate::commands::ctx::policy::Stance;
+        if policy.repo_fs_write == Stance::Deny || policy.shell_exec == Stance::Deny {
+            let mut args = self.read_only_args();
+            args.push("--ask-for-approval".to_string());
+            args.push("never".to_string());
+            args
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The codex side of the shipped-default "sandboxed, no prompts"
+    /// posture (2026-08-22): `--sandbox workspace-write` (writes confined to
+    /// the workspace, commands run freely inside it) paired with
+    /// `--ask-for-approval never` (no escalation prompt for anything the
+    /// sandbox does allow or refuse -- the model is told the outcome
+    /// directly). Both verified against the actually-installed `codex-cli
+    /// 0.147.0`'s own `--help`/`exec --help` (2026-08-22 addendum to
+    /// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`, the same
+    /// capture `policy_args`'s own doc comment cites). Never
+    /// `--dangerously-bypass-approvals-and-sandbox`: that removes
+    /// sandboxing entirely, which is the one thing this posture must not
+    /// do.
+    /// `sandbox.extra_allow`/`extra_deny` (fix round 3, 2026-08-22) are
+    /// claude permission-rule strings (`Bash(...)`/`Edit(...)`/`Read(...)`);
+    /// codex has no per-command mechanism to receive them and ignores the
+    /// parameter, exactly like the trait default.
+    fn default_sandbox_args(
+        &self,
+        sandbox: &crate::commands::ctx::config::SandboxConfig,
+    ) -> Vec<String> {
+        let _ = sandbox;
+        vec![
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+        ]
     }
 
     fn launch_prefix_len(&self) -> usize {
@@ -774,6 +856,142 @@ mod tests {
         assert!(
             args.windows(2).any(|w| w == ["--sandbox", "read-only"]),
             "the distiller must be pinned to codex's own read-only sandbox: {args:?}"
+        );
+    }
+
+    /// Bug B: the shipped default `[policy]` (all `Allow`) must leave a real
+    /// launch byte-for-byte unaffected, exactly like claude's own
+    /// `policy_args_is_empty_under_the_default_all_allow_policy`.
+    #[test]
+    fn policy_args_is_empty_under_the_default_all_allow_policy() {
+        let adapter = CodexAdapter::new(None);
+        assert!(
+            adapter
+                .policy_args(&crate::commands::ctx::policy::EffectivePolicy::default())
+                .is_empty()
+        );
+    }
+
+    /// `-a, --ask-for-approval <untrusted|on-request|never>`, verified
+    /// against the installed `codex-cli 0.147.0`'s own `--help`/`exec --help`
+    /// (see `policy_args`'s own doc comment and the 2026-08-22 addendum to
+    /// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`): pairing
+    /// `--sandbox read-only` with `--ask-for-approval never` is what actually
+    /// stops a Deny-policy launch from escalating to a human before the
+    /// sandbox denies the command anyway -- `--sandbox` alone only decides
+    /// what is *allowed*, not whether a blocked attempt still prompts first.
+    #[test]
+    fn policy_args_pins_the_read_only_sandbox_and_suppresses_approval_prompts_when_shell_exec_is_denied()
+     {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = CodexAdapter::new(None);
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        assert_eq!(
+            adapter.policy_args(&policy),
+            vec![
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_args_pins_the_read_only_sandbox_and_suppresses_approval_prompts_when_repo_fs_write_is_denied()
+     {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = CodexAdapter::new(None);
+        let policy = EffectivePolicy {
+            repo_fs_write: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        assert_eq!(
+            adapter.policy_args(&policy),
+            vec![
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ]
+        );
+    }
+
+    /// `Ask` stays `OperatorControlled` (`policy_support`'s own `CONFIG`
+    /// arm): codex has no verified per-run mechanism for it either, so
+    /// `policy_args` must not invent one -- an operator who wants
+    /// per-command prompting still configures it in `~/.codex/config.toml`.
+    #[test]
+    fn policy_args_leaves_ask_untouched() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = CodexAdapter::new(None);
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Ask,
+            ..EffectivePolicy::default()
+        };
+        assert!(adapter.policy_args(&policy).is_empty());
+    }
+
+    /// This never emits `--dangerously-bypass-approvals-and-sandbox` (the
+    /// only flag that actually removes sandboxing) under any policy input --
+    /// a Deny policy must only ever get *more* restrictive, never that.
+    #[test]
+    fn policy_args_never_emits_the_dangerous_bypass_flag() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = CodexAdapter::new(None);
+        for policy in [
+            EffectivePolicy::default(),
+            EffectivePolicy {
+                shell_exec: Stance::Deny,
+                ..EffectivePolicy::default()
+            },
+            EffectivePolicy {
+                repo_fs_write: Stance::Deny,
+                shell_exec: Stance::Deny,
+                approval: Stance::Deny,
+                ..EffectivePolicy::default()
+            },
+        ] {
+            let args = adapter.policy_args(&policy);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.contains("dangerously-bypass-approvals-and-sandbox")),
+                "must never widen: {args:?}"
+            );
+        }
+    }
+
+    /// The shipped-default posture (2026-08-22): workspace-write (commands
+    /// run freely inside the repo) paired with never-ask (no escalation
+    /// prompt), verified against the real installed `codex-cli 0.147.0`.
+    #[test]
+    fn default_sandbox_args_pairs_workspace_write_with_never_ask() {
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(
+            adapter.default_sandbox_args(&Default::default()),
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ]
+        );
+    }
+
+    /// Must never be the flag that removes sandboxing entirely.
+    #[test]
+    fn default_sandbox_args_never_emits_the_dangerous_bypass_flag() {
+        let adapter = CodexAdapter::new(None);
+        let args = adapter.default_sandbox_args(&Default::default());
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("dangerously-bypass-approvals-and-sandbox")),
+            "must never widen: {args:?}"
         );
     }
 

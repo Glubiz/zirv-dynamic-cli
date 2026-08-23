@@ -4,7 +4,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::ctx;
@@ -37,6 +37,8 @@ pub enum SetupVerb {
     Apply(ApplyArgs),
     /// Back up and reset Claude/Codex custom settings.
     Reset(ResetArgs),
+    /// List or restore a previous `apply`/`reset` backup.
+    Restore(RestoreArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -65,7 +67,7 @@ pub struct ApplyArgs {
     pub memory_source: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResetProvider {
     Claude,
@@ -73,7 +75,7 @@ pub enum ResetProvider {
     All,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResetScope {
     Project,
@@ -96,6 +98,117 @@ pub struct ResetArgs {
     #[arg(long, default_value_t = false)]
     pub yes: bool,
 }
+
+/// A backup run's origin: `reset` removed files, `apply` merged into a
+/// harness config file, `restore` is the automatic safety copy a restore
+/// takes of the state it is about to overwrite. All three share one manifest
+/// shape and one directory layout under `.zirv/backups/ai-reset`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BackupKind {
+    #[default]
+    Reset,
+    Apply,
+    Restore,
+}
+
+/// A manifest schema_version this build understands. Bump only alongside a
+/// reader that still understands every older version, or accept that older
+/// backups become list-only (readable for `--list`, refused for `restore`).
+const SUPPORTED_MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+fn default_existed_before() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManifestTarget {
+    source: PathBuf,
+    relative_path: PathBuf,
+    /// Whether this target existed before the run that produced this backup.
+    /// `false` means the run *created* the file (an `apply` merge into a
+    /// fresh settings file); restoring such a target means removing it, not
+    /// copying anything back. Old reset-only manifests predate this field
+    /// and always recorded existing targets, so it defaults to `true`.
+    #[serde(default = "default_existed_before")]
+    existed_before: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Manifest {
+    schema_version: u32,
+    #[serde(default)]
+    kind: BackupKind,
+    provider: ResetProvider,
+    scope: ResetScope,
+    base: PathBuf,
+    created: u64,
+    targets: Vec<ManifestTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetState {
+    Absent,
+    Identical,
+    Differs,
+}
+
+fn describe_state(state: TargetState) -> &'static str {
+    match state {
+        TargetState::Absent => "currently absent",
+        TargetState::Identical => "currently present, identical to the backup",
+        TargetState::Differs => {
+            "currently present, DIFFERS from the backup -- restoring will overwrite it"
+        }
+    }
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct RestoreArgs {
+    /// Backup run id (a directory name under `.zirv/backups/ai-reset`).
+    pub id: Option<String>,
+    /// Enumerate available backup runs instead of restoring one.
+    #[arg(long, default_value_t = false)]
+    pub list: bool,
+    /// Restore the most recent matching run instead of naming an id.
+    #[arg(long, default_value_t = false)]
+    pub latest: bool,
+    #[arg(long, value_enum)]
+    pub provider: Option<ResetProvider>,
+    #[arg(long, value_enum)]
+    pub scope: Option<ResetScope>,
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    #[arg(long, default_value_t = false)]
+    pub include_auth: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+struct BackupRun {
+    dir: PathBuf,
+    id: String,
+    manifest: Manifest,
+}
+
+const CLAUDE_JSON_NOTE: &str = "note: ~/.claude.json (MCP server registrations, OAuth/account linkage, project trust state) is never reset or restored by zirv; it is out of scope because clearing it would sign the operator out. Manage it by hand.";
+
+/// Guided-menu wording, pulled into named constants so it is directly
+/// assertable from a test rather than only reachable through an interactive
+/// `dialoguer` prompt.
+const GUIDED_RESET_CONFIRM_PROMPT: &str = "Back up these settings, then reset them? This is \
+     recoverable: `zirv setup restore` can bring this exact configuration back at any time.";
+const GUIDED_NO_BACKUPS_MESSAGE: &str = "No backup runs found yet. A backup is created \
+     automatically every time `zirv setup apply` merges Zirv's hooks into a harness config \
+     file, and every time `zirv setup reset` clears one -- there is nothing to restore until \
+     one of those has actually run.";
+const GUIDED_RESTORE_CONFIRM_PROMPT: &str = "Apply this restore now? The overwrites listed \
+     above will happen; the current state is backed up first, so this restore can itself be \
+     undone.";
 
 #[derive(Debug, Serialize)]
 struct HarnessStatus {
@@ -246,11 +359,14 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
                 .parent()
                 .ok_or("settings path has no parent")?,
         )?;
-        if settings_path.is_file() {
-            let backup = settings_path
-                .with_extension(format!("json.zirv-backup-{}", ctx::state::now_secs()));
-            std::fs::copy(&settings_path, backup)?;
-        }
+        write_backup_run(
+            &home.join(".zirv/backups/ai-reset"),
+            BackupKind::Apply,
+            ResetProvider::Claude,
+            ResetScope::Global,
+            &claude_config_dir(home),
+            std::slice::from_ref(&settings_path),
+        )?;
         std::fs::write(
             &settings_path,
             serde_json::to_string_pretty(&settings)? + "\n",
@@ -259,7 +375,7 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
     Ok((hooks_added, statusline_added))
 }
 
-fn install_codex_hooks(hooks_path: &Path, dry_run: bool) -> SetupResult<usize> {
+fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupResult<usize> {
     if std::fs::symlink_metadata(hooks_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
         return Err(format!("refusing to write symlink {}", hooks_path.display()).into());
@@ -272,19 +388,23 @@ fn install_codex_hooks(hooks_path: &Path, dry_run: bool) -> SetupResult<usize> {
         }
     }
     if !dry_run && hooks_added > 0 {
-        std::fs::create_dir_all(hooks_path.parent().ok_or("hooks path has no parent")?)?;
-        if hooks_path.is_file() {
-            let backup =
-                hooks_path.with_extension(format!("json.zirv-backup-{}", ctx::state::now_secs()));
-            std::fs::copy(hooks_path, backup)?;
-        }
+        let base = hooks_path.parent().ok_or("hooks path has no parent")?;
+        std::fs::create_dir_all(base)?;
+        write_backup_run(
+            &home.join(".zirv/backups/ai-reset"),
+            BackupKind::Apply,
+            ResetProvider::Codex,
+            ResetScope::Global,
+            base,
+            &[hooks_path.to_path_buf()],
+        )?;
         std::fs::write(hooks_path, serde_json::to_string_pretty(&hooks)? + "\n")?;
     }
     Ok(hooks_added)
 }
 
 fn install_codex_integration(home: &Path, dry_run: bool) -> SetupResult<usize> {
-    install_codex_hooks(&codex_config_dir(home).join("hooks.json"), dry_run)
+    install_codex_hooks(home, &codex_config_dir(home).join("hooks.json"), dry_run)
 }
 
 fn read_regular(path: &Path) -> Option<String> {
@@ -751,6 +871,7 @@ fn global_candidates(provider: ResetProvider, base: &Path, include_auth: bool) -
             "agents",
             "agent-memory",
             "skills",
+            "plugins",
             "output-styles",
             "keybindings.json",
             "themes",
@@ -868,6 +989,58 @@ fn unique_backup_dir(root: &Path, label: &str) -> PathBuf {
         .unwrap_or_else(|| root.join(format!("{}-{label}-overflow", ctx::state::now_secs())))
 }
 
+fn relative_path_buf(base: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(base)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.file_name().map(PathBuf::from).unwrap_or_default())
+}
+
+/// Writes one versioned, manifest-tracked backup run: every target that
+/// currently exists is copied verbatim into `<run>/files/<relative_path>`,
+/// and every target (existing or not) gets a manifest row recording whether
+/// it existed. Shared by `reset` (before deletion), `apply` (before merging
+/// into a harness config file), and `restore` (before overwriting the
+/// current state) -- one backup format, one place that writes it.
+fn write_backup_run(
+    backup_root: &Path,
+    kind: BackupKind,
+    provider: ResetProvider,
+    scope: ResetScope,
+    base: &Path,
+    targets: &[PathBuf],
+) -> SetupResult<PathBuf> {
+    let label = format!("{:?}-{:?}", provider, scope).to_ascii_lowercase();
+    let backup_dir = unique_backup_dir(backup_root, &label);
+    std::fs::create_dir_all(&backup_dir)?;
+    let mut manifest_targets = Vec::new();
+    for path in targets {
+        let relative = relative_path_buf(base, path);
+        let existed_before = path.exists();
+        if existed_before {
+            copy_for_backup(path, &backup_dir.join("files").join(&relative))?;
+        }
+        manifest_targets.push(json!({
+            "source": path,
+            "relative_path": relative,
+            "existed_before": existed_before,
+        }));
+    }
+    let manifest = json!({
+        "schema_version": SUPPORTED_MANIFEST_SCHEMA_VERSION,
+        "kind": kind,
+        "provider": provider,
+        "scope": scope,
+        "base": base,
+        "created": ctx::state::now_secs(),
+        "targets": manifest_targets,
+    });
+    std::fs::write(
+        backup_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )?;
+    Ok(backup_dir)
+}
+
 fn reset_one<W: Write>(
     writer: &mut W,
     provider: ResetProvider,
@@ -900,40 +1073,13 @@ fn reset_one<W: Write>(
         validate_reset_target(path)?;
     }
 
-    let label = format!("{:?}-{:?}", provider, scope).to_ascii_lowercase();
-    let backup_dir = unique_backup_dir(backup_root, &label);
-    std::fs::create_dir_all(&backup_dir)?;
-    for path in &existing {
-        let relative = path
-            .strip_prefix(base)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| path.file_name().map(PathBuf::from).unwrap_or_default());
-        copy_for_backup(path, &backup_dir.join("files").join(relative))?;
-    }
-    let manifest_targets = existing
-        .iter()
-        .map(|path| {
-            let relative = path
-                .strip_prefix(base)
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|_| path.file_name().map(PathBuf::from).unwrap_or_default());
-            json!({
-                "source": path,
-                "relative_path": relative,
-            })
-        })
-        .collect::<Vec<_>>();
-    let manifest = json!({
-        "schema_version": 1,
-        "provider": provider,
-        "scope": scope,
-        "base": base,
-        "created": ctx::state::now_secs(),
-        "targets": manifest_targets,
-    });
-    std::fs::write(
-        backup_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)? + "\n",
+    let backup_dir = write_backup_run(
+        backup_root,
+        BackupKind::Reset,
+        provider,
+        scope,
+        base,
+        &existing,
     )?;
     for path in &existing {
         remove_reset_target(path, base)?;
@@ -1152,6 +1298,9 @@ fn run_reset<W: Write>(args: &ResetArgs, writer: &mut W) -> SetupResult<i32> {
     if !args.dry_run && !args.yes {
         return Err("reset is destructive; inspect with --dry-run, then repeat with --yes".into());
     }
+    if args.dry_run && !matches!(args.provider, ResetProvider::Codex) {
+        writeln!(writer, "{CLAUDE_JSON_NOTE}")?;
+    }
     let repo = resolved_repo(&args.repo)?;
     let home = home_dir()?;
     let providers = match args.provider {
@@ -1225,7 +1374,13 @@ fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
     }
     let action = dialoguer::Select::new()
         .with_prompt("Zirv AI setup")
-        .items(["Apply full setup", "Show status", "Factory reset", "Cancel"])
+        .items([
+            "Apply full setup",
+            "Show status",
+            "Factory reset",
+            "Restore a previous configuration",
+            "Cancel",
+        ])
         .default(0)
         .interact()?;
     match action {
@@ -1260,7 +1415,7 @@ fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
                 .default(0)
                 .interact()?;
             if !dialoguer::Confirm::new()
-                .with_prompt("Back up these settings, then reset them?")
+                .with_prompt(GUIDED_RESET_CONFIRM_PROMPT)
                 .default(false)
                 .interact()?
             {
@@ -1282,8 +1437,578 @@ fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
                 writer,
             )
         }
+        3 => run_guided_restore(writer),
         _ => Ok(0),
     }
+}
+
+/// The guided counterpart to `restore --list` + `restore <id>`: presents the
+/// same absent/identical/differs classification as a readable menu instead
+/// of a column dump, previews with a dry run before asking for the same
+/// explicit confirmation the flag surface requires, and never skips that
+/// confirmation -- the guided path is a friendlier front end onto
+/// `restore_run`, not a second, looser gate.
+fn run_guided_restore<W: Write>(writer: &mut W) -> SetupResult<i32> {
+    let repo = resolved_repo(&PathBuf::from("."))?;
+    let home = home_dir()?;
+    let roots = vec![
+        repo.join(".zirv/backups/ai-reset"),
+        home.join(".zirv/backups/ai-reset"),
+    ];
+    let runs = all_runs(&roots);
+    if runs.is_empty() {
+        writeln!(writer, "{GUIDED_NO_BACKUPS_MESSAGE}")?;
+        return Ok(0);
+    }
+
+    writeln!(writer, "{}", backup_summary_line(&runs))?;
+    let mut items = runs.iter().map(format_run_line).collect::<Vec<_>>();
+    items.push("Cancel".to_string());
+
+    let choice = dialoguer::Select::new()
+        .with_prompt("Restore which backup run?")
+        .items(&items)
+        .default(0)
+        .interact()?;
+    if choice == runs.len() {
+        return Ok(0);
+    }
+    let run = &runs[choice];
+
+    let preview = RestoreArgs {
+        id: Some(run.id.clone()),
+        list: false,
+        latest: false,
+        provider: None,
+        scope: None,
+        repo: PathBuf::from("."),
+        include_auth: false,
+        dry_run: true,
+        yes: false,
+        json: false,
+    };
+    restore_run(writer, run, &preview)?;
+
+    if !dialoguer::Confirm::new()
+        .with_prompt(GUIDED_RESTORE_CONFIRM_PROMPT)
+        .default(false)
+        .interact()?
+    {
+        return Ok(0);
+    }
+
+    let apply = RestoreArgs {
+        yes: true,
+        dry_run: false,
+        ..preview
+    };
+    restore_run(writer, run, &apply)
+}
+
+fn matches_provider(filter: ResetProvider, actual: ResetProvider) -> bool {
+    matches!(filter, ResetProvider::All) || filter == actual
+}
+
+fn matches_scope(filter: ResetScope, actual: ResetScope) -> bool {
+    matches!(filter, ResetScope::All) || filter == actual
+}
+
+fn is_auth_relative_path(relative: &Path) -> bool {
+    matches!(
+        relative.to_string_lossy().as_ref(),
+        ".credentials.json" | "auth.json"
+    )
+}
+
+/// Days-since-epoch to proleptic Gregorian (y, m, d), Howard Hinnant's
+/// `civil_from_days` algorithm -- avoids pulling in a date/time dependency
+/// for one human-readable timestamp column.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn format_epoch(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+/// Byte-for-byte comparison of two files, or a recursive comparison of two
+/// directories (same entry names, each entry equal in turn). Symlinks never
+/// compare equal -- restore's safety classification must never call a
+/// symlink target "identical" and therefore harmless to overwrite.
+fn paths_equal(a: &Path, b: &Path) -> SetupResult<bool> {
+    let (Ok(ma), Ok(mb)) = (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) else {
+        return Ok(false);
+    };
+    if ma.file_type().is_symlink() || mb.file_type().is_symlink() {
+        return Ok(false);
+    }
+    if ma.is_dir() != mb.is_dir() {
+        return Ok(false);
+    }
+    if ma.is_dir() {
+        let mut entries_a = std::fs::read_dir(a)?.collect::<Result<Vec<_>, _>>()?;
+        let mut entries_b = std::fs::read_dir(b)?.collect::<Result<Vec<_>, _>>()?;
+        entries_a.sort_by_key(|entry| entry.file_name());
+        entries_b.sort_by_key(|entry| entry.file_name());
+        if entries_a.len() != entries_b.len() {
+            return Ok(false);
+        }
+        for (entry_a, entry_b) in entries_a.iter().zip(entries_b.iter()) {
+            if entry_a.file_name() != entry_b.file_name() {
+                return Ok(false);
+            }
+            if !paths_equal(&entry_a.path(), &entry_b.path())? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    } else {
+        Ok(std::fs::read(a)? == std::fs::read(b)?)
+    }
+}
+
+fn target_state(run_dir: &Path, target: &ManifestTarget) -> SetupResult<TargetState> {
+    let current_exists = target.source.exists();
+    if !target.existed_before {
+        return Ok(if current_exists {
+            TargetState::Differs
+        } else {
+            TargetState::Absent
+        });
+    }
+    if !current_exists {
+        return Ok(TargetState::Absent);
+    }
+    let backup_path = run_dir.join("files").join(&target.relative_path);
+    Ok(if paths_equal(&backup_path, &target.source)? {
+        TargetState::Identical
+    } else {
+        TargetState::Differs
+    })
+}
+
+fn aggregate_state(states: &[TargetState]) -> &'static str {
+    if states.is_empty() {
+        return "empty";
+    }
+    if states.contains(&TargetState::Differs) {
+        "differs"
+    } else if states.iter().all(|state| *state == TargetState::Absent) {
+        "absent"
+    } else if states.iter().all(|state| *state == TargetState::Identical) {
+        "identical"
+    } else {
+        "mixed"
+    }
+}
+
+fn read_manifest(dir: &Path) -> SetupResult<Manifest> {
+    let text = std::fs::read_to_string(dir.join("manifest.json"))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn discover_runs(root: &Path) -> Vec<BackupRun> {
+    let mut runs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return runs;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || !dir.join("manifest.json").is_file() {
+            continue;
+        }
+        let Ok(manifest) = read_manifest(&dir) else {
+            continue;
+        };
+        runs.push(BackupRun {
+            id: entry.file_name().to_string_lossy().to_string(),
+            dir,
+            manifest,
+        });
+    }
+    runs
+}
+
+fn all_runs(roots: &[PathBuf]) -> Vec<BackupRun> {
+    let mut runs = roots
+        .iter()
+        .flat_map(|root| discover_runs(root))
+        .collect::<Vec<_>>();
+    runs.sort_by_key(|run| std::cmp::Reverse(run.manifest.created));
+    runs
+}
+
+fn find_run_by_id(roots: &[PathBuf], id: &str) -> SetupResult<BackupRun> {
+    for root in roots {
+        let dir = root.join(id);
+        if dir.join("manifest.json").is_file() {
+            let manifest = read_manifest(&dir)?;
+            return Ok(BackupRun {
+                dir,
+                id: id.to_string(),
+                manifest,
+            });
+        }
+    }
+    Err(format!("no backup run found with id {id}").into())
+}
+
+fn pick_latest(
+    roots: &[PathBuf],
+    provider: Option<ResetProvider>,
+    scope: Option<ResetScope>,
+) -> SetupResult<BackupRun> {
+    all_runs(roots)
+        .into_iter()
+        .find(|run| {
+            provider.is_none_or(|filter| matches_provider(filter, run.manifest.provider))
+                && scope.is_none_or(|filter| matches_scope(filter, run.manifest.scope))
+        })
+        .ok_or_else(|| "no matching backup runs found".into())
+}
+
+fn run_target_states(run: &BackupRun) -> Vec<TargetState> {
+    run.manifest
+        .targets
+        .iter()
+        .map(|target| target_state(&run.dir, target).unwrap_or(TargetState::Differs))
+        .collect()
+}
+
+/// One human-readable line for a backup run: id, timestamp, provider/scope,
+/// kind, file count, and the absent/identical/differs/mixed classification
+/// that tells an operator whether restoring is safe or will clobber current
+/// work. Shared by `restore --list`'s text output and the guided menu, so
+/// the two surfaces read the same way.
+fn format_run_line(run: &BackupRun) -> String {
+    let states = run_target_states(run);
+    format!(
+        "{}  {}  {:?} {:?} ({:?})  {} file(s)  status={}",
+        run.id,
+        format_epoch(run.manifest.created),
+        run.manifest.provider,
+        run.manifest.scope,
+        run.manifest.kind,
+        run.manifest.targets.len(),
+        aggregate_state(&states),
+    )
+}
+
+/// Recursively sums file sizes under `path`. Errors (a vanished entry mid-walk,
+/// a permission denial) are treated as zero for that entry rather than failing
+/// the whole listing -- this number is informational, not load-bearing.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(metadata) if metadata.is_dir() => dir_size(&entry.path()),
+            Ok(metadata) => metadata.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// Makes unbounded backup growth visible instead of invisible until a disk
+/// fills: nothing here prunes old runs (that is separate, filed work), but
+/// every listing states the running count and on-disk size so an operator
+/// can see it accumulating.
+fn backup_summary_line<'a>(runs: impl IntoIterator<Item = &'a BackupRun>) -> String {
+    let mut count = 0usize;
+    let mut total_bytes: u64 = 0;
+    for run in runs {
+        count += 1;
+        total_bytes += dir_size(&run.dir);
+    }
+    format!(
+        "{count} backup run(s), {} on disk under .zirv/backups/ai-reset (old runs are never \
+         automatically pruned)",
+        human_bytes(total_bytes)
+    )
+}
+
+fn print_restore_list<W: Write>(
+    writer: &mut W,
+    runs: &[BackupRun],
+    args: &RestoreArgs,
+) -> SetupResult<()> {
+    let filtered = runs
+        .iter()
+        .filter(|run| {
+            args.provider
+                .is_none_or(|filter| matches_provider(filter, run.manifest.provider))
+        })
+        .filter(|run| {
+            args.scope
+                .is_none_or(|filter| matches_scope(filter, run.manifest.scope))
+        })
+        .collect::<Vec<_>>();
+    if args.json {
+        let rows = filtered
+            .iter()
+            .map(|run| {
+                let states = run_target_states(run);
+                json!({
+                    "id": run.id,
+                    "created": run.manifest.created,
+                    "timestamp": format_epoch(run.manifest.created),
+                    "kind": run.manifest.kind,
+                    "provider": run.manifest.provider,
+                    "scope": run.manifest.scope,
+                    "file_count": run.manifest.targets.len(),
+                    "status": aggregate_state(&states),
+                    "bytes_on_disk": dir_size(&run.dir),
+                })
+            })
+            .collect::<Vec<_>>();
+        let total_bytes: u64 = filtered.iter().map(|run| dir_size(&run.dir)).sum();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": SUPPORTED_MANIFEST_SCHEMA_VERSION,
+                "run_count": filtered.len(),
+                "total_bytes_on_disk": total_bytes,
+                "runs": rows,
+                "not_covered": ["~/.claude.json"],
+            }))?
+        )?;
+        return Ok(());
+    }
+    if filtered.is_empty() {
+        writeln!(writer, "no backup runs found")?;
+    } else {
+        writeln!(writer, "{}", backup_summary_line(filtered.iter().copied()))?;
+    }
+    for run in &filtered {
+        writeln!(writer, "{}", format_run_line(run))?;
+    }
+    writeln!(writer, "{CLAUDE_JSON_NOTE}")?;
+    Ok(())
+}
+
+fn restore_target(backup_path: &Path, dest: &Path) -> SetupResult<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(dest) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!("refusing to restore over symlink {}", dest.display()).into());
+        }
+        if metadata.is_dir() {
+            std::fs::remove_dir_all(dest)?;
+        } else {
+            std::fs::remove_file(dest)?;
+        }
+    }
+    copy_for_backup(backup_path, dest)
+}
+
+fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) -> SetupResult<i32> {
+    if !args.dry_run && !args.yes {
+        return Err(
+            "restore is destructive; inspect with --dry-run, then repeat with --yes".into(),
+        );
+    }
+    let manifest = &run.manifest;
+    if manifest.schema_version != SUPPORTED_MANIFEST_SCHEMA_VERSION {
+        return Err(format!(
+            "backup run {} uses manifest schema_version {}, which this build of zirv does not understand (supports schema_version {})",
+            run.id, manifest.schema_version, SUPPORTED_MANIFEST_SCHEMA_VERSION
+        )
+        .into());
+    }
+
+    let mut targets = Vec::new();
+    let mut skipped_auth = Vec::new();
+    for target in &manifest.targets {
+        if is_auth_relative_path(&target.relative_path) && !args.include_auth {
+            skipped_auth.push(target.clone());
+        } else {
+            targets.push(target.clone());
+        }
+    }
+
+    // Fail closed: validate every backup source and every current
+    // destination before writing anything.
+    for target in &targets {
+        if target.existed_before {
+            validate_reset_target(&run.dir.join("files").join(&target.relative_path))?;
+        }
+        if target.source.exists() {
+            validate_reset_target(&target.source)?;
+        }
+        if let Some(parent) = target.source.parent() {
+            for candidate in parent.ancestors().take(3) {
+                if std::fs::symlink_metadata(candidate)
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    return Err(format!(
+                        "refusing to restore through symlink {}",
+                        candidate.display()
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    if args.dry_run {
+        writeln!(
+            writer,
+            "restoring backup run {} ({:?} {:?}, {})",
+            run.id,
+            manifest.provider,
+            manifest.scope,
+            format_epoch(manifest.created)
+        )?;
+        for target in &targets {
+            let state = target_state(&run.dir, target)?;
+            writeln!(
+                writer,
+                "would restore {} [{}]",
+                target.source.display(),
+                describe_state(state)
+            )?;
+        }
+        for target in &skipped_auth {
+            writeln!(
+                writer,
+                "would NOT restore {} (credentials; pass --include-auth)",
+                target.source.display()
+            )?;
+        }
+        return Ok(0);
+    }
+
+    // Back up the current state first, so this restore is itself undoable.
+    let backup_root = run
+        .dir
+        .parent()
+        .ok_or("backup run has no parent directory")?;
+    let pre_restore_sources = targets
+        .iter()
+        .map(|target| target.source.clone())
+        .collect::<Vec<_>>();
+    let safety_backup = write_backup_run(
+        backup_root,
+        BackupKind::Restore,
+        manifest.provider,
+        manifest.scope,
+        &manifest.base,
+        &pre_restore_sources,
+    )?;
+
+    let mut written = Vec::new();
+    let mut failed = Vec::new();
+    for target in &targets {
+        let result = if target.existed_before {
+            let backup_path = run.dir.join("files").join(&target.relative_path);
+            restore_target(&backup_path, &target.source)
+        } else if target.source.exists() {
+            remove_reset_target(&target.source, &manifest.base)
+        } else {
+            Ok(())
+        };
+        match result {
+            Ok(()) => written.push(target.source.clone()),
+            Err(error) => failed.push((target.source.clone(), error.to_string())),
+        }
+    }
+
+    for path in &written {
+        writeln!(writer, "restored {}", path.display())?;
+    }
+    for target in &skipped_auth {
+        writeln!(
+            writer,
+            "not restored (credentials; pass --include-auth): {}",
+            target.source.display()
+        )?;
+    }
+    for (path, error) in &failed {
+        writeln!(
+            writer,
+            "NOT restored (error): {} -- {error}",
+            path.display()
+        )?;
+    }
+    writeln!(
+        writer,
+        "safety backup of the pre-restore state: {}",
+        safety_backup.display()
+    )?;
+
+    if !failed.is_empty() {
+        return Err(format!(
+            "restore partially completed: {} of {} target(s) failed",
+            failed.len(),
+            targets.len()
+        )
+        .into());
+    }
+    Ok(0)
+}
+
+fn run_restore<W: Write>(args: &RestoreArgs, writer: &mut W) -> SetupResult<i32> {
+    let repo = resolved_repo(&args.repo)?;
+    let home = home_dir()?;
+    let roots = vec![
+        repo.join(".zirv/backups/ai-reset"),
+        home.join(".zirv/backups/ai-reset"),
+    ];
+
+    let mode_count = [args.list, args.latest, args.id.is_some()]
+        .iter()
+        .filter(|value| **value)
+        .count();
+    if mode_count == 0 {
+        return Err("provide a backup id, --list, or --latest".into());
+    }
+    if mode_count > 1 {
+        return Err("pass exactly one of: a backup id, --list, or --latest".into());
+    }
+
+    if args.list {
+        let runs = all_runs(&roots);
+        print_restore_list(writer, &runs, args)?;
+        return Ok(0);
+    }
+
+    let run = if args.latest {
+        pick_latest(&roots, args.provider, args.scope)?
+    } else {
+        find_run_by_id(&roots, args.id.as_deref().expect("checked above"))?
+    };
+
+    restore_run(writer, &run, args)
 }
 
 pub fn dispatch(args: &[String]) -> i32 {
@@ -1303,6 +2028,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         Some(SetupVerb::Status(args)) => run_status(args, &mut writer),
         Some(SetupVerb::Apply(args)) => run_apply(args, &mut writer),
         Some(SetupVerb::Reset(args)) => run_reset(args, &mut writer),
+        Some(SetupVerb::Restore(args)) => run_restore(args, &mut writer),
         None => run_guided(&mut writer),
     };
     match result {
@@ -1449,6 +2175,7 @@ mod tests {
     #[test]
     fn codex_hook_merge_preserves_existing_configuration_and_backs_up() {
         let root = tempfile::tempdir().expect("root");
+        let home = tempfile::tempdir().expect("home");
         let hooks_path = root.path().join("hooks.json");
         std::fs::write(
             &hooks_path,
@@ -1457,7 +2184,7 @@ mod tests {
         .expect("hooks");
 
         assert_eq!(
-            install_codex_hooks(&hooks_path, false).expect("install"),
+            install_codex_hooks(home.path(), &hooks_path, false).expect("install"),
             HARNESS_HOOKS.len()
         );
         let hooks = load_json_object(&hooks_path).expect("load");
@@ -1467,11 +2194,14 @@ mod tests {
             assert!(contains_command(&hooks, command), "missing {command}");
         }
         assert_eq!(
-            install_codex_hooks(&hooks_path, false).expect("idempotent"),
+            install_codex_hooks(home.path(), &hooks_path, false).expect("idempotent"),
             0
         );
+        // The old ad-hoc sibling backup is gone; the backup is now
+        // manifest-tracked under the home backup root, restorable via
+        // `zirv setup restore`.
         assert!(
-            std::fs::read_dir(root.path())
+            !std::fs::read_dir(root.path())
                 .expect("dir")
                 .flatten()
                 .any(|entry| entry
@@ -1479,6 +2209,20 @@ mod tests {
                     .to_string_lossy()
                     .starts_with("hooks.json.zirv-backup-"))
         );
+        let backup_root = home.path().join(".zirv/backups/ai-reset");
+        let run = std::fs::read_dir(&backup_root)
+            .expect("backup root")
+            .next()
+            .expect("one backup run")
+            .expect("entry")
+            .path();
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(run.join("manifest.json")).expect("manifest"),
+        )
+        .expect("manifest json");
+        assert_eq!(manifest["kind"], "apply");
+        assert_eq!(manifest["provider"], "codex");
+        assert!(run.join("files/hooks.json").is_file());
     }
 
     #[test]
@@ -1724,5 +2468,576 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "missing stable status key {key}");
         }
+    }
+
+    fn restore_args(repo: &Path) -> RestoreArgs {
+        RestoreArgs {
+            id: None,
+            list: false,
+            latest: false,
+            provider: None,
+            scope: None,
+            repo: repo.to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: false,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn parses_restore_list_id_and_latest() {
+        let list = SetupCli::try_parse_from(["zirv setup", "restore", "--list"]).expect("list");
+        match list.verb {
+            Some(SetupVerb::Restore(args)) => assert!(args.list),
+            other => panic!("expected restore, got {other:?}"),
+        }
+
+        let by_id =
+            SetupCli::try_parse_from(["zirv setup", "restore", "1700000000-claude-project"])
+                .expect("by id");
+        match by_id.verb {
+            Some(SetupVerb::Restore(args)) => {
+                assert_eq!(args.id.as_deref(), Some("1700000000-claude-project"))
+            }
+            other => panic!("expected restore, got {other:?}"),
+        }
+
+        let latest = SetupCli::try_parse_from([
+            "zirv setup",
+            "restore",
+            "--latest",
+            "--provider",
+            "claude",
+            "--scope",
+            "global",
+            "--yes",
+        ])
+        .expect("latest");
+        match latest.verb {
+            Some(SetupVerb::Restore(args)) => {
+                assert!(args.latest);
+                assert!(matches!(args.provider, Some(ResetProvider::Claude)));
+                assert!(matches!(args.scope, Some(ResetScope::Global)));
+                assert!(args.yes);
+            }
+            other => panic!("expected restore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_requires_exactly_one_of_id_list_or_latest() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        let none = run_restore(&restore_args(repo.path()), &mut Vec::new());
+        assert!(none.unwrap_err().to_string().contains("--list"));
+
+        let both = RestoreArgs {
+            list: true,
+            latest: true,
+            ..restore_args(repo.path())
+        };
+        assert!(
+            run_restore(&both, &mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
+    }
+
+    #[test]
+    fn restore_list_classifies_absent_identical_and_differing_targets() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::write(repo.path().join("CLAUDE.md"), "project instructions\n").expect("claude");
+
+        // Reset once: this both removes CLAUDE.md and produces a restorable run.
+        let reset = ResetArgs {
+            provider: ResetProvider::Claude,
+            scope: ResetScope::Project,
+            repo: repo.path().to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&reset, &mut Vec::new()).expect("reset");
+        assert!(!repo.path().join("CLAUDE.md").exists());
+
+        // Absent case: nothing recreated yet.
+        let mut output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                list: true,
+                json: true,
+                ..restore_args(repo.path())
+            },
+            &mut output,
+        )
+        .expect("list absent");
+        let value: Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(value["runs"][0]["status"], "absent");
+        assert_eq!(value["not_covered"][0], "~/.claude.json");
+
+        // Identical case: recreate the exact original content.
+        std::fs::write(repo.path().join("CLAUDE.md"), "project instructions\n").expect("recreate");
+        let mut output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                list: true,
+                json: true,
+                ..restore_args(repo.path())
+            },
+            &mut output,
+        )
+        .expect("list identical");
+        let value: Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(value["runs"][0]["status"], "identical");
+
+        // Differs case: current content diverges from the backup.
+        std::fs::write(repo.path().join("CLAUDE.md"), "something else entirely\n")
+            .expect("diverge");
+        let mut output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                list: true,
+                json: true,
+                ..restore_args(repo.path())
+            },
+            &mut output,
+        )
+        .expect("list differs");
+        let value: Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(value["runs"][0]["status"], "differs");
+    }
+
+    #[test]
+    fn restore_requires_confirmation_and_dry_run_previews_without_writing() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::write(repo.path().join("CLAUDE.md"), "keep\n").expect("claude");
+        let reset = ResetArgs {
+            provider: ResetProvider::Claude,
+            scope: ResetScope::Project,
+            repo: repo.path().to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&reset, &mut Vec::new()).expect("reset");
+
+        let mut listing = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                list: true,
+                json: true,
+                ..restore_args(repo.path())
+            },
+            &mut listing,
+        )
+        .expect("list");
+        let listing: Value = serde_json::from_slice(&listing).expect("listing json");
+        let id = listing["runs"][0]["id"].as_str().expect("id").to_string();
+        let id = id.as_str();
+
+        let unconfirmed = RestoreArgs {
+            id: Some(id.to_string()),
+            ..restore_args(repo.path())
+        };
+        assert!(run_restore(&unconfirmed, &mut Vec::new()).is_err());
+        assert!(!repo.path().join("CLAUDE.md").exists());
+
+        let mut preview = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                id: Some(id.to_string()),
+                dry_run: true,
+                ..restore_args(repo.path())
+            },
+            &mut preview,
+        )
+        .expect("dry run");
+        assert!(!repo.path().join("CLAUDE.md").exists());
+        let preview = String::from_utf8(preview).expect("utf8");
+        assert!(preview.contains("would restore"));
+    }
+
+    #[test]
+    fn restore_recovers_a_reset_and_is_itself_undoable() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::write(repo.path().join("CLAUDE.md"), "original content\n").expect("claude");
+        let reset = ResetArgs {
+            provider: ResetProvider::Claude,
+            scope: ResetScope::Project,
+            repo: repo.path().to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&reset, &mut Vec::new()).expect("reset");
+        assert!(!repo.path().join("CLAUDE.md").exists());
+
+        let run = all_runs(&[repo.path().join(".zirv/backups/ai-reset")]);
+        assert_eq!(run.len(), 1);
+        let id = run[0].id.clone();
+
+        let mut output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                id: Some(id),
+                yes: true,
+                ..restore_args(repo.path())
+            },
+            &mut output,
+        )
+        .expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("CLAUDE.md")).expect("restored"),
+            "original content\n"
+        );
+
+        // The restore itself produced its own backup run, so a restore can
+        // be undone too -- two runs now exist under the same backup root.
+        let runs_after = all_runs(&[repo.path().join(".zirv/backups/ai-reset")]);
+        assert_eq!(runs_after.len(), 2);
+        assert!(
+            runs_after
+                .iter()
+                .any(|run| matches!(run.manifest.kind, BackupKind::Restore))
+        );
+    }
+
+    #[test]
+    fn restore_undoes_an_apply_by_removing_what_it_created() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = HomeGuard::set(home.path());
+
+        // No pre-existing settings.json: apply creates it from nothing.
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        assert!(!settings_path.exists());
+        install_claude_integration(home.path(), false).expect("apply");
+        assert!(settings_path.is_file());
+
+        let backup_root = home.path().join(".zirv/backups/ai-reset");
+        let run = all_runs(&[backup_root]);
+        assert_eq!(run.len(), 1);
+        assert!(matches!(run[0].manifest.kind, BackupKind::Apply));
+        assert!(!run[0].manifest.targets[0].existed_before);
+        let id = run[0].id.clone();
+
+        run_restore(
+            &RestoreArgs {
+                id: Some(id),
+                yes: true,
+                ..restore_args(repo.path())
+            },
+            &mut Vec::new(),
+        )
+        .expect("restore");
+        assert!(
+            !settings_path.exists(),
+            "restoring an apply that created the file should remove it again"
+        );
+    }
+
+    #[test]
+    fn restore_never_touches_credentials_without_include_auth() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let base = home.path().join("custom-codex");
+        std::fs::create_dir_all(&base).expect("base");
+        std::fs::write(base.join("config.toml"), "model='demo'\n").expect("config");
+        std::fs::write(base.join("auth.json"), "{\"token\":\"secret\"}\n").expect("auth");
+        let base_text = base.to_string_lossy().to_string();
+        let _codex_home = VarGuard::set(&[("CODEX_HOME", Some(&base_text))]);
+
+        let reset = ResetArgs {
+            provider: ResetProvider::Codex,
+            scope: ResetScope::Global,
+            repo: repo.path().to_path_buf(),
+            include_auth: true,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&reset, &mut Vec::new()).expect("reset");
+        assert!(!base.join("config.toml").exists());
+        assert!(!base.join("auth.json").exists());
+
+        let backup_root = home.path().join(".zirv/backups/ai-reset");
+        let run = all_runs(&[backup_root]);
+        let id = run[0].id.clone();
+
+        // Restore without --include-auth: config.toml comes back, auth.json does not.
+        let mut output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                id: Some(id.clone()),
+                yes: true,
+                ..restore_args(repo.path())
+            },
+            &mut output,
+        )
+        .expect("restore without auth");
+        assert!(base.join("config.toml").is_file());
+        assert!(!base.join("auth.json").exists());
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(output.contains("not restored (credentials"));
+
+        // Reset again so there is something to restore with --include-auth.
+        std::fs::write(base.join("auth.json"), "{\"token\":\"secret\"}\n").expect("auth again");
+        run_reset(&reset, &mut Vec::new()).expect("reset again");
+        let run = all_runs(&[home.path().join(".zirv/backups/ai-reset")])
+            .into_iter()
+            .find(|run| run.id != id && matches!(run.manifest.kind, BackupKind::Reset))
+            .expect("second reset run");
+        run_restore(
+            &RestoreArgs {
+                id: Some(run.id),
+                yes: true,
+                include_auth: true,
+                ..restore_args(repo.path())
+            },
+            &mut Vec::new(),
+        )
+        .expect("restore with auth");
+        assert!(base.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn restore_refuses_an_unknown_manifest_schema_version() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let backup_root = repo.path().join(".zirv/backups/ai-reset");
+        let run_dir = backup_root.join("1700000000-claude-project");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            r#"{"schema_version":99,"provider":"claude","scope":"project","base":".","created":1700000000,"targets":[]}"#,
+        )
+        .expect("manifest");
+
+        let error = run_restore(
+            &RestoreArgs {
+                id: Some("1700000000-claude-project".to_string()),
+                yes: true,
+                ..restore_args(repo.path())
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("must refuse");
+        assert!(error.to_string().contains("schema_version 99"));
+    }
+
+    #[test]
+    fn restore_latest_resolves_the_most_recent_matching_run() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::write(repo.path().join("CLAUDE.md"), "claude one\n").expect("claude");
+        let claude_reset = ResetArgs {
+            provider: ResetProvider::Claude,
+            scope: ResetScope::Project,
+            repo: repo.path().to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&claude_reset, &mut Vec::new()).expect("claude reset");
+
+        std::fs::write(repo.path().join("AGENTS.md"), "codex one\n").expect("agents");
+        let codex_reset = ResetArgs {
+            provider: ResetProvider::Codex,
+            ..claude_reset
+        };
+        run_reset(&codex_reset, &mut Vec::new()).expect("codex reset");
+
+        let mut output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                latest: true,
+                provider: Some(ResetProvider::Claude),
+                yes: true,
+                ..restore_args(repo.path())
+            },
+            &mut output,
+        )
+        .expect("restore latest claude");
+        assert!(repo.path().join("CLAUDE.md").is_file());
+        assert!(!repo.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn global_plugins_are_now_covered_by_reset_symmetrically_with_project_scope() {
+        let base = Path::new("/tmp/example-claude-home");
+        let candidates = global_candidates(ResetProvider::Claude, base, false);
+        assert!(
+            candidates.contains(&base.join("plugins")),
+            "global Claude reset should cover plugins, matching project scope"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_symlinked_destination_before_writing_anything() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::write(repo.path().join("CLAUDE.md"), "content\n").expect("claude");
+        let reset = ResetArgs {
+            provider: ResetProvider::Claude,
+            scope: ResetScope::Project,
+            repo: repo.path().to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&reset, &mut Vec::new()).expect("reset");
+        let id = all_runs(&[repo.path().join(".zirv/backups/ai-reset")])[0]
+            .id
+            .clone();
+
+        let outside = repo.path().join("outside.md");
+        std::fs::write(&outside, "outside\n").expect("outside");
+        symlink(&outside, repo.path().join("CLAUDE.md")).expect("symlink");
+
+        let error = run_restore(
+            &RestoreArgs {
+                id: Some(id),
+                yes: true,
+                ..restore_args(repo.path())
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("must refuse symlinked destination");
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside untouched"),
+            "outside\n"
+        );
+    }
+
+    #[test]
+    fn guided_reset_prompt_names_restore_as_the_way_back() {
+        assert!(GUIDED_RESET_CONFIRM_PROMPT.contains("recoverable"));
+        assert!(GUIDED_RESET_CONFIRM_PROMPT.contains("zirv setup restore"));
+    }
+
+    #[test]
+    fn guided_no_backups_message_explains_when_one_is_created() {
+        assert!(GUIDED_NO_BACKUPS_MESSAGE.contains("zirv setup apply"));
+        assert!(GUIDED_NO_BACKUPS_MESSAGE.contains("zirv setup reset"));
+    }
+
+    #[test]
+    fn guided_restore_confirm_prompt_names_the_self_backup_guarantee() {
+        assert!(GUIDED_RESTORE_CONFIRM_PROMPT.contains("backed up first"));
+        assert!(GUIDED_RESTORE_CONFIRM_PROMPT.contains("undone"));
+    }
+
+    #[test]
+    fn human_bytes_formats_common_magnitudes() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn format_run_line_surfaces_the_safety_classification() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::write(repo.path().join("CLAUDE.md"), "content\n").expect("claude");
+        let reset = ResetArgs {
+            provider: ResetProvider::Claude,
+            scope: ResetScope::Project,
+            repo: repo.path().to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&reset, &mut Vec::new()).expect("reset");
+        let runs = all_runs(&[repo.path().join(".zirv/backups/ai-reset")]);
+        let line = format_run_line(&runs[0]);
+        assert!(line.starts_with(&runs[0].id));
+        assert!(line.contains("status=absent"));
+    }
+
+    #[test]
+    fn restore_list_makes_run_count_and_disk_usage_visible() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::write(repo.path().join("CLAUDE.md"), "content\n").expect("claude");
+        let reset = ResetArgs {
+            provider: ResetProvider::Claude,
+            scope: ResetScope::Project,
+            repo: repo.path().to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&reset, &mut Vec::new()).expect("reset");
+
+        let mut text_output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                list: true,
+                ..restore_args(repo.path())
+            },
+            &mut text_output,
+        )
+        .expect("list");
+        let text_output = String::from_utf8(text_output).expect("utf8");
+        assert!(
+            text_output.contains("1 backup run(s)"),
+            "expected a run-count summary line, got: {text_output}"
+        );
+        assert!(text_output.contains("on disk under .zirv/backups/ai-reset"));
+
+        let mut json_output = Vec::new();
+        run_restore(
+            &RestoreArgs {
+                list: true,
+                json: true,
+                ..restore_args(repo.path())
+            },
+            &mut json_output,
+        )
+        .expect("list json");
+        let value: Value = serde_json::from_slice(&json_output).expect("json");
+        assert_eq!(value["run_count"], 1);
+        assert!(value["total_bytes_on_disk"].as_u64().expect("bytes") > 0);
+        assert!(value["runs"][0]["bytes_on_disk"].as_u64().expect("bytes") > 0);
+    }
+
+    #[test]
+    fn dir_size_sums_a_backup_runs_files() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::write(repo.path().join("CLAUDE.md"), "0123456789\n").expect("claude");
+        let reset = ResetArgs {
+            provider: ResetProvider::Claude,
+            scope: ResetScope::Project,
+            repo: repo.path().to_path_buf(),
+            include_auth: false,
+            dry_run: false,
+            yes: true,
+        };
+        run_reset(&reset, &mut Vec::new()).expect("reset");
+        let runs = all_runs(&[repo.path().join(".zirv/backups/ai-reset")]);
+        // manifest.json + files/CLAUDE.md, both non-empty.
+        assert!(dir_size(&runs[0].dir) >= 11);
     }
 }

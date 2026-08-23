@@ -161,17 +161,71 @@ cargo clippy --all-targets -- -D warnings
   process-wide `OnceLock` (`ctx_about()`) since it otherwise re-runs on every
   `dispatch()` call, including hook/statusline invocations that never
   display it.
-- `pace.use_credits`/`poll_enabled`/`poll_min_interval_secs` are
-  `REPO_FORBIDDEN`: a repo checkout must not change how often zirv polls a
-  vendor usage endpoint or declare its own credits-cover-overage exemption.
-  `pace.soft_percent` is deliberately **not** repo-forbidden (the spec rules
-  it a tuning knob, and a repo can already set `pace.enabled = false`, so
-  forbidding the band alone would be security theater). `poll.rs`'s `HttpPoller` reads an OAuth
+- `pace.use_credits`/`poll_enabled`/`poll_min_interval_secs`/`blind_delay_secs`
+  are `REPO_FORBIDDEN`: a repo checkout must not change how often zirv polls a
+  vendor usage endpoint, declare its own credits-cover-overage exemption, or
+  shrink the fail-safe delay a genuinely blind gate applies instead of
+  proceeding unthrottled (T8). `poll.rs`'s `HttpPoller` reads an OAuth
   token fresh from disk on every call and never caches, logs, or persists it
   anywhere but that one outbound request; it is consulted only as a fallback
   once the passive collector reading has gone stale, floored to at most one
   attempt per `poll_min_interval_secs`, and never called from a path that
-  must stay network-free (`wrap`'s status-bar redraw never constructs one).
+  must stay network-free (`wrap`'s status-bar redraw never constructs one --
+  though its pre-spawn launch path now does, see below).
+- **`pace.enabled`/`max_percent`/`soft_percent` are a spend gate, not
+  advisory, and are no longer a plain repo-overridable tuning knob (T9,
+  2026-08-22, revisiting the reasoning above).** A repo layer may narrow
+  pacing -- lower `max_percent`/`soft_percent`, or force `enabled = true`
+  even against an operator's own `false` -- but may never widen it: raise
+  either percentage above the operator's own value, or turn pacing off.
+  Modeled on `policy::resolve`'s own narrowing fold (`Stance::max`), not
+  added to `REPO_FORBIDDEN` outright, so the legitimate "this repo is
+  expensive, be more careful here" case still works: `config.rs`'s
+  `narrow_pace_bool`/`narrow_pace_percent` lift these three keys out of both
+  layers before the ordinary deep merge (the same seam `[policy]` and
+  `sandbox.extra_deny` already use) and fold them before `ZIRV_CTX_PACE*`
+  env, which still wins outright over both layers. See the Decision Log for
+  why the old "a repo can already disable pacing, so guarding the band alone
+  is theater" reasoning no longer holds.
+- **T10: `wrap`'s pre-spawn launch path now consults the pacing gate too**,
+  closing the coverage gap where `wrap` standalone, `zirv ctx chat`'s
+  orchestrator, and every dashboard pane (both launched through the same
+  `wrap::run_with`/`dash::run_dashboard` code) never paced at all -- only the
+  reactive `scan_for_limit` caught a vendor-imposed limit, after the fact.
+  Interactive and headless launches get different treatment for the same
+  decision (`pace::InteractiveGate`, mapped from the same `PaceDecision`
+  `wait_for_window` already computes): the soft band shows the usage and a
+  skippable pause (any keypress or `--force-pace` proceeds); the hard
+  ceiling refuses by default and requires a deliberate `'y'` confirmation or
+  `--force-pace`; blind data reuses `usage_source_hint`'s own reason/remedy
+  rather than silently inheriting the T8 delay. Gated on both stdin *and*
+  stdout being real terminals (mirroring `chrome::dash_eligible`'s own
+  double-check) -- there is no one to prompt otherwise, and blocking on a
+  `crossterm` keypress read with no terminal attached is exactly the kind of
+  silent hang a spend gate must not cause; a non-interactive `wrap`
+  invocation is out of scope for this fix (`exec`/`loop` are the headless
+  supervisors, and already gated). A dashboard **worker** pane spawned while
+  the dashboard's own event loop is live (`fulfill_spawn_request`) cannot
+  reuse the blocking keypress read at all -- it would collide with the
+  dashboard's own input loop reading the same `crossterm` stream -- so it
+  gates non-interactively instead: the soft band spawns anyway with a
+  notice, and the hard ceiling refuses the spawn outright with no
+  confirmation possible from that call site. Only the dashboard's own
+  *first* (orchestrator) pane spawn, which runs before `enable_raw_mode`/
+  `EnterAlternateScreen`, is early enough to reuse the full interactive
+  treatment safely.
+- **T11: `exec::run_with`/`run_loop::run_with`'s `sleep_fn`/`now_fn` are
+  injectable now** (`run_with_clock`, a `pub(crate)` sibling each thin
+  `run_with` wrapper delegates to with the real clock/sleep), the same
+  `FakeClock`-style seam `pace.rs`'s own unit tests already use one layer
+  down. Before this, the T8 fail-safe delay was verifiable in `pace.rs` but
+  not at this integration level, so both files' test suites zeroed
+  `ZIRV_CTX_PACE_BLIND_DELAY_SECS` via their shared `base_env` test helper
+  just to stay fast -- a real regression risk, since nothing proved the
+  delay actually reached a real `sleep_fn` call. It does now, in one
+  dedicated fast test per file (`ZIRV_CTX_PACE_BLIND_DELAY_SECS` overridden
+  back to a small nonzero value, recorded through an injected closure rather
+  than actually slept).
 
 ## Using the Obsidian Vault
 

@@ -240,7 +240,18 @@ pub fn run_with<W: Write>(
         .map(adapters::provider_for_usage_readout);
     match provider {
         Some(provider) if crate::commands::ctx::window::has_no_usage_source(&state, provider) => {
-            writeln!(w, "\nusage windows: {provider}: no usage source")?;
+            // T7 follow-up 2: a bare "no usage source" told an operator
+            // nothing about *why* -- credentials file absent, macOS Keychain
+            // access needed, or the statusline tee simply never wired.
+            // `poll::usage_source_hint` is the one place that reasoning
+            // lives, shared with nothing else so this line and a live
+            // `Event::MacosKeychainPromptExpected` announcement (`poll.rs`)
+            // never drift apart on what they tell the operator to do.
+            writeln!(
+                w,
+                "\nusage windows: {provider}: no usage source ({})",
+                crate::commands::ctx::poll::usage_source_hint(provider)
+            )?;
         }
         Some(provider) => {
             // A window whose `resets_at` has provably passed (or, absent a

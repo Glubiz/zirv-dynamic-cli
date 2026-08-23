@@ -41,6 +41,7 @@ use super::announce::{Announcer, Event};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::NormalizedEvent;
 use super::handoff::{self, Handoff};
+use super::pace;
 use super::prompt::PromptRole;
 use super::rot::Verdict;
 use super::signal::TurnSignal;
@@ -197,6 +198,14 @@ pub struct WrapArgs {
     /// take the outer session down.
     #[arg(long, default_value_t = false)]
     pub allow_nested: bool,
+    /// T10: skip the interactive usage-pacing prompt (the soft-band pause
+    /// and the at-the-ceiling refusal shown before launch) and go straight
+    /// to launching. Named in the prompt's own text as the flag alternative
+    /// to a keypress, for a scripted or CI launch with nobody to answer it.
+    /// Never silent about *why* it launched anyway -- see `run_with`'s own
+    /// interactive-gate call site.
+    #[arg(long, default_value_t = false)]
+    pub force_pace: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +230,14 @@ pub struct InjectionState {
     pub score: u32,
     pub user_typed_since_turn: bool,
     pub last_output: Instant,
+    /// The last time the operator's own keystroke reached this pty --
+    /// `last_output`'s counterpart for input, tracked only so a signal-less
+    /// adapter's own idleness ([`signal_less_mail_ready`]) can be measured
+    /// from the *later* of the two, the same `dash::pane::latest_of` fold a
+    /// signal-less dashboard pane already applies. A turn-signal-capable
+    /// session never reads this field: its idleness is decided by the signal
+    /// alone (`may_inject`), exactly as before this field existed.
+    pub last_input: Instant,
     /// `signals_seen` at the moment an action fired. The next action waits for
     /// a strictly newer signal than that one.
     pub cooldown_at_signal: Option<u64>,
@@ -235,13 +252,15 @@ impl Default for InjectionState {
 
 impl InjectionState {
     pub fn new() -> Self {
+        let now = Instant::now();
         Self {
             last_turn: 0,
             signals_seen: 0,
             verdict: Verdict::Healthy,
             score: 0,
             user_typed_since_turn: false,
-            last_output: Instant::now(),
+            last_output: now,
+            last_input: now,
             cooldown_at_signal: None,
             degraded: false,
         }
@@ -250,7 +269,10 @@ impl InjectionState {
     pub fn on_event(&mut self, event: PumpEvent, now: Instant) {
         match event {
             PumpEvent::Output(_) => self.last_output = now,
-            PumpEvent::Input(_) => self.user_typed_since_turn = true,
+            PumpEvent::Input(_) => {
+                self.user_typed_since_turn = true;
+                self.last_input = now;
+            }
             PumpEvent::PtyClosed => {}
         }
     }
@@ -290,6 +312,60 @@ pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> b
         && !state.user_typed_since_turn
         && now.duration_since(state.last_output) >= debounce
         && cooldown_cleared(state)
+}
+
+/// Whether a session with no turn-signal mechanism at all (codex today) has
+/// been quiet long enough for T13's live mail advisory to be typed into it.
+///
+/// `may_inject`'s `state.signals_seen > 0` precondition can never pass for
+/// such a session: `register_turn_signal` is a no-op for it, so `on_turn` is
+/// never called and `signals_seen` stays `0` for the session's entire life.
+/// Before this, T13's poll arm therefore always fell back to `MailAction::
+/// Announce` for it -- a documented residual (see Known Issues, "wrap's own
+/// live mail advisory has no equivalent for a signal-less adapter"), and the
+/// mirror image of the bug `dash::pane::pane_is_idle` already fixed for a
+/// signal-less dashboard pane.
+///
+/// Mirrors `dash::pane::signal_less_quiescent` exactly: quiet is measured
+/// from the *later* of the child's last output and the operator's own last
+/// keystroke into it, not from output alone -- the same fold
+/// `dash::pane::latest_of` applies, for the same reason (see that function's
+/// own doc comment: an injection or a keystroke has to restart the quiet
+/// window, or the very next poll tick reads the pane as idle again before the
+/// child has had any real chance to respond). Finding 5 (review): the
+/// elapsed-time check itself is `dash::pane::quiescent_since`, shared rather
+/// than reimplemented here, so the two formulas cannot drift apart again.
+/// Deliberately **not** folded
+/// into `may_inject` itself: that function also gates `Compact`/`Restart`,
+/// and a debounce-only idle guess is not something this codebase wants
+/// deciding whether to type `/compact` into a session the rot engine cannot
+/// even score in the first place (every adapter that lacks a turn signal
+/// today also has `capabilities().events == false`, so `action_for` never
+/// reaches `Verdict::Compact`/`Verdict::Restart` for one regardless) -- this
+/// is scoped to the one caller that actually needs it.
+pub fn signal_less_mail_ready(state: &InjectionState, now: Instant, quiet: Duration) -> bool {
+    !state.degraded
+        && super::dash::pane::quiescent_since(state.last_output.max(state.last_input), now, quiet)
+}
+
+/// The T13 mail poll's own eligibility question, branching on
+/// `turn_signal_capable` (`AgentAdapter::capabilities().turn_signal`)
+/// exactly the way `dash::pane::pane_is_idle` already branches for a
+/// dashboard pane: `may_inject` for an adapter that reports turn boundaries,
+/// [`signal_less_mail_ready`] for one that cannot. Split out of the pump
+/// loop's own call site so the branch is testable without a real pty.
+pub fn mail_inject_ready(
+    turn_signal_capable: bool,
+    state: &InjectionState,
+    now: Instant,
+    debounce: Duration,
+    idle_quiet: Duration,
+) -> bool {
+    if turn_signal_capable {
+        may_inject(state, now, debounce)
+    } else {
+        signal_less_mail_ready(state, now, idle_quiet)
+    }
 }
 
 /// Sent as arguments to the adapter's compaction command. PreCompact hooks
@@ -648,8 +724,8 @@ pub enum MailAction {
 #[derive(Debug, Default)]
 pub struct MailWatch {
     last_poll: Option<Instant>,
-    injected: std::collections::BTreeSet<String>,
-    announced: std::collections::BTreeSet<String>,
+    injected: super::mail::AdvisedIds,
+    announced: super::mail::AdvisedIds,
 }
 
 impl MailWatch {
@@ -666,12 +742,13 @@ impl MailWatch {
     /// by this session's own `zirv ctx inbox`, or pruned by `mail::store_to`.
     /// Keeps both sets bounded by what is actually in the mailbox, and means
     /// a file name that somehow came back is treated as the new message it
-    /// looks like rather than as one already advised.
+    /// looks like rather than as one already advised. Finding 3 (review):
+    /// this is the id-set/prune shape `mail::AdvisedIds` now shares with the
+    /// dashboard's own orchestrator advisory.
     fn forget_missing(&mut self, current: &[MailFacts]) {
-        let live: std::collections::BTreeSet<&str> =
-            current.iter().map(|facts| facts.id.as_str()).collect();
-        self.injected.retain(|id| live.contains(id.as_str()));
-        self.announced.retain(|id| live.contains(id.as_str()));
+        let ids: Vec<&str> = current.iter().map(|facts| facts.id.as_str()).collect();
+        self.injected.forget_missing(ids.iter().copied());
+        self.announced.forget_missing(ids.iter().copied());
     }
 
     /// Pure: what to do about `current`, given what has already been advised
@@ -705,7 +782,7 @@ impl MailWatch {
 
     fn commit_injected(&mut self, ids: &[String]) {
         for id in ids {
-            self.injected.insert(id.clone());
+            self.injected.insert(id);
             self.announced.remove(id);
         }
     }
@@ -738,7 +815,7 @@ impl MailWatch {
 
     fn commit_announced(&mut self, ids: &[String]) {
         for id in ids {
-            self.announced.insert(id.clone());
+            self.announced.insert(id);
         }
     }
 }
@@ -1094,6 +1171,111 @@ fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
+/// T10: how often the skippable pause and the confirmation prompt poll for a
+/// keypress -- short enough to feel responsive, long enough not to busy-loop
+/// the CPU while a human decides (or doesn't).
+const INTERACTIVE_GATE_POLL_MS: u64 = 200;
+
+/// T10: the skippable half of the interactive gate (`InteractiveGate::
+/// Pause`) -- waits up to `seconds`, returning the instant any key arrives.
+/// Best-effort: a `crossterm` raw-mode/poll/read failure degrades to "no
+/// keypress arrived", so the pause simply runs its full course rather than
+/// erroring -- the same posture every other input-detection path in this
+/// crate already takes (a spend gate must never crash a launch over a
+/// terminal quirk).
+fn interactive_skippable_pause(seconds: u64) {
+    let _ = crossterm::terminal::enable_raw_mode();
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let poll_for = remaining.min(Duration::from_millis(INTERACTIVE_GATE_POLL_MS));
+        match crossterm::event::poll(poll_for) {
+            Ok(true) => {
+                if matches!(
+                    crossterm::event::read(),
+                    Ok(crossterm::event::Event::Key(_))
+                ) {
+                    break;
+                }
+            }
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// T10: the deliberate-confirmation half (`InteractiveGate::Refuse`) --
+/// blocks until a key arrives, since a hard ceiling has no safe timeout to
+/// fall through to (the whole point is "refuse unless a human overrides
+/// it"). Only `y`/`Y` confirms; any other key, or an input-detection
+/// failure, refuses -- the same "unknown must not be read as permission"
+/// rule `pace::decide` itself already follows for usage data.
+fn interactive_confirm() -> bool {
+    let _ = crossterm::terminal::enable_raw_mode();
+    let mut confirmed = false;
+    loop {
+        match crossterm::event::poll(Duration::from_millis(INTERACTIVE_GATE_POLL_MS)) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(crossterm::event::Event::Key(key)) => {
+                    confirmed = matches!(
+                        key.code,
+                        crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y')
+                    );
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            },
+            Ok(false) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = crossterm::terminal::disable_raw_mode();
+    confirmed
+}
+
+/// T10: applies the resolved `InteractiveGate` before the pty is ever
+/// opened. `force_pace` short-circuits both wait shapes with one line naming
+/// why, never silently -- an operator who passed the flag still deserves to
+/// see what they skipped, not just a launch with no explanation. Returns
+/// `Err` to refuse (the caller returns it straight out of `run_with`, the
+/// same pattern every other pre-terminal refusal in this function already
+/// uses); every other case returns `Ok(())` to launch.
+pub(in crate::commands::ctx) fn apply_interactive_gate(
+    gate: pace::InteractiveGate,
+    force_pace: bool,
+) -> CtxResult<()> {
+    match gate {
+        pace::InteractiveGate::Launch => Ok(()),
+        pace::InteractiveGate::Pause { message, seconds } => {
+            if force_pace {
+                eprintln!("zirv ctx wrap: {message} (--force-pace: launching now)");
+                return Ok(());
+            }
+            eprintln!("zirv ctx wrap: {message}");
+            interactive_skippable_pause(seconds);
+            Ok(())
+        }
+        pace::InteractiveGate::Refuse { message } => {
+            if force_pace {
+                eprintln!("zirv ctx wrap: {message} (--force-pace: launching anyway)");
+                return Ok(());
+            }
+            eprintln!("zirv ctx wrap: {message}");
+            if interactive_confirm() {
+                Ok(())
+            } else {
+                Err(
+                    "zirv ctx wrap: refusing to launch (usage at the ceiling); pass \
+                     --force-pace or confirm with 'y' to launch anyway"
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
 /// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
 /// not something a user ever types on the `wrap` command line, only something
 /// another verb (`zirv ctx chat`) decides on the caller's behalf. Both callers
@@ -1192,6 +1374,34 @@ pub fn run_with(
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = session.unwrap_or_else(super::event::SessionId::new_v4);
 
+    // T10: the launch-time pacing gate -- before this fix, `wrap` (and, by
+    // extension, `zirv ctx chat`'s orchestrator and every dashboard pane,
+    // which launch through this same function) never consulted `pace` at
+    // all, so an operator's dashboard-heavy workload had no proactive
+    // protection whatsoever, only the reactive `scan_for_limit` catching a
+    // vendor-imposed limit after the fact. Deliberately placed before any
+    // pty/terminal work below (never on the redraw path, which stays
+    // network-free per CLAUDE.md) and skipped outright for `--no-supervise`,
+    // whose whole promise is "nothing supervisory happens" -- `--simple`
+    // does NOT skip it (its own doc comment already promises "supervision,
+    // pacing and hooks still apply").
+    //
+    // Also gated on both stdin *and* stdout being real terminals: the whole
+    // design (a skippable pause, a 'y'-to-confirm refusal) assumes a human
+    // is there to answer it, exactly the same double-check `chrome::
+    // dash_eligible` already makes for the same reason. Without a real
+    // terminal there is nobody to prompt -- under `cargo test`'s piped
+    // stdio in particular, `crossterm`'s raw-mode/poll calls have no console
+    // to act on, so blocking here would either error out immediately (best
+    // case) or hang a test suite waiting for a keypress that can never
+    // arrive (worst case). A non-interactive `wrap` invocation is out of
+    // scope for this fix -- `exec`/`loop` are the supervisors for headless
+    // work, and already gate correctly.
+    if !args.no_supervise && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let gate = pace::interactive_gate(&state_dir, &cfg, adapter.provider(), true);
+        apply_interactive_gate(gate, args.force_pace)?;
+    }
+
     // `--no-supervise` promises pure passthrough (its own help text says so),
     // and so does a wrapped command that matches no adapter: injecting this
     // adapter's flags into a program that may not be it would leak them into
@@ -1255,6 +1465,52 @@ pub fn run_with(
     let (program, rest) = launch_command
         .split_first()
         .ok_or("no command to wrap; pass it after --")?;
+    // Bug B (harness/model parity, 2026-08-22): the same seam every real
+    // launch now calls (`adapters::policy_launch_args`) -- the shipped-
+    // default "sandboxed, no prompts" posture plus any explicit `[policy]`
+    // restriction. Computed once, from `rest` (the wrapped command's own
+    // trailing argv, whether zirv-built via `chat.rs::build_launch` or a
+    // hand-typed `zirv ctx wrap -- <command>`), and reused for both the
+    // first launch and every restart below (`relaunch_extra`), exactly like
+    // `prompt_args` already is. `flags_pin_policy` reads `rest`, so an
+    // operator's own explicit `--sandbox`/`--ask-for-approval`/
+    // `--permission-mode`/`--disallowedTools` still wins.
+    //
+    // Deliberately **not** gated on `skip_injection` (which also folds in
+    // `args.simple`): `--simple` promises no *injected instruction text*,
+    // and the sandbox posture is a safety flag layer, not instruction text
+    // (see `chat.rs`'s own `--simple` test for the identical call). It is
+    // gated on the two reasons `skip_injection` exists for that *do* apply
+    // here: `--no-supervise`'s own contract is pure passthrough (nothing
+    // zirv-added at all), and a wrapped command that does not actually
+    // match this adapter must never receive this adapter's flags -- the
+    // same leakage risk `skip_injection` exists to prevent for `prompt_
+    // args`.
+    let policy_skip = args.no_supervise
+        || !adapters::command_matches_adapter(
+            adapter.as_ref(),
+            agent_name.is_some(),
+            &args.command,
+        );
+    let policy_extra = if policy_skip {
+        Vec::new()
+    } else {
+        adapters::policy_launch_args(&cfg, adapter.as_ref(), rest)
+    };
+    // Visible, not silent: the shipped-default posture (or the operator's
+    // own opt-out/override) is announced once, here, at session start -- not
+    // re-announced on a restart, since `policy_extra` is computed once above
+    // and simply reused by `relaunch_extra`. A no-op under `--no-supervise`
+    // (`announcer` is `Announcer::silent()` there already).
+    announcer.emit(&super::announce::Event::SandboxPosture {
+        detail: if policy_extra.is_empty() {
+            "not applied (operator flags, an unmatched wrapped command, --no-supervise, or \
+             [sandbox] enabled = false)"
+                .to_string()
+        } else {
+            policy_extra.join(" ")
+        },
+    });
 
     let mut supervision = InjectionState::new();
     supervision.degraded = args.no_supervise;
@@ -1356,11 +1612,15 @@ pub fn run_with(
     // repo-sourced text. A no-op off Windows and for any non-shim program.
     {
         let mut guarded: Vec<String> = rest.to_vec();
+        guarded.extend(policy_extra.iter().cloned());
         guarded.extend(prompt_args.iter().cloned());
         adapters::guard_cmd_shim_reparse(program, &guarded)?;
     }
     let mut command = CommandBuilder::new(program);
     for arg in rest {
+        command.arg(arg);
+    }
+    for arg in &policy_extra {
         command.arg(arg);
     }
     for arg in &prompt_args {
@@ -1569,8 +1829,10 @@ pub fn run_with(
     // budget doing it. `exec` already worked this out; this is that same
     // function, and the positional prompt it also strips is one `relaunch`
     // regenerates from the handoff anyway.
-    let relaunch_extra: Vec<String> = restart_launch_flags(adapter.as_ref(), &launch_command)
-        .into_iter()
+    let relaunch_extra: Vec<String> = policy_extra
+        .iter()
+        .cloned()
+        .chain(restart_launch_flags(adapter.as_ref(), &launch_command))
         .chain(prompt_args.iter().cloned())
         .collect();
 
@@ -2394,7 +2656,23 @@ fn pump(
             ) {
                 let facts = mail_facts(&unread);
                 mail_watch.forget_missing(&facts);
-                match mail_watch.decide(&facts, may_inject(supervision, now, debounce)) {
+                // A signal-less adapter (codex today) never satisfies
+                // `may_inject`'s own `signals_seen > 0` precondition -- see
+                // `signal_less_mail_ready`'s own doc comment. `cfg.dash.
+                // idle_quiet_ms` is reused rather than a new wrap-only knob:
+                // it already means exactly "how long a signal-less session's
+                // pty must be quiet before zirv treats it as idle", the same
+                // question this is, and it is already an operator-only,
+                // non-`REPO_FORBIDDEN` timing knob over a session the
+                // operator chose to run interactively.
+                let ready = mail_inject_ready(
+                    adapter.capabilities().turn_signal,
+                    supervision,
+                    now,
+                    debounce,
+                    Duration::from_millis(cfg.dash.idle_quiet_ms),
+                );
+                match mail_watch.decide(&facts, ready) {
                     MailAction::None => {}
                     MailAction::Announce { count, ids } => {
                         // R5: `try_emit`, not `emit` -- an advisory the
@@ -2829,6 +3107,30 @@ mod tests {
         }
         cmd.env_remove("CLAUDE_PID");
         cmd.env_remove("CLAUDECODE");
+        // T10 fix regression (2026-08-23): every one of these harnesses spawns
+        // a *real* `zirv ctx wrap` attached to a real pty on both stdin and
+        // stdout, which is exactly the condition the launch-time interactive
+        // pacing gate (`pace::interactive_gate`, applied in `run_with` right
+        // before spawn) is gated on. With a fresh, isolated state dir (no
+        // usage source has ever been observed) that gate resolves to a blind
+        // `pace.blind_delay_secs` (60s) pause on every single test, which is
+        // both why this suite took 31 minutes in CI and why the pty output
+        // these tests assert on exactly (argv, prompt text, `--sandbox`/
+        // `--ask-for-approval` flags) had the pause's own banner text mixed
+        // into it -- `read_until`'s fixed budget elapses mid-pause and the
+        // assertions see nothing, or the wrong thing. Neither the pacing gate
+        // nor the shipped sandbox posture is what these tests exist to cover
+        // (`force_pace_skips_the_wait_or_confirmation_for_both_pause_and_
+        // refuse` and `a_supervised_wrap_carries_the_shipped_sandbox_posture_
+        // for_codex` are, and opt back in explicitly via `extra_env`, applied
+        // after these two and so free to override them), so both are off by
+        // default here -- the same `base_env`-defaults-it-once shape
+        // `exec.rs`/`run_loop.rs` already use to zero their own blind delay,
+        // just disabling the gate outright rather than zeroing its delay,
+        // since this harness spawns a real subprocess and cannot inject a
+        // `FakeClock`.
+        cmd.env("ZIRV_CTX_PACE", "false");
+        cmd.env("ZIRV_CTX_SANDBOX", "false");
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -3043,6 +3345,7 @@ mod tests {
             command: command.iter().map(|s| (*s).to_string()).collect(),
             simple: false,
             allow_nested,
+            force_pace: false,
         }
     }
 
@@ -3357,6 +3660,44 @@ mod tests {
         assert_eq!(read_socket_path(&state, Some("cccc3333")), None);
     }
 
+    /// T10: `--force-pace` skips the interactive wait/confirmation
+    /// deterministically -- the one half of `apply_interactive_gate` that is
+    /// unit-testable without a real terminal, since the non-`force_pace`
+    /// branches call into `crossterm`'s raw-mode keypress detection
+    /// (`interactive_skippable_pause`/`interactive_confirm`), which needs an
+    /// actual console and is exercised only by hand and by the `gate ==
+    /// Launch` case reaching zero I/O at all in every other wrap test (the
+    /// terminal-presence check ahead of this function already keeps them
+    /// off this path entirely under `cargo test`'s piped stdio).
+    #[test]
+    fn force_pace_skips_the_wait_or_confirmation_for_both_pause_and_refuse() {
+        assert!(apply_interactive_gate(pace::InteractiveGate::Launch, false).is_ok());
+        assert!(apply_interactive_gate(pace::InteractiveGate::Launch, true).is_ok());
+
+        assert!(
+            apply_interactive_gate(
+                pace::InteractiveGate::Pause {
+                    message: "usage 85.0% of the five_hour window".to_string(),
+                    seconds: 999_999,
+                },
+                true,
+            )
+            .is_ok(),
+            "force_pace must not block on a pause that would otherwise wait ~11 days"
+        );
+
+        assert!(
+            apply_interactive_gate(
+                pace::InteractiveGate::Refuse {
+                    message: "usage 99.9% of the five_hour window".to_string(),
+                },
+                true,
+            )
+            .is_ok(),
+            "force_pace must launch anyway even at the hard ceiling"
+        );
+    }
+
     #[test]
     fn wrap_needs_a_command() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3366,6 +3707,7 @@ mod tests {
             command: Vec::new(),
             simple: false,
             allow_nested: false,
+            force_pace: false,
         };
         let err = run_with(
             &args,
@@ -3394,6 +3736,7 @@ mod tests {
             command: vec!["echo".to_string(), "hello".to_string()],
             simple: false,
             allow_nested: false,
+            force_pace: false,
         };
         let err = run_with(
             &args,
@@ -3435,6 +3778,7 @@ mod tests {
             command: vec!["--append-system-prompt".to_string(), "foo".to_string()],
             simple: false,
             allow_nested: false,
+            force_pace: false,
         };
         let err = run_with(
             &args,
@@ -3512,6 +3856,43 @@ mod tests {
         assert!(
             carried_text.contains("zirv session conventions"),
             "zirv's own layer is still present: {carried_text:?}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let status = h.child.wait().expect("wait");
+        assert_eq!(status.exit_code(), 0);
+    }
+
+    /// Bug B (harness/model parity, 2026-08-22): the shipped-default
+    /// "sandboxed, no prompts" posture reaches a plain (non-dashboard)
+    /// `wrap` launch too, not only the seams a human never watches. Not
+    /// runnable on this Windows dev machine (`#[cfg(unix)]`, mirroring
+    /// every neighbouring live-argv test in this module); intended for CI.
+    #[cfg(unix)]
+    #[test]
+    fn a_supervised_wrap_carries_the_shipped_sandbox_posture_for_codex() {
+        let script = fixture("stub-tui.sh").display().to_string();
+        // This is the one test in the suite the shipped sandbox posture must
+        // actually reach, so it opts back in over the harness's own default
+        // (see `spawn_wrap_with_flags`'s `ZIRV_CTX_SANDBOX=false`) rather than
+        // relying on whatever `[sandbox]` happens to default to.
+        let mut h = spawn_wrap_with_flags(
+            &[("ZIRV_CTX_SANDBOX", "true".to_string())],
+            &["--agent", "codex"],
+            &["sh", &script],
+        );
+
+        let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+        assert!(
+            seen.contains("--sandbox workspace-write")
+                || seen.contains("--sandbox\nworkspace-write"),
+            "the shipped sandbox posture must reach a plain wrap launch: {seen:?}"
+        );
+        assert!(
+            seen.contains("--ask-for-approval never") || seen.contains("--ask-for-approval\nnever"),
+            "got: {seen:?}"
         );
 
         h.writer.write_all(b"/exit\r").expect("write");
@@ -3749,6 +4130,126 @@ mod tests {
             may_inject(&state, now + Duration::from_secs(4), DEBOUNCE),
             "quiet for longer than the debounce"
         );
+    }
+
+    // Root cause 3 (this task): `may_inject` needs `signals_seen > 0`, which
+    // a signal-less adapter (codex today) can never satisfy -- its
+    // `register_turn_signal` is a no-op, so `on_turn` never runs and the mail
+    // advisory (T13) fell back to `MailAction::Announce` forever, exactly as
+    // the pre-fix `mail_with_no_injection_window_yet_is_announced_on_stderr_
+    // instead` pins for a claude session that has not yet reported its first
+    // turn. `signal_less_mail_ready`/`mail_inject_ready` close it for a
+    // session that will *never* report one, mirroring
+    // `dash::pane::signal_less_quiescent`.
+
+    const IDLE_QUIET: Duration = Duration::from_secs(10);
+
+    /// A fresh `InjectionState` with both `last_output` and `last_input`
+    /// pinned to `now`, rather than left at whatever instant the constructor
+    /// itself happened to read. `InjectionState::new()` stamps `last_input`
+    /// with its own `Instant::now()` call, a few nanoseconds after a caller's
+    /// own `let now = Instant::now()` -- close enough that most assertions
+    /// never notice, but exactly the kind of sub-microsecond skew that makes
+    /// a `duration_since(..) >= quiet` boundary check flaky. Pinning both
+    /// fields to the same `now` the test already captured removes that
+    /// skew entirely.
+    fn signal_less_state(now: Instant) -> InjectionState {
+        let mut state = InjectionState::new();
+        state.last_output = now;
+        state.last_input = now;
+        state
+    }
+
+    #[test]
+    fn a_fresh_signal_less_state_is_not_ready_yet() {
+        let now = Instant::now();
+        let state = signal_less_state(now);
+        assert!(
+            !signal_less_mail_ready(&state, now, IDLE_QUIET),
+            "no time has passed since the state was created"
+        );
+    }
+
+    #[test]
+    fn a_signal_less_session_becomes_ready_once_quiet_for_the_idle_window() {
+        let now = Instant::now();
+        let state = signal_less_state(now);
+        assert!(
+            !signal_less_mail_ready(&state, now, IDLE_QUIET),
+            "just produced output"
+        );
+        assert!(
+            signal_less_mail_ready(&state, now + IDLE_QUIET, IDLE_QUIET),
+            "quiet for the whole idle window, with no turn signal ever needed"
+        );
+    }
+
+    #[test]
+    fn a_signal_less_sessions_own_keystroke_restarts_the_quiet_window() {
+        let now = Instant::now();
+        let mut state = signal_less_state(now);
+        let quiet_at = now + IDLE_QUIET;
+        assert!(signal_less_mail_ready(&state, quiet_at, IDLE_QUIET));
+
+        // A keystroke lands right as the pane would otherwise have gone
+        // ready -- the same race `dash::pane`'s own `latest_of` fold closes
+        // for a dashboard pane: measuring off output alone would still read
+        // this as quiet.
+        state.on_event(PumpEvent::Input(1), quiet_at);
+        assert!(
+            !signal_less_mail_ready(&state, quiet_at, IDLE_QUIET),
+            "the operator's own keystroke must restart the quiet window"
+        );
+        assert!(
+            signal_less_mail_ready(&state, quiet_at + IDLE_QUIET, IDLE_QUIET),
+            "and it clears once quiet resumes for the full window"
+        );
+    }
+
+    #[test]
+    fn a_degraded_signal_less_session_is_never_ready() {
+        let now = Instant::now();
+        let mut state = signal_less_state(now);
+        state.degraded = true;
+        assert!(!signal_less_mail_ready(
+            &state,
+            now + IDLE_QUIET,
+            IDLE_QUIET
+        ));
+    }
+
+    #[test]
+    fn mail_inject_ready_uses_may_inject_for_a_turn_signal_capable_adapter() {
+        let now = Instant::now();
+        // Idle by `signal_less_mail_ready`'s own rule (long quiet, no typing)
+        // but with no turn ever reported -- `may_inject` must still say no
+        // for a capable adapter, since that is the precise bug this task is
+        // about for the *other* direction (claude waiting on its first turn).
+        let mut state = signal_less_state(now);
+        let later = now + IDLE_QUIET;
+        assert!(
+            !mail_inject_ready(true, &state, later, DEBOUNCE, IDLE_QUIET),
+            "a capable adapter must still wait for a real turn boundary"
+        );
+
+        state.on_turn(&turn_signal(1, Verdict::Healthy));
+        state.last_output = later - Duration::from_secs(10);
+        assert!(mail_inject_ready(true, &state, later, DEBOUNCE, IDLE_QUIET));
+    }
+
+    #[test]
+    fn mail_inject_ready_uses_the_signal_less_idle_window_for_an_incapable_adapter() {
+        let now = Instant::now();
+        let state = signal_less_state(now);
+        assert!(
+            !mail_inject_ready(false, &state, now, DEBOUNCE, IDLE_QUIET),
+            "just produced output"
+        );
+        assert!(
+            mail_inject_ready(false, &state, now + IDLE_QUIET, DEBOUNCE, IDLE_QUIET),
+            "quiet for the idle window, with signals_seen still at 0 forever"
+        );
+        assert_eq!(state.signals_seen, 0, "sanity: no signal ever arrived");
     }
 
     #[test]

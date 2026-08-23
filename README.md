@@ -998,7 +998,7 @@ subscription-window waiting.
 A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
-`optimize.model`, `prompt.enabled`, `prompt.repo_layer`,
+`optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, `review`, or `worker`; doing so is an error
@@ -1013,6 +1013,8 @@ checkout:
 | `supervise.on_failure` | `ZIRV_CTX_ON_FAILURE` |
 | `handoff.model` | `ZIRV_CTX_MODEL` |
 | `optimize.model` | `ZIRV_CTX_OPTIMIZE_MODEL` |
+| `sandbox.enabled` | `ZIRV_CTX_SANDBOX` |
+| `sandbox.extra_allow` | `ZIRV_CTX_SANDBOX_EXTRA_ALLOW` |
 | `prompt.enabled` | `ZIRV_CTX_PROMPT` |
 | `prompt.repo_layer` | `ZIRV_CTX_PROMPT_REPO` |
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
@@ -1042,6 +1044,7 @@ checkout:
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
 | `pace.poll_enabled` | `ZIRV_CTX_PACE_POLL` |
 | `pace.poll_min_interval_secs` | `ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS` |
+| `pace.blind_delay_secs` | `ZIRV_CTX_PACE_BLIND_DELAY_SECS` |
 | `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
 | `worker` (`worker.claude`, `worker.codex`) | `ZIRV_CTX_WORKER_MODEL_CLAUDE` / `ZIRV_CTX_WORKER_MODEL_CODEX` |
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
@@ -1499,6 +1502,55 @@ Pass `--simple` to any of the four verbs to start the agent with no zirv text at
 all, shipped default included. Supervision, pacing and hooks are unaffected.
 Whether a prompt was injected, and from which layers, is recorded in the decision
 log at every session start.
+
+### Sandboxed by default
+
+Every zirv-launched session (2026-08-22) ships with the same default posture on
+every supported harness: **sandboxed, no prompts**. Commands run freely inside
+the repository workspace; anything reaching outside it fails rather than
+prompting a human. This is a safety flag layer, not injected instruction text,
+so `--simple` does not withhold it — only `--no-supervise` (pure passthrough) or
+the explicit opt-out below do.
+
+- **codex**: `--sandbox workspace-write --ask-for-approval never`, both verified
+  against the installed `codex-cli 0.147.0`.
+- **claude**: `--permission-mode dontAsk` plus a generated permission set
+  (`--allowedTools=`/`--disallowedTools=`), passed at launch and never written
+  to `~/.claude/settings.json`. `dontAsk` alone denies every unapproved action —
+  verified as the one mode that both suppresses prompts and never auto-runs an
+  unapproved action (`--help`'s own text: `"Don't prompt for permissions, deny
+  if not pre-approved."`) — but with no operator-configured allow rules that
+  makes a fresh install *inert*, not merely safe: it cannot write a file at
+  all. The generated set (one shared source, `adapters::SHIPPED_POSTURE_ALLOW`/
+  `_DENY`, also documented against codex's own flags) is what makes it usable:
+  allow reading/writing/editing inside the workspace and the common
+  git/list/search/build/test verbs; deny recursive force-delete, force-push and
+  history rewriting, `curl`/`wget`, `sudo`/`su`, and the macOS keychain CLI,
+  regardless of anything on the allow side. Verified live against the real
+  `claude 2.1.240`: an in-repo write and a `cargo test` both run with no
+  prompt; a write outside the workspace and a `rm -rf` are both refused.
+  Still an honest **partial**: general credential-file reads are denied only
+  by omission (nothing pre-approves `cat`), not by a targeted rule, and this
+  is not a full harness-neutral command classifier — that is proposed, not
+  built, as issue #83.
+
+An operator's own explicit `--sandbox`/`--ask-for-approval`/`--permission-mode`/
+`--disallowedTools` (passed after `--`, or via `worker.claude`/`worker.codex`'s
+own trailing flags) always wins outright — zirv prepends nothing when the
+launch already pins one of these.
+
+To restore the pre-2026-08-22 behaviour (no zirv-applied flags at all; a
+launch's approval/sandbox posture comes entirely from the harness's own native
+config), set:
+
+```toml
+[sandbox]
+enabled = false
+```
+
+or `ZIRV_CTX_SANDBOX=false`. `sandbox.enabled` is `REPO_FORBIDDEN` (see
+[Trust boundary](#trust-boundary) above): a checkout cannot turn its own
+sandboxing off, only the operator can.
 
 ## Supported Platforms
 - Windows (see the platform note under [Context Management](#context-management-zirv-ctx): `zirv ctx` supervision is unix only)

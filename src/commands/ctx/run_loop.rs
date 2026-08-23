@@ -86,11 +86,33 @@ fn prompt_delivery_via_stdin(
     super::adapters::launch_reparses_through_shim(&probe)
 }
 
+/// T11: real-clock wrapper, identical role to `exec::run_with`'s own -- see
+/// that function's doc comment.
 pub fn run_with<W: Write>(
     args: &LoopArgs,
     w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    run_with_clock(
+        args,
+        w,
+        repo,
+        env,
+        &super::state::now_secs,
+        &|d: Duration| std::thread::sleep(d),
+    )
+}
+
+/// T11 (sleep injection): see `exec::run_with_clock`'s own doc comment --
+/// same fix, same reason, applied here for `loop`'s own pacing gate calls.
+pub(crate) fn run_with_clock<W: Write>(
+    args: &LoopArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
     if args.cycles == Some(0) {
         return Err("--cycles must be at least 1".into());
@@ -111,8 +133,6 @@ pub fn run_with<W: Write>(
 
     let mut cycle = 0u32;
     let mut failures = 0u32;
-    let now_fn = now_secs;
-    let sleep_fn = |d: Duration| std::thread::sleep(d);
     // One registry record for the whole run, refreshed (not re-registered)
     // each cycle since every cycle mints a fresh session id -- see
     // `SessionGuard::refresh_session`. `None` until the first cycle actually
@@ -130,7 +150,7 @@ pub fn run_with<W: Write>(
     // (pace.rs's own `wait_for_window`) prints once for the whole run
     // rather than once per cycle.
     let mut pace_flags = pace::PaceGateFlags::default();
-    let http_poller = super::poll::HttpPoller;
+    let http_poller = super::poll::HttpPoller::new(cfg.chrome.events);
     loop {
         if let Some(limit) = args.cycles
             && cycle >= limit
@@ -148,8 +168,8 @@ pub fn run_with<W: Write>(
             &cfg.pace,
             "loop",
             "loop",
-            &now_fn,
-            &sleep_fn,
+            now_fn,
+            sleep_fn,
             None,
             adapter.provider(),
             pace::PaceGate {
@@ -267,7 +287,33 @@ pub fn run_with<W: Write>(
             &state,
             session.as_str(),
         )?;
-        let extra: Vec<String> = user_extra.iter().cloned().chain(prompt_args).collect();
+        // Bug B (harness/model parity, 2026-08-22): the same seam every real
+        // launch now calls (`adapters::policy_launch_args`) -- the shipped-
+        // default "sandboxed, no prompts" posture plus any explicit
+        // `[policy]` restriction, recomputed every cycle since `loop` is a
+        // fresh, stateless session each time and `user_extra` (the operator's
+        // own trailing flags) can itself change cycle to cycle if the
+        // operator's own config did. `flags_pin_policy` reads `user_extra`,
+        // so an operator's own `--sandbox`/`--ask-for-approval`/
+        // `--permission-mode`/`--disallowedTools` still wins.
+        let policy_extra = adapters::policy_launch_args(&cfg, adapter.as_ref(), &user_extra);
+        // Visible, not silent: announced every cycle, the same "at every
+        // session start" discipline the M2 injection-attribution comment
+        // just below already follows -- each `loop` cycle genuinely is a
+        // fresh session, so this is not a repeat of the same announcement.
+        announcer.emit(&super::announce::Event::SandboxPosture {
+            detail: if policy_extra.is_empty() {
+                "not applied (operator flags or [sandbox] enabled = false)".to_string()
+            } else {
+                policy_extra.join(" ")
+            },
+        });
+        let extra: Vec<String> = policy_extra
+            .iter()
+            .cloned()
+            .chain(user_extra.iter().cloned())
+            .chain(prompt_args)
+            .collect();
         // M2: README promises injection attribution "at every session start",
         // and every cycle is a new session, so the entry is written here under
         // that cycle's own id rather than once under a literal "loop".
@@ -463,8 +509,8 @@ pub fn run_with<W: Write>(
                 &cfg.pace,
                 "loop",
                 session.as_str(),
-                &now_fn,
-                &sleep_fn,
+                now_fn,
+                sleep_fn,
                 None,
                 adapter.provider(),
                 pace::PaceGate {
@@ -615,6 +661,13 @@ mod tests {
                 format!("sh {}", fixture("fake-agent.sh").display()),
             ),
             ("ZIRV_CTX_POLL_MS".to_string(), "50".to_string()),
+            // T8: `run_with`'s `sleep_fn` is real `std::thread::sleep`, and a
+            // fresh temp state dir has no usage source by construction --
+            // see the identical comment on `exec.rs`'s own `base_env`.
+            (
+                "ZIRV_CTX_PACE_BLIND_DELAY_SECS".to_string(),
+                "0".to_string(),
+            ),
         ]
         .into()
     }
@@ -1023,6 +1076,47 @@ mod tests {
         assert!(log.contains("\"action\":\"pace-wait\""), "got {log}");
     }
 
+    /// T11: same seam as `exec.rs`'s own `the_blind_delay_reaches_the_
+    /// injected_sleep_fn_with_the_right_duration` -- `loop`'s pacing gate
+    /// calls also go through the now-injectable `run_with_clock`, so the
+    /// fail-safe blind delay (T8) is verifiable here too, not just claimed.
+    #[test]
+    fn loops_blind_delay_reaches_the_injected_sleep_fn_with_the_right_duration() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert(
+            "ZIRV_CTX_PACE_BLIND_DELAY_SECS".to_string(),
+            "2".to_string(),
+        );
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let mut out = Vec::new();
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let code = run_with_clock(
+            &args_for(1),
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|d: Duration| slept.borrow_mut().push(d.as_secs()),
+        );
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), 0);
+        assert_eq!(
+            slept.borrow().first().copied(),
+            Some(2),
+            "the blind-mode delay must actually be slept via the injected sleep_fn, got {:?}",
+            slept.borrow()
+        );
+    }
+
     #[test]
     fn a_cycle_launches_with_the_system_prompt() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1056,6 +1150,48 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("\"action\":\"prompt-injected\""), "got {log}");
+    }
+
+    /// Bug B seam coverage (2026-08-22, fix round 3): `run_loop.rs` is one
+    /// of the three seams that had only full-suite-green plus log
+    /// inspection backing its own `policy_extra` wiring. Asserts the real
+    /// argv the launched child receives (`FAKE_AGENT_ARGV_LOG`).
+    #[test]
+    fn a_cycle_launches_with_the_shipped_sandbox_posture() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let argv_log = tmp.path().join("argv.log");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // SAFETY: CI runs tests single-threaded.
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "1");
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+        let mut out = Vec::new();
+        let mut args = args_for(1);
+        args.simple = false;
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        assert!(
+            argv.contains("--permission-mode") && argv.contains("dontAsk"),
+            "the shipped-default posture must reach the real launched argv: {argv}"
+        );
+        assert!(
+            argv.contains("--allowedTools=") && argv.contains("Edit(./**)"),
+            "the generated permission set must reach it too: {argv}"
+        );
     }
 
     /// M2: README promises injection attribution "at every session start", and

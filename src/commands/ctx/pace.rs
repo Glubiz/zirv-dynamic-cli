@@ -543,6 +543,256 @@ fn pacing_event(decision: &PaceDecision) -> Option<super::announce::Event> {
     }
 }
 
+/// T8 (fail-SAFE, not open): whether `decide()`'s `Unknown` verdict reflects
+/// genuine blindness -- no binding collector reading and no configured
+/// estimator -- rather than a stale-but-still-tracked `Slow` episode
+/// surviving a recheck (item 2's own `slow.is_some()` case, which must keep
+/// using its latched deadline and `wait_cap`, not this path). Pure and
+/// table-testable on its own: this is exactly the branch condition that
+/// decides whether a spend gate proceeds blind or applies the fail-safe
+/// delay, so it must be checkable with no clock, no state dir, and no
+/// `Announcer` involved.
+fn is_blind(decision: &PaceDecision, slow_latched: bool) -> bool {
+    matches!(decision, PaceDecision::Unknown) && !slow_latched
+}
+
+/// T8: what a genuinely blind gate does and tells the operator, shared by
+/// the upfront no-source shortcut and the in-loop case where `decide()`
+/// itself returns `Unknown` with no latched `Slow` episode to fall back on
+/// (`is_blind`) -- a reading that existed once but has since gone stale
+/// below the ceiling with nothing fresher reaches this same path, which the
+/// upfront shortcut's own `has_no_usage_source` check cannot see on its own
+/// (that check only knows "nothing was ever recorded", not "what was
+/// recorded is now too old to trust").
+///
+/// This is the fix for the fail-open gap: previously both call sites simply
+/// returned `Proceed` with zero delay, once per cycle, forever -- a
+/// supervised loop with no usage data span at full speed with nothing
+/// slowing it down. Now every call pays a bounded `cfg.blind_delay_secs`
+/// safety delay (small next to `fallback_delay_secs`/`wait_slack_secs` by
+/// design -- see `PaceConfig::blind_delay_secs`'s own doc comment), and the
+/// operator is told once per run, not once per cycle (`flags.no_source_
+/// announced`, the same latch discipline every other once-per-run line in
+/// this module already follows) -- but the *delay* is not deduplicated: it
+/// applies on every call, since that is the actual safety mechanism, not
+/// just the narration of it.
+///
+/// A `writeln!`/`log::append` failure here degrades exactly like every
+/// other decision-logging call in this module: this must never become a
+/// hard error, since a spend gate that panics instead of pacing is strictly
+/// worse than one that merely logs badly.
+#[allow(clippy::too_many_arguments)]
+fn blind_wait<W: Write>(
+    w: &mut W,
+    state: &StateDir,
+    cfg: &PaceConfig,
+    verb: &'static str,
+    session: &str,
+    provider: &str,
+    announcer: Option<&super::announce::Announcer>,
+    sleep_fn: &dyn Fn(Duration),
+    flags: &mut PaceGateFlags,
+    waited_so_far: u64,
+) -> PaceOutcome {
+    if !flags.no_source_announced {
+        let _ = writeln!(
+            w,
+            "zirv ctx {verb}: pacing degraded: {provider} has no usage source; applying a \
+             {}s safety delay per cycle until data is available (see `zirv ctx status`)",
+            cfg.blind_delay_secs
+        );
+        if let Some(announcer) = announcer {
+            announcer.emit(&super::announce::Event::PacingBlind {
+                provider: provider.to_string(),
+                delay_secs: cfg.blind_delay_secs,
+            });
+        }
+        let _ = log::append(
+            state,
+            &log::Decision {
+                ts: now_secs(),
+                session,
+                verb,
+                verdict: "n/a",
+                score: 0,
+                action: "pacing-blind",
+                detail: "no usage source; applying the blind-mode safety delay instead of \
+                         proceeding unthrottled",
+            },
+        );
+        flags.no_source_announced = true;
+    }
+    sleep_fn(Duration::from_secs(cfg.blind_delay_secs));
+    PaceOutcome {
+        waited_secs: waited_so_far + cfg.blind_delay_secs,
+        source: Source::None,
+    }
+}
+
+/// T10: what an INTERACTIVE launch (a human sitting in front of it, unlike
+/// `wait_for_window`'s headless callers) should show and do, given the same
+/// `PaceDecision` the headless gate already computes. A silent wait in front
+/// of a person is its own failure -- worse than the spend problem it would
+/// be solving -- so this never blocks without saying why, and every wait it
+/// describes is one the human can shorten or refuse (never a bare sleep with
+/// no way out). Pure: no I/O, no clock beyond what the caller already
+/// resolved, so the exact wording and which decisions pause/refuse/launch
+/// silently are table-testable without a terminal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InteractiveGate {
+    /// Real data, comfortably below the soft band (or pacing off/use_credits
+    /// declared): launch immediately, nothing shown.
+    Launch,
+    /// The soft band, or genuinely blind data: show `message`, then a
+    /// skippable pause of `seconds` -- any keypress launches immediately,
+    /// and the pause elapsing on its own also launches (this is advisory,
+    /// not a refusal).
+    Pause { message: String, seconds: u64 },
+    /// At or above the hard ceiling: show `message` and refuse to launch by
+    /// default. Only an explicit, deliberate confirmation launches anyway --
+    /// this is not skippable by an idle timeout the way `Pause` is.
+    Refuse { message: String },
+}
+
+/// The pure decision/message mapping `resolve_interactive_gate` (below)
+/// hands off to once it has a `PaceDecision` in hand. Kept separate from the
+/// `enabled`/`use_credits` short-circuits (which never reach here at all --
+/// they resolve straight to `InteractiveGate::Launch`) so this function's
+/// only job is "given a decision, what does a human need to see and do".
+/// Named `gate_for_decision` (not `interactive_gate`) so the public
+/// `interactive_gate` below -- which assembles the poller/gate/flags a call
+/// site used to hand-build itself -- can have the name call sites actually
+/// want.
+fn gate_for_decision(decision: &PaceDecision, provider: &str, cfg: &PaceConfig) -> InteractiveGate {
+    match decision {
+        PaceDecision::Proceed { .. } => InteractiveGate::Launch,
+        PaceDecision::Slow {
+            delay_secs,
+            window,
+            percent,
+            source,
+        } => InteractiveGate::Pause {
+            message: format!(
+                "usage {percent:.1}% of the {window} window ({} data); pausing {delay_secs}s \
+                 before launch to spread the remaining budget -- press any key to launch now, or \
+                 pass --force-pace to skip this pause automatically",
+                source.as_str()
+            ),
+            seconds: *delay_secs,
+        },
+        PaceDecision::WaitUntil {
+            percent,
+            window,
+            source,
+            reset_at,
+        } => {
+            let reset = match reset_at {
+                Some(at) => format!("resets at unix {at}"),
+                None => "reset time unknown".to_string(),
+            };
+            InteractiveGate::Refuse {
+                message: format!(
+                    "usage {percent:.1}% of the {window} window ({} data) is at or above the \
+                     {:.0}% limit ({reset}); refusing to launch -- press 'y' then Enter to launch \
+                     anyway, or pass --force-pace to skip this check",
+                    source.as_str(),
+                    cfg.max_percent
+                ),
+            }
+        }
+        // T8's blind fail-safe delay, made honest in front of a human: the
+        // same reason (`usage_source_hint`) and the same bounded delay, but
+        // shown and skippable rather than silently slept through.
+        PaceDecision::Unknown => InteractiveGate::Pause {
+            message: format!(
+                "{} -- pausing {}s before launch as a precaution -- press any key to launch now, \
+                 or pass --force-pace to skip this pause automatically",
+                super::poll::usage_source_hint(provider),
+                cfg.blind_delay_secs
+            ),
+            seconds: cfg.blind_delay_secs,
+        },
+    }
+}
+
+/// T10: resolves what an interactive launch should show/do. A one-shot
+/// question, not a loop like `wait_for_window`'s own: an interactive launch
+/// asks once, shows the human the answer, and lets *them* decide whether to
+/// wait it out, skip it, or (at the ceiling) refuse -- it never loops or
+/// blocks silently on its own. `flags` still threads through `refresh_
+/// sources` (its `last_codex_scan` floor applies here exactly like it does
+/// for the headless gate), but the announce-once latches (`no_source_
+/// announced`/`credits_announced`) are deliberately not consulted for the
+/// *message* shown here: a human deciding right now needs to see the reason
+/// every time, not "trust me, I said this already" from a possibly
+/// much-earlier restart.
+pub fn resolve_interactive_gate(
+    state: &StateDir,
+    cfg: &PaceConfig,
+    now: u64,
+    provider: &str,
+    gate: PaceGate,
+    flags: &mut PaceGateFlags,
+) -> InteractiveGate {
+    if !cfg.enabled || gate.use_credits {
+        return InteractiveGate::Launch;
+    }
+    refresh_sources(state, cfg, now, provider, &gate, flags);
+    let (collector, estimated) = current_windows(state, cfg, now, provider);
+    let decision = decide(&collector, estimated.as_ref(), now, cfg);
+    gate_for_decision(&decision, provider, cfg)
+}
+
+/// Pure assembly of the `PaceGate` `interactive_gate` (below) resolves
+/// against -- split out so the `poll` flag's effect on `gate.poller` is
+/// directly testable without a state dir, a real decision, or a network
+/// call. `http_poller` is always constructed by the caller (cheap: it only
+/// stores a bool, see `HttpPoller::new`); `poll` and `cfg.poll_enabled`
+/// together decide whether it is actually handed to the gate as a live
+/// `UsagePoller` or left out entirely. This is where finding 1 (the
+/// dashboard's mid-session spawn gate must never carry a live poller onto
+/// the UI thread) is enforced, in one place rather than at each call site.
+fn build_gate<'a>(
+    cfg: &PaceConfig,
+    provider: &str,
+    poll: bool,
+    http_poller: &'a super::poll::HttpPoller,
+) -> PaceGate<'a> {
+    PaceGate {
+        use_credits: cfg.use_credits.for_provider(provider),
+        poller: (poll && cfg.poll_enabled).then_some(http_poller as &dyn super::poll::UsagePoller),
+    }
+}
+
+/// Builds the `HttpPoller`/`PaceGate`/fresh `PaceGateFlags` and resolves the
+/// interactive gate in one call. Introduced so the three call sites that
+/// used to hand-assemble this block individually (`wrap::run_with`, and
+/// `dash/mod.rs`'s two spawn points -- `fulfill_spawn_request` and
+/// `run_dashboard`'s own first-pane spawn) cannot drift out of sync with
+/// each other again. `poll` is the one difference between call sites: pass
+/// `false` on a call site that must never block on a synchronous HTTP/
+/// keychain round trip (the dashboard's mid-session spawn path, which runs
+/// on its single UI thread) and `true` everywhere a blocking wait is
+/// already the point (`wrap`'s own pre-spawn gate, the dashboard's first
+/// pane before raw mode is entered).
+pub fn interactive_gate(
+    state: &StateDir,
+    cfg: &super::config::CtxConfig,
+    provider: &str,
+    poll: bool,
+) -> InteractiveGate {
+    let http_poller = super::poll::HttpPoller::new(cfg.chrome.events);
+    let gate = build_gate(&cfg.pace, provider, poll, &http_poller);
+    resolve_interactive_gate(
+        state,
+        &cfg.pace,
+        now_secs(),
+        provider,
+        gate,
+        &mut PaceGateFlags::default(),
+    )
+}
+
 /// Blocks until the window has room, then returns. Never exits the process and
 /// never returns an error: pacing failing closed would be worse than pacing not
 /// happening, so every unknown proceeds.
@@ -633,22 +883,9 @@ pub fn wait_for_window<W: Write>(
     // disable an operator's estimator-only pacing setup (no statusline tee,
     // no working poll, but a configured budget).
     if usage_window::has_no_usage_source(state, provider) && !estimator_configured(cfg) {
-        if !flags.no_source_announced {
-            let _ = writeln!(
-                w,
-                "zirv ctx {verb}: pacing off: {provider} has no usage source"
-            );
-            if let Some(announcer) = announcer {
-                announcer.emit(&super::announce::Event::PacingSkipped {
-                    provider: provider.to_string(),
-                });
-            }
-            flags.no_source_announced = true;
-        }
-        return PaceOutcome {
-            waited_secs: 0,
-            source: Source::None,
-        };
+        return blind_wait(
+            w, state, cfg, verb, session, provider, announcer, sleep_fn, flags, 0,
+        );
     }
 
     let started = now_fn();
@@ -664,6 +901,30 @@ pub fn wait_for_window<W: Write>(
         refresh_sources(state, cfg, now, provider, &gate, flags);
         let (collector, estimated) = current_windows(state, cfg, now, provider);
         let decision = decide(&collector, estimated.as_ref(), now, cfg);
+
+        // T8: a reading that existed when the upfront shortcut ran (so it
+        // did not fire) can still go stale *during* the wait -- `binding()`
+        // then reads it as unusable, `decide()` returns `Unknown`, and
+        // without this check the loop below would fall through to `deadline
+        // = None` and return `Proceed` at zero delay, silently reopening the
+        // exact fail-open gap the upfront shortcut exists to close. Skipped
+        // only when a `Slow` episode is already latched (`slow.is_some()`):
+        // that is item 2's own "stale-but-still-tracked" case, which must
+        // keep its latched deadline, not fall back to this one.
+        if is_blind(&decision, slow.is_some()) {
+            return blind_wait(
+                w,
+                state,
+                cfg,
+                verb,
+                session,
+                provider,
+                announcer,
+                sleep_fn,
+                flags,
+                now.saturating_sub(started),
+            );
+        }
 
         let source = match &decision {
             PaceDecision::Proceed { source, .. } => *source,
@@ -1813,6 +2074,221 @@ mod tests {
         );
     }
 
+    /// T8 (fail-SAFE, not open): the exact branch condition deciding whether
+    /// a genuinely data-less gate degrades to the bounded safety delay or
+    /// falls through to item 2's own latched-`Slow`-survives-staleness path.
+    /// Pure and table-testable with no clock, state dir, or `Announcer`.
+    #[test]
+    fn is_blind_is_true_only_for_unknown_with_no_slow_episode_latched() {
+        assert!(
+            is_blind(&PaceDecision::Unknown, false),
+            "no binding data and nothing latched: genuinely blind"
+        );
+        assert!(
+            !is_blind(&PaceDecision::Unknown, true),
+            "item 2's own case: a latched Slow surviving a stale recheck must \
+             keep its own deadline, not fall back to the blind delay"
+        );
+        assert!(
+            !is_blind(
+                &PaceDecision::Proceed {
+                    source: Source::Collector,
+                    worst_percent: 10.0
+                },
+                false
+            ),
+            "real data exists: not blind"
+        );
+        assert!(
+            !is_blind(
+                &PaceDecision::WaitUntil {
+                    reset_at: Some(NOW + 600),
+                    window: "five_hour",
+                    percent: 99.0,
+                    source: Source::Collector,
+                },
+                false
+            ),
+            "a hard pause is real data, not blindness"
+        );
+        assert!(
+            !is_blind(
+                &PaceDecision::Slow {
+                    delay_secs: 100,
+                    window: "five_hour",
+                    percent: 90.0,
+                    source: Source::Collector,
+                },
+                false
+            ),
+            "a soft throttle is real data, not blindness"
+        );
+    }
+
+    /// T10: the pure decision/message mapping an interactive launch uses --
+    /// no terminal, no I/O, just the same `PaceDecision` the headless gate
+    /// already computes. Pins the exact override wording verbatim, since a
+    /// human reading this message is the whole point of the fix.
+    #[test]
+    fn interactive_gate_maps_each_decision_to_the_right_shape_and_names_the_override() {
+        let cfg = PaceConfig::default();
+
+        assert_eq!(
+            gate_for_decision(
+                &PaceDecision::Proceed {
+                    source: Source::Collector,
+                    worst_percent: 10.0
+                },
+                "anthropic",
+                &cfg
+            ),
+            InteractiveGate::Launch,
+            "healthy usage launches with nothing shown"
+        );
+
+        let slow = PaceDecision::Slow {
+            delay_secs: 42,
+            window: "five_hour",
+            percent: 85.0,
+            source: Source::Collector,
+        };
+        match gate_for_decision(&slow, "anthropic", &cfg) {
+            InteractiveGate::Pause { message, seconds } => {
+                assert_eq!(seconds, 42);
+                assert!(message.contains("85.0%"), "got {message}");
+                assert!(message.contains("five_hour"), "got {message}");
+                assert!(message.contains("press any key"), "got {message}");
+                assert!(message.contains("--force-pace"), "got {message}");
+            }
+            other => panic!("soft band must Pause, got {other:?}"),
+        }
+
+        let wait = PaceDecision::WaitUntil {
+            reset_at: Some(1_785_507_915),
+            window: "seven_day",
+            percent: 99.5,
+            source: Source::Collector,
+        };
+        match gate_for_decision(&wait, "anthropic", &cfg) {
+            InteractiveGate::Refuse { message } => {
+                assert!(message.contains("99.5%"), "got {message}");
+                assert!(message.contains("seven_day"), "got {message}");
+                assert!(message.contains("refusing to launch"), "got {message}");
+                assert!(message.contains("press 'y' then Enter"), "got {message}");
+                assert!(message.contains("--force-pace"), "got {message}");
+                assert!(message.contains("1785507915"), "got {message}");
+            }
+            other => panic!("the hard ceiling must Refuse, got {other:?}"),
+        }
+
+        match gate_for_decision(&PaceDecision::Unknown, "anthropic", &cfg) {
+            InteractiveGate::Pause { message, seconds } => {
+                assert_eq!(seconds, cfg.blind_delay_secs);
+                assert!(
+                    message.contains("zirv ctx status") || message.contains("statusline tee"),
+                    "reuses usage_source_hint's own reason/remedy: {message}"
+                );
+                assert!(message.contains("press any key"), "got {message}");
+                assert!(message.contains("--force-pace"), "got {message}");
+            }
+            other => {
+                panic!("blind data must Pause (not silently inherit the delay), got {other:?}")
+            }
+        }
+    }
+
+    /// T10: `resolve_interactive_gate`'s own short-circuits -- disabled
+    /// pacing and an operator's `use_credits` declaration both launch with
+    /// nothing shown, exactly like the headless gate's own early returns,
+    /// without ever reaching `decide()` at all.
+    #[test]
+    fn resolve_interactive_gate_launches_silently_when_disabled_or_credits_cover_it() {
+        let exhausted = UsageWindows {
+            five_hour: window(100.0, NOW + 600, NOW),
+            seven_day: None,
+        };
+        let (_tmp, state) = state_with(exhausted);
+
+        let disabled = resolve_interactive_gate(
+            &state,
+            &PaceConfig {
+                enabled: false,
+                ..PaceConfig::default()
+            },
+            NOW,
+            "anthropic",
+            PaceGate {
+                use_credits: false,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
+        );
+        assert_eq!(disabled, InteractiveGate::Launch);
+
+        let credits = resolve_interactive_gate(
+            &state,
+            &PaceConfig::default(),
+            NOW,
+            "anthropic",
+            PaceGate {
+                use_credits: true,
+                poller: None,
+            },
+            &mut PaceGateFlags::default(),
+        );
+        assert_eq!(
+            credits,
+            InteractiveGate::Launch,
+            "an operator's own use_credits declaration is never second-guessed"
+        );
+    }
+
+    /// Finding 1 (review): the dashboard's mid-session spawn gate
+    /// (`fulfill_spawn_request`) must never carry a live `HttpPoller` onto
+    /// the dashboard's single UI thread -- a synchronous ureq request or a
+    /// macOS Keychain shell-out would freeze every pane and all input.
+    /// `build_gate(.., poll: false, ..)` is how that call site enforces it;
+    /// pinned here directly against the `PaceGate` it produces, without a
+    /// state dir or a real decision.
+    #[test]
+    fn build_gate_carries_no_poller_for_the_dashboards_mid_session_spawn_path() {
+        let cfg = PaceConfig::default();
+        let http_poller = crate::commands::ctx::poll::HttpPoller::new(false);
+
+        let gate = build_gate(&cfg, "anthropic", false, &http_poller);
+        assert!(
+            gate.poller.is_none(),
+            "poll: false must never hand a live poller to the gate"
+        );
+    }
+
+    /// The mirror case: a call site that passes `poll: true` (`wrap`'s own
+    /// pre-spawn gate, the dashboard's first pane before raw mode) still
+    /// gets a live poller, as long as `cfg.poll_enabled` allows it -- so
+    /// `poll: false` above is a deliberate per-call-site choice, not
+    /// `build_gate` silently dropping every poller.
+    #[test]
+    fn build_gate_carries_a_poller_when_poll_is_true_and_polling_is_enabled() {
+        let cfg = PaceConfig {
+            poll_enabled: true,
+            ..PaceConfig::default()
+        };
+        let http_poller = crate::commands::ctx::poll::HttpPoller::new(false);
+
+        let gate = build_gate(&cfg, "anthropic", true, &http_poller);
+        assert!(gate.poller.is_some());
+
+        let disabled_cfg = PaceConfig {
+            poll_enabled: false,
+            ..PaceConfig::default()
+        };
+        let gate = build_gate(&disabled_cfg, "anthropic", true, &http_poller);
+        assert!(
+            gate.poller.is_none(),
+            "cfg.poll_enabled = false must still win even when the call site asks for poll: true"
+        );
+    }
+
     /// Item 4: the plain writer `w` and the announcer are gated by the
     /// exact same `announced != fingerprint` check, so counting the
     /// writer's "throttling" lines is an honest proxy for "the announce arm
@@ -2010,22 +2486,31 @@ mod tests {
     /// deterministic regardless of what the real machine has on disk, while
     /// still exercising the same generic skip path a real unknown provider
     /// would take.
+    /// T8 (fail-SAFE, not open): a provider with nothing ever recorded no
+    /// longer skips the gate at zero delay -- that was the fail-open bug.
+    /// It now pays `cfg.blind_delay_secs` every cycle (the actual safety
+    /// mechanism) while the *narration* still dedupes to once per run (item
+    /// 10's own discipline, unchanged).
     #[test]
-    fn a_provider_with_no_usage_source_skips_the_gate_and_names_it() {
+    fn a_provider_with_no_usage_source_pays_the_blind_delay_every_cycle_and_names_it_once() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         let clock = FakeClock::new(NOW);
         let mut out = Vec::new();
         let mut flags = PaceGateFlags::default();
+        let cfg = PaceConfig::default();
 
         let outcome = wait_for_window(
             &mut out,
             &state,
-            &PaceConfig::default(),
+            &cfg,
             "loop",
             "sess",
             &|| *clock.now.borrow(),
-            &|d| *clock.now.borrow_mut() += d.as_secs(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
             None,
             "example-vendor",
             PaceGate {
@@ -2035,14 +2520,23 @@ mod tests {
             &mut flags,
         );
 
-        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.waited_secs, cfg.blind_delay_secs);
         assert_eq!(outcome.source, Source::None);
         let printed = String::from_utf8_lossy(&out).to_string();
         assert!(printed.contains("example-vendor"), "got {printed}");
         assert!(printed.contains("no usage source"), "got {printed}");
         assert!(
-            clock.slept.borrow().is_empty(),
-            "must never enter the wait loop"
+            printed.contains("zirv ctx status"),
+            "the remedy is pointed at: {printed}"
+        );
+        assert!(
+            !printed.to_lowercase().contains("pacing off"),
+            "must read as degraded, not off: {printed}"
+        );
+        assert_eq!(
+            clock.slept.borrow().as_slice(),
+            &[cfg.blind_delay_secs],
+            "the fail-safe delay must actually be slept, not just claimed"
         );
         assert!(
             flags.no_source_announced,
@@ -2051,18 +2545,21 @@ mod tests {
 
         // Item 10: a second cycle of the same run (the caller's own
         // `flags` threaded straight back in, exactly like `exec`'s and
-        // `loop`'s own supervise loops do) must not repeat the line or grow
-        // `out` at all -- the no-source fact was already stated once for
-        // this run.
+        // `loop`'s own supervise loops do) must not repeat the *line*, but
+        // must still pay the delay -- narration dedupes, the safety
+        // mechanism itself does not.
         let before = out.len();
         let outcome = wait_for_window(
             &mut out,
             &state,
-            &PaceConfig::default(),
+            &cfg,
             "loop",
             "sess",
             &|| *clock.now.borrow(),
-            &|d| *clock.now.borrow_mut() += d.as_secs(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
             None,
             "example-vendor",
             PaceGate {
@@ -2071,13 +2568,18 @@ mod tests {
             },
             &mut flags,
         );
-        assert_eq!(outcome.waited_secs, 0);
-        assert_eq!(outcome.source, Source::None, "still skipped, just quietly");
+        assert_eq!(outcome.waited_secs, cfg.blind_delay_secs, "still throttled");
+        assert_eq!(outcome.source, Source::None);
         assert_eq!(
             out.len(),
             before,
             "a second cycle in the same run prints nothing new: {:?}",
             String::from_utf8_lossy(&out)
+        );
+        assert_eq!(
+            clock.slept.borrow().as_slice(),
+            &[cfg.blind_delay_secs, cfg.blind_delay_secs],
+            "every cycle pays the delay even once the narration has gone quiet"
         );
     }
 
@@ -2156,20 +2658,31 @@ mod tests {
         );
     }
 
+    /// T8: a recorded-but-empty `UsageWindows` (a file exists, so the
+    /// upfront `has_no_usage_source` shortcut does not fire, but neither
+    /// sub-window has ever been observed) still reaches `decide()`'s own
+    /// `Unknown` verdict inside the loop -- this is the path the upfront
+    /// shortcut structurally cannot see (it only knows "nothing was ever
+    /// recorded", not "what exists has nothing usable in it"), and it must
+    /// degrade the same fail-SAFE way, not proceed at zero delay.
     #[test]
-    fn unknown_usage_proceeds_without_waiting() {
+    fn genuinely_unknown_usage_pays_the_blind_delay_rather_than_proceeding_free() {
         let (_tmp, state) = state_with(UsageWindows::default());
         let clock = FakeClock::new(NOW);
         let mut out = Vec::new();
+        let cfg = PaceConfig::default();
 
         let outcome = wait_for_window(
             &mut out,
             &state,
-            &PaceConfig::default(),
+            &cfg,
             "loop",
             "sess",
             &|| *clock.now.borrow(),
-            &|d| *clock.now.borrow_mut() += d.as_secs(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
             None,
             "anthropic",
             PaceGate {
@@ -2179,8 +2692,9 @@ mod tests {
             &mut PaceGateFlags::default(),
         );
 
-        assert_eq!(outcome.waited_secs, 0);
+        assert_eq!(outcome.waited_secs, cfg.blind_delay_secs);
         assert_eq!(outcome.source, Source::None);
+        assert_eq!(clock.slept.borrow().as_slice(), &[cfg.blind_delay_secs]);
     }
 
     #[test]

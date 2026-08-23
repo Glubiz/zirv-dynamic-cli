@@ -45,6 +45,10 @@ pub struct ChatArgs {
     /// take the outer session down.
     #[arg(long, default_value_t = false)]
     pub allow_nested: bool,
+    /// T10: see `WrapArgs::force_pace` -- threaded straight through, since a
+    /// `chat` launch becomes a `wrap` launch (`wrap_args_for`).
+    #[arg(long, default_value_t = false)]
+    pub force_pace: bool,
     /// Extra arguments passed through to the agent, after `--`.
     //
     // `allow_hyphen_values`, because what gets passed through here is the
@@ -92,6 +96,60 @@ pub fn build_launch(
         role: PromptRole::Orchestrator,
         verb: super::sessions::Verb::Chat,
     }
+}
+
+/// When `adapter` has no verified system-prompt injection mechanism for the
+/// launch shape it is about to use, folds the composed session context onto
+/// the positional initial-prompt slot as a fallback -- the same task-prompt-
+/// text channel `exec.rs`/`run_loop.rs`/`dash::compose_worker_prompt` already
+/// use for exactly this adapter shape (see `prompt::task_prompt_with_
+/// composed_fallback`'s own doc comment for why the task prompt is the one
+/// channel such an adapter has). A no-op (returns `initial_prompt`
+/// unchanged) whenever the adapter *is* supported, so a claude launch --
+/// which always reports supported, see `ClaudeAdapter`'s lack of a `system_
+/// prompt_supported` override -- is byte-for-byte unaffected.
+///
+/// `adapter.system_prompt_supported(&[])` (an empty launch) is deliberately
+/// probed here rather than against the eventual full launch argv: this runs
+/// before `build_launch` exists, and `CodexAdapter::system_prompt_supported`'s
+/// own contract is to probe `self.interactive_cmd(None, &[])` when handed an
+/// empty launch, answering the same question (does *this adapter's own
+/// program* resolve to a reparsing shell shim) without needing the real argv
+/// in hand -- `compose_worker_prompt` makes the identical `adapter.system_
+/// prompt_supported(&[])` call for the same reason, a launch that also does
+/// not exist yet at that point.
+///
+/// `simple`/`cfg.prompt.enabled` are not checked directly here: `compile::
+/// compile` already returns `composed: None` for either (mirroring `prompt::
+/// compose`'s own gate), and `task_prompt_with_composed_fallback` is a no-op
+/// when handed `None`, so both degrade to returning `initial_prompt`
+/// unchanged -- the correct answer either way.
+fn orchestrator_initial_prompt(
+    adapter: &dyn AgentAdapter,
+    initial_prompt: Option<String>,
+    cfg: &CtxConfig,
+    home: Option<&Path>,
+    repo: &Path,
+    simple: bool,
+    state: &StateDir,
+) -> Option<String> {
+    if adapter.system_prompt_supported(&[]) {
+        return initial_prompt;
+    }
+    let compiled = super::compile::compile(
+        home,
+        repo,
+        simple,
+        cfg,
+        adapter,
+        PromptRole::Orchestrator,
+        state,
+        super::state::now_secs(),
+    );
+    let base = initial_prompt.unwrap_or_default();
+    let text =
+        super::prompt::task_prompt_with_composed_fallback(&base, false, compiled.composed.as_ref());
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// The explicit `--agent`, else the configured default, else the registry's
@@ -264,6 +322,35 @@ pub fn run_with<W: Write, E: Write>(
     let resuming = args.resume && initial_prompt.is_some();
     let session = SessionId::new_v4();
 
+    // Bug B (harness parity): an adapter with no verified system-prompt
+    // injection mechanism for this launch shape (codex's own `system_prompt_
+    // supported` narrows to `false` on a Windows shell-shim launch) never
+    // reaches `injection_args_for_session`'s output at all. `dash_
+    // orchestrator_pane` and `wrap::run_with`'s own fallback below both
+    // correctly skip that call for such an adapter, but neither has anywhere
+    // left to deliver the composed context, because the positional
+    // initial-prompt slot `build_launch` bakes into `launch.argv` is already
+    // fixed by the time either of them runs. Every *other* Zirv launch path
+    // (`exec`, `loop`, and the dashboard's own worker panes via `dash::
+    // compose_worker_prompt`) already folds the composed context onto its
+    // task-prompt text as a fallback for exactly this adapter shape; this
+    // Orchestrator launch was the one path that never got the same
+    // treatment, so a codex orchestrator (a standalone `wrap` fallback, or
+    // the dashboard's own orchestrator pane) started with no zirv context at
+    // all -- not even the shipped default layer -- while a claude
+    // orchestrator always gets one. Folded in here, once, before `build_
+    // launch` bakes the positional prompt slot: both branches below reuse
+    // this same `launch`.
+    let initial_prompt = orchestrator_initial_prompt(
+        adapter.as_ref(),
+        initial_prompt,
+        &cfg,
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        args.simple,
+        &state,
+    );
+
     // Applies to both branches below (the dashboard's orchestrator pane and
     // the wrap fallback): `chat.model` shapes `zirv chat` generally, not only
     // the dashboard, so the model flags are folded into the launch's own
@@ -307,7 +394,7 @@ pub fn run_with<W: Write, E: Write>(
             session.as_str(),
             args.simple,
         )?;
-        return dash::run_dashboard(&cfg, repo, &env, &state, pane);
+        return dash::run_dashboard(&cfg, repo, &env, &state, pane, args.force_pace);
     }
 
     // Ineligible because the dashboard is on but the terminal is too small
@@ -452,6 +539,34 @@ pub(crate) fn dash_orchestrator_pane(
         composed.as_ref(),
         adapter.system_prompt_supported(&argv),
     );
+    // Bug B (harness/model parity, 2026-08-22): the same seam every real
+    // launch now calls (`adapters::policy_launch_args`) -- the shipped-
+    // default "sandboxed, no prompts" posture plus any explicit `[policy]`
+    // restriction. This is the dashboard's own orchestrator pane, the
+    // interactive session a human is actually watching, so an approval
+    // prompt here is at least answerable -- but the posture still applies:
+    // "sandboxed, no prompts" is the shipped default for every launch, not
+    // only the unattended ones. `flags_pin_policy` (inside `policy_launch_
+    // args`) scans the argv built so far, so an operator's own explicit
+    // `--sandbox`/`--ask-for-approval`/`--permission-mode`/
+    // `--disallowedTools` (passed after `--` on `zirv chat`) still wins.
+    let sandbox_extra = adapters::policy_launch_args(cfg, adapter, &argv);
+    // Visible, not silent: the one interactive pane a human is actually
+    // watching gets the same announcement every headless seam does. `Chrome
+    // events`/`--quiet` govern it identically (`cfg.chrome.events`); no
+    // `quiet` parameter reaches this function, so a caller that silenced the
+    // banner (`--quiet` folded into the environment before `CtxConfig::load`
+    // ran) already has `cfg.chrome.events == false` here too.
+    super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr()).emit(
+        &super::announce::Event::SandboxPosture {
+            detail: if sandbox_extra.is_empty() {
+                "not applied (operator flags or [sandbox] enabled = false)".to_string()
+            } else {
+                sandbox_extra.join(" ")
+            },
+        },
+    );
+    argv.extend(sandbox_extra);
     argv.extend(prompt_args);
     // R1: a dashboard pane -- and only a dashboard pane -- pins the harness's
     // own conversation to zirv's session uuid, so the quit roster's stored id
@@ -535,6 +650,7 @@ pub fn wrap_args_for(args: &ChatArgs, launch: ChatLaunch) -> WrapArgs {
         command: launch.argv,
         simple: args.simple,
         allow_nested: args.allow_nested,
+        force_pace: args.force_pace,
     }
 }
 
@@ -640,6 +756,145 @@ mod tests {
         );
     }
 
+    /// Bug B: claude always reports `system_prompt_supported`, so this
+    /// function must be a true no-op for it -- byte-for-byte the same
+    /// `initial_prompt` in and out, whether or not one was given.
+    #[test]
+    fn orchestrator_initial_prompt_is_a_no_op_for_a_supported_adapter() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+
+        assert_eq!(
+            orchestrator_initial_prompt(
+                &adapter,
+                None,
+                &cfg,
+                Some(&home),
+                tmp.path(),
+                false,
+                &state,
+            ),
+            None
+        );
+        assert_eq!(
+            orchestrator_initial_prompt(
+                &adapter,
+                Some("resume this".to_string()),
+                &cfg,
+                Some(&home),
+                tmp.path(),
+                false,
+                &state,
+            ),
+            Some("resume this".to_string())
+        );
+    }
+
+    /// Bug B, the actual fix: on a Windows npm-installed `codex.cmd` shim --
+    /// the shape `CodexAdapter::system_prompt_supported` narrows to
+    /// unsupported -- the composed session context (the shipped default
+    /// layer and, because this is an Orchestrator launch, the harness
+    /// meta-teaching layer) must land on the positional initial-prompt slot,
+    /// since `injection_args_for_session` never reaches this adapter at all.
+    /// Before this fix a codex orchestrator on this launch shape started
+    /// with no zirv context whatsoever, while a claude orchestrator always
+    /// got one (see the previous test).
+    #[cfg(windows)]
+    #[test]
+    fn orchestrator_initial_prompt_folds_composed_context_for_an_unsupported_codex_shim() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let shim_dir = tempfile::tempdir().expect("tempdir");
+        let shim = shim_dir.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+        let adapter = CodexAdapter::new(Some(&shim.display().to_string()));
+        assert!(
+            !adapter.system_prompt_supported(&[]),
+            "a .cmd shim must be the unsupported shape this test exercises"
+        );
+
+        let text = orchestrator_initial_prompt(
+            &adapter,
+            None,
+            &cfg,
+            Some(&home),
+            tmp.path(),
+            false,
+            &state,
+        )
+        .expect("an unsupported adapter still gets a fallback prompt");
+        assert!(
+            text.contains("zirv session conventions"),
+            "the shipped default layer must reach the fallback: {text}"
+        );
+        assert!(
+            text.contains("zirv meta-harness"),
+            "an Orchestrator launch must still get the harness delegation layer: {text}"
+        );
+
+        // A real resume prompt is preserved as the leading text, with the
+        // composed context appended after it -- the same order `exec.rs`'s
+        // own `task_prompt_with_composed_fallback` call keeps for a headless
+        // worker's own task text.
+        let with_resume = orchestrator_initial_prompt(
+            &adapter,
+            Some("continue the payments webhook".to_string()),
+            &cfg,
+            Some(&home),
+            tmp.path(),
+            false,
+            &state,
+        )
+        .expect("still folds a fallback in on top of a real prompt");
+        assert!(
+            with_resume.starts_with("continue the payments webhook"),
+            "the caller's own prompt text must lead: {with_resume}"
+        );
+        assert!(
+            with_resume.contains("zirv session conventions"),
+            "and the composed context must still follow it: {with_resume}"
+        );
+    }
+
+    /// `--simple` disables prompt composition entirely (`compile::compile`
+    /// returns `composed: None`, mirroring `prompt::compose`'s own gate), so
+    /// even an unsupported adapter must fall back to the caller's own
+    /// `initial_prompt` unchanged rather than injecting anything.
+    #[cfg(windows)]
+    #[test]
+    fn orchestrator_initial_prompt_is_a_no_op_under_simple_even_for_an_unsupported_adapter() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let shim_dir = tempfile::tempdir().expect("tempdir");
+        let shim = shim_dir.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+        let adapter = CodexAdapter::new(Some(&shim.display().to_string()));
+
+        assert_eq!(
+            orchestrator_initial_prompt(
+                &adapter,
+                None,
+                &cfg,
+                Some(&home),
+                tmp.path(),
+                true,
+                &state
+            ),
+            None,
+            "--simple must still suppress every zirv-injected layer, fallback included"
+        );
+    }
+
     #[test]
     fn chat_is_an_orchestrator_session() {
         let adapter = ClaudeAdapter::new(None);
@@ -725,6 +980,119 @@ mod tests {
             pane.argv.first().map(String::as_str),
             Some("/nonexistent/fake-claude"),
             "the launch program is still the adapter's own binary: {argv}"
+        );
+    }
+
+    /// Bug B (harness/model parity, 2026-08-22): the dashboard's own
+    /// orchestrator pane is the interactive session a human actually
+    /// watches -- previously the one path a codex operator saw zero
+    /// zirv-applied argv restriction on. It now carries the shipped-default
+    /// sandbox posture too, and an operator's own explicit pin still wins.
+    #[test]
+    fn the_dash_orchestrator_pane_carries_the_shipped_sandbox_posture_by_default() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let adapter = CodexAdapter::new(Some("/nonexistent/fake-codex"));
+        let launch = build_launch(&adapter, None, &[]);
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+        )
+        .expect("pane");
+        assert!(
+            pane.argv
+                .windows(2)
+                .any(|w| w == ["--sandbox", "workspace-write"]),
+            "got {:?}",
+            pane.argv
+        );
+        assert!(
+            pane.argv
+                .windows(2)
+                .any(|w| w == ["--ask-for-approval", "never"]),
+            "got {:?}",
+            pane.argv
+        );
+    }
+
+    /// An operator's own explicit `--sandbox`/`--ask-for-approval` (passed
+    /// after `--` on `zirv chat`) suppresses the zirv-computed prefix
+    /// entirely, the same `flags_pin_policy` contract every other seam
+    /// honours.
+    #[test]
+    fn the_dash_orchestrator_pane_lets_an_operators_own_sandbox_flag_win() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let adapter = CodexAdapter::new(Some("/nonexistent/fake-codex"));
+        let extra = vec!["--sandbox".to_string(), "danger-full-access".to_string()];
+        let launch = build_launch(&adapter, None, &extra);
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+        )
+        .expect("pane");
+        assert_eq!(
+            pane.argv
+                .iter()
+                .filter(|a| a.as_str() == "--sandbox")
+                .count(),
+            1,
+            "the operator's own --sandbox must appear exactly once, not augmented: {:?}",
+            pane.argv
+        );
+        assert!(pane.argv.contains(&"danger-full-access".to_string()));
+    }
+
+    /// `[sandbox] enabled = false` restores the pre-2026-08-22 behaviour: no
+    /// posture argv from this seam at all.
+    #[test]
+    fn the_dash_orchestrator_pane_carries_nothing_when_the_sandbox_posture_is_opted_out() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig {
+            sandbox: crate::commands::ctx::config::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        let adapter = CodexAdapter::new(Some("/nonexistent/fake-codex"));
+        let launch = build_launch(&adapter, None, &[]);
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+        )
+        .expect("pane");
+        assert!(
+            !pane.argv.contains(&"--sandbox".to_string()),
+            "got {:?}",
+            pane.argv
         );
     }
 
@@ -846,12 +1214,21 @@ mod tests {
         );
     }
 
-    /// `--simple` promises no zirv-injected instruction at all. It also makes
-    /// the terminal dashboard-ineligible, so this path is unreachable in
-    /// practice today -- pinned anyway, because the flag's meaning must not
-    /// depend on which launch path happens to be taken.
+    /// `--simple` promises no zirv-*injected instruction* -- the composed
+    /// prompt layer -- at all. It also makes the terminal dashboard-
+    /// ineligible, so this path is unreachable in practice today -- pinned
+    /// anyway, because the flag's meaning must not depend on which launch
+    /// path happens to be taken.
+    ///
+    /// 2026-08-22 revision: the shipped-default sandbox posture
+    /// (`adapters::policy_launch_args`) is a *safety* flag layer, not
+    /// injected instruction text, so `--simple` does not withhold it --
+    /// otherwise `--simple` would double as an accidental way to disable
+    /// the default sandboxing, which is not what "skip zirv's injected
+    /// text" asks for. This test now pins that the session pin *and* the
+    /// sandbox prefix survive `--simple`, and nothing else does.
     #[test]
-    fn a_simple_dash_orchestrator_pane_carries_no_injected_prompt() {
+    fn a_simple_dash_orchestrator_pane_still_carries_the_sandbox_posture_but_no_injected_prompt() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -873,12 +1250,13 @@ mod tests {
         .expect("pane");
         // R1: the session pin is launch plumbing, not injected instruction --
         // `--simple` promises the agent no zirv-authored text, and a pane that
-        // cannot be resumed after a quit is not what it is asking for. Every
-        // other argument is still exactly the adapter's own.
+        // cannot be resumed after a quit is not what it is asking for.
+        expected.extend(adapter.default_sandbox_args(&Default::default()));
         expected.extend(adapter.session_pin_args("11111111-2222-4333-8444-555555555555"));
         assert_eq!(
             pane.argv, expected,
-            "--simple leaves the adapter's own argv untouched apart from the session pin"
+            "--simple leaves the adapter's own argv untouched apart from the sandbox posture \
+             and the session pin"
         );
     }
 
@@ -1251,6 +1629,7 @@ mod tests {
             simple: false,
             quiet: false,
             allow_nested: false,
+            force_pace: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1293,6 +1672,7 @@ mod tests {
             simple: false,
             quiet: false,
             allow_nested: false,
+            force_pace: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1349,6 +1729,7 @@ mod tests {
             simple: false,
             quiet: false,
             allow_nested: false,
+            force_pace: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1377,6 +1758,7 @@ mod tests {
             simple: false,
             quiet: false,
             allow_nested,
+            force_pace: false,
             extra: Vec::new(),
         }
     }

@@ -177,6 +177,19 @@ pub struct PaceConfig {
     /// Operator declaration that a harness's vendor plan covers overage from
     /// credits: gating (throttle and pause) is skipped for that harness.
     pub use_credits: UseCreditsConfig,
+    /// T8 (fail-SAFE, not open): the bounded per-cycle delay `pace::wait_for_
+    /// window` applies when it is genuinely blind -- no binding collector
+    /// reading, and no configured estimator to fall back on -- instead of
+    /// the old behavior of skipping the gate outright and proceeding at full
+    /// speed. Deliberately small next to `fallback_delay_secs`/`wait_slack_
+    /// secs`: those pace a *known* trip against a *known* window, while this
+    /// is a floor applied with zero visibility into actual usage, so it must
+    /// not punish a single one-shot `zirv ctx agent` call (a common,
+    /// legitimate case for an operator who has not wired a statusline tee)
+    /// while still meaningfully slowing a tight automated loop of headless
+    /// cycles that would otherwise spend against the account with nobody
+    /// watching. See [[Usage and Pacing]]/[[Known Issues]].
+    pub blind_delay_secs: u64,
 }
 
 impl Default for PaceConfig {
@@ -197,6 +210,7 @@ impl Default for PaceConfig {
             poll_enabled: true,
             poll_min_interval_secs: 60,
             use_credits: UseCreditsConfig::default(),
+            blind_delay_secs: 60,
         }
     }
 }
@@ -642,6 +656,78 @@ pub struct WorkerConfig {
     pub codex: Option<String>,
 }
 
+/// zirv's own shipped-default launch posture (2026-08-22 decision,
+/// harness/model parity round): **sandboxed, no prompts**. Commands run
+/// freely inside the repository workspace; anything reaching outside it
+/// fails rather than prompting a human. `AgentAdapter::default_sandbox_
+/// args()` is each adapter's own honest mapping of this posture -- see that
+/// method's own doc comment, `adapters::policy_launch_args` (the seam every
+/// real launch calls), and `docs/obsidian/Modules/Ctx Adapters.md`.
+///
+/// Independent of `[policy]`/`EffectivePolicy`: that table stays all-`Allow`
+/// by default ("zirv's per-capability policy declares nothing"), unchanged
+/// by this. This is a separate baseline layered underneath it.
+///
+/// `REPO_FORBIDDEN`: a repo checkout must not be able to turn its own
+/// sandboxing off -- that would be a privilege *widening*, the trust
+/// asymmetry every other repo-facing toggle in this table already holds to.
+/// The operator's own escape hatch, `[sandbox] enabled = false` in
+/// `~/.zirv/ctx.toml` or `ZIRV_CTX_SANDBOX=false`, restores the pre-
+/// 2026-08-22 behaviour (no baseline argv from this posture at all; a real
+/// launch is then governed purely by `[policy]`, exactly as before this
+/// struct existed).
+///
+/// **`extra_allow`/`extra_deny` (fix round 3, 2026-08-22):** the shipped
+/// `adapters::SHIPPED_POSTURE_ALLOW`/`_DENY` lists are deliberately small,
+/// so an operator whose project needs one more build command has an
+/// escape hatch that does not cost them the whole generated deny list --
+/// without one, "pin your own `--allowedTools`" (the only alternative)
+/// discards every shipped deny too, which is a worse security posture than
+/// a slightly wider allow list. Both are claude permission-rule strings
+/// (`ClaudeAdapter::default_sandbox_args`'s own vocabulary; codex has no
+/// per-command mechanism to receive them, see that method's doc comment).
+///
+/// - `extra_allow` is **operator-only**: `["sandbox", "extra_allow"]` is a
+///   whole-key `REPO_FORBIDDEN` entry (a repo file setting it at all is a
+///   hard load error), so it never needs lifting out of the ordinary deep
+///   merge -- a repo can never contribute to it, full stop. Env
+///   (`ZIRV_CTX_SANDBOX_EXTRA_ALLOW`, comma-separated) replaces the merged
+///   file value outright, the operator's own final word, same as every
+///   other `REPO_FORBIDDEN` escape hatch.
+/// - `extra_deny` is the one list a repo checkout *may* contribute to --
+///   narrowing is always safe. Lifted out of the ordinary deep merge in
+///   `CtxConfig::load` (the same treatment `[policy]` gets, for the same
+///   reason: a plain merge would let the repo layer's array *replace* the
+///   operator's instead of adding to it) and resolved as a **union**: the
+///   final list is the operator's home-layer entries plus the repo's,
+///   never fewer than either. `ZIRV_CTX_SANDBOX_EXTRA_DENY` (comma-
+///   separated) replaces the unioned value outright when set -- the
+///   operator's own escape hatch to loosen a repo-added entry, the same
+///   "environment wins outright in both directions" rule `[policy]`'s own
+///   env layer already holds.
+///
+/// Both extra lists are appended after the shipped ones in `default_
+/// sandbox_args`, so deny continues to beat allow across every source --
+/// verified live for the shipped pair, and true here by construction: the
+/// underlying CLI mechanism does not care which list an entry came from.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SandboxConfig {
+    pub enabled: bool,
+    pub extra_allow: Vec<String>,
+    pub extra_deny: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            extra_allow: Vec::new(),
+            extra_deny: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -663,6 +749,7 @@ pub struct CtxConfig {
     pub chat: ChatConfig,
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
+    pub sandbox: SandboxConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -809,6 +896,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_PACE_BLIND_DELAY_SECS",
+        &["pace", "blind_delay_secs"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
         &["pace", "use_credits", "claude"],
         EnvKind::Bool,
@@ -829,6 +921,7 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["optimize", "model"],
         EnvKind::Str,
     ),
+    ("ZIRV_CTX_SANDBOX", &["sandbox", "enabled"], EnvKind::Bool),
     ("ZIRV_CTX_PROMPT", &["prompt", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_PROMPT_REPO",
@@ -1019,6 +1112,98 @@ fn merge(base: &mut toml::Table, over: toml::Table) {
     }
 }
 
+/// Removes `table[section][key]` and returns it, leaving the rest of
+/// `table[section]` (if any) untouched -- the nested equivalent of
+/// `toml::Table::remove`, used to lift `sandbox.extra_deny` out of a layer
+/// before the ordinary deep merge (`merge()` above would let a later
+/// layer's array *replace* an earlier one's instead of adding to it, the
+/// same reason `[policy]` is lifted out whole via `POLICY_SECTION`). Only
+/// `extra_deny` needs this: `extra_allow` never needs lifting because it is
+/// `REPO_FORBIDDEN` outright, so a repo layer can never contribute a value
+/// for `merge()` to clobber the operator's with in the first place.
+fn take_nested(table: &mut toml::Table, section: &str, key: &str) -> Option<toml::Value> {
+    table.get_mut(section)?.as_table_mut()?.remove(key)
+}
+
+/// A `toml::Value::Array` of strings (from `take_nested`) as owned
+/// `Vec<String>`, or empty for anything else (absent, wrong shape) -- the
+/// deserializer catches a genuinely malformed `sandbox.extra_deny` later
+/// when the merged table is deserialized into `CtxConfig` proper; this
+/// helper only needs to read the two candidate layers well enough to union
+/// them before that point.
+fn string_array(value: Option<toml::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// A `toml::Value::Boolean` (from `take_nested`) as `Option<bool>` -- a
+/// wrong-shaped or absent value reads as `None`, the same "let the real
+/// deserializer catch malformed input later" contract `string_array` above
+/// follows.
+fn bool_at(value: Option<toml::Value>) -> Option<bool> {
+    value.and_then(|v| v.as_bool())
+}
+
+/// A `toml::Value::Float` or `Value::Integer` (from `take_nested`) as
+/// `Option<f64>` -- TOML happily writes `max_percent = 90` with no decimal
+/// point, which parses as an `Integer`, not a `Float`; without the second
+/// arm a whole-number override would silently vanish from the narrowing
+/// fold below (read as `None`, i.e. "this layer didn't set it") while still
+/// reaching the real deserializer just fine on its own.
+fn float_at(value: Option<toml::Value>) -> Option<f64> {
+    value.and_then(|v| match v {
+        toml::Value::Float(f) => Some(f),
+        toml::Value::Integer(i) => Some(i as f64),
+        _ => None,
+    })
+}
+
+/// T9: the repo-narrowing fold for `pace.enabled`, mirroring `policy::
+/// EffectivePolicy::narrowed_by`'s own `Stance::max` -- `true` (the gate is
+/// on) is the stricter value, so it wins regardless of which layer set it.
+/// `repo` absent (`None`) contributes nothing: a repo that never mentions
+/// `pace.enabled` must not accidentally *turn it on* against an operator who
+/// deliberately left it at `home`'s value (which could itself be the
+/// built-in default, already folded in by the caller). This is genuinely
+/// the same shape `policy::resolve` uses -- a repo checkout may push
+/// *stricter* than whatever the operator configured, never looser -- unlike
+/// every other `REPO_FORBIDDEN` key, which the repo may not touch at all;
+/// see this module's own `REPO_FORBIDDEN` doc comment for why `pace.enabled`
+/// deliberately is not on that list.
+fn narrow_pace_bool(home: bool, repo: Option<bool>) -> bool {
+    home.max(repo.unwrap_or(false))
+}
+
+/// T9: the repo-narrowing fold for `pace.max_percent`/`pace.soft_percent` --
+/// lower is stricter (a tighter ceiling or an earlier soft-throttle band),
+/// so the smaller of the two layers wins. `repo` absent contributes nothing
+/// (folds in as `f64::INFINITY`, which `min` never picks over a real
+/// `home` value), the numeric mirror of `narrow_pace_bool`'s own
+/// `unwrap_or(false)`.
+fn narrow_pace_percent(home: f64, repo: Option<f64>) -> f64 {
+    home.min(repo.unwrap_or(f64::INFINITY))
+}
+
+/// Finding 4 (review): the one comma-separated-list splitter shared by every
+/// caller that needs "trimmed, non-empty entries" -- this module's own
+/// `ZIRV_CTX_SANDBOX_EXTRA_ALLOW`/`_DENY` env values (the same shape
+/// `--allowedTools`/`--disallowedTools` themselves already take on the
+/// command line, so an operator setting one of these can paste the identical
+/// rule syntax), `memory.rs`'s `Tags`/`Paths` header parsing, and
+/// `optimize.rs`'s `Evidence:` line parsing. Previously three separate
+/// copies of the identical `split(',').trim().filter(!is_empty())` logic.
+pub(crate) fn split_csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn insert_path(table: &mut toml::Table, path: &[&str], value: toml::Value) {
     let Some((head, rest)) = path.split_first() else {
         return;
@@ -1089,6 +1274,8 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),
     (&["handoff", "model"], "ZIRV_CTX_MODEL"),
     (&["optimize", "model"], "ZIRV_CTX_OPTIMIZE_MODEL"),
+    (&["sandbox", "enabled"], "ZIRV_CTX_SANDBOX"),
+    (&["sandbox", "extra_allow"], "ZIRV_CTX_SANDBOX_EXTRA_ALLOW"),
     (&["prompt", "enabled"], "ZIRV_CTX_PROMPT"),
     (&["prompt", "repo_layer"], "ZIRV_CTX_PROMPT_REPO"),
     // Without this the cap would be decorative: the untrusted layer could
@@ -1258,6 +1445,16 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["pace", "poll_min_interval_secs"],
         "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
     ),
+    // T8: the fail-safe delay applied when the gate is genuinely blind (see
+    // `PaceConfig::blind_delay_secs`'s own doc comment) is a spend-safety
+    // floor, the same class of decision as `use_credits`/`poll_*` right
+    // above -- a repo checkout must not be able to shrink or zero it out and
+    // silently restore the old fail-open behavior for anyone who checks it
+    // out.
+    (
+        &["pace", "blind_delay_secs"],
+        "ZIRV_CTX_PACE_BLIND_DELAY_SECS",
+    ),
     // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
     // own doc comment and the spec's "Orchestrator model" section
     // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
@@ -1362,6 +1559,27 @@ impl CtxConfig {
         // allow. `policy::resolve` folds the same three layers with `max`
         // instead, so the repo half can only narrow.
         let home_policy = merged.remove(POLICY_SECTION);
+        // `sandbox.extra_deny` gets the identical treatment, one level
+        // deeper: a repo checkout may *add* deny entries (narrowing is
+        // always safe), but the ordinary merge would let its array replace
+        // the operator's home-layer one instead of adding to it. Resolved
+        // as a union below, once both layers are in hand. `extra_allow`
+        // needs no such lift: it is `REPO_FORBIDDEN` outright, so the repo
+        // layer never has a value here for `merge()` to clobber anything
+        // with.
+        let home_extra_deny = string_array(take_nested(&mut merged, "sandbox", "extra_deny"));
+        // T9 (repo-narrowing fold): `pace.enabled`/`max_percent`/`soft_percent`
+        // get the identical treatment, for the identical reason -- lifted out
+        // before the deep merge so a repo layer's value can never simply
+        // replace the operator's. Unlike `sandbox.extra_deny`'s union, these
+        // fold like `[policy]`'s own `Stance::max` (see `narrow_pace_bool`/
+        // `narrow_pace_percent` below): the *stricter* of the two layers wins,
+        // never the later one. `soft_percent`/`max_percent` share the same
+        // rule (lower is stricter); `enabled` uses the bool-ordering
+        // equivalent (`true` is stricter than `false`).
+        let home_pace_enabled = bool_at(take_nested(&mut merged, "pace", "enabled"));
+        let home_pace_max_percent = float_at(take_nested(&mut merged, "pace", "max_percent"));
+        let home_pace_soft_percent = float_at(take_nested(&mut merged, "pace", "soft_percent"));
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
@@ -1374,7 +1592,40 @@ impl CtxConfig {
         // still gets its loud rejection rather than being quietly folded.
         reject_untrusted_keys(&repo_layer, &repo_path)?;
         let repo_policy = repo_layer.remove(POLICY_SECTION);
+        let repo_extra_deny = string_array(take_nested(&mut repo_layer, "sandbox", "extra_deny"));
+        let repo_pace_enabled = bool_at(take_nested(&mut repo_layer, "pace", "enabled"));
+        let repo_pace_max_percent = float_at(take_nested(&mut repo_layer, "pace", "max_percent"));
+        let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
         merge(&mut merged, repo_layer);
+
+        // Re-inserted after the merge, before env: env (below) must still be
+        // able to overwrite this outright, the same final-word precedence
+        // every other key already gets.
+        let default_pace = PaceConfig::default();
+        insert_path(
+            &mut merged,
+            &["pace", "enabled"],
+            toml::Value::Boolean(narrow_pace_bool(
+                home_pace_enabled.unwrap_or(default_pace.enabled),
+                repo_pace_enabled,
+            )),
+        );
+        insert_path(
+            &mut merged,
+            &["pace", "max_percent"],
+            toml::Value::Float(narrow_pace_percent(
+                home_pace_max_percent.unwrap_or(default_pace.max_percent),
+                repo_pace_max_percent,
+            )),
+        );
+        insert_path(
+            &mut merged,
+            &["pace", "soft_percent"],
+            toml::Value::Float(narrow_pace_percent(
+                home_pace_soft_percent.unwrap_or(default_pace.soft_percent),
+                repo_pace_soft_percent,
+            )),
+        );
 
         for (var, path, kind) in ENV_MAP {
             if let Some(raw) = env(var) {
@@ -1386,6 +1637,26 @@ impl CtxConfig {
         let mut cfg: Self = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| format!("invalid ctx config: {e}"))?;
+
+        // The union: the operator's own home-layer entries plus the repo's,
+        // never fewer than either -- narrowing can only add restriction.
+        // `ZIRV_CTX_SANDBOX_EXTRA_DENY`, when set, replaces this outright
+        // (the operator's own final word, same as every other env escape
+        // hatch), and `ZIRV_CTX_SANDBOX_EXTRA_ALLOW` replaces the plain
+        // merged (operator-only, `REPO_FORBIDDEN`) `extra_allow` the same
+        // way. Neither goes through `ENV_MAP`/`EnvKind`, which has no
+        // list-shaped variant; both are simple comma-separated overrides.
+        cfg.sandbox.extra_deny = match env("ZIRV_CTX_SANDBOX_EXTRA_DENY") {
+            Some(raw) => split_csv_list(&raw),
+            None => {
+                let mut combined = home_extra_deny;
+                combined.extend(repo_extra_deny);
+                combined
+            }
+        };
+        if let Some(raw) = env("ZIRV_CTX_SANDBOX_EXTRA_ALLOW") {
+            cfg.sandbox.extra_allow = split_csv_list(&raw);
+        }
 
         // SECURITY (command-injection defense): `chat.model` is one of the few
         // keys a repo `ctx.toml` may set (see `REPO_FORBIDDEN`'s `chat.model`
@@ -1699,8 +1970,19 @@ mod tests {
 
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
-        assert!(!cfg.pace.enabled);
-        assert_eq!(cfg.pace.max_percent, 80.5);
+        // T9: `enabled` and `max_percent` now go through the repo-narrowing
+        // fold (see `narrow_pace_bool`/`narrow_pace_percent`), not a plain
+        // merge -- this repo's own `enabled = false` is a weakening attempt
+        // against the (enabled) default and is silently ineffective, while
+        // `max_percent = 80.5` genuinely tightens the default 99.0% ceiling
+        // and still lands. Every other key in this repo layer (still
+        // ordinary merge) is untouched proof the fold is scoped to exactly
+        // these two/three keys, not the whole `[pace]` table.
+        assert!(
+            cfg.pace.enabled,
+            "a repo may not disable pacing (T9 narrowing)"
+        );
+        assert_eq!(cfg.pace.max_percent, 80.5, "a repo may tighten the ceiling");
         assert_eq!(cfg.pace.five_hour_budget_tokens, 500_000);
         assert!(cfg.pace.count_cache_reads);
         assert_eq!(
@@ -1812,6 +2094,154 @@ mod tests {
         assert!(cfg.pace.poll_enabled);
         assert_eq!(cfg.pace.poll_min_interval_secs, 60);
         assert!(!cfg.pace.use_credits.claude);
+    }
+
+    /// T9: the fold rule itself, pure and direct -- no config file, no env,
+    /// no `CtxConfig::load` involved. `narrow_pace_bool` mirrors `Stance::
+    /// max` (stricter wins regardless of layer); `narrow_pace_percent`
+    /// mirrors it for "lower is stricter" instead of "higher is stricter".
+    #[test]
+    fn the_pace_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // enabled: true (stricter) wins no matter which layer set it.
+        assert!(narrow_pace_bool(true, None));
+        assert!(narrow_pace_bool(true, Some(false)), "repo may not weaken");
+        assert!(narrow_pace_bool(false, Some(true)), "repo may tighten");
+        assert!(!narrow_pace_bool(false, None), "both loose: stays loose");
+        assert!(!narrow_pace_bool(false, Some(false)));
+
+        // percent: lower (stricter) wins no matter which layer set it.
+        assert_eq!(narrow_pace_percent(90.0, None), 90.0);
+        assert_eq!(
+            narrow_pace_percent(70.0, Some(99.0)),
+            70.0,
+            "repo may not raise the ceiling above home's own"
+        );
+        assert_eq!(
+            narrow_pace_percent(99.0, Some(60.0)),
+            60.0,
+            "repo may lower it below home's own"
+        );
+    }
+
+    /// T9: `pace.enabled`/`max_percent`/`soft_percent` are deliberately NOT
+    /// on `REPO_FORBIDDEN` (unlike `use_credits`/`poll_*` right above) --
+    /// they fold like `[policy]` instead, so a repo checkout may narrow
+    /// (make pacing stricter) but never widen it. This table proves both
+    /// directions actually differ: a repo trying to weaken is silently
+    /// ineffective (not an error -- these keys were never forbidden), and a
+    /// repo trying to tighten actually lands.
+    #[test]
+    fn a_repo_layer_may_only_narrow_pace_enabled_max_percent_and_soft_percent() {
+        struct Case {
+            home: &'static str,
+            repo: &'static str,
+            want_enabled: bool,
+            want_max: f64,
+            want_soft: f64,
+        }
+        for case in [
+            // A repo trying to turn pacing OFF against an operator who left
+            // it at the (enabled) default must not succeed.
+            Case {
+                home: "",
+                repo: "[pace]\nenabled = false\n",
+                want_enabled: true,
+                want_max: 99.0,
+                want_soft: 80.0,
+            },
+            // A repo trying to RAISE the ceiling (weaken it) must not
+            // succeed -- the operator's tighter home value wins.
+            Case {
+                home: "[pace]\nmax_percent = 70.0\n",
+                repo: "[pace]\nmax_percent = 99.9\n",
+                want_enabled: true,
+                want_max: 70.0,
+                want_soft: 80.0,
+            },
+            // A repo LOWERING the ceiling below the operator's own value
+            // must succeed -- this is the legitimate "this repo is
+            // expensive, be more careful here" case the fold exists for.
+            Case {
+                home: "[pace]\nmax_percent = 99.0\n",
+                repo: "[pace]\nmax_percent = 60.0\n",
+                want_enabled: true,
+                want_max: 60.0,
+                want_soft: 80.0,
+            },
+            // Same for soft_percent, and a repo turning pacing back ON
+            // against an operator who explicitly disabled it -- narrowing
+            // is allowed to push stricter than home too, the same "repo may
+            // ratchet stricter than the operator configured" rule
+            // `policy::resolve` already uses.
+            Case {
+                home: "[pace]\nenabled = false\nsoft_percent = 90.0\n",
+                repo: "[pace]\nenabled = true\nsoft_percent = 50.0\n",
+                want_enabled: true,
+                want_max: 99.0,
+                want_soft: 50.0,
+            },
+            // No repo layer at all: home's own values, untouched.
+            Case {
+                home: "[pace]\nmax_percent = 55.0\n",
+                repo: "",
+                want_enabled: true,
+                want_max: 55.0,
+                want_soft: 80.0,
+            },
+        ] {
+            let home_dir = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+            if !case.home.is_empty() {
+                std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+                std::fs::write(home_dir.path().join(".zirv/ctx.toml"), case.home).expect("write");
+            }
+            let repo = tempfile::tempdir().expect("tempdir");
+            if !case.repo.is_empty() {
+                std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+                std::fs::write(repo.path().join(".zirv/ctx.toml"), case.repo).expect("write");
+            }
+            let empty = env_map(&[]);
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("a repo narrowing pace.* must not be a load error");
+            assert_eq!(
+                cfg.pace.enabled, case.want_enabled,
+                "home={:?} repo={:?}",
+                case.home, case.repo
+            );
+            assert_eq!(
+                cfg.pace.max_percent, case.want_max,
+                "home={:?} repo={:?}",
+                case.home, case.repo
+            );
+            assert_eq!(
+                cfg.pace.soft_percent, case.want_soft,
+                "home={:?} repo={:?}",
+                case.home, case.repo
+            );
+        }
+    }
+
+    /// T9: the operator's own env override is still the final word over
+    /// both layers, exactly like every other config key -- narrowing is a
+    /// repo-vs-home question only, and env sits above the fold entirely.
+    #[test]
+    fn env_still_overrides_the_pace_narrowing_fold_outright() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[pace]\nenabled = false\nmax_percent = 10.0\n",
+        )
+        .expect("write");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE", "true"),
+            ("ZIRV_CTX_PACE_MAX_PERCENT", "95.0"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.pace.enabled);
+        assert_eq!(cfg.pace.max_percent, 95.0);
     }
 
     #[test]
@@ -2675,6 +3105,210 @@ mod tests {
         }
     }
 
+    /// Bug B (harness/model parity, 2026-08-22, fix round 2): a repo
+    /// checkout must not be able to turn its own sandboxing off. `sandbox.
+    /// enabled` gates `AgentAdapter::default_sandbox_args()` on every
+    /// adapter -- for claude that means the whole generated `SHIPPED_
+    /// POSTURE_ALLOW`/`_DENY` set (see `adapters/mod.rs`), not merely a
+    /// `--permission-mode` flag, so a repo widening this key would strip
+    /// the operator's own default protection wholesale, end to end.
+    #[test]
+    fn repo_layer_cannot_touch_sandbox_keys() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set this key")
+            .to_string();
+        assert!(err.contains("sandbox.enabled"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_SANDBOX"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    /// The end-to-end path the coordinator asked for: even if the hard
+    /// rejection above were ever weakened to a narrow-only fold instead (the
+    /// shape most other `[policy]`-adjacent keys use), the resolved config
+    /// must still carry the operator's own `true` through to the actual
+    /// generated argv on both adapters -- not just to a boolean field
+    /// nothing downstream reads.
+    #[test]
+    fn a_repo_widening_attempt_on_sandbox_enabled_never_reaches_either_adapters_argv() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nenabled = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+
+        // The repo file alone is a hard load error (see the test above);
+        // simulate what a caller degraded to the operator-only layers would
+        // see instead (`config::degrade_to_operator_only`, the same
+        // fail-closed path `optimize.rs`/`hook.rs` already take on an
+        // unreadable repo config) -- `cfg.sandbox` still defaults `true`.
+        let cfg = super::degrade_to_operator_only(&|k| empty.get(k).cloned());
+        assert!(cfg.sandbox.enabled);
+        use super::super::adapters::AgentAdapter;
+        let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
+        assert!(
+            claude
+                .default_sandbox_args(&Default::default())
+                .iter()
+                .any(|a| a.starts_with("--allowedTools=")),
+            "the generated permission set must still reach the argv"
+        );
+    }
+
+    /// Fix round 3 (2026-08-22): `sandbox.extra_allow` is operator-only, the
+    /// same asymmetry as every other whole-key `REPO_FORBIDDEN` entry -- a
+    /// repo checkout adding to the allow list would be a privilege
+    /// *widening*, not the narrowing a repo layer is otherwise permitted.
+    #[test]
+    fn repo_layer_cannot_add_sandbox_extra_allow_entries() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nextra_allow = [\"Bash(deploy *)\"]\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not widen the allow list")
+            .to_string();
+        assert!(err.contains("sandbox.extra_allow"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_SANDBOX_EXTRA_ALLOW"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
+    /// The one list a repo checkout *may* contribute to: adding a deny entry
+    /// only ever narrows. The union must include both layers' entries, end
+    /// to end through `CtxConfig::load` -- a plain deep merge would let the
+    /// repo's array silently replace the operator's instead.
+    #[test]
+    fn sandbox_extra_deny_unions_the_operators_and_the_repos_own_entries() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nextra_deny = [\"Bash(npm publish *)\"]\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nextra_deny = [\"Bash(docker push *)\"]\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            cfg.sandbox
+                .extra_deny
+                .contains(&"Bash(npm publish *)".to_string()),
+            "the operator's own entry must survive: {:?}",
+            cfg.sandbox.extra_deny
+        );
+        assert!(
+            cfg.sandbox
+                .extra_deny
+                .contains(&"Bash(docker push *)".to_string()),
+            "the repo's own addition must land too: {:?}",
+            cfg.sandbox.extra_deny
+        );
+    }
+
+    /// The environment is the operator in both directions, exactly like
+    /// `[policy]`'s own env layer: it replaces the unioned file value
+    /// outright, for both extra lists.
+    #[test]
+    fn the_operator_may_set_sandbox_extra_allow_and_deny_from_the_environment() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nextra_deny = [\"Bash(npm publish *)\"]\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            (
+                "ZIRV_CTX_SANDBOX_EXTRA_ALLOW",
+                "Bash(just test *), Bash(just build *)",
+            ),
+            ("ZIRV_CTX_SANDBOX_EXTRA_DENY", "Bash(terraform apply *)"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.sandbox.extra_allow,
+            vec![
+                "Bash(just test *)".to_string(),
+                "Bash(just build *)".to_string()
+            ]
+        );
+        assert_eq!(
+            cfg.sandbox.extra_deny,
+            vec!["Bash(terraform apply *)".to_string()],
+            "the env value replaces the file-layer union outright"
+        );
+    }
+
+    /// Deny continues to beat allow even when both sides of the conflict
+    /// come from operator-added entries rather than the shipped lists --
+    /// the underlying CLI mechanism does not care which list an entry came
+    /// from, but this pins that the config layer does not accidentally
+    /// separate them in a way that would matter.
+    #[test]
+    fn an_operator_added_deny_entry_beats_an_operator_added_allow_entry() {
+        use super::super::adapters::AgentAdapter;
+        let cfg = CtxConfig {
+            sandbox: SandboxConfig {
+                enabled: true,
+                extra_allow: vec!["Bash(deploy *)".to_string()],
+                extra_deny: vec!["Bash(deploy *)".to_string()],
+            },
+            ..CtxConfig::default()
+        };
+        let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let args = claude.default_sandbox_args(&cfg.sandbox);
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("allow token");
+        let deny_arg = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("deny token");
+        assert!(allow_arg.contains("Bash(deploy *)"));
+        assert!(
+            deny_arg.contains("Bash(deploy *)"),
+            "both lists carry the entry; claude's own engine resolves the conflict as deny-wins \
+             (verified live for the shipped pair), not this config layer"
+        );
+    }
+
     #[test]
     fn env_can_disable_the_dashboard() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2916,6 +3550,7 @@ mod tests {
         ("pace", "soft_percent"),
         ("pace", "poll_enabled"),
         ("pace", "poll_min_interval_secs"),
+        ("pace", "blind_delay_secs"),
         ("pace.use_credits", "claude"),
         ("pace.use_credits", "codex"),
         ("optimize", "enabled"),
@@ -3206,6 +3841,58 @@ mod tests {
         assert_eq!(cfg.policy.shell_exec, Stance::Deny);
         assert_eq!(cfg.policy.network, Stance::Deny);
         assert_eq!(cfg.policy.approval, Stance::Ask);
+    }
+
+    /// Bug B, end to end: the same cloned-repository widening attempt as
+    /// `a_repo_policy_table_cannot_widen_the_operators_own_stances` above, but
+    /// followed all the way to the argv `AgentAdapter::policy_args` actually
+    /// builds from the resolved (narrow-only) `cfg.policy` -- for *both*
+    /// registered adapters, from the *same* resolved config. A repo checkout
+    /// must never be able to raise its own approval level on either harness,
+    /// and one operator `[policy]` setting must produce a real, non-empty
+    /// restriction on both, not just on the one this test happens to check
+    /// first.
+    #[test]
+    fn a_repo_cannot_widen_its_way_to_a_permissive_launch_on_either_adapter() {
+        use super::super::adapters::{AgentAdapter, claude::ClaudeAdapter, codex::CodexAdapter};
+
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"deny\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec = \"allow\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+
+        let claude = ClaudeAdapter::new(None);
+        let claude_args = claude.policy_args(&cfg.policy);
+        assert_eq!(
+            claude_args,
+            claude.read_only_args(),
+            "the repo's own 'allow' must not reach claude's launch argv: {claude_args:?}"
+        );
+
+        let codex = CodexAdapter::new(None);
+        let codex_args = codex.policy_args(&cfg.policy);
+        assert!(
+            codex_args.contains(&"--sandbox".to_string())
+                && codex_args.contains(&"read-only".to_string())
+                && codex_args.contains(&"--ask-for-approval".to_string())
+                && codex_args.contains(&"never".to_string()),
+            "the repo's own 'allow' must not reach codex's launch argv either: {codex_args:?}"
+        );
     }
 
     /// The other direction: narrowing from a checkout is honored, because a

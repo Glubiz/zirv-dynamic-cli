@@ -186,6 +186,33 @@ pub fn dash_mouse_on_bytes() -> &'static [u8] {
 /// reason every other sequence in this module is one.
 const DASH_MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 
+/// The counterpart of [`dash_mouse_on_bytes`]: turns every mouse-reporting
+/// mode back off without leaving the alternate screen or touching the cursor
+/// or scroll region, the way [`dash_reset_bytes`] does on exit. Written by
+/// `dash::mod`'s `Ctrl+A v` toggle (`DashAction::ToggleSelectMode`) when the
+/// operator wants the terminal's own native click-drag text selection back
+/// for a pane whose child has enabled its own mouse reporting -- exactly the
+/// pane the dashboard's own click-drag selection cannot help, since that
+/// feature only ever engages for a child that does *not* want mouse (see
+/// `dash::Selection`'s doc comment). Disabling reporting entirely, rather
+/// than trying to make zirv's own selection cover that case too, hands
+/// control back to the terminal emulator, which already knows how to do
+/// native selection -- the same trade every real terminal multiplexer offers
+/// (tmux's copy-mode, screen's copy mode).
+///
+/// Covers all four modes, including `?1003` which the dashboard never turns
+/// on, for the same "the reset covers more than the enable" reason
+/// [`dash_reset_bytes`] does: a mode this toggle didn't turn on is a
+/// harmless no-op to turn off, and future drift in the enable set cannot
+/// silently outrun it.
+pub fn dash_mouse_off_bytes() -> &'static [u8] {
+    DASH_MOUSE_OFF
+}
+
+/// See [`dash_mouse_off_bytes`]. A constant for the same allocation-free
+/// reason every other sequence in this module is one.
+const DASH_MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+
 /// Installed exactly once, however many guards are entered.
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
@@ -1095,6 +1122,32 @@ mod tests {
                     .any(|w| w == off_seq)
             );
         }
+    }
+
+    /// The `Ctrl+A v` select-mode toggle's own off sequence: every mode the
+    /// enable set turns on (plus `?1003`, which it never does) turned back
+    /// off, without touching the cursor, scroll region, or alternate screen
+    /// the way `dash_reset_bytes` does on exit -- this toggle runs mid-session,
+    /// not on the way out.
+    #[test]
+    fn mouse_off_disables_every_mode_the_toggle_could_have_left_on() {
+        let off = dash_mouse_off_bytes();
+        for mode in [
+            &b"\x1b[?1000l"[..],
+            &b"\x1b[?1002l"[..],
+            &b"\x1b[?1003l"[..],
+            &b"\x1b[?1006l"[..],
+        ] {
+            assert!(
+                off.windows(mode.len()).any(|w| w == mode),
+                "{} missing from the select-mode off sequence: {off:?}",
+                String::from_utf8_lossy(mode)
+            );
+        }
+        assert!(
+            !off.windows(6).any(|w| w == b"\x1b[?25h") && !off.windows(3).any(|w| w == b"\x1b[r"),
+            "the toggle must not touch the cursor or scroll region: {off:?}"
+        );
     }
 
     /// P2: which console control events take the supervised children with
