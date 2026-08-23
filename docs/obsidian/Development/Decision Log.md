@@ -24,6 +24,13 @@ last-verified: 2026-08-23
 
 ## Decisions
 
+### 2026-08-23 — The shipped posture is "usable, no prompts, destructive families denied" (issue #104)
+**Context:** The 2026-08-22 "sandboxed, no prompts" round (below) only pre-approved a handful of subcommands per toolchain and no harness/operator dirs at all -- under `dontAsk` every omission is a final denial, no prompt to escalate to, so a legitimate `cargo run`, `gh pr create`, or a session trying to read its own memory/settings still hit a silent dead end.
+**Decision:** Replace per-subcommand allow entries with whole `Bash(<tool> *)` families (git/gh/cargo/npm/npx/node/python/pip/go/dotnet/make/gradle/mvn/pytest/zirv) plus read-only utilities, `Read(~/.claude/**)`/`Edit(~/.claude/projects/**)`/`Read(~/.zirv/**)`/`WebFetch`/`WebSearch`, and a launch-computed scratchpad rule pair. The deny list, not per-verb narrowing, now carries the whole guarantee: it gained the destructive half of every widened family (`git clean`, `git push --delete`, `gh repo delete`/`release delete`/`auth`, `cargo publish`/`npm publish`) plus `Edit(~/.zirv/**)` -- a session must never widen its own posture.
+**Rejected:** Keeping per-subcommand allow entries and adding more of them piecemeal -- the same inert-by-omission failure just resurfaces on the next untried subcommand; a family-level allow with a family-aware deny is the only fix that generalizes.
+**Consequences:** `SHIPPED_POSTURE_ALLOW`/`_DENY` remain the single source `safety.rs`'s built-in policy and both adapters' projections derive from -- no new drift surface. `Read(~/.zirv/**)` being allowed while `Edit(~/.zirv/**)` is denied is deliberate asymmetry, not an oversight.
+**Spec / link:** [[Ctx Adapters]], [[Command Safety]]; `adapters::SHIPPED_POSTURE_ALLOW`/`_DENY`, `scratchpad_rules`; issue #104.
+
 ### 2026-08-23 — A hook `ask` under `dontAsk` falls through (issue #102)
 **Context:** `hook_output` mapped `Verdict::Ask` to an active `"ask"` `permissionDecision` unconditionally. Claude's own docs say a hook decision never bypasses permission rules, and `--permission-mode dontAsk` itself means "deny if not pre-approved" — so an `"ask"` there is an unsatisfiable denial, silently stripping the operator's own `permissions.allow` entries from every zirv-launched session.
 **Decision:** The stdin payload now carries `permission_mode`; `hook_output` emits nothing (falls through, same as `Allow`) for `Ask` specifically when `permission_mode == "dontAsk"`, letting claude's own flow and the operator's `allow` list decide. `Deny` is unaffected in every mode; every other mode, including a payload with no `permission_mode` at all, keeps emitting `"ask"`.

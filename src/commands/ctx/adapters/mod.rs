@@ -167,6 +167,37 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// explicitly (the one credential-reading *command family* worth naming on
 /// its own, since zirv's own macOS keychain fallback already documents it
 /// as the concrete vector -- see `poll.rs`).
+///
+/// **Fix round 4 (2026-08-23, issue #104): whole toolchain families, harness
+/// dirs, scratchpad, `WebFetch`/`WebSearch`.** Round 2's list above still hit
+/// `dontAsk`'s own inert-by-omission failure one layer up: it only
+/// pre-approved a handful of subcommands per toolchain (`cargo build *`/
+/// `cargo test *`/`cargo check *`, not `cargo run *`/`cargo doc *`/...), so
+/// an otherwise-legitimate in-family command still hit a silent, final
+/// denial. The narrow per-subcommand entries are replaced with whole
+/// `Bash(<tool> *)` families (`git *`, `gh *`, `cargo *`, `npm *`, `npx *`,
+/// `node *`, `python *`, `python3 *`, `pip *`, `go *`, `dotnet *`, `make *`,
+/// `gradle *`, `mvn *`, `pytest *`, `zirv *`) plus a set of read-only shell
+/// utilities -- the deny list, not per-verb narrowing, is what still keeps
+/// each family's destructive half blocked (`git clean *`, `git push
+/// --delete *`, `gh repo delete *`, `gh release delete *`, `gh auth *`,
+/// `cargo publish*`, `npm publish*`, added to `SHIPPED_POSTURE_DENY`
+/// alongside the pre-existing force-push/reset/rebase/curl/wget/sudo/su/
+/// security entries -- deny still wins, verified live in fix round 2).
+///
+/// `zirv *` (issue #98): the injected session prompt routinely instructs a
+/// session to run `zirv ctx ...`/`zirv agent ...` -- denying zirv's own CLI
+/// by omission would make that prompt-mandated guidance unusable under
+/// `dontAsk`.
+///
+/// Also added: `Read(~/.claude/**)`/`Edit(~/.claude/projects/**)` (inspect
+/// the harness's own settings/memory, and write Claude Code's own
+/// auto-memory, which lives under `~/.claude/projects/<slug>/memory/`);
+/// `Read(~/.zirv/**)` (inspect the operator layer -- `Edit(~/.zirv/**)` is
+/// denied below, since a session must never widen its own posture);
+/// `WebFetch`/`WebSearch` (bare tool rules, no `Bash(...)` wrapper); and two
+/// scratchpad rules computed at launch from the real `std::env::temp_dir()`
+/// rather than baked into this `&'static` list -- see [`scratchpad_rules`].
 pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Read(./**)", "read anything inside the workspace"),
     (
@@ -174,97 +205,134 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
         "create or modify files inside the workspace (covers both the Write and Edit tools)",
     ),
     (
-        "Bash(git status *)",
-        "inspect working tree state, read-only",
+        "Read(~/.claude/**)",
+        "inspect the harness's own settings and memory",
     ),
-    ("Bash(git diff *)", "inspect changes, read-only"),
-    ("Bash(git log *)", "inspect history, read-only"),
+    (
+        "Edit(~/.claude/projects/**)",
+        "Claude Code's own auto-memory lives under ~/.claude/projects/<slug>/memory/",
+    ),
+    (
+        "Read(~/.zirv/**)",
+        "inspect the operator layer (editing it is denied below)",
+    ),
+    ("WebFetch", "fetch a URL's contents, read-only"),
+    ("WebSearch", "search the web, read-only"),
+    // Whole toolchain families (2026-08-23, fix round 4, issue #104) -- see
+    // this constant's own doc comment for why the narrower per-subcommand
+    // entries these replace were still inert-by-omission on anything else
+    // in the same family.
+    (
+        "Bash(git *)",
+        "the full git command family; force-push, hard reset, rebase, filter-branch and clean are denied below and win",
+    ),
+    (
+        "Bash(gh *)",
+        "the GitHub CLI; repo/release delete and auth are denied below and win",
+    ),
+    (
+        "Bash(cargo *)",
+        "the Rust toolchain; publish is denied below",
+    ),
+    (
+        "Bash(npm *)",
+        "the Node/npm toolchain; publish is denied below",
+    ),
+    (
+        "Bash(npx *)",
+        "run a Node package binary with no separate install step",
+    ),
+    ("Bash(node *)", "run a Node script directly"),
+    ("Bash(python *)", "the Python toolchain"),
+    (
+        "Bash(python3 *)",
+        "the Python toolchain, explicit-version spelling",
+    ),
+    ("Bash(pip *)", "install or manage Python packages"),
+    ("Bash(go *)", "the Go toolchain"),
+    ("Bash(dotnet *)", "the .NET toolchain"),
+    ("Bash(make *)", "a Makefile-based toolchain"),
+    ("Bash(gradle *)", "the Java/Kotlin/Gradle toolchain"),
+    ("Bash(mvn *)", "the Java/Maven toolchain"),
+    ("Bash(pytest *)", "test with the Python toolchain"),
+    (
+        "Bash(zirv *)",
+        "zirv's own CLI (issue #98) -- the injected prompt routinely instructs a session to run it; denying it by omission would make that guidance unusable under dontAsk",
+    ),
+    // Read-only shell utilities.
     ("Bash(ls *)", "list directory contents, read-only"),
     ("Bash(grep *)", "search file contents, read-only"),
     ("Bash(rg *)", "search file contents, read-only"),
-    // Non-destructive git writes (2026-08-22, fix round 3): under `dontAsk`
-    // a denial is final for the whole session -- there is no prompt to
-    // escalate to, so omitting these left a session that could read and
-    // build the repo but never record a single change. The destructive
-    // variants (force-push, hard reset, rebase, filter-branch) stay denied
-    // below, and deny wins over a broader overlapping allow, verified live.
+    ("Bash(cat *)", "read file contents, read-only"),
+    ("Bash(head *)", "read the start of a file, read-only"),
+    ("Bash(tail *)", "read the end of a file, read-only"),
+    ("Bash(wc *)", "count lines, words or bytes, read-only"),
+    ("Bash(find *)", "search for files by name, read-only"),
+    ("Bash(echo *)", "print text, read-only, no side effects"),
+    ("Bash(pwd)", "print the working directory, read-only"),
+    ("Bash(which *)", "locate a command on PATH, read-only"),
     (
-        "Bash(git add *)",
-        "stage a change; undoable with a plain reset",
+        "Bash(where *)",
+        "locate a command on PATH, read-only (Windows spelling)",
     ),
-    (
-        "Bash(git commit *)",
-        "record a change -- the basic unit of version control work",
-    ),
-    (
-        "Bash(git checkout *)",
-        "switch branches or restore a working-tree file to a known state",
-    ),
-    (
-        "Bash(git switch *)",
-        "switch branches, the non-overloaded successor to checkout",
-    ),
-    (
-        "Bash(git branch *)",
-        "create, list, or delete a local branch",
-    ),
-    (
-        "Bash(git stash *)",
-        "shelve and restore uncommitted changes",
-    ),
-    ("Bash(git pull *)", "fetch and integrate remote changes"),
-    ("Bash(git merge *)", "integrate another branch's history"),
-    (
-        "Bash(git push *)",
-        "publish committed history to the remote; force variants are denied below and win",
-    ),
-    ("Bash(cargo build *)", "build with the Rust toolchain"),
-    ("Bash(cargo test *)", "test with the Rust toolchain"),
-    ("Bash(cargo check *)", "typecheck with the Rust toolchain"),
-    ("Bash(cargo fmt *)", "format with the Rust toolchain"),
-    ("Bash(cargo clippy *)", "lint with the Rust toolchain"),
-    ("Bash(npm test *)", "test with the Node toolchain"),
-    ("Bash(npm run build *)", "build with the Node toolchain"),
-    ("Bash(make test *)", "test with a Makefile-based toolchain"),
-    (
-        "Bash(make build *)",
-        "build with a Makefile-based toolchain",
-    ),
-    ("Bash(pytest *)", "test with the Python toolchain"),
-    ("Bash(go test *)", "test with the Go toolchain"),
-    ("Bash(go build *)", "build with the Go toolchain"),
-    ("Bash(mvn test *)", "test with the Java/Maven toolchain"),
-    ("Bash(mvn package *)", "build with the Java/Maven toolchain"),
-    (
-        "Bash(gradle test *)",
-        "test with the Java/Kotlin/Gradle toolchain",
-    ),
-    (
-        "Bash(gradle build *)",
-        "build with the Java/Kotlin/Gradle toolchain",
-    ),
-    ("Bash(dotnet test *)", "test with the .NET toolchain"),
-    ("Bash(dotnet build *)", "build with the .NET toolchain"),
-    // zirv's own commands (2026-08-23, issue #98): the injected prompt
-    // (`prompt.rs`'s `HARNESS_PROMPT`, `ORCHESTRATOR_PROMPT` in
-    // `adapters::claude`) mandates `zirv ctx status`/`inbox`/`send`/
-    // `nudge`/`remember`/`recall`, `zirv agent <name> "..."`, and
-    // `zirv <script>` for repo-defined work -- but the shipped posture had
-    // no entry for `zirv` at all, so every one of those mandated commands
-    // was silently denied under `dontAsk`. A prompt must never mandate a
-    // command family the posture itself denies. `zirv <script>` runs
-    // repo-defined commands, the same trust class as the already-allowed
-    // `make build`/`npm run build` above.
-    (
-        "Bash(zirv *)",
-        "zirv's own verbs (ctx status/inbox/send/nudge/remember/recall, agent, setup, memory, context) and repo-defined scripts -- the channel the injected prompt mandates",
-    ),
+    ("Bash(diff *)", "compare files, read-only"),
+    ("Bash(sort *)", "sort input lines, read-only"),
+    ("Bash(uniq *)", "filter duplicate lines, read-only"),
+    ("Bash(tr *)", "translate or delete characters, read-only"),
+    ("Bash(cut *)", "extract fields from input, read-only"),
 ];
+
+/// Projects the operator's scratchpad temp directory into the two claude
+/// permission rules that make it usable under `dontAsk` -- computed at
+/// launch (2026-08-23, issue #104) inside `ClaudeAdapter::
+/// default_sandbox_args` rather than baked into [`SHIPPED_POSTURE_ALLOW`],
+/// since the path is per-machine and that constant has to stay `&'static`.
+///
+/// Claude Code's absolute-path rule form is a *doubled* leading slash
+/// (`//<path>`, the same convention `SHIPPED_POSTURE_ALLOW`'s own doc
+/// comment cites live findings against). `temp_dir` is normalized to
+/// forward slashes, any trailing slash is removed, then **one** leading
+/// slash (if the path already had one, e.g. a Unix absolute path) is
+/// stripped before the `//` prefix is added -- so the result always has
+/// exactly two leading slashes, never three. A Windows path with no leading
+/// slash of its own (a drive letter) is unaffected by the strip:
+/// `C:\Users\x\AppData\Local\Temp\` becomes
+/// `//C:/Users/x/AppData/Local/Temp/claude/**`; a Unix `/tmp` becomes
+/// `//tmp/claude/**`, not `///tmp/claude/**`.
+pub(crate) fn scratchpad_rules(temp_dir: &Path) -> [String; 2] {
+    let normalized = temp_dir.to_string_lossy().replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    let stripped = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let base = format!("//{stripped}/claude/**");
+    [format!("Read({base})"), format!("Edit({base})")]
+}
 
 /// The destructive families this posture denies regardless of anything on
 /// [`SHIPPED_POSTURE_ALLOW`] -- verified live to win over a broader,
 /// overlapping allow entry (see that constant's own doc comment).
+///
+/// **Fix round 4 additions (2026-08-23, issue #104):** `Edit(~/.zirv/**)`
+/// (a session must never widen its own posture -- `Read(~/.zirv/**)` is
+/// allowed above, editing it is not) and `Read(~/.claude/.credentials.json)`
+/// (the harness's own stored OAuth credentials, alongside the harness dirs
+/// newly allowed above) -- both non-`Bash` entries, declared first so the
+/// claude projection can prepend them the same way it prepends
+/// [`SHIPPED_POSTURE_ALLOW`]'s own non-`Bash` entries, see `ClaudeAdapter::
+/// default_sandbox_args`. Plus the destructive halves of the toolchain
+/// families [`SHIPPED_POSTURE_ALLOW`] widened to whole `Bash(<tool> *)`
+/// entries: `cargo publish*`/`npm publish*` (irreversible; no trailing
+/// space, so the bare invocation is denied too, not only one carrying
+/// flags), `gh repo delete *`/`gh release delete *`/`gh auth *`, `git clean
+/// *`, `git push --delete *`.
 pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
+    (
+        "Edit(~/.zirv/**)",
+        "a session must never widen its own posture",
+    ),
+    (
+        "Read(~/.claude/.credentials.json)",
+        "the harness's own stored OAuth credentials",
+    ),
     ("Bash(rm -rf *)", "recursive force-delete"),
     (
         "Bash(rm -fr *)",
@@ -312,6 +380,22 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ("Bash(cat *.aws*)", "reads AWS credential files"),
     ("Bash(cat *.ssh*)", "reads SSH private keys"),
     ("Bash(cat *.netrc*)", "reads stored HTTP credentials"),
+    ("Bash(cargo publish*)", "publishes a crate; irreversible"),
+    ("Bash(npm publish*)", "publishes a package; irreversible"),
+    (
+        "Bash(gh repo delete *)",
+        "irreversibly deletes a GitHub repository",
+    ),
+    (
+        "Bash(gh release delete *)",
+        "irreversibly deletes a GitHub release",
+    ),
+    (
+        "Bash(gh auth *)",
+        "changes or reveals the operator's own GitHub authentication",
+    ),
+    ("Bash(git clean *)", "irreversibly deletes untracked files"),
+    ("Bash(git push --delete *)", "deletes a remote branch"),
 ];
 
 /// The last model-flag occurrence in `flags`, in any form `classify_model_
@@ -3836,6 +3920,39 @@ mod tests {
         assert!(
             !latch.load(std::sync::atomic::Ordering::SeqCst),
             "an adapter with nothing to report must never reach the claim step"
+        );
+    }
+
+    // -- scratchpad_rules (issue #104) ---------------------------------
+
+    /// A Windows-shaped temp dir: backslashes become forward slashes, the
+    /// trailing slash is dropped, and -- since the path already carries no
+    /// leading slash of its own (a drive letter) -- `//` is simply
+    /// prepended.
+    #[test]
+    fn scratchpad_rules_projects_a_windows_temp_dir() {
+        let rules = scratchpad_rules(Path::new(r"C:\Users\x\AppData\Local\Temp\"));
+        assert_eq!(
+            rules,
+            [
+                "Read(//C:/Users/x/AppData/Local/Temp/claude/**)".to_string(),
+                "Edit(//C:/Users/x/AppData/Local/Temp/claude/**)".to_string(),
+            ]
+        );
+    }
+
+    /// A Unix-shaped temp dir already carries its own leading `/`, so the
+    /// convention is `//` plus the path *without* that leading slash --
+    /// `//tmp/claude/**`, not `///tmp/claude/**` (three slashes).
+    #[test]
+    fn scratchpad_rules_projects_a_unix_temp_dir() {
+        let rules = scratchpad_rules(Path::new("/tmp"));
+        assert_eq!(
+            rules,
+            [
+                "Read(//tmp/claude/**)".to_string(),
+                "Edit(//tmp/claude/**)".to_string(),
+            ]
         );
     }
 }
