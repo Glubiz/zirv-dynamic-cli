@@ -341,19 +341,20 @@ fn verdict_rank(verdict: Verdict) -> u8 {
 
 /// The candidate fold: the raw command plus every string
 /// [`normalize_segments`] derives from it, resolved to the single most
-/// restrictive [`Outcome`] (deny > ask > allow). `fallback` is the
-/// unmatched-command verdict already chosen for this launch mode
-/// ([`SafetyPolicy::default_verdict`]), so this function itself has no
-/// opinion about which default applies.
+/// restrictive [`Outcome`] (deny > ask > allow). Each candidate receives
+/// both the generic policy match and every enabled semantic analyzer before
+/// the fold. Applying semantic analysis only after the fold loses which
+/// executable segment produced the answer and lets a harmless leading
+/// command hide a dangerous nested invocation.
 ///
-/// Split out of [`evaluate`] so the SQL classifier (Task 6) can be layered on
-/// top of a complete rule-matching answer rather than fighting for a place
-/// inside the fold -- one dangerous segment in a compound command must still
-/// win over a read-only SQL segment sitting next to it.
+/// `fallback` is the unmatched-command verdict already chosen for this
+/// launch mode ([`SafetyPolicy::default_verdict`]), so this function itself
+/// has no opinion about which default applies.
 fn evaluate_candidates(policy: &SafetyPolicy, command: &str, fallback: Verdict) -> Outcome {
     let mut worst: Option<(u8, Outcome)> = None;
     for candidate in normalize_segments(command) {
-        let outcome = evaluate_single(policy, &candidate, fallback);
+        let base = evaluate_single(policy, &candidate, fallback);
+        let outcome = apply_sql_outcome(policy, &candidate, base);
         let rank = verdict_rank(outcome.verdict);
         let is_worse = match &worst {
             Some((best_rank, _)) => rank > *best_rank,
@@ -369,9 +370,29 @@ fn evaluate_candidates(policy: &SafetyPolicy, command: &str, fallback: Verdict) 
     })
 }
 
-/// Matches `command` against `policy` for one launch posture, then lets the
-/// SQL classifier ([`sql_outcome`]) adjust the answer within two strict
-/// rules:
+/// Applies the SQL semantic analyzer to one executable candidate while
+/// preserving explicit policy precedence. Keeping this rule in one helper is
+/// what makes direct, compound, and shell-wrapped client invocations obey the
+/// same narrowing/widening contract.
+fn apply_sql_outcome(policy: &SafetyPolicy, command: &str, base: Outcome) -> Outcome {
+    if policy.sql == SqlMode::Off {
+        return base;
+    }
+    let Some(sql) = sql_outcome(command) else {
+        return base;
+    };
+    match (base.verdict, sql.verdict) {
+        (Verdict::Deny, _) => base,
+        (Verdict::Allow, Verdict::Ask) => sql,
+        (_, Verdict::Allow) if base.matched.is_none() => sql,
+        _ => base,
+    }
+}
+
+/// Matches `command` against `policy` for one launch posture. For every raw
+/// or normalized executable candidate, the SQL classifier
+/// ([`sql_outcome`]) may adjust that candidate's answer within two strict
+/// rules before the most-restrictive-result fold:
 ///
 /// - It may **narrow** to `Ask` whenever it cannot prove the statement
 ///   read-only. A broad `Bash(psql *)` allow rule -- or, interactively, the
@@ -395,19 +416,7 @@ pub fn evaluate(
     command: &str,
     mode: super::adapters::LaunchMode,
 ) -> Outcome {
-    let base = evaluate_candidates(policy, command, policy.default_verdict(mode));
-    if policy.sql == SqlMode::Off {
-        return base;
-    }
-    let Some(sql) = sql_outcome(command) else {
-        return base;
-    };
-    match (base.verdict, sql.verdict) {
-        (Verdict::Deny, _) => base,
-        (Verdict::Allow, Verdict::Ask) => sql,
-        (_, Verdict::Allow) if base.matched.is_none() => sql,
-        _ => base,
-    }
+    evaluate_candidates(policy, command, policy.default_verdict(mode))
 }
 
 /// Collapses runs of ASCII/Unicode whitespace to a single space and trims
@@ -1931,6 +1940,36 @@ mod tests {
             evaluate(&policy, "psql -c 'DROP TABLE users'", LaunchMode::Headless,).verdict,
             Verdict::Ask
         );
+    }
+
+    /// SECURITY: semantic analyzers must run on every executable candidate,
+    /// not only on the raw command string. A harmless leading command or one
+    /// shell wrapper previously hid a destructive SQL client invocation from
+    /// `sql_outcome`, even though the generic rule matcher already inspected
+    /// those normalized candidates.
+    #[test]
+    fn evaluate_applies_sql_narrowing_to_compound_and_wrapped_segments() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "echo ok && psql -c 'DROP TABLE t'",
+            "printf ready; mysql -e 'DELETE FROM users'",
+            "bash -c \"psql -c 'DROP TABLE t'\"",
+            "powershell -Command \"sqlite3 app.db 'DELETE FROM users'\"",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Ask,
+                "{command} must not hide a destructive SQL invocation: {outcome:?}"
+            );
+            assert!(
+                outcome
+                    .matched
+                    .as_ref()
+                    .is_some_and(|rule| rule.pattern.starts_with("<sql:")),
+                "the explanation must identify the SQL analyzer for {command}: {outcome:?}"
+            );
+        }
     }
 
     /// SECURITY: the upgrade must never undo an operator's or a repo's own
