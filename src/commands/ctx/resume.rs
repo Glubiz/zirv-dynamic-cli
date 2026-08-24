@@ -369,6 +369,12 @@ mod tests {
         }
         command.env_remove("CLAUDE_PID");
         command.env_remove("CLAUDECODE");
+        // T8: `SUPERVISION_ENV` deliberately excludes `DASH_REQUESTS_ENV`
+        // (see `nested_session_evidence`'s own doc comment) -- a dashboard
+        // pane's own process (this whole suite's environment, when run from
+        // `zirv ctx dash` itself) still exports it, so without this the
+        // spawned `zirv ctx resume` inherits it and trips the same guard.
+        command.env_remove(crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV);
         let status = command.status().expect("resume runs");
         assert!(status.success(), "the launched agent exited cleanly");
 

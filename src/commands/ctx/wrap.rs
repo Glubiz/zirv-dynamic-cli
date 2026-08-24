@@ -3557,6 +3557,16 @@ mod tests {
         }
         cmd.env_remove("CLAUDE_PID");
         cmd.env_remove("CLAUDECODE");
+        // T8: `SUPERVISION_ENV` deliberately excludes `DASH_REQUESTS_ENV` (a
+        // pane's own child must still be able to reach the spawn-request
+        // channel -- see `nested_session_evidence`'s own doc comment), so it
+        // is not scrubbed by anything above. A real dashboard pane -- which
+        // is exactly the environment this whole suite runs under when driven
+        // from `zirv ctx dash` itself -- exports it into ITS OWN process, so
+        // without this every one of these harnesses' spawned `zirv ctx wrap`
+        // also inherited it and tripped the same nesting guard the comment
+        // above already scrubs the other three signals for.
+        cmd.env_remove(super::super::dash::spawnreq::DASH_REQUESTS_ENV);
         // T10 fix regression (2026-08-23): every one of these harnesses spawns
         // a *real* `zirv ctx wrap` attached to a real pty on both stdin and
         // stdout, which is exactly the condition the launch-time interactive
@@ -6703,19 +6713,33 @@ mod tests {
         assert_eq!(status.exit_code(), 0);
     }
 
-    // KNOWN ISSUE (perf/test-suite-speed, item 3b follow-up): the 24-test
-    // wrap::/resume:: nesting-guard baseline on this machine is caused by
-    // this whole file's real-spawn harnesses never scrubbing
-    // `dash::spawnreq::DASH_REQUESTS_ENV` (deliberately excluded from
-    // `sessions::SUPERVISION_ENV`, which they do scrub) before spawning a
-    // real `zirv`, so a session that is itself running under `zirv ctx
-    // dash` -- as every one of these development sessions is -- leaks its
-    // own `ZIRV_CTX_DASH_REQUESTS` into the child and trips the guard.
-    // Adding that scrub fixes the guard trip, but unmasks a second, separate
-    // bug: `h.child.wait()` below has no timeout, and once the child's real
-    // execution path is no longer short-circuited by the guard, it hung
-    // (reproduced twice, ~20+ min combined). Fix both together -- the scrub
-    // alone trades a fast known failure for a hang, which is worse.
+    /// Waits for `child`, killing it and returning `None` past `timeout` so
+    /// a genuinely wedged child fails this one test fast instead of hanging
+    /// it (and the suite behind it) forever. `h.child.wait()`'s own contract
+    /// has no timeout at all -- fine for a child known to exit promptly, but
+    /// `a_broken_transcript_path_never_stops_the_session` hung on it for real
+    /// once the `DASH_REQUESTS_ENV` scrub above stopped short-circuiting the
+    /// nesting guard before this child's own exit path was ever reached
+    /// (reproduced twice, ~20+ min combined, before this fix). Mirrors
+    /// `win::wait_bounded`'s identical shape for `std::process::Child`.
+    #[cfg(unix)]
+    fn wait_bounded(
+        child: &mut dyn portable_pty::Child,
+        timeout: Duration,
+    ) -> Option<portable_pty::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => return None,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_broken_transcript_path_never_stops_the_session() {
@@ -6753,7 +6777,8 @@ mod tests {
         assert!(echoed.contains("echo: still here"), "got {echoed:?}");
 
         h.writer.write_all(b"/exit\r").expect("write");
-        let status = h.child.wait().expect("wait");
+        let status = wait_bounded(h.child.as_mut(), Duration::from_secs(10))
+            .expect("the session must exit within a bounded window, not hang");
         assert_eq!(status.exit_code(), 0);
     }
 
@@ -6785,6 +6810,16 @@ mod tests {
             "ZIRV_CTX_STATE_DIR",
             tmp.path().join("state").display().to_string(),
         );
+        // T8: hermetic against the developer's/agent's own environment --
+        // see the identical comment on `spawn_wrap`'s pty harness above.
+        // This test builds its own `CommandBuilder` rather than going
+        // through that harness, so it needs the same scrub explicitly.
+        for key in super::super::sessions::SUPERVISION_ENV {
+            cmd.env_remove(key);
+        }
+        cmd.env_remove("CLAUDE_PID");
+        cmd.env_remove("CLAUDECODE");
+        cmd.env_remove(super::super::dash::spawnreq::DASH_REQUESTS_ENV);
         let mut child = pair.slave.spawn_command(cmd).expect("spawn");
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().expect("reader");
@@ -6988,6 +7023,12 @@ mod tests {
             }
             cmd.env_remove("CLAUDE_PID");
             cmd.env_remove("CLAUDECODE");
+            // T8: see the identical fix/comment on `spawn_wrap`'s pty
+            // harness above -- `SUPERVISION_ENV` deliberately excludes
+            // `DASH_REQUESTS_ENV`, so a real dashboard pane's own process
+            // (this whole suite's environment, when run from `zirv ctx
+            // dash`) still leaks it into this spawn without an explicit scrub.
+            cmd.env_remove(super::super::super::dash::spawnreq::DASH_REQUESTS_ENV);
             // No terminal: this is also the CI/piped case, which is exactly
             // why the synthetic cursor report cannot be left to a real
             // terminal to send.
