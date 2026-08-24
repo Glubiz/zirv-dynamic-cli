@@ -47,6 +47,20 @@
 # assert on it), but never pops a mode and always answers with a minimal,
 # real, parseable handoff so `distill()` succeeds instead of falling back to
 # the mechanical "structural" extraction.
+#
+# CI run 32723969751 (2026-08-24) found the same one-binary-per-session
+# problem on a second, independent code path: `detect_ignore_flags`
+# (`adapters/codex.rs`) probes capability support by spawning `exec --help`
+# on this same override before composing a nudge/rot-restart's distiller
+# call. That argv has no `--sandbox read-only` pair, so `is_distiller` above
+# does not exempt it, and (before this fix) it fell through to the
+# mode-file branch and silently stole a line meant for the main agent's
+# next launch, shifting every mode after it by one. Handled as its own case
+# for the same reason `is_distiller` is: still logged to
+# `FAKE_AGENT_ARGV_LOG` (a test relies on seeing "exec --help" there), but
+# never pops a mode. The answer deliberately omits `--ignore-rules` and
+# `--ignore-user-config` so the probe reads "unsupported", matching the
+# behavior CI observed before this fix.
 set -eu
 
 head_bin=head
@@ -63,10 +77,14 @@ mv_bin=mv
 [ -z "${FAKE_AGENT_ARGV_LOG:-}" ] || printf '%s\n' "$*" >> "$FAKE_AGENT_ARGV_LOG"
 
 is_distiller=0
+is_help_probe=0
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--sandbox" ] && [ "$arg" = "read-only" ]; then
     is_distiller=1
+  fi
+  if [ "$arg" = "--help" ]; then
+    is_help_probe=1
   fi
   prev="$arg"
 done
@@ -83,6 +101,11 @@ fi
 
 if [ "$is_distiller" -eq 1 ]; then
   printf '## Task\nfake distilled task\n\n## Next step\nfake next step\n'
+  exit 0
+fi
+
+if [ "$is_help_probe" -eq 1 ]; then
+  printf 'codex-exec\n\nUsage: codex exec [OPTIONS] [PROMPT]\n\nOptions:\n  -h, --help  Print help\n'
   exit 0
 fi
 

@@ -31,7 +31,8 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # pool while it runs, so nothing else *in this run* executes alongside it --
 # it cannot exclude contention from other processes on the host (see the
 # doc comment on `a_post_nudge_park_carries_the_nudges_own_mail_not_the_
-# stale_launch_mail` for a case that survives even this).
+# stale_launch_mail` for a second, now-fixed failure mode this group alone
+# did not prevent: a codex capability probe stealing a fixture mode line).
 [test-groups.exec-nudge-restart]
 max-threads = 1
 

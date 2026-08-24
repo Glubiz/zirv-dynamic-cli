@@ -3673,35 +3673,27 @@ mod tests {
     /// even_though_it_already_exited`, `supervise.rs`), 20/20 passes
     /// including under genuine heavy host contention.
     ///
-    /// This test can still fail intermittently (~30% of filtered, cold,
-    /// single-run attempts observed here) with a DIFFERENT signature than
-    /// the one above, and the tap-vs-exit fix does not explain or claim to
-    /// fix it. Diagnosed further, not yet fixed: this machine has a real
-    /// `codex` CLI installed (visible in this test's own stderr: "sandbox
-    /// residual: codex's report-only sandbox ... on this installed
-    /// codex-cli"), and the adapter probes it (`codex exec --help`) to
-    /// detect flag support, cached process-wide behind a `OnceLock` in
-    /// `adapters/codex.rs` (`IGNORE_FLAGS_SUPPORT`). Because this test's
-    /// `ZIRV_CTX_AGENT_BIN` override redirects that probe to
-    /// `fake-codex-agent.sh` too, the fixture logs it ("exec --help" showed
-    /// up in `argv_log` on a failing run) and -- since the probe's argv has
-    /// no `--sandbox read-only` pair, so the fixture's own `is_distiller`
-    /// check does not exempt it -- pops a real line off `FAKE_AGENT_MODE_
-    /// FILE`, shifting hang/limit/healthy by one and making the "limit"
-    /// stage silently run as "healthy" instead (no prompt-injection log
-    /// entry, no limit-park, launch mail re-appended). Whether the probe
-    /// actually fires is gated by that same process-wide cache, which is
-    /// why the full serial suite (many earlier tests likely warm it first)
-    /// and this test run alone (always cold) behave differently, and why
-    /// even alone it is not 100% one way or the other (the probe's own
-    /// preconditions, e.g. whether `codex` is found on PATH at all in this
-    /// process's environment, are not fully pinned down either). A real
-    /// fix belongs in `fake-codex-agent.sh` (recognize a bare `--help`
-    /// probe the same way `is_distiller` already special-cases `--sandbox
-    /// read-only`) and was not made here -- found late, under severe time
-    /// pressure, and better verified deliberately than patched on a guess.
-    /// Machine-specific either way: a CI runner with no `codex` on PATH
-    /// should never trigger the probe at all.
+    /// This test also failed intermittently (~30% of filtered, cold,
+    /// single-run attempts observed on the dev machine, 100% on CI run
+    /// 32723969751) with a DIFFERENT signature than the race above, and the
+    /// tap-vs-exit fix did not explain or claim to fix it. Root cause: the
+    /// adapter probes capability support by spawning `exec --help`
+    /// (`detect_ignore_flags`, `adapters/codex.rs`) before composing the
+    /// nudge restart's distiller call. This test's `ZIRV_CTX_AGENT_BIN`
+    /// override redirects that probe to `fake-codex-agent.sh` too, and the
+    /// probe's argv has no `--sandbox read-only` pair, so the fixture's
+    /// `is_distiller` check did not exempt it -- it popped a real line off
+    /// `FAKE_AGENT_MODE_FILE`, shifting hang/limit/healthy by one and making
+    /// the "limit" stage silently run as "healthy" instead (no
+    /// prompt-injection log entry, no limit-park, launch mail re-appended).
+    /// The initial suspicion that this was machine-specific (a CI runner
+    /// with no `codex` on PATH would never trigger the probe) was wrong:
+    /// the probe targets the `ZIRV_CTX_AGENT_BIN` override directly, not a
+    /// PATH-resolved `codex`, so it fires on CI just as reliably -- which is
+    /// what CI run 32723969751's deterministic failure confirmed. Fixed in
+    /// `fake-codex-agent.sh`: a bare `--help` probe is now recognized the
+    /// same way `is_distiller` special-cases `--sandbox read-only`, logged
+    /// but never popping a mode.
     #[test]
     fn a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_launch_mail() {
         let tmp = crate::commands::ctx::testenv::repo();
