@@ -6,7 +6,7 @@ last-verified: 2026-08-24
 
 ## Quick Reference
 
-- Crate `zirv`, version 2.25.1, Rust edition 2024.
+- Crate `zirv`, version 2.28.0, Rust edition 2024.
 - Async runtime is `tokio` (multi-thread), used for process spawning throughout `script_runner/` and the `ctx` supervisors.
 - Release profile is tuned for a small, fast-starting CLI binary and sets `panic = "abort"` — see the Gotcha below.
 - Local/CI test runner is `cargo-nextest` (pinned 0.9.143), replacing serial `cargo test -- --test-threads=1` as the primary loop — see "Test runner" below.
@@ -18,7 +18,7 @@ last-verified: 2026-08-24
 | Field | Value |
 |---|---|
 | name | `zirv` |
-| version | `2.25.1` |
+| version | `2.28.0` |
 | edition | `2024` |
 | license | MIT |
 | repository | https://github.com/Glubiz/zirv |
@@ -40,6 +40,7 @@ last-verified: 2026-08-24
 | `futures` | 0.3.32 | Async combinators |
 | `slab` | 0.4.12 | Slot-keyed allocation, used in the `ctx` supervisor machinery |
 | `regex` | 1 | Detecting unresolved `${...}` placeholders after substitution |
+| `sha2` | 0.11.0 | Stable SHA-256 identities for immutable launch-policy snapshots, privacy-preserving command-decision audit correlation, and tamper detection in the Claude safety-hook attestation |
 | `portable-pty` | 0.9.0 | Cross-platform PTY for `zirv ctx wrap`'s interactive supervision, and for each of the dashboard's own panes (`dash::pane`) |
 | `uuid` (v4) | 1.24.0 | Session IDs for `ctx` transcripts and supervised runs |
 | `crossterm` | 0.29 | Terminal event/key input and raw-mode primitives for the dashboard's own event loop (`dash/mod.rs`) |

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-23
+last-verified: 2026-08-24
 ---
 
 # _system-context
@@ -141,7 +141,7 @@ Run all four before claiming a change is done. Full detail: [[Getting Started]],
 
 ## State Directory Layout
 
-`StateDir::resolve` roots at `ZIRV_CTX_STATE_DIR`, else the OS state dir, else the OS local-data dir, then `zirv/ctx`. Subpaths: `handoffs/<repo_slug>/` (stored handoff docs), `s/` (turn-signal sockets, short name for the unix path-length limit), `logs/decisions.jsonl` (append-only decision log), `usage.json` (single machine-wide file, merged across sessions), `scoring/` (per-transcript incremental-scoring checkpoints). Unix directories are `0700` and files `0600`; Windows has no equivalent and is a no-op there. See [[Ctx Subsystem]].
+`StateDir::resolve` roots at `ZIRV_CTX_STATE_DIR`, else the OS state dir, else the OS local-data dir, then `zirv/ctx`. Subpaths: `handoffs/<repo_slug>/` (stored handoff docs), `s/` (turn-signal sockets, short name for the unix path-length limit), `logs/decisions.jsonl` (append-only context decision log), `logs/safety-decisions/<UTC-day>.jsonl` (privacy-preserving command verdicts with command/policy SHA-256 identities, never raw command text), `usage.json` (single machine-wide file, merged across sessions), `scoring/` (per-transcript incremental-scoring checkpoints). Unix directories are `0700` and files `0600`; Windows has no equivalent and is a no-op there. See [[Ctx Subsystem]].
 
 ## Documentation Contract
 

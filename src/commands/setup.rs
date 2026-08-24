@@ -19,7 +19,7 @@ const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
 ];
 
 /// Issue #83's command safety hook: `zirv ctx safety check`, matched on
-/// `Bash` calls only (a distinct `PreToolUse` matcher from `HARNESS_HOOKS`'s
+/// `Bash|PowerShell` calls (a distinct `PreToolUse` matcher from `HARNESS_HOOKS`'s
 /// own `Agent|Task` entry above -- both coexist in the same event array,
 /// `ensure_harness_hook` pushes a new entry per distinct command string
 /// rather than replacing). Wired into **claude only**
@@ -34,8 +34,11 @@ const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
 /// <command>` argv, and always exits 0 -- see `safety::run_check`'s own doc
 /// comment for why (the decision is expressed in the JSON envelope, not the
 /// exit code, mirroring `hook::run_pretool`).
-const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) =
-    ("PreToolUse", Some("Bash"), "zirv ctx safety check");
+const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) = (
+    "PreToolUse",
+    Some("Bash|PowerShell"),
+    "zirv ctx safety check",
+);
 
 /// Total claude hooks `zirv setup` installs/reports on: `HARNESS_HOOKS`
 /// (shared with codex) plus `CLAUDE_SAFETY_HOOK` (claude-only, see its own
@@ -2925,7 +2928,7 @@ mod tests {
     }
 
     /// Issue #83: `zirv setup apply` wires `zirv ctx safety check` into
-    /// claude's `PreToolUse` hooks, matched on `Bash` (distinct from the
+    /// claude's `PreToolUse` hooks, matched on `Bash|PowerShell` (distinct from the
     /// existing `Agent|Task`-matched `PreToolUse` entry `HARNESS_HOOKS`
     /// already installs -- both must coexist in the same event array), and
     /// idempotently (a second `apply` adds nothing more, backed up via the
@@ -2948,8 +2951,8 @@ mod tests {
         assert!(
             pretool_entries
                 .iter()
-                .any(|entry| entry["matcher"] == "Bash"),
-            "the safety hook must be its own Bash-matched entry: {pretool_entries:?}"
+                .any(|entry| entry["matcher"] == "Bash|PowerShell"),
+            "the safety hook must guard both shell tool names: {pretool_entries:?}"
         );
         assert!(
             pretool_entries

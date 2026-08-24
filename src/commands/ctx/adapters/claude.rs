@@ -426,18 +426,28 @@ impl ClaudeAdapter {
     /// Zirv home. The write is atomic and private on Unix; if either step
     /// fails, the caller deliberately falls back to Claude's native prompt
     /// flow without adding a blanket Bash allow.
-    fn launch_settings_path(&self) -> Option<PathBuf> {
+    fn launch_settings_path(&self, safety: &super::super::safety::SafetyPolicy) -> Option<PathBuf> {
         #[cfg(test)]
         if let Some(forced) = &self.forced_launch_settings {
             return forced.clone();
         }
 
         let dir = self.home_dir().join(".zirv").join("runtime");
-        let path = dir.join("claude-launch-settings.json");
+        let fingerprint = super::super::safety::policy_fingerprint(safety).ok()?;
+        let policy_dir = dir.join("policies");
+        let policy_path = policy_dir.join(format!("{fingerprint}.json"));
+        let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
-            let mut body = serde_json::to_string_pretty(&launch_settings_value())
-                .map_err(std::io::Error::other)?;
+            super::super::state::create_private_dir_all(&policy_dir)?;
+            let mut policy_body =
+                serde_json::to_string_pretty(safety).map_err(std::io::Error::other)?;
+            policy_body.push('\n');
+            super::super::state::write_private(&policy_path, &policy_body)?;
+            let settings =
+                launch_settings_value(safety, &policy_path).map_err(std::io::Error::other)?;
+            let mut body =
+                serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?;
             body.push('\n');
             super::super::state::write_private(&path, &body)
         })();
@@ -457,13 +467,17 @@ impl ClaudeAdapter {
 /// it. The operator's ordinary settings remain in force for keys omitted
 /// here; Claude merges hook arrays across settings levels and applies the
 /// most restrictive PreToolUse verdict (`deny > ask > allow`).
-fn launch_settings_value() -> Value {
+fn launch_settings_value(
+    safety: &super::super::safety::SafetyPolicy,
+    policy_path: &Path,
+) -> Result<Value, serde_json::Error> {
+    let fingerprint = super::super::safety::policy_fingerprint(safety)?;
     #[cfg_attr(windows, allow(unused_mut))]
     let mut settings = serde_json::json!({
         "disableAllHooks": false,
         "hooks": {
             "PreToolUse": [{
-                "matcher": "Bash",
+                "matcher": "Bash|PowerShell",
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx safety check"
@@ -487,7 +501,9 @@ fn launch_settings_value() -> Value {
             ]
         },
         "env": {
-            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            super::super::safety::POLICY_FINGERPRINT_ENV: fingerprint,
+            super::super::safety::POLICY_SNAPSHOT_ENV: policy_path.display().to_string()
         }
     });
 
@@ -524,7 +540,7 @@ fn launch_settings_value() -> Value {
         );
     }
 
-    settings
+    Ok(settings)
 }
 
 fn warn_launch_settings_once(path: &Path, error: &std::io::Error) {
@@ -1126,7 +1142,7 @@ impl AgentAdapter for ClaudeAdapter {
             format!("--allowedTools={allow}"),
             format!("--disallowedTools={deny}"),
         ];
-        if let Some(path) = self.launch_settings_path() {
+        if let Some(path) = self.launch_settings_path(safety) {
             args.push("--settings".to_string());
             args.push(path.display().to_string());
         }
@@ -1264,6 +1280,14 @@ impl AgentAdapter for ClaudeAdapter {
 mod tests {
     use super::*;
     use crate::commands::ctx::event::{NormalizedEvent, input_hash};
+
+    fn test_launch_settings() -> Value {
+        launch_settings_value(
+            &Default::default(),
+            Path::new("zirv-test-safety-policy.json"),
+        )
+        .expect("settings")
+    }
 
     pub(crate) fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1865,11 +1889,11 @@ mod tests {
     /// upgraded, reset, and deliberately minimal profiles unguarded.
     #[test]
     fn launch_settings_attest_the_safety_hook_and_sandbox_escape_gate() {
-        let settings = launch_settings_value();
+        let settings = test_launch_settings();
         assert_eq!(settings["disableAllHooks"], false);
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/0/matcher"),
-            Some(&serde_json::json!("Bash"))
+            Some(&serde_json::json!("Bash|PowerShell"))
         );
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
@@ -1885,10 +1909,33 @@ mod tests {
         assert_eq!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
     }
 
+    #[test]
+    fn launch_settings_bind_the_hook_to_an_immutable_policy_snapshot() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("C:/safe/policies/policy.json");
+        let settings = launch_settings_value(&policy, policy_path).expect("settings");
+        let expected =
+            super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
+
+        assert_eq!(
+            settings["env"][super::super::super::safety::POLICY_FINGERPRINT_ENV],
+            expected
+        );
+        assert_eq!(
+            settings["env"][super::super::super::safety::POLICY_SNAPSHOT_ENV],
+            policy_path.display().to_string()
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/0/matcher"),
+            Some(&serde_json::json!("Bash|PowerShell")),
+            "the identical hook must guard both native Windows and Unix shell tools"
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn launch_settings_enable_containment_and_common_credential_denials() {
-        let settings = launch_settings_value();
+        let settings = test_launch_settings();
         assert_eq!(settings["sandbox"]["enabled"], true);
         assert_eq!(settings["sandbox"]["autoAllowBashIfSandboxed"], true);
         let files = settings["sandbox"]["filesystem"]["denyRead"]
@@ -1924,19 +1971,38 @@ mod tests {
         let adapter = ClaudeAdapter::new(None)
             .with_home(home.path().to_path_buf())
             .with_live_launch_settings();
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let fingerprint =
+            super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
         let path = adapter
-            .launch_settings_path()
+            .launch_settings_path(&policy)
             .expect("settings materialized");
         assert_eq!(
             path,
             home.path()
-                .join(".zirv/runtime/claude-launch-settings.json")
+                .join(".zirv")
+                .join("runtime")
+                .join(format!("claude-launch-settings-{fingerprint}.json"))
         );
+        let policy_path = home
+            .path()
+            .join(".zirv")
+            .join("runtime")
+            .join("policies")
+            .join(format!("{fingerprint}.json"));
         let written: Value = serde_json::from_str(
             &std::fs::read_to_string(path).expect("read materialized settings"),
         )
         .expect("valid settings JSON");
-        assert_eq!(written, launch_settings_value());
+        assert_eq!(
+            written,
+            launch_settings_value(&policy, &policy_path).expect("settings")
+        );
+        let snapshotted: super::super::super::safety::SafetyPolicy = serde_json::from_str(
+            &std::fs::read_to_string(policy_path).expect("read policy snapshot"),
+        )
+        .expect("valid policy JSON");
+        assert_eq!(snapshotted, policy);
     }
 
     /// If the private settings file cannot be materialized, the projection

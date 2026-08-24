@@ -1521,9 +1521,12 @@ text, so `--simple` does not remove it—only `--no-supervise` (pure passthrough
 or the explicit opt-out below do.
 
 - **Claude interactive:** `--permission-mode default`, native workspace/tool
-  scoping, and a Bash `PreToolUse` safety hook attested on every Zirv launch
-  through a private `~/.zirv/runtime/claude-launch-settings.json` layer as the
-  sole per-command gate. The hook emits an explicit `allow` for everyday and
+  scoping, and a `Bash|PowerShell` `PreToolUse` safety hook attested on every
+  Zirv launch through fingerprinted settings and immutable policy snapshots
+  under `~/.zirv/runtime/` as the sole per-command gate. The hook evaluates
+  both the launch snapshot and the policy resolved now, keeps the stricter
+  verdict, and fails closed on a missing or tampered attestation. It emits an
+  explicit `allow` for everyday and
   unclassified commands, `ask` only for the closed dangerous list, and `deny`
   for the shorter refusal list. Zirv ships conservative Design B: no blanket
   native `Bash(*)` allow. On macOS, Linux, and WSL2 the same launch layer
@@ -1546,12 +1549,16 @@ or the explicit opt-out below do.
 built-in classifier and Claude projection. Plain `curl`/`wget`, dependency
 installation, builds, commits, in-repo writes, read utilities, and commands
 zirv has never seen are not prompt-worthy merely because they mutate or are
-unknown. Force-push, hard reset, recursive deletion, process termination,
-registry mutation and device/partition tools ask interactively; publication,
-credential reads, privilege escalation, download-to-shell pipelines, and
-attacks on zirv itself are denied. This classifier is a tripwire layered with
-the harness sandbox, not a claim that finite command globs can contain an
-arbitrary-code interpreter.
+unknown. Force-push, hard reset, local ref/stash/reflog/worktree loss, recursive deletion, process termination,
+registry mutation, remote HTTP mutations, infrastructure destruction and
+device/partition tools ask interactively. Generated-directory cleanup,
+downloads, loopback requests and dry runs stay silent. Irreversible package or
+release publication/deletion, credential-file access or upload, privilege
+escalation, download-to-shell pipelines, and attacks on zirv itself are denied.
+The structural/semantic result is identical for Unix, `cmd.exe`, and
+PowerShell spellings (including `.exe`/`.cmd` wrappers). This classifier is a
+tripwire layered with the harness sandbox, not a claim that finite command
+analysis can contain an arbitrary-code interpreter.
 
 An operator's own explicit `--sandbox`/`--ask-for-approval`/`--permission-mode`/
 `--disallowedTools` (passed after `--`, or via `worker.claude`/`worker.codex`'s
@@ -1574,7 +1581,7 @@ sandboxing off, only the operator can.
 ### Command safety policy (issue #83)
 
 `[safety]` is zirv's harness-neutral shell-command classifier. Claude projects
-it through its native rule lists and Bash hook; codex currently has no verified
+it through its native rule lists and `Bash|PowerShell` hook; codex currently has no verified
 per-command channel and relies on its sandbox/approval boundary instead:
 
 ```toml
@@ -1596,12 +1603,23 @@ silently; write-shaped, multi-statement, stdin/script-fed, malformed, or CTE
 input asks conservatively.
 
 The analyzer evaluates the most restrictive result across quote-aware compound
-segments, nested `sh`/`bash`/`zsh`/`cmd`/PowerShell inline wrappers, `$()` and
-backtick command substitutions, and every SQL client candidate it finds.
-Quoted command-looking text remains data. This structural tripwire is bounded
-against hostile input and deliberately does not decode obfuscation, expand
-variables, or read dynamically sourced scripts; the harness sandbox is the
-containment boundary beneath it.
+segments (`;`, `&`, `&&`, `||`, pipes and newlines), nested
+`sh`/`bash`/`zsh`/`cmd`/PowerShell inline wrappers, `$()` and backtick command
+substitutions, and every semantic candidate it finds. The semantic layer
+recognizes SQL writes, remote network mutations, credential-file access,
+recursive deletion, infrastructure/service destruction, and irreversible
+package/release operations using case-folded executable basenames, so native
+Windows and Unix wrapper spellings reach the same verdict. Quoted
+command-looking text remains data. This tripwire is bounded against hostile
+input and deliberately does not decode obfuscation, expand variables, or read
+dynamically sourced scripts; the harness sandbox is the containment boundary
+beneath it.
+
+Each supervised Claude decision appends a privacy-preserving audit record under
+the platform state directory's `logs/safety-decisions/` UTC-day bucket. Records
+contain the verdict, matched rule/origin, launch/current policy fingerprints,
+attestation status and SHA-256 of the command—never the raw command, source,
+paths, tokens, or shell secrets.
 
 `deny`/`ask` may be extended by a repo checkout (narrowing is always safe—both
 are checked before `allow`); `allow`, both defaults, and `sql` may not. A
@@ -1617,7 +1635,8 @@ zirv ctx safety explain --mode headless -- git push --force  # rule plus launch 
 ```
 
 `zirv ctx safety check` (with no trailing command) is also what `zirv setup
-apply` wires into claude's `PreToolUse` hook for `Bash` calls, so the same
+apply` wires into claude's `PreToolUse` hook for `Bash` and `PowerShell` calls,
+so the same
 evaluator zirv's own CLI uses is what claude consults before running a
 command — see [Context Management](#context-management-zirv-ctx).
 
