@@ -832,6 +832,16 @@ mod tests {
                 "ZIRV_CTX_AGENT_BIN".to_string(),
                 format!("sh {}", fixture("fake-agent.sh").display()),
             ),
+            // T8: `run_with`'s `sleep_fn` is real `std::thread::sleep`, and a
+            // fresh temp state dir has no usage source by construction --
+            // see the identical comment on `exec.rs`'s and `run_loop.rs`'s
+            // own `base_env`. Without this, any delegated run through this
+            // module's `run_with` pays the real, wall-clock fail-safe delay
+            // (default 60s) once per call.
+            (
+                "ZIRV_CTX_PACE_BLIND_DELAY_SECS".to_string(),
+                "0".to_string(),
+            ),
         ]
         .into()
     }

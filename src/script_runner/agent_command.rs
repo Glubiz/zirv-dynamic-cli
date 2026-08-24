@@ -322,6 +322,12 @@ mod tests {
         let _env = crate::commands::ctx::testenv::VarGuard::set(&[
             (STATE_ENV, state.to_str()),
             ("ZIRV_CTX_AGENT_BIN", Some(&agent_bin)),
+            // T8: `run_supervised` reads the real process env, and a fresh
+            // temp state dir has no usage source by construction -- without
+            // this, the real fail-safe delay (default 60s) is paid on the
+            // wall clock. See the identical comment on `exec.rs`'s own
+            // `base_env`.
+            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
         ]);
 
         let mut cmd = agent_step("go");
@@ -382,6 +388,9 @@ mod tests {
                 format!("sh {}", fixture("fake-agent.sh").display()),
             );
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            // T8: see the identical comment on `codex_runs_as_a_supported_
+            // script_agent` -- `run_supervised` reads the real process env.
+            std::env::set_var("ZIRV_CTX_PACE_BLIND_DELAY_SECS", "0");
         }
 
         let cmd = agent_step("do the work");
@@ -394,6 +403,7 @@ mod tests {
             std::env::remove_var(STATE_ENV);
             std::env::remove_var("ZIRV_CTX_AGENT_BIN");
             std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("ZIRV_CTX_PACE_BLIND_DELAY_SECS");
         }
 
         assert!(result.is_ok(), "expected success, got {result:?}");
@@ -412,6 +422,9 @@ mod tests {
                 format!("sh {}", fixture("fake-agent.sh").display()),
             );
             std::env::set_var("FAKE_AGENT_MODE", "fail");
+            // T8: see the identical comment on `codex_runs_as_a_supported_
+            // script_agent` -- `run_supervised` reads the real process env.
+            std::env::set_var("ZIRV_CTX_PACE_BLIND_DELAY_SECS", "0");
         }
 
         let cmd = agent_step("do the work");
@@ -424,6 +437,7 @@ mod tests {
             std::env::remove_var(STATE_ENV);
             std::env::remove_var("ZIRV_CTX_AGENT_BIN");
             std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("ZIRV_CTX_PACE_BLIND_DELAY_SECS");
         }
 
         let err = result.expect_err("a nonzero exit must fail the step");
@@ -443,6 +457,9 @@ mod tests {
                 format!("sh {}", fixture("fake-agent.sh").display()),
             );
             std::env::set_var("FAKE_AGENT_MODE", "fail");
+            // T8: see the identical comment on `codex_runs_as_a_supported_
+            // script_agent` -- `run_supervised` reads the real process env.
+            std::env::set_var("ZIRV_CTX_PACE_BLIND_DELAY_SECS", "0");
         }
 
         let mut cmd = agent_step("do the work");
@@ -459,6 +476,7 @@ mod tests {
             std::env::remove_var(STATE_ENV);
             std::env::remove_var("ZIRV_CTX_AGENT_BIN");
             std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("ZIRV_CTX_PACE_BLIND_DELAY_SECS");
         }
 
         assert!(
