@@ -339,9 +339,64 @@ fn last_line_of(screen: &vt100::Screen) -> String {
 /// the injected text was ever entered. `wrap::inject_compact` (`wrap.rs:477`)
 /// already establishes this codebase's convention for the same job -- write
 /// the text, then exactly one `\r`, because a TUI submits on carriage return
-/// -- and `inject_visible` now follows it.
+/// -- and `inject_visible` follows the same "text, then one `\r`" shape,
+/// though (issue #114) it no longer writes them in the same `write_all`; see
+/// [`INJECTION_SUBMIT_DELAY`] for why.
 fn visible_injection_line(label: &str, body: &str) -> String {
     format!("[zirv \u{25b8} {label}] {body}")
+}
+
+/// How long `inject_visible` waits between writing an injected line and the
+/// lone `\r` that submits it -- issue #114.
+///
+/// Observed against codex's ratatui composer: a burst of bytes that arrive
+/// within a few milliseconds of each other is read as a paste, and a `\r`
+/// inside that burst is folded into the pasted text as a literal newline
+/// rather than read as a submit keypress. The injected line then sits typed
+/// but unsubmitted in the composer until a human happens to press Enter. A
+/// real terminal never produces a paste and a keypress in the same instant,
+/// so the two writes below are separated by this gap, which is enough for
+/// the child's TUI to see the line arrive, settle, and then see the `\r`
+/// arrive on its own as an ordinary keypress rather than as the tail of the
+/// paste burst.
+///
+/// A hardcoded constant, deliberately not a new `.zirv` config key: an older
+/// installed zirv binary hard-fails on an unknown settings key (see
+/// CLAUDE.md's "This Windows dev machine" notes), so a config knob here
+/// would force a coupled binary-then-config rollout for a value no operator
+/// is expected to ever need to tune.
+///
+/// Blocking the dashboard's single UI thread for this long on every
+/// injection is accepted: injections are rare (an operator nudge, a swept
+/// mail message, a report-back reminder -- at most a handful a minute), and
+/// 50ms is well under what reads as latency to a human watching the pane.
+const INJECTION_SUBMIT_DELAY: Duration = Duration::from_millis(50);
+
+/// Performs one two-phase visible injection against `writer`: the labelled
+/// line ([`visible_injection_line`], scrubbed) with **no** control bytes of
+/// its own, then `settle` (the delay hook -- see [`INJECTION_SUBMIT_DELAY`]),
+/// then a lone `\r` alone, the *only* control byte either write carries.
+///
+/// `settle` is a test seam: `inject_visible` passes a hook that actually
+/// sleeps for the requested duration; tests pass one that only records the
+/// call, so the two writes -- and the gap between them -- are assertable
+/// without a real TUI on the other end of a pty. Both writes are flushed
+/// individually so the settle gap is measured between two bytes that have
+/// actually left this process, not two bytes sitting in the same unflushed
+/// buffer.
+fn write_two_phase_injection(
+    writer: &mut dyn Write,
+    label: &str,
+    body: &str,
+    settle: &mut dyn FnMut(Duration),
+) -> std::io::Result<()> {
+    let line = visible_injection_line(&scrub_controls(label), &scrub_controls(body));
+    writer.write_all(line.as_bytes())?;
+    writer.flush()?;
+    settle(INJECTION_SUBMIT_DELAY);
+    writer.write_all(b"\r")?;
+    writer.flush()?;
+    Ok(())
 }
 
 /// The suffix `body_for_injection` appends when it had to cut a body short,
@@ -430,8 +485,15 @@ pub(crate) fn capped_injection(label: &str, body: &str, cap: usize) -> (String, 
     )
 }
 
-/// Pure: the exact bytes one visible injection writes into the child's pty --
-/// the labelled line, then exactly one `\r` to submit it.
+/// Pure: the concatenation of the bytes one visible injection writes into
+/// the child's pty -- the labelled line, then exactly one `\r` to submit it.
+///
+/// Kept for the byte-level invariant tests below: since issue #114,
+/// `inject_visible` no longer writes this in one `write_all`
+/// ([`write_two_phase_injection`] splits it in two, with a settle gap
+/// between them), but the invariant this proves -- exactly one control byte
+/// in the whole injection, and it is the trailing submission -- holds
+/// identically whether the bytes cross the pty in one write or two.
 ///
 /// Both the label and the body are scrubbed here as a floor, whatever the
 /// caller did: the label carries a sender-supplied agent name and the body is
@@ -694,6 +756,26 @@ pub struct Pane {
     /// that leaves a pane's owner must call `shutdown` explicitly (mirrors
     /// `RawGuard`/`SessionGuard`'s own `done`/`released` fields).
     done: bool,
+    /// Issue #115: the address this worker pane was told, at spawn time, to
+    /// report its outcome back to (`spawnreq::SpawnRequest::requested_by`,
+    /// via `compose_worker_prompt`/`worker_task_prompt`'s report-back
+    /// layer) -- `Some` only when the caller judged the requester
+    /// addressable AND mail delivery enabled, i.e. only when a real
+    /// report-back instruction was actually attached to this pane's launch.
+    /// `None` for the dashboard's own orchestrator pane and for a worker
+    /// pane whose requester could not be named. Set once, by
+    /// `set_report_to`, never by `Pane::spawn` itself -- the caller
+    /// (`fulfill_spawn_request`) already computed `req.requested_by`'s
+    /// addressability for the report-back layer and is the only place that
+    /// answer exists.
+    report_to: Option<String>,
+    /// Whether `report_back_reminder_sweep`'s one-shot completion reminder
+    /// has already been injected into this pane. Set the moment that
+    /// injection succeeds and never cleared again -- unlike
+    /// `injected_awaiting_turn`, a turn boundary does not reset it, because
+    /// the whole point is "remind at most once in this pane's life," not
+    /// "once per turn."
+    report_reminder_sent: bool,
 }
 
 impl Pane {
@@ -856,6 +938,8 @@ impl Pane {
             user_typed_since_turn: false,
             exit_code: None,
             done: false,
+            report_to: None,
+            report_reminder_sent: false,
         })
     }
 
@@ -1239,6 +1323,47 @@ impl Pane {
         &self.session_id
     }
 
+    /// Issue #115: records the address this pane was told to report its
+    /// outcome back to (`None` if it was not told at all). Meant to be
+    /// called at most once, right after `Pane::spawn`, by the same caller
+    /// that decided whether a report-back instruction was actually attached
+    /// to this pane's launch prompt -- see [`Pane::report_to`]'s own doc
+    /// comment. Also resets `report_reminder_sent`, so a pane freshly given
+    /// a target is always eligible for its one reminder.
+    pub fn set_report_to(&mut self, report_to: Option<String>) {
+        self.report_to = report_to;
+        self.report_reminder_sent = false;
+    }
+
+    /// The address `report_back_reminder_sweep` reminds this pane to report
+    /// its outcome back to, if any.
+    pub fn report_to(&self) -> Option<&str> {
+        self.report_to.as_deref()
+    }
+
+    /// Whether `report_back_reminder_sweep`'s one-shot reminder has already
+    /// been injected into this pane.
+    pub fn report_reminder_sent(&self) -> bool {
+        self.report_reminder_sent
+    }
+
+    /// Marks this pane as having received its one-shot report-back reminder,
+    /// so `report_back_reminder_sweep` never injects a second one.
+    pub fn mark_report_reminder_sent(&mut self) {
+        self.report_reminder_sent = true;
+    }
+
+    /// Whether this pane's child has produced any output at all since it was
+    /// spawned -- `report_back_reminder_sweep`'s cheapest available signal
+    /// for "this worker actually ran and went quiet" as opposed to "this
+    /// pane has never done anything yet" (both read as merely `injectable()`
+    /// otherwise). Reuses `last_output_at`, the same timestamp `drain()`
+    /// already stamps on every batch of bytes read from the child, rather
+    /// than adding a new field that duplicates it.
+    pub fn has_produced_output(&self) -> bool {
+        self.last_output_at.is_some()
+    }
+
     /// This pane's registry verb (`Verb::Chat` for the orchestrator,
     /// `Verb::Dash` for a worker pane) -- see the field's own doc comment.
     pub fn verb(&self) -> Verb {
@@ -1252,10 +1377,11 @@ impl Pane {
     }
 
     /// Writes a visible, clearly-labelled line into the child's own pty --
-    /// `"[zirv ▸ {label}] {body}"` followed by exactly one `\r` to submit it,
-    /// the same framing `wrap::inject_compact` uses. Used by Task 9's
-    /// idle-gated intervention (an operator nudge, or a swept mail message) to
-    /// put text in front of the agent the same way a human typing at the
+    /// `"[zirv ▸ {label}] {body}"` then, after a settle gap, exactly one `\r`
+    /// to submit it (issue #114: [`write_two_phase_injection`] /
+    /// [`INJECTION_SUBMIT_DELAY`]). Used by Task 9's idle-gated intervention
+    /// (an operator nudge, a swept mail message, or a report-back reminder)
+    /// to put text in front of the agent the same way a human typing at the
     /// prompt would, rather than any side channel the agent has to know to
     /// look for.
     ///
@@ -1267,28 +1393,32 @@ impl Pane {
     /// On success the pane reports `Working` until its next turn signal
     /// (`injected_awaiting_turn`), so a second idle-gated caller later in the
     /// same tick sees a busy pane rather than the stale `Idle` this one just
-    /// acted on. A failed write leaves the flag alone: nothing was typed, so
-    /// nothing is pending.
+    /// acted on. A failed write (either phase) leaves the flag alone: no
+    /// submission ever reached the child, so no turn is pending.
     ///
-    /// H1 (review): the injection also stamps `last_local_input_at`, and it
-    /// stamps *before* the write, on the same "bytes may already have
-    /// reached the cursor" rationale as `write_operator_input`: `write_all`/
-    /// `flush` can fail after delivering part of the line, and an unstamped
-    /// early return would leave a signal-less pane reading as quiet again on
-    /// the very next tick, letting a retry (or the unthrottled nudge drain
-    /// following the mail sweep in the same tick) type on top of the partial
-    /// delivery. A wasted quiet window on a fully-failed write is the safe
-    /// direction; a double-typed line is not. `injected_awaiting_turn` stays
-    /// successful-write-only: a failed write has no turn to await, and for a
-    /// signal-less pane the freshly stamped clock alone holds the pane
-    /// non-idle for a full `idle_quiet` window either way.
+    /// H1 (review) / issue #114: `last_local_input_at` is stamped once, after
+    /// the *second* write succeeds, not before the first as H1 originally
+    /// had it -- deliberately so signal-less quiescence
+    /// (`signal_less_quiescent`) measures its `idle_quiet` window from the
+    /// injection's actual end (once the child has the whole submitted line)
+    /// rather than from before the settle gap even started, which would let
+    /// a signal-less pane's quiet window begin ticking while the submission
+    /// itself was still pending. The trade H1 was guarding against --
+    /// bytes reaching the cursor on a write that then fails, leaving the
+    /// clock unstamped -- is accepted here: a first-phase failure means only
+    /// an unsubmitted, unlabelled-as-typed line sits in the composer, and the
+    /// caller's `Err` surfaces it rather than silently limping on.
+    /// `injected_awaiting_turn` stays successful-write-only, unchanged.
     pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
-        // One write, not two (line then `\r`): a single `write_all` cannot
-        // leave a half-typed line behind if the second write fails. The
-        // control-character scrub is applied inside `injection_bytes` for
-        // every caller, mail sweep and operator nudge alike (R3).
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| "dashboard pane: writer lock poisoned")?;
+            let sink: &mut dyn Write = &mut **writer;
+            write_two_phase_injection(sink, label, body, &mut |d| std::thread::sleep(d))?;
+        }
         self.last_local_input_at = Some(Instant::now());
-        self.write_input(&injection_bytes(label, body))?;
         self.injected_awaiting_turn = true;
         Ok(())
     }
@@ -2435,6 +2565,99 @@ pub(crate) mod tests {
         assert_eq!(bytes[bytes.len() - 1], b'\r', "and it is the submission");
     }
 
+    /// Records each `write_all` call `write_two_phase_injection` makes as its
+    /// own chunk (this impl always accepts the whole buffer in one `write`
+    /// call, so one `write_all` produces exactly one chunk here), so a test
+    /// can assert the two-write shape issue #114 requires without a real pty.
+    struct RecordingWriter {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.chunks.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Issue #114: the fix's central shape -- the label/body line and the
+    /// submitting `\r` cross the pty as two separate writes, with the settle
+    /// hook invoked exactly once, between them, with the documented const.
+    #[test]
+    fn write_two_phase_injection_writes_the_line_then_settles_then_writes_the_lone_cr() {
+        let mut writer = RecordingWriter { chunks: Vec::new() };
+        let mut settle_calls: Vec<Duration> = Vec::new();
+
+        write_two_phase_injection(&mut writer, "nudge from operator", "hello", &mut |d| {
+            settle_calls.push(d);
+        })
+        .expect("write must succeed against an in-memory sink");
+
+        assert_eq!(
+            writer.chunks.len(),
+            2,
+            "exactly two separate writes reach the pty: {:?}",
+            writer.chunks
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&writer.chunks[0]),
+            "[zirv \u{25b8} nudge from operator] hello",
+            "the first write is the visible line, with nothing appended"
+        );
+        assert!(
+            !writer.chunks[0].iter().any(|b| *b < 0x20 || *b == 0x7f),
+            "the first write carries no control bytes of its own: {:?}",
+            String::from_utf8_lossy(&writer.chunks[0])
+        );
+        assert_eq!(
+            writer.chunks[1], b"\r",
+            "the second write is exactly one byte -- the submission"
+        );
+        assert_eq!(
+            settle_calls,
+            vec![INJECTION_SUBMIT_DELAY],
+            "the delay hook ran exactly once, between the two writes, for the documented const"
+        );
+    }
+
+    /// The scrub-then-split invariant `an_injection_writes_exactly_one_
+    /// control_byte` proved for the old single-write shape still holds once
+    /// the write is split in two: across both chunks combined there is
+    /// still exactly one control byte, and it is still the trailing `\r`.
+    #[test]
+    fn a_two_phase_injection_still_carries_exactly_one_control_byte_total() {
+        let mut writer = RecordingWriter { chunks: Vec::new() };
+
+        write_two_phase_injection(
+            &mut writer,
+            "mail from claude\r/aaaa1111",
+            "line one\r\nline two\u{1b}[2Jline three\u{7f}",
+            &mut |_| {},
+        )
+        .expect("write must succeed against an in-memory sink");
+
+        assert_eq!(writer.chunks.len(), 2, "still exactly two writes");
+        let all: Vec<u8> = writer.chunks.iter().flatten().copied().collect();
+        let controls: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b < 0x20 || **b == 0x7f)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            controls.len(),
+            1,
+            "exactly one control byte across both writes: {:?}",
+            String::from_utf8_lossy(&all)
+        );
+        assert_eq!(controls[0], all.len() - 1, "and it is the very last byte");
+        assert_eq!(all[all.len() - 1], b'\r', "and it is the submission");
+    }
+
     /// A trivial, immediately-exiting command: never a real agent (the
     /// ABSOLUTE rule this plan spells out), just enough of a child for
     /// `Pane::spawn` to have something real to supervise. Mirrors the
@@ -2482,7 +2705,7 @@ pub(crate) mod tests {
     /// last-output timestamp rather than racing a harness that might repaint
     /// on its own.
     #[cfg(windows)]
-    fn silent_after_first_line_argv() -> Vec<String> {
+    pub(crate) fn silent_after_first_line_argv() -> Vec<String> {
         vec![
             "cmd".to_string(),
             "/c".to_string(),
@@ -2491,7 +2714,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
-    fn silent_after_first_line_argv() -> Vec<String> {
+    pub(crate) fn silent_after_first_line_argv() -> Vec<String> {
         vec![
             "sh".to_string(),
             "-c".to_string(),
