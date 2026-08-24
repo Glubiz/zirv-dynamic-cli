@@ -628,8 +628,9 @@ impl AgentAdapter for CodexAdapter {
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
         safety: &crate::commands::ctx::safety::SafetyPolicy,
+        mode: super::LaunchMode,
     ) -> Vec<String> {
-        let _ = (sandbox, safety);
+        let _ = (sandbox, safety, mode);
         vec![
             "--sandbox".to_string(),
             "workspace-write".to_string(),
@@ -1397,7 +1398,11 @@ mod tests {
     fn default_sandbox_args_pairs_workspace_write_with_never_ask() {
         let adapter = CodexAdapter::new(None);
         assert_eq!(
-            adapter.default_sandbox_args(&Default::default(), &Default::default()),
+            adapter.default_sandbox_args(
+                &Default::default(),
+                &Default::default(),
+                super::super::LaunchMode::Headless,
+            ),
             vec![
                 "--sandbox".to_string(),
                 "workspace-write".to_string(),
@@ -1411,7 +1416,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_never_emits_the_dangerous_bypass_flag() {
         let adapter = CodexAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         assert!(
             !args
                 .iter()

@@ -550,7 +550,8 @@ pub(crate) fn dash_orchestrator_pane(
     // args`) scans the argv built so far, so an operator's own explicit
     // `--sandbox`/`--ask-for-approval`/`--permission-mode`/
     // `--disallowedTools` (passed after `--` on `zirv chat`) still wins.
-    let sandbox_extra = adapters::policy_launch_args(cfg, adapter, &argv);
+    let sandbox_extra =
+        adapters::policy_launch_args(cfg, adapter, &argv, adapters::LaunchMode::Interactive);
     // Visible, not silent: the one interactive pane a human is actually
     // watching gets the same announcement every headless seam does. `Chrome
     // events`/`--quiet` govern it identically (`cfg.chrome.events`); no
@@ -1251,7 +1252,11 @@ mod tests {
         // R1: the session pin is launch plumbing, not injected instruction --
         // `--simple` promises the agent no zirv-authored text, and a pane that
         // cannot be resumed after a quit is not what it is asking for.
-        expected.extend(adapter.default_sandbox_args(&Default::default(), &Default::default()));
+        expected.extend(adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::adapters::LaunchMode::Interactive,
+        ));
         expected.extend(adapter.session_pin_args("11111111-2222-4333-8444-555555555555"));
         assert_eq!(
             pane.argv, expected,

@@ -85,6 +85,46 @@ pub(crate) fn classify_model_flag(arg: &str) -> Option<ModelFlagForm<'_>> {
     None
 }
 
+/// Whether the launch this argv is being built for has a human sitting in
+/// front of it who can answer an approval prompt.
+///
+/// This is the one distinction zirv's shipped posture could not previously
+/// express, and it is why `--permission-mode dontAsk` had to be applied to
+/// interactive sessions too: with no way to say "someone is watching", the
+/// only safe answer was the fail-closed one. Every real-launch seam
+/// (`chat.rs`, `wrap.rs`, `dash/mod.rs`, `handover.rs`, `exec.rs`,
+/// `run_loop.rs`, `agent.rs`) now states its own answer, and the compiler
+/// -- not a comment -- is what keeps a new seam from forgetting to.
+///
+/// `ValueEnum` so `zirv ctx safety explain --mode <...>` can take it
+/// directly; the derived value names are already `interactive`/`headless`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LaunchMode {
+    /// `zirv chat`, `zirv ctx wrap`, a dashboard pane, a live handover swap:
+    /// the harness's own TUI is on a terminal the operator is watching, so an
+    /// `Ask` verdict becomes a real prompt they can answer.
+    Interactive,
+    /// `zirv ctx exec`, `zirv ctx loop`, `zirv ctx agent`: nobody is present,
+    /// so an `Ask` verdict is an unanswerable prompt and must fail closed.
+    Headless,
+}
+
+// Task 1 lands these accessors before the later policy/report tasks consume
+// them in production; the seam tests exercise both in the meantime.
+#[allow(dead_code)]
+impl LaunchMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            LaunchMode::Interactive => "interactive",
+            LaunchMode::Headless => "headless",
+        }
+    }
+
+    pub fn is_interactive(self) -> bool {
+        matches!(self, LaunchMode::Interactive)
+    }
+}
+
 /// Whether `flags` already pins one of the CLI-level policy flags
 /// `AgentAdapter::policy_args`/`default_sandbox_args` might otherwise
 /// prepend: claude's `--disallowedTools`/`--allowedTools`/`--permission-
@@ -1014,8 +1054,9 @@ pub trait AgentAdapter: std::fmt::Debug {
         &self,
         sandbox: &super::config::SandboxConfig,
         safety: &super::safety::SafetyPolicy,
+        mode: LaunchMode,
     ) -> Vec<String> {
-        let _ = (sandbox, safety);
+        let _ = (sandbox, safety, mode);
         Vec::new()
     }
 
@@ -1880,9 +1921,10 @@ pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter
 /// The argv `policy_launch_args` prepends ahead of an operator's own
 /// trailing flags, at every real-launch seam this codebase builds
 /// (`agent.rs::worker_launch_flags`, `exec.rs`, `run_loop.rs`, `wrap.rs`,
-/// `chat.rs::dash_orchestrator_pane`, `dash::mod::fulfill_spawn_request`) --
-/// the one function all six call, so "operator's own choice always wins" and
-/// the shipped-default posture can never drift between seams.
+/// `chat.rs::dash_orchestrator_pane`, `dash::mod::fulfill_spawn_request`,
+/// `handover.rs::resolve_swap_launch`) -- the one function all seven call,
+/// so "operator's own choice always wins" and the shipped-default posture
+/// can never drift between seams.
 ///
 /// `Vec::new()` when `flags_pin_policy(flags)`: the operator's own explicit
 /// flag wins outright, nothing of zirv's own is prepended at all. Otherwise:
@@ -1897,12 +1939,13 @@ pub fn policy_launch_args(
     cfg: &CtxConfig,
     adapter: &dyn AgentAdapter,
     flags: &[String],
+    mode: LaunchMode,
 ) -> Vec<String> {
     if flags_pin_policy(flags) {
         return Vec::new();
     }
     let mut out = if cfg.sandbox.enabled {
-        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety)
+        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety, mode)
     } else {
         Vec::new()
     };
@@ -2277,6 +2320,43 @@ pub fn command_matches_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interactive/headless seam itself (2026-08-24, cross-harness
+    /// permissions): the enum every real-launch call site now has to answer
+    /// with. Landing the parameter with no behaviour change is deliberate --
+    /// the compiler forces all seven seams to state their own posture
+    /// before any task actually branches on it.
+    #[test]
+    fn launch_mode_names_the_two_postures_the_projection_splits_on() {
+        assert_eq!(LaunchMode::Interactive.label(), "interactive");
+        assert_eq!(LaunchMode::Headless.label(), "headless");
+        assert!(LaunchMode::Interactive.is_interactive());
+        assert!(!LaunchMode::Headless.is_interactive());
+    }
+
+    /// Task 1 carries the parameter and nothing else: both modes must still
+    /// produce the exact argv today's single-posture projection produces, on
+    /// both registered adapters. Task 3/Task 6 are what make them differ.
+    #[test]
+    fn threading_launch_mode_changes_no_argv_yet() {
+        let cfg = CtxConfig::default();
+        for adapter in all(None) {
+            let interactive =
+                policy_launch_args(&cfg, adapter.as_ref(), &[], LaunchMode::Interactive);
+            let headless = policy_launch_args(&cfg, adapter.as_ref(), &[], LaunchMode::Headless);
+            assert_eq!(
+                interactive,
+                headless,
+                "{}: task 1 must not change any argv",
+                adapter.name()
+            );
+            assert!(
+                !interactive.is_empty(),
+                "{}: sandbox is on by default",
+                adapter.name()
+            );
+        }
+    }
 
     /// A permissive `CtxConfig` (every agent enabled, no `agent_bin`
     /// override) for tests that only care about selection, not gating.

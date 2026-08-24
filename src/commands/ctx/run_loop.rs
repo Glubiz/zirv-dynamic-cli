@@ -296,7 +296,12 @@ pub(crate) fn run_with_clock<W: Write>(
         // operator's own config did. `flags_pin_policy` reads `user_extra`,
         // so an operator's own `--sandbox`/`--ask-for-approval`/
         // `--permission-mode`/`--disallowedTools` still wins.
-        let policy_extra = adapters::policy_launch_args(&cfg, adapter.as_ref(), &user_extra);
+        let policy_extra = adapters::policy_launch_args(
+            &cfg,
+            adapter.as_ref(),
+            &user_extra,
+            adapters::LaunchMode::Headless,
+        );
         // Visible, not silent: announced every cycle, the same "at every
         // session start" discipline the M2 injection-attribution comment
         // just below already follows -- each `loop` cycle genuinely is a

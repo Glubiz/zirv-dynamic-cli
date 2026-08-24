@@ -2060,7 +2060,12 @@ fn worker_pane_extra_args(
     session_id: &str,
 ) -> Vec<String> {
     let mut extra = pane_model_args(req, cfg, adapter);
-    extra.extend(adapters::policy_launch_args(cfg, adapter, &[]));
+    extra.extend(adapters::policy_launch_args(
+        cfg,
+        adapter,
+        &[],
+        adapters::LaunchMode::Interactive,
+    ));
     extra.extend(pane_launch_extra(adapter, prompt_args, session_id));
     extra
 }

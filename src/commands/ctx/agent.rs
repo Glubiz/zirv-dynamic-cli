@@ -132,7 +132,8 @@ fn worker_launch_flags(
     adapter: &dyn AgentAdapter,
     flags: &[String],
 ) -> Vec<String> {
-    let policy_extra = adapters::policy_launch_args(cfg, adapter, flags);
+    let policy_extra =
+        adapters::policy_launch_args(cfg, adapter, flags, adapters::LaunchMode::Headless);
     if flags_pin_model(flags) {
         let mut out = policy_extra;
         out.extend_from_slice(flags);
@@ -482,7 +483,11 @@ mod tests {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let flags = vec!["--model".to_string(), "opus".to_string()];
-        let mut expected = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let mut expected = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::adapters::LaunchMode::Headless,
+        );
         expected.extend(flags.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &adapter, &flags),
@@ -491,8 +496,11 @@ mod tests {
         );
 
         let joined = vec!["--model=opus".to_string()];
-        let mut expected_joined =
-            adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let mut expected_joined = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::adapters::LaunchMode::Headless,
+        );
         expected_joined.extend(joined.iter().cloned());
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &adapter, &joined),
@@ -624,7 +632,11 @@ mod tests {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let mut expected = vec!["--model".to_string(), "sonnet".to_string()];
-        expected.extend(adapter.default_sandbox_args(&Default::default(), &Default::default()));
+        expected.extend(adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::adapters::LaunchMode::Headless,
+        ));
         assert_eq!(worker_launch_flags(&cfg, "claude", &adapter, &[]), expected);
     }
 
@@ -669,8 +681,11 @@ mod tests {
 
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         let mut expected_claude = vec!["--model".to_string(), "sonnet".to_string()];
-        expected_claude
-            .extend(claude.default_sandbox_args(&Default::default(), &Default::default()));
+        expected_claude.extend(claude.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::adapters::LaunchMode::Headless,
+        ));
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &claude, &[]),
             expected_claude
@@ -731,8 +746,11 @@ mod tests {
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         let claude_flags = worker_launch_flags(&cfg, "claude", &claude, &[]);
         let mut expected_claude = vec!["--model".to_string(), "sonnet".to_string()];
-        expected_claude
-            .extend(claude.default_sandbox_args(&Default::default(), &Default::default()));
+        expected_claude.extend(claude.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::adapters::LaunchMode::Headless,
+        ));
         expected_claude.push("--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string());
         assert_eq!(claude_flags, expected_claude);
 

@@ -199,7 +199,12 @@ pub fn resolve_swap_launch(
     req: &HandoverRequest,
 ) -> CtxResult<(Box<dyn adapters::AgentAdapter>, Vec<String>)> {
     let new_adapter = adapters::select(Some(&req.target_agent), &[], cfg)?;
-    let mut extra = adapters::policy_launch_args(cfg, new_adapter.as_ref(), &[]);
+    let mut extra = adapters::policy_launch_args(
+        cfg,
+        new_adapter.as_ref(),
+        &[],
+        adapters::LaunchMode::Interactive,
+    );
     if let Some(model) = &req.target_model {
         extra.extend(new_adapter.model_args(model));
     }

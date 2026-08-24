@@ -569,7 +569,12 @@ pub(crate) fn run_with_clock<W: Write>(
     let policy_extra = if policy_skip {
         Vec::new()
     } else {
-        adapters::policy_launch_args(&cfg, adapter.as_ref(), &user_extra)
+        adapters::policy_launch_args(
+            &cfg,
+            adapter.as_ref(),
+            &user_extra,
+            adapters::LaunchMode::Headless,
+        )
     };
     // Visible, not silent: the shipped-default posture (or the operator's
     // own opt-out/override) is announced once, here, at session start --

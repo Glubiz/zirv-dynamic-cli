@@ -1530,7 +1530,12 @@ pub fn run_with(
     let policy_extra = if policy_skip {
         Vec::new()
     } else {
-        adapters::policy_launch_args(&cfg, adapter.as_ref(), rest)
+        adapters::policy_launch_args(
+            &cfg,
+            adapter.as_ref(),
+            rest,
+            adapters::LaunchMode::Interactive,
+        )
     };
     // Visible, not silent: the shipped-default posture (or the operator's
     // own opt-out/override) is announced once, here, at session start -- not

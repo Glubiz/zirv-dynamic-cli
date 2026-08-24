@@ -876,7 +876,9 @@ impl AgentAdapter for ClaudeAdapter {
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
         safety: &crate::commands::ctx::safety::SafetyPolicy,
+        mode: super::LaunchMode,
     ) -> Vec<String> {
+        let _ = mode;
         let mut allow_entries: Vec<String> = super::SHIPPED_POSTURE_ALLOW
             .iter()
             .filter(|(rule, _)| !rule.starts_with("Bash("))
@@ -1634,7 +1636,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_uses_the_verified_dont_ask_mode() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         assert_eq!(
             &args[0..2],
             &["--permission-mode".to_string(), "dontAsk".to_string()]
@@ -1650,7 +1656,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_generates_the_allow_and_deny_lists_from_the_shared_source() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         assert_eq!(args.len(), 4, "got {args:?}");
         let allow_arg = args
             .iter()
@@ -1690,7 +1700,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_allows_zirvs_own_commands() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1716,7 +1730,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_stays_byte_identical_to_the_pre_safety_shipped_default() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
 
         // `SHIPPED_POSTURE_ALLOW`'s own non-`Bash(...)` entries (`Read(./
         // **)`/`Edit(./**)` and the rest) are prepended separately only
@@ -1757,7 +1775,11 @@ mod tests {
             extra_allow: vec!["Bash(just test *)".to_string()],
             extra_deny: vec!["Bash(terraform apply *)".to_string()],
         };
-        let args = adapter.default_sandbox_args(&sandbox, &Default::default());
+        let args = adapter.default_sandbox_args(
+            &sandbox,
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1790,7 +1812,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_scopes_file_edits_to_the_workspace_not_bare_write() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1811,7 +1837,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_allows_the_scratchpad_and_claude_memory_dir() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1834,7 +1864,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_denies_editing_the_operator_zirv_layer() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let deny_arg = args
             .iter()
             .find(|a| a.starts_with("--disallowedTools="))
@@ -1846,7 +1880,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_never_emits_the_dangerous_bypass_flag() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         assert!(
             !args
                 .iter()

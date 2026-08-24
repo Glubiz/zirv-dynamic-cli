@@ -3721,7 +3721,11 @@ mod tests {
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         assert!(
             claude
-                .default_sandbox_args(&Default::default(), &Default::default())
+                .default_sandbox_args(
+                    &Default::default(),
+                    &Default::default(),
+                    super::super::adapters::LaunchMode::Headless,
+                )
                 .iter()
                 .any(|a| a.starts_with("--allowedTools=")),
             "the generated permission set must still reach the argv"
@@ -3848,7 +3852,11 @@ mod tests {
             ..CtxConfig::default()
         };
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
-        let args = claude.default_sandbox_args(&cfg.sandbox, &Default::default());
+        let args = claude.default_sandbox_args(
+            &cfg.sandbox,
+            &Default::default(),
+            super::super::adapters::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
