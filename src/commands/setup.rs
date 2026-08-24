@@ -243,6 +243,11 @@ const GUIDED_NO_BACKUPS_MESSAGE: &str = "No backup runs found yet. A backup is c
 const GUIDED_RESTORE_CONFIRM_PROMPT: &str = "Apply this restore now? The overwrites listed \
      above will happen; the current state is backed up first, so this restore can itself be \
      undone.";
+/// Shared by every guided (`dialoguer`-driven) entry point -- `run_guided`
+/// and `run_first_run` -- so both refuse the same way rather than drifting
+/// into two slightly different messages for the same condition.
+const INTERACTIVE_TERMINAL_REQUIRED: &str =
+    "interactive setup requires a terminal; use `zirv setup apply` in automation";
 
 #[derive(Debug, Serialize)]
 struct HarnessStatus {
@@ -624,6 +629,71 @@ fn set_home_ctx_toml_bool(home: &Path, table: &str, key: &str, value: bool) -> S
     }
     std::fs::write(&path, toml::to_string_pretty(&root)?)?;
     Ok(())
+}
+
+/// String sibling of `set_home_ctx_toml_bool`, same structure and same
+/// home-only guarantee. `table = None` writes a top-level key (`agent` lives
+/// at the root of `ctx.toml`, not under a section); `table = Some(t)` writes
+/// `[t] key = value` exactly like the bool version does.
+fn set_home_ctx_toml_string(
+    home: &Path,
+    table: Option<&str>,
+    key: &str,
+    value: &str,
+) -> SetupResult<()> {
+    let path = home
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join(ctx::config::CTX_CONFIG_FILE);
+    let mut root: toml::Table = if path.is_file() {
+        toml::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        toml::Table::new()
+    };
+    let target = match table {
+        Some(table) => root
+            .entry(table.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| format!("{} `[{table}]` is not a table", path.display()))?,
+        None => &mut root,
+    };
+    target.insert(key.to_string(), toml::Value::String(value.to_string()));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+    Ok(())
+}
+
+/// True when `home_zirv_dir` (the operator's `~/.zirv`) holds neither
+/// `ctx.toml` nor `.settings.toml` -- i.e. zirv has never been configured at
+/// all, and the first-run setup wizard should run before continuing into
+/// whatever command the operator typed. Pure and path-based, so it is
+/// testable without touching `HOME`; the directory itself existing (e.g. only
+/// `.shortcuts.yaml` from a plain `zirv init`) still counts as first-run.
+pub fn first_run_needed(home_zirv_dir: &Path) -> bool {
+    !home_zirv_dir.join(ctx::config::CTX_CONFIG_FILE).is_file()
+        && !home_zirv_dir.join(crate::settings::SETTINGS_FILE).is_file()
+}
+
+/// A conservative heuristic for "this directory is a project a local `.zirv`
+/// would make sense in": any of the manifest files `toolchain_proposal`
+/// already treats as an authoritative build surface, or a `.git` directory
+/// for a repository with none of those. Used only to decide whether the
+/// first-run wizard's project-layer step is worth offering at all.
+fn looks_like_project_dir(dir: &Path) -> bool {
+    const MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "Makefile",
+    ];
+    MARKERS.iter().any(|marker| dir.join(marker).exists())
 }
 
 /// Issue #87: applies the operator's answer to the memory-harvest offer.
@@ -1859,11 +1929,127 @@ fn run_reset<W: Write>(args: &ResetArgs, writer: &mut W) -> SetupResult<i32> {
     Ok(0)
 }
 
+/// Guided first-run wizard: walks a brand-new operator through scaffolding
+/// `~/.zirv`, choosing which harnesses are enabled and which is the default,
+/// picking a chat model, memory settings, and hook installation, then
+/// (optionally) a local `.zirv` for the current project. Triggered
+/// automatically by `main.rs` on a bare `zirv`/`zirv chat` the first time
+/// `first_run_needed` is true, and re-runnable on demand from `run_guided`'s
+/// own menu (`zirv setup`).
+///
+/// Every write targets the HOME layer only (`home_dir()`), never `repo`: most
+/// of the keys touched here are `REPO_FORBIDDEN` (see `ctx::config`'s own
+/// module doc), and a repo layer may only narrow what an operator already
+/// configured, never set it in the first place. The interactive body itself
+/// is deliberately thin -- every actual mutation goes through an already
+/// tested, non-interactive setter (`set_home_ctx_toml_bool`,
+/// `set_home_ctx_toml_string`, `settings::set_operator_agent_enabled`,
+/// `run_apply`, `init::scaffold_local_zirv`) -- so the only untested part is
+/// the prompt wiring itself, which cannot be automated.
+pub fn run_first_run() -> SetupResult<i32> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(INTERACTIVE_TERMINAL_REQUIRED.into());
+    }
+    println!("zirv has not been configured yet -- let's set up ~/.zirv.");
+    let home = home_dir()?;
+
+    super::init::scaffold_global_zirv()?;
+
+    let mut enabled_harnesses = Vec::new();
+    for (name, _ctor) in ctx::adapters::ADAPTERS {
+        let detected = executable_exists(name);
+        println!(
+            "{name}: {}",
+            if detected {
+                "detected on PATH"
+            } else {
+                "not detected on PATH"
+            }
+        );
+        let enable = dialoguer::Confirm::new()
+            .with_prompt(format!("Enable the {name} harness?"))
+            .default(detected)
+            .interact()?;
+        crate::settings::set_operator_agent_enabled(&home, name, enable)?;
+        if enable {
+            enabled_harnesses.push(*name);
+        }
+    }
+    if !enabled_harnesses.is_empty() {
+        let choice = dialoguer::Select::new()
+            .with_prompt("Default agent for `zirv chat` / `zirv agent`")
+            .items(&enabled_harnesses)
+            .default(0)
+            .interact()?;
+        set_home_ctx_toml_string(&home, None, "agent", enabled_harnesses[choice])?;
+    }
+
+    let model_choice = dialoguer::Select::new()
+        .with_prompt("Chat model")
+        .items(["Use the harness default", "Enter a model name"])
+        .default(0)
+        .interact()?;
+    if model_choice == 1 {
+        let model: String = dialoguer::Input::new()
+            .with_prompt("Model name")
+            .allow_empty(true)
+            .interact_text()?;
+        let model = model.trim();
+        if !model.is_empty() {
+            set_home_ctx_toml_string(&home, Some("chat"), "model", model)?;
+        }
+    }
+
+    let memory_enabled = dialoguer::Confirm::new()
+        .with_prompt("Enable zirv's memory bank?")
+        .default(true)
+        .interact()?;
+    set_home_ctx_toml_bool(&home, "memory", "enabled", memory_enabled)?;
+    let memory_harvest = dialoguer::Confirm::new()
+        .with_prompt("Enable automatic memory harvest?")
+        .default(false)
+        .interact()?;
+    set_home_ctx_toml_bool(&home, "memory", "harvest", memory_harvest)?;
+
+    let install_hooks = dialoguer::Confirm::new()
+        .with_prompt("Install harness hook integration now?")
+        .default(true)
+        .interact()?;
+    if install_hooks {
+        run_apply(
+            &ApplyArgs {
+                repo: PathBuf::from("."),
+                dry_run: false,
+                no_context: false,
+                no_memory: false,
+                no_claude_hooks: false,
+                no_codex_hooks: false,
+                memory_source: None,
+            },
+            &mut std::io::stdout(),
+        )?;
+    }
+
+    let cwd = std::env::current_dir()?;
+    if !cwd.join(crate::utils::SCRIPT_DIR_NAME).is_dir() && looks_like_project_dir(&cwd) {
+        let create_local = dialoguer::Confirm::new()
+            .with_prompt("Create a local .zirv directory here too?")
+            .default(false)
+            .interact()?;
+        if create_local {
+            super::init::scaffold_local_zirv(&cwd)?;
+        }
+    }
+
+    println!(
+        "zirv setup complete; run `zirv setup status` to review, `zirv setup` to change it later."
+    );
+    Ok(0)
+}
+
 fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(
-            "interactive setup requires a terminal; use `zirv setup apply` in automation".into(),
-        );
+        return Err(INTERACTIVE_TERMINAL_REQUIRED.into());
     }
     let action = dialoguer::Select::new()
         .with_prompt("Zirv AI setup")
@@ -1872,6 +2058,7 @@ fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
             "Show status",
             "Factory reset",
             "Restore a previous configuration",
+            "Run first-run wizard",
             "Cancel",
         ])
         .default(0)
@@ -1931,6 +2118,7 @@ fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
             )
         }
         3 => run_guided_restore(writer),
+        4 => run_first_run(),
         _ => Ok(0),
     }
 }
@@ -4140,5 +4328,112 @@ mod tests {
             status(repo.path()).expect("status").claude_statusline,
             StatuslineStatus::Absent
         );
+    }
+
+    // -- First-run setup wizard ------------------------------------------
+
+    #[test]
+    fn first_run_needed_is_true_when_neither_config_file_exists() {
+        let home_zirv = tempfile::tempdir().expect("tempdir");
+        assert!(first_run_needed(home_zirv.path()));
+    }
+
+    #[test]
+    fn first_run_needed_is_true_when_the_dir_does_not_exist_at_all() {
+        let missing = tempfile::tempdir().expect("tempdir").path().join(".zirv");
+        assert!(first_run_needed(&missing));
+    }
+
+    #[test]
+    fn first_run_needed_is_false_once_ctx_toml_exists() {
+        let home_zirv = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home_zirv.path().join(ctx::config::CTX_CONFIG_FILE), "").expect("write");
+        assert!(!first_run_needed(home_zirv.path()));
+    }
+
+    #[test]
+    fn first_run_needed_is_false_once_settings_toml_exists() {
+        let home_zirv = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home_zirv.path().join(crate::settings::SETTINGS_FILE), "").expect("write");
+        assert!(!first_run_needed(home_zirv.path()));
+    }
+
+    /// A `~/.zirv` that only holds shortcuts from a plain `zirv init` still
+    /// counts as first-run: neither config file exists yet.
+    #[test]
+    fn a_zirv_dir_with_only_shortcuts_still_counts_as_first_run() {
+        let home_zirv = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home_zirv.path().join(".shortcuts.yaml"), "shortcuts: {}\n").expect("write");
+        assert!(first_run_needed(home_zirv.path()));
+    }
+
+    #[test]
+    fn set_home_ctx_toml_string_writes_a_top_level_key() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        // `agent` is REPO_FORBIDDEN, and the environment sits above every
+        // file in that fold -- a real `ZIRV_CTX_AGENT` inherited from the
+        // process running this test (e.g. this repo's own `zirv ctx`
+        // supervision) would otherwise shadow the value this test just wrote.
+        let _var = VarGuard::set(&[("ZIRV_CTX_AGENT", None)]);
+        set_home_ctx_toml_string(home.path(), None, "agent", "codex").expect("write");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(cfg.agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn set_home_ctx_toml_string_writes_a_nested_table_key() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        set_home_ctx_toml_string(home.path(), Some("chat"), "model", "opus").expect("write");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(cfg.chat.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn set_home_ctx_toml_string_preserves_other_keys_already_in_the_file() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        set_home_ctx_toml_bool(home.path(), "memory", "enabled", false).expect("write bool");
+        set_home_ctx_toml_string(home.path(), Some("chat"), "model", "opus").expect("write string");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(cfg.chat.model.as_deref(), Some("opus"));
+        assert!(
+            !cfg.memory.enabled,
+            "a key written earlier must survive a later, unrelated write"
+        );
+    }
+
+    #[test]
+    fn looks_like_project_dir_detects_common_manifest_markers() {
+        for marker in [
+            ".git",
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "go.mod",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(marker), "").expect("write marker");
+            assert!(
+                looks_like_project_dir(dir.path()),
+                "{marker} should be recognised as a project marker"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_project_dir_is_false_for_an_empty_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!looks_like_project_dir(dir.path()));
     }
 }

@@ -204,6 +204,40 @@ fn operator_settings_path() -> Option<PathBuf> {
         .map(|home| home.join(crate::utils::SCRIPT_DIR_NAME).join(SETTINGS_FILE))
 }
 
+/// Writes `[agents.<name>] enabled = <bool>` into `<home>/.zirv/.settings.toml`,
+/// creating the file and parent directories as needed. Reads and
+/// re-serializes the whole file first, so this only ever adds/updates the one
+/// `[agents.<name>]` table -- every other section, and every other agent's own
+/// table, is left exactly as it was. Written for the first-run setup wizard
+/// (`commands::setup::run_first_run`), which only calls this while the file is
+/// known not to exist yet (`commands::setup::first_run_needed`), but it stays
+/// defensive so a later re-run (`zirv setup`'s guided menu) merges rather than
+/// silently clobbers an existing file.
+pub fn set_operator_agent_enabled(home: &Path, name: &str, enabled: bool) -> CtxResult<()> {
+    let path = home.join(crate::utils::SCRIPT_DIR_NAME).join(SETTINGS_FILE);
+    let mut root: toml::Table = if path.is_file() {
+        toml::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        toml::Table::new()
+    };
+    let agents = root
+        .entry("agents".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: `[agents]` is not a table", path.display()))?;
+    let agent = agents
+        .entry(name.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: `[agents.{name}]` is not a table", path.display()))?;
+    agent.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+    Ok(())
+}
+
 /// `Ok(None)` when the environment is silent on this agent; `Err` names the
 /// variable when it is set but not a boolean.
 fn env_override(name: &str, env: EnvLookup<'_>) -> CtxResult<Option<bool>> {
@@ -491,6 +525,66 @@ mod tests {
     fn write_settings(dir: &Path, contents: &str) {
         std::fs::create_dir_all(dir.join(".zirv")).expect("mkdir");
         std::fs::write(dir.join(".zirv").join(SETTINGS_FILE), contents).expect("write");
+    }
+
+    // -- set_operator_agent_enabled (the first-run wizard's settings writer) --
+
+    #[test]
+    fn set_operator_agent_enabled_writes_a_fresh_file_the_loader_can_read() {
+        let home = tempfile::tempdir().expect("tempdir");
+
+        set_operator_agent_enabled(home.path(), "codex", false).expect("write");
+
+        let path = home.path().join(".zirv").join(SETTINGS_FILE);
+        let settings: SettingsFile =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read back")).expect("parse");
+        assert_eq!(
+            settings.agents.get("codex").and_then(|a| a.enabled),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn set_operator_agent_enabled_merges_without_clobbering_other_agents_or_keys() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(
+            home.path(),
+            "[agents.claude]\nenabled = true\ncapacity = \"small\"\n",
+        );
+
+        set_operator_agent_enabled(home.path(), "codex", true).expect("write");
+
+        let path = home.path().join(".zirv").join(SETTINGS_FILE);
+        let settings: SettingsFile =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read back")).expect("parse");
+        assert_eq!(
+            settings.agents.get("codex").and_then(|a| a.enabled),
+            Some(true)
+        );
+        assert_eq!(
+            settings.agents.get("claude").and_then(|a| a.enabled),
+            Some(true),
+            "an unrelated agent's existing table must survive the merge"
+        );
+        assert_eq!(
+            settings.agents.get("claude").and_then(|a| a.capacity),
+            Some(Capacity::Small),
+            "an unrelated key on the same agent's table must survive the merge"
+        );
+    }
+
+    #[test]
+    fn set_operator_agent_enabled_round_trips_through_the_real_loader() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        set_operator_agent_enabled(home.path(), "codex", false).expect("write");
+
+        let empty = env_map(&[]);
+        let gate = AgentGate::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!gate.is_enabled("codex"));
+        assert!(gate.is_enabled("claude"), "only codex was disabled");
     }
 
     /// Review finding 3: without an isolated `HOME`, this read the

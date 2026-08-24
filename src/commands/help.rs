@@ -81,11 +81,19 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     )?;
     writeln!(
         writer,
-        "Bare `zirv` (no arguments) starts `zirv ctx chat` when a `.zirv` directory exists"
+        "Bare `zirv` (no arguments) starts `zirv ctx chat` when a local `.zirv` directory"
     )?;
     writeln!(
         writer,
-        "(locally or in ~/.zirv) and stdin is a real terminal; otherwise it shows this help.\n"
+        "exists here and stdin and stdout are both a real terminal; otherwise it shows this help."
+    )?;
+    writeln!(
+        writer,
+        "The first time zirv (or `zirv chat`) is run before it has ever been configured, a"
+    )?;
+    writeln!(
+        writer,
+        "guided setup wizard runs first either way -- see `zirv setup`.\n"
     )?;
     writeln!(writer, "Commands:")?;
     writeln!(writer, "  help, h        Show this help")?;

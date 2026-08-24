@@ -159,6 +159,37 @@ fn zirv_dir_present(cwd: &Path) -> bool {
     cwd.join(utils::SCRIPT_DIR_NAME).is_dir()
 }
 
+/// Whether the guided first-run setup wizard should run before continuing
+/// into whatever command the operator actually typed: only in a real
+/// interactive terminal (a script/CI invocation must never hang on a prompt),
+/// and only when zirv has genuinely never been configured
+/// (`setup::first_run_needed`). Pure so this policy -- as opposed to the
+/// wizard's own interactive body, which cannot be automated -- is testable
+/// without a pty or a real `HOME`.
+fn first_run_wizard_should_run(
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    first_run_needed: bool,
+) -> bool {
+    stdin_is_tty && stdout_is_tty && first_run_needed
+}
+
+/// Runs the guided first-run wizard when appropriate, degrading silently on
+/// any failure -- no `HOME`, a declined terminal check, Ctrl-C, any other
+/// `dialoguer` error. The wizard must never make the command the operator
+/// typed worse, so from a caller's perspective its only two outcomes are
+/// "configured, keep going exactly as planned" and "didn't run (or aborted),
+/// keep going exactly as before".
+fn maybe_run_first_run_wizard(stdin_is_tty: bool, stdout_is_tty: bool) {
+    let Ok(home) = utils::home_dir() else {
+        return;
+    };
+    let needed = setup::first_run_needed(&home.join(utils::SCRIPT_DIR_NAME));
+    if first_run_wizard_should_run(stdin_is_tty, stdout_is_tty, needed) {
+        let _ = setup::run_first_run();
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -183,14 +214,27 @@ async fn main() {
     }
 
     if let Some(verb) = top_level_ctx_alias(&argv) {
+        // Only `chat` gets the first-run gate, not `agent`: `agent` delegates
+        // one bounded task to another harness rather than opening the kind of
+        // standing interactive session first-run setup is meant to precede.
+        if verb == "chat" {
+            maybe_run_first_run_wizard(
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            );
+        }
         std::process::exit(ctx::dispatch(&rewrite_ctx_alias_args(verb, &argv)));
     }
 
     if argv.len() == 1 {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-        let zirv_exists = zirv_dir_present(&cwd);
         let stdin_is_tty = std::io::stdin().is_terminal();
         let stdout_is_tty = std::io::stdout().is_terminal();
+        maybe_run_first_run_wizard(stdin_is_tty, stdout_is_tty);
+        // Re-checked *after* the wizard: it may have just created a local
+        // `.zirv` in this directory (step 6), which should immediately count
+        // toward the target this same bare invocation resolves to.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+        let zirv_exists = zirv_dir_present(&cwd);
         match bare_invocation_target(zirv_exists, stdin_is_tty, stdout_is_tty) {
             BareTarget::Chat => {
                 std::process::exit(ctx::dispatch(&["ctx".to_string(), "chat".to_string()]));
@@ -481,6 +525,17 @@ mod tests {
         assert!(!is_top_level_memory(&argv(&["zirv"])));
         assert!(utils::is_reserved_command("memory"));
         assert!(utils::is_reserved_command("Memory"));
+    }
+
+    #[test]
+    fn first_run_wizard_runs_only_when_interactive_and_unconfigured() {
+        assert!(first_run_wizard_should_run(true, true, true));
+        assert!(!first_run_wizard_should_run(false, true, true));
+        assert!(!first_run_wizard_should_run(true, false, true));
+        assert!(
+            !first_run_wizard_should_run(true, true, false),
+            "already configured -- must not re-run"
+        );
     }
 
     /// A repo `.zirv/Memory.yaml` (any casing) must never be reachable as a

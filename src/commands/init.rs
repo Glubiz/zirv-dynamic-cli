@@ -1,21 +1,17 @@
 use dialoguer::Confirm;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Default shortcuts file content.
 const DEFAULT_SHORTCUTS: &str = r#"shortcuts:
   e: "example.yaml"
 "#;
 
-/// Initializes the global .zirv folder in the home directory and (optionally)
-/// the .zirv folder in the current directory based on the confirmation function.
-///
-/// The `confirm_fn` closure is called to determine if the user wants to initialize
-/// in the current directory. In production, you can pass a closure that uses `dialoguer::Confirm`.
-pub fn init_zirv_with<F>(confirm_fn: F) -> Result<(), Box<dyn std::error::Error>>
-where
-    F: Fn() -> Result<bool, Box<dyn std::error::Error>>,
-{
+/// Creates `~/.zirv` and its default `.shortcuts.yaml` if either is missing,
+/// leaving an existing one untouched. The global half of `init_zirv_with`,
+/// pulled out so the first-run setup wizard (`commands::setup::run_first_run`)
+/// can scaffold the operator's home layer without duplicating this logic.
+pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
     // Instead of using dirs::home_dir(), use the HOME or USERPROFILE env variable.
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -33,6 +29,37 @@ where
         fs::write(&home_shortcuts, DEFAULT_SHORTCUTS)?;
         println!("Created default .shortcuts.yaml in home directory: {home_shortcuts:?}");
     }
+    Ok(())
+}
+
+/// Creates `<current_dir>/.zirv` and its default `.shortcuts.yaml`. The local
+/// half of `init_zirv_with`'s confirmed branch, pulled out for the same
+/// reason `scaffold_global_zirv` is: the first-run wizard's project-layer
+/// step reuses it rather than duplicating the creation logic. Callers are
+/// expected to have already checked `current_dir.join(".zirv")` does not
+/// exist; this always (re-)creates it.
+pub fn scaffold_local_zirv(current_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let current_zirv = current_dir.join(".zirv");
+    fs::create_dir_all(&current_zirv)?;
+    println!("Created .zirv in current directory: {current_zirv:?}");
+    let current_shortcuts = current_zirv.join(".shortcuts.yaml");
+    if !current_shortcuts.exists() {
+        fs::write(&current_shortcuts, DEFAULT_SHORTCUTS)?;
+        println!("Created default .shortcuts.yaml in current directory: {current_shortcuts:?}");
+    }
+    Ok(())
+}
+
+/// Initializes the global .zirv folder in the home directory and (optionally)
+/// the .zirv folder in the current directory based on the confirmation function.
+///
+/// The `confirm_fn` closure is called to determine if the user wants to initialize
+/// in the current directory. In production, you can pass a closure that uses `dialoguer::Confirm`.
+pub fn init_zirv_with<F>(confirm_fn: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn() -> Result<bool, Box<dyn std::error::Error>>,
+{
+    scaffold_global_zirv()?;
 
     // Get the current directory.
     let current_dir = std::env::current_dir()?;
@@ -41,16 +68,7 @@ where
     if !current_zirv.exists() {
         let init_current = confirm_fn()?;
         if init_current {
-            fs::create_dir_all(&current_zirv)?;
-            println!("Created .zirv in current directory: {current_zirv:?}");
-            // Create default .shortcuts.yaml in current dicurrent_zirvrect
-            let current_shortcuts = current_zirv.join(".shortcuts.yaml");
-            if !current_shortcuts.exists() {
-                fs::write(&current_shortcuts, DEFAULT_SHORTCUTS)?;
-                println!(
-                    "Created default .shortcuts.yaml in current directory: {current_shortcuts:?}"
-                );
-            }
+            scaffold_local_zirv(&current_dir)?;
         } else {
             println!(".zirv not created in current directory.");
         }
