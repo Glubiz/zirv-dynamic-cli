@@ -650,6 +650,7 @@ impl AgentAdapter for CodexAdapter {
         &self,
         capability: crate::commands::ctx::policy::Capability,
         stance: crate::commands::ctx::policy::Stance,
+        mode: super::LaunchMode,
     ) -> crate::commands::ctx::policy::CapabilityDescriptor {
         use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
 
@@ -668,6 +669,20 @@ impl AgentAdapter for CodexAdapter {
              escalation prompt for a blocked action but does not by itself decide what the \
              sandbox blocks -- paired with --sandbox read-only when repo_fs_write/shell_exec \
              are also denied, which is what actually makes this hold";
+        // 2026-08-24: the interactive posture pins `--ask-for-approval
+        // on-request` when the installed binary's own `--help` documents it.
+        // Degraded, never Enforced, and the wording has to carry two facts an
+        // operator would otherwise assume wrongly: what actually contains the
+        // damage here is the SANDBOX, not a command classifier; and codex
+        // escalates on its own sandbox-boundary decision, with no per-command
+        // mechanism to receive zirv's `[safety]` rules -- so read-only-SQL
+        // silence and everyday-command silence are not carried onto this
+        // harness the way they are onto claude.
+        const APPROVAL_ASK_INTERACTIVE: &str = "-a, --ask-for-approval on-request paired with --sandbox workspace-write, probed \
+             live against the installed codex-cli's own --help before it is used: the sandbox is \
+             what contains damage, and codex escalates on its own sandbox-boundary decision with \
+             no per-command mechanism to receive zirv's [safety] classification, so approval \
+             granularity here is codex's own rather than zirv's";
 
         match (capability, stance) {
             (Capability::RepoFsWrite, Stance::Deny) => CapabilityDescriptor::degraded(SANDBOX),
@@ -679,6 +694,11 @@ impl AgentAdapter for CodexAdapter {
             }
             (Capability::Approval, Stance::Deny) => {
                 CapabilityDescriptor::degraded(APPROVAL_DENY_DEGRADED)
+            }
+            (Capability::ShellExec | Capability::Approval, Stance::Ask)
+                if mode.is_interactive() && self.on_request_approval_supported() =>
+            {
+                CapabilityDescriptor::degraded(APPROVAL_ASK_INTERACTIVE)
             }
             (Capability::ShellExec | Capability::Approval, Stance::Ask) => {
                 CapabilityDescriptor::operator_controlled(CONFIG)

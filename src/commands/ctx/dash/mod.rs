@@ -2235,6 +2235,7 @@ fn compose_worker_prompt(
         prompt::PromptRole::Worker,
         state,
         super::state::now_secs(),
+        super::adapters::LaunchMode::Interactive,
     )
     .composed;
     let system_prompt_supported = adapter.system_prompt_supported(&[]);

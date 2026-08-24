@@ -1081,8 +1081,9 @@ pub trait AgentAdapter: std::fmt::Debug {
         &self,
         capability: super::policy::Capability,
         stance: super::policy::Stance,
+        mode: LaunchMode,
     ) -> super::policy::CapabilityDescriptor {
-        let _ = (capability, stance);
+        let _ = (capability, stance, mode);
         super::policy::CapabilityDescriptor::advisory_only()
     }
 

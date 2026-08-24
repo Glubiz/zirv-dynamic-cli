@@ -1463,6 +1463,7 @@ pub fn run_with(
         role,
         &state_dir,
         super::state::now_secs(),
+        super::adapters::LaunchMode::Interactive,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -6380,6 +6381,7 @@ mod tests {
             PromptRole::Orchestrator,
             &state,
             1,
+            crate::commands::ctx::adapters::LaunchMode::Headless,
         )
         .composed
         .expect("a launch still composes a prompt");

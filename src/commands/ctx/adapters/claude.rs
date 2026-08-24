@@ -721,13 +721,15 @@ impl AgentAdapter for ClaudeAdapter {
     ///   scopes writes by path, and the available pin denies writes
     ///   everywhere, in-repo included.
     ///
-    /// No stance reports as `Enforced` or `Degraded` at `Ask`: the pin can
-    /// only deny outright, and claude's interactive ask-by-default comes
-    /// from the operator's own settings, not from anything zirv pins.
+    /// Interactive `Ask` reports as `Degraded` only where zirv now pins the
+    /// default permission mode and its own safety-hook/path allow-list seam;
+    /// headless `Ask` remains operator-controlled because `dontAsk` cannot
+    /// carry that prompt posture.
     fn policy_support(
         &self,
         capability: crate::commands::ctx::policy::Capability,
         stance: crate::commands::ctx::policy::Stance,
+        mode: super::LaunchMode,
     ) -> crate::commands::ctx::policy::CapabilityDescriptor {
         use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
 
@@ -740,10 +742,26 @@ impl AgentAdapter for ClaudeAdapter {
              resolve in headless `-p` mode";
         const SETTINGS: &str = "claude's own permission prompts and `.claude/settings.json` permissions, which zirv \
              reads and never rewrites";
+        // 2026-08-24: an INTERACTIVE launch carries `--permission-mode
+        // default` plus the `zirv ctx safety check` PreToolUse hook as the
+        // sole prompting gate. That is a real, verified per-run mechanism, so
+        // an `Ask` stance stops being purely operator-controlled -- but only
+        // `Degraded`: the hook is registered for the `Bash` tool alone, so
+        // every other tool still lands on claude's own settings.
+        const ASK_INTERACTIVE: &str = "--permission-mode default plus the `zirv ctx safety check` PreToolUse hook as the \
+             sole prompting gate, which allows everyday and unclassified commands outright and \
+             prompts only on zirv's own short dangerous-command list; the hook matches the Bash \
+             tool only, so every other tool still falls to claude's own settings";
+        const OUTSIDE_REPO_ASK_INTERACTIVE: &str = "--permission-mode default with --allowedTools scoped to Edit(./**) plus the \
+             workspace scratchpad: a write outside those paths is not pre-approved, so claude \
+             prompts rather than failing silently";
 
         match capability {
             Capability::RepoFsWrite | Capability::ShellExec => match stance {
                 Stance::Deny => CapabilityDescriptor::enforced(TOOL_PIN),
+                Stance::Ask if mode.is_interactive() => {
+                    CapabilityDescriptor::degraded(ASK_INTERACTIVE)
+                }
                 Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
             },
             Capability::ToolAccess => match stance {
@@ -752,14 +770,21 @@ impl AgentAdapter for ClaudeAdapter {
             },
             Capability::Approval => match stance {
                 Stance::Deny => CapabilityDescriptor::unsupported(APPROVAL_UNSUPPORTED),
+                Stance::Ask if mode.is_interactive() => {
+                    CapabilityDescriptor::degraded(ASK_INTERACTIVE)
+                }
                 Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
             },
-            // Network, git push/destructive git, and path-scoped writes --
-            // see this method's own doc for why each is advisory rather than
-            // carried by the pin above.
-            Capability::Network
-            | Capability::GitPushDestructive
-            | Capability::OutsideRepoFsWrite => CapabilityDescriptor::advisory_only(),
+            Capability::OutsideRepoFsWrite => match stance {
+                Stance::Ask if mode.is_interactive() => {
+                    CapabilityDescriptor::degraded(OUTSIDE_REPO_ASK_INTERACTIVE)
+                }
+                Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
+                Stance::Deny => CapabilityDescriptor::advisory_only(),
+            },
+            Capability::Network | Capability::GitPushDestructive => {
+                CapabilityDescriptor::advisory_only()
+            }
         }
     }
 

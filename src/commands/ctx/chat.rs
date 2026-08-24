@@ -145,6 +145,7 @@ fn orchestrator_initial_prompt(
         PromptRole::Orchestrator,
         state,
         super::state::now_secs(),
+        super::adapters::LaunchMode::Interactive,
     );
     let base = initial_prompt.unwrap_or_default();
     let text =
@@ -517,6 +518,7 @@ pub(crate) fn dash_orchestrator_pane(
         launch.role,
         state,
         super::state::now_secs(),
+        super::adapters::LaunchMode::Interactive,
     );
     let (mut argv, composed) = super::prompt::merge_command_line_prompt(
         adapter,

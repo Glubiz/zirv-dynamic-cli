@@ -272,6 +272,43 @@ impl EffectivePolicy {
             tool_access: Stance::Deny,
         }
     }
+
+    /// The stances zirv's own shipped INTERACTIVE projection actually
+    /// delivers, before any `[policy]` table narrows anything -- the spec's
+    /// own defaults table (`docs/superpowers/specs/2026-08-24-cross-harness-
+    /// permissions-design.md`), stated once so `PolicyReport::render` can
+    /// show an operator what an unconfigured interactive launch carries.
+    ///
+    /// Deliberately **not** `EffectivePolicy::default()`, and deliberately
+    /// **not** an input to [`resolve`]'s fold. `Default` means "zirv declares
+    /// no restriction of its own" and is what `narrowed_by`'s widening
+    /// defense rests on; folding this in instead would silently narrow every
+    /// headless launch too, and -- because the fold is a `max` -- would make
+    /// an operator's own `ZIRV_CTX_POLICY_OUTSIDE_REPO_FS_WRITE=allow`
+    /// unexpressible, since `max(Ask, Allow)` is `Ask`. This is a reported
+    /// baseline: it describes what the argv in
+    /// `ClaudeAdapter::default_sandbox_args` amounts to, and nothing decides
+    /// anything from it.
+    pub fn interactive_baseline() -> Self {
+        EffectivePolicy {
+            // `Edit(./**)` is pre-approved on the allow list.
+            repo_fs_write: Stance::Allow,
+            // Not pre-approved, so `--permission-mode default` prompts --
+            // where `dontAsk` used to kill the call outright.
+            outside_repo_fs_write: Stance::Ask,
+            // Governed per command by `safety.rs`, which is the sole
+            // prompting gate on this posture: the allow set and every
+            // unclassified command run silently, the short ask set prompts,
+            // the deny set is refused by rule.
+            shell_exec: Stance::Ask,
+            // `WebFetch`/`WebSearch` are pre-approved.
+            network: Stance::Allow,
+            approval: Stance::Ask,
+            // Force-push and history rewrites are in the built-in ask set.
+            git_push_destructive: Stance::Ask,
+            tool_access: Stance::Allow,
+        }
+    }
 }
 
 /// Resolves the three policy layers per the module doc's fold: `home`/`repo`
@@ -437,10 +474,17 @@ pub struct CapabilityOutcome {
     pub mechanism: &'static str,
 }
 
-/// What one policy actually means on one harness. Built only by [`evaluate`].
+/// What one policy actually means on one harness, for one launch posture.
+/// Built only by [`evaluate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyReport {
     pub adapter: &'static str,
+    /// Which posture this report describes. The same policy on the same
+    /// adapter genuinely means two different things (2026-08-24): an `Ask`
+    /// stance is a real prompt on an interactive launch and a fail-closed
+    /// refusal on a headless one, so a report that did not say which it was
+    /// describing was ambiguous by construction.
+    pub mode: super::adapters::LaunchMode,
     pub outcomes: Vec<CapabilityOutcome>,
 }
 
@@ -475,7 +519,11 @@ impl PolicyReport {
     }
 
     pub fn render(&self) -> String {
-        let mut out = format!("policy on {}:\n", self.adapter);
+        let mut out = format!(
+            "policy on {} ({} launch):\n",
+            self.adapter,
+            self.mode.label()
+        );
         for outcome in &self.outcomes {
             out.push_str(&format!(
                 "  {}: {} -- {} ({})\n",
@@ -485,19 +533,38 @@ impl PolicyReport {
                 outcome.mechanism
             ));
         }
+        // Only interactively: the headless baseline is `dontAsk`'s
+        // deny-by-omission, which the per-capability lines above already
+        // describe. Printing an "interactive baseline" under a headless
+        // report would be a claim about a launch this report is not about.
+        if self.mode.is_interactive() {
+            out.push_str("  shipped interactive baseline (before any [policy] table):\n");
+            let baseline = EffectivePolicy::interactive_baseline();
+            for capability in Capability::ALL {
+                out.push_str(&format!(
+                    "    {}: {}\n",
+                    capability.label(),
+                    baseline.stance(capability).label()
+                ));
+            }
+        }
         out
     }
 }
 
-/// Translates one canonical policy onto one adapter. Pure: it asks the adapter
-/// for descriptors and combines them, and neither side reads a clock, the
-/// filesystem or the environment.
+/// Translates one canonical policy onto one adapter, for one launch posture.
+/// Pure: it asks the adapter for descriptors and combines them, and neither
+/// side reads a clock, the filesystem or the environment.
 ///
 /// A [`Stance::Allow`] capability is answered here rather than by the adapter:
 /// zirv is imposing nothing, so there is no mechanism to name and nothing an
 /// adapter could usefully say. That is also why every adapter's own
 /// `policy_support` may leave `Allow` to a catch-all arm -- it is never asked.
-pub fn evaluate(policy: &EffectivePolicy, adapter: &dyn AgentAdapter) -> PolicyReport {
+pub fn evaluate(
+    policy: &EffectivePolicy,
+    adapter: &dyn AgentAdapter,
+    mode: super::adapters::LaunchMode,
+) -> PolicyReport {
     let outcomes = Capability::ALL
         .into_iter()
         .map(|capability| {
@@ -507,7 +574,7 @@ pub fn evaluate(policy: &EffectivePolicy, adapter: &dyn AgentAdapter) -> PolicyR
                     "zirv declares no restriction; the harness's own defaults and the operator's \
                      own settings decide",
                 ),
-                _ => adapter.policy_support(capability, stance),
+                _ => adapter.policy_support(capability, stance, mode),
             };
             CapabilityOutcome {
                 capability,
@@ -519,6 +586,7 @@ pub fn evaluate(policy: &EffectivePolicy, adapter: &dyn AgentAdapter) -> PolicyR
         .collect();
     PolicyReport {
         adapter: adapter.name(),
+        mode,
         outcomes,
     }
 }
@@ -540,6 +608,148 @@ mod tests {
 
     fn table(toml_text: &str) -> Option<toml::Value> {
         Some(toml::from_str::<toml::Value>(toml_text).expect("test toml parses"))
+    }
+
+    /// The spec's own interactive defaults table, stated once so a report can
+    /// show an operator what an unconfigured interactive launch carries.
+    #[test]
+    fn the_interactive_baseline_is_the_specs_own_defaults_table() {
+        let baseline = EffectivePolicy::interactive_baseline();
+        assert_eq!(baseline.repo_fs_write, Stance::Allow);
+        assert_eq!(baseline.outside_repo_fs_write, Stance::Ask);
+        assert_eq!(baseline.network, Stance::Allow);
+        assert_eq!(baseline.shell_exec, Stance::Ask);
+        assert_eq!(baseline.approval, Stance::Ask);
+        assert_eq!(baseline.git_push_destructive, Stance::Ask);
+        assert_eq!(baseline.tool_access, Stance::Allow);
+    }
+
+    /// SECURITY: the baseline is a REPORTED fact, never a fold input.
+    /// `EffectivePolicy::default()` must stay all-`Allow` -- it is what
+    /// `narrowed_by`'s widening defense and `resolve`'s fold rest on, and
+    /// what makes `ZIRV_CTX_POLICY_*` able to loosen at all.
+    #[test]
+    fn the_interactive_baseline_does_not_touch_the_default_or_the_fold() {
+        assert_ne!(
+            EffectivePolicy::interactive_baseline(),
+            EffectivePolicy::default()
+        );
+        for capability in Capability::ALL {
+            assert_eq!(
+                EffectivePolicy::default().stance(capability),
+                Stance::Allow,
+                "{} must still default to allow",
+                capability.key()
+            );
+        }
+    }
+
+    /// A report says which posture it describes, and an interactive one shows
+    /// the shipped baseline underneath the per-capability lines.
+    #[test]
+    fn a_rendered_report_names_the_launch_mode_and_the_interactive_baseline() {
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        let claude = ClaudeAdapter::new(None);
+
+        let interactive = evaluate(&policy, &claude, adapters::LaunchMode::Interactive).render();
+        assert!(interactive.starts_with("policy on claude (interactive launch):"));
+        assert!(interactive.contains("shipped interactive baseline"));
+        assert!(interactive.contains("writes outside the repository: ask"));
+
+        let headless = evaluate(&policy, &claude, adapters::LaunchMode::Headless).render();
+        assert!(headless.starts_with("policy on claude (headless launch):"));
+        assert!(
+            !headless.contains("shipped interactive baseline"),
+            "a headless report must not advertise the interactive baseline"
+        );
+    }
+
+    /// The honesty half of the posture split: on an INTERACTIVE claude launch
+    /// zirv really does pin a mechanism for an `Ask` stance now
+    /// (`--permission-mode default` plus the safety hook as sole gate), so
+    /// those cells stop being `OperatorControlled`. Headless is unchanged --
+    /// under `dontAsk` a hook `ask` is suppressed, so there is nothing to
+    /// claim.
+    #[test]
+    fn claude_claims_an_ask_mechanism_only_on_an_interactive_launch() {
+        let claude = ClaudeAdapter::new(None);
+        for capability in [
+            Capability::ShellExec,
+            Capability::Approval,
+            Capability::OutsideRepoFsWrite,
+        ] {
+            let interactive =
+                claude.policy_support(capability, Stance::Ask, adapters::LaunchMode::Interactive);
+            assert_eq!(
+                interactive.support,
+                Support::Degraded,
+                "{} must report a real, partial ask mechanism interactively",
+                capability.key()
+            );
+            let headless =
+                claude.policy_support(capability, Stance::Ask, adapters::LaunchMode::Headless);
+            assert_eq!(
+                headless.support,
+                Support::OperatorControlled,
+                "{} must claim nothing headlessly",
+                capability.key()
+            );
+        }
+        // Never `Enforced`: the hook is registered for the Bash tool only.
+        assert_ne!(
+            claude
+                .policy_support(
+                    Capability::ToolAccess,
+                    Stance::Ask,
+                    adapters::LaunchMode::Interactive,
+                )
+                .support,
+            Support::Enforced
+        );
+    }
+
+    /// Codex's own honest answer for the same question. The mechanism string
+    /// must say what codex's approval actually is -- a SANDBOX-boundary
+    /// escalation, whose granularity is codex's own -- and must state that
+    /// zirv's per-command classification is not carried onto this harness at
+    /// all. Anything vaguer reads as parity with claude, which is the
+    /// over-claim `policy.rs` exists to prevent.
+    #[test]
+    fn codex_reports_its_interactive_ask_posture_as_degraded_and_names_the_gap() {
+        let codex = CodexAdapter::new(None).with_on_request_approval_forced(true);
+        let descriptor = codex.policy_support(
+            Capability::Approval,
+            Stance::Ask,
+            adapters::LaunchMode::Interactive,
+        );
+        assert_eq!(descriptor.support, Support::Degraded);
+        assert!(descriptor.mechanism.contains("on-request"));
+        assert!(
+            descriptor.mechanism.contains("sandbox"),
+            "the report must say the sandbox is what contains damage: {}",
+            descriptor.mechanism
+        );
+        assert!(
+            descriptor.mechanism.contains("per-command"),
+            "the report must name what codex cannot match: {}",
+            descriptor.mechanism
+        );
+
+        let unsure = CodexAdapter::new(None).with_on_request_approval_forced(false);
+        assert_eq!(
+            unsure
+                .policy_support(
+                    Capability::Approval,
+                    Stance::Ask,
+                    adapters::LaunchMode::Interactive,
+                )
+                .support,
+            Support::OperatorControlled,
+            "an install that cannot take `on-request` must claim nothing"
+        );
     }
 
     #[test]
@@ -701,7 +911,7 @@ mod tests {
     fn an_allow_stance_reports_as_operator_controlled_on_every_adapter() {
         let policy = EffectivePolicy::default();
         for adapter in adapters::all(None) {
-            let report = evaluate(&policy, adapter.as_ref());
+            let report = evaluate(&policy, adapter.as_ref(), adapters::LaunchMode::Headless);
             for outcome in &report.outcomes {
                 assert_eq!(
                     outcome.support,
@@ -726,7 +936,7 @@ mod tests {
                 *policy.stance_mut(capability) = stance;
             }
             for adapter in adapters::all(None) {
-                let report = evaluate(&policy, adapter.as_ref());
+                let report = evaluate(&policy, adapter.as_ref(), adapters::LaunchMode::Headless);
                 assert_eq!(report.outcomes.len(), Capability::ALL.len());
                 for outcome in &report.outcomes {
                     assert_eq!(outcome.stance, stance);
@@ -778,8 +988,7 @@ mod tests {
             ..EffectivePolicy::default()
         };
         let claude = ClaudeAdapter::new(None);
-        let rendered = evaluate(&policy, &claude).render();
-        assert!(rendered.starts_with("policy on claude:"));
+        let rendered = evaluate(&policy, &claude, adapters::LaunchMode::Headless).render();
         assert!(rendered.contains("shell execution: deny -- enforced"));
         assert!(rendered.contains("--disallowedTools=Write,Edit,Bash,NotebookEdit"));
     }
@@ -798,7 +1007,11 @@ mod tests {
     #[test]
     fn claude_enforces_what_its_verified_tool_pin_covers_and_nothing_else() {
         let claude = ClaudeAdapter::new(None);
-        let enforced = |capability| claude.policy_support(capability, Stance::Deny).support;
+        let enforced = |capability| {
+            claude
+                .policy_support(capability, Stance::Deny, adapters::LaunchMode::Headless)
+                .support
+        };
         assert_eq!(enforced(Capability::RepoFsWrite), Support::Enforced);
         assert_eq!(enforced(Capability::ShellExec), Support::Enforced);
         assert_eq!(enforced(Capability::ToolAccess), Support::Degraded);
@@ -821,7 +1034,11 @@ mod tests {
     #[test]
     fn claude_tool_access_degraded_mechanism_names_what_still_runs() {
         let claude = ClaudeAdapter::new(None);
-        let descriptor = claude.policy_support(Capability::ToolAccess, Stance::Deny);
+        let descriptor = claude.policy_support(
+            Capability::ToolAccess,
+            Stance::Deny,
+            adapters::LaunchMode::Headless,
+        );
         assert_eq!(descriptor.support, Support::Degraded);
         assert!(descriptor.mechanism.contains("Write"));
         assert!(descriptor.mechanism.contains("MCP"));
@@ -833,7 +1050,11 @@ mod tests {
     #[test]
     fn claude_approval_at_deny_is_unsupported_not_enforced() {
         let claude = ClaudeAdapter::new(None);
-        let descriptor = claude.policy_support(Capability::Approval, Stance::Deny);
+        let descriptor = claude.policy_support(
+            Capability::Approval,
+            Stance::Deny,
+            adapters::LaunchMode::Headless,
+        );
         assert_eq!(descriptor.support, Support::Unsupported);
         assert!(descriptor.mechanism.contains("approval"));
     }
@@ -847,7 +1068,8 @@ mod tests {
     fn claude_does_not_claim_to_pin_an_ask_stance() {
         let claude = ClaudeAdapter::new(None);
         for capability in Capability::ALL {
-            let descriptor = claude.policy_support(capability, Stance::Ask);
+            let descriptor =
+                claude.policy_support(capability, Stance::Ask, adapters::LaunchMode::Headless);
             assert!(
                 !matches!(descriptor.support, Support::Enforced | Support::Degraded),
                 "{} must not claim a per-run ask mechanism, not even a degraded one",
@@ -867,7 +1089,8 @@ mod tests {
         let codex = CodexAdapter::new(None);
         for capability in Capability::ALL {
             for stance in [Stance::Ask, Stance::Deny] {
-                let descriptor = codex.policy_support(capability, stance);
+                let descriptor =
+                    codex.policy_support(capability, stance, adapters::LaunchMode::Headless);
                 assert_ne!(
                     descriptor.support,
                     Support::Enforced,
@@ -879,13 +1102,21 @@ mod tests {
         }
         assert_eq!(
             codex
-                .policy_support(Capability::RepoFsWrite, Stance::Deny)
+                .policy_support(
+                    Capability::RepoFsWrite,
+                    Stance::Deny,
+                    adapters::LaunchMode::Headless,
+                )
                 .support,
             Support::Degraded
         );
         assert!(
             codex
-                .policy_support(Capability::RepoFsWrite, Stance::Deny)
+                .policy_support(
+                    Capability::RepoFsWrite,
+                    Stance::Deny,
+                    adapters::LaunchMode::Headless,
+                )
                 .mechanism
                 .contains("--sandbox read-only")
         );
@@ -899,7 +1130,11 @@ mod tests {
     #[test]
     fn codex_shell_exec_at_deny_is_unsupported_not_degraded() {
         let codex = CodexAdapter::new(None);
-        let descriptor = codex.policy_support(Capability::ShellExec, Stance::Deny);
+        let descriptor = codex.policy_support(
+            Capability::ShellExec,
+            Stance::Deny,
+            adapters::LaunchMode::Headless,
+        );
         assert_eq!(descriptor.support, Support::Unsupported);
         assert!(descriptor.mechanism.contains("write"));
     }
@@ -917,7 +1152,11 @@ mod tests {
     #[test]
     fn codex_approval_at_deny_is_degraded_not_unsupported_or_enforced() {
         let codex = CodexAdapter::new(None);
-        let descriptor = codex.policy_support(Capability::Approval, Stance::Deny);
+        let descriptor = codex.policy_support(
+            Capability::Approval,
+            Stance::Deny,
+            adapters::LaunchMode::Headless,
+        );
         assert_eq!(descriptor.support, Support::Degraded);
         assert!(descriptor.mechanism.contains("ask-for-approval"));
     }
@@ -934,7 +1173,9 @@ mod tests {
             Capability::GitPushDestructive,
         ] {
             assert_eq!(
-                codex.policy_support(capability, Stance::Deny).support,
+                codex
+                    .policy_support(capability, Stance::Deny, adapters::LaunchMode::Headless)
+                    .support,
                 Support::Unsupported,
                 "{} should be advisory-only on codex",
                 capability.key()
@@ -958,8 +1199,8 @@ mod tests {
         };
         let claude = ClaudeAdapter::new(None);
         let codex = CodexAdapter::new(None);
-        let claude_report = evaluate(&policy, &claude);
-        let codex_report = evaluate(&policy, &codex);
+        let claude_report = evaluate(&policy, &claude, adapters::LaunchMode::Headless);
+        let codex_report = evaluate(&policy, &codex, adapters::LaunchMode::Headless);
         assert_ne!(claude_report.outcomes, codex_report.outcomes);
         assert!(claude_report.unenforced().is_empty());
         let codex_unenforced: Vec<_> = codex_report
@@ -986,7 +1227,7 @@ mod tests {
             ..EffectivePolicy::default()
         };
         let claude = ClaudeAdapter::new(None);
-        let report = evaluate(&policy, &claude);
+        let report = evaluate(&policy, &claude, adapters::LaunchMode::Headless);
         let unenforced: Vec<_> = report
             .unenforced()
             .iter()
@@ -1008,7 +1249,7 @@ mod tests {
             ..EffectivePolicy::default()
         };
         let claude = ClaudeAdapter::new(None);
-        let report = evaluate(&policy, &claude);
+        let report = evaluate(&policy, &claude, adapters::LaunchMode::Headless);
 
         let partial: Vec<_> = report
             .partially_enforced()
