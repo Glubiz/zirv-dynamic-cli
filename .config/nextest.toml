@@ -3,40 +3,35 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 
 # Every test below drives a real supervised session through a background
 # writer thread that polls something (a growing log file via `wait_for_lines`,
-# or the session registry directly) with a fixed 5s bound, silently gives up
-# and returns without ever nudging if the condition isn't met in time, and
-# otherwise nudges the live session. Under CPU contention -- reproduced
-# under nextest's default per-CPU-core parallelism, not under serial
-# `cargo test` and not when any one of them is run alone under nextest --
-# that poll loses the race, the nudge never fires, and the run falls through
-# to its own ~30s exec timeout instead (exit 76, or the codex-shaped
-# equivalent). This is the whole such family in exec.rs (every
-# `std::thread::spawn` there follows this shape); nothing in run_loop.rs
-# matches it (its two writer threads wait on a marker *file* a plain,
-# always-completing script creates almost immediately, not on a hang-mode
-# agent that only proceeds once nudged, and neither has been observed flaky
-# across many runs in this work).
+# or the session registry directly) with a bounded budget, then nudges the
+# live session. Under CPU contention that poll can lose the race against the
+# hang-mode fake agent actually starting, and the run falls through to its
+# own ~30s exec timeout instead (exit 76, or the codex-shaped equivalent).
+# This is the whole such family in exec.rs (every `std::thread::spawn` there
+# follows this shape); nothing in run_loop.rs matches it (its two writer
+# threads wait on a marker *file* a plain, always-completing script creates
+# almost immediately, not on a hang-mode agent that only proceeds once
+# nudged, and neither has been observed flaky across many runs in this work).
 #
-# A `test-group` alone only serializes these against each other; nextest
-# schedules ungrouped tests independently of a group's own concurrency
-# limit, so it would not have stopped the rest of the suite from contending
-# with them. Pairing it with `threads-required = "num-test-threads"` makes
-# each of these tests claim the whole concurrency pool while it runs, so
-# nothing else in the suite executes alongside it either. GitHub's 2-core
-# runners are more contended than this machine, so this was a live CI risk,
-# not a local-only quirk -- reproduced here against the full `exec::` filter
-# (not just this group) before the group existed. Revisit once
-# `wait_for_lines`'s (and the sibling registry-poll's) silent give-up is
-# itself made load-robust -- its own 5s budget is far short of these tests'
-# 30s exec timeout, so there is plenty of room to just wait longer instead.
-#
-# One member, `a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_
-# launch_mail`, has a DIFFERENT, unresolved problem: it fails deterministically
-# under nextest on at least one dev machine (not just under contention), on
-# an unmodified `exec.rs`. See the doc comment on that test for the probable
-# mechanism (a production-logic race in `supervise_run`, not a test-config
-# issue) -- this group does not fix it, it is just where it structurally
-# belongs alongside the rest of this family.
+# Each wait used to give up *silently* on a 5s budget (return without ever
+# nudging), so a loss here surfaced tens of seconds later as a bare exit 76
+# with no indication of the real cause. Fixed test-side (see
+# `wait_for_lines_or_panic`/`wait_for_live_session_or_panic` in exec.rs): a
+# give-up now panics with a clear message, and the budget is honestly sized
+# per test against its own exec timeout (20s against a 30s timeout for most
+# of this family; 2s against `consecutive_nudge_restarts_are_capped_...`'s
+# much tighter 3s per-cycle timeout). That makes a real failure legible, but
+# it does not remove the underlying contention risk -- a louder failure is
+# still a failure -- so this group is kept belt-and-braces rather than
+# removed. A `test-group` alone only serializes these against each other;
+# nextest schedules ungrouped tests independently of a group's own
+# concurrency limit, so it would not have stopped the rest of the suite from
+# contending with them. Pairing it with `threads-required =
+# "num-test-threads"` makes each of these tests claim the whole concurrency
+# pool while it runs, so nothing else *in this run* executes alongside it --
+# it cannot exclude contention from other processes on the host (see the
+# doc comment on `a_post_nudge_park_carries_the_nudges_own_mail_not_the_
+# stale_launch_mail` for a case that survives even this).
 [test-groups.exec-nudge-restart]
 max-threads = 1
 
