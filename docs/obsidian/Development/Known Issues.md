@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-24 (feat/cross-harness-permissions, post-plan permission audit): recorded that the SQL analyzer is applied only to the raw command while the generic policy is applied to every normalized segment, allowing a destructive database CLI invocation hidden behind a leading command or one shell wrapper to inherit the interactive allow result -->
 <!-- Updated 2026-08-24 (perf/test-suite-speed, PR #113, v2.25.1): resolved four test-hermeticity gaps surfaced while switching the suite to nextest's per-process isolation (real-$HOME leak in context_cli.rs/handoff.rs/handover.rs, review.rs's dash_channel_active hard-coded env read, a 24-name DASH_REQUESTS_ENV ambient-failure baseline in wrap.rs/resume.rs when run under a dash session, and the fake-codex-agent.sh --help-probe mode-shift that caused CI run 32723969751's one deterministic failure); recorded the drain_to_eof supervise-race fix and a still-open read_until blocking-read residual -->
 <!-- Updated 2026-08-24 (feature/first-run-setup, v2.25.0): recorded two residuals from the guided first-run wizard -- the hook-install fallback installs both harnesses' hooks regardless of the operator's individual enable/disable answers, and a nesting-guard skip produces no output rather than a hint that `zirv setup` exists; also recorded that three setup.rs tests (the new N1 harvest-decline regression test plus the pre-existing issue-#87 pair) assert `cfg.memory.*` without clearing every `ZIRV_CTX_MEMORY*` env var -->
 <!-- Updated 2026-08-23 (fix/shipped-posture-allows-zirv, issues #99/#100): recorded that Drop for SignalServer on Windows removes only the marker file, never the acceptor/drainer threads or the named-pipe instance itself -- discovered while adding signal::probe for the #99 orphaned-endpoint sweep (sessions::sweep_orphan_endpoints), since a same-process drop-then-reprobe cannot observe "endpoint gone" the way the unix build can -->
@@ -55,6 +56,12 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## SQL analysis does not follow normalized compound or shell-wrapped segments
+
+`safety::evaluate_candidates` evaluates the raw command and every candidate from `normalize_segments`, then keeps the most restrictive generic glob-rule outcome. The SQL layer is applied afterward as exactly one `sql_outcome(command)` call on the original raw string. A database client that is not the first program therefore never reaches `sql_invocation`: on the v2.26.0 tree, `zirv ctx safety explain --mode interactive -- "echo ok && psql -c 'DROP TABLE t'"` reports `allow` from the built-in `echo *` rule, and `bash -c "psql -c 'DROP TABLE t'"` reports the unmatched interactive `allow` default. A leading `psql -c 'DROP TABLE t'` correctly reports `ask`.
+
+Recorded, not fixed: apply semantic classifiers to the same normalized candidate set as the generic matcher and take the strictest outcome across every analyzer/candidate pair. A shell-aware parser (with conservative handling of unsupported syntax) should replace the current quote-insensitive splitter when that work is taken up; merely adding more raw-string globs would leave the structural bypass intact.
 
 ## `OutputTap::try_lines`'s "final drain" could still lose a fast-exiting child's last line
 
