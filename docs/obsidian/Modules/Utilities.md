@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-20
+last-verified: 2026-08-24
 ---
 
 # Utilities
@@ -36,6 +36,8 @@ last-verified: 2026-08-20
 ## How It Works — `zirv ctx optimize` (`optimize.rs`)
 
 `optimize` is an analysis verb: it reads the configuration surfaces that steer a session, looks for friction in recent transcripts, optionally asks a small model to judge the surfaces, and prints a report. It never edits anything it analyses.
+
+**Static-check accuracy (2026-08-24, issues #108-#110):** the hook-binary probe resolves programs the same PATHEXT-aware way `adapters::resolve_program` does (a Chocolatey `zirv` shim or Git-for-Windows `bash` no longer reads as "not installed"); the dead-path lint skips `<placeholder>` segments, `~`-anchored operator paths on repo-owned surfaces, bare `*.exe` names, and any bare basename that exists somewhere in the tracked tree (a once-per-run basename index), and also tries the evidence file's own directory and `docs/obsidian/` before flagging; and the layer-duplicate analysis excludes any surface carrying the `zirv:managed-context-file` marker (via `context_cli::is_managed`), so a generated `CLAUDE.md`/`AGENTS.md` is never reported as duplicating its own canonical source and never becomes the target of a proposed diff.
 
 **Surfaces collected** (`collect_surfaces`, capped at `MAX_SURFACES = 40`, each file capped at `cfg.optimize.max_surface_bytes`, default 200,000 bytes): global `CLAUDE.md` (`~/CLAUDE.md` and `~/.claude/CLAUDE.md`), the repo's own `CLAUDE.md`, every nested `CLAUDE.md` up to `MAX_NESTED_DEPTH = 4` directories deep (symlinked directories are skipped so a link can't walk the scan outside the repository), and user/project/local `settings.json`. Settings-layer surfaces are flagged `is_settings()` and their values are never sent to the judgment model verbatim, since an `env` block routinely holds secrets.
 
