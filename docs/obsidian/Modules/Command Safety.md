@@ -7,7 +7,7 @@ last-verified: 2026-08-24
 ## Quick Reference
 
 - **Files:** `src/commands/ctx/safety.rs`
-- **Used by:** [[Ctx Subsystem]] (`zirv ctx safety check|list|explain`, dispatched from `CtxVerb::Safety`), [[Ctx Adapters]] (`ClaudeAdapter::default_sandbox_args` projects `SafetyPolicy` onto `--allowedTools=`/`--disallowedTools=`; `CodexAdapter::default_sandbox_args` receives the same policy but has no per-command mechanism and ignores it), `src/commands/setup.rs` (`zirv setup apply` wires `zirv ctx safety check` into claude's `PreToolUse` hook, matched on `Bash`)
+- **Used by:** [[Ctx Subsystem]] (`zirv ctx safety check|list|explain`, dispatched from `CtxVerb::Safety`), [[Ctx Adapters]] (`ClaudeAdapter::default_sandbox_args` projects `SafetyPolicy` onto `--allowedTools=`/`--disallowedTools=` and attests the hook on every launch; `CodexAdapter::default_sandbox_args` receives the same policy but has no per-command mechanism and ignores it), `src/commands/setup.rs` (`zirv setup apply` also wires the hook persistently for non-Zirv launches)
 - **Depends on:** [[Ctx Subsystem]] for `CtxConfig`/`EnvLookup`/`CtxResult`, [[Ctx Adapters]] for `LaunchMode` and `adapters::SHIPPED_POSTURE_ALLOW`/`_ASK`/`_DENY` (the built-in rule set is derived from these, not duplicated)
 - **Tests:** inline `#[cfg(test)] mod tests` in `safety.rs` — the primary gate is `the_product_requirement_no_everyday_or_novel_command_ever_prompts`, paired with `the_product_requirement_only_genuinely_dangerous_commands_prompt`; the suite also covers mode-specific defaults, the shipped sets, normalization bypasses, the SQL classifier's adversarial corpus, repo narrowing, hook output and mode-aware `explain`; adapter/setup tests pin the launch projection and hook installation
 - **If changed:** [[Ctx Subsystem]], [[Ctx Adapters]], [[Untrusted Configuration]], [[Decision Log]]
@@ -55,22 +55,21 @@ This asymmetry is the design, not a compatibility exception. Sharing the headles
 
 `glob_match(pattern, text)` supports only `*` (any run of characters, including none), case-sensitive, matched against one already-normalized command string (see below). It is the standard iterative two-pointer `fnmatch`-style algorithm with a saved star position, not recursive backtracking: a command string can originate from repository-influenced text (a prompt-injected shell command an agent was talked into proposing), so the matcher must not be a stack-depth or exponential-blowup DoS surface. Worst case is `O(pattern * command)` with no recursion.
 
-### Normalization, and its explicit non-goals
+### Structural executable-node analysis, and its explicit non-goals
 
-`evaluate` does not match `command` as one raw string against every rule any more — that read as a single opaque string a compound command (`a && b`), a one-layer shell-wrapped one (`bash -c '<cmd>'`, `cmd /c <cmd>`, `powershell -Command <cmd>`), a `/usr/bin/rm`-style absolute-path invocation, or merely doubled whitespace (`rm  -rf /`) never matched a shipped `deny` pattern at all — four confirmed bypasses of the destructive-family denylist. `normalize_segments(command)` now derives a list of candidate strings `evaluate` checks independently, taking the single most restrictive `Outcome` (`deny` > `ask` > `allow`) across all of them:
+`evaluate` does not treat `command` as one opaque string. Inspired by Dippy's strongest transferable property—visit every executable node and fold the most restrictive result—`normalize_segments(command)` derives a bounded candidate set and `evaluate_candidates` applies both ordinary policy matching and SQL classification to every candidate before taking `deny > ask > allow`:
 
 1. The raw command, unmodified — always checked first, so a pattern written against the *whole* string (there are none in the shipped `deny` set today, but a repo/operator `[safety]` entry could still be one) keeps matching exactly as before this fix.
-2. One entry per shell-separator segment (`split_segments`: splits on `;`, `&&`, `||`, `|`, newline), whitespace-collapsed (`collapse_whitespace`) and leading-directory-stripped (`strip_program_dir`, so `/usr/bin/rm -rf /` and `rm -rf /` compare identically).
-3. For a segment that is itself a recognised one-layer shell-wrapper invocation (`unwrap_shell_wrapper`: `sh`/`bash`/`zsh -c '<inner>'`, `cmd /c <inner>`, `powershell -Command <inner>`), its unwrapped, quote-stripped inner command, normalized the same way.
+2. One entry per quote-aware shell-separator segment (`split_segments`: `;`, `&&`, `||`, `|`, newline), whitespace-collapsed (`collapse_whitespace`) and leading-directory-stripped (`strip_program_dir`, so `/usr/bin/rm -rf /` and `rm -rf /` compare identically). A separator inside quoted data is not treated as executable syntax.
+3. Recursively unwrapped inline shells (`unwrap_shell_wrapper`: `sh`/`bash`/`zsh` flags containing `c`, `cmd /c`, PowerShell `-Command`), each split and normalized again.
+4. Executable text inside `$()` and legacy backtick substitutions, including substitutions inside double quotes; single-quoted lookalikes remain inert data.
 
-**Explicit non-goals**, not bugs to be filed later: this is one layer of normalization, not a shell parser or a sandbox.
+Depth is capped at 16 and the candidate set at 128, so repository-influenced hook input cannot grow recursion or work without limit. These ceilings are a parser-availability boundary, not a permission widening: Claude's/Codex's OS sandbox remains the containment layer beneath the semantic tripwire.
 
-- **No quote-aware splitting.** `split_segments` does not track quoting, so a separator character inside a quoted string (`bash -c 'a; b'`) still splits the outer command at `;` — the inner `a`/`b` pieces are evaluated as their own (likely meaningless) segments rather than staying joined.
-- **No nested unwrapping.** `unwrap_shell_wrapper` unwraps exactly one layer; `bash -c 'bash -c "rm -rf /"'` is not chased down to the innermost command.
 - **No encoding/obfuscation awareness.** Base64-encoded payloads piped into `sh`, `eval "$(...)"`, environment-variable reassembly of a command string, and similar obfuscation are not decoded or evaluated — the matcher only ever compares literal text.
 - **No `eval`/`exec`/`source`/`.`-style indirection.** A command that reads and runs a file's contents at runtime is invisible to a static string matcher by construction; this is the same limit every static-glob classifier (claude's own `permissions.allow`/`deny`, codex's `.rules`) already has.
 
-A determined adversarial actor with control over the exact command text can still construct something none of the four confirmed-fixed bypasses (`bash -c '<denied cmd>'`, absolute path, doubled whitespace, `a && <denied cmd>`) cover — this module raises the bar against the bypasses that were actually demonstrated, not against every possible obfuscation. `zirv setup apply`'s wired `PreToolUse` hook and `[policy]`'s sandbox enforcement are independent layers underneath this one; `[safety]` is a classifier, not the only defense.
+A determined adversarial actor can still express a destructive effect through an allowed interpreter or dynamic script in a form this literal analyzer cannot recognize. `[safety]` is therefore a high-signal classifier, never described as the security boundary; OS sandboxing and native permission rules contain what an unrecognized command can reach. Native Windows Claude is the honest exception because Claude's OS sandbox is unsupported there—see [[Known Issues]].
 
 ## The built-in default rule set
 
@@ -102,7 +101,7 @@ Order is preserved through derivation so the headless Claude projection can conc
 
 With `safety.sql = "on"` (the default), `psql`, `mysql`, `mariadb`, `sqlite3`, `duckdb`, and `sqlcmd` invocations get a second pure classification. A statement is silent only when all four gates hold: the client exposes exactly one statement on argv; comments and quoting are balanced; after an optional trailing semicolon the statement begins with `SELECT`, `EXPLAIN`, or `SHOW`; and token scanning finds none of the write/escape words (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `MERGE`, `REPLACE`, `CALL`, `COPY`, `VACUUM`, `ATTACH`, `DETACH`, `PRAGMA`, `WITH`, `INTO`, `OUTFILE`, `DUMPFILE`, `LOAD_EXTENSION`, large-object/file helpers, or `SYSTEM`). Anything else through a recognized client asks.
 
-The classifier may always narrow an `Allow` to `Ask`. It may widen the result to `Allow` only when no ordinary rule matched, and it never overrides `Deny`; an operator/repo `ask = ["psql *"]` also wins over a provably read-only statement. This is deliberately not a SQL parser or obfuscation defense: stdin/script/interactive input, multiple statements, malformed quotes/comments and every CTE (`WITH`, including a read-only one) ask. Rejecting all CTEs is the conservative superset chosen instead of pretending to distinguish a write-wrapping CTE without a parser.
+The classifier runs on every structural candidate, so `echo ok && psql -c 'DROP TABLE t'` and recursively shell-wrapped DB clients cannot inherit an outer interactive allow. It may always narrow an `Allow` to `Ask`. It may widen the result to `Allow` only when no ordinary rule matched, and it never overrides `Deny`; an operator/repo `ask = ["psql *"]` also wins over a provably read-only statement. This is deliberately not a SQL parser or obfuscation defense: stdin/script/interactive input, multiple statements, malformed quotes/comments and every CTE (`WITH`, including a read-only one) ask. Rejecting all CTEs is the conservative superset chosen instead of pretending to distinguish a write-wrapping CTE without a parser.
 
 ## The `zirv ctx safety` verbs
 
@@ -113,11 +112,13 @@ The classifier may always narrow an `Allow` to `Ask`. It may widen the result to
 `check` is dual-mode, chosen by whether a trailing command was given:
 
 - **CLI mode** (`-- <command>` present): the ordinary case above.
-- **Hook mode** (no trailing command): reads a claude `PreToolUse` JSON payload from stdin instead (`{"tool_name": ..., "tool_input": {"command": ...}}`). A non-`Bash` tool, an empty command, or unparseable JSON all fail open — print nothing, exit 0 — the same rule `hook.rs::run_pretool` already holds every hook in this codebase to: a safety hook that crashes or misbehaves must never be the reason a session cannot make progress.
+- **Hook mode** (no trailing command): reads a claude `PreToolUse` JSON payload from stdin instead (`{"tool_name": ..., "tool_input": {"command": ..., "dangerouslyDisableSandbox": ...}}`). A non-`Bash` tool, an empty command, or unparseable JSON all fail open — print nothing, exit 0 — the same rule `hook.rs::run_pretool` already holds every hook in this codebase to. An explicit unsandboxed retry never inherits an ordinary allow: it asks interactively and denies headlessly.
 
 ## The wired `PreToolUse` hook
 
-`zirv setup apply` (`src/commands/setup.rs`) installs `zirv ctx safety check` as a `PreToolUse` hook matched on `Bash`, a distinct entry from the existing `Agent|Task`-matched `PreToolUse` hook (`zirv ctx hook pretool`) — both live in the same `PreToolUse` event array, since `ensure_harness_hook` pushes a new entry per distinct command string rather than replacing. Backed up via the same manifest system every other `zirv setup` write already uses, and idempotent (`contains_command` skips re-adding a command already present).
+Every supervised Claude launch materializes a private, atomic `~/.zirv/runtime/claude-launch-settings.json` and names it with `--settings`. This launch-local attestation sets `disableAllHooks = false`, installs `zirv ctx safety check` for Bash, asks on `dangerouslyDisableSandbox`, scrubs cloud credentials from subprocess environments, and denies common credential paths through both `permissions.deny` and `sandbox.filesystem.denyRead`. On macOS/Linux/WSL2 it also enables Claude's OS sandbox with auto-allow, allows an unsandboxed retry only through the explicit ask boundary, and sets `failIfUnavailable = true`; native Windows omits the unsupported sandbox key. A materialization failure adds no settings flag and no blanket Bash allow, falling back to native prompts rather than widening.
+
+`zirv setup apply` (`src/commands/setup.rs`) still installs the same hook persistently for Claude sessions started outside Zirv, as a distinct entry from the existing `Agent|Task` guard. That setup path is backed up and idempotent, but supervised-launch correctness no longer depends on it having run once in the past.
 
 **Claude only.** `HARNESS_HOOKS` (the shared four-hook array `install_claude_integration`/`install_codex_hooks` both iterate) is untouched; the safety hook is a separate `CLAUDE_SAFETY_HOOK` constant wired only into `install_claude_integration`. Codex has no verified equivalent of the structured `permissionDecision` contract this hook relies on, so wiring it into the shared array would write a hook codex has no verified way to honor.
 
@@ -143,7 +144,7 @@ The classifier may always narrow an `Allow` to `Ask`. It may widen the result to
 
 - **Claude interactive**: `--permission-mode default`; Design B ships, so there is no blanket native `Bash(*)` allow. Non-command allow rules and scratchpad paths are pre-approved, deny rules are natively disallowed, and ask rules are on neither list. The hook emits explicit allow/ask/deny and therefore carries everyday and unknown Bash commands without making the finite native allow list a prompt surface.
 - **Claude headless**: unchanged fail-closed shape, `--permission-mode dontAsk`; allow rules are pre-approved and `deny ∪ ask` is disallowed because nobody can answer.
-- **Codex interactive/headless**: `--sandbox workspace-write` in both modes, with `--ask-for-approval on-request` only when the cached live probe confirms support, otherwise `never`; headless always uses `never`. No `[safety]` rule reaches codex per command.
+- **Codex interactive/headless**: `--sandbox workspace-write` in both modes, with `--ask-for-approval on-request` only when the cached live probe confirms support, otherwise `never`; a second probe adds `--approve-for-me` interactively when the installed CLI advertises its native automatic reviewer. Headless always uses `never`. No `[safety]` rule reaches codex per command.
 
 ## See also
 

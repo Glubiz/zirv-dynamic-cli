@@ -1521,18 +1521,25 @@ text, so `--simple` does not remove it—only `--no-supervise` (pure passthrough
 or the explicit opt-out below do.
 
 - **Claude interactive:** `--permission-mode default`, native workspace/tool
-  scoping, and the installed Bash `PreToolUse` safety hook as the sole
-  per-command gate. The hook emits an explicit `allow` for everyday and
+  scoping, and a Bash `PreToolUse` safety hook attested on every Zirv launch
+  through a private `~/.zirv/runtime/claude-launch-settings.json` layer as the
+  sole per-command gate. The hook emits an explicit `allow` for everyday and
   unclassified commands, `ask` only for the closed dangerous list, and `deny`
   for the shorter refusal list. Zirv ships conservative Design B: no blanket
-  native `Bash(*)` allow.
+  native `Bash(*)` allow. On macOS, Linux, and WSL2 the same launch layer
+  enables Claude's OS sandbox in auto-allow mode, fails closed if it cannot
+  start, blocks common credential paths, and scrubs cloud credentials from
+  subprocesses. Native Windows receives the hook and credential rules but no
+  unsupported OS-sandbox setting.
 - **Claude headless:** `--permission-mode dontAsk`; ordinary allow rules are
   pre-approved and both deny and ask rules are disallowed, so no prompt can
   stall automation.
 - **Codex interactive:** `--sandbox workspace-write --ask-for-approval
   on-request` when the installed CLI's own bounded capability probe documents
-  it, otherwise `never`. Codex decides escalation at its sandbox boundary; no
-  zirv `[safety]` rule is projected per command.
+  it, otherwise `never`. When that CLI also advertises `--approve-for-me`,
+  Zirv enables Codex's native security reviewer for boundary requests; older
+  versions retain plain `on-request`. No zirv `[safety]` rule is projected per
+  command.
 - **Codex headless:** `--sandbox workspace-write --ask-for-approval never`.
 
 `adapters::SHIPPED_POSTURE_ALLOW`/`_ASK`/`_DENY` are the shared source for the
@@ -1587,6 +1594,14 @@ launch and `default` for a headless one. With SQL classification on, one
 provably read-only `SELECT`/`EXPLAIN`/`SHOW` through a recognized client runs
 silently; write-shaped, multi-statement, stdin/script-fed, malformed, or CTE
 input asks conservatively.
+
+The analyzer evaluates the most restrictive result across quote-aware compound
+segments, nested `sh`/`bash`/`zsh`/`cmd`/PowerShell inline wrappers, `$()` and
+backtick command substitutions, and every SQL client candidate it finds.
+Quoted command-looking text remains data. This structural tripwire is bounded
+against hostile input and deliberately does not decode obfuscation, expand
+variables, or read dynamically sourced scripts; the harness sandbox is the
+containment boundary beneath it.
 
 `deny`/`ask` may be extended by a repo checkout (narrowing is always safe—both
 are checked before `allow`); `allow`, both defaults, and `sql` may not. A

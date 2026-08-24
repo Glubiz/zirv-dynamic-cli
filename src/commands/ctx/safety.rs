@@ -612,12 +612,13 @@ fn command_substitutions(command: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        if c == '$' && chars.get(i + 1) == Some(&'(') {
-            if let Some(end) = command_substitution_end(&chars, i + 2, 0) {
-                out.push(chars[i + 2..end].iter().collect());
-                i = end + 1;
-                continue;
-            }
+        if c == '$'
+            && chars.get(i + 1) == Some(&'(')
+            && let Some(end) = command_substitution_end(&chars, i + 2, 0)
+        {
+            out.push(chars[i + 2..end].iter().collect());
+            i = end + 1;
+            continue;
         }
         if c == '`'
             && quote != Some('\'')

@@ -65,7 +65,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 | `wrap` | Supervise an interactive TUI through a PTY; advise/compact/restart at verified turn boundaries. |
 | `usage` | Report usage windows, or tee the statusline to record them. |
 | `optimize` | Report-only analysis of the config surfaces that steer every session. |
-| `safety` | `check`/`list`/`explain` against zirv's harness-neutral command safety policy; `check` is also the wired claude `PreToolUse` hook. |
+| `safety` | `check`/`list`/`explain` against zirv's harness-neutral command safety policy; `check` is also Claude's launch-attested `PreToolUse` hook. |
 | `handover` | Swap the orchestrator seat's model or harness in place, same registry short id (issue #84). |
 
 ## Key Flows
