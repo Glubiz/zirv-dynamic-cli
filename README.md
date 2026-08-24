@@ -1510,46 +1510,41 @@ all, shipped default included. Supervision, pacing and hooks are unaffected.
 Whether a prompt was injected, and from which layers, is recorded in the decision
 log at every session start.
 
-### Sandboxed by default
+### Low-noise interactive, fail-closed headless
 
-Every zirv-launched session (2026-08-22) ships with the same default posture on
-every supported harness: **sandboxed, no prompts**. Commands run freely inside
-the repository workspace; anything reaching outside it fails rather than
-prompting a human. This is a safety flag layer, not injected instruction text,
-so `--simple` does not withhold it — only `--no-supervise` (pure passthrough) or
-the explicit opt-out below do.
+The permission rule is simple: **everyday and unknown commands run silently in
+an interactive session; a short list of genuinely dangerous commands prompts;
+a shorter irreversible, credential-exfiltrating, or zirv-self-destructive list
+is refused outright. Headless sessions stay fail-closed because nobody is
+present to answer.** This is a launch-flag/hook layer, not injected instruction
+text, so `--simple` does not remove it—only `--no-supervise` (pure passthrough)
+or the explicit opt-out below do.
 
-- **codex**: `--sandbox workspace-write --ask-for-approval never`, both verified
-  against the installed `codex-cli 0.147.0`.
-- **claude**: `--permission-mode dontAsk` plus a generated permission set
-  (`--allowedTools=`/`--disallowedTools=`), passed at launch and never written
-  to `~/.claude/settings.json`. `dontAsk` alone denies every unapproved action —
-  verified as the one mode that both suppresses prompts and never auto-runs an
-  unapproved action (`--help`'s own text: `"Don't prompt for permissions, deny
-  if not pre-approved."`) — but with no operator-configured allow rules that
-  makes a fresh install *inert*, not merely safe: it cannot write a file at
-  all. The generated set (one shared source, `adapters::SHIPPED_POSTURE_ALLOW`/
-  `_DENY`, also documented against codex's own flags) is what makes it usable:
-  allow reading/writing/editing inside the workspace; reading the harness's own
-  settings/memory (`~/.claude/**`) and writing its auto-memory
-  (`~/.claude/projects/**`); reading the operator's own `~/.zirv/**` layer
-  (editing it is denied — a session must never widen its own posture);
-  `WebFetch`/`WebSearch`; a per-session scratchpad under the real temp
-  directory; whole toolchain command families (`git`, `gh`, `cargo`, `npm`,
-  `npx`, `node`, `python`/`python3`, `pip`, `go`, `dotnet`, `make`, `gradle`,
-  `mvn`, `pytest`, and zirv's own CLI) rather than a hand-picked subset of
-  subcommands; and a set of read-only shell utilities (`ls`, `grep`, `rg`,
-  `cat`, `head`, `tail`, `wc`, `find`, `echo`, `pwd`, `which`, `where`,
-  `diff`, `sort`, `uniq`, `tr`, `cut`). Deny still wins over allow regardless
-  of family breadth: recursive force-delete, force-push and history
-  rewriting, `git clean`, `curl`/`wget`, `sudo`/`su`, the macOS keychain CLI,
-  `cargo publish`/`npm publish`, `gh repo delete`/`gh release delete`/`gh
-  auth`, credential-path reads, and editing the operator's own `~/.zirv/**`
-  layer are all denied regardless of anything on the allow side. Verified
-  live against the real `claude 2.1.240`: an in-repo write and a `cargo
-  test` both run with no prompt; a write outside the workspace and a `rm
-  -rf` are both refused. The harness-neutral command classifier that
-  generates both harnesses' rule sets is `[safety]`, described next.
+- **Claude interactive:** `--permission-mode default`, native workspace/tool
+  scoping, and the installed Bash `PreToolUse` safety hook as the sole
+  per-command gate. The hook emits an explicit `allow` for everyday and
+  unclassified commands, `ask` only for the closed dangerous list, and `deny`
+  for the shorter refusal list. Zirv ships conservative Design B: no blanket
+  native `Bash(*)` allow.
+- **Claude headless:** `--permission-mode dontAsk`; ordinary allow rules are
+  pre-approved and both deny and ask rules are disallowed, so no prompt can
+  stall automation.
+- **Codex interactive:** `--sandbox workspace-write --ask-for-approval
+  on-request` when the installed CLI's own bounded capability probe documents
+  it, otherwise `never`. Codex decides escalation at its sandbox boundary; no
+  zirv `[safety]` rule is projected per command.
+- **Codex headless:** `--sandbox workspace-write --ask-for-approval never`.
+
+`adapters::SHIPPED_POSTURE_ALLOW`/`_ASK`/`_DENY` are the shared source for the
+built-in classifier and Claude projection. Plain `curl`/`wget`, dependency
+installation, builds, commits, in-repo writes, read utilities, and commands
+zirv has never seen are not prompt-worthy merely because they mutate or are
+unknown. Force-push, hard reset, recursive deletion, process termination,
+registry mutation and device/partition tools ask interactively; publication,
+credential reads, privilege escalation, download-to-shell pipelines, and
+attacks on zirv itself are denied. This classifier is a tripwire layered with
+the harness sandbox, not a claim that finite command globs can contain an
+arbitrary-code interpreter.
 
 An operator's own explicit `--sandbox`/`--ask-for-approval`/`--permission-mode`/
 `--disallowedTools` (passed after `--`, or via `worker.claude`/`worker.codex`'s
@@ -1571,10 +1566,9 @@ sandboxing off, only the operator can.
 
 ### Command safety policy (issue #83)
 
-`[safety]` is zirv's own harness-neutral classification of shell commands —
-one declaration that both adapters project onto their native mechanism, so
-"never auto-run `rm -rf`, `git push --force`, `curl | sh`" means the same
-thing on claude and codex instead of being encoded twice, unevenly:
+`[safety]` is zirv's harness-neutral shell-command classifier. Claude projects
+it through its native rule lists and Bash hook; codex currently has no verified
+per-command channel and relies on its sandbox/approval boundary instead:
 
 ```toml
 [safety]
@@ -1582,29 +1576,29 @@ deny  = ["terraform destroy*"]   # additional deny patterns
 ask   = ["kubectl delete*"]      # additional ask patterns
 allow = ["just test*"]           # operator-only, REPO-FORBIDDEN
 default = "ask"                  # operator-only, REPO-FORBIDDEN
+interactive_default = "allow"    # operator-only, REPO-FORBIDDEN
+sql = "on"                       # operator-only, REPO-FORBIDDEN
 ```
 
 Rules are glob patterns (`*` matches any run of characters); a command is
 matched deny-first, then ask, then allow, first match wins within a
-category. A fresh install already blocks the obvious destructive families
-(recursive force-delete, force-push/history-rewrite, a download piped into
-a shell, `sudo`/`su`, credential-path reads) with no config written at all —
-the same built-in set `adapters::SHIPPED_POSTURE_ALLOW`/`_DENY` already
-verified live against claude, now the single source claude's generated
-`--allowedTools`/`--disallowedTools` pair and codex's `--sandbox`/
-`--ask-for-approval` flags are both derived from.
+category. Unmatched commands use `interactive_default` for an interactive
+launch and `default` for a headless one. With SQL classification on, one
+provably read-only `SELECT`/`EXPLAIN`/`SHOW` through a recognized client runs
+silently; write-shaped, multi-statement, stdin/script-fed, malformed, or CTE
+input asks conservatively.
 
-`deny`/`ask` may be extended by a repo checkout (narrowing is always safe —
-both are checked before `allow`); `allow` and `default` may not (see the
-Trust boundary table above) — a checkout cannot grant itself its own
-approval or change what an unmatched command defaults to.
+`deny`/`ask` may be extended by a repo checkout (narrowing is always safe—both
+are checked before `allow`); `allow`, both defaults, and `sql` may not. A
+checkout cannot grant itself approval, loosen either launch posture, or turn
+off the conservative SQL narrowing.
 
 Three verbs work with the resolved policy directly:
 
 ```sh
-zirv ctx safety check -- rm -rf /        # prints the verdict, exits 0/1/2 for allow/ask/deny
+zirv ctx safety check --mode interactive -- rm -rf /  # exits 0/1/2 for allow/ask/deny
 zirv ctx safety list                     # the effective merged policy, with each rule's origin
-zirv ctx safety explain -- git push --force   # why a command got its verdict
+zirv ctx safety explain --mode headless -- git push --force  # rule plus launch consequence
 ```
 
 `zirv ctx safety check` (with no trailing command) is also what `zirv setup

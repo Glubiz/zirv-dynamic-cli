@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-23
+last-verified: 2026-08-24
 ---
 
 # Untrusted Configuration
@@ -133,7 +133,11 @@ The `&&` is the trust boundary: a repo's `enabled = true` is a silent no-op (the
 
 ### A third fold, now for `[safety]` (issue #83, 2026-08-23)
 
-`[safety]` (`src/commands/ctx/safety.rs`) is a third surface built on a narrowing fold rather than `REPO_FORBIDDEN`'s outright rejection, but its shape is asymmetric within itself, unlike `[policy]`'s uniform `max` over an ordered `Stance`: `deny`/`ask` are lifted out of every layer and **unioned** (a repo checkout may add either — narrowing is always safe, since `evaluate` checks deny, then ask, then allow, first match wins), while `allow`/`default` are `REPO_FORBIDDEN` outright (see the table above) — there is no narrowing reading of adding an allow entry or changing what an unmatched command defaults to, so folding them the way `[policy]`'s `max` does would have nothing to bound them with. `ZIRV_CTX_SAFETY_DENY`/`_ASK`/`_ALLOW`/`_DEFAULT` sit above the fold and win outright, mirroring every other operator escape hatch here; the environment replaces only the operator+repo *contribution* to a list, never the built-in set derived from `adapters::SHIPPED_POSTURE_ALLOW`/`_DENY` (always present, regardless of configuration). `zirv ctx safety check`/`list`/`explain` read the resolved `SafetyPolicy`; `zirv setup apply` wires `zirv ctx safety check` into claude's `PreToolUse` hook for `Bash` calls, so the same evaluator zirv's own CLI uses is the single source claude's generated `--allowedTools`/`--disallowedTools` pair (previously a directly-hardcoded projection of `SHIPPED_POSTURE_ALLOW`/`_DENY`) and codex's `--sandbox`/`--ask-for-approval` flags are both derived from — see [[Ctx Adapters]] and [[Ctx Subsystem]].
+`[safety]` (`src/commands/ctx/safety.rs`) is a third surface built on a narrowing fold rather than one uniform deep merge. `deny`/`ask` are lifted from every layer and **unioned**: a repo may add to either, because evaluation checks deny, then ask, then allow, so either contribution can only narrow. `ask` is therefore trusted like `deny`, not like `allow`; it can interrupt an interactive session but cannot make a matched command less restricted.
+
+`allow`, `default`, `interactive_default`, and `sql` are `REPO_FORBIDDEN`. Adding an allow has no narrowing reading. Changing either unmatched-command default can loosen the corresponding launch—especially `interactive_default`, whose shipped value is already `allow`, the loosest verdict available. Turning `sql` off can remove the classifier's `Ask` narrowing from a write-shaped database command. Only the operator may choose any of those through `~/.zirv/ctx.toml` or `ZIRV_CTX_SAFETY_ALLOW`/`_DEFAULT`/`_INTERACTIVE_DEFAULT`/`_SQL`.
+
+The environment sits above the fold and replaces only the operator+repo contribution, never the built-ins derived from `adapters::SHIPPED_POSTURE_ALLOW`/`_ASK`/`_DENY`. `zirv ctx safety check|explain --mode` reads the resolved `SafetyPolicy`; `zirv setup apply` wires the same evaluator into Claude's Bash `PreToolUse` hook. Codex has no verified per-command projection, so its sandbox/approval flags are not described as carrying these rules—see [[Ctx Adapters]] and [[Command Safety]].
 
 ## `system-prompt.md`: capped, labeled, and outranked
 
