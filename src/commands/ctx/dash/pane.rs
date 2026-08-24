@@ -2669,7 +2669,13 @@ pub(crate) mod tests {
             "the old child must still be running -- it must never have been quit"
         );
 
-        pane.shutdown("").expect("shutdown");
+        // Test-plumbing only: this child (`long_lived_argv`) never reads its
+        // pty input, so `shutdown`'s polite ask-then-wait always burns the
+        // full `QUIT_GRACE` (production, unchanged) before falling through to
+        // the same kill. `finish_shutdown` is the escalation half on its own
+        // -- already public, already used by the batched-shutdown path -- so
+        // teardown here is immediate instead of a real multi-second wait.
+        pane.finish_shutdown().expect("shutdown");
     }
 
     /// R3, end to end on a real supervised child: an idle pane that is
@@ -2707,7 +2713,9 @@ pub(crate) mod tests {
             "the next turn signal must clear the pending injection"
         );
 
-        pane.shutdown("").expect("shutdown");
+        // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical
+        // comment on `handover_failure_in_successor_setup_leaves_the_old_pane_untouched`.
+        pane.finish_shutdown().expect("shutdown");
     }
 
     /// F1/G1, end to end on a real supervised child: a keystroke the dashboard
@@ -2757,7 +2765,9 @@ pub(crate) mod tests {
             "and the pane is reachable again once it does"
         );
 
-        pane.shutdown("").expect("shutdown");
+        // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical
+        // comment on `handover_failure_in_successor_setup_leaves_the_old_pane_untouched`.
+        pane.finish_shutdown().expect("shutdown");
     }
 
     /// Task A end to end: a signal-less pane's real supervised child prints
@@ -2819,7 +2829,9 @@ pub(crate) mod tests {
             "and therefore reachable by the mail sweep/nudge drain"
         );
 
-        pane.shutdown("").expect("shutdown");
+        // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical
+        // comment on `handover_failure_in_successor_setup_leaves_the_old_pane_untouched`.
+        pane.finish_shutdown().expect("shutdown");
     }
 
     /// Task A regression guard: a signal-carrying pane must ignore output
@@ -2861,7 +2873,9 @@ pub(crate) mod tests {
         );
         assert!(!pane.injectable());
 
-        pane.shutdown("").expect("shutdown");
+        // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical
+        // comment on `handover_failure_in_successor_setup_leaves_the_old_pane_untouched`.
+        pane.finish_shutdown().expect("shutdown");
     }
 
     /// H1 (review): the bug this test pins -- a signal-less pane's own
@@ -2946,7 +2960,9 @@ pub(crate) mod tests {
             "reachable again once idle_quiet has elapsed since the injection"
         );
 
-        pane.shutdown("").expect("shutdown");
+        // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical
+        // comment on `handover_failure_in_successor_setup_leaves_the_old_pane_untouched`.
+        pane.finish_shutdown().expect("shutdown");
     }
 
     /// H1 (review): a signal-less pane has no turn signal to tell "the
@@ -3032,7 +3048,9 @@ pub(crate) mod tests {
         );
         assert!(pane.injectable());
 
-        pane.shutdown("").expect("shutdown");
+        // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical
+        // comment on `handover_failure_in_successor_setup_leaves_the_old_pane_untouched`.
+        pane.finish_shutdown().expect("shutdown");
     }
 
     #[test]
