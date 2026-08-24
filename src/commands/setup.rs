@@ -668,11 +668,6 @@ pub fn first_run_needed(home_zirv_dir: &Path) -> bool {
         && !home_zirv_dir.join(crate::settings::SETTINGS_FILE).is_file()
 }
 
-/// A conservative heuristic for "this directory is a project a local `.zirv`
-/// would make sense in": any of the manifest files `toolchain_proposal`
-/// already treats as an authoritative build surface, or a `.git` directory
-/// for a repository with none of those. Used only to decide whether the
-/// first-run wizard's project-layer step is worth offering at all.
 /// Manifest files that name an authoritative build/toolchain surface,
 /// shared between `looks_like_project_dir` (below) and `toolchain_proposal`
 /// (further down, issue #103's memory bootstrap) so the two heuristics can't
@@ -2117,10 +2112,16 @@ fn apply_first_run_answers(answers: &FirstRunAnswers, home: &Path) -> SetupResul
         set_home_ctx_toml_string(home, Some("chat"), "model", model)?;
     }
     set_home_ctx_toml_bool(home, "memory", "enabled", answers.memory_enabled)?;
-    // Reuses the existing issue-#87 helper (rather than a raw bool write) so
-    // `setup.memory_harvest_offered` is recorded too -- that is what stops
-    // `run_apply`'s own `maybe_offer_memory_harvest` below from asking the
-    // same question a second time in the same run.
+    // `apply_memory_harvest_decision` only ever writes `harvest = true` on
+    // accept; by design (see its own doc comment) it never writes `false`
+    // on a decline, so it cannot be trusted alone to record *this* answer --
+    // an operator who somehow already had `harvest = true` and declines here
+    // would keep it. Write the plain bool first, then call the existing
+    // issue-#87 helper purely for its `setup.memory_harvest_offered` side
+    // effect, which is what stops `run_apply`'s own
+    // `maybe_offer_memory_harvest` below from asking the same question a
+    // second time in the same run.
+    set_home_ctx_toml_bool(home, "memory", "harvest", answers.memory_harvest)?;
     apply_memory_harvest_decision(home, answers.memory_harvest)?;
 
     let cwd = std::env::current_dir()?;
@@ -4617,6 +4618,43 @@ mod tests {
         );
     }
 
+    /// N1: `apply_memory_harvest_decision` alone, by design, only ever
+    /// writes `harvest = true` on accept -- never `false` on decline (see
+    /// its own doc comment) -- so a decline that reuses only that helper
+    /// would silently leave a previously-`true` harvest untouched. Writing
+    /// the plain bool first is what makes a decline actually take effect.
+    #[test]
+    fn apply_first_run_answers_lets_a_decline_actually_turn_off_a_previously_true_harvest() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        let _var = VarGuard::set(&[
+            ("ZIRV_CTX_AGENT", None),
+            ("ZIRV_CTX_CHAT_MODEL", None),
+            ("ZIRV_CTX_MEMORY", None),
+        ]);
+        set_home_ctx_toml_bool(home.path(), "memory", "harvest", true).expect("seed true");
+
+        let answers = FirstRunAnswers {
+            harness_enabled: vec![("claude", false), ("codex", false)],
+            default_agent: None,
+            chat_model: None,
+            memory_enabled: true,
+            memory_harvest: false,
+            create_local_zirv: false,
+            install_hooks: false,
+        };
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert!(
+            !cfg.memory.harvest,
+            "a decline must actually turn off a previously-true harvest"
+        );
+    }
+
     /// A `None` answer must leave the corresponding key entirely unwritten,
     /// not written as some placeholder -- `agent`/`chat.model` stay whatever
     /// they already were (here: absent).
@@ -4658,10 +4696,19 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let cwd = tempfile::tempdir().expect("cwd");
         let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        // This test asserts on the *default* claude/codex config locations
+        // under `home`; `claude_config_dir`/`codex_config_dir` honour
+        // `$CLAUDE_CONFIG_DIR`/`$CODEX_HOME` when set, which -- on a machine
+        // where either is set in the real environment -- would otherwise
+        // route `install_hooks: true` below into mutating the operator's
+        // actual `settings.json`/`hooks.json` before this test's assertions
+        // even run.
         let _var = VarGuard::set(&[
             ("ZIRV_CTX_AGENT", None),
             ("ZIRV_CTX_CHAT_MODEL", None),
             ("ZIRV_CTX_MEMORY", None),
+            ("CLAUDE_CONFIG_DIR", None),
+            ("CODEX_HOME", None),
         ]);
 
         let answers = FirstRunAnswers {
