@@ -544,41 +544,94 @@ pub fn short_is_live(state: &StateDir, short: &str) -> bool {
 /// fails to parse is skipped outright: one malformed record must never fail
 /// the whole listing.
 pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
-    let Ok(entries) = std::fs::read_dir(state.sessions()) else {
-        return Vec::new();
-    };
     let mut found = Vec::new();
+    // Issue #99 (2026-08-23): an absent `sessions/` directory used to make
+    // this whole function return immediately, before `sweep_orphan_endpoints`
+    // below ever ran. That is exactly the state a fresh install, or a
+    // machine where every registry record has already been cleaned up some
+    // other way, is in -- precisely the case a stray `*.sock` file left by an
+    // older zirv build (which predates the registry entirely) needs the
+    // sweep to still run. `state.sessions()` missing now only means "no
+    // records to list", not "skip every other sweep this function does".
+    if let Ok(entries) = std::fs::read_dir(state.sessions()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<Record>(&contents) else {
+                continue;
+            };
+            if is_alive(record.pid) {
+                found.push((record, Liveness::Live));
+            } else {
+                let _ = std::fs::remove_file(&path);
+                found.push((record, Liveness::Stale));
+            }
+        }
+        // `read_dir` yields records in a filesystem-dependent order, so a
+        // caller that indexes the list positionally (the dashboard sidebar
+        // re-reads it every ~1s) would see rows reorder under the operator
+        // whenever an unrelated session registers or exits. Sort by a stable
+        // key -- the launch time, then the short id as a tiebreak -- so the
+        // ordering is deterministic across refreshes regardless of how the
+        // directory happened to enumerate.
+        found.sort_by(|a, b| {
+            a.0.started_at
+                .cmp(&b.0.started_at)
+                .then_with(|| a.0.short.cmp(&b.0.short))
+        });
+    }
+    sweep_orphaned_markers(state, &found);
+    sweep_orphan_endpoints(state, &found);
+    found
+}
+
+/// C9 (issue #99, 2026-08-23): an orphaned turn-signal endpoint -- a
+/// `*.sock` file in `state.sockets()` with no matching live session record.
+/// `SignalServer::bind` writes one for every supervised session (a real Unix
+/// domain socket, or on Windows a marker file naming the pipe), and only
+/// `Drop for SignalServer` removes it, which never runs for a killed or
+/// crashed process (this binary's release profile is `panic = "abort"`).
+/// Left behind, these accumulate and `zirv ctx status` lists every one of
+/// them forever as `(no record)` (`status.rs`'s own `sessions_lines`).
+///
+/// Only a marker whose endpoint fails a connection probe
+/// (`signal::probe`) is removed: one that still answers belongs to a
+/// supervisor that is alive but was never (or no longer) recorded in the
+/// registry -- an older build, or a registry write that failed -- and must
+/// stay both on disk and listed. `found` is the same list `list` just
+/// computed, so this never calls back into `list` itself, and every record
+/// with a live entry is skipped outright without ever touching the network
+/// (matching `sweep_orphaned_markers`'s own "only markers with no live
+/// record" rule immediately above).
+fn sweep_orphan_endpoints(state: &StateDir, found: &[(Record, Liveness)]) {
+    let Ok(entries) = std::fs::read_dir(state.sockets()) else {
+        return;
+    };
+    let live: std::collections::BTreeSet<&str> = found
+        .iter()
+        .filter(|(_, liveness)| *liveness == Liveness::Live)
+        .map(|(record, _)| record.short.as_str())
+        .collect();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
             continue;
         }
-        let Ok(contents) = std::fs::read_to_string(&path) else {
+        let Some(short) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Ok(record) = serde_json::from_str::<Record>(&contents) else {
+        if live.contains(short) {
             continue;
-        };
-        if is_alive(record.pid) {
-            found.push((record, Liveness::Live));
-        } else {
+        }
+        if !super::signal::probe(&path) {
             let _ = std::fs::remove_file(&path);
-            found.push((record, Liveness::Stale));
         }
     }
-    // `read_dir` yields records in a filesystem-dependent order, so a caller
-    // that indexes the list positionally (the dashboard sidebar re-reads it
-    // every ~1s) would see rows reorder under the operator whenever an
-    // unrelated session registers or exits. Sort by a stable key -- the launch
-    // time, then the short id as a tiebreak -- so the ordering is deterministic
-    // across refreshes regardless of how the directory happened to enumerate.
-    found.sort_by(|a, b| {
-        a.0.started_at
-            .cmp(&b.0.started_at)
-            .then_with(|| a.0.short.cmp(&b.0.short))
-    });
-    sweep_orphaned_markers(state, &found);
-    found
 }
 
 /// C8: a wake-up marker outlives its session whenever the supervisor died
@@ -1315,6 +1368,94 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = state_in(tmp.path());
         assert!(list(&state).is_empty());
+    }
+
+    /// The Windows named-pipe namespace is machine-global (unlike a unix
+    /// domain socket, scoped to its own tempdir), so a hardcoded or
+    /// small-space-derived short id in a test that touches
+    /// `signal::probe`/`SignalServer::bind` risks colliding with an
+    /// unrelated live pipe -- including one this very test binary leaked
+    /// earlier in the same run (`Drop for SignalServer` on Windows only
+    /// removes the marker file; the acceptor thread and its pipe instance
+    /// keep answering for the rest of the process's life). A fresh random
+    /// UUID per call, the same generator every real session id already uses
+    /// (`event.rs`), keeps this from ever landing on a name anything else in
+    /// the process could already own.
+    fn unique_endpoint_session() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Issue #99 (2026-08-23): a `*.sock` marker with no matching session
+    /// record and nothing listening behind it is a leftover from a killed or
+    /// crashed supervisor (`Drop for SignalServer` never ran). `list`'s own
+    /// sweep must remove it rather than let it accumulate forever.
+    #[test]
+    fn a_dead_endpoint_marker_with_no_record_is_swept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        super::super::state::create_private_dir_all(&state.sockets()).expect("mkdir");
+        let path = state.socket_for(&unique_endpoint_session());
+        std::fs::write(&path, "leftover, nothing is listening").expect("write leftover marker");
+        assert!(path.exists(), "sanity: the leftover marker exists");
+
+        assert!(list(&state).is_empty(), "no registry record exists");
+        assert!(
+            !path.exists(),
+            "a dead endpoint with no record must be swept: {}",
+            path.display()
+        );
+    }
+
+    /// A marker whose endpoint still answers belongs to a supervisor that is
+    /// alive but simply has no registry record (an older build, or a
+    /// registry write that failed) -- it must stay on disk and stay listed,
+    /// not be swept just because nothing filed a `Record` for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_endpoint_marker_with_no_record_is_kept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let path = state.socket_for(&unique_endpoint_session());
+        let _server = crate::commands::ctx::signal::SignalServer::bind(&path).expect("bind");
+        assert!(path.exists(), "sanity: the live endpoint exists");
+
+        assert!(list(&state).is_empty(), "no registry record exists");
+        assert!(
+            path.exists(),
+            "a live endpoint with no record must be kept: {}",
+            path.display()
+        );
+    }
+
+    /// A live *registered* session's own endpoint marker must never be swept
+    /// as a side effect of sweeping everyone else's orphans.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_registered_sessions_endpoint_marker_is_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let session = unique_endpoint_session();
+        let record = record_for(&session, &repo, Verb::Wrap);
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+
+        let path = state.socket_for(&session);
+        let _server = crate::commands::ctx::signal::SignalServer::bind(&path).expect("bind");
+        assert!(path.exists(), "sanity: the endpoint exists");
+
+        let found = list(&state);
+        assert!(
+            found
+                .iter()
+                .any(|(r, liveness)| r.short == short && *liveness == Liveness::Live),
+            "the registered session is still listed as live: {found:?}"
+        );
+        assert!(
+            path.exists(),
+            "a live registered session's own marker must be untouched: {}",
+            path.display()
+        );
     }
 
     #[test]

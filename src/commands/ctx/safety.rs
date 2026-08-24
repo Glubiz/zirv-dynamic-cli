@@ -468,6 +468,20 @@ fn normalize_segments(command: &str) -> Vec<String> {
 /// stack-depth or exponential-blowup DoS surface. Worst case is `O(pattern
 /// * command)` with no recursion.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
+    // Issue #106: claude's own documented prefix semantics for a
+    // `<verb> *`-style rule match the bare verb too (`Bash(git *)` "matches
+    // git, git status, git commit" -- adapters/mod.rs's own doc comment),
+    // but the star here otherwise only matches text *after* the literal
+    // space that precedes it, so `"git push --force *"` matched `"git push
+    // --force x"` yet not the bare `"git push --force"` a real invocation
+    // sends with nothing following. Every `verb *` deny pattern was
+    // therefore inert against exactly that bare form. A pattern ending in
+    // `" *"` also matches its own prefix with the trailing `" *"` stripped.
+    if let Some(prefix) = pattern.strip_suffix(" *")
+        && text == prefix
+    {
+        return true;
+    }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -661,11 +675,19 @@ fn read_stdin() -> String {
 /// Every field optional with a zero default, the same rule `hook.rs`'s own
 /// `PreToolPayload` follows: a hook that fails to parse must fail open, not
 /// crash or silently deny everything.
+///
+/// `permission_mode` carries claude's own session mode (documented values:
+/// `"default"`, `"plan"`, `"acceptEdits"`, `"auto"`, `"dontAsk"`,
+/// `"bypassPermissions"`, https://code.claude.com/docs/en/hooks) and defaults
+/// to the empty string on an older payload that omits it entirely -- treated
+/// the same as any mode other than `"dontAsk"` by `hook_output` below
+/// (2026-08-23, issue #102).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct HookToolPayload {
     tool_name: String,
     tool_input: HookToolInput,
+    permission_mode: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -724,9 +746,23 @@ fn explain_text(command: &str, outcome: &Outcome) -> String {
 /// nothing is claude's own "no opinion, fall through to the normal
 /// permission flow" reading, the same convention `pretool_output`'s own
 /// caller (`run_pretool`) already relies on.
-fn hook_output(command: &str, outcome: &Outcome) -> Option<String> {
+///
+/// Under `--permission-mode dontAsk`, claude's own docs say a hook decision
+/// never bypasses permission rules ("Hook decisions don't bypass permission
+/// rules", https://code.claude.com/docs/en/permissions) and that `dontAsk`
+/// itself means "deny if not pre-approved" -- so an active `"ask"` in that
+/// mode is not a prompt, it is an unsatisfiable denial that would strip the
+/// operator's own `permissions.allow` entries from every zirv-launched
+/// session. `permission_mode` therefore also gates `Verdict::Ask`: under
+/// `dontAsk` it falls through to `None` (nothing emitted, same as `Allow`),
+/// letting claude's own permission flow -- and the operator's `allow` list --
+/// decide. Every other mode (including the empty/unknown default) keeps
+/// emitting `"ask"` unchanged, and `Deny` is unaffected by mode: it always
+/// emits `"deny"` (2026-08-23, issue #102).
+fn hook_output(command: &str, outcome: &Outcome, permission_mode: &str) -> Option<String> {
     let decision = match outcome.verdict {
         Verdict::Deny => "deny",
+        Verdict::Ask if permission_mode == "dontAsk" => return None,
         Verdict::Ask => "ask",
         Verdict::Allow => return None,
     };
@@ -767,7 +803,16 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
         return Ok(outcome.verdict.exit_code());
     }
 
-    let Some(payload) = HookToolPayload::parse(&read_stdin()) else {
+    run_check_hook_mode(&cfg, w, &read_stdin())
+}
+
+/// The hook-mode core of `run_check`, split out so it can be tested by
+/// feeding it a raw stdin payload directly rather than the process's actual
+/// stdin (which `run_check` only reads lazily, once it knows this is hook
+/// mode -- reading it eagerly here would make CLI mode block waiting on
+/// stdin that never arrives).
+fn run_check_hook_mode<W: Write>(cfg: &CtxConfig, w: &mut W, stdin: &str) -> CtxResult<i32> {
+    let Some(payload) = HookToolPayload::parse(stdin) else {
         return Ok(0);
     };
     if payload.tool_name != "Bash" {
@@ -778,7 +823,7 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
         return Ok(0);
     }
     let outcome = evaluate(&cfg.safety, command);
-    if let Some(output) = hook_output(command, &outcome) {
+    if let Some(output) = hook_output(command, &outcome, &payload.permission_mode) {
         writeln!(w, "{output}")?;
     }
     Ok(0)
@@ -886,6 +931,24 @@ mod tests {
         assert!(!glob_match("*a*b*c*", "xaxbx"));
     }
 
+    /// Issue #106: claude's own documented prefix semantics (`adapters/
+    /// mod.rs`'s doc comment on `Bash(git *)`: "matches git, git status,
+    /// git commit") match the bare verb with no trailing space too, but
+    /// `glob_match`'s literal star semantics did not -- `"git push
+    /// --force *"` matched `"git push --force x"` but not the bare `"git
+    /// push --force"` a real invocation actually sends. Every `verb *`
+    /// deny pattern was therefore inert against exactly the bare form an
+    /// attacker (or an honest mistake) would type.
+    #[test]
+    fn glob_match_trailing_space_star_also_matches_the_bare_prefix() {
+        assert!(glob_match("git push --force *", "git push --force"));
+        assert!(glob_match("git *", "git"));
+        assert!(!glob_match("git *", "gitx"));
+        // No trailing space before the star: unaffected, still prefix-only.
+        assert!(glob_match("cargo publish*", "cargo publish"));
+        assert!(glob_match("cat *.aws*", "cat .aws/credentials"));
+    }
+
     // -- evaluate: destructive families the issue lists --------------
 
     fn policy_with(deny: &[&str], ask: &[&str], allow: &[&str], default: Verdict) -> SafetyPolicy {
@@ -935,6 +998,113 @@ mod tests {
             ("cat README.md", Verdict::Allow),
             ("rg pattern", Verdict::Allow),
             ("some totally unknown command", Verdict::Ask),
+        ];
+        for (command, expected) in cases {
+            let outcome = evaluate(&policy, command);
+            assert_eq!(
+                outcome.verdict, *expected,
+                "{command}: expected {expected:?}, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    /// Issue #104: zirv's own injected prompt routinely instructs a session
+    /// to run `zirv ctx ...`/`zirv agent ...` -- the shipped default must
+    /// actually allow zirv's own CLI, not deny it by omission the same way
+    /// `dontAsk` denies anything unlisted (issue #98).
+    #[test]
+    fn prompt_mandated_zirv_commands_are_allowed_by_the_shipped_posture() {
+        let policy = SafetyPolicy::default();
+        for command in ["zirv ctx status", "zirv agent codex \"do the thing\""] {
+            let outcome = evaluate(&policy, command);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "{command}: expected Allow, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    /// Issue #104's own worked examples, evaluated against the real shipped
+    /// default (not a hand-built `policy_with`, unlike `evaluate_table_
+    /// matches_the_issues_own_examples` above) -- this is the end-to-end
+    /// check that the whole-family allow entries plus the new deny
+    /// additions actually classify the way the issue describes.
+    #[test]
+    fn evaluate_shipped_default_matches_issue_104_examples() {
+        let policy = SafetyPolicy::default();
+        let cases: &[(&str, Verdict)] = &[
+            ("gh pr create --title x", Verdict::Allow),
+            ("cargo run -- version", Verdict::Allow),
+            ("cat src/main.rs", Verdict::Allow),
+            ("cat ~/.aws/credentials", Verdict::Deny),
+            ("gh repo delete x", Verdict::Deny),
+            ("cargo publish", Verdict::Deny),
+            ("git clean -fdx", Verdict::Deny),
+            ("git push --delete origin x", Verdict::Deny),
+            ("npm publish", Verdict::Deny),
+            // Issue #106: the bare form (no trailing args) of a `verb *`
+            // deny pattern must be denied too, not only one carrying flags.
+            ("git push --force", Verdict::Deny),
+            ("git reset --hard", Verdict::Deny),
+            ("some-unknown-tool --flag", Verdict::Ask),
+        ];
+        for (command, expected) in cases {
+            let outcome = evaluate(&policy, command);
+            assert_eq!(
+                outcome.verdict, *expected,
+                "{command}: expected {expected:?}, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    /// Issue #111 (PR #107's review of issue #104's round): the old
+    /// `git push`/`git reset` deny entries were flag-anchored and so were
+    /// bypassed by simple argument reordering (`git push origin --force`)
+    /// or a sibling spelling (`-f`/`-d`, an empty-src refspec, a
+    /// force-refspec push); `find`, `head`, `tail`, `diff`, and `gh` had
+    /// their own uncovered sibling escapes. This asserts the fixed shipped
+    /// default catches every bypass form and still allows the ordinary,
+    /// non-destructive uses of the same command families (2026-08-23,
+    /// issue #111).
+    #[test]
+    fn evaluate_deny_survives_argument_reordering_issue_111() {
+        let policy = SafetyPolicy::default();
+        let cases: &[(&str, Verdict)] = &[
+            // Reordered / sibling git push forms.
+            ("git push origin --force", Verdict::Deny),
+            ("git push origin -f", Verdict::Deny),
+            ("git push origin --delete x", Verdict::Deny),
+            ("git push origin -d x", Verdict::Deny),
+            ("git push origin :x", Verdict::Deny),
+            ("git push origin +x", Verdict::Deny),
+            ("git push --force-with-lease origin x", Verdict::Deny),
+            ("git reset HEAD~1 --hard", Verdict::Deny),
+            // find's own -delete/-exec/-ok actions.
+            ("find . -type f -delete", Verdict::Deny),
+            ("find . -name x -exec rm {} ;", Verdict::Deny),
+            // head/tail/diff credential-path parity with cat.
+            ("head ~/.ssh/id_rsa", Verdict::Deny),
+            ("tail -c 40 ~/.aws/credentials", Verdict::Deny),
+            ("diff ~/.ssh/id_rsa /dev/null", Verdict::Deny),
+            // gh escapes.
+            ("gh api -X DELETE /repos/o/r", Verdict::Deny),
+            ("gh secret set X", Verdict::Deny),
+            ("gh codespace ssh", Verdict::Deny),
+            // Ordinary, non-destructive uses must stay Allow -- in
+            // particular, the space-anchored `-f`/`-d` patterns must not
+            // fire on an unrelated `-u` flag or a branch name that merely
+            // contains a hyphen.
+            ("git push origin feature-branch", Verdict::Allow),
+            ("git push -u origin feature-branch", Verdict::Allow),
+            ("git push -u origin x", Verdict::Allow),
+            ("find . -name foo.rs", Verdict::Allow),
+            ("head src/main.rs", Verdict::Allow),
+            ("gh api /repos/o/r", Verdict::Allow),
+            ("gh pr create --fill", Verdict::Allow),
         ];
         for (command, expected) in cases {
             let outcome = evaluate(&policy, command);
@@ -1105,7 +1275,22 @@ mod tests {
         let allow = builtin_allow();
         assert!(!allow.iter().any(|r| r.pattern.contains("Read(")));
         assert!(!allow.iter().any(|r| r.pattern.contains("Edit(")));
-        assert!(allow.iter().any(|r| r.pattern == "git status *"));
+        assert!(!allow.iter().any(|r| r.pattern == "WebFetch"));
+        assert!(!allow.iter().any(|r| r.pattern == "WebSearch"));
+        assert!(allow.iter().any(|r| r.pattern == "git *"));
+    }
+
+    /// The deny side gained its own non-`Bash` entries too (issue #104):
+    /// `command_pattern_from_bash_rule` is the single, general gate both
+    /// `builtin_allow`/`builtin_deny` share, not a hard-coded skip of the
+    /// two original file-scope rules -- this pins that a `Read(...)`/
+    /// `Edit(...)` deny entry is skipped exactly the same way.
+    #[test]
+    fn builtin_deny_skips_the_non_command_file_scope_rules_too() {
+        let deny = builtin_deny();
+        assert!(!deny.iter().any(|r| r.pattern.contains("Read(")));
+        assert!(!deny.iter().any(|r| r.pattern.contains("Edit(")));
+        assert!(deny.iter().any(|r| r.pattern == "rm -rf *"));
     }
 
     // -- resolve: the repo-narrowing trust boundary --------------------
@@ -1250,7 +1435,7 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        assert!(hook_output("ls", &allow).is_none());
+        assert!(hook_output("ls", &allow, "default").is_none());
 
         let deny = Outcome {
             verdict: Verdict::Deny,
@@ -1259,7 +1444,7 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("rm -rf /", &deny).expect("deny produces output");
+        let output = hook_output("rm -rf /", &deny, "default").expect("deny produces output");
         assert!(output.contains("\"permissionDecision\":\"deny\""));
         assert!(output.contains("\"hookEventName\":\"PreToolUse\""));
 
@@ -1270,8 +1455,150 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("git push", &ask).expect("ask produces output");
+        let output = hook_output("git push", &ask, "default").expect("ask produces output");
         assert!(output.contains("\"permissionDecision\":\"ask\""));
+    }
+
+    // -- dontAsk fall-through (issue #102) -------------------------------
+    //
+    // A hook "ask" is an unsatisfiable prompt under `--permission-mode
+    // dontAsk` (claude treats it as "deny if not pre-approved"), so it must
+    // fall through and emit nothing rather than strip the operator's own
+    // `permissions.allow` entries. `Deny` still denies in every mode, and
+    // every mode other than `dontAsk` keeps emitting `"ask"`.
+
+    #[test]
+    fn hook_output_ask_under_dont_ask_falls_through_to_nothing() {
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "git push*".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        assert!(hook_output("git push", &ask, "dontAsk").is_none());
+    }
+
+    #[test]
+    fn hook_output_deny_still_denies_under_dont_ask() {
+        let deny = Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(Rule {
+                pattern: "rm -rf *".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let output = hook_output("rm -rf /", &deny, "dontAsk").expect("deny still denies");
+        assert!(output.contains("\"permissionDecision\":\"deny\""));
+    }
+
+    #[test]
+    fn hook_output_ask_with_no_permission_mode_still_asks() {
+        // Backward compatible: an older claude CLI (or any payload that
+        // omits `permission_mode`) parses to the empty string default, which
+        // must not be treated as `dontAsk`.
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "git push*".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let output = hook_output("git push", &ask, "").expect("ask still asks");
+        assert!(output.contains("\"permissionDecision\":\"ask\""));
+    }
+
+    #[test]
+    fn hook_tool_payload_parses_the_permission_mode_field() {
+        let payload = HookToolPayload::parse(
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"permission_mode":"dontAsk"}"#,
+        )
+        .expect("parses");
+        assert_eq!(payload.permission_mode, "dontAsk");
+
+        // Absent entirely: defaults to empty, not an error.
+        let payload =
+            HookToolPayload::parse(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)
+                .expect("parses");
+        assert_eq!(payload.permission_mode, "");
+    }
+
+    /// End-to-end through `run_check_hook_mode`, the same core `run_check`'s
+    /// hook branch delegates to once the stdin payload is in hand -- pinned
+    /// separately from `run_check` itself because `run_check` reads real
+    /// process stdin lazily (only in hook mode) and must not be made to block
+    /// on stdin in CLI mode just to be testable.
+    #[test]
+    fn run_check_hook_mode_dont_ask_with_unmatched_command_emits_nothing() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let stdin =
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"permission_mode":"dontAsk"}"#;
+        let mut out = Vec::new();
+        let code = run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "expected no output, got {out:?}");
+    }
+
+    #[test]
+    fn run_check_hook_mode_default_mode_with_unmatched_ask_command_emits_ask() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"some-unknown-tool --flag"},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        let code = run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\"permissionDecision\":\"ask\""),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn run_check_hook_mode_denied_command_denies_under_both_modes() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        for mode in ["dontAsk", "default"] {
+            let stdin = format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"rm -rf x"}},"permission_mode":"{mode}"}}"#
+            );
+            let mut out = Vec::new();
+            let code = run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+            assert_eq!(code, 0);
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.contains("\"permissionDecision\":\"deny\""),
+                "mode {mode}: got {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_check_hook_mode_missing_permission_mode_still_asks() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"some-unknown-tool --flag"}}"#;
+        let mut out = Vec::new();
+        let code = run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\"permissionDecision\":\"ask\""),
+            "got {text}"
+        );
     }
 
     #[test]

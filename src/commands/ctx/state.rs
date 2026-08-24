@@ -30,6 +30,27 @@ pub fn now_secs() -> u64 {
 /// readable) falls back to its own text, which is the pre-existing behavior.
 pub fn repo_slug(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    display_path(&path)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Strips a Windows verbatim path prefix (`\\?\`, or `\\?\UNC\` for a UNC
+/// path) for user-facing display. `std::fs::canonicalize` yields a verbatim
+/// path on Windows (`\\?\D:\...`) -- correct for filesystem calls, but
+/// confusing and often un-copy-pasteable printed to a terminal (`setup.rs`
+/// was doing this raw: "Zirv AI setup for \\?\D:\..."). A no-op on
+/// non-Windows and on any path that was never in verbatim form. `repo_slug`
+/// above uses this same stripping so callers get one answer, not two
+/// (2026-08-23, issue #101).
+pub fn display_path(path: &Path) -> String {
     let rendered = path.to_string_lossy();
     #[cfg(windows)]
     let rendered = if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
@@ -43,15 +64,6 @@ pub fn repo_slug(path: &Path) -> String {
     #[cfg(not(windows))]
     let rendered = rendered.into_owned();
     rendered
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 /// Filesystem-safe form of an adapter's provider slug
@@ -521,6 +533,29 @@ mod tests {
             repo_slug(std::path::Path::new("/Users/x/Documents/my repo.git")),
             "-Users-x-Documents-my-repo-git"
         );
+    }
+
+    // -- display_path (issue #101) ---------------------------------------
+
+    #[cfg(windows)]
+    #[test]
+    fn display_path_strips_the_windows_verbatim_prefix() {
+        assert_eq!(display_path(std::path::Path::new(r"\\?\D:\x\y")), r"D:\x\y");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_path_strips_the_windows_verbatim_unc_prefix() {
+        assert_eq!(
+            display_path(std::path::Path::new(r"\\?\UNC\srv\share\x")),
+            r"\\srv\share\x"
+        );
+    }
+
+    #[test]
+    fn display_path_leaves_a_plain_path_alone() {
+        let plain = std::path::Path::new("some/plain/path");
+        assert_eq!(display_path(plain), plain.to_string_lossy());
     }
 
     #[cfg(windows)]

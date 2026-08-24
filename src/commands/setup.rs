@@ -879,7 +879,152 @@ fn toolchain_proposal(repo: &Path) -> Option<MemoryProposal> {
     })
 }
 
-fn high_signal_markdown(path: &Path, repo: &Path) -> Vec<MemoryProposal> {
+/// Strips fenced code blocks (```` ``` ```` ... ```` ``` ````) out of a
+/// section body before it is measured or stored: verbatim source dumped
+/// into a memory entry is noise the retrieval layer has to pay for, never
+/// the "durable fact" a vault section is meant to distill (2026-08-23,
+/// issue #103). A fence line itself (opening or closing) is also dropped.
+/// An unterminated fence at end-of-text is treated as still "inside" the
+/// fence, so a truncated/malformed block never leaks its trailing lines.
+fn strip_fenced_code_blocks(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Cuts `text` to at most `cap` bytes, preferring the last sentence
+/// boundary (`". "`, `".\n"`, or a `.` right at the cut point) before the
+/// cap, falling back to the last whitespace boundary, and never splitting a
+/// UTF-8 character -- so a vault-extracted body never ends mid-word or
+/// mid-character (2026-08-23, issue #103). Appends nothing: an omitted tail
+/// is not marked, matching `crate::utils::truncate_bytes`'s own contract.
+fn truncate_at_sentence_boundary(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let safe = crate::utils::truncate_bytes(text.to_string(), Some(cap));
+    let mut best: Option<usize> = None;
+    for pattern in [". ", ".\n"] {
+        if let Some(idx) = safe.rfind(pattern) {
+            best = Some(best.map_or(idx, |b| b.max(idx)));
+        }
+    }
+    if safe.ends_with('.') {
+        let idx = safe.len() - 1;
+        best = Some(best.map_or(idx, |b| b.max(idx)));
+    }
+    if let Some(idx) = best {
+        return safe[..=idx].to_string();
+    }
+    match safe.rfind(char::is_whitespace) {
+        Some(idx) => safe[..idx].trim_end().to_string(),
+        None => safe,
+    }
+}
+
+/// Cuts a slug to at most `cap` bytes without splitting a word: trims back
+/// to the last `-` at or before the cap so a truncated key never ends
+/// mid-word (2026-08-23, issue #103). The input is always the ASCII
+/// `[a-z0-9-]` output of `ctx::memory::slug_key`, so byte slicing is safe.
+fn truncate_key_bytes(key: &str, cap: usize) -> String {
+    let trimmed = if key.len() <= cap {
+        key
+    } else {
+        let cut = &key[..cap];
+        match cut.rfind('-') {
+            Some(idx) if idx > 0 => &cut[..idx],
+            _ => cut,
+        }
+    };
+    let trimmed = trimmed.trim_matches('-');
+    if trimmed.is_empty() {
+        "project-knowledge".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Builds a shared-memory key for one vault section (issue #103): the
+/// page's slug plus up to four slugged heading words, truncated to 48
+/// bytes on a `-` boundary -- readable, unlike the old whole-heading key
+/// (`memory-key(&format!("{stem}-{title}"))`), which could run to the
+/// entire heading text. Reuses `ctx::memory::slug_key`/`validate_shared_key`
+/// (the shared-scope key rules a generated key must satisfy anyway) rather
+/// than a second validator; `memory_key` is kept only as a fallback for the
+/// pathological case where slugging the heading leaves nothing usable.
+/// Disambiguated against every key already produced in this run (`seen`,
+/// shared across pages by the caller) with a `-2`, `-3`, ... suffix, so two
+/// pages that share both a file stem and a heading never collide.
+fn memory_section_key(stem: &str, heading: &str, seen: &mut BTreeSet<String>) -> String {
+    let page_slug = ctx::memory::slug_key(stem);
+    let heading_words = heading
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let heading_slug = ctx::memory::slug_key(&heading_words);
+    let base = truncate_key_bytes(&format!("{page_slug}-{heading_slug}"), 48);
+    let base = if ctx::memory::validate_shared_key(&base).is_ok() {
+        base
+    } else {
+        memory_key(heading)
+    };
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while !seen.insert(candidate.clone()) {
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+/// Flushes one accumulated `## ` section (if it was one of the qualifying
+/// keywords) into `sections`. Fenced code blocks are stripped and the
+/// section is skipped outright when what remains is under 80 bytes -- a
+/// heading with no real prose under it is not a usable fact (issue #103).
+#[allow(clippy::too_many_arguments)]
+fn flush_markdown_section(
+    stem: &str,
+    heading: &Option<String>,
+    body: &str,
+    path: &Path,
+    repo: &Path,
+    body_cap: usize,
+    seen_keys: &mut BTreeSet<String>,
+    sections: &mut Vec<MemoryProposal>,
+) {
+    let Some(title) = heading else {
+        return;
+    };
+    let content = normalized(&strip_fenced_code_blocks(body));
+    if content.len() < 80 {
+        return;
+    }
+    sections.push(MemoryProposal {
+        key: memory_section_key(stem, title, seen_keys),
+        body: truncate_at_sentence_boundary(&content, body_cap),
+        tags: vec!["documentation".to_string()],
+        paths: vec![relative_path(repo, path)],
+    });
+}
+
+fn high_signal_markdown(
+    path: &Path,
+    repo: &Path,
+    body_cap: usize,
+    seen_keys: &mut BTreeSet<String>,
+) -> Vec<MemoryProposal> {
     let Some(text) = read_regular(path) else {
         return Vec::new();
     };
@@ -894,33 +1039,27 @@ fn high_signal_markdown(path: &Path, repo: &Path) -> Vec<MemoryProposal> {
         "deployment",
         "contributing",
     ];
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("docs");
     let mut sections = Vec::new();
     let mut heading: Option<String> = None;
     let mut body = String::new();
-    let flush = |heading: &mut Option<String>, body: &mut String, sections: &mut Vec<_>| {
-        let Some(title) = heading.take() else {
-            body.clear();
-            return;
-        };
-        let content = normalized(body);
-        body.clear();
-        if content.is_empty() {
-            return;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("docs");
-        sections.push(MemoryProposal {
-            key: memory_key(&format!("{stem}-{title}")),
-            body: crate::utils::truncate_bytes(content, Some(768)),
-            tags: vec!["documentation".to_string()],
-            paths: vec![relative_path(repo, path)],
-        });
-    };
     for line in text.lines() {
         if let Some(title) = line.trim_start().strip_prefix("## ") {
-            flush(&mut heading, &mut body, &mut sections);
+            flush_markdown_section(
+                stem,
+                &heading,
+                &body,
+                path,
+                repo,
+                body_cap,
+                seen_keys,
+                &mut sections,
+            );
+            heading = None;
+            body.clear();
             let title = title.trim();
             if keywords
                 .iter()
@@ -933,7 +1072,16 @@ fn high_signal_markdown(path: &Path, repo: &Path) -> Vec<MemoryProposal> {
             body.push('\n');
         }
     }
-    flush(&mut heading, &mut body, &mut sections);
+    flush_markdown_section(
+        stem,
+        &heading,
+        &body,
+        path,
+        repo,
+        body_cap,
+        seen_keys,
+        &mut sections,
+    );
     sections
 }
 
@@ -974,12 +1122,15 @@ fn markdown_files(root: &Path, limit: usize) -> Vec<PathBuf> {
     files
 }
 
-fn memory_proposals(repo: &Path, source: Option<&Path>) -> Vec<MemoryProposal> {
+fn memory_proposals(repo: &Path, source: Option<&Path>, body_cap: usize) -> Vec<MemoryProposal> {
     let mut proposals = Vec::new();
+    let mut seen = BTreeSet::new();
     if let Some(proposal) = validation_proposal(repo) {
+        seen.insert(proposal.key.clone());
         proposals.push(proposal);
     }
     if let Some(proposal) = toolchain_proposal(repo) {
+        seen.insert(proposal.key.clone());
         proposals.push(proposal);
     }
     let roots = source
@@ -987,11 +1138,9 @@ fn memory_proposals(repo: &Path, source: Option<&Path>) -> Vec<MemoryProposal> {
         .unwrap_or_else(|| vec![repo.join("README.md"), repo.join("docs")]);
     for root in roots {
         for path in markdown_files(&root, 32) {
-            proposals.extend(high_signal_markdown(&path, repo));
+            proposals.extend(high_signal_markdown(&path, repo, body_cap, &mut seen));
         }
     }
-    let mut seen = BTreeSet::new();
-    proposals.retain(|proposal| seen.insert(proposal.key.clone()));
     proposals
 }
 
@@ -1034,7 +1183,7 @@ fn initialize_memory_with(
         .iter()
         .map(|(_, entry)| entry.key.clone())
         .collect::<BTreeSet<_>>();
-    let proposals = memory_proposals(repo, options.source.as_deref());
+    let proposals = memory_proposals(repo, options.source.as_deref(), cfg.memory.max_entry_bytes);
     let proposed = proposals.len().min(options.max_entries);
     let mut written = 0;
     let mut skipped_existing = 0;
@@ -1391,7 +1540,11 @@ fn reset_one<W: Write>(
     }
     if dry_run {
         for path in &existing {
-            writeln!(writer, "would back up and reset {}", path.display())?;
+            writeln!(
+                writer,
+                "would back up and reset {}",
+                ctx::state::display_path(path)
+            )?;
         }
         return Ok(existing.len());
     }
@@ -1416,7 +1569,7 @@ fn reset_one<W: Write>(
         "reset {} {:?} setting(s); backup: {}",
         existing.len(),
         provider,
-        backup_dir.display()
+        ctx::state::display_path(&backup_dir)
     )?;
     Ok(existing.len())
 }
@@ -1494,7 +1647,11 @@ fn run_status<W: Write>(args: &StatusArgs, writer: &mut W) -> SetupResult<i32> {
         writeln!(writer, "{}", serde_json::to_string_pretty(&status)?)?;
         return Ok(0);
     }
-    writeln!(writer, "Zirv AI setup for {}", status.repo.display())?;
+    writeln!(
+        writer,
+        "Zirv AI setup for {}",
+        ctx::state::display_path(&status.repo)
+    )?;
     writeln!(
         writer,
         "  harnesses: Claude {}, Codex {}",
@@ -1558,7 +1715,7 @@ fn run_apply<W: Write>(args: &ApplyArgs, writer: &mut W) -> SetupResult<i32> {
                     } else {
                         "created"
                     },
-                    path.display()
+                    ctx::state::display_path(&path)
                 )?;
             }
         }
@@ -1675,7 +1832,7 @@ fn run_reset<W: Write>(args: &ResetArgs, writer: &mut W) -> SetupResult<i32> {
                         return Err(format!(
                             "refusing global reset because {} is inside repository {}",
                             base.display(),
-                            repo.display()
+                            ctx::state::display_path(&repo)
                         )
                         .into());
                     }
@@ -2229,7 +2386,7 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
             writeln!(
                 writer,
                 "would restore {} [{}]",
-                target.source.display(),
+                ctx::state::display_path(&target.source),
                 describe_state(state)
             )?;
         }
@@ -2237,7 +2394,7 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
             writeln!(
                 writer,
                 "would NOT restore {} (credentials; pass --include-auth)",
-                target.source.display()
+                ctx::state::display_path(&target.source)
             )?;
         }
         return Ok(0);
@@ -2279,26 +2436,26 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
     }
 
     for path in &written {
-        writeln!(writer, "restored {}", path.display())?;
+        writeln!(writer, "restored {}", ctx::state::display_path(path))?;
     }
     for target in &skipped_auth {
         writeln!(
             writer,
             "not restored (credentials; pass --include-auth): {}",
-            target.source.display()
+            ctx::state::display_path(&target.source)
         )?;
     }
     for (path, error) in &failed {
         writeln!(
             writer,
             "NOT restored (error): {} -- {error}",
-            path.display()
+            ctx::state::display_path(path)
         )?;
     }
     writeln!(
         writer,
         "safety backup of the pre-restore state: {}",
-        safety_backup.display()
+        ctx::state::display_path(&safety_backup)
     )?;
 
     if !failed.is_empty() {
@@ -2623,6 +2780,109 @@ mod tests {
         );
     }
 
+    /// Issue #103: a vault section's key must be readable (page slug plus a
+    /// few slugged heading words, not the whole heading text), its body
+    /// must respect the *configured* per-entry cap (not a hardcoded 768)
+    /// and end on a sentence boundary, and a fenced code block must never
+    /// survive into the stored body.
+    #[test]
+    fn high_signal_markdown_produces_readable_keys_and_sentence_bounded_bodies() {
+        let repo = tempfile::tempdir().expect("repo");
+        let path = repo.path().join("architecture-notes.md");
+        let sentence = "This is a long sentence describing the architecture decision in detail. ";
+        let paragraph = sentence.repeat(15);
+        assert!(paragraph.len() > 900, "fixture must exceed 900 bytes");
+        std::fs::write(
+            &path,
+            format!(
+                "# Notes\n\n## Architecture Decisions About The Mail Versus Composed Delivery System\n\n```rust\nfn leaked_code_block() {{ totally_secret(); }}\n```\n\n{paragraph}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let mut seen = BTreeSet::new();
+        let sections = high_signal_markdown(&path, repo.path(), 512, &mut seen);
+        assert_eq!(sections.len(), 1, "expected one qualifying section");
+        let section = &sections[0];
+
+        assert!(
+            section.key.len() <= 48,
+            "key must be capped to 48 bytes: {}",
+            section.key
+        );
+        assert!(
+            section.key.starts_with("architecture-notes-"),
+            "key must carry the page slug prefix: {}",
+            section.key
+        );
+
+        assert!(
+            section.body.len() <= 512,
+            "body must respect the configured cap: {} bytes",
+            section.body.len()
+        );
+        assert!(
+            section.body.ends_with('.'),
+            "body must end on a sentence boundary: {:?}",
+            section.body
+        );
+        assert!(
+            !section.body.contains("leaked_code_block") && !section.body.contains("```"),
+            "a fenced code block must never survive into the body: {:?}",
+            section.body
+        );
+    }
+
+    /// Issue #103: a heading with no real body (after stripping code
+    /// fences, under 80 bytes) is noise, not a usable memory entry.
+    #[test]
+    fn high_signal_markdown_skips_a_heading_only_section() {
+        let repo = tempfile::tempdir().expect("repo");
+        let path = repo.path().join("testing.md");
+        std::fs::write(&path, "## Testing\nOK.\n").expect("write fixture");
+
+        let mut seen = BTreeSet::new();
+        let sections = high_signal_markdown(&path, repo.path(), 512, &mut seen);
+        assert!(
+            sections.is_empty(),
+            "a heading-only section must be skipped: {sections:?}"
+        );
+    }
+
+    /// Issue #103: two pages sharing a file stem and heading (e.g. two
+    /// `guide.md` files in different directories) must not collide on the
+    /// same shared-memory key -- the second gets a `-2` suffix.
+    #[test]
+    fn high_signal_markdown_disambiguates_identical_headings_across_pages() {
+        let repo = tempfile::tempdir().expect("repo");
+        let dir_a = repo.path().join("docs");
+        let dir_b = repo.path().join("docs").join("sub");
+        std::fs::create_dir_all(&dir_a).expect("mkdir a");
+        std::fs::create_dir_all(&dir_b).expect("mkdir b");
+        let body = "This section explains the development workflow in enough detail to qualify as a real fact.\n";
+        let text = format!("## Development Workflow Guide\n\n{body}");
+        std::fs::write(dir_a.join("guide.md"), &text).expect("write a");
+        std::fs::write(dir_b.join("guide.md"), &text).expect("write b");
+
+        let mut seen = BTreeSet::new();
+        let mut sections =
+            high_signal_markdown(&dir_a.join("guide.md"), repo.path(), 512, &mut seen);
+        sections.extend(high_signal_markdown(
+            &dir_b.join("guide.md"),
+            repo.path(),
+            512,
+            &mut seen,
+        ));
+
+        assert_eq!(sections.len(), 2);
+        assert_ne!(
+            sections[0].key,
+            sections[1].key,
+            "identical headings on two pages must get distinct keys: {:?}",
+            sections.iter().map(|s| &s.key).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn reset_backs_up_exact_targets_and_preserves_auth_by_default() {
         let root = tempfile::tempdir().expect("root");
@@ -2869,6 +3129,30 @@ mod tests {
             "every claude hook, including the safety hook, is now installed"
         );
         assert_eq!(after.claude_hooks_installed, HARNESS_HOOKS.len() + 1);
+    }
+
+    /// `resolved_repo` canonicalizes, which on Windows yields a `\\?\`
+    /// verbatim-prefixed path; the status header must strip it before
+    /// printing (issue #101) rather than showing an operator something like
+    /// `Zirv AI setup for \\?\D:\...`, which is confusing and often cannot
+    /// even be pasted back into another command.
+    #[test]
+    fn run_status_header_names_the_repo_without_a_windows_verbatim_prefix() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        let args = StatusArgs {
+            repo: repo.path().to_path_buf(),
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_status(&args, &mut out).expect("runs");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains(r"\\?\"),
+            "status header must not leak the Windows verbatim prefix: {text}"
+        );
     }
 
     fn restore_args(repo: &Path) -> RestoreArgs {

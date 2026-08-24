@@ -88,6 +88,27 @@ pub fn is_managed(text: &str) -> bool {
     text.trim_start().starts_with(MANAGED_MARKER_PREFIX)
 }
 
+/// Narrows `surfaces` for `drift::analyze`'s duplicate/precedence-level
+/// comparison (issue #105): drops any surface that is itself a zirv-managed
+/// native file (`is_managed` on its text). A managed `CLAUDE.md`/`AGENTS.md`
+/// is a verbatim render of `.zirv/context/` (`context_cli::run_generate`),
+/// so pairing it against the canonical layer it was rendered from in a
+/// `duplicate-canonicalizable`/`precedence-shadowing` finding is a
+/// tautology, not real drift -- right after `zirv context sync --generate
+/// --force`, `zirv context status`/`context sync --report` were reporting
+/// exactly that. Reuses `is_managed`, the one marker parser in this
+/// codebase, rather than a second one; both call sites (`context_status::
+/// run_with`, this module's own `run_report`) still pass the UNFILTERED
+/// `surfaces` to their own surfaces listing, so sizes/budgets are unaffected
+/// -- only what `drift::analyze` gets to compare narrows.
+pub fn surfaces_for_drift(surfaces: &[optimize::Surface]) -> Vec<optimize::Surface> {
+    surfaces
+        .iter()
+        .filter(|surface| !is_managed(&surface.text))
+        .cloned()
+        .collect()
+}
+
 /// `<repo>/CLAUDE.md` -- Claude's own native instruction file, read by Claude
 /// Code directly regardless of whether zirv is involved at all. Same fixed
 /// path `optimize::collect_surfaces` reads for `Layer::RepoClaudeMd`; not
@@ -279,7 +300,7 @@ fn run_report<W: Write>(w: &mut W, repo: &Path) -> CtxResult<i32> {
 
     let home = crate::utils::home_dir().ok();
     let surfaces = optimize::collect_surfaces(home.as_deref(), repo, REPORT_MAX_SURFACE_BYTES);
-    let findings = drift::analyze(&surfaces);
+    let findings = drift::analyze(&surfaces_for_drift(&surfaces));
     if findings.is_empty() {
         writeln!(
             w,
@@ -669,6 +690,32 @@ mod tests {
         assert!(
             !context::claude_path(dir.path()).exists(),
             "report must not create any canonical file either"
+        );
+    }
+
+    /// Issue #105: `--report` (like `context status`) must not report a
+    /// zirv-managed native `CLAUDE.md` -- a verbatim render of
+    /// `.zirv/context/` -- as duplicating the canonical layer it was
+    /// rendered from.
+    #[test]
+    fn report_mode_finds_no_drift_between_canonical_content_and_its_own_managed_render() {
+        let dir = repo();
+        write_canonical(
+            dir.path(),
+            "common.md",
+            "- always run the full test suite\n",
+        );
+        fs::write(
+            native_claude_path(dir.path()),
+            format!("{MANAGED_MARKER}\n\n- always run the full test suite\n"),
+        )
+        .expect("write");
+
+        let (code, out) = run_sync(&report_args(), dir.path());
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("no differences detected between canonical context and native files"),
+            "a zirv-managed native file must not be diffed against its own canonical source: {out}"
         );
     }
 

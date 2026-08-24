@@ -652,7 +652,17 @@ fn is_eligible_deletion_target(layer: Layer, spans_multiple_surfaces: bool) -> b
 /// target at all (e.g. a rule stated only in an operator's global file and
 /// the canonical layer) still gets a finding, just without a diff.
 pub fn lint_redundancy(surfaces: &[Surface], repo: &Path) -> Vec<Finding> {
-    let all = all_instructions(surfaces);
+    // (2026-08-23, issue #110) A zirv-generated render of the canonical
+    // `.zirv/context/` layer (`context_cli::is_managed`) restates its own
+    // canonical source by design (`zirv context sync --generate`) -- that is
+    // not a duplicate a human created. Its instructions are excluded from
+    // this analysis entirely: never flagged as "stated in more than one
+    // layer", and never a candidate for the proposed deletion diff (editing
+    // it is futile, since the next `--generate` overwrites it again).
+    let all: Vec<Instruction> = all_instructions(surfaces)
+        .into_iter()
+        .filter(|instruction| !context_cli::is_managed(&surfaces[instruction.surface].text))
+        .collect();
     let (order, groups) = group_by_normalized(&all);
 
     let mut findings = Vec::new();
@@ -710,6 +720,68 @@ fn looks_like_path(token: &str) -> bool {
         .is_some_and(|e| !e.is_empty());
     // `and/or` is prose; `src/main.rs` and `Cargo.toml` are paths.
     has_extension && (token.contains('/') || token.contains('.'))
+}
+
+/// Whether `token` has a `<...>` placeholder segment, e.g. `<repo>` in
+/// `<repo>/.zirv/ctx.toml` -- documentation notation for "substitute the
+/// real value here", not a literal path any checkout actually has (issue
+/// #109).
+fn has_placeholder_segment(token: &str) -> bool {
+    token
+        .split(['/', '\\'])
+        .any(|segment| segment.starts_with('<') && segment.ends_with('>') && segment.len() > 1)
+}
+
+/// Whether `token` is a bare `*.exe` name with no directory component, e.g.
+/// `zirv.exe` -- prose naming a built binary in the abstract, not a literal
+/// path to check against this checkout (issue #109). A token that still
+/// names a directory (`bin/zirv.exe`) is left to the ordinary candidate
+/// check.
+fn is_bare_exe_name(token: &str) -> bool {
+    !token.contains('/')
+        && !token.contains('\\')
+        && Path::new(token)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+}
+
+/// A once-per-run index of every file's bare basename under `repo`, up to
+/// `MAX_NESTED_DEPTH` (issue #109): lets a bare basename token in prose
+/// (`rot.rs`, no `/` or `\` in it) be recognised as a real file living
+/// somewhere in the tree, without checking it only against the repo root or
+/// the evidence file's own directory. Same skip list and symlink posture as
+/// `nested_instruction_files`'s own walk.
+fn repo_basename_index(repo: &Path) -> hashbrown::HashSet<String> {
+    let mut names = hashbrown::HashSet::new();
+    let mut stack = vec![(repo.to_path_buf(), 0usize)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= MAX_NESTED_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() {
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            } else {
+                names.insert(name.to_string());
+            }
+        }
+    }
+
+    names
 }
 
 fn backticked(line: &str) -> Vec<&str> {
@@ -807,7 +879,17 @@ fn resolve_candidates(
         return candidates;
     }
     if surface.layer.is_repo_owned() {
-        return vec![repo.join(token)];
+        let mut candidates = vec![repo.join(token)];
+        // (2026-08-23, issue #109) A relative token in prose is sometimes
+        // written from a documentation page's own vantage point (an
+        // Obsidian vault cross-reference like `Concepts/Shortcuts.md`), not
+        // the repo root's -- try the evidence surface's own directory and
+        // the vault root before giving up.
+        if let Some(dir) = surface.path.parent() {
+            candidates.push(dir.join(token));
+        }
+        candidates.push(repo.join("docs").join("obsidian").join(token));
+        return candidates;
     }
     if let Some(rest) = token.strip_prefix("~/") {
         return home.map(|home| vec![home.join(rest)]).unwrap_or_default();
@@ -828,6 +910,11 @@ pub fn lint_dead_references(
     on_path: &dyn Fn(&str) -> bool,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
+    // (2026-08-23, issue #109) Built once per run, not per token: a bare
+    // basename in prose (`rot.rs`) is checked against every real file in the
+    // tree instead of only the repo root or the evidence file's own
+    // directory.
+    let basename_index = repo_basename_index(repo);
 
     for surface in surfaces {
         // Claude's own settings schema (JSON `hooks` block); derived from the
@@ -865,6 +952,29 @@ pub fn lint_dead_references(
         for (index, line) in surface.text.lines().enumerate() {
             for token in backticked(line) {
                 if !looks_like_path(token) {
+                    continue;
+                }
+                // (2026-08-23, issue #109) A `<...>` placeholder segment is
+                // documentation notation, not a literal path this checkout
+                // has. A leading `~` in a repo-owned surface (CLAUDE.md,
+                // AGENTS.md, the canonical `.zirv/context/` layer) is prose
+                // describing the general home-directory convention, not a
+                // literal token that surface's own repo-relative resolution
+                // could ever check correctly -- but a `~`-anchored token in a
+                // non-repo-owned surface (the *global* CLAUDE.md/AGENTS.md)
+                // is still meaningfully resolved against the real home below
+                // (I4), so it must not be skipped here.
+                if has_placeholder_segment(token) {
+                    continue;
+                }
+                if token.starts_with('~') && surface.layer.is_repo_owned() {
+                    continue;
+                }
+                if is_bare_exe_name(token) {
+                    continue;
+                }
+                let is_bare_basename = !token.contains('/') && !token.contains('\\');
+                if is_bare_basename && basename_index.contains(token) {
                     continue;
                 }
                 let candidates = resolve_candidates(surface, token, repo, home);
@@ -1630,7 +1740,7 @@ use std::time::Duration;
 
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::state::{now_secs, repo_slug};
-use super::{CtxResult, adapters, handoff, window};
+use super::{CtxResult, adapters, context_cli, handoff, window};
 
 /// Long enough for a careful answer over a few excerpted files, short enough
 /// that a wedged model does not own the terminal.
@@ -1655,16 +1765,16 @@ pub struct OptimizeArgs {
     pub out: Option<PathBuf>,
 }
 
+// (2026-08-23, issue #108) A hand-rolled `PATH` walk here used to check only
+// the bare name, so a program that resolves through `PATHEXT` on Windows
+// (an npm-installed `.cmd`/`.bat` shim -- `zirv`, `bash` under Git for
+// Windows, etc.) was reported "not installed" even though the OS itself
+// launches it fine. `adapters::program_is_present` already does the correct,
+// PATHEXT-aware `PATH` walk (the same resolution `adapters::resolve_program`
+// uses to route a shim through `cmd.exe`); reuse it instead of maintaining a
+// second, extension-blind PATH search here.
 fn on_path(program: &str) -> bool {
-    // An absolute or relative path is checked directly; a bare name is looked
-    // up the way a shell would.
-    if program.contains('/') {
-        return Path::new(program).exists();
-    }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return true;
-    };
-    std::env::split_paths(&paths).any(|dir| dir.join(program).exists())
+    adapters::program_is_present(program)
 }
 
 pub fn run_with<W: Write>(
@@ -1999,6 +2109,7 @@ pub fn queue_recommendation(
 mod tests {
     use super::*;
     use crate::commands::ctx::adapters::claude;
+    use crate::commands::ctx::context_cli;
     use crate::commands::ctx::event::{SessionId, SessionRef, StructuralContext};
     use clap::Parser;
 
@@ -2400,6 +2511,102 @@ mod tests {
             finding.evidence.iter().any(|e| e.contains("CLAUDE.md")),
             "{finding:?}"
         );
+    }
+
+    /// Issue #110: after `zirv context sync --generate`, a native CLAUDE.md
+    /// is a zirv-generated render of the canonical `.zirv/context/` layer,
+    /// not a second hand-authored copy of the same rule -- restating the
+    /// canonical text is the whole point of `--generate`. It must not be
+    /// flagged as "stated in more than one layer", and (per
+    /// `a_managed_render_is_never_a_proposed_deletion_target_even_in_a_three_way_duplicate`
+    /// below) must never be the target of a proposed diff either, since
+    /// `zirv context sync --generate` overwrites it again on the next run.
+    #[test]
+    fn a_managed_render_of_the_canonical_layer_is_not_flagged_as_a_layer_duplicate() {
+        // (2026-08-23, issue #110)
+        let generated = format!("{}\n\n- always run tests\n", context_cli::MANAGED_MARKER);
+        let surfaces = vec![
+            surface_of(
+                Layer::ContextCommon,
+                "/repo/.zirv/context/common.md",
+                "- always run tests\n",
+            ),
+            surface_of(Layer::RepoClaudeMd, "/repo/CLAUDE.md", &generated),
+        ];
+
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
+        assert!(
+            findings.iter().all(|f| f.kind != "redundancy"),
+            "a zirv-generated render restating its own canonical source is not a duplicate: \
+             {findings:?}"
+        );
+    }
+
+    /// The same content, minus the managed marker (i.e. a human wrote
+    /// CLAUDE.md by hand and it happens to match common.md verbatim): this
+    /// is a genuine duplicate and must still be flagged, so the #110 fix is
+    /// scoped to zirv's own generated renders and does not silently swallow
+    /// real hand-authored duplication.
+    #[test]
+    fn a_hand_authored_claude_md_matching_the_canonical_layer_is_still_flagged() {
+        // (2026-08-23, issue #110)
+        let surfaces = vec![
+            surface_of(
+                Layer::ContextCommon,
+                "/repo/.zirv/context/common.md",
+                "- always run tests\n",
+            ),
+            surface_of(
+                Layer::RepoClaudeMd,
+                "/repo/CLAUDE.md",
+                "- always run tests\n",
+            ),
+        ];
+
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
+        assert!(
+            findings.iter().any(|f| f.kind == "redundancy"),
+            "a hand-authored duplicate with no managed marker must still be flagged: {findings:?}"
+        );
+    }
+
+    /// Even when a third, hand-authored surface (AGENTS.md) keeps the
+    /// duplicate finding alive, the managed CLAUDE.md render must never
+    /// appear as evidence or as the proposed diff's target: editing it is
+    /// futile, since `zirv context sync --generate` overwrites it again.
+    #[test]
+    fn a_managed_render_is_never_a_proposed_deletion_target_even_in_a_three_way_duplicate() {
+        // (2026-08-23, issue #110)
+        let generated = format!("{}\n\n- always run tests\n", context_cli::MANAGED_MARKER);
+        let surfaces = vec![
+            surface_of(
+                Layer::ContextCommon,
+                "/repo/.zirv/context/common.md",
+                "- always run tests\n",
+            ),
+            surface_of(Layer::RepoClaudeMd, "/repo/CLAUDE.md", &generated),
+            surface_of(
+                Layer::RepoAgentsMd,
+                "/repo/AGENTS.md",
+                "- always run tests\n",
+            ),
+        ];
+
+        let findings = lint_redundancy(&surfaces, Path::new("/repo"));
+        let finding = findings
+            .iter()
+            .find(|f| f.kind == "redundancy")
+            .expect("still duplicated via the hand-authored AGENTS.md");
+        assert!(
+            finding.evidence.iter().all(|e| !e.contains("CLAUDE.md")),
+            "the managed render must not appear as evidence: {finding:?}"
+        );
+        if let Some(diff) = &finding.proposed_diff {
+            assert!(
+                !diff.contains("CLAUDE.md"),
+                "a proposed diff must never target the managed render: {diff}"
+            );
+        }
     }
 
     /// `ALL_LAYERS` is hand-maintained, and so is the match below -- so what
@@ -3288,6 +3495,35 @@ mod tests {
         assert!(lint_dead_references(&surfaces, tmp.path(), None, &|_| true).is_empty());
     }
 
+    /// Issue #108: a hook program that resolves only through `PATHEXT` (an
+    /// npm-installed `.cmd` shim on Windows, or any other extension the OS
+    /// search adds) must not be reported "not installed" just because the
+    /// probe checked for the bare name with no extension. `on_path` is
+    /// production's own hook-binary probe (passed as `&on_path` into
+    /// `lint_dead_references` below), restricted here to a fake `PATH`
+    /// containing only `prog.exe` so the assertion does not depend on what is
+    /// actually installed on the machine running the test.
+    #[test]
+    fn a_hook_program_resolving_only_via_pathext_is_not_reported_missing() {
+        // (2026-08-23, issue #108)
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("prog.exe"), "").expect("write stub");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        #[cfg(windows)]
+        assert!(
+            on_path("prog"),
+            "prog.exe on a restricted PATH must resolve via PATHEXT"
+        );
+        assert!(
+            !on_path("missing"),
+            "a program genuinely absent from PATH must still read as missing"
+        );
+    }
+
     /// I4: `~`-prefixed hook commands (`~/.claude/hooks/foo.sh`) are common.
     /// This exercises the real, production `on_path` (no fake closure), with
     /// a real executable inside a fabricated home, so the fix is proven
@@ -3436,6 +3672,37 @@ mod tests {
         )];
         let findings = lint_dead_references(&surfaces, repo, None, &|_| true);
         assert_eq!(findings.len(), 1, "got {findings:?}");
+    }
+
+    /// Issue #109: prose commonly names a real source file by its bare
+    /// basename (`rot.rs`, found by walking the actual tree rather than only
+    /// the repo root or the evidence file's own directory), a home-anchored
+    /// convention (`~/.zirv/ctx.toml`), a documentation placeholder segment
+    /// (`<repo>/.zirv/ctx.toml`), or a bare built-binary name (`zirv.exe`)
+    /// with no directory component at all. None of these name a literal path
+    /// this repo can check, so none should be flagged -- only the file that
+    /// is genuinely gone.
+    #[test]
+    fn prose_basenames_tilde_paths_and_placeholders_are_not_flagged_as_missing_paths() {
+        // (2026-08-23, issue #109)
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "- see `rot.rs` for the rot engine\n\
+             - config lives at `~/.zirv/ctx.toml`\n\
+             - or at `<repo>/.zirv/ctx.toml`\n\
+             - the built binary is `zirv.exe`\n\
+             - but `truly-gone.rs` was removed a while back\n",
+        )];
+
+        let findings = lint_dead_references(&surfaces, repo, None, &|_| true);
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert!(
+            findings[0].detail.contains("truly-gone.rs"),
+            "the only real dead reference should be truly-gone.rs: {:?}",
+            findings[0]
+        );
     }
 
     #[test]

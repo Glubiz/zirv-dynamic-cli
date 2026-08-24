@@ -52,6 +52,7 @@ use super::CtxResult;
 use super::adapters;
 use super::compile;
 use super::config::{ContextConfig, CtxConfig, EnvLookup, env_from_process};
+use super::context_cli;
 use super::drift;
 use super::handoff;
 use super::mail;
@@ -135,9 +136,21 @@ fn render_surface_line<W: Write>(
     let tokens = estimate_tokens(bytes);
     let oversized = oversized_threshold(surface.layer, cfg).is_some_and(|budget| bytes > budget);
     let flag = if oversized { "  [OVERSIZED]" } else { "" };
+    // Issue #105: a managed native file is still listed here -- its size
+    // still counts toward budgets -- but is excluded from the duplicate/
+    // precedence-level drift analysis below (`context_cli::
+    // surfaces_for_drift`), since it is a verbatim render of the canonical
+    // layer it would otherwise be reported as "duplicating". The note
+    // explains that exclusion right where a reader would otherwise wonder
+    // why this file never shows up in a drift finding.
+    let managed_note = if context_cli::is_managed(&surface.text) {
+        "  (zirv-managed, rendered from .zirv/context/)"
+    } else {
+        ""
+    };
     writeln!(
         w,
-        "{indent}{} ({}) -- {bytes}B, ~{tokens} tok (est.){flag}",
+        "{indent}{} ({}) -- {bytes}B, ~{tokens} tok (est.){flag}{managed_note}",
         surface.path.display(),
         surface.layer.label()
     )?;
@@ -302,6 +315,15 @@ fn render_memory_section<W: Write>(
 /// agent/session filter -- the same broad, idempotent view `zirv ctx
 /// status`/`zirv ctx inbox --peek` already use), so running this report
 /// never consumes a message a real session would otherwise have seen.
+///
+/// Issue #100 (2026-08-23): the one exception is a message whose
+/// `To-session` names a session that no longer exists at all -- nothing
+/// will ever read it, so `mail::sweep_undeliverable` moves it into `read/`
+/// (the same move an ordinary read does) before the count below, and the
+/// swept count is reported separately rather than folded into "pending".
+/// This does not weaken the non-destructive promise above: it is cleanup of
+/// mail no live session could ever have seen, not a read on any session's
+/// behalf.
 fn render_mail_section<W: Write>(
     w: &mut W,
     state: &StateDir,
@@ -312,6 +334,7 @@ fn render_mail_section<W: Write>(
         w,
         "\nmail (pending, read non-destructively -- this report never consumes a message):"
     )?;
+    let swept = mail::sweep_undeliverable(state, slug);
     let messages = match mail::list(state, slug, None, None) {
         Ok(messages) => messages,
         Err(e) => {
@@ -320,15 +343,24 @@ fn render_mail_section<W: Write>(
         }
     };
     if messages.is_empty() {
-        writeln!(w, "  none pending")?;
+        if swept > 0 {
+            writeln!(w, "  none pending ({swept} undeliverable, swept)")?;
+        } else {
+            writeln!(w, "  none pending")?;
+        }
         return Ok(());
     }
 
     let bytes: usize = messages.iter().map(|(_, m)| m.body.len()).sum();
     let exceeds = bytes > cfg.mail.max_delivered_bytes;
+    let swept_note = if swept > 0 {
+        format!(" ({swept} undeliverable, swept)")
+    } else {
+        String::new()
+    };
     writeln!(
         w,
-        "  {} message(s) pending, {bytes} raw body bytes (~{} tok, est.) -- \
+        "  {} message(s) pending{swept_note}, {bytes} raw body bytes (~{} tok, est.) -- \
          mail.max_delivered_bytes budget: {} ({} budget)",
         messages.len(),
         estimate_tokens(bytes),
@@ -606,7 +638,7 @@ pub fn run_with<W: Write>(
         optimize::collect_surfaces(home.as_deref(), repo, cfg.optimize.max_surface_bytes);
     render_instruction_surfaces(w, &surfaces, &cfg.context)?;
 
-    let findings = drift::analyze(&surfaces);
+    let findings = drift::analyze(&context_cli::surfaces_for_drift(&surfaces));
     render_drift_section(w, &findings, args.verbose)?;
 
     render_memory_section(w, &state, repo, &slug, &cfg)?;
@@ -846,6 +878,83 @@ mod tests {
         );
     }
 
+    /// Issue #105: a native `CLAUDE.md` that is itself zirv-managed
+    /// (rendered verbatim from `.zirv/context/` by `zirv context sync
+    /// --generate`) is a tautological "duplicate" of the canonical layer it
+    /// was rendered from -- pairing it against `common.md` in a drift
+    /// finding is noise, not real drift.
+    #[test]
+    fn a_zirv_managed_native_claude_md_produces_no_duplicate_or_precedence_findings() {
+        let fixture = Fixture::new();
+        fixture.write_canonical("common.md", "- always run the full test suite\n");
+        std::fs::write(
+            fixture.repo.join("CLAUDE.md"),
+            format!(
+                "{}\n\n- always run the full test suite\n",
+                crate::commands::ctx::context_cli::MANAGED_MARKER
+            ),
+        )
+        .expect("write");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            !out.contains("duplicate-redundant-with-canonical"),
+            "a zirv-managed native file must not be diffed against the canonical layer it was \
+             rendered from: {out}"
+        );
+        assert!(
+            !out.contains("precedence-shadowing"),
+            "nor treated as a precedence conflict with it: {out}"
+        );
+        assert!(out.contains("duplicate / conflict findings"), "got {out}");
+        assert!(out.contains("  none found"), "got {out}");
+    }
+
+    /// Companion to the test above: the SAME content, minus the managed
+    /// marker, is a real hand-authored duplicate and must still be flagged
+    /// -- proves the exclusion is keyed on the marker, not merely on the
+    /// path being `CLAUDE.md`.
+    #[test]
+    fn the_same_content_without_the_managed_marker_still_gets_the_duplicate_finding() {
+        let fixture = Fixture::new();
+        fixture.write_canonical("common.md", "- always run the full test suite\n");
+        std::fs::write(
+            fixture.repo.join("CLAUDE.md"),
+            "- always run the full test suite\n",
+        )
+        .expect("write");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            out.contains("duplicate-redundant-with-canonical"),
+            "an unmanaged native file duplicating canonical content is still real drift: {out}"
+        );
+    }
+
+    /// The exclusion narrows the drift *analysis* only -- the surfaces
+    /// listing (sizes/budgets) must still show the managed file, now with a
+    /// note explaining why it never appears as a duplicate above.
+    #[test]
+    fn the_surfaces_section_still_lists_a_managed_native_file_with_its_note() {
+        let fixture = Fixture::new();
+        fixture.write_canonical("common.md", "- always run the full test suite\n");
+        std::fs::write(
+            fixture.repo.join("CLAUDE.md"),
+            format!(
+                "{}\n\n- always run the full test suite\n",
+                crate::commands::ctx::context_cli::MANAGED_MARKER
+            ),
+        )
+        .expect("write");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            out.contains("CLAUDE.md")
+                && out.contains("(zirv-managed, rendered from .zirv/context/)"),
+            "the managed native file must still be listed, with its note: {out}"
+        );
+    }
+
     #[test]
     fn an_oversized_canonical_surface_is_flagged() {
         let fixture = Fixture::new();
@@ -1041,6 +1150,49 @@ mod tests {
             after.len(),
             1,
             "the report must never consume the mail it reports on"
+        );
+    }
+
+    /// Issue #100 (2026-08-23): a message addressed to a session that no
+    /// longer exists is swept out of "pending" and reported separately --
+    /// this is cleanup of mail no live session could ever read, distinct
+    /// from the non-destructive promise the test above pins for ordinary
+    /// mail.
+    #[test]
+    fn mail_addressed_to_a_dead_session_is_swept_and_reported_separately() {
+        let fixture = Fixture::new();
+        let state = StateDir::resolve(&|k| fixture.env.get(k).cloned()).expect("state");
+        let slug = repo_slug(&fixture.repo);
+        let dead = mail::Message {
+            from_session: "sess1".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: Some("deadbeef".to_string()),
+            sent: 1_700_000_000,
+            body: "nobody will ever read this".to_string(),
+        };
+        let pending = mail::Message {
+            from_session: "sess2".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 1_700_000_100,
+            body: "still pending".to_string(),
+        };
+        mail::store(&state, &slug, &dead, &CtxConfig::default()).expect("store dead");
+        mail::store(&state, &slug, &pending, &CtxConfig::default()).expect("store pending");
+
+        let (_, out) = fixture.run(&default_args());
+        assert!(
+            out.contains("1 message(s) pending (1 undeliverable, swept)"),
+            "got {out}"
+        );
+
+        let after = mail::list(&state, &slug, None, None).expect("list after");
+        assert_eq!(
+            after.len(),
+            1,
+            "the swept message is gone; the still-pending one remains"
         );
     }
 }

@@ -3457,6 +3457,33 @@ mod tests {
         flags: &[&str],
         wrapped: &[&str],
     ) -> Harness {
+        spawn_wrap_with_flags_in(
+            &std::env::current_dir().expect("cwd"),
+            extra_env,
+            flags,
+            wrapped,
+        )
+    }
+
+    /// I2 regression (2026-08-23): as of the zirv-managed context migration
+    /// this checkout carries its own committed `.zirv/context/{common,claude,
+    /// codex}.md` and `.zirv/memory/*.md`. `spawn_wrap_with_flags` pins the
+    /// spawned child's cwd to *this* process's cwd (see the comment below) so
+    /// mail-slug tests agree on "repo" -- but during `cargo test` that cwd
+    /// *is* the checkout root, so any test asserting the exact composed
+    /// prompt now picks up the checkout's own repo layers on top of the
+    /// built-in default, not just what it explicitly wrote into a fixture.
+    /// This variant takes an explicit `cwd` so a prompt-composition test can
+    /// point the child at an isolated, unrelated temp directory instead --
+    /// keeping the mail-slug tests (which still want cwd == this process's
+    /// cwd) on `spawn_wrap_with_flags` unchanged.
+    #[cfg(unix)]
+    pub(crate) fn spawn_wrap_with_flags_in(
+        cwd: &std::path::Path,
+        extra_env: &[(&str, String)],
+        flags: &[&str],
+        wrapped: &[&str],
+    ) -> Harness {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -3487,7 +3514,9 @@ mod tests {
         // disagree on "repo": the spawned `wrap` never finds mail the test
         // stored, and a test waiting on the mail advisory hangs rather than
         // failing loudly, since nothing further ever arrives on the pty.
-        cmd.cwd(std::env::current_dir().expect("cwd"));
+        // Callers that don't need slug agreement (no mail involved) can pass
+        // an isolated `cwd` instead -- see `spawn_wrap_with_flags_in` above.
+        cmd.cwd(cwd);
         // C9: a throwaway state dir and HOME by default. These tests spawn a
         // real `zirv ctx wrap`, which resolves its state dir from the
         // environment -- so without this they registered sessions, published
@@ -4276,9 +4305,21 @@ mod tests {
         // parsing of a prompt-file path out of the stub's echoed argv below.
         // A tempdir sidesteps both.
         let state = tempfile::tempdir().expect("tempdir");
+        // I2 regression (2026-08-23): this test asserts the exact composed
+        // prompt text, so it cannot run with the wrapped child's cwd pinned
+        // to this checkout -- the checkout now carries its own committed
+        // `.zirv/context/*.md` and `.zirv/memory/*.md` (the zirv-managed
+        // context migration), which would merge into the composed prompt on
+        // top of the built-in default and the user's own flag under test.
+        // No mail is involved here, so there is no need for the spawned
+        // child's cwd to match this process's cwd for slug agreement --
+        // point it at an isolated, unrelated temp dir instead.
+        let repo = tempfile::tempdir().expect("tempdir");
         let script = fixture("stub-tui.sh").display().to_string();
-        let mut h = spawn_wrap(
+        let mut h = spawn_wrap_with_flags_in(
+            repo.path(),
             &[("ZIRV_CTX_STATE_DIR", state.path().display().to_string())],
+            &["--agent", "claude"],
             &[
                 "sh",
                 &script,

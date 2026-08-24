@@ -115,14 +115,34 @@ impl Drop for SignalServer {
 }
 
 #[cfg(unix)]
+fn connect(path: &Path) -> CtxResult<std::os::unix::net::UnixStream> {
+    check_len(path)?;
+    Ok(std::os::unix::net::UnixStream::connect(path)?)
+}
+
+#[cfg(unix)]
 pub fn send(path: &Path, signal: &TurnSignal) -> CtxResult<()> {
     use std::io::Write;
 
-    check_len(path)?;
-    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+    let mut stream = connect(path)?;
     writeln!(stream, "{}", serde_json::to_string(signal)?)?;
     stream.flush()?;
     Ok(())
+}
+
+/// Issue #99 (2026-08-23): whether a turn-signal endpoint still answers a
+/// connection -- used by `sessions::sweep_orphan_endpoints` to tell a marker
+/// that belongs to a genuinely dead supervisor (nothing accepts the
+/// connection) apart from one whose supervisor is alive but was never (or no
+/// longer) recorded in the session registry. Built on the same `connect`
+/// `send` itself uses, deliberately stopping short of writing anything: the
+/// accept loop on the other end only ever acts on a complete,
+/// newline-terminated `TurnSignal` line, so a connect-then-drop probe can
+/// never inject a phantom turn into a live supervisor's rot engine the way
+/// reusing `send` with a made-up signal would.
+#[cfg(unix)]
+pub fn probe(path: &Path) -> bool {
+    connect(path).is_ok()
 }
 
 /// Windows has no unix domain sockets, so the same surface rides a named pipe
@@ -623,6 +643,19 @@ pub fn send(path: &Path, signal: &TurnSignal) -> CtxResult<()> {
     Ok(())
 }
 
+/// Issue #99 (2026-08-23): the Windows counterpart of the unix `probe`
+/// above, built on the same `win::pipe_name`/`win::connect` `send` itself
+/// uses -- opening the pipe and immediately dropping the handle without
+/// writing anything, so a live supervisor's `win::drain` sees an empty
+/// connection time out rather than a phantom `TurnSignal`.
+#[cfg(windows)]
+pub fn probe(path: &Path) -> bool {
+    let Ok(name) = win::pipe_name(path) else {
+        return false;
+    };
+    win::connect(&name).is_ok()
+}
+
 /// Neither transport exists here, so `wrap` reports the failure once and runs
 /// as pure passthrough for the rest of the session (`InjectionState::degraded`).
 #[cfg(not(any(unix, windows)))]
@@ -650,6 +683,13 @@ impl SignalServer {
 #[cfg(not(any(unix, windows)))]
 pub fn send(_path: &Path, _signal: &TurnSignal) -> CtxResult<()> {
     Err("turn signals need a unix domain socket or a Windows named pipe".into())
+}
+
+/// Issue #99 (2026-08-23): neither transport exists here, so nothing can
+/// ever answer a probe.
+#[cfg(not(any(unix, windows)))]
+pub fn probe(_path: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -701,6 +741,25 @@ mod tests {
         )
         .expect("a sender that omits the field still parses");
         assert_eq!(legacy.transcript_path, None);
+    }
+
+    /// Issue #99 (2026-08-23): `probe` is the connection-only half of
+    /// `send`, used to tell a genuinely dead endpoint apart from one whose
+    /// supervisor is alive but simply has no registry record.
+    #[cfg(unix)]
+    #[test]
+    fn probe_answers_true_for_a_bound_server_and_false_for_a_dead_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("probe.sock");
+        let server = SignalServer::bind(&path).expect("bind");
+        assert!(probe(&path), "a bound server answers the probe");
+
+        drop(server);
+        assert!(!path.exists(), "sanity: dropping removed the socket file");
+        assert!(
+            !probe(&path),
+            "nothing is listening once the server is gone"
+        );
     }
 
     #[cfg(unix)]
@@ -887,6 +946,36 @@ mod tests {
             assert!(
                 err.to_string().contains("too long"),
                 "message should say why: {err}"
+            );
+        }
+
+        /// Issue #99 (2026-08-23): `probe` is the connection-only half of
+        /// `send`, used to tell a genuinely dead endpoint apart from one
+        /// whose supervisor is alive but simply has no registry record.
+        ///
+        /// Deliberately does not test "probe is false right after `drop`ping
+        /// the `SignalServer` in this same process": on Windows, `Drop` only
+        /// removes the marker *file* -- the acceptor thread it spawned, and
+        /// the named-pipe instance it owns, are never signaled to stop, so
+        /// the pipe keeps answering for the rest of *this process's* life
+        /// regardless of the Rust value's lifetime. That is not a gap in
+        /// `probe` itself: the real #99 scenario is a *process* that is dead
+        /// (killed or crashed), and Windows unconditionally releases every
+        /// handle a process held, named pipes included, the moment that
+        /// process actually exits -- which an in-process `drop` here does
+        /// not simulate. `sending_to_a_dead_socket_is_an_error_not_a_hang`
+        /// below already pins the correct case: an endpoint nothing ever
+        /// bound.
+        #[test]
+        fn probe_answers_true_for_a_bound_server_and_false_for_one_never_bound() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(dir.path());
+            let _server = SignalServer::bind(&path).expect("bind");
+            assert!(probe(&path), "a bound server answers the probe");
+
+            assert!(
+                !probe(&socket_path(dir.path())),
+                "nothing was ever bound at this other endpoint"
             );
         }
 
