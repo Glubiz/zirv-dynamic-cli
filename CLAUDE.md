@@ -11,9 +11,16 @@ sessions, scores transcripts with a deterministic rot engine, and acts
 ## Build and verify (all four, before claiming done)
 
     cargo build
-    cargo test --verbose -- --test-threads=1   # serial required
+    cargo nextest run                            # primary local loop
+    cargo test --verbose -- --test-threads=1     # compatibility fallback
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
+
+`cargo nextest run` runs each test in its own process (config in
+`.config/nextest.toml`), so the process-wide `env::set_var` races that used
+to force `--test-threads=1` cannot happen; it is the fast default loop.
+`cargo test --verbose -- --test-threads=1` stays as the compatibility
+fallback -- both must pass before claiming done.
 
 ## Module map
 

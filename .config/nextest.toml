@@ -1,0 +1,14 @@
+[store]
+dir = "target/nextest"
+
+# One process per test (nextest's own default) is what makes this fast and
+# safe: process-wide `env::set_var` races that forced the old `cargo test
+# -- --test-threads=1` serial requirement simply cannot happen across
+# separate processes. As of this writing, no test in this suite needs its
+# own serial group -- a full run here shows the exact same failure set as
+# the serial `cargo test` run, not a different (race-induced) one. If a
+# genuinely shared-resource test shows up later, give it its own
+# `[[profile.default.overrides]]` with `test-group = "serial"` rather than
+# reintroducing suite-wide seriality.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
