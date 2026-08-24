@@ -872,33 +872,44 @@ impl AgentAdapter for ClaudeAdapter {
     /// path is per-machine, and the constant has to stay `&'static`.
     /// Appended after the safety-derived allow entries, before the
     /// operator's own `sandbox.extra_allow`.
+    ///
+    /// **Cross-harness permissions (2026-08-24): Design B.** A live probe
+    /// against Claude Code 2.1.241 reached `permissionMode: default`, but the
+    /// account rate-limited before the Bash request, so whether a hook's
+    /// `"ask"` overrides a native `Bash(*)` allow could not be established.
+    /// The conservative projection therefore emits no blanket Bash allow:
+    /// the hook's explicit `"allow"` carries ordinary commands, while an
+    /// ask verdict cannot accidentally be bypassed by native pre-approval.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
         safety: &crate::commands::ctx::safety::SafetyPolicy,
         mode: super::LaunchMode,
     ) -> Vec<String> {
-        let _ = mode;
+        // The non-`Bash(...)` surface is pre-approved in BOTH modes: file
+        // scope, the harness dirs, WebFetch/WebSearch. These are outside
+        // `[safety]`'s command-only domain (see `safety::
+        // command_pattern_from_bash_rule`), so the safety hook -- registered
+        // for the `Bash` tool alone -- cannot speak for them, and leaving
+        // them off the list would prompt on every file read.
         let mut allow_entries: Vec<String> = super::SHIPPED_POSTURE_ALLOW
             .iter()
             .filter(|(rule, _)| !rule.starts_with("Bash("))
             .map(|(rule, _)| rule.to_string())
             .collect();
-        allow_entries.extend(
-            safety
-                .allow
-                .iter()
-                .map(|rule| format!("Bash({})", rule.pattern)),
-        );
+
+        if !mode.is_interactive() {
+            allow_entries.extend(
+                safety
+                    .allow
+                    .iter()
+                    .map(|rule| format!("Bash({})", rule.pattern)),
+            );
+        }
         allow_entries.extend(super::scratchpad_rules(&std::env::temp_dir()));
         allow_entries.extend(sandbox.extra_allow.iter().cloned());
         let allow = allow_entries.join(",");
 
-        // `SHIPPED_POSTURE_DENY` gained two non-`Bash` entries of its own
-        // (issue #104): `Edit(~/.zirv/**)`/`Read(~/.claude/.credentials.json)`,
-        // filtered out of `safety.deny` the same way the allow side's
-        // non-`Bash` entries are -- prepended directly, same treatment as
-        // `allow_entries` above.
         let mut deny_entries: Vec<String> = super::SHIPPED_POSTURE_DENY
             .iter()
             .filter(|(rule, _)| !rule.starts_with("Bash("))
@@ -910,12 +921,38 @@ impl AgentAdapter for ClaudeAdapter {
                 .iter()
                 .map(|rule| format!("Bash({})", rule.pattern)),
         );
+        // The ask set is a hard rule ONLY headlessly. Interactively it must
+        // reach a prompt, which means it belongs on neither list: the hook's
+        // own "ask" decision is what stops it. Headlessly there is nobody to
+        // answer, so folding it into the deny list turns what `dontAsk`
+        // would refuse by omission into an explicit, named refusal.
+        if !mode.is_interactive() {
+            deny_entries.extend(
+                safety
+                    .ask
+                    .iter()
+                    .map(|rule| format!("Bash({})", rule.pattern)),
+            );
+        }
         deny_entries.extend(sandbox.extra_deny.iter().cloned());
         let deny = deny_entries.join(",");
 
+        // `dontAsk` is "don't prompt, deny if not pre-approved" (the
+        // installed CLI's own `--help` text, quoted in this method's doc
+        // comment) -- correct with no human present, and exactly wrong with
+        // one. `default` prompts for anything not pre-approved, which is what
+        // lets the safety hook's own decisions be the whole story. Never
+        // `acceptEdits`/`bypassPermissions`: both were probed live and both
+        // auto-run unapproved destructive actions.
+        let permission_mode = if mode.is_interactive() {
+            "default"
+        } else {
+            "dontAsk"
+        };
+
         vec![
             "--permission-mode".to_string(),
-            "dontAsk".to_string(),
+            permission_mode.to_string(),
             format!("--allowedTools={allow}"),
             format!("--disallowedTools={deny}"),
         ]
@@ -1634,7 +1671,7 @@ mod tests {
     /// unapproved action -- `bypassPermissions`/`acceptEdits` were probed
     /// and rejected for doing the opposite.
     #[test]
-    fn default_sandbox_args_uses_the_verified_dont_ask_mode() {
+    fn default_sandbox_args_uses_the_verified_dont_ask_mode_when_headless() {
         let adapter = ClaudeAdapter::new(None);
         let args = adapter.default_sandbox_args(
             &Default::default(),
@@ -1645,6 +1682,106 @@ mod tests {
             &args[0..2],
             &["--permission-mode".to_string(), "dontAsk".to_string()]
         );
+    }
+
+    /// THE requirement, at the argv level: an interactive launch must not
+    /// carry a finite Bash allow-list under a prompting permission mode,
+    /// because everything off the end of that list is a prompt. Design A
+    /// blanket-allows Bash and lets the safety hook gate; Design B (see the
+    /// plan's Task 3 Step 1) drops the blanket entry and lets the hook's own
+    /// explicit `"allow"` carry it. This test pins what BOTH designs share:
+    /// the mode is `default`, and no per-command Bash allow-list is emitted.
+    #[test]
+    fn the_interactive_projection_never_emits_a_finite_bash_allow_list() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        assert_eq!(
+            &args[0..2],
+            &["--permission-mode".to_string(), "default".to_string()]
+        );
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        for family in ["Bash(cargo *)", "Bash(git *)", "Bash(npm *)"] {
+            assert!(
+                !allow_arg.contains(family),
+                "a per-family Bash allow-list means every OTHER command prompts: {allow_arg}"
+            );
+        }
+        // The non-Bash surface is still pre-approved: those tools are outside
+        // `[safety]`'s command-only domain, so the hook cannot speak for them.
+        assert!(allow_arg.contains("Edit(./**)"), "got {allow_arg}");
+        assert!(allow_arg.contains("Read(./**)"), "got {allow_arg}");
+        assert!(allow_arg.contains("WebFetch"), "got {allow_arg}");
+    }
+
+    /// The ask set must never be pre-approved and never hard-denied on an
+    /// interactive launch: pre-approving it would skip the prompt this whole
+    /// change exists to produce, and denying it would be the silent death it
+    /// exists to remove.
+    #[test]
+    fn the_interactive_projection_leaves_the_ask_set_to_the_hook() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        let deny_arg = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        for (rule, _) in super::super::SHIPPED_POSTURE_ASK {
+            assert!(
+                !deny_arg.contains(rule),
+                "interactive must let '{rule}' reach a prompt, not die: {deny_arg}"
+            );
+        }
+        for (rule, _) in super::super::SHIPPED_POSTURE_DENY {
+            assert!(
+                deny_arg.contains(rule),
+                "the deny set must still be a hard rule: {deny_arg}"
+            );
+        }
+    }
+
+    /// Headless is untouched by all of the above.
+    #[test]
+    fn the_headless_projection_is_unchanged_by_the_interactive_inversion() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
+        assert_eq!(
+            &args[0..2],
+            &["--permission-mode".to_string(), "dontAsk".to_string()]
+        );
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        assert!(allow_arg.contains("Bash(cargo *)"), "got {allow_arg}");
+        assert!(
+            !allow_arg.contains("Bash(*)"),
+            "no blanket allow headlessly: {allow_arg}"
+        );
+        let deny_arg = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        for (rule, _) in super::super::SHIPPED_POSTURE_ASK {
+            assert!(
+                deny_arg.contains(rule),
+                "headless has nobody to prompt, so ask folds into deny: {deny_arg}"
+            );
+        }
     }
 
     /// Fix round 2 (2026-08-22): `dontAsk` alone denies every unapproved
@@ -1728,7 +1865,7 @@ mod tests {
     /// this refactor could not have silently changed a live-verified
     /// permission set.
     #[test]
-    fn default_sandbox_args_stays_byte_identical_to_the_pre_safety_shipped_default() {
+    fn the_headless_projection_is_byte_exact_against_the_shipped_constants() {
         let adapter = ClaudeAdapter::new(None);
         let args = adapter.default_sandbox_args(
             &Default::default(),
@@ -1747,10 +1884,15 @@ mod tests {
             .map(|(rule, _)| rule.to_string())
             .collect();
         expected_allow.extend(super::super::scratchpad_rules(&std::env::temp_dir()));
-        let expected_deny: Vec<String> = super::super::SHIPPED_POSTURE_DENY
+        let mut expected_deny: Vec<String> = super::super::SHIPPED_POSTURE_DENY
             .iter()
             .map(|(rule, _)| rule.to_string())
             .collect();
+        expected_deny.extend(
+            super::super::SHIPPED_POSTURE_ASK
+                .iter()
+                .map(|(rule, _)| rule.to_string()),
+        );
 
         assert_eq!(
             args,

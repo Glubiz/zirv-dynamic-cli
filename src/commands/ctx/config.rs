@@ -1663,6 +1663,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // `sandbox.extra_allow` right above.
     (&["safety", "allow"], "ZIRV_CTX_SAFETY_ALLOW"),
     (&["safety", "default"], "ZIRV_CTX_SAFETY_DEFAULT"),
+    // `safety.interactive_default` (2026-08-24): the unmatched-command
+    // verdict on an interactive launch, default `allow`. Same reasoning as
+    // `safety.default` right above and then some -- `allow` is the loosest
+    // verdict there is, so a checkout that could set it could silence every
+    // prompt for the session it is checked out in.
+    (
+        &["safety", "interactive_default"],
+        "ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -4182,6 +4191,7 @@ mod tests {
         ("safety", "ask"),
         ("safety", "allow"),
         ("safety", "default"),
+        ("safety", "interactive_default"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like
