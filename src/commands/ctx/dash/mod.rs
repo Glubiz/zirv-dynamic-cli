@@ -8822,12 +8822,10 @@ mod tests {
         }
     }
 
-    /// Bug B seam coverage (2026-08-22, fix round 3): the dashboard's own
-    /// worker-pane seam is one of the three that had only full-suite-green
-    /// plus log inspection backing its `policy_launch_args` wiring. Exercises
-    /// `worker_pane_extra_args` directly -- the exact function `fulfill_
-    /// spawn_request` calls to build a pane's trailing argv -- for both
-    /// adapters, from the same `cfg`.
+    /// The dashboard's worker pane is interactive: the operator is watching
+    /// it and can answer. Exercise `worker_pane_extra_args` directly -- the
+    /// exact function `fulfill_spawn_request` calls -- for both adapters,
+    /// with codex's live capability probe forced out of the assertion.
     #[test]
     fn worker_pane_extra_args_carries_the_shipped_sandbox_posture_on_both_adapters() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -8847,7 +8845,7 @@ mod tests {
         );
         assert!(
             claude_extra.contains(&"--permission-mode".to_string())
-                && claude_extra.contains(&"dontAsk".to_string()),
+                && claude_extra.contains(&"default".to_string()),
             "got {claude_extra:?}"
         );
         assert!(
@@ -8857,7 +8855,8 @@ mod tests {
             "got {claude_extra:?}"
         );
 
-        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let codex = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_on_request_approval_forced(true);
         let codex_extra = worker_pane_extra_args(
             &req,
             &cfg,
@@ -8874,7 +8873,7 @@ mod tests {
         assert!(
             codex_extra
                 .windows(2)
-                .any(|w| w == ["--ask-for-approval", "never"]),
+                .any(|w| w == ["--ask-for-approval", "on-request"]),
             "got {codex_extra:?}"
         );
     }

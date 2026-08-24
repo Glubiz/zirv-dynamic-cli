@@ -2442,28 +2442,41 @@ mod tests {
         assert!(!LaunchMode::Headless.is_interactive());
     }
 
-    /// Task 1 carries the parameter and nothing else: both modes must still
-    /// produce the exact argv today's single-posture projection produces, on
-    /// both registered adapters. Task 3/Task 6 are what make them differ.
+    /// The Task 1 seam becomes load-bearing once Tasks 3 and 7 project the
+    /// two postures differently. Pin that distinction at the shared seam,
+    /// with codex's live capability probe forced out of the assertion.
     #[test]
-    fn threading_launch_mode_changes_no_argv_yet() {
+    fn launch_mode_projects_the_two_postures_differently() {
         let cfg = CtxConfig::default();
-        for adapter in all(None) {
-            let interactive =
-                policy_launch_args(&cfg, adapter.as_ref(), &[], LaunchMode::Interactive);
-            let headless = policy_launch_args(&cfg, adapter.as_ref(), &[], LaunchMode::Headless);
-            assert_eq!(
-                interactive,
-                headless,
-                "{}: task 1 must not change any argv",
-                adapter.name()
-            );
-            assert!(
-                !interactive.is_empty(),
-                "{}: sandbox is on by default",
-                adapter.name()
-            );
-        }
+        let claude = claude::ClaudeAdapter::new(None);
+        let interactive = policy_launch_args(&cfg, &claude, &[], LaunchMode::Interactive);
+        let headless = policy_launch_args(&cfg, &claude, &[], LaunchMode::Headless);
+        assert_ne!(interactive, headless);
+        assert!(
+            interactive
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "default"])
+        );
+        assert!(
+            headless
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "dontAsk"])
+        );
+
+        let codex = codex::CodexAdapter::new(None).with_on_request_approval_forced(true);
+        let interactive = policy_launch_args(&cfg, &codex, &[], LaunchMode::Interactive);
+        let headless = policy_launch_args(&cfg, &codex, &[], LaunchMode::Headless);
+        assert_ne!(interactive, headless);
+        assert!(
+            interactive
+                .windows(2)
+                .any(|w| w == ["--ask-for-approval", "on-request"])
+        );
+        assert!(
+            headless
+                .windows(2)
+                .any(|w| w == ["--ask-for-approval", "never"])
+        );
     }
 
     /// A permissive `CtxConfig` (every agent enabled, no `agent_bin`
