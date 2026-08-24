@@ -203,6 +203,22 @@ mod tests {
             .join(name)
     }
 
+    /// The `VarGuard` entries every `run_supervised`-driving test in this
+    /// module needs: the sandboxed state dir and the fake agent binary, plus
+    /// a zeroed pacing delay. T8: `run_supervised` reads the real process
+    /// env, and a fresh temp state dir has no usage source by construction --
+    /// without the last entry, the real fail-safe delay (default 60s) is
+    /// paid on the wall clock. See the identical comment on `exec.rs`'s own
+    /// `base_env`. Callers extend the returned `Vec` with their own
+    /// `FAKE_AGENT_MODE` entry before passing it to `VarGuard::set`.
+    fn base_env<'a>(state: &'a Path, agent_bin: &'a str) -> Vec<(&'a str, Option<&'a str>)> {
+        vec![
+            (STATE_ENV, state.to_str()),
+            ("ZIRV_CTX_AGENT_BIN", Some(agent_bin)),
+            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
+        ]
+    }
+
     fn agent_step(prompt: &str) -> AgentCommand {
         AgentCommand {
             agent: "claude".to_string(),
@@ -319,10 +335,7 @@ mod tests {
         let state = tmp.path().join("state");
         let agent_bin = format!("sh {}", fixture("fake-codex-agent.sh").display());
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
-            (STATE_ENV, state.to_str()),
-            ("ZIRV_CTX_AGENT_BIN", Some(&agent_bin)),
-        ]);
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&base_env(&state, &agent_bin));
 
         let mut cmd = agent_step("go");
         cmd.agent = "codex".to_string();
@@ -374,27 +387,17 @@ mod tests {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
+        let agent_bin = format!("sh {}", fixture("fake-agent.sh").display());
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        unsafe {
-            std::env::set_var(STATE_ENV, &state);
-            std::env::set_var(
-                "ZIRV_CTX_AGENT_BIN",
-                format!("sh {}", fixture("fake-agent.sh").display()),
-            );
-            std::env::set_var("FAKE_AGENT_MODE", "healthy");
-        }
+        let mut env = base_env(&state, &agent_bin);
+        env.push(("FAKE_AGENT_MODE", Some("healthy")));
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&env);
 
         let cmd = agent_step("do the work");
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().display().to_string());
 
         let result = cmd.execute(&mut context).await;
-
-        unsafe {
-            std::env::remove_var(STATE_ENV);
-            std::env::remove_var("ZIRV_CTX_AGENT_BIN");
-            std::env::remove_var("FAKE_AGENT_MODE");
-        }
 
         assert!(result.is_ok(), "expected success, got {result:?}");
     }
@@ -404,27 +407,17 @@ mod tests {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
+        let agent_bin = format!("sh {}", fixture("fake-agent.sh").display());
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        unsafe {
-            std::env::set_var(STATE_ENV, &state);
-            std::env::set_var(
-                "ZIRV_CTX_AGENT_BIN",
-                format!("sh {}", fixture("fake-agent.sh").display()),
-            );
-            std::env::set_var("FAKE_AGENT_MODE", "fail");
-        }
+        let mut env = base_env(&state, &agent_bin);
+        env.push(("FAKE_AGENT_MODE", Some("fail")));
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&env);
 
         let cmd = agent_step("do the work");
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().display().to_string());
 
         let result = cmd.execute(&mut context).await;
-
-        unsafe {
-            std::env::remove_var(STATE_ENV);
-            std::env::remove_var("ZIRV_CTX_AGENT_BIN");
-            std::env::remove_var("FAKE_AGENT_MODE");
-        }
 
         let err = result.expect_err("a nonzero exit must fail the step");
         assert!(err.contains("claude"), "got {err}");
@@ -435,15 +428,11 @@ mod tests {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
+        let agent_bin = format!("sh {}", fixture("fake-agent.sh").display());
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        unsafe {
-            std::env::set_var(STATE_ENV, &state);
-            std::env::set_var(
-                "ZIRV_CTX_AGENT_BIN",
-                format!("sh {}", fixture("fake-agent.sh").display()),
-            );
-            std::env::set_var("FAKE_AGENT_MODE", "fail");
-        }
+        let mut env = base_env(&state, &agent_bin);
+        env.push(("FAKE_AGENT_MODE", Some("fail")));
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&env);
 
         let mut cmd = agent_step("do the work");
         cmd.options = Some(Options {
@@ -454,12 +443,6 @@ mod tests {
         context.insert("cwd".to_string(), tmp.path().display().to_string());
 
         let result = cmd.execute(&mut context).await;
-
-        unsafe {
-            std::env::remove_var(STATE_ENV);
-            std::env::remove_var("ZIRV_CTX_AGENT_BIN");
-            std::env::remove_var("FAKE_AGENT_MODE");
-        }
 
         assert!(
             result.expect("proceed_on_failure must not error").is_some(),

@@ -3551,12 +3551,10 @@ mod tests {
         // suite run from inside an agent session would otherwise trip the
         // nesting guard instead of running the test. Removed *before*
         // `extra_env`, which several tests use to pin `ZIRV_CTX_TRANSCRIPT`
-        // deliberately.
-        for key in super::super::sessions::SUPERVISION_ENV {
-            cmd.env_remove(key);
-        }
-        cmd.env_remove("CLAUDE_PID");
-        cmd.env_remove("CLAUDECODE");
+        // deliberately. T8: see `testenv::scrub_supervision_env_for_test`'s
+        // own doc comment for why this is a test-side scrub, not an extended
+        // production one.
+        crate::commands::ctx::testenv::scrub_supervision_env_for_test(&mut cmd);
         // T10 fix regression (2026-08-23): every one of these harnesses spawns
         // a *real* `zirv ctx wrap` attached to a real pty on both stdin and
         // stdout, which is exactly the condition the launch-time interactive
@@ -6703,6 +6701,45 @@ mod tests {
         assert_eq!(status.exit_code(), 0);
     }
 
+    /// Waits for `child`, killing it and returning `None` past `timeout` so
+    /// a genuinely wedged child fails this one test fast instead of hanging
+    /// it (and the suite behind it) forever. `h.child.wait()`'s own contract
+    /// has no timeout at all -- fine for a child known to exit promptly, but
+    /// `a_broken_transcript_path_never_stops_the_session` hung on it for real
+    /// once the `DASH_REQUESTS_ENV` scrub above stopped short-circuiting the
+    /// nesting guard before this child's own exit path was ever reached
+    /// (reproduced twice, ~20+ min combined, before this fix). Mirrors
+    /// `win::wait_bounded`'s identical shape for `std::process::Child`.
+    #[cfg(unix)]
+    fn wait_bounded(
+        child: &mut dyn portable_pty::Child,
+        timeout: Duration,
+    ) -> Option<portable_pty::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => return None,
+            }
+        }
+        let _ = child.kill();
+        // The kill is not synchronous, so reap with the same bounded poll
+        // rather than a blocking `wait()` -- a `wait()` here would hang this
+        // helper forever on a child the kill somehow failed to actually
+        // terminate, defeating the entire point of bounding it above. A
+        // child left unreaped in a test process that is about to exit is
+        // harmless (the OS reaps it); a wedged suite is not.
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < reap_deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        None
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_broken_transcript_path_never_stops_the_session() {
@@ -6740,7 +6777,8 @@ mod tests {
         assert!(echoed.contains("echo: still here"), "got {echoed:?}");
 
         h.writer.write_all(b"/exit\r").expect("write");
-        let status = h.child.wait().expect("wait");
+        let status = wait_bounded(h.child.as_mut(), Duration::from_secs(10))
+            .expect("the session must exit within a bounded window, not hang");
         assert_eq!(status.exit_code(), 0);
     }
 
@@ -6772,6 +6810,12 @@ mod tests {
             "ZIRV_CTX_STATE_DIR",
             tmp.path().join("state").display().to_string(),
         );
+        // T8: hermetic against the developer's/agent's own environment --
+        // see the identical comment on `spawn_wrap`'s pty harness above.
+        // This test builds its own `CommandBuilder` rather than going
+        // through that harness, so it needs the same scrub explicitly (see
+        // `testenv::scrub_supervision_env_for_test`'s own doc comment).
+        crate::commands::ctx::testenv::scrub_supervision_env_for_test(&mut cmd);
         let mut child = pair.slave.spawn_command(cmd).expect("spawn");
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().expect("reader");
@@ -6936,6 +6980,7 @@ mod tests {
 
         /// Waits for `child`, killing it and returning `None` past `timeout` so
         /// a re-deadlocked `wrap` fails the test instead of wedging the suite.
+        /// Mirrors the non-Windows `wait_bounded` above, reap loop included.
         fn wait_bounded(
             child: &mut std::process::Child,
             timeout: Duration,
@@ -6949,7 +6994,17 @@ mod tests {
                 }
             }
             let _ = child.kill();
-            let _ = child.wait();
+            // The kill is not synchronous, so reap with the same bounded poll
+            // rather than a blocking `wait()` -- see the identical comment on
+            // the non-Windows `wait_bounded` for why an unbounded wait here
+            // would defeat this helper's entire purpose.
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < reap_deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                }
+            }
             None
         }
 
@@ -6969,12 +7024,11 @@ mod tests {
             // environment, so a suite run from inside an agent session would
             // otherwise trip the nesting guard and see exit code 1 instead of
             // whatever the test is actually about. The guard has its own
-            // dedicated coverage above; here it is noise.
-            for key in super::super::super::sessions::SUPERVISION_ENV {
-                cmd.env_remove(key);
-            }
-            cmd.env_remove("CLAUDE_PID");
-            cmd.env_remove("CLAUDECODE");
+            // dedicated coverage above; here it is noise. T8: see the
+            // identical fix/comment on `spawn_wrap`'s pty harness above, and
+            // `testenv::scrub_supervision_env_for_test_cmd`'s own doc comment
+            // for why this is a test-side scrub, not an extended production one.
+            crate::commands::ctx::testenv::scrub_supervision_env_for_test_cmd(&mut cmd);
             // No terminal: this is also the CI/piped case, which is exactly
             // why the synthetic cursor report cannot be left to a real
             // terminal to send.

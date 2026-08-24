@@ -16,9 +16,10 @@ anything you need to keep.
 
 ## Verification
 
-Run all four yourself, in the foreground, to completion:
+Run all five yourself, in the foreground, to completion:
 
     cargo build
+    cargo nextest run --no-fail-fast
     cargo test --verbose -- --test-threads=1
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings

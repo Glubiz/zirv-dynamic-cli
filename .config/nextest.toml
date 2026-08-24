@@ -1,0 +1,45 @@
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Every test below drives a real supervised session through a background
+# writer thread that polls something (a growing log file via `wait_for_lines`,
+# or the session registry directly) with a bounded budget, then nudges the
+# live session. Under CPU contention that poll can lose the race against the
+# hang-mode fake agent actually starting, and the run falls through to its
+# own ~30s exec timeout instead (exit 76, or the codex-shaped equivalent).
+# This is the whole such family in exec.rs (every `std::thread::spawn` there
+# follows this shape); nothing in run_loop.rs matches it (its two writer
+# threads wait on a marker *file* a plain, always-completing script creates
+# almost immediately, not on a hang-mode agent that only proceeds once
+# nudged, and neither has been observed flaky across many runs in this work).
+#
+# Each wait used to give up *silently* on a 5s budget (return without ever
+# nudging), so a loss here surfaced tens of seconds later as a bare exit 76
+# with no indication of the real cause. Fixed test-side (see
+# `wait_for_lines_or_panic`/`wait_for_live_session_or_panic` in exec.rs): a
+# give-up now panics with a clear message, and the budget is honestly sized
+# per test against its own exec timeout (20s against a 30s timeout for most
+# of this family; 2s against `consecutive_nudge_restarts_are_capped_...`'s
+# much tighter 3s per-cycle timeout). That makes a real failure legible, but
+# it does not remove the underlying contention risk -- a louder failure is
+# still a failure -- so this group is kept belt-and-braces rather than
+# removed. A `test-group` alone only serializes these against each other;
+# nextest schedules ungrouped tests independently of a group's own
+# concurrency limit, so it would not have stopped the rest of the suite from
+# contending with them. Pairing it with `threads-required =
+# "num-test-threads"` makes each of these tests claim the whole concurrency
+# pool while it runs, so nothing else *in this run* executes alongside it --
+# it cannot exclude contention from other processes on the host (see the
+# doc comment on `a_post_nudge_park_carries_the_nudges_own_mail_not_the_
+# stale_launch_mail` for a second, now-fixed failure mode this group alone
+# did not prevent: a codex capability probe stealing a fixture mode line).
+[test-groups.exec-nudge-restart]
+max-threads = 1
+
+# A rename here silently drops a test from the group (nextest matches an
+# unresolved `test(NAME)` clause against nothing rather than erroring) --
+# guarded by exec.rs's `the_nextest_exec_nudge_restart_group_names_still_resolve`.
+[[profile.default.overrides]]
+filter = 'test(a_nudge_on_an_explicit_command_codex_run_delivers_the_nudge_mail_on_the_relaunch) or test(a_nudge_relaunch_of_an_explicit_command_codex_run_survives_a_cmd_shim_agent_bin) or test(a_nudge_on_a_simple_codex_run_still_delivers_its_own_guidance) or test(a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_launch_mail) or test(a_headless_worker_stops_at_the_next_poll_and_relaunches_with_the_guidance) or test(a_nudge_restart_does_not_spend_the_rot_restart_budget) or test(a_nudge_restart_carries_a_handoff_forward_like_every_other_restart) or test(consecutive_nudge_restarts_are_capped_and_the_message_is_left_unread)'
+test-group = 'exec-nudge-restart'
+threads-required = "num-test-threads"

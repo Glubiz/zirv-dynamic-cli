@@ -868,8 +868,16 @@ fn is_dashboard_ack(line: &str) -> bool {
         .starts_with(crate::commands::ctx::agent::DASH_SPAWN_ACK_PREFIX)
 }
 
-fn dash_channel_active() -> bool {
-    std::env::var(crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV).is_ok()
+// T8: `env` used to be a hard-coded `std::env::var` read -- the one process-
+// global lookup in this file with no injectable seam at all, unlike
+// `sessions::nested_session_evidence`'s own `EnvLookup`-based read of the
+// same variable. Nothing here manipulates the real `ZIRV_CTX_DASH_REQUESTS`
+// today, so it was not observed to leak between tests, but a hard-coded
+// real-env read is exactly the shape that does once something does -- the
+// call site below still passes the real environment, so production behavior
+// is unchanged.
+fn dash_channel_active(env: crate::commands::ctx::config::EnvLookup<'_>) -> bool {
+    env(crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV).is_some()
 }
 
 /// The argv a reviewer is launched with, after the program itself. The
@@ -949,7 +957,7 @@ fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRu
         }
         drop(stdin);
     });
-    let dash_active = dash_channel_active();
+    let dash_active = dash_channel_active(&|k| std::env::var(k).ok());
     let mut dashboard_spawn = false;
     let mut output = Vec::new();
     if let Some(stdout) = child.stdout.take() {
@@ -1393,6 +1401,20 @@ mod tests {
         assert_eq!(diff.matches("sensitive filename").count(), 3);
         assert!(diff.contains("omitted: binary"));
         assert!(diff.contains("ordinary text"));
+    }
+
+    /// T8: `dash_channel_active` reads whichever channel its `env` lookup
+    /// hands back, never the real process environment directly -- so this
+    /// exercises both branches without ever touching (or leaking) the real
+    /// `ZIRV_CTX_DASH_REQUESTS`.
+    #[test]
+    fn dash_channel_active_reads_only_its_injected_env() {
+        let set = std::collections::HashMap::from([(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            "/tmp/some-requests-dir".to_string(),
+        )]);
+        assert!(dash_channel_active(&|k| set.get(k).cloned()));
+        assert!(!dash_channel_active(&|_| None));
     }
 
     /// C4: under `ZIRV_CTX_DASH_REQUESTS` a delegation exits 0 as soon as the

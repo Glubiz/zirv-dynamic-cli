@@ -363,12 +363,10 @@ mod tests {
         // `resume`'s own nesting guard and fail on the refusal instead of
         // testing attribution. The same scrub `wrap`'s pty harness does, for
         // the same reason -- and the stub `ZIRV_CTX_AGENT_BIN` above means
-        // even a fully regressed guard can only ever reach the stub.
-        for key in crate::commands::ctx::sessions::SUPERVISION_ENV {
-            command.env_remove(key);
-        }
-        command.env_remove("CLAUDE_PID");
-        command.env_remove("CLAUDECODE");
+        // even a fully regressed guard can only ever reach the stub. T8: see
+        // `testenv::scrub_supervision_env_for_test_cmd`'s own doc comment for
+        // why this is a test-side scrub, not an extended production one.
+        crate::commands::ctx::testenv::scrub_supervision_env_for_test_cmd(&mut command);
         let status = command.status().expect("resume runs");
         assert!(status.success(), "the launched agent exited cleanly");
 

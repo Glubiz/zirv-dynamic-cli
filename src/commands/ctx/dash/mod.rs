@@ -9494,7 +9494,10 @@ mod tests {
         // A is reaped while the dialog is open: it leaves the vector, and B
         // slides into index 0 -- the index the dialog used to hold.
         let mut reaped = panes.remove(0);
-        let _ = reaped.shutdown("");
+        // finish_shutdown: immediate, no QUIT_GRACE wait -- these panes'
+        // `long_lived_argv` child never reads its pty input, so the polite
+        // `shutdown` ask-then-wait always burns the full grace for nothing.
+        let _ = reaped.finish_shutdown();
         let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
         let mut errors = Vec::new();
         let env = |_: &str| None;
@@ -9521,7 +9524,7 @@ mod tests {
         );
 
         for pane in panes.iter_mut() {
-            let _ = pane.shutdown("");
+            let _ = pane.finish_shutdown();
         }
     }
 
@@ -9536,7 +9539,9 @@ mod tests {
         let (mut panes, _a, b) = two_live_panes(&state, &repo);
 
         let mut reaped = panes.remove(0);
-        let _ = reaped.shutdown("");
+        // finish_shutdown: see the identical comment on
+        // `a_nudge_aimed_at_a_reaped_pane_is_reported_and_delivered_nowhere`.
+        let _ = reaped.finish_shutdown();
         assert_eq!(panes[0].short(), b, "B is at index 0 now, not index 1");
 
         // B has reported no turn boundary, so a nudge for it queues rather
@@ -9564,7 +9569,7 @@ mod tests {
         );
 
         for pane in panes.iter_mut() {
-            let _ = pane.shutdown("");
+            let _ = pane.finish_shutdown();
         }
     }
 
@@ -9666,8 +9671,10 @@ mod tests {
             "the queued nudge was drained once the pane became injectable again"
         );
 
+        // finish_shutdown: see the identical comment on
+        // `a_nudge_aimed_at_a_reaped_pane_is_reported_and_delivered_nowhere`.
         for pane in panes.iter_mut() {
-            let _ = pane.shutdown("");
+            let _ = pane.finish_shutdown();
         }
     }
 
@@ -10119,8 +10126,10 @@ mod tests {
         deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
         assert!(queues[0].is_empty(), "and delivers once that turn ends too");
 
+        // finish_shutdown: see the identical comment on
+        // `a_nudge_aimed_at_a_reaped_pane_is_reported_and_delivered_nowhere`.
         for pane in panes.iter_mut() {
-            let _ = pane.shutdown("");
+            let _ = pane.finish_shutdown();
         }
     }
 
@@ -10207,8 +10216,10 @@ mod tests {
             "once the injected turn ends the queued nudge is delivered"
         );
 
+        // finish_shutdown: see the identical comment on
+        // `a_nudge_aimed_at_a_reaped_pane_is_reported_and_delivered_nowhere`.
         for pane in panes.iter_mut() {
-            let _ = pane.shutdown("");
+            let _ = pane.finish_shutdown();
         }
     }
 
@@ -10389,8 +10400,10 @@ mod tests {
             "the dedup set records the advised message's own file name"
         );
 
+        // finish_shutdown: see the identical comment on
+        // `a_nudge_aimed_at_a_reaped_pane_is_reported_and_delivered_nowhere`.
         for pane in panes.iter_mut() {
-            let _ = pane.shutdown("");
+            let _ = pane.finish_shutdown();
         }
     }
 
@@ -10941,8 +10954,10 @@ mod tests {
         claim_pane_nudges(&panes, &state, &mut again, Instant::now());
         assert!(again.is_empty(), "a claimed marker is not claimed twice");
 
+        // finish_shutdown: see the identical comment on
+        // `a_nudge_aimed_at_a_reaped_pane_is_reported_and_delivered_nowhere`.
         for pane in panes.iter_mut() {
-            let _ = pane.shutdown("");
+            let _ = pane.finish_shutdown();
         }
     }
 
@@ -11002,8 +11017,10 @@ mod tests {
             "the pane's screen was resized to the new inner geometry"
         );
 
+        // finish_shutdown: see the identical comment on
+        // `a_nudge_aimed_at_a_reaped_pane_is_reported_and_delivered_nowhere`.
         for pane in panes.iter_mut() {
-            let _ = pane.shutdown("");
+            let _ = pane.finish_shutdown();
         }
     }
 

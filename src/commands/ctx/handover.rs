@@ -623,6 +623,14 @@ mod tests {
     #[test]
     fn dry_run_previews_the_packet_and_mutates_nothing() {
         let tmp = testenv::repo();
+        // T8 hermeticity: this test's `--agent codex` dry-run reaches
+        // `AgentGate::load` (real-`$HOME`-backed), same as the identical
+        // fix on handoff.rs's `no_model_on_codex_now_reports_structural_
+        // since_codex_has_real_structural_context` -- without it, codex
+        // being disabled in a developer's own `~/.zirv/.settings.toml`
+        // fails this test on an unrelated refusal.
+        let home = tmp.path().join("home");
+        let _home = testenv::HomeGuard::set(&home);
         let state = state_in(&tmp.path().join("state"));
         let transcript = tmp.path().join("t.jsonl");
         std::fs::write(

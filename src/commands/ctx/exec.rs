@@ -923,10 +923,14 @@ pub(crate) fn run_with_clock<W: Write>(
         // tick, so a fast limit-hit exit (print the notice, exit immediately,
         // exactly what a real exhausted-window run looks like) can race past
         // the last tick that would have caught it. A final drain here closes
-        // that race without touching supervise_child's general contract.
+        // that race without touching supervise_child's general contract --
+        // `drain_to_eof`, not `try_lines`, because `try_lines` alone is just
+        // as non-blocking as every tick's own call and can still lose the
+        // race it looks like it closes (root-caused via a deterministic
+        // repro in `supervise.rs`'s own test module, not by inspection alone).
         if !limit_hit {
             limit_hit = pace::scan_for_limit(
-                &tap.try_lines(),
+                &tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET),
                 &state,
                 session.as_str(),
                 "exec",
@@ -1744,6 +1748,67 @@ mod tests {
             "the truncation must be visible, not silent: {}",
             composed.text
         );
+    }
+
+    /// Guards `.config/nextest.toml`'s `exec-nudge-restart` group against
+    /// silent membership rot: its `filter = 'test(a) or test(b) or ...'`
+    /// enumerates 8 test names verbatim, and nextest silently matches
+    /// nothing for a clause naming a test that does not exist rather than
+    /// erroring -- so a rename here would silently drop a test out of the
+    /// serialized group with no signal anywhere. This extracts every
+    /// `test(NAME)` clause from that override's filter and asserts each
+    /// NAME still resolves to a real `fn` in this file. `include_str!` on
+    /// this very file is deliberate, not an accident -- the whole
+    /// exec-nudge-restart family lives here -- and the check is on the
+    /// exact `fn NAME(` byte pattern (not a loose substring match) so it
+    /// cannot be fooled by a name that only ever appears as this test's own
+    /// dynamically-parsed data, never as a real function definition. The
+    /// reverse direction (every such-shaped `fn` also present in the
+    /// filter) is not checked: there is no reliable lexical marker that
+    /// distinguishes a member of this family from any other test.
+    #[test]
+    fn the_nextest_exec_nudge_restart_group_names_still_resolve() {
+        const NEXTEST_TOML: &str =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.config/nextest.toml"));
+        const THIS_FILE: &str = include_str!("exec.rs");
+
+        let block = NEXTEST_TOML
+            .split("[[profile.default.overrides]]")
+            .find(|block| block.contains("test-group = 'exec-nudge-restart'"))
+            .expect("nextest.toml must still have an override naming the exec-nudge-restart group");
+        let filter_line = block
+            .lines()
+            .find(|line| line.trim_start().starts_with("filter = "))
+            .expect("the exec-nudge-restart override must still have a filter line");
+
+        let mut names: Vec<&str> = Vec::new();
+        let mut rest = filter_line;
+        while let Some(start) = rest.find("test(") {
+            let after = &rest[start + "test(".len()..];
+            let end = after
+                .find(')')
+                .expect("every test( clause in the filter must close with a )");
+            names.push(&after[..end]);
+            rest = &after[end + 1..];
+        }
+
+        assert!(
+            names.len() >= 8,
+            "expected at least the 8 known exec-nudge-restart tests, found {}: {:?}",
+            names.len(),
+            names
+        );
+
+        for name in names {
+            let needle = format!("fn {name}(");
+            assert!(
+                THIS_FILE.contains(&needle),
+                "nextest.toml's exec-nudge-restart filter names `{name}`, which no longer \
+                 resolves to `fn {name}(` in exec.rs -- nextest silently drops a clause like \
+                 this rather than erroring, so the test just as silently fell out of the \
+                 serialized group"
+            );
+        }
     }
 
     #[test]
@@ -3414,24 +3479,11 @@ mod tests {
             // at all -- see the fixture's own doc comment), so liveness is
             // polled straight off the real session registry instead of a
             // log-line count, mirroring `nudge_live_session`'s own read.
-            let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer.clone());
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let mut live = false;
-            while std::time::Instant::now() < deadline {
-                if crate::commands::ctx::sessions::list(&state)
-                    .iter()
-                    .any(|(_, liveness)| {
-                        *liveness == crate::commands::ctx::sessions::Liveness::Live
-                    })
-                {
-                    live = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if !live {
-                return;
-            }
+            // 20s, not the old 5s: honest against this test's own 30s exec
+            // timeout, and a give-up now panics instead of silently never
+            // nudging -- see `wait_for_live_session_or_panic`'s own doc
+            // comment.
+            wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -3532,24 +3584,11 @@ mod tests {
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
         let writer = std::thread::spawn(move || {
-            let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer.clone());
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let mut live = false;
-            while std::time::Instant::now() < deadline {
-                if crate::commands::ctx::sessions::list(&state)
-                    .iter()
-                    .any(|(_, liveness)| {
-                        *liveness == crate::commands::ctx::sessions::Liveness::Live
-                    })
-                {
-                    live = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if !live {
-                return;
-            }
+            // 20s, not the old 5s: honest against this test's own 30s exec
+            // timeout, and a give-up now panics instead of silently never
+            // nudging -- see `wait_for_live_session_or_panic`'s own doc
+            // comment.
+            wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -3621,24 +3660,11 @@ mod tests {
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
         let writer = std::thread::spawn(move || {
-            let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer.clone());
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let mut live = false;
-            while std::time::Instant::now() < deadline {
-                if crate::commands::ctx::sessions::list(&state)
-                    .iter()
-                    .any(|(_, liveness)| {
-                        *liveness == crate::commands::ctx::sessions::Liveness::Live
-                    })
-                {
-                    live = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if !live {
-                return;
-            }
+            // 20s, not the old 5s: honest against this test's own 30s exec
+            // timeout, and a give-up now panics instead of silently never
+            // nudging -- see `wait_for_live_session_or_panic`'s own doc
+            // comment.
+            wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -3686,6 +3712,49 @@ mod tests {
     /// appended the launch mail's text (already consumed, stale) instead of
     /// the nudge's; it must instead carry the nudge's guidance, and the
     /// launch mail's text must never reach argv a second time.
+    ///
+    /// KNOWN ISSUE (perf/test-suite-speed fix round 2, 2026-08-24): this
+    /// test was originally suspected of a nextest-only failure; re-review
+    /// corrected that -- the discriminator is process *warmth*, not the
+    /// runner (a cold filtered serial `cargo test` run failed it ~60% of
+    /// the time; nextest gives every test a cold process and failed it
+    /// ~100%; a full serial run reaches it warm, after ~2300 others, and
+    /// passed). One real mechanism behind that has been found and fixed:
+    /// `OutputTap::try_lines` (`supervise.rs`) was a pure, instantaneous,
+    /// non-blocking drain with no synchronization against `forward`'s
+    /// reader threads reaching EOF, so a child that prints its limit line
+    /// and exits immediately could still have that line in flight when
+    /// `child.wait()` observed the exit -- defeating both the poll-loop
+    /// `scan_for_limit` and the "final drain" right after `supervise_run`
+    /// returns, whose own comment claimed (wrongly) to close this race.
+    /// Fixed via `OutputTap::drain_to_eof`, a bounded blocking drain that
+    /// waits only as long as it takes for the reader threads to disconnect;
+    /// verified independently via a real `spawn_tapped` child reproducing
+    /// exactly this shape (`drain_to_eof_catches_a_real_childs_last_line_
+    /// even_though_it_already_exited`, `supervise.rs`), 20/20 passes
+    /// including under genuine heavy host contention.
+    ///
+    /// This test also failed intermittently (~30% of filtered, cold,
+    /// single-run attempts observed on the dev machine, 100% on CI run
+    /// 32723969751) with a DIFFERENT signature than the race above, and the
+    /// tap-vs-exit fix did not explain or claim to fix it. Root cause: the
+    /// adapter probes capability support by spawning `exec --help`
+    /// (`detect_ignore_flags`, `adapters/codex.rs`) before composing the
+    /// nudge restart's distiller call. This test's `ZIRV_CTX_AGENT_BIN`
+    /// override redirects that probe to `fake-codex-agent.sh` too, and the
+    /// probe's argv has no `--sandbox read-only` pair, so the fixture's
+    /// `is_distiller` check did not exempt it -- it popped a real line off
+    /// `FAKE_AGENT_MODE_FILE`, shifting hang/limit/healthy by one and making
+    /// the "limit" stage silently run as "healthy" instead (no
+    /// prompt-injection log entry, no limit-park, launch mail re-appended).
+    /// The initial suspicion that this was machine-specific (a CI runner
+    /// with no `codex` on PATH would never trigger the probe) was wrong:
+    /// the probe targets the `ZIRV_CTX_AGENT_BIN` override directly, not a
+    /// PATH-resolved `codex`, so it fires on CI just as reliably -- which is
+    /// what CI run 32723969751's deterministic failure confirmed. Fixed in
+    /// `fake-codex-agent.sh`: a bare `--help` probe is now recognized the
+    /// same way `is_distiller` special-cases `--sandbox read-only`, logged
+    /// but never popping a mode.
     #[test]
     fn a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_launch_mail() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -3731,24 +3800,11 @@ mod tests {
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
         let writer = std::thread::spawn(move || {
-            let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer.clone());
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let mut live = false;
-            while std::time::Instant::now() < deadline {
-                if crate::commands::ctx::sessions::list(&state)
-                    .iter()
-                    .any(|(_, liveness)| {
-                        *liveness == crate::commands::ctx::sessions::Liveness::Live
-                    })
-                {
-                    live = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if !live {
-                return;
-            }
+            // 20s, not the old 5s: honest against this test's own 30s exec
+            // timeout, and a give-up now panics instead of silently never
+            // nudging -- see `wait_for_live_session_or_panic`'s own doc
+            // comment.
+            wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -4308,6 +4364,54 @@ mod tests {
         .expect("nudge the live session");
     }
 
+    /// `wait_for_lines`, but a give-up (never reaching `n` lines within
+    /// `budget`) panics with a clear message instead of silently returning
+    /// whatever partial result it has. Every writer-thread test in this
+    /// nudge family used to swallow that case (`if lines.is_empty() {
+    /// return; }`) and just never nudge -- the only visible symptom, tens of
+    /// seconds later, was the launch's own exec timeout (a bare exit 76),
+    /// indistinguishable from a real regression. `budget` is sized honestly
+    /// against each test's own exec timeout (not the old, uniformly tight
+    /// 5s this whole family shared regardless of how much headroom its own
+    /// launch actually had), leaving real margin for the rest of the test's
+    /// work after the wait. A panic here is caught by the caller's own
+    /// `writer.join().expect(...)`, which is what actually fails the test --
+    /// this only makes the *reason* legible.
+    fn wait_for_lines_or_panic(path: &std::path::Path, n: usize, budget: Duration) -> Vec<String> {
+        let lines = wait_for_lines(path, n, budget);
+        assert!(
+            lines.len() >= n,
+            "never saw {n} line(s) in {} within {budget:?} -- the hang-mode agent likely never \
+             started, or this machine is starved badly enough that it could not be observed in \
+             time (check for CPU contention before assuming a real regression): got {lines:?}",
+            path.display()
+        );
+        lines
+    }
+
+    /// The registry-poll sibling of `wait_for_lines_or_panic`, for the
+    /// codex-shaped tests that have no session-env log to poll and instead
+    /// watch the session registry directly (see the identical comment on
+    /// each of their own writer threads before this helper existed).
+    fn wait_for_live_session_or_panic(state_dir: &std::path::Path, budget: Duration) {
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.to_path_buf());
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if crate::commands::ctx::sessions::list(&state)
+                .iter()
+                .any(|(_, liveness)| *liveness == crate::commands::ctx::sessions::Liveness::Live)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "no live session appeared within {budget:?} -- the hang-mode agent likely never \
+             started, or this machine is starved badly enough that it could not be observed in \
+             time (check for CPU contention before assuming a real regression)"
+        );
+    }
+
     #[test]
     fn a_headless_worker_stops_at_the_next_poll_and_relaunches_with_the_guidance() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -4339,10 +4443,10 @@ mod tests {
         let repo_for_writer = tmp.path().to_path_buf();
         let session_log_for_writer = session_log.clone();
         let writer = std::thread::spawn(move || {
-            let lines = wait_for_lines(&session_log_for_writer, 1, Duration::from_secs(5));
-            if lines.is_empty() {
-                return;
-            }
+            // 20s, not the old 5s: honest against this test's own 30s exec
+            // timeout, and a give-up now panics instead of silently never
+            // nudging -- see `wait_for_lines_or_panic`'s own doc comment.
+            wait_for_lines_or_panic(&session_log_for_writer, 1, Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -4423,10 +4527,10 @@ mod tests {
         let repo_for_writer = tmp.path().to_path_buf();
         let session_log_for_writer = session_log.clone();
         let writer = std::thread::spawn(move || {
-            let lines = wait_for_lines(&session_log_for_writer, 1, Duration::from_secs(5));
-            if lines.is_empty() {
-                return;
-            }
+            // 20s, not the old 5s: honest against this test's own 30s exec
+            // timeout, and a give-up now panics instead of silently never
+            // nudging -- see `wait_for_lines_or_panic`'s own doc comment.
+            wait_for_lines_or_panic(&session_log_for_writer, 1, Duration::from_secs(20));
             nudge_live_session(&state_for_writer, &repo_for_writer, "keep going");
         });
 
@@ -4499,10 +4603,10 @@ mod tests {
         let repo_for_writer = tmp.path().to_path_buf();
         let session_log_for_writer = session_log.clone();
         let writer = std::thread::spawn(move || {
-            let lines = wait_for_lines(&session_log_for_writer, 1, Duration::from_secs(5));
-            if lines.is_empty() {
-                return;
-            }
+            // 20s, not the old 5s: honest against this test's own 30s exec
+            // timeout, and a give-up now panics instead of silently never
+            // nudging -- see `wait_for_lines_or_panic`'s own doc comment.
+            wait_for_lines_or_panic(&session_log_for_writer, 1, Duration::from_secs(20));
             nudge_live_session(&state_for_writer, &repo_for_writer, "keep going");
         });
 
@@ -4579,16 +4683,20 @@ mod tests {
         let repo_for_writer = tmp.path().to_path_buf();
         let session_log_for_writer = session_log.clone();
         let writer = std::thread::spawn(move || -> Vec<String> {
-            let first = wait_for_lines(&session_log_for_writer, 1, Duration::from_secs(5));
-            if first.is_empty() {
-                return Vec::new();
-            }
+            // 2s, not the old 5s (which already exceeded this test's own 3s
+            // per-cycle timeout even before any contention): honest against
+            // the time actually available, and a give-up on either wait now
+            // panics instead of silently skipping its own nudge -- which,
+            // for the *second* wait especially, would have let this test
+            // pass for the wrong reason (proving nothing about the cap,
+            // only that no second nudge was ever attempted). See
+            // `wait_for_lines_or_panic`'s own doc comment.
+            let first = wait_for_lines_or_panic(&session_log_for_writer, 1, Duration::from_secs(2));
+            debug_assert!(!first.is_empty());
             nudge_live_session(&state_for_writer, &repo_for_writer, "first nudge, honored");
 
-            let second = wait_for_lines(&session_log_for_writer, 2, Duration::from_secs(5));
-            if second.len() < 2 {
-                return second;
-            }
+            let second =
+                wait_for_lines_or_panic(&session_log_for_writer, 2, Duration::from_secs(2));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,

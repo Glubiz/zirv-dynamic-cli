@@ -465,9 +465,11 @@ pub(crate) fn run_with_clock<W: Write>(
         // See the matching comment in exec.rs: supervise_child checks the
         // child's exit status before calling the tick, so a fast limit-hit
         // exit can race past the last tick that would have caught it.
+        // `drain_to_eof`, not `try_lines`: see `supervise.rs`'s own doc
+        // comment on it for why `try_lines` alone does not close this race.
         if !limit_hit {
             limit_hit = pace::scan_for_limit(
-                &tap.try_lines(),
+                &tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET),
                 &state,
                 session.as_str(),
                 "loop",

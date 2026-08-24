@@ -1316,6 +1316,14 @@ mod tests {
     #[test]
     fn no_model_on_codex_now_reports_structural_since_codex_has_real_structural_context() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // T8 hermeticity: this is the one handoff.rs test whose `--agent
+        // codex` path actually reaches `AgentGate::load` (via adapter
+        // selection for structural context), which is real-`$HOME`-backed
+        // (`crate::utils::home_dir()`) -- without this, a developer machine
+        // with codex disabled in their own `~/.zirv/.settings.toml` fails
+        // this test on a refusal that has nothing to do with what it tests.
+        let home = tempfile::tempdir().expect("tempdir for home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let transcript_dir = tmp.path().join("rollout");
         std::fs::create_dir_all(&transcript_dir).expect("mkdir");
         let transcript = transcript_dir.join("rollout-test.jsonl");

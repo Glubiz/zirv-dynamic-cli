@@ -215,6 +215,40 @@ pub(crate) mod testenv {
             Self(EnvGuard::set(home, None))
         }
     }
+
+    /// The full scrub a test harness needs before spawning a *real* `zirv`
+    /// subprocess: `sessions::SUPERVISION_ENV` plus `CLAUDE_PID`/`CLAUDECODE`
+    /// plus `DASH_REQUESTS_ENV`.
+    ///
+    /// Production's own `sessions::scrub_supervision_env`/`_cmd` deliberately
+    /// stop short of `DASH_REQUESTS_ENV` -- a dashboard pane's own child must
+    /// still be able to reach the spawn-request channel (see
+    /// `nested_session_evidence`'s own doc comment) -- so this cannot just
+    /// widen those. It delegates to the unmodified production helper and
+    /// layers the extra test-only scrubs on top, purely so a suite spawned
+    /// from inside a dashboard pane (this whole suite's own environment, when
+    /// run via `zirv ctx dash`) does not trip its own nesting guard.
+    ///
+    /// `#[cfg(unix)]`: every current caller is one of wrap.rs's real-PTY
+    /// `CommandBuilder` harnesses, which are themselves `#[cfg(unix)]` --
+    /// see CLAUDE.md. `scrub_supervision_env_for_test_cmd` below is the
+    /// cross-platform counterpart `mod win`'s `std::process::Command`
+    /// harness uses instead.
+    #[cfg(unix)]
+    pub(crate) fn scrub_supervision_env_for_test(builder: &mut portable_pty::CommandBuilder) {
+        super::sessions::scrub_supervision_env(builder);
+        builder.env_remove("CLAUDE_PID");
+        builder.env_remove("CLAUDECODE");
+        builder.env_remove(super::dash::spawnreq::DASH_REQUESTS_ENV);
+    }
+
+    /// The `std::process::Command` counterpart of `scrub_supervision_env_for_test`.
+    pub(crate) fn scrub_supervision_env_for_test_cmd(command: &mut std::process::Command) {
+        super::sessions::scrub_supervision_env_cmd(command);
+        command.env_remove("CLAUDE_PID");
+        command.env_remove("CLAUDECODE");
+        command.env_remove(super::dash::spawnreq::DASH_REQUESTS_ENV);
+    }
 }
 
 /// Every ctx entry point returns this. Matches the error style used by the
