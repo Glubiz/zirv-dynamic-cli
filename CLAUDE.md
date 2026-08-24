@@ -8,19 +8,23 @@ params and secrets), and `zirv ctx`, which supervises Claude Code / Codex
 sessions, scores transcripts with a deterministic rot engine, and acts
 (advise / compact / restart-with-handoff) before context rot ruins it.
 
-## Build and verify (all four, before claiming done)
+## Build and verify (all five, before claiming done)
 
     cargo build
-    cargo nextest run                            # primary local loop
-    cargo test --verbose -- --test-threads=1     # compatibility fallback
+    cargo nextest run --no-fail-fast              # primary local loop
+    cargo test --verbose -- --test-threads=1      # compatibility fallback
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
 
 `cargo nextest run` runs each test in its own process (config in
 `.config/nextest.toml`), so the process-wide `env::set_var` races that used
 to force `--test-threads=1` cannot happen; it is the fast default loop.
-`cargo test --verbose -- --test-threads=1` stays as the compatibility
-fallback -- both must pass before claiming done.
+`--no-fail-fast` is required, not optional: nextest's own default is
+fail-fast (stop at the first failure), which cannot produce the complete,
+sorted failure-NAME list a pre-existing-failure baseline has to be judged
+against (diff the names, never the count). `cargo test --verbose --
+--test-threads=1` stays as the compatibility fallback -- both must pass
+before claiming done.
 
 ## Module map
 

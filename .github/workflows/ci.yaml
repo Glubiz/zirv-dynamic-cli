@@ -47,13 +47,17 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.143
 
       # nextest runs each test in its own process, so the process-wide
       # `env::set_var` races that used to require `--test-threads=1` cannot
-      # happen -- see .config/nextest.toml.
+      # happen -- see .config/nextest.toml. `--no-fail-fast` matches serial
+      # `cargo test`'s behavior of running every test and reporting a
+      # complete `failures:`-equivalent list, which the sorted failure-NAME
+      # baseline methodology (CLAUDE.md) depends on -- nextest's own default
+      # is fail-fast, which would otherwise stop at the first failure.
       - name: Run Tests
-        run: cargo nextest run
+        run: cargo nextest run --no-fail-fast
 
       - name: Check Code Formatting
         run: cargo fmt -- --check
