@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-23
+last-verified: 2026-08-24
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-08-23
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-24 — The first-run wizard is collect-then-apply, gated cheapest-check-first, and never widens argv it wasn't given (v2.25.0)
+**Context:** A never-configured operator's first `zirv`/`zirv chat` needed a guided setup step, but a wizard that prompts interactively has two ways to go wrong an ordinary CLI command doesn't: it can hang a non-interactive/CI invocation, and an abort partway through (Ctrl-C) can leave `~/.zirv` half-written in a state neither "first run" nor "configured" cleanly describes. A first review round also found it could run ahead of `chat`'s own nesting refusal and that `zirv chat --help` was arming it.
+**Decision:** `run_first_run`'s interactive body splits into `collect_first_run_answers` (every `dialoguer` prompt, zero writes) and `apply_first_run_answers` (every write, no prompts), called only after collection fully succeeds — an abort anywhere in the former leaves disk untouched and `first_run_needed` still true, so the wizard simply re-offers next time. `main.rs`'s `maybe_run_first_run_wizard` checks stdin/stdout-are-both-ttys first (cheapest), then `setup::first_run_needed`, then `ctx::sessions::nesting_refusal("chat", env, false)` before ever prompting. The `chat` entry point only arms on `verb == "chat" && argv.len() == 2` — a literal bare `zirv chat`, nothing else — so `--help`, `--allow-nested`, or any other flag skip straight to `ctx::dispatch` untouched.
+**Rejected:** A single monolithic prompt-and-write function (simpler, but an abort mid-way leaves an ambiguous half-written `ctx.toml`/`.settings.toml` — the actual bug the round-1 review caught, I4). Gating the wizard only inside `ctx::dispatch` itself, after argv parsing — would mean six interactive prompts already ran before a nested-session refusal or a `--help` request was even recognized.
+**Consequences:** `allow_nested` is hardcoded `false` at both call sites (bare `zirv` has no argv to carry a flag on; the `chat` alias path never reaches this function for anything but a bare `zirv chat`) — an operator who actually needs `--allow-nested` gets `chat`'s own real check downstream, not this one. Every wizard mutation routes through an already-tested non-interactive setter, so `apply_first_run_answers` itself is fully unit-testable without a pty; only the prompt sequencing in `collect_first_run_answers` is reviewed by reading. Two residuals recorded, not fixed: the hook-install fallback ignores per-harness enable answers, and a nesting-guard skip is silent. See [[Known Issues]].
+**Spec / link:** `src/main.rs`'s `maybe_run_first_run_wizard`/`first_run_wizard_should_run`; `src/commands/setup.rs`'s `run_first_run`/`collect_first_run_answers`/`apply_first_run_answers`; [[Built-in Commands]]'s "The guided first-run wizard".
 
 ### 2026-08-23 — The repo's agent context is zirv-managed now
 **Context:** This session ran the full zirv AI-setup migration on the working machine: `zirv setup apply`, canonical `.zirv/context/{common,claude,codex}.md`, a populated `.zirv/memory/` shared bank (29 hand-authored + 8 vault-extracted, 5 forgotten), 10 private entries migrated from Claude Code's own auto-memory, then `zirv context sync --generate --force`, which replaced the hand-maintained 21 KB `CLAUDE.md` with a 7.3 KB managed render and created `AGENTS.md`. That leaves two candidate sources of truth for "what does the agent read": the generated native files, and this Obsidian vault.

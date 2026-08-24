@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-23
+last-verified: 2026-08-24
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-24 (feature/first-run-setup, v2.25.0): recorded two residuals from the guided first-run wizard -- the hook-install fallback installs both harnesses' hooks regardless of the operator's individual enable/disable answers, and a nesting-guard skip produces no output rather than a hint that `zirv setup` exists; also recorded that three setup.rs tests (the new N1 harvest-decline regression test plus the pre-existing issue-#87 pair) assert `cfg.memory.*` without clearing every `ZIRV_CTX_MEMORY*` env var -->
 <!-- Updated 2026-08-23 (fix/shipped-posture-allows-zirv, issues #99/#100): recorded that Drop for SignalServer on Windows removes only the marker file, never the acceptor/drainer threads or the named-pipe instance itself -- discovered while adding signal::probe for the #99 orphaned-endpoint sweep (sessions::sweep_orphan_endpoints), since a same-process drop-then-reprobe cannot observe "endpoint gone" the way the unix build can -->
 <!-- Updated 2026-08-23 (feat/close-open-issues, review-fix round): recorded that the handover structural (no-model) packet is thin -- see the new entry below; also documented the HOME-layer-vs-REPO-layer parse-failure split (CtxConfig::load vs load_for_launch) in Untrusted Configuration.md -->
 <!-- Updated 2026-08-23 (feat/close-open-issues, vault keeper pass): removed "workflow::repo_gates's fail-closed test no longer matches CtxConfig::load's new parse-skip behaviour" -- verified against src/commands/workflow/{mod,verification}.rs: repo_gates's doc comment and the renamed test (an_unparseable_repo_config_does_not_disable_a_gate_it_never_controlled) already reflect the narrower fails-closed-only-on-Err claim the entry asked for; it described a residual from earlier in the same session's diff that a later part of the same commit (issues #88/#90/#91) already closed -->
@@ -53,6 +54,16 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## The first-run wizard's hook-install fallback ignores the operator's per-harness answers, and a nested skip is silent (v2.25.0)
+
+`commands::setup::apply_first_run_answers`'s `install_hooks` branch, when the current directory has no local `.zirv` to run `run_apply` against, calls `install_claude_integration` *and* `install_codex_integration` unconditionally — an operator who answered "no" to enabling codex in the harness-enable step still gets codex's hooks installed if they accept the later "install harness hook integration now?" prompt. The two questions are independent by construction (`FirstRunAnswers.harness_enabled` is never consulted by the `install_hooks` arm). Not fixed — deferred past the two-fix-round cap as a non-blocking finding.
+
+Separately, `main.rs`'s `maybe_run_first_run_wizard` checks `ctx::sessions::nesting_refusal("chat", &env, false)` before ever prompting, and returns with no output at all when it refuses — a never-configured operator who types a bare `zirv`/`zirv chat` from inside an existing agent session (a dashboard pane, a nested `wrap`) gets silence, not a hint that `zirv setup` exists to configure things later. Also recorded, not fixed: `zirv chat --allow-nested` (or any other flag after `chat`) never arms the wizard either, since the gate is `verb == "chat" && argv.len() == 2` — a deliberate, accepted side effect of the same fix that stops `zirv chat --help` from running it (see [[Built-in Commands]]'s "The guided first-run wizard").
+
+## Three `commands::setup` tests assert `cfg.memory.*` without clearing every `ZIRV_CTX_MEMORY*` env var (v2.25.0)
+
+`apply_first_run_answers_lets_a_decline_actually_turn_off_a_previously_true_harvest` (new) clears `ZIRV_CTX_AGENT`/`ZIRV_CTX_CHAT_MODEL`/`ZIRV_CTX_MEMORY` via `VarGuard` before asserting `cfg.memory.harvest`, but not `ZIRV_CTX_MEMORY_HARVEST` — the exact env var `REPO_FORBIDDEN`-overrides the very field it asserts on (see [[Ctx Subsystem]]'s `REPO_FORBIDDEN` table). The two pre-existing issue-#87 tests (`declining_memory_harvest_leaves_the_default_off_but_remembers_it_was_asked`, `accepting_memory_harvest_writes_only_to_the_home_layer_never_the_repo`, `setup.rs`) have the identical gap. On a machine or CI runner with `ZIRV_CTX_MEMORY_HARVEST` set in the real process environment, `ctx::config::CtxConfig::load`'s env layer would silently override whatever the test just wrote to `ctx.toml`, producing a false pass or a false failure unrelated to the code under test. Not fixed — recorded so a red result on one of these three tests is checked against the runner's own environment before being treated as a regression.
 
 ## The handover structural (no-model) packet is thin
 

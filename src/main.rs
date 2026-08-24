@@ -159,6 +159,69 @@ fn zirv_dir_present(cwd: &Path) -> bool {
     cwd.join(utils::SCRIPT_DIR_NAME).is_dir()
 }
 
+/// Whether the guided first-run setup wizard should run before continuing
+/// into whatever command the operator actually typed: only in a real
+/// interactive terminal (a script/CI invocation must never hang on a prompt),
+/// and only when zirv has genuinely never been configured
+/// (`setup::first_run_needed`). Pure so this policy -- as opposed to the
+/// wizard's own interactive body, which cannot be automated -- is testable
+/// without a pty or a real `HOME`.
+fn first_run_wizard_should_run(
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    first_run_needed: bool,
+) -> bool {
+    stdin_is_tty && stdout_is_tty && first_run_needed
+}
+
+/// Runs the guided first-run wizard when appropriate, degrading on any
+/// failure -- no `HOME`, a declined terminal check, Ctrl-C, any other
+/// `dialoguer` error -- with a note on stderr rather than a silent swallow,
+/// so an operator who answered every prompt still learns that nothing was
+/// saved. The wizard must never make the command the operator typed worse,
+/// so from a caller's perspective its only two outcomes are "configured,
+/// keep going exactly as planned" and "didn't run (or aborted), keep going
+/// exactly as before".
+///
+/// Checks are ordered cheapest first: the TTY flags are already in hand, so
+/// they gate before anything that touches `HOME` or the filesystem. `chat`'s
+/// own nesting guard (`ctx::sessions::nesting_refusal`) is checked before
+/// ever launching the wizard, not just before the eventual `ctx::dispatch`:
+/// a `zirv chat`/bare `zirv` run from inside an existing agent session (a
+/// dashboard pane, a nested wrap) must refuse outright, the same as `chat`
+/// itself would -- launching six interactive prompts first, only to refuse
+/// the command anyway, would block on the first prompt in exactly the
+/// nested-pty context the guard exists to protect.
+///
+/// `allow_nested` is always `false` at both call sites below: the bare-`zirv`
+/// path has no argv to carry a flag on, and the `chat`-alias path only ever
+/// reaches this function for literally `zirv chat` with no further
+/// arguments (see that call site), so there is no `--allow-nested` to read
+/// either -- an operator who passes it gets the ordinary `chat` verb's own
+/// check instead, with the real flag.
+fn maybe_run_first_run_wizard(stdin_is_tty: bool, stdout_is_tty: bool, allow_nested: bool) {
+    if !stdin_is_tty || !stdout_is_tty {
+        return;
+    }
+    let Ok(home) = utils::home_dir() else {
+        return;
+    };
+    let needed = setup::first_run_needed(&home.join(utils::SCRIPT_DIR_NAME));
+    if !first_run_wizard_should_run(stdin_is_tty, stdout_is_tty, needed) {
+        return;
+    }
+    let env = ctx::config::env_from_process();
+    if ctx::sessions::nesting_refusal("chat", &env, allow_nested).is_some() {
+        return;
+    }
+    if let Err(e) = setup::run_first_run() {
+        eprintln!(
+            "zirv: first-run setup did not finish ({e}); continuing without it. \
+             Run `zirv setup` to configure later."
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -183,14 +246,32 @@ async fn main() {
     }
 
     if let Some(verb) = top_level_ctx_alias(&argv) {
+        // Only `chat` gets the first-run gate, not `agent`: `agent` delegates
+        // one bounded task to another harness rather than opening the kind of
+        // standing interactive session first-run setup is meant to precede.
+        // And only a bare `zirv chat` with no further arguments qualifies --
+        // `zirv chat --help` (or any other flag, valid or not) is a discovery
+        // or parse-failure path that `ctx::dispatch` owns downstream; running
+        // the wizard first would answer neither and write config besides.
+        if verb == "chat" && argv.len() == 2 {
+            maybe_run_first_run_wizard(
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+                false,
+            );
+        }
         std::process::exit(ctx::dispatch(&rewrite_ctx_alias_args(verb, &argv)));
     }
 
     if argv.len() == 1 {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-        let zirv_exists = zirv_dir_present(&cwd);
         let stdin_is_tty = std::io::stdin().is_terminal();
         let stdout_is_tty = std::io::stdout().is_terminal();
+        maybe_run_first_run_wizard(stdin_is_tty, stdout_is_tty, false);
+        // Re-checked *after* the wizard: it may have just created a local
+        // `.zirv` in this directory (step 6), which should immediately count
+        // toward the target this same bare invocation resolves to.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+        let zirv_exists = zirv_dir_present(&cwd);
         match bare_invocation_target(zirv_exists, stdin_is_tty, stdout_is_tty) {
             BareTarget::Chat => {
                 std::process::exit(ctx::dispatch(&["ctx".to_string(), "chat".to_string()]));
@@ -481,6 +562,17 @@ mod tests {
         assert!(!is_top_level_memory(&argv(&["zirv"])));
         assert!(utils::is_reserved_command("memory"));
         assert!(utils::is_reserved_command("Memory"));
+    }
+
+    #[test]
+    fn first_run_wizard_runs_only_when_interactive_and_unconfigured() {
+        assert!(first_run_wizard_should_run(true, true, true));
+        assert!(!first_run_wizard_should_run(false, true, true));
+        assert!(!first_run_wizard_should_run(true, false, true));
+        assert!(
+            !first_run_wizard_should_run(true, true, false),
+            "already configured -- must not re-run"
+        );
     }
 
     /// A repo `.zirv/Memory.yaml` (any casing) must never be reachable as a

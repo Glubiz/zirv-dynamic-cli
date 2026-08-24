@@ -243,6 +243,11 @@ const GUIDED_NO_BACKUPS_MESSAGE: &str = "No backup runs found yet. A backup is c
 const GUIDED_RESTORE_CONFIRM_PROMPT: &str = "Apply this restore now? The overwrites listed \
      above will happen; the current state is backed up first, so this restore can itself be \
      undone.";
+/// Shared by every guided (`dialoguer`-driven) entry point -- `run_guided`
+/// and `run_first_run` -- so both refuse the same way rather than drifting
+/// into two slightly different messages for the same condition.
+const INTERACTIVE_TERMINAL_REQUIRED: &str =
+    "interactive setup requires a terminal; use `zirv setup apply` in automation";
 
 #[derive(Debug, Serialize)]
 struct HarnessStatus {
@@ -598,12 +603,21 @@ fn install_codex_integration(home: &Path, dry_run: bool) -> SetupResult<usize> {
     install_codex_hooks(home, &codex_config_dir(home).join("hooks.json"), dry_run)
 }
 
-/// Writes one boolean key into the operator's global `~/.zirv/ctx.toml`,
-/// creating the file and the `[table]` section if necessary and leaving
-/// every other key in the file untouched. Issues #87 and #93 both require
-/// the guided flow's answer to land only in the operator's own config, never
-/// a repo layer -- this always targets `home`, never `repo`.
-fn set_home_ctx_toml_bool(home: &Path, table: &str, key: &str, value: bool) -> SetupResult<()> {
+/// Writes one key into the operator's global `~/.zirv/ctx.toml`, creating
+/// the file (and the `[table]` section, if any) as needed and leaving every
+/// other key in the file untouched. Issues #87 and #93 both require the
+/// guided flow's answer to land only in the operator's own config, never a
+/// repo layer -- this always targets `home`, never `repo`. `table = None`
+/// writes a top-level key (`agent` lives at the root of `ctx.toml`, not
+/// under a section); `table = Some(t)` writes `[t] key = value`. Shared by
+/// `set_home_ctx_toml_bool`/`set_home_ctx_toml_string` below so the
+/// read-mutate-write body exists exactly once.
+fn set_home_ctx_toml_value(
+    home: &Path,
+    table: Option<&str>,
+    key: &str,
+    value: toml::Value,
+) -> SetupResult<()> {
     let path = home
         .join(crate::utils::SCRIPT_DIR_NAME)
         .join(ctx::config::CTX_CONFIG_FILE);
@@ -612,18 +626,74 @@ fn set_home_ctx_toml_bool(home: &Path, table: &str, key: &str, value: bool) -> S
     } else {
         toml::Table::new()
     };
-    let section = root
-        .entry(table.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let section_table = section
-        .as_table_mut()
-        .ok_or_else(|| format!("{} `[{table}]` is not a table", path.display()))?;
-    section_table.insert(key.to_string(), toml::Value::Boolean(value));
+    let target = match table {
+        Some(table) => root
+            .entry(table.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| format!("{} `[{table}]` is not a table", path.display()))?,
+        None => &mut root,
+    };
+    target.insert(key.to_string(), value);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, toml::to_string_pretty(&root)?)?;
     Ok(())
+}
+
+fn set_home_ctx_toml_bool(home: &Path, table: &str, key: &str, value: bool) -> SetupResult<()> {
+    set_home_ctx_toml_value(home, Some(table), key, toml::Value::Boolean(value))
+}
+
+/// String sibling of `set_home_ctx_toml_bool`; see `set_home_ctx_toml_value`
+/// for the shared body and what `table = None` means.
+fn set_home_ctx_toml_string(
+    home: &Path,
+    table: Option<&str>,
+    key: &str,
+    value: &str,
+) -> SetupResult<()> {
+    set_home_ctx_toml_value(home, table, key, toml::Value::String(value.to_string()))
+}
+
+/// True when `home_zirv_dir` (the operator's `~/.zirv`) holds neither
+/// `ctx.toml` nor `.settings.toml` -- i.e. zirv has never been configured at
+/// all, and the first-run setup wizard should run before continuing into
+/// whatever command the operator typed. Pure and path-based, so it is
+/// testable without touching `HOME`; the directory itself existing (e.g. only
+/// `.shortcuts.yaml` from a plain `zirv init`) still counts as first-run.
+pub fn first_run_needed(home_zirv_dir: &Path) -> bool {
+    !home_zirv_dir.join(ctx::config::CTX_CONFIG_FILE).is_file()
+        && !home_zirv_dir.join(crate::settings::SETTINGS_FILE).is_file()
+}
+
+/// Manifest files that name an authoritative build/toolchain surface,
+/// shared between `looks_like_project_dir` (below) and `toolchain_proposal`
+/// (further down, issue #103's memory bootstrap) so the two heuristics can't
+/// silently drift apart over what counts as "a project".
+const PROJECT_MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Makefile",
+];
+
+/// A conservative heuristic for "this directory is a project a local `.zirv`
+/// would make sense in": any of `PROJECT_MANIFESTS`, or a `.git` directory
+/// for a repository with none of those (`.git` is deliberately local to this
+/// heuristic, not `PROJECT_MANIFESTS` -- `toolchain_proposal` has no use for
+/// it). Used only to decide whether the first-run wizard's project-layer
+/// step is worth offering at all.
+fn looks_like_project_dir(dir: &Path) -> bool {
+    dir.join(".git").exists()
+        || PROJECT_MANIFESTS
+            .iter()
+            .any(|marker| dir.join(marker).exists())
 }
 
 /// Issue #87: applies the operator's answer to the memory-harvest offer.
@@ -847,20 +917,11 @@ fn validation_proposal(repo: &Path) -> Option<MemoryProposal> {
 }
 
 fn toolchain_proposal(repo: &Path) -> Option<MemoryProposal> {
-    let manifests = [
-        "Cargo.toml",
-        "package.json",
-        "pyproject.toml",
-        "go.mod",
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "Makefile",
-    ]
-    .into_iter()
-    .filter(|name| repo.join(name).is_file())
-    .map(str::to_string)
-    .collect::<Vec<_>>();
+    let manifests = PROJECT_MANIFESTS
+        .iter()
+        .filter(|name| repo.join(name).is_file())
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
     if manifests.is_empty() {
         return None;
     }
@@ -1859,11 +1920,249 @@ fn run_reset<W: Write>(args: &ResetArgs, writer: &mut W) -> SetupResult<i32> {
     Ok(0)
 }
 
+/// Guided first-run wizard: walks a brand-new operator through scaffolding
+/// `~/.zirv`, choosing which harnesses are enabled and which is the default,
+/// picking a chat model and memory settings, optionally scaffolding a local
+/// `.zirv` for the current project, and optionally installing harness hooks
+/// (asked in that order -- see `apply_first_run_answers`'s doc for why the
+/// local-`.zirv` question must be settled before hook install runs).
+/// Triggered automatically by `main.rs` on a bare `zirv`/`zirv chat` the
+/// first time `first_run_needed` is true, and re-runnable on demand from
+/// `run_guided`'s own menu (`zirv setup`).
+///
+/// Every write targets the HOME layer only (`home_dir()`), never `repo`: most
+/// of the keys touched here are `REPO_FORBIDDEN` (see `ctx::config`'s own
+/// module doc), and a repo layer may only narrow what an operator already
+/// configured, never set it in the first place. The interactive body itself
+/// is split into `collect_first_run_answers` (prompts only, no writes) and
+/// `apply_first_run_answers` (writes only, no prompts) precisely so an abort
+/// partway through the former can never leave a half-written config behind
+/// -- every actual mutation goes through an already tested, non-interactive
+/// setter (`set_home_ctx_toml_bool`, `set_home_ctx_toml_string`,
+/// `settings::set_operator_agent_enabled`, `apply_memory_harvest_decision`,
+/// `run_apply`, `install_claude_integration`/`install_codex_integration`,
+/// `init::scaffold_local_zirv`), so the only untested part is the prompt
+/// wiring itself, which cannot be automated.
+pub fn run_first_run() -> SetupResult<i32> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(INTERACTIVE_TERMINAL_REQUIRED.into());
+    }
+    let home = home_dir()?;
+    // `zirv setup`'s guided menu can reach this after zirv is already
+    // configured (re-running on demand); the greeting should say so rather
+    // than always claiming a first run.
+    if first_run_needed(&home.join(crate::utils::SCRIPT_DIR_NAME)) {
+        println!("zirv has not been configured yet -- let's set up ~/.zirv.");
+    } else {
+        println!("Re-running zirv's guided setup.");
+    }
+
+    super::init::scaffold_global_zirv()?;
+    let answers = collect_first_run_answers()?;
+    apply_first_run_answers(&answers, &home)?;
+
+    println!(
+        "zirv setup complete; run `zirv setup status` to review, `zirv setup` to change it later."
+    );
+    Ok(0)
+}
+
+/// Every answer the operator gives during the first-run wizard, gathered
+/// before anything is written to disk (see `run_first_run`'s doc for why).
+struct FirstRunAnswers {
+    /// One `(name, enabled)` pair per `ctx::adapters::ADAPTERS` entry, in
+    /// that order.
+    harness_enabled: Vec<(&'static str, bool)>,
+    /// `None` when no harness was enabled (nothing to pick a default from).
+    default_agent: Option<&'static str>,
+    /// `None` means "use the harness default" -- nothing to write.
+    chat_model: Option<String>,
+    memory_enabled: bool,
+    memory_harvest: bool,
+    /// Whether to scaffold a local `.zirv` here. The *sole* decider of that
+    /// outcome -- see `apply_first_run_answers`'s doc for why `install_hooks`
+    /// must never also create one as an unrequested side effect.
+    create_local_zirv: bool,
+    install_hooks: bool,
+}
+
+/// Prompts only: no config file, `.settings.toml`, or project directory is
+/// touched anywhere in this function. An abort at any `?` -- Ctrl-C, any
+/// other `dialoguer` error -- returns before a single byte is written, so
+/// `first_run_needed` stays true and the wizard simply runs again next time.
+fn collect_first_run_answers() -> SetupResult<FirstRunAnswers> {
+    let mut harness_enabled = Vec::new();
+    let mut enabled_names = Vec::new();
+    for (name, _ctor) in ctx::adapters::ADAPTERS {
+        let detected = executable_exists(name);
+        println!(
+            "{name}: {}",
+            if detected {
+                "detected on PATH"
+            } else {
+                "not detected on PATH"
+            }
+        );
+        let enable = dialoguer::Confirm::new()
+            .with_prompt(format!("Enable the {name} harness?"))
+            .default(detected)
+            .interact()?;
+        harness_enabled.push((*name, enable));
+        if enable {
+            enabled_names.push(*name);
+        }
+    }
+
+    let default_agent = if enabled_names.is_empty() {
+        println!(
+            "warning: no harness enabled -- `zirv chat`/`zirv agent` will have nothing to \
+             launch until one is (revisit any time with `zirv setup`)."
+        );
+        None
+    } else {
+        let choice = dialoguer::Select::new()
+            .with_prompt("Default agent for `zirv chat` / `zirv agent`")
+            .items(&enabled_names)
+            .default(0)
+            .interact()?;
+        // `Select::interact` only ever returns an index into the items it
+        // was given, but `.get` keeps this free of even a theoretical panic
+        // (release is `panic = "abort"`) at no real cost.
+        enabled_names.get(choice).copied()
+    };
+
+    let model_choice = dialoguer::Select::new()
+        .with_prompt("Chat model")
+        .items(["Use the harness default", "Enter a model name"])
+        .default(0)
+        .interact()?;
+    let chat_model = if model_choice == 1 {
+        let model: String = dialoguer::Input::new()
+            .with_prompt("Model name")
+            .allow_empty(true)
+            .interact_text()?;
+        let model = model.trim();
+        (!model.is_empty()).then(|| model.to_string())
+    } else {
+        None
+    };
+
+    let memory_enabled = dialoguer::Confirm::new()
+        .with_prompt("Enable zirv's memory bank?")
+        .default(true)
+        .interact()?;
+    let memory_harvest = dialoguer::Confirm::new()
+        .with_prompt("Enable automatic memory harvest?")
+        .default(false)
+        .interact()?;
+
+    // Asked here, before hook installation, and the only place that decides
+    // it -- see `apply_first_run_answers`'s doc comment.
+    let cwd = std::env::current_dir()?;
+    let create_local_zirv =
+        if !cwd.join(crate::utils::SCRIPT_DIR_NAME).is_dir() && looks_like_project_dir(&cwd) {
+            dialoguer::Confirm::new()
+                .with_prompt("Create a local .zirv directory here too?")
+                .default(false)
+                .interact()?
+        } else {
+            false
+        };
+
+    let install_hooks = dialoguer::Confirm::new()
+        .with_prompt("Install harness hook integration now?")
+        .default(true)
+        .interact()?;
+
+    Ok(FirstRunAnswers {
+        harness_enabled,
+        default_agent,
+        chat_model,
+        memory_enabled,
+        memory_harvest,
+        create_local_zirv,
+        install_hooks,
+    })
+}
+
+/// Persists every answer `collect_first_run_answers` gathered and performs
+/// the side-effecting steps it asked about. Called only once that full
+/// interactive body has already succeeded.
+///
+/// `create_local_zirv` is applied *before* `install_hooks` on purpose:
+/// `run_apply` unconditionally creates `<repo>/.zirv` (and, once it exists,
+/// also migrates context and initializes shared memory into it) as a side
+/// effect of installing hooks -- which would otherwise silently create a
+/// project layer the operator was never asked about, and change what a
+/// later bare `zirv` in this same directory does (`zirv_dir_present`'s own
+/// doc explains why that matters). So `run_apply`'s repo-scoped work only
+/// runs when a local `.zirv` genuinely exists (pre-existing, or just
+/// scaffolded above); otherwise hook install falls back to the two
+/// functions the brief names directly
+/// (`install_claude_integration`/`install_codex_integration`), which are
+/// already home-scoped and carry no such side effect.
+fn apply_first_run_answers(answers: &FirstRunAnswers, home: &Path) -> SetupResult<()> {
+    for (name, enabled) in &answers.harness_enabled {
+        crate::settings::set_operator_agent_enabled(home, name, *enabled)?;
+    }
+    if let Some(agent) = answers.default_agent {
+        set_home_ctx_toml_string(home, None, "agent", agent)?;
+    }
+    if let Some(model) = &answers.chat_model {
+        set_home_ctx_toml_string(home, Some("chat"), "model", model)?;
+    }
+    set_home_ctx_toml_bool(home, "memory", "enabled", answers.memory_enabled)?;
+    // `apply_memory_harvest_decision` only ever writes `harvest = true` on
+    // accept; by design (see its own doc comment) it never writes `false`
+    // on a decline, so it cannot be trusted alone to record *this* answer --
+    // an operator who somehow already had `harvest = true` and declines here
+    // would keep it. Write the plain bool first, then call the existing
+    // issue-#87 helper purely for its `setup.memory_harvest_offered` side
+    // effect, which is what stops `run_apply`'s own
+    // `maybe_offer_memory_harvest` below from asking the same question a
+    // second time in the same run.
+    set_home_ctx_toml_bool(home, "memory", "harvest", answers.memory_harvest)?;
+    apply_memory_harvest_decision(home, answers.memory_harvest)?;
+
+    let cwd = std::env::current_dir()?;
+    if answers.create_local_zirv {
+        super::init::scaffold_local_zirv(&cwd)?;
+    }
+
+    if answers.install_hooks {
+        if cwd.join(crate::utils::SCRIPT_DIR_NAME).is_dir() {
+            run_apply(
+                &ApplyArgs {
+                    repo: cwd,
+                    dry_run: false,
+                    no_context: false,
+                    no_memory: false,
+                    no_claude_hooks: false,
+                    no_codex_hooks: false,
+                    memory_source: None,
+                },
+                &mut std::io::stdout(),
+            )?;
+        } else {
+            let (hooks, statusline) = install_claude_integration(home, false)?;
+            println!(
+                "Claude: {hooks} hook(s) added, statusline {}",
+                if statusline {
+                    "configured"
+                } else {
+                    "preserved"
+                }
+            );
+            let codex_hooks = install_codex_integration(home, false)?;
+            println!("Codex: {codex_hooks} hook(s) added; review new hooks with `/hooks` in Codex");
+        }
+    }
+    Ok(())
+}
+
 fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(
-            "interactive setup requires a terminal; use `zirv setup apply` in automation".into(),
-        );
+        return Err(INTERACTIVE_TERMINAL_REQUIRED.into());
     }
     let action = dialoguer::Select::new()
         .with_prompt("Zirv AI setup")
@@ -1872,6 +2171,7 @@ fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
             "Show status",
             "Factory reset",
             "Restore a previous configuration",
+            "Run first-run wizard",
             "Cancel",
         ])
         .default(0)
@@ -1931,6 +2231,7 @@ fn run_guided<W: Write>(writer: &mut W) -> SetupResult<i32> {
             )
         }
         3 => run_guided_restore(writer),
+        4 => run_first_run(),
         _ => Ok(0),
     }
 }
@@ -4140,5 +4441,322 @@ mod tests {
             status(repo.path()).expect("status").claude_statusline,
             StatuslineStatus::Absent
         );
+    }
+
+    // -- First-run setup wizard ------------------------------------------
+
+    #[test]
+    fn first_run_needed_is_true_when_neither_config_file_exists() {
+        let home_zirv = tempfile::tempdir().expect("tempdir");
+        assert!(first_run_needed(home_zirv.path()));
+    }
+
+    #[test]
+    fn first_run_needed_is_true_when_the_dir_does_not_exist_at_all() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let missing = parent.path().join(".zirv");
+        assert!(first_run_needed(&missing));
+    }
+
+    #[test]
+    fn first_run_needed_is_false_once_ctx_toml_exists() {
+        let home_zirv = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home_zirv.path().join(ctx::config::CTX_CONFIG_FILE), "").expect("write");
+        assert!(!first_run_needed(home_zirv.path()));
+    }
+
+    #[test]
+    fn first_run_needed_is_false_once_settings_toml_exists() {
+        let home_zirv = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home_zirv.path().join(crate::settings::SETTINGS_FILE), "").expect("write");
+        assert!(!first_run_needed(home_zirv.path()));
+    }
+
+    /// A `~/.zirv` that only holds shortcuts from a plain `zirv init` still
+    /// counts as first-run: neither config file exists yet.
+    #[test]
+    fn a_zirv_dir_with_only_shortcuts_still_counts_as_first_run() {
+        let home_zirv = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home_zirv.path().join(".shortcuts.yaml"), "shortcuts: {}\n").expect("write");
+        assert!(first_run_needed(home_zirv.path()));
+    }
+
+    #[test]
+    fn set_home_ctx_toml_string_writes_a_top_level_key() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        // `agent` is REPO_FORBIDDEN, and the environment sits above every
+        // file in that fold -- a real `ZIRV_CTX_AGENT` inherited from the
+        // process running this test (e.g. this repo's own `zirv ctx`
+        // supervision) would otherwise shadow the value this test just wrote.
+        let _var = VarGuard::set(&[("ZIRV_CTX_AGENT", None)]);
+        set_home_ctx_toml_string(home.path(), None, "agent", "codex").expect("write");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(cfg.agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn set_home_ctx_toml_string_writes_a_nested_table_key() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        // `chat.model` has a documented env override that sits above every
+        // file layer -- see the `ZIRV_CTX_AGENT` guard on the sibling test
+        // above for why this matters in a real process environment.
+        let _var = VarGuard::set(&[("ZIRV_CTX_CHAT_MODEL", None)]);
+        set_home_ctx_toml_string(home.path(), Some("chat"), "model", "opus").expect("write");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(cfg.chat.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn set_home_ctx_toml_string_preserves_other_keys_already_in_the_file() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        // Both `chat.model` and `memory.enabled` have documented env
+        // overrides that sit above every file layer -- same hazard as the
+        // `ZIRV_CTX_AGENT` guard on the earlier tests in this section.
+        let _var = VarGuard::set(&[("ZIRV_CTX_CHAT_MODEL", None), ("ZIRV_CTX_MEMORY", None)]);
+        set_home_ctx_toml_bool(home.path(), "memory", "enabled", false).expect("write bool");
+        set_home_ctx_toml_string(home.path(), Some("chat"), "model", "opus").expect("write string");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(cfg.chat.model.as_deref(), Some("opus"));
+        assert!(
+            !cfg.memory.enabled,
+            "a key written earlier must survive a later, unrelated write"
+        );
+    }
+
+    #[test]
+    fn looks_like_project_dir_detects_common_manifest_markers() {
+        for marker in [
+            ".git",
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "go.mod",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(marker), "").expect("write marker");
+            assert!(
+                looks_like_project_dir(dir.path()),
+                "{marker} should be recognised as a project marker"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_project_dir_is_false_for_an_empty_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!looks_like_project_dir(dir.path()));
+    }
+
+    // -- apply_first_run_answers (choices in, mutations out) -------------
+
+    fn full_answers() -> FirstRunAnswers {
+        FirstRunAnswers {
+            harness_enabled: vec![("claude", true), ("codex", false)],
+            default_agent: Some("claude"),
+            chat_model: Some("opus".to_string()),
+            memory_enabled: true,
+            memory_harvest: true,
+            create_local_zirv: false,
+            install_hooks: false,
+        }
+    }
+
+    /// I2/I4's fix hinges on `apply_first_run_answers` being a plain
+    /// "answers in, mutations out" function with no prompts of its own; this
+    /// pins that every field it can write actually lands, all in the home
+    /// layer.
+    #[test]
+    fn apply_first_run_answers_writes_every_answer_to_the_home_layer() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        let _var = VarGuard::set(&[
+            ("ZIRV_CTX_AGENT", None),
+            ("ZIRV_CTX_CHAT_MODEL", None),
+            ("ZIRV_CTX_MEMORY", None),
+        ]);
+
+        apply_first_run_answers(&full_answers(), home.path()).expect("apply");
+
+        let settings_path = home
+            .path()
+            .join(".zirv")
+            .join(crate::settings::SETTINGS_FILE);
+        let settings: crate::settings::SettingsFile =
+            toml::from_str(&std::fs::read_to_string(&settings_path).expect("read")).expect("parse");
+        assert_eq!(
+            settings.agents.get("claude").and_then(|a| a.enabled),
+            Some(true)
+        );
+        assert_eq!(
+            settings.agents.get("codex").and_then(|a| a.enabled),
+            Some(false)
+        );
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(cfg.agent.as_deref(), Some("claude"));
+        assert_eq!(cfg.chat.model.as_deref(), Some("opus"));
+        assert!(cfg.memory.enabled);
+        assert!(cfg.memory.harvest);
+        assert!(
+            cfg.setup.memory_harvest_offered,
+            "reusing apply_memory_harvest_decision must record the offered flag (I3)"
+        );
+    }
+
+    /// N1: `apply_memory_harvest_decision` alone, by design, only ever
+    /// writes `harvest = true` on accept -- never `false` on decline (see
+    /// its own doc comment) -- so a decline that reuses only that helper
+    /// would silently leave a previously-`true` harvest untouched. Writing
+    /// the plain bool first is what makes a decline actually take effect.
+    #[test]
+    fn apply_first_run_answers_lets_a_decline_actually_turn_off_a_previously_true_harvest() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        let _var = VarGuard::set(&[
+            ("ZIRV_CTX_AGENT", None),
+            ("ZIRV_CTX_CHAT_MODEL", None),
+            ("ZIRV_CTX_MEMORY", None),
+        ]);
+        set_home_ctx_toml_bool(home.path(), "memory", "harvest", true).expect("seed true");
+
+        let answers = FirstRunAnswers {
+            harness_enabled: vec![("claude", false), ("codex", false)],
+            default_agent: None,
+            chat_model: None,
+            memory_enabled: true,
+            memory_harvest: false,
+            create_local_zirv: false,
+            install_hooks: false,
+        };
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert!(
+            !cfg.memory.harvest,
+            "a decline must actually turn off a previously-true harvest"
+        );
+    }
+
+    /// A `None` answer must leave the corresponding key entirely unwritten,
+    /// not written as some placeholder -- `agent`/`chat.model` stay whatever
+    /// they already were (here: absent).
+    #[test]
+    fn apply_first_run_answers_skips_agent_and_chat_model_when_the_answers_are_none() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        let _var = VarGuard::set(&[
+            ("ZIRV_CTX_AGENT", None),
+            ("ZIRV_CTX_CHAT_MODEL", None),
+            ("ZIRV_CTX_MEMORY", None),
+        ]);
+
+        let answers = FirstRunAnswers {
+            harness_enabled: vec![("claude", false), ("codex", false)],
+            default_agent: None,
+            chat_model: None,
+            memory_enabled: false,
+            memory_harvest: false,
+            create_local_zirv: false,
+            install_hooks: false,
+        };
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(cfg.agent, None);
+        assert_eq!(cfg.chat.model, None);
+    }
+
+    /// I2's core regression: installing hooks when the operator declined a
+    /// local `.zirv` must never create one as a side effect. Exercises the
+    /// `install_claude_integration`/`install_codex_integration` fallback
+    /// directly (no local `.zirv` exists), which is home-scoped only.
+    #[test]
+    fn apply_first_run_answers_never_creates_a_local_zirv_as_a_side_effect_of_hook_install() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        // This test asserts on the *default* claude/codex config locations
+        // under `home`; `claude_config_dir`/`codex_config_dir` honour
+        // `$CLAUDE_CONFIG_DIR`/`$CODEX_HOME` when set, which -- on a machine
+        // where either is set in the real environment -- would otherwise
+        // route `install_hooks: true` below into mutating the operator's
+        // actual `settings.json`/`hooks.json` before this test's assertions
+        // even run.
+        let _var = VarGuard::set(&[
+            ("ZIRV_CTX_AGENT", None),
+            ("ZIRV_CTX_CHAT_MODEL", None),
+            ("ZIRV_CTX_MEMORY", None),
+            ("CLAUDE_CONFIG_DIR", None),
+            ("CODEX_HOME", None),
+        ]);
+
+        let answers = FirstRunAnswers {
+            harness_enabled: vec![("claude", true), ("codex", true)],
+            default_agent: Some("claude"),
+            chat_model: None,
+            memory_enabled: true,
+            memory_harvest: false,
+            create_local_zirv: false,
+            install_hooks: true,
+        };
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        assert!(
+            !cwd.path().join(".zirv").exists(),
+            "declining the local-.zirv question must hold even when hooks are installed"
+        );
+        assert!(
+            home.path().join(".claude/settings.json").is_file(),
+            "hook install must still have run, home-scoped, via the fallback path"
+        );
+    }
+
+    /// The positive counterpart: when the operator *does* ask for a local
+    /// `.zirv` (step 6), it is created regardless of the hook-install
+    /// answer -- `create_local_zirv` is the sole decider (I2).
+    #[test]
+    fn apply_first_run_answers_creates_a_local_zirv_when_the_answer_says_so() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        let _var = VarGuard::set(&[
+            ("ZIRV_CTX_AGENT", None),
+            ("ZIRV_CTX_CHAT_MODEL", None),
+            ("ZIRV_CTX_MEMORY", None),
+        ]);
+
+        let answers = FirstRunAnswers {
+            harness_enabled: vec![("claude", false), ("codex", false)],
+            default_agent: None,
+            chat_model: None,
+            memory_enabled: true,
+            memory_harvest: false,
+            create_local_zirv: true,
+            install_hooks: false,
+        };
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        assert!(cwd.path().join(".zirv").is_dir());
     }
 }

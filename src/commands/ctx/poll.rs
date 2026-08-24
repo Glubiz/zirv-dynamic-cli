@@ -220,7 +220,7 @@ fn anthropic_token(chrome_events_enabled: bool) -> Option<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        return anthropic_token_from_keychain(chrome_events_enabled);
+        anthropic_token_from_keychain(chrome_events_enabled)
     }
     #[cfg(not(target_os = "macos"))]
     {

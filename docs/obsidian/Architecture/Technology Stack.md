@@ -1,12 +1,12 @@
 ---
-last-verified: 2026-08-20
+last-verified: 2026-08-24
 ---
 
 # Technology Stack
 
 ## Quick Reference
 
-- Crate `zirv`, version 2.14.0, Rust edition 2024.
+- Crate `zirv`, version 2.25.0, Rust edition 2024.
 - Async runtime is `tokio` (multi-thread), used for process spawning throughout `script_runner/` and the `ctx` supervisors.
 - Release profile is tuned for a small, fast-starting CLI binary and sets `panic = "abort"` — see the Gotcha below.
 - **If changed:** update this page whenever a dependency is added, removed, or re-pinned in `Cargo.toml`. If the release profile changes (especially `panic`), also check [[Ctx Supervisors]] and [[Architecture Overview]] for correctness of any assumption built on it.
@@ -17,7 +17,7 @@ last-verified: 2026-08-20
 | Field | Value |
 |---|---|
 | name | `zirv` |
-| version | `2.14.0` |
+| version | `2.25.0` |
 | edition | `2024` |
 | license | MIT |
 | repository | https://github.com/Glubiz/zirv |
