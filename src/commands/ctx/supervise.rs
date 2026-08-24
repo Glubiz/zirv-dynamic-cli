@@ -19,6 +19,16 @@ pub enum Outcome {
     StoppedByTick(&'static str),
 }
 
+/// Budget for `OutputTap::drain_to_eof`'s one legitimate blocking read, at
+/// `exec.rs`'s and `run_loop.rs`'s "final drain" call sites right after
+/// `supervise_child` returns `Outcome::Exited`. Scheduling headroom, not a
+/// work-completion wait: both `forward` reader threads normally disconnect
+/// within a scheduling quantum of the child's own exit, so this is paid in
+/// full only in the pathological case where they do not, and is otherwise a
+/// negligible, one-time cost per session cycle -- nowhere near a delay an
+/// operator would notice on a hot path measured in whole agent turns.
+pub const FINAL_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
 #[cfg(test)]
 pub fn spawn(mut command: Command) -> CtxResult<Child> {
     Ok(command
@@ -635,6 +645,46 @@ impl OutputTap {
         }
         lines
     }
+
+    /// Drains everything already queued, then blocks -- but only as long as
+    /// it actually takes -- for `forward`'s reader thread(s) to either
+    /// deliver more lines or disconnect (stdout's and stderr's threads both
+    /// finished, i.e. real EOF), whichever comes first, up to `budget`.
+    ///
+    /// `try_lines` alone is a pure, instantaneous, non-blocking drain with
+    /// no synchronization against those threads: a child that prints its
+    /// last line and exits immediately can still have that line in flight
+    /// -- the reader thread not yet scheduled to read it out of the pipe --
+    /// at the exact instant `child.wait()`/`try_wait()` observes the OS-level
+    /// exit, independently of this process's own thread scheduling. This is
+    /// the seam the "final drain" right after `supervise_child` returns
+    /// (`exec.rs`, `run_loop.rs`) needs, and `try_lines` alone does not
+    /// provide despite each call site's own comment claiming to close the
+    /// race: it is exactly as non-blocking as every other call to
+    /// `try_lines`, so it can lose the same race it was written to close.
+    ///
+    /// Bounded so a child that genuinely has nothing further to say is
+    /// never held up by more than `budget` -- and in practice far less,
+    /// since both reader threads normally disconnect within a scheduling
+    /// quantum of the child's own exit, at which point `recv_timeout`
+    /// returns immediately rather than waiting out the rest of the budget.
+    pub fn drain_to_eof(&self, budget: Duration) -> Vec<String> {
+        let mut lines = self.try_lines();
+        let deadline = Instant::now() + budget;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return lines;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(line) => lines.push(line),
+                // Disconnected (both forward threads finished; nothing more
+                // will ever arrive) or genuinely timed out -- either way,
+                // this is everything drain_to_eof is ever going to get.
+                Err(_) => return lines,
+            }
+        }
+    }
 }
 
 /// FIX 2a: refuse a launch that would let a downstream argv element be
@@ -1123,6 +1173,133 @@ mod tests {
         // Drain whatever arrived; a silent child must not block or panic.
         let _ = tap.try_lines();
         assert!(tap.try_lines().is_empty());
+    }
+
+    /// End-to-end version of `drain_to_eof_waits_for_a_line_that_is_still_in_
+    /// flight`, against a *real* spawned child and `spawn_tapped`'s own
+    /// reader threads rather than a hand-built channel -- printing its one
+    /// line and exiting in the same breath, exactly `fake-codex-agent.sh`'s
+    /// own "limit" mode. `child.wait()` (blocking, real exit observed) races
+    /// the reader thread for real here; looped so a single lucky scheduling
+    /// slice cannot hide a regression.
+    #[test]
+    fn drain_to_eof_catches_a_real_childs_last_line_even_though_it_already_exited() {
+        for _ in 0..20 {
+            let (mut child, tap, _guard) =
+                spawn_tapped(sh("printf 'limit hit\\n'; exit 1"), None).expect("spawn");
+            let status = child.wait().expect("wait");
+            assert_eq!(status.code(), Some(1));
+            let lines = tap.drain_to_eof(FINAL_DRAIN_BUDGET);
+            assert!(
+                lines.iter().any(|l| l.contains("limit hit")),
+                "the child's last line must survive `child.wait()` already having observed the \
+                 exit: got {lines:?}"
+            );
+        }
+    }
+
+    /// The race this whole family of tests exists to pin: `try_lines` is a
+    /// pure, instantaneous, non-blocking drain (`while let Ok(_) =
+    /// rx.try_recv()`), with no synchronization against `forward`'s reader
+    /// thread having actually reached EOF. A line that is genuinely on its
+    /// way -- the sender is about to send it, a beat from now -- is
+    /// invisible to `try_lines` called before that beat elapses. This is
+    /// exactly the mechanism a child that prints its last line and exits
+    /// immediately hits against `child.wait()`: `try_wait`/`wait` observe
+    /// the OS-level exit independently of whether this process's own reader
+    /// thread has been scheduled yet to drain the pipe. Built with a plain
+    /// channel rather than a real spawned child so the delay is exact and
+    /// deterministic instead of racing real thread-scheduling luck -- this
+    /// is the seam `exec.rs`'s and `run_loop.rs`'s own "final drain" calls
+    /// (right after `supervise_child` returns) sit on top of.
+    #[test]
+    fn try_lines_can_miss_a_line_that_has_not_arrived_yet() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let tap = OutputTap { rx };
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let _ = tx.send("You've hit your session limit".to_string());
+        });
+
+        assert!(
+            tap.try_lines().is_empty(),
+            "the line has not been sent yet -- try_lines must not block waiting for it"
+        );
+    }
+
+    /// The fix: `drain_to_eof` blocks only as long as it actually takes for
+    /// the tap's sender(s) to either deliver more lines or disconnect (both
+    /// `forward` reader threads finished), not the full `budget` -- so a
+    /// line that arrives a beat late, exactly the race above, is still
+    /// caught, and a child with nothing further to say is not delayed by
+    /// more than it takes the threads to notice EOF and exit.
+    #[test]
+    fn drain_to_eof_waits_for_a_line_that_is_still_in_flight() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let tap = OutputTap { rx };
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let _ = tx.send("You've hit your session limit".to_string());
+            // Dropping `tx` here (end of closure) is what lets a caller
+            // with nothing further to wait for return early instead of
+            // paying the rest of the budget.
+        });
+
+        let started = Instant::now();
+        let lines = tap.drain_to_eof(Duration::from_millis(500));
+        assert_eq!(lines, vec!["You've hit your session limit".to_string()]);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "must return as soon as the sender disconnects, not wait out the full budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The common case -- a child that had nothing more to say -- must not
+    /// pay anything close to the full budget: both reader threads finish
+    /// and drop their sender almost immediately once the child's pipes hit
+    /// EOF, and `drain_to_eof` must notice that disconnect and return, not
+    /// wait the budget out on principle.
+    #[test]
+    fn drain_to_eof_returns_promptly_once_the_sender_disconnects_with_nothing_sent() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let tap = OutputTap { rx };
+        drop(tx);
+
+        let started = Instant::now();
+        let lines = tap.drain_to_eof(Duration::from_secs(5));
+        assert!(lines.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "an already-disconnected tap must return near-instantly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Safety bound: this is still the hot supervision path, so a sender
+    /// that (pathologically) never sends and never disconnects must not
+    /// hang `drain_to_eof` forever -- it returns once `budget` elapses,
+    /// with whatever it collected (nothing, here).
+    #[test]
+    fn drain_to_eof_is_bounded_when_the_sender_never_disconnects() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let tap = OutputTap { rx };
+        // Kept alive for the whole test so the receiver can never observe a
+        // disconnect -- the one condition that must not hang this call.
+        let _keep_alive = tx;
+
+        let started = Instant::now();
+        let lines = tap.drain_to_eof(Duration::from_millis(100));
+        assert!(lines.is_empty());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "must actually wait out the budget, not give up early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not overrun the budget by much: {elapsed:?}"
+        );
     }
 
     /// FIX B: a `Some(stdin_text)` is written to the child's stdin and then
