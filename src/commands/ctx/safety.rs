@@ -503,6 +503,336 @@ fn normalize_segments(command: &str) -> Vec<String> {
     candidates
 }
 
+// ---------------------------------------------------------------------
+// SQL statement classifier (2026-08-24, cross-harness permissions design)
+// ---------------------------------------------------------------------
+//
+// Read-only SQL through a database CLI is ordinary read-only work and must
+// not prompt; a write through the same CLI should. Neither question can be
+// answered by `glob_match` over a command string, because the interesting
+// part is inside a quoted argument -- `psql -c '...'` is one opaque token to
+// every other matcher in this module.
+//
+// Explicitly NOT a SQL parser, exactly as `Modules/Command Safety.md` already
+// says of the command splitter: this raises the bar, it is not the only
+// defense, and it is not obfuscation-proof. The asymmetry is deliberate --
+// every uncertainty (an unbalanced quote, an unclosed comment, a statement
+// that is not on argv at all, two statements, a keyword it does not know)
+// resolves to `Ask`. The worst outcome is an unnecessary prompt; an
+// unprompted write is not reachable from here.
+//
+// Pure, like the rest of this module: no clock, no filesystem, no
+// environment.
+
+/// The database command-line clients this classifier recognizes, each paired
+/// with the flags that carry an inline statement on it. An empty flag list
+/// means the statement is a positional argument after the database name
+/// (`sqlite3 app.db "SELECT 1"`).
+const SQL_CLIS: &[(&str, &[&str])] = &[
+    ("psql", &["-c", "--command"]),
+    ("mysql", &["-e", "--execute"]),
+    ("mariadb", &["-e", "--execute"]),
+    ("sqlite3", &[]),
+    ("duckdb", &["-c", "--command"]),
+    ("sqlcmd", &["-Q", "-q"]),
+];
+
+/// Flags whose value is a path to a script this classifier cannot read.
+const SQL_FILE_FLAGS: &[&str] = &["-f", "--file", "-i", "--init"];
+
+/// What a recognized DB-client invocation turned out to carry.
+enum SqlInvocation {
+    /// Exactly one inline statement, visible on argv.
+    Statement(String),
+    /// A recognized client whose statement this function cannot see at all:
+    /// read from stdin, read from a script file, typed into an interactive
+    /// shell, split across two flags, or hidden behind an unbalanced quote.
+    Opaque,
+}
+
+/// Splits `command` into shell-ish tokens, honoring one level of `'`/`"`
+/// quoting so a statement containing spaces stays a single token. `None` when
+/// a quote is left open -- the caller must then treat the invocation as
+/// [`SqlInvocation::Opaque`], because it cannot see where the statement ends.
+///
+/// Not a shell parser (no escapes, no variable expansion, no nesting), the
+/// same declared scope `split_segments`/`strip_quotes` above already hold to.
+fn sql_tokens(command: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                started = true;
+            }
+            None if c.is_whitespace() => {
+                if started {
+                    // Windows commonly exposes an unquoted executable path
+                    // below `C:\Program Files`. While that is not valid
+                    // shell quoting in general, the CLI corpus deliberately
+                    // requires the recognizable `.exe` basename to survive
+                    // it. Keep only the FIRST drive-qualified token open
+                    // until its executable suffix; SQL statement arguments
+                    // are unaffected.
+                    let lower = current.to_ascii_lowercase();
+                    let drive_path_without_executable_suffix = tokens.is_empty()
+                        && current.as_bytes().get(1) == Some(&b':')
+                        && matches!(current.as_bytes().get(2), Some(b'\\' | b'/'))
+                        && ![".exe", ".cmd", ".bat"]
+                            .iter()
+                            .any(|suffix| lower.ends_with(suffix));
+                    if drive_path_without_executable_suffix {
+                        current.push(' ');
+                    } else {
+                        tokens.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+            }
+            None => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        tokens.push(current);
+    }
+    Some(tokens)
+}
+
+/// The bare, lowercased program name for `first_token`, with any Windows
+/// executable extension removed.
+fn sql_program_name(first_token: &str) -> String {
+    let bare = first_token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(first_token);
+    let lowered = bare.to_ascii_lowercase();
+    lowered
+        .trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".bat")
+        .to_string()
+}
+
+/// Classifies `command` as a DB-client invocation. `None` means it is not one
+/// at all, which is how [`sql_outcome`] stays silent about every command that
+/// has nothing to do with SQL.
+fn sql_invocation(command: &str) -> Option<SqlInvocation> {
+    let bare = collapse_whitespace(command);
+    let Some(tokens) = sql_tokens(&bare) else {
+        // An unbalanced quote. If the program still names a client, this is a
+        // recognized invocation whose statement cannot be read -- opaque, not
+        // "not a DB command".
+        let program = sql_program_name(bare.split(' ').next().unwrap_or(""));
+        return SQL_CLIS
+            .iter()
+            .any(|(name, _)| *name == program)
+            .then_some(SqlInvocation::Opaque);
+    };
+    let program = sql_program_name(tokens.first()?);
+    let (_, flags) = SQL_CLIS.iter().find(|(name, _)| *name == program)?;
+
+    let mut statements: Vec<String> = Vec::new();
+    let mut positionals = 0usize;
+    let mut i = 1;
+    while i < tokens.len() {
+        let token = tokens[i].clone();
+        if SQL_FILE_FLAGS
+            .iter()
+            .any(|f| token == *f || token.starts_with(&format!("{f}=")))
+        {
+            return Some(SqlInvocation::Opaque);
+        }
+        if let Some(inline) = flags
+            .iter()
+            .find_map(|f| token.strip_prefix(&format!("{f}=")))
+        {
+            statements.push(inline.to_string());
+            i += 1;
+            continue;
+        }
+        if flags.iter().any(|f| token == *f) {
+            match tokens.get(i + 1) {
+                Some(statement) => statements.push(statement.clone()),
+                // A trailing `-c` with nothing after it: unreadable.
+                None => return Some(SqlInvocation::Opaque),
+            }
+            i += 2;
+            continue;
+        }
+        if !token.starts_with('-') {
+            positionals += 1;
+            // `sqlite3 <db> <statement>`: only a client with no
+            // inline-statement flag of its own takes its statement
+            // positionally, and only as the SECOND positional (the first is
+            // the database).
+            if flags.is_empty() && positionals == 2 {
+                statements.push(token);
+            }
+        }
+        i += 1;
+    }
+
+    if statements.len() == 1 {
+        Some(SqlInvocation::Statement(statements.remove(0)))
+    } else {
+        // Zero (stdin/interactive) or more than one (chained across flags):
+        // either way, not a single provably read-only statement.
+        Some(SqlInvocation::Opaque)
+    }
+}
+
+/// Removes `--` line comments and `/* ... */` block comments so a comment
+/// cannot hide a write keyword from [`statement_is_read_only`]. `None` when a
+/// block comment is never closed -- unparseable, so the caller falls back to
+/// `Ask`. Each removed comment leaves one space behind, so two tokens it sat
+/// between cannot fuse into one word.
+fn strip_sql_comments(statement: &str) -> Option<String> {
+    let chars: Vec<char> = statement.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            out.push(' ');
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            let mut j = i + 2;
+            loop {
+                if j + 1 >= chars.len() {
+                    return None;
+                }
+                if chars[j] == '*' && chars[j + 1] == '/' {
+                    break;
+                }
+                j += 1;
+            }
+            i = j + 2;
+            out.push(' ');
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Whether `statement` is PROVABLY a single read-only SQL statement.
+///
+/// Four gates, all of which must pass:
+/// 1. Comments strip cleanly (an unclosed block comment fails).
+/// 2. Exactly one statement: at most one trailing `;`, and no `;` inside what
+///    is left.
+/// 3. It starts with `SELECT`, `EXPLAIN` or `SHOW`. This is what rejects
+///    every CTE outright -- a `WITH` prefix never reaches the read-only
+///    branch, a deliberate SUPERSET of the spec's "no CTE that wraps a
+///    write": proving which CTEs are harmless needs a real parser, and an
+///    unnecessary prompt on a read-only CTE is the acceptable side of that
+///    trade.
+/// 4. No write/exfiltration keyword appears as a whole word anywhere in it.
+///    Word-splitting is on non-alphanumeric-and-not-underscore, so a column
+///    called `system_tables` or `into_bucket` is one word and does not trip
+///    the `system`/`into` entries.
+///
+/// Every failure is a `false`, i.e. `Ask`. False positives (a read-only
+/// statement carrying one of these words in a string literal) cost a prompt;
+/// there is no input for which a write returns `true` short of a keyword this
+/// list does not name -- which is exactly why the shipped deny/ask sets and
+/// the harness's own permission system remain the other layers of defense.
+fn statement_is_read_only(statement: &str) -> bool {
+    const READ_ONLY_VERBS: &[&str] = &["select", "explain", "show"];
+    const WRITE_WORDS: &[&str] = &[
+        "insert",
+        "update",
+        "delete",
+        "drop",
+        "create",
+        "alter",
+        "truncate",
+        "grant",
+        "revoke",
+        "merge",
+        "replace",
+        "call",
+        "copy",
+        "vacuum",
+        "attach",
+        "detach",
+        "pragma",
+        "with",
+        "into",
+        "outfile",
+        "dumpfile",
+        "load_extension",
+        "lo_import",
+        "lo_export",
+        "pg_read_file",
+        "pg_write_file",
+        "system",
+    ];
+
+    let Some(stripped) = strip_sql_comments(statement) else {
+        return false;
+    };
+    let trimmed = stripped.trim();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+    if trimmed.is_empty() || trimmed.contains(';') {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if !READ_ONLY_VERBS
+        .iter()
+        .any(|verb| lower == *verb || lower.starts_with(&format!("{verb} ")))
+    {
+        return false;
+    }
+    !lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| WRITE_WORDS.contains(&word))
+}
+
+/// The SQL classifier's own opinion about `command`: `Some(Allow)` when the
+/// entire input is provably one read-only statement through a recognized
+/// client, `Some(Ask)` for a recognized client in any other shape, and `None`
+/// when `command` names no recognized client at all -- in which case
+/// [`evaluate`]'s ordinary rule matching (and its launch-mode default) is the
+/// whole answer.
+///
+/// Pure: no clock, filesystem or environment, the same discipline `evaluate`
+/// and `glob_match` hold to.
+pub fn sql_outcome(command: &str) -> Option<Outcome> {
+    let (verdict, pattern) = match sql_invocation(command)? {
+        SqlInvocation::Statement(statement) if statement_is_read_only(&statement) => (
+            Verdict::Allow,
+            "<sql: a single provably read-only statement>",
+        ),
+        _ => (
+            Verdict::Ask,
+            "<sql: not provably a single read-only statement>",
+        ),
+    };
+    Some(Outcome {
+        verdict,
+        matched: Some(Rule {
+            pattern: pattern.to_string(),
+            origin: Origin::BuiltIn,
+        }),
+    })
+}
+
 /// A minimal glob matcher: `*` matches any run of characters (including
 /// none), every other character matches itself literally, case-sensitively
 /// (shell commands are case-sensitive). No `?`, no character classes -- the
@@ -1320,6 +1650,133 @@ mod tests {
         assert_eq!(
             evaluate(&policy, "cargo test", LaunchMode::Headless).verdict,
             Verdict::Allow
+        );
+    }
+
+    // -- SQL classifier (2026-08-24, cross-harness permissions) -----------
+
+    /// Read-only SQL through a recognized client is ordinary read-only work
+    /// and must never prompt -- the primary acceptance criterion applied to
+    /// the one command family a glob matcher cannot classify, because the
+    /// interesting part is inside a quoted argument.
+    #[test]
+    fn sql_outcome_allows_a_single_provably_read_only_statement() {
+        for command in [
+            "psql -c \"SELECT id FROM users LIMIT 10\"",
+            "psql --command='SELECT 1'",
+            "psql -d mydb -c 'select count(*) from orders'",
+            "mysql -e \"SHOW TABLES\"",
+            "mariadb --execute='EXPLAIN SELECT * FROM t'",
+            "sqlite3 app.db \"SELECT name FROM sqlite_master\"",
+            "duckdb -c 'SELECT 42'",
+            "sqlcmd -Q \"SELECT TOP 5 * FROM dbo.Users\"",
+            "psql -c 'SELECT 1;'",
+            "psql -c 'SELECT 1 -- trailing comment'",
+        ] {
+            let outcome = sql_outcome(command).expect("a recognized DB client");
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "{command} should be allowed, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    /// The adversarial corpus the spec's Testing section requires. Every one
+    /// of these must classify ask: the worst case is an unnecessary prompt,
+    /// never an unprompted write.
+    #[test]
+    fn sql_outcome_asks_on_the_whole_adversarial_corpus() {
+        for command in [
+            // CTE-wrapped write.
+            "psql -c \"WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x\"",
+            // A CTE at all -- rejected as a deliberate superset.
+            "psql -c 'WITH x AS (SELECT 1) SELECT * FROM x'",
+            // `;`-chained.
+            "psql -c 'SELECT 1; DROP TABLE users'",
+            "mysql -e \"SELECT 1;DELETE FROM t\"",
+            // SELECT ... INTO.
+            "psql -c 'SELECT * INTO backup FROM users'",
+            "mysql -e \"SELECT * INTO OUTFILE '/tmp/x' FROM t\"",
+            // Comment tricks.
+            "psql -c 'SELECT 1 /* still */ ; DROP TABLE t'",
+            "psql -c 'SELECT 1 /* never closed'",
+            // Outright writes.
+            "psql -c 'DROP TABLE users'",
+            "psql -c 'UPDATE users SET admin = true'",
+            "sqlite3 app.db 'DELETE FROM users'",
+            // stdin-fed / script-fed / interactive: not on argv at all.
+            "psql",
+            "psql -d mydb",
+            "psql -f migrate.sql",
+            "sqlite3 app.db",
+            // Two statements on one command line.
+            "psql -c 'SELECT 1' -c 'DROP TABLE t'",
+            // Unbalanced quoting: the statement cannot be seen.
+            "psql -c \"SELECT 1",
+            // A flag with nothing after it.
+            "psql -c",
+        ] {
+            let outcome = sql_outcome(command).expect("a recognized DB client");
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Ask,
+                "{command} should ask, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    /// Anything that is not a recognized DB client is not this classifier's
+    /// business: it must say nothing, so the ordinary rule matching (and the
+    /// interactive default) is the whole answer.
+    #[test]
+    fn sql_outcome_is_silent_on_non_database_commands() {
+        for command in ["cargo test", "git status", "echo SELECT 1", "rm -rf /"] {
+            assert!(
+                sql_outcome(command).is_none(),
+                "{command} is not a DB client invocation"
+            );
+        }
+    }
+
+    /// The program-path and case normalization the rest of this module
+    /// already applies must reach the classifier too, or `/usr/bin/psql` and
+    /// `psql.exe` would silently escape it.
+    #[test]
+    fn sql_outcome_normalizes_the_program_path_and_windows_extension() {
+        for command in [
+            "/usr/bin/psql -c 'SELECT 1'",
+            "C:\\Program Files\\psql.exe -c 'SELECT 1'",
+            "PSQL -c 'SELECT 1'",
+        ] {
+            let outcome = sql_outcome(command).expect("a recognized DB client");
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "got {outcome:?} for {command}"
+            );
+        }
+    }
+
+    /// The matched rule has to be nameable, so `zirv ctx safety explain` can
+    /// say WHY without inventing a pattern the operator could go look for.
+    #[test]
+    fn sql_outcome_reports_a_built_in_origin_and_a_readable_pattern() {
+        let allowed = sql_outcome("psql -c 'SELECT 1'").expect("recognized");
+        let rule = allowed.matched.expect("a matched rule");
+        assert_eq!(rule.origin, Origin::BuiltIn);
+        assert!(rule.pattern.starts_with("<sql:"), "got {}", rule.pattern);
+
+        let asked = sql_outcome("psql -c 'DROP TABLE t'").expect("recognized");
+        assert!(
+            asked
+                .matched
+                .expect("a matched rule")
+                .pattern
+                .contains("not provably"),
+            "the ask reason must say what it could not prove"
         );
     }
 
