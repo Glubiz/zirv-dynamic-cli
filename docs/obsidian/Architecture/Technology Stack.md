@@ -6,9 +6,10 @@ last-verified: 2026-08-24
 
 ## Quick Reference
 
-- Crate `zirv`, version 2.25.0, Rust edition 2024.
+- Crate `zirv`, version 2.25.1, Rust edition 2024.
 - Async runtime is `tokio` (multi-thread), used for process spawning throughout `script_runner/` and the `ctx` supervisors.
 - Release profile is tuned for a small, fast-starting CLI binary and sets `panic = "abort"` — see the Gotcha below.
+- Local/CI test runner is `cargo-nextest` (pinned 0.9.143), replacing serial `cargo test -- --test-threads=1` as the primary loop — see "Test runner" below.
 - **If changed:** update this page whenever a dependency is added, removed, or re-pinned in `Cargo.toml`. If the release profile changes (especially `panic`), also check [[Ctx Supervisors]] and [[Architecture Overview]] for correctness of any assumption built on it.
 - **Gotchas:** `panic = "abort"` means no unwind-time `Drop` runs on panic. `wrap`'s PTY/raw-mode supervision code (see [[Ctx Supervisors]]) has to restore terminal state in explicit error arms rather than relying on `Drop`, and avoids `unwrap`/`expect` on its hot path for this reason.
 
@@ -17,7 +18,7 @@ last-verified: 2026-08-24
 | Field | Value |
 |---|---|
 | name | `zirv` |
-| version | `2.25.0` |
+| version | `2.25.1` |
 | edition | `2024` |
 | license | MIT |
 | repository | https://github.com/Glubiz/zirv |
@@ -73,3 +74,9 @@ strip            = "symbols"
 ```
 
 Optimized for binary size (`opt-level = "z"`, LTO, single codegen unit, stripped symbols) over compile speed, appropriate for a CLI that is installed once and run many times. `panic = "abort"` means a panic terminates the process immediately without unwinding — no `Drop` cleanup runs on the way out. This is load-bearing for [[Ctx Supervisors]]: `wrap` must restore terminal raw-mode in explicit error-handling arms, not in a `Drop` impl, since a panic would skip that cleanup entirely.
+
+## Test runner
+
+`cargo nextest run --no-fail-fast` (config: `.config/nextest.toml`) is now the primary local and CI test loop, replacing serial `cargo test --verbose -- --test-threads=1` as the default (~11–12 min → ~23–54s on this machine, v2.25.1, PR #113). nextest runs each test in its own process, so the process-wide `env::set_var` races that used to force `--test-threads=1` cannot happen. `--no-fail-fast` is required, not optional: nextest's own default is fail-fast (stop at the first failure), which cannot produce the complete, sorted failure-NAME list a pre-existing-failure baseline has to be diffed against (see this repo's own Windows-baseline methodology). CI installs a pinned `cargo-nextest@0.9.143` via `taiki-e/install-action@v2` (`.github/workflows/ci.yaml`) rather than trusting whatever version a runner image happens to ship. Serial `cargo test -- --test-threads=1` is kept as a compatibility fallback — `.zirv/context/common.md`'s "Build and verify" now lists both as required before claiming done, not either/or.
+
+`.config/nextest.toml` also defines a `test-groups.exec-nudge-restart` group (`max-threads = 1`, `threads-required = "num-test-threads"`) for the family of `exec.rs` tests that drive a real supervised session through a background writer thread polling a bounded budget before nudging it — under CPU contention that poll can lose the race against the fake agent starting. The group claims the whole nextest concurrency pool while any of its members run, so nothing else in the same run contends with them; it cannot exclude contention from other processes on the host. See [[Known Issues]] for the two related fixes this same PR made test-side (`wait_for_lines_or_panic`/`wait_for_live_session_or_panic` panicking instead of silently giving up, and the `fake-codex-agent.sh` capability-probe mode-shift).
