@@ -323,6 +323,19 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Bash(uniq *)", "filter duplicate lines, read-only"),
     ("Bash(tr *)", "translate or delete characters, read-only"),
     ("Bash(cut *)", "extract fields from input, read-only"),
+    // Moved out of SHIPPED_POSTURE_DENY (2026-08-24, primary acceptance
+    // criterion): fetching a URL is everyday dev work -- checking an API,
+    // downloading a fixture -- and denying the tool wholesale is exactly the
+    // over-blocking this round exists to remove. The real danger, a download
+    // piped straight into a shell, is denied on its own below.
+    (
+        "Bash(curl *)",
+        "fetch a URL; piping into a shell is denied below",
+    ),
+    (
+        "Bash(wget *)",
+        "fetch a URL; piping into a shell is denied below",
+    ),
 ];
 
 /// Projects the operator's scratchpad temp directory into the two claude
@@ -398,65 +411,53 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "Read(~/.claude/.credentials.json)",
         "the harness's own stored OAuth credentials",
     ),
-    ("Bash(rm -rf *)", "recursive force-delete"),
+    // Self-destructive (2026-08-24): this session itself runs under zirv, so
+    // killing a zirv process kills the supervisor that would have asked the
+    // question. `evaluate_single` walks the whole deny list before it looks
+    // at ask at all, so these beat the broad `taskkill *`/`rm -rf *` entries
+    // in SHIPPED_POSTURE_ASK with no ordering rule needed.
+    ("Bash(taskkill*zirv*)", "kills the supervising zirv session"),
     (
-        "Bash(rm -fr *)",
-        "recursive force-delete, flag-order variant",
+        "Bash(Stop-Process*zirv*)",
+        "kills the supervising zirv session, PowerShell spelling",
     ),
-    // Git push destructive-argument family (2026-08-23, issue #111):
-    // mid-string wildcards close the argument-reordering bypass the old
-    // flag-anchored patterns had (`git push origin --force` slipped past
-    // `Bash(git push --force *)`). `git push*--force*` also covers
-    // `--force-with-lease`, since that flag's own text contains `--force`
-    // as a substring. The short-flag forms are matched with a leading
-    // space (`" -f"`/`" -d"`) so a branch literally named `feature-fix` or
-    // similar is never mistaken for the flag -- see this constant's own
-    // doc comment.
+    ("Bash(pkill*zirv*)", "kills the supervising zirv session"),
+    ("Bash(killall*zirv*)", "kills the supervising zirv session"),
     (
-        "Bash(git push*--force*)",
-        "force-push (covers --force-with-lease too), any argument position",
+        "Bash(rm -rf*zirv*)",
+        "destroys zirv's own state or operator layer",
     ),
     (
-        "Bash(git push* -f *)",
-        "force-push, short-flag form, followed by more arguments",
+        "Bash(rm -fr*zirv*)",
+        "destroys zirv's own state or operator layer, flag-order variant",
     ),
     (
-        "Bash(git push* -f)",
-        "force-push, short-flag form, as the final argument",
+        "Bash(Remove-Item*zirv*)",
+        "destroys zirv's own state or operator layer, PowerShell spelling",
+    ),
+    // The actual danger `curl`/`wget` were denied wholesale for, now denied
+    // precisely instead: a remote download executed as a shell script. These
+    // are whole-string patterns, matched against the raw command -- which
+    // `evaluate` always checks as its first candidate.
+    (
+        "Bash(* | sh)",
+        "a remote download executed as a shell script",
     ),
     (
-        "Bash(git push*--delete*)",
-        "deletes a remote branch, any argument position",
+        "Bash(* | bash)",
+        "a remote download executed as a shell script",
     ),
     (
-        "Bash(git push* -d *)",
-        "deletes a remote branch, short-flag form, followed by more arguments",
+        "Bash(* | zsh)",
+        "a remote download executed as a shell script",
     ),
     (
-        "Bash(git push* -d)",
-        "deletes a remote branch, short-flag form, as the final argument",
+        "Bash(*| sh)",
+        "a remote download executed as a shell script, no space before the pipe",
     ),
     (
-        "Bash(git push* :*)",
-        "empty-src refspec delete (git push origin :branch)",
-    ),
-    (
-        "Bash(git push* +*)",
-        "force-refspec push (git push origin +branch)",
-    ),
-    (
-        "Bash(git reset*--hard*)",
-        "destroys uncommitted work and can discard commits, any argument position",
-    ),
-    ("Bash(git rebase *)", "rewrites commit history"),
-    ("Bash(git filter-branch *)", "rewrites commit history"),
-    (
-        "Bash(curl *)",
-        "can pipe a remote download straight into a shell",
-    ),
-    (
-        "Bash(wget *)",
-        "can pipe a remote download straight into a shell",
+        "Bash(*| bash)",
+        "a remote download executed as a shell script, no space before the pipe",
     ),
     ("Bash(sudo *)", "privilege escalation"),
     ("Bash(su *)", "privilege escalation"),
@@ -501,20 +502,6 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ("Bash(diff *.aws*)", "reads AWS credential files"),
     ("Bash(diff *.ssh*)", "reads SSH private keys"),
     ("Bash(diff *.netrc*)", "reads stored HTTP credentials"),
-    // `find`'s own delete/exec actions (2026-08-23, issue #111): the
-    // read-only `Bash(find *)` allow above is only read-only up to these.
-    (
-        "Bash(find*-delete*)",
-        "find's own delete action; not covered by the read-only find allow above",
-    ),
-    (
-        "Bash(find*-exec*)",
-        "find's own exec action can run an arbitrary command",
-    ),
-    (
-        "Bash(find*-ok*)",
-        "find's own interactive-exec action can run an arbitrary command",
-    ),
     ("Bash(cargo publish *)", "publishes a crate; irreversible"),
     ("Bash(npm publish *)", "publishes a package; irreversible"),
     (
@@ -536,7 +523,127 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ),
     ("Bash(gh secret *)", "reads or writes repository secrets"),
     ("Bash(gh codespace ssh*)", "opens a shell into a codespace"),
+];
+
+/// The short, closed list of families zirv's shipped posture wants a HUMAN to
+/// see before they run (2026-08-24, cross-harness permissions design).
+///
+/// **This list is deliberately narrow, and adding to it is a product
+/// decision, not a hardening reflex.** The primary acceptance criterion is
+/// that an everyday dev command -- and a command zirv has never seen -- never
+/// prompts. Every entry here is a prompt an operator will actually be
+/// interrupted by, so the bar for membership is "genuinely dangerous and
+/// hard to undo", not "mutates something". `cargo build`, `npm install`,
+/// `git commit`, `mkdir`, an in-repo file write, a plain `curl` and an
+/// unrecognised tool are all `Allow`, and must stay that way -- pinned by
+/// `the_product_requirement_no_everyday_or_novel_command_ever_prompts` in
+/// `safety.rs`.
+///
+/// **Split from [`SHIPPED_POSTURE_DENY`] by reversibility, not by danger.**
+/// `git push --force` is recoverable from a reflog and `rm -rf ./target`
+/// from a rebuild, so both ask. `cargo publish` is irreversible and
+/// `cat ~/.ssh/id_rsa` has already leaked by the time anyone sees the
+/// prompt, so both stay denied.
+///
+/// **Deny still wins**: `safety::evaluate_single` walks deny before ask, so
+/// the specific `Bash(taskkill*zirv*)` deny beats the broad
+/// `Bash(taskkill *)` ask here with no ordering rule of its own.
+///
+/// Projected differently per launch mode: claude's INTERACTIVE argv leaves
+/// these off `--allowedTools`, so the safety hook's `"ask"` decision is what
+/// prompts on them; claude's HEADLESS argv folds them into
+/// `--disallowedTools` alongside the deny set, since nobody is present to
+/// answer (see `ClaudeAdapter::default_sandbox_args`).
+pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
+    ("Bash(rm -rf *)", "recursive force-delete"),
+    (
+        "Bash(rm -fr *)",
+        "recursive force-delete, flag-order variant",
+    ),
+    (
+        "Bash(git push*--force*)",
+        "force-push (covers --force-with-lease too), any argument position",
+    ),
+    (
+        "Bash(git push* -f *)",
+        "force-push, short-flag form, followed by more arguments",
+    ),
+    (
+        "Bash(git push* -f)",
+        "force-push, short-flag form, as the final argument",
+    ),
+    (
+        "Bash(git push*--delete*)",
+        "deletes a remote branch, any argument position",
+    ),
+    (
+        "Bash(git push* -d *)",
+        "deletes a remote branch, short-flag form, followed by more arguments",
+    ),
+    (
+        "Bash(git push* -d)",
+        "deletes a remote branch, short-flag form, as the final argument",
+    ),
+    (
+        "Bash(git push* :*)",
+        "empty-src refspec delete (git push origin :branch)",
+    ),
+    (
+        "Bash(git push* +*)",
+        "force-refspec push (git push origin +branch)",
+    ),
+    (
+        "Bash(git reset*--hard*)",
+        "destroys uncommitted work and can discard commits, any argument position",
+    ),
+    ("Bash(git rebase *)", "rewrites commit history"),
+    ("Bash(git filter-branch *)", "rewrites commit history"),
     ("Bash(git clean *)", "irreversibly deletes untracked files"),
+    // `find` asks ONLY on its delete action and on an exec that runs a
+    // delete. `find -exec grep`/`-exec sed -n` are everyday read-only work
+    // and must not prompt, which is why the old blanket `find*-exec*` entry
+    // is not carried over.
+    ("Bash(find*-delete*)", "find's own delete action"),
+    (
+        "Bash(find*-exec rm*)",
+        "find's exec action invoking a delete",
+    ),
+    (
+        "Bash(find*-exec*rm -rf*)",
+        "find's exec action invoking a recursive force-delete",
+    ),
+    // Process termination. The zirv-specific spellings are DENIED above and
+    // win, since deny is walked first.
+    ("Bash(taskkill *)", "terminates a running process"),
+    (
+        "Bash(Stop-Process *)",
+        "terminates a running process, PowerShell spelling",
+    ),
+    ("Bash(pkill *)", "terminates running processes by name"),
+    ("Bash(killall *)", "terminates running processes by name"),
+    (
+        "Bash(Remove-Item*-Recurse*)",
+        "recursive delete, PowerShell spelling",
+    ),
+    // Raw device and partition tools.
+    (
+        "Bash(dd *)",
+        "writes raw blocks; can destroy a whole device",
+    ),
+    ("Bash(mkfs*)", "formats a filesystem; destroys its contents"),
+    ("Bash(mkswap *)", "reformats a device as swap"),
+    ("Bash(diskpart*)", "Windows disk partitioning tool"),
+    ("Bash(fdisk *)", "disk partitioning tool"),
+    ("Bash(format *)", "formats a volume; destroys its contents"),
+    // Registry MUTATION only -- `reg query` is read-only and must not prompt.
+    (
+        "Bash(reg delete*)",
+        "deletes a Windows registry key or value",
+    ),
+    ("Bash(reg add*)", "writes a Windows registry key or value"),
+    ("Bash(reg import*)", "bulk-writes the Windows registry"),
+    ("Bash(shutdown *)", "powers off or restarts the machine"),
+    ("Bash(reboot*)", "restarts the machine"),
 ];
 
 /// The last model-flag occurrence in `flags`, in any form `classify_model_

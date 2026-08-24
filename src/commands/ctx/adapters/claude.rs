@@ -1798,7 +1798,7 @@ mod tests {
             "got {deny_arg}"
         );
         assert!(
-            deny_arg.contains("Bash(rm -rf *)"),
+            deny_arg.contains("Bash(sudo *)"),
             "the shipped deny entries must still be present, not replaced: {deny_arg}"
         );
     }
