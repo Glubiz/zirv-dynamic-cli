@@ -1176,6 +1176,13 @@ fn on_quit(
             .to_string(),
             short: pane.short().to_string(),
             title: pane.title().to_string(),
+            // F3 (review, PR #116): persisted so a restore
+            // (`spawn_restored_pane`) can hand a worker pane back its
+            // report-back target and reminder-sent state -- without this,
+            // every restored worker pane lost `report_to` for good, so
+            // `report_back_reminder_sweep` could never remind it again.
+            report_to: pane.report_to().map(str::to_string),
+            report_reminder_sent: pane.report_reminder_sent(),
         })
         .collect();
     let panes_for_roster = merge_unoffered(live, unoffered);
@@ -2276,7 +2283,16 @@ fn compose_worker_prompt(
     // path; a fallback-only adapter's omission is this exact same fact about
     // `req.requested_by`, so one check here covers both call sites named in
     // issue #115 without double-logging one spawn twice).
-    if cfg.mail.enabled && !prompt::is_addressable_short(&req.requested_by) {
+    //
+    // F6 (review, PR #116): this used to restate the addressability
+    // predicate inline (`!prompt::is_addressable_short(&req.requested_by)`)
+    // rather than asking `report_to_for` -- the one function that already
+    // computes, and is the single source of truth for, "does this pane get
+    // a report-back target" (`Pane::set_report_to`'s own caller uses it
+    // too). A drift between the two predicates would have logged
+    // "report-back-omitted" for a pane that in fact got a target, or stayed
+    // silent for one that did not.
+    if cfg.mail.enabled && report_to_for(req, cfg).is_none() {
         let _ = super::log::append(
             state,
             &super::log::Decision {
@@ -3295,7 +3311,20 @@ fn spawn_restored_pane(
         adapter.capabilities().turn_signal,
         Duration::from_millis(cfg.dash.idle_quiet_ms),
     ) {
-        Ok(pane) => {
+        Ok(mut pane) => {
+            // F3 (review, PR #116): restore the report-back target and
+            // reminder-sent state the roster carried for this pane.
+            // `set_report_to` always resets `report_reminder_sent` to
+            // `false` (the right default for a *freshly spawned* pane), so
+            // the sent flag is restored afterwards, only when the roster
+            // says it was already true -- a restore resurrects the SAME
+            // logical session, so an already-reminded worker must not be
+            // reminded again (contrast `Pane::handover`'s F5 reset, which
+            // is right for a successor session, not this one).
+            pane.set_report_to(candidate.report_to.clone());
+            if candidate.report_reminder_sent {
+                pane.mark_report_reminder_sent();
+            }
             panes.push(pane);
             nudge_queues.push(VecDeque::new());
         }
@@ -3753,6 +3782,35 @@ fn deliver_queued_nudges(
             && let Err(e) = pane.inject_visible("nudge from operator", &text)
         {
             push_error(errors, format!("nudge delivery: {e}"));
+        }
+    }
+}
+
+/// F1/F2 (review, PR #116): drains every pane's deferred injection
+/// submission (`Pane::pending_submit`) whose settle deadline has passed --
+/// the lone `\r` `Pane::inject_visible` no longer writes inline. See
+/// `dash::pane::INJECTION_SUBMIT_DELAY`'s own doc comment for the bug this
+/// replaced: blocking the dashboard's single UI thread for the settle gap
+/// inside every injection meant `mail_sweep`, `report_back_reminder_sweep`
+/// and `deliver_queued_nudges` -- all iterating every pane, all in the same
+/// tick -- could serially freeze redraw and input for the sum of their
+/// delays (up to ~1.35s across nine panes and three sweeps).
+///
+/// Called every tick, unthrottled by `FACTS_THROTTLE`: a 50ms deadline has
+/// to be checked far more often than once a second, or an injection would
+/// sit unsubmitted for up to a second past its own deadline. `Pane::
+/// submit_pending` is itself cheap and safe to call on a pane with nothing
+/// pending (a no-op `Ok(())`), and a write that fails simply leaves that
+/// pane's `pending_submit` set for the next tick to retry -- see
+/// `dash::pane::write_submit_cr`'s own doc comment for why a retried lone
+/// `\r` is always safe.
+fn drain_pending_submits(panes: &mut [Pane], errors: &mut Vec<String>) {
+    let now = Instant::now();
+    for pane in panes.iter_mut() {
+        if pane.pending_submit_due(now)
+            && let Err(e) = pane.submit_pending()
+        {
+            push_error(errors, format!("submit {}: {e}", pane.short()));
         }
     }
 }
@@ -4453,6 +4511,9 @@ pub fn run_dashboard(
             report_back_reminder_sweep(&mut panes, state, &mut errors);
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
+        // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s
+        // own doc comment.
+        drain_pending_submits(&mut panes, &mut errors);
 
         // Facts + sidebar rows, computed BEFORE input handling: the Nudge
         // dialog's attached-vs-view-only routing and the SelectUp/SelectDown
@@ -9326,6 +9387,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
+            ..Default::default()
         }];
         let view = build_restore_view(&candidates);
         assert_eq!(view.entries.len(), 1);
@@ -9860,6 +9922,71 @@ mod tests {
         }
     }
 
+    /// F1/F2 (review, PR #116): `drain_pending_submits` is what the tick
+    /// loop calls in place of the old inline sleep -- it must leave a
+    /// too-early pending submit alone and only drain it once
+    /// `INJECTION_SUBMIT_DELAY` has genuinely elapsed, with no error
+    /// surfaced for the happy path.
+    #[test]
+    fn drain_pending_submits_drains_a_due_injection_and_leaves_an_early_one_alone() {
+        use super::pane::tests::long_lived_argv;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "dddddddd-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk pending-submit".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let mut errors = Vec::new();
+
+        panes[0]
+            .inject_visible("nudge from operator", "hello")
+            .expect("inject");
+        assert!(panes[0].has_pending_submit(), "sanity: a submit is owed");
+
+        // Too early: the drain must not touch it yet.
+        drain_pending_submits(&mut panes, &mut errors);
+        assert!(
+            panes[0].has_pending_submit(),
+            "a pending submit inside its settle gap must not be drained early"
+        );
+        assert!(errors.is_empty());
+
+        std::thread::sleep(
+            crate::commands::ctx::dash::pane::INJECTION_SUBMIT_DELAY + Duration::from_millis(20),
+        );
+        drain_pending_submits(&mut panes, &mut errors);
+        assert!(
+            !panes[0].has_pending_submit(),
+            "due once the settle gap has actually elapsed"
+        );
+        assert!(errors.is_empty(), "the happy path surfaces no error");
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
     // Issue #115: report-back reminder.
 
     /// Pure: `report_to_for`'s address gate. `spawn_request`'s own default
@@ -10138,6 +10265,7 @@ mod tests {
             role: roster::ROLE_ORCHESTRATOR.to_string(),
             short: "aaaa1111".to_string(),
             title: "orch".to_string(),
+            ..Default::default()
         };
         let worker = roster::RosterPane {
             agent: "codex".to_string(),
@@ -10145,6 +10273,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
+            ..Default::default()
         };
         let taken = roster::Roster {
             written: 1_000,
@@ -10176,6 +10305,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
+            ..Default::default()
         };
         let unoffered = roster::RosterPane {
             agent: "codex".to_string(),
@@ -10183,6 +10313,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -10216,6 +10347,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
+            ..Default::default()
         };
         let pending = ui::Overlay::Restore(build_restore_view(std::slice::from_ref(&candidate)));
         let answered = ui::Overlay::None;
@@ -10926,6 +11058,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: short.to_string(),
             title: format!("wrk {short}"),
+            ..Default::default()
         }
     }
 
@@ -11123,6 +11256,74 @@ mod tests {
             written.panes, deferred_restore,
             "the spawn-failed candidate is offered again next launch"
         );
+    }
+
+    /// F3 (review, PR #116): a successfully restored worker pane gets its
+    /// `report_to`/`report_reminder_sent` back from the roster entry that
+    /// named them -- before this fix the roster carried no such fields at
+    /// all, so `spawn_restored_pane` never set `report_to` on the pane it
+    /// spawned and a restored worker's requester silently lost its
+    /// completion reminder for good.
+    ///
+    /// The candidate's own argv is deliberately not a real agent (`ping`
+    /// with extra positional args it will reject and exit on almost
+    /// immediately) -- only the pty spawn itself has to succeed here, the
+    /// same ABSOLUTE rule every other test in this module already follows.
+    #[test]
+    fn spawn_restored_pane_restores_report_to_and_reminder_sent_from_the_roster() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.report_to = Some("aaaa1111".to_string());
+        candidate.report_reminder_sent = true;
+        let cfg = CtxConfig {
+            #[cfg(windows)]
+            agent_bin: Some("ping -n 3 127.0.0.1".to_string()),
+            #[cfg(unix)]
+            agent_bin: Some("sleep 3".to_string()),
+            ..Default::default()
+        };
+
+        let mut panes = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = Vec::new();
+        let mut deferred_restore = Vec::new();
+
+        spawn_restored_pane(
+            &candidate,
+            &mut panes,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert!(
+            errors.is_empty(),
+            "a trivially spawnable program must restore cleanly: {errors:?}"
+        );
+        assert_eq!(panes.len(), 1, "the candidate spawned exactly one pane");
+        assert_eq!(
+            panes[0].report_to(),
+            Some("aaaa1111"),
+            "the roster's report_to must reach the restored pane"
+        );
+        assert!(
+            panes[0].report_reminder_sent(),
+            "a restore resurrects the SAME logical session, so an \
+             already-reminded worker must not be reminded again"
+        );
+
+        panes[0].finish_shutdown().expect("shutdown");
     }
 
     // R8: the loop has to be able to give up on a dead input stream.

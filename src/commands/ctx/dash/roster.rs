@@ -32,13 +32,33 @@ pub const ROLE_WORKER: &str = "worker";
 /// One pane's own snapshot at quit time: enough to relaunch it (`agent`,
 /// `session_id` -- fed to `resume_args`) and enough to label it in the
 /// restore dialog (`role`, `short`, `title`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterPane {
     pub agent: String,
     pub session_id: String,
     pub role: String,
     pub short: String,
     pub title: String,
+    /// F3 (review, PR #116): the report-back address this worker pane was
+    /// spawned with (`Pane::report_to`), persisted so a restored worker
+    /// still gets `report_back_reminder_sweep`'s one-shot reminder --
+    /// `spawn_restored_pane` used to leave a restored pane's `report_to`
+    /// permanently unset (the roster carried no such field at all), which
+    /// silently dropped the reminder for every worker that survived a
+    /// dashboard restart. `#[serde(default)]` so a roster file written by an
+    /// older build, with no such field on disk, still parses: absence reads
+    /// as `None`, the same as a pane that was never given a report-back
+    /// target.
+    #[serde(default)]
+    pub report_to: Option<String>,
+    /// Whether this pane had already received its one-shot report-back
+    /// reminder (`Pane::report_reminder_sent`) at quit time. A restore
+    /// resurrects the SAME logical session (unlike a handover, which starts
+    /// a fresh one -- see `Pane::handover`'s own F5 doc comment), so a
+    /// worker already reminded before the restart must not be reminded
+    /// again. `#[serde(default)]`, same reasoning as `report_to`.
+    #[serde(default)]
+    pub report_reminder_sent: bool,
 }
 
 /// A full dashboard's worth of panes, stamped with the time it was written
@@ -183,6 +203,8 @@ mod tests {
                     role: ROLE_ORCHESTRATOR.to_string(),
                     short: "aaaa1111".to_string(),
                     title: "orch".to_string(),
+                    report_to: None,
+                    report_reminder_sent: false,
                 },
                 RosterPane {
                     agent: "codex".to_string(),
@@ -190,6 +212,8 @@ mod tests {
                     role: ROLE_WORKER.to_string(),
                     short: "bbbb2222".to_string(),
                     title: "wrk codex".to_string(),
+                    report_to: Some("aaaa1111".to_string()),
+                    report_reminder_sent: true,
                 },
             ],
         }
@@ -214,6 +238,39 @@ mod tests {
         write_roster(&state, "-repo", &roster).expect("write_roster");
         let got = take_roster(&state, "-repo", 1_500, 1_000).expect("roster present");
         assert_eq!(got, roster);
+    }
+
+    /// F3 (review, PR #116): a roster file written by a build that predates
+    /// `report_to`/`report_reminder_sent` (no such keys on disk at all) must
+    /// still parse -- `#[serde(default)]` is what makes an old file's
+    /// absence read as `None`/`false` rather than a hard parse failure that
+    /// would silently drop the whole roster (`take_roster`'s own `.ok()?`
+    /// chain turns any parse error into "nothing to restore").
+    #[test]
+    fn an_old_style_roster_entry_with_no_report_back_fields_loads_with_none_and_false() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = state.dash();
+        super::super::super::state::create_private_dir_all(&dir).expect("mkdir");
+        let old_style_json = r#"{
+            "written": 1000,
+            "panes": [
+                {
+                    "agent": "claude",
+                    "session_id": "11111111-2222-4333-8444-555555555555",
+                    "role": "worker",
+                    "short": "aaaa1111",
+                    "title": "wrk claude"
+                }
+            ]
+        }"#;
+        super::super::super::state::write_private(&roster_path(&state, "-repo"), old_style_json)
+            .expect("write old-style roster directly");
+
+        let got = take_roster(&state, "-repo", 1_500, 1_000).expect("roster present");
+        assert_eq!(got.panes.len(), 1);
+        assert_eq!(got.panes[0].report_to, None);
+        assert!(!got.panes[0].report_reminder_sent);
     }
 
     #[test]
@@ -338,6 +395,7 @@ mod tests {
             role: ROLE_WORKER.to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
+            ..Default::default()
         };
         let argv = restore_argv(&adapter, &pane);
         assert_eq!(
@@ -364,6 +422,7 @@ mod tests {
             role: ROLE_WORKER.to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
+            ..Default::default()
         };
         let argv = restore_argv(&adapter, &pane);
         assert!(argv.iter().any(|a| a == "--resume"), "got {argv:?}");
@@ -389,6 +448,7 @@ mod tests {
             role: ROLE_WORKER.to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
+            ..Default::default()
         };
         let argv = restore_argv(&adapter, &pane);
         assert_eq!(argv[0], "/tmp/fake-codex");
