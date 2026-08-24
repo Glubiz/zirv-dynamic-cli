@@ -208,11 +208,14 @@ fn operator_settings_path() -> Option<PathBuf> {
 /// creating the file and parent directories as needed. Reads and
 /// re-serializes the whole file first, so this only ever adds/updates the one
 /// `[agents.<name>]` table -- every other section, and every other agent's own
-/// table, is left exactly as it was. Written for the first-run setup wizard
-/// (`commands::setup::run_first_run`), which only calls this while the file is
-/// known not to exist yet (`commands::setup::first_run_needed`), but it stays
-/// defensive so a later re-run (`zirv setup`'s guided menu) merges rather than
-/// silently clobbers an existing file.
+/// table, is left exactly as it was (though, like the pre-existing
+/// `set_home_ctx_toml_bool` does for `ctx.toml`, round-tripping through
+/// `toml::Table` drops any hand-written comments in the file). Written for
+/// the first-run setup wizard (`commands::setup::run_first_run`), which only
+/// calls this while the file is known not to exist yet
+/// (`commands::setup::first_run_needed`), but it stays defensive so a later
+/// re-run (`zirv setup`'s guided menu) merges rather than silently clobbers
+/// an existing file's keys.
 pub fn set_operator_agent_enabled(home: &Path, name: &str, enabled: bool) -> CtxResult<()> {
     let path = home.join(crate::utils::SCRIPT_DIR_NAME).join(SETTINGS_FILE);
     let mut root: toml::Table = if path.is_file() {

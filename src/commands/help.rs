@@ -85,15 +85,15 @@ fn write_builtins<W: Write>(writer: &mut W) -> Result<(), Box<dyn std::error::Er
     )?;
     writeln!(
         writer,
-        "exists here and stdin and stdout are both a real terminal; otherwise it shows this help."
+        "exists here and stdin and stdout are both real terminals; otherwise it shows this help."
     )?;
     writeln!(
         writer,
-        "The first time zirv (or `zirv chat`) is run before it has ever been configured, a"
+        "The first time zirv (or `zirv chat`) is run in a real terminal before it has ever"
     )?;
     writeln!(
         writer,
-        "guided setup wizard runs first either way -- see `zirv setup`.\n"
+        "been configured, a guided setup wizard runs first -- see `zirv setup`.\n"
     )?;
     writeln!(writer, "Commands:")?;
     writeln!(writer, "  help, h        Show this help")?;
