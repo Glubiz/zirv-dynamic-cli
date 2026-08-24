@@ -90,6 +90,49 @@ jobs:
       - name: Run Clippy Lint (Windows target)
         run: cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 
+  # nextest (above) runs each test in its own process, so it cannot catch the
+  # process-wide `env::set_var` races that serial `cargo test` was written to
+  # guard against -- CLAUDE.md keeps the serial run as a compatibility
+  # fallback and requires both to pass, so this job enforces that in CI. It
+  # runs in parallel with the `test` job (not as an extra step in it) so it
+  # doesn't lengthen that job's critical path.
+  serial-test:
+    name: Serial Test Compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Up Rust Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo Build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      # cargo test alone never builds target/debug/zirv; some ctx tests spawn it as a subprocess.
+      - name: Build Binary
+        run: cargo build
+
+      - name: Run Tests (serial)
+        run: cargo test --verbose -- --test-threads=1
+
   # Every merge to main triggers CD, which re-publishes whatever version main
   # carries and fails on a duplicate — so every PR must raise Cargo.toml's
   # version above its base branch before it can merge.

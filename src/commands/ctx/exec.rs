@@ -1750,6 +1750,67 @@ mod tests {
         );
     }
 
+    /// Guards `.config/nextest.toml`'s `exec-nudge-restart` group against
+    /// silent membership rot: its `filter = 'test(a) or test(b) or ...'`
+    /// enumerates 8 test names verbatim, and nextest silently matches
+    /// nothing for a clause naming a test that does not exist rather than
+    /// erroring -- so a rename here would silently drop a test out of the
+    /// serialized group with no signal anywhere. This extracts every
+    /// `test(NAME)` clause from that override's filter and asserts each
+    /// NAME still resolves to a real `fn` in this file. `include_str!` on
+    /// this very file is deliberate, not an accident -- the whole
+    /// exec-nudge-restart family lives here -- and the check is on the
+    /// exact `fn NAME(` byte pattern (not a loose substring match) so it
+    /// cannot be fooled by a name that only ever appears as this test's own
+    /// dynamically-parsed data, never as a real function definition. The
+    /// reverse direction (every such-shaped `fn` also present in the
+    /// filter) is not checked: there is no reliable lexical marker that
+    /// distinguishes a member of this family from any other test.
+    #[test]
+    fn the_nextest_exec_nudge_restart_group_names_still_resolve() {
+        const NEXTEST_TOML: &str =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.config/nextest.toml"));
+        const THIS_FILE: &str = include_str!("exec.rs");
+
+        let block = NEXTEST_TOML
+            .split("[[profile.default.overrides]]")
+            .find(|block| block.contains("test-group = 'exec-nudge-restart'"))
+            .expect("nextest.toml must still have an override naming the exec-nudge-restart group");
+        let filter_line = block
+            .lines()
+            .find(|line| line.trim_start().starts_with("filter = "))
+            .expect("the exec-nudge-restart override must still have a filter line");
+
+        let mut names: Vec<&str> = Vec::new();
+        let mut rest = filter_line;
+        while let Some(start) = rest.find("test(") {
+            let after = &rest[start + "test(".len()..];
+            let end = after
+                .find(')')
+                .expect("every test( clause in the filter must close with a )");
+            names.push(&after[..end]);
+            rest = &after[end + 1..];
+        }
+
+        assert!(
+            names.len() >= 8,
+            "expected at least the 8 known exec-nudge-restart tests, found {}: {:?}",
+            names.len(),
+            names
+        );
+
+        for name in names {
+            let needle = format!("fn {name}(");
+            assert!(
+                THIS_FILE.contains(&needle),
+                "nextest.toml's exec-nudge-restart filter names `{name}`, which no longer \
+                 resolves to `fn {name}(` in exec.rs -- nextest silently drops a clause like \
+                 this rather than erroring, so the test just as silently fell out of the \
+                 serialized group"
+            );
+        }
+    }
+
     #[test]
     fn prompt_extraction_finds_the_dash_p_argument() {
         let cmd = vec![

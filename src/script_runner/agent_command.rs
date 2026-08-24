@@ -203,6 +203,22 @@ mod tests {
             .join(name)
     }
 
+    /// The `VarGuard` entries every `run_supervised`-driving test in this
+    /// module needs: the sandboxed state dir and the fake agent binary, plus
+    /// a zeroed pacing delay. T8: `run_supervised` reads the real process
+    /// env, and a fresh temp state dir has no usage source by construction --
+    /// without the last entry, the real fail-safe delay (default 60s) is
+    /// paid on the wall clock. See the identical comment on `exec.rs`'s own
+    /// `base_env`. Callers extend the returned `Vec` with their own
+    /// `FAKE_AGENT_MODE` entry before passing it to `VarGuard::set`.
+    fn base_env<'a>(state: &'a Path, agent_bin: &'a str) -> Vec<(&'a str, Option<&'a str>)> {
+        vec![
+            (STATE_ENV, state.to_str()),
+            ("ZIRV_CTX_AGENT_BIN", Some(agent_bin)),
+            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
+        ]
+    }
+
     fn agent_step(prompt: &str) -> AgentCommand {
         AgentCommand {
             agent: "claude".to_string(),
@@ -319,16 +335,7 @@ mod tests {
         let state = tmp.path().join("state");
         let agent_bin = format!("sh {}", fixture("fake-codex-agent.sh").display());
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
-            (STATE_ENV, state.to_str()),
-            ("ZIRV_CTX_AGENT_BIN", Some(&agent_bin)),
-            // T8: `run_supervised` reads the real process env, and a fresh
-            // temp state dir has no usage source by construction -- without
-            // this, the real fail-safe delay (default 60s) is paid on the
-            // wall clock. See the identical comment on `exec.rs`'s own
-            // `base_env`.
-            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
-        ]);
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&base_env(&state, &agent_bin));
 
         let mut cmd = agent_step("go");
         cmd.agent = "codex".to_string();
@@ -382,14 +389,9 @@ mod tests {
         let state = tmp.path().join("state");
         let agent_bin = format!("sh {}", fixture("fake-agent.sh").display());
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
-            (STATE_ENV, state.to_str()),
-            ("ZIRV_CTX_AGENT_BIN", Some(&agent_bin)),
-            ("FAKE_AGENT_MODE", Some("healthy")),
-            // T8: see the identical comment on `codex_runs_as_a_supported_
-            // script_agent` -- `run_supervised` reads the real process env.
-            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
-        ]);
+        let mut env = base_env(&state, &agent_bin);
+        env.push(("FAKE_AGENT_MODE", Some("healthy")));
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&env);
 
         let cmd = agent_step("do the work");
         let mut context = HashMap::new();
@@ -407,14 +409,9 @@ mod tests {
         let state = tmp.path().join("state");
         let agent_bin = format!("sh {}", fixture("fake-agent.sh").display());
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
-            (STATE_ENV, state.to_str()),
-            ("ZIRV_CTX_AGENT_BIN", Some(&agent_bin)),
-            ("FAKE_AGENT_MODE", Some("fail")),
-            // T8: see the identical comment on `codex_runs_as_a_supported_
-            // script_agent` -- `run_supervised` reads the real process env.
-            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
-        ]);
+        let mut env = base_env(&state, &agent_bin);
+        env.push(("FAKE_AGENT_MODE", Some("fail")));
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&env);
 
         let cmd = agent_step("do the work");
         let mut context = HashMap::new();
@@ -433,14 +430,9 @@ mod tests {
         let state = tmp.path().join("state");
         let agent_bin = format!("sh {}", fixture("fake-agent.sh").display());
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
-            (STATE_ENV, state.to_str()),
-            ("ZIRV_CTX_AGENT_BIN", Some(&agent_bin)),
-            ("FAKE_AGENT_MODE", Some("fail")),
-            // T8: see the identical comment on `codex_runs_as_a_supported_
-            // script_agent` -- `run_supervised` reads the real process env.
-            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
-        ]);
+        let mut env = base_env(&state, &agent_bin);
+        env.push(("FAKE_AGENT_MODE", Some("fail")));
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&env);
 
         let mut cmd = agent_step("do the work");
         cmd.options = Some(Options {

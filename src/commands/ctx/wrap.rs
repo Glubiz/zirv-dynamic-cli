@@ -3551,22 +3551,10 @@ mod tests {
         // suite run from inside an agent session would otherwise trip the
         // nesting guard instead of running the test. Removed *before*
         // `extra_env`, which several tests use to pin `ZIRV_CTX_TRANSCRIPT`
-        // deliberately.
-        for key in super::super::sessions::SUPERVISION_ENV {
-            cmd.env_remove(key);
-        }
-        cmd.env_remove("CLAUDE_PID");
-        cmd.env_remove("CLAUDECODE");
-        // T8: `SUPERVISION_ENV` deliberately excludes `DASH_REQUESTS_ENV` (a
-        // pane's own child must still be able to reach the spawn-request
-        // channel -- see `nested_session_evidence`'s own doc comment), so it
-        // is not scrubbed by anything above. A real dashboard pane -- which
-        // is exactly the environment this whole suite runs under when driven
-        // from `zirv ctx dash` itself -- exports it into ITS OWN process, so
-        // without this every one of these harnesses' spawned `zirv ctx wrap`
-        // also inherited it and tripped the same nesting guard the comment
-        // above already scrubs the other three signals for.
-        cmd.env_remove(super::super::dash::spawnreq::DASH_REQUESTS_ENV);
+        // deliberately. T8: see `testenv::scrub_supervision_env_for_test`'s
+        // own doc comment for why this is a test-side scrub, not an extended
+        // production one.
+        crate::commands::ctx::testenv::scrub_supervision_env_for_test(&mut cmd);
         // T10 fix regression (2026-08-23): every one of these harnesses spawns
         // a *real* `zirv ctx wrap` attached to a real pty on both stdin and
         // stdout, which is exactly the condition the launch-time interactive
@@ -6736,7 +6724,19 @@ mod tests {
             }
         }
         let _ = child.kill();
-        let _ = child.wait();
+        // The kill is not synchronous, so reap with the same bounded poll
+        // rather than a blocking `wait()` -- a `wait()` here would hang this
+        // helper forever on a child the kill somehow failed to actually
+        // terminate, defeating the entire point of bounding it above. A
+        // child left unreaped in a test process that is about to exit is
+        // harmless (the OS reaps it); a wedged suite is not.
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < reap_deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
         None
     }
 
@@ -6813,13 +6813,9 @@ mod tests {
         // T8: hermetic against the developer's/agent's own environment --
         // see the identical comment on `spawn_wrap`'s pty harness above.
         // This test builds its own `CommandBuilder` rather than going
-        // through that harness, so it needs the same scrub explicitly.
-        for key in super::super::sessions::SUPERVISION_ENV {
-            cmd.env_remove(key);
-        }
-        cmd.env_remove("CLAUDE_PID");
-        cmd.env_remove("CLAUDECODE");
-        cmd.env_remove(super::super::dash::spawnreq::DASH_REQUESTS_ENV);
+        // through that harness, so it needs the same scrub explicitly (see
+        // `testenv::scrub_supervision_env_for_test`'s own doc comment).
+        crate::commands::ctx::testenv::scrub_supervision_env_for_test(&mut cmd);
         let mut child = pair.slave.spawn_command(cmd).expect("spawn");
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().expect("reader");
@@ -6984,6 +6980,7 @@ mod tests {
 
         /// Waits for `child`, killing it and returning `None` past `timeout` so
         /// a re-deadlocked `wrap` fails the test instead of wedging the suite.
+        /// Mirrors the non-Windows `wait_bounded` above, reap loop included.
         fn wait_bounded(
             child: &mut std::process::Child,
             timeout: Duration,
@@ -6997,7 +6994,17 @@ mod tests {
                 }
             }
             let _ = child.kill();
-            let _ = child.wait();
+            // The kill is not synchronous, so reap with the same bounded poll
+            // rather than a blocking `wait()` -- see the identical comment on
+            // the non-Windows `wait_bounded` for why an unbounded wait here
+            // would defeat this helper's entire purpose.
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < reap_deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                }
+            }
             None
         }
 
@@ -7017,18 +7024,11 @@ mod tests {
             // environment, so a suite run from inside an agent session would
             // otherwise trip the nesting guard and see exit code 1 instead of
             // whatever the test is actually about. The guard has its own
-            // dedicated coverage above; here it is noise.
-            for key in super::super::super::sessions::SUPERVISION_ENV {
-                cmd.env_remove(key);
-            }
-            cmd.env_remove("CLAUDE_PID");
-            cmd.env_remove("CLAUDECODE");
-            // T8: see the identical fix/comment on `spawn_wrap`'s pty
-            // harness above -- `SUPERVISION_ENV` deliberately excludes
-            // `DASH_REQUESTS_ENV`, so a real dashboard pane's own process
-            // (this whole suite's environment, when run from `zirv ctx
-            // dash`) still leaks it into this spawn without an explicit scrub.
-            cmd.env_remove(super::super::super::dash::spawnreq::DASH_REQUESTS_ENV);
+            // dedicated coverage above; here it is noise. T8: see the
+            // identical fix/comment on `spawn_wrap`'s pty harness above, and
+            // `testenv::scrub_supervision_env_for_test_cmd`'s own doc comment
+            // for why this is a test-side scrub, not an extended production one.
+            crate::commands::ctx::testenv::scrub_supervision_env_for_test_cmd(&mut cmd);
             // No terminal: this is also the CI/piped case, which is exactly
             // why the synthetic cursor report cannot be left to a real
             // terminal to send.
