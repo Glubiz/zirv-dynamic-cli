@@ -51,6 +51,12 @@ pub struct CodexAdapter {
     /// `forced_file_support` field exactly.
     #[cfg(test)]
     forced_ignore_flags_support: Option<bool>,
+    /// Test seam only, mirroring `forced_ignore_flags_support` exactly:
+    /// forces `on_request_approval_supported`'s answer instead of spawning a
+    /// real `--help` probe against whatever "codex" happens to resolve to on
+    /// the machine running the test suite.
+    #[cfg(test)]
+    forced_on_request_approval_support: Option<bool>,
 }
 
 impl CodexAdapter {
@@ -66,6 +72,8 @@ impl CodexAdapter {
             home: None,
             #[cfg(test)]
             forced_ignore_flags_support: None,
+            #[cfg(test)]
+            forced_on_request_approval_support: None,
         }
     }
 
@@ -81,6 +89,36 @@ impl CodexAdapter {
     pub fn with_ignore_flags_forced(mut self, supported: bool) -> Self {
         self.forced_ignore_flags_support = Some(supported);
         self
+    }
+
+    /// Test seam: see the field's own doc comment.
+    #[cfg(test)]
+    pub fn with_on_request_approval_forced(mut self, supported: bool) -> Self {
+        self.forced_on_request_approval_support = Some(supported);
+        self
+    }
+
+    /// Whether the installed codex-cli's own top-level `codex --help`
+    /// documents the `on-request` value of `-a, --ask-for-approval`
+    /// (2026-08-24, cross-harness permissions design).
+    ///
+    /// Probed, never assumed, for exactly the reason `ignore_flags_supported`
+    /// above is: the real minimum supporting version is unknown, and passing
+    /// a value an older install does not recognize is an
+    /// unrecognized-argument error that breaks the launch outright. Fails
+    /// closed (`false`) on any doubt at all: binary missing, timeout, or
+    /// `--help` output that does not name both the flag and the value.
+    ///
+    /// The TOP-LEVEL `--help` is probed, not `exec --help`: this gates the
+    /// INTERACTIVE launch (`codex [PROMPT]`, built by `interactive_cmd`),
+    /// which is a different command surface from the headless `codex exec`
+    /// that `ignore_flags_supported` probes.
+    fn on_request_approval_supported(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_on_request_approval_support {
+            return forced;
+        }
+        probe_on_request_approval_support(&self.program, &self.bin_args)
     }
 
     /// Issue #89: whether the installed codex-cli's own `codex exec --help`
@@ -221,6 +259,89 @@ fn detect_ignore_flags(program: &str, bin_args: &[String]) -> bool {
         if matches!(child.try_wait(), Ok(Some(_))) {
             let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
             return text.contains("--ignore-rules") && text.contains("--ignore-user-config");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+/// Bounds the top-level `codex --help` probe below, exactly as
+/// [`IGNORE_FLAGS_PROBE_TIMEOUT`] bounds the `codex exec --help` one.
+const ON_REQUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Process-wide cache of `detect_on_request_approval`'s answer, keyed by the
+/// exact program invocation -- the identical `ProbeKey` shape
+/// [`IGNORE_FLAGS_SUPPORT`] uses, for the identical reason: `agent_bin` can
+/// point at a different binary, or a different version resolved off a
+/// different `PATH`, and each has its own answer.
+static ON_REQUEST_APPROVAL_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
+
+fn probe_on_request_approval_support(program: &str, bin_args: &[String]) -> bool {
+    let key = (PathBuf::from(program), bin_args.to_vec());
+    let cache = ON_REQUEST_APPROVAL_SUPPORT.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = cache.lock() else {
+        return false;
+    };
+    if let Some(cached) = map.get(&key) {
+        return *cached;
+    }
+    let detected = detect_on_request_approval(program, bin_args);
+    map.insert(key, detected);
+    detected
+}
+
+/// Runs `<program> [bin_args] --help` and reports whether its output names
+/// BOTH `--ask-for-approval` and the `on-request` value. Any doubt at all --
+/// binary missing, timeout, output missing either string -- reads as
+/// unsupported, and the caller keeps `never`.
+fn detect_on_request_approval(program: &str, bin_args: &[String]) -> bool {
+    // The same resolution the real launch uses, exactly like
+    // `detect_ignore_flags` -- otherwise the probe and the spawn could
+    // disagree on Windows about whether this is a `.cmd` shim.
+    let resolved =
+        super::resolve_program(program).unwrap_or_else(|_| ResolvedProgram::direct(program));
+
+    // SECURITY: identical defense to `detect_ignore_flags` -- run the
+    // fail-closed reparse guard against the exact probe argv before spawning,
+    // since `bin_args` can carry repo-controlled text on some launch shapes.
+    let mut probe_args: Vec<String> =
+        Vec::with_capacity(resolved.prefix.len() + bin_args.len() + 1);
+    probe_args.extend(resolved.prefix.iter().cloned());
+    probe_args.extend(bin_args.iter().cloned());
+    probe_args.push("--help".to_string());
+    if super::guard_cmd_shim_reparse(&resolved.program, &probe_args).is_err() {
+        return false;
+    }
+
+    let Ok(mut child) = Command::new(&resolved.program)
+        .args(&resolved.prefix)
+        .args(bin_args)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let mut stdout_pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let deadline = Instant::now() + ON_REQUEST_PROBE_TIMEOUT;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+            return text.contains("--ask-for-approval") && text.contains("on-request");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -606,36 +727,58 @@ impl AgentAdapter for CodexAdapter {
         }
     }
 
-    /// The codex side of the shipped-default "sandboxed, no prompts"
-    /// posture (2026-08-22): `--sandbox workspace-write` (writes confined to
-    /// the workspace, commands run freely inside it) paired with
-    /// `--ask-for-approval never` (no escalation prompt for anything the
-    /// sandbox does allow or refuse -- the model is told the outcome
-    /// directly). Both verified against the actually-installed `codex-cli
-    /// 0.147.0`'s own `--help`/`exec --help` (2026-08-22 addendum to
-    /// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`, the same
-    /// capture `policy_args`'s own doc comment cites). Never
-    /// `--dangerously-bypass-approvals-and-sandbox`: that removes
-    /// sandboxing entirely, which is the one thing this posture must not
-    /// do.
-    /// `sandbox.extra_allow`/`extra_deny` (fix round 3, 2026-08-22) are
-    /// claude permission-rule strings (`Bash(...)`/`Edit(...)`/`Read(...)`);
-    /// codex has no per-command mechanism to receive them and ignores the
-    /// parameter, exactly like the trait default. `safety` (issue #83) is
-    /// the same story: codex has no per-command classifier to project
-    /// `[safety]` rules onto, so this stays the fixed pair it always was.
+    /// The codex side of the shipped-default posture, split by launch mode
+    /// (2026-08-24, cross-harness permissions design).
+    ///
+    /// **Headless** is unchanged: `--sandbox workspace-write` paired with
+    /// `--ask-for-approval never`, both verified against the installed
+    /// `codex-cli 0.147.0`. Nobody is present to answer an escalation, so a
+    /// blocked action is reported straight back to the model.
+    ///
+    /// **Interactive** upgrades the approval mode to `on-request`: the
+    /// session works freely inside the workspace sandbox and escalates only
+    /// when it needs to leave it, so the operator sees a prompt when
+    /// something real is at stake and not otherwise.
+    ///
+    /// Deliberately **not** `untrusted`, which was this design's first
+    /// answer: `untrusted` prompts for everything outside codex's own narrow
+    /// built-in trusted set, which is exactly the endless-prompting failure
+    /// the primary acceptance criterion exists to remove. Choosing the
+    /// approval mode by how much it interrupts -- not by how much it
+    /// gates -- is the whole point; the SANDBOX is what gates, and it is
+    /// unchanged between the two modes.
+    ///
+    /// Probed, never assumed (`on_request_approval_supported`): on any doubt
+    /// the launch keeps `never`, because an unrecognized argument breaks the
+    /// launch outright.
+    ///
+    /// Never `--dangerously-bypass-approvals-and-sandbox`: that removes
+    /// sandboxing entirely, which is the one thing this posture must not do.
+    ///
+    /// `sandbox.extra_allow`/`extra_deny` and `safety` are still ignored in
+    /// both modes: they are claude permission-rule strings, and no
+    /// trusted-command mechanism was verified on the installed codex CLI to
+    /// receive them. Rather than invent one, this projects nothing extra and
+    /// `policy_support` reports the gap as `Degraded` -- see that method's own
+    /// doc comment. Faking parity here would be exactly the over-claim
+    /// `policy.rs`'s honesty contract exists to prevent.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
         safety: &crate::commands::ctx::safety::SafetyPolicy,
         mode: super::LaunchMode,
     ) -> Vec<String> {
-        let _ = (sandbox, safety, mode);
+        let _ = (sandbox, safety);
+        let approval = if mode.is_interactive() && self.on_request_approval_supported() {
+            "on-request"
+        } else {
+            "never"
+        };
         vec![
             "--sandbox".to_string(),
             "workspace-write".to_string(),
             "--ask-for-approval".to_string(),
-            "never".to_string(),
+            approval.to_string(),
         ]
     }
 
@@ -1389,6 +1532,132 @@ mod tests {
                 "must never widen: {args:?}"
             );
         }
+    }
+
+    /// The spec's revised codex-interactive projection (2026-08-24).
+    /// `on-request`, NOT `untrusted`: `untrusted` prompts for everything
+    /// outside codex's own narrow trusted set, which is precisely the
+    /// endless-prompting failure the primary acceptance criterion forbids.
+    /// Driven through the forcing seam, never a live probe: asserting an
+    /// exact argv that depends on whatever `codex` happens to be installed
+    /// on the test machine is the probe-dependent assertion this repo
+    /// forbids.
+    #[test]
+    fn an_interactive_launch_uses_the_low_noise_on_request_approval_mode() {
+        let adapter = CodexAdapter::new(None).with_on_request_approval_forced(true);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "on-request".to_string(),
+            ]
+        );
+        assert!(
+            !args.iter().any(|a| a == "untrusted"),
+            "untrusted is the noisy polarity this task exists to avoid: {args:?}"
+        );
+    }
+
+    /// The fail-closed half: an installed codex whose own `--help` does not
+    /// document `on-request` gets the posture it always had. zirv must never
+    /// pass a value the binary may reject -- an unrecognized argument breaks
+    /// the launch outright, which is worse than the prompt behaviour it was
+    /// meant to tune.
+    #[test]
+    fn an_interactive_launch_falls_back_to_never_when_the_probe_is_unsure() {
+        let adapter = CodexAdapter::new(None).with_on_request_approval_forced(false);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ]
+        );
+    }
+
+    /// Headless is unchanged in both directions: nobody is present, so
+    /// `on-request` would stall the run waiting on an answer that never
+    /// comes, even on an install that supports it.
+    #[test]
+    fn a_headless_launch_keeps_never_regardless_of_what_the_probe_says() {
+        for supported in [true, false] {
+            let adapter = CodexAdapter::new(None).with_on_request_approval_forced(supported);
+            let args = adapter.default_sandbox_args(
+                &Default::default(),
+                &Default::default(),
+                super::super::LaunchMode::Headless,
+            );
+            assert_eq!(
+                args,
+                vec![
+                    "--sandbox".to_string(),
+                    "workspace-write".to_string(),
+                    "--ask-for-approval".to_string(),
+                    "never".to_string(),
+                ],
+                "probe={supported}"
+            );
+        }
+    }
+
+    /// The invariant that holds whatever is installed -- the assertion that
+    /// is safe to make without the forcing seam.
+    #[test]
+    fn every_codex_posture_is_a_sandboxed_four_token_pair() {
+        let adapter = CodexAdapter::new(None);
+        for mode in [
+            super::super::LaunchMode::Interactive,
+            super::super::LaunchMode::Headless,
+        ] {
+            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            assert_eq!(args.len(), 4, "got {args:?}");
+            assert_eq!(
+                &args[0..2],
+                &["--sandbox".to_string(), "workspace-write".to_string()]
+            );
+            assert_eq!(args[2], "--ask-for-approval");
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.contains("dangerously-bypass-approvals-and-sandbox")),
+                "must never remove the sandbox: {args:?}"
+            );
+        }
+    }
+
+    /// zirv projects NOTHING of `[safety]` onto codex: no trusted-command
+    /// configuration was verified to exist on the installed CLI, and the spec
+    /// is explicit that on any doubt the adapter projects nothing extra and
+    /// reports the gap rather than faking parity with claude.
+    #[test]
+    fn codex_projects_no_per_command_safety_rules_at_all() {
+        let adapter = CodexAdapter::new(None).with_on_request_approval_forced(true);
+        let safety = crate::commands::ctx::safety::SafetyPolicy::default();
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &safety,
+            super::super::LaunchMode::Interactive,
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("rm -rf") || a.contains("git push")),
+            "no command-level rule may leak into codex argv: {args:?}"
+        );
     }
 
     /// The shipped-default posture (2026-08-22): workspace-write (commands
