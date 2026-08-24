@@ -549,17 +549,22 @@ mod tests {
     /// nothing in the test ever wrote, and false drift/no-drift results.
     /// Bundled into `repo()` itself (rather than added test-by-test) since
     /// every one of this module's tests goes through it and none of them
-    /// want the real home.
-    #[allow(clippy::type_complexity)]
+    /// want the real home. Both the home tempdir and the guard must be
+    /// bound to live names at the call site (every current caller uses
+    /// `let (dir, _home, _guard) = repo();`) -- dropping either restores
+    /// the real `$HOME` (the guard) or deletes the directory it now points
+    /// at (the tempdir) immediately, reintroducing exactly the leak this
+    /// helper exists to close.
     fn repo() -> (
         tempfile::TempDir,
-        (tempfile::TempDir, crate::commands::ctx::testenv::HomeGuard),
+        tempfile::TempDir,
+        crate::commands::ctx::testenv::HomeGuard,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(dir.path().join(".zirv/context")).expect("mkdir");
         let home = tempfile::tempdir().expect("tempdir for home");
         let guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
-        (dir, (home, guard))
+        (dir, home, guard)
     }
 
     fn write_canonical(repo: &Path, name: &str, text: &str) {
@@ -688,7 +693,7 @@ mod tests {
 
     #[test]
     fn report_mode_changes_nothing_on_disk() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         write_canonical(dir.path(), "common.md", "Always run tests.");
         let claude_native = native_claude_path(dir.path());
         fs::write(&claude_native, "# Hand-maintained CLAUDE.md\n").expect("write");
@@ -716,7 +721,7 @@ mod tests {
     /// rendered from.
     #[test]
     fn report_mode_finds_no_drift_between_canonical_content_and_its_own_managed_render() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         write_canonical(
             dir.path(),
             "common.md",
@@ -738,7 +743,7 @@ mod tests {
 
     #[test]
     fn report_mode_is_also_the_default_with_no_flags() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         let (code, out) = run_sync(
             &SyncArgs {
                 report: false,
@@ -756,7 +761,7 @@ mod tests {
 
     #[test]
     fn generate_refuses_to_overwrite_an_unmanaged_native_file() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         write_canonical(dir.path(), "common.md", "Always run the full test suite.");
         let claude_native = native_claude_path(dir.path());
         let hand_written = "# My own CLAUDE.md\n\nDo not touch this.\n";
@@ -775,7 +780,7 @@ mod tests {
 
     #[test]
     fn generate_with_force_replaces_an_unmanaged_native_file() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         write_canonical(dir.path(), "common.md", "Always run the full test suite.");
         let claude_native = native_claude_path(dir.path());
         fs::write(&claude_native, "# hand-written\n").expect("write");
@@ -792,7 +797,7 @@ mod tests {
 
     #[test]
     fn import_round_trips_native_files_into_canonical_paths() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         fs::write(
             native_claude_path(dir.path()),
             "# Claude notes\n\nPrefer rg over grep.\n",
@@ -823,7 +828,7 @@ mod tests {
 
     #[test]
     fn import_refuses_to_overwrite_differing_canonical_content_without_force() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         write_canonical(dir.path(), "claude.md", "Existing canonical content.");
         fs::write(
             native_claude_path(dir.path()),
@@ -842,7 +847,7 @@ mod tests {
 
     #[test]
     fn import_refuses_a_native_file_that_is_itself_zirv_managed() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         fs::write(native_claude_path(dir.path()), MANAGED_MARKER).expect("write");
 
         let (code, out) = run_sync(&import_args(false), dir.path());
@@ -856,7 +861,7 @@ mod tests {
 
     #[test]
     fn import_with_no_native_files_is_a_clean_no_op() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         let (code, out) = run_sync(&import_args(false), dir.path());
         assert_eq!(code, 0);
         assert!(out.contains("nothing to import"));
@@ -866,7 +871,7 @@ mod tests {
 
     #[test]
     fn generation_is_idempotent_and_byte_stable() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         write_canonical(dir.path(), "common.md", "Always run the full test suite.");
         write_canonical(dir.path(), "claude.md", "Prefer the native tool-use loop.");
 
@@ -887,7 +892,7 @@ mod tests {
 
     #[test]
     fn generate_with_no_canonical_content_writes_nothing() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         let (code, out) = run_sync(&generate_args(false), dir.path());
         assert_eq!(code, 0);
         assert!(out.contains("nothing to generate"));
@@ -897,7 +902,7 @@ mod tests {
 
     #[test]
     fn regenerating_after_a_canonical_change_updates_the_managed_file() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         write_canonical(dir.path(), "common.md", "Version one.");
         let (code, _) = run_sync(&generate_args(false), dir.path());
         assert_eq!(code, 0);
@@ -964,7 +969,7 @@ mod tests {
 
     #[test]
     fn dispatch_runs_sync_report_end_to_end_in_the_current_directory() {
-        let (dir, _home) = repo();
+        let (dir, _home, _guard) = repo();
         let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(dir.path()).expect("enter repo");
         let code = dispatch(&[
             "context".to_string(),
