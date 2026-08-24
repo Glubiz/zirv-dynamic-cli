@@ -1123,6 +1123,12 @@ pub struct ListArgs {
 pub struct ExplainArgs {
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
+    /// Which launch posture to explain the verdict under. An unmatched
+    /// command is allowed interactively and asked headlessly, and an `ask`
+    /// verdict prompts interactively and fails closed headlessly -- so the
+    /// same rule means two different things.
+    #[arg(long, value_enum, default_value = "interactive")]
+    pub mode: super::adapters::LaunchMode,
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
 }
@@ -1181,8 +1187,37 @@ fn render_outcome(command: &str, outcome: &Outcome) -> String {
     format!("{head} (`{command}`)")
 }
 
-fn explain_text(command: &str, outcome: &Outcome) -> String {
-    match &outcome.matched {
+/// What the verdict actually DOES to a launch in `mode` -- the half an
+/// operator cannot read off the matched rule alone (2026-08-24). Naming the
+/// concrete flag in each sentence is deliberate: an operator debugging "why
+/// did that just prompt" needs the flag to search their own scrollback for.
+fn mode_consequence(verdict: Verdict, mode: super::adapters::LaunchMode) -> &'static str {
+    use super::adapters::LaunchMode;
+    match (verdict, mode) {
+        (Verdict::Allow, LaunchMode::Interactive) => {
+            "It runs with no prompt: on an interactive launch the safety hook states an explicit \
+             `allow` decision, which is what keeps everyday and unclassified commands silent."
+        }
+        (Verdict::Allow, LaunchMode::Headless) => {
+            "It runs with no prompt: it is pre-approved in the launch's own --allowedTools set."
+        }
+        (Verdict::Ask, LaunchMode::Interactive) => {
+            "On an interactive launch (zirv chat, zirv ctx wrap, a dashboard pane) this prompts \
+             you: claude runs under `--permission-mode default` with the safety hook as the sole \
+             gate, and codex under `--ask-for-approval on-request` where the installed CLI \
+             supports it."
+        }
+        (Verdict::Ask, LaunchMode::Headless) => {
+            "On a headless launch (zirv ctx exec, zirv ctx loop, zirv ctx agent) nobody is present \
+             to answer, so this fails closed: claude runs under `--permission-mode dontAsk` with \
+             the ask set folded into --disallowedTools, and codex under `--ask-for-approval never`."
+        }
+        (Verdict::Deny, _) => "It is refused in every launch mode.",
+    }
+}
+
+fn explain_text(command: &str, outcome: &Outcome, mode: super::adapters::LaunchMode) -> String {
+    let head = match &outcome.matched {
         Some(rule) => format!(
             "`{command}` is {} because it matched the {} rule `{}` from {}.",
             outcome.verdict.label(),
@@ -1191,12 +1226,14 @@ fn explain_text(command: &str, outcome: &Outcome) -> String {
             rule.origin.label()
         ),
         None => format!(
-            "`{command}` is {} because no deny, ask or allow rule matched; the configured \
-             default ({}) applies.",
+            "`{command}` is {} because no deny, ask or allow rule matched; the {} default ({}) \
+             applies.",
             outcome.verdict.label(),
+            mode.label(),
             outcome.verdict.label()
         ),
-    }
+    };
+    format!("{head} {}", mode_consequence(outcome.verdict, mode))
 }
 
 /// The documented PreToolUse decision envelope -- the identical shape
@@ -1222,6 +1259,17 @@ fn explain_text(command: &str, outcome: &Outcome) -> String {
 /// decide. Every other mode (including the empty/unknown default) keeps
 /// emitting `"ask"` unchanged, and `Deny` is unaffected by mode: it always
 /// emits `"deny"` (2026-08-23, issue #102).
+///
+/// **2026-08-24 re-scoping:** the `dontAsk` fall-through is unchanged,
+/// because the reason for it is unchanged -- an `ask` under `dontAsk` is
+/// still an unsatisfiable prompt claude turns into a denial that would strip
+/// the operator's own `permissions.allow`. What changed is which launches can
+/// reach it: zirv no longer pins `dontAsk` on an interactive launch
+/// (`ClaudeAdapter::default_sandbox_args` pins `default` there), so the only
+/// two remaining populations are a headless zirv launch and an operator who
+/// pinned `dontAsk` themselves -- `adapters::flags_pin_policy` already makes
+/// zirv stand down entirely for the latter. Pinned end to end by
+/// `the_dont_ask_suppression_is_reachable_only_from_the_headless_posture`.
 fn hook_output(command: &str, outcome: &Outcome, permission_mode: &str) -> Option<String> {
     let dont_ask = permission_mode == "dontAsk";
     let decision = match outcome.verdict {
@@ -1249,7 +1297,15 @@ fn hook_output(command: &str, outcome: &Outcome, permission_mode: &str) -> Optio
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": decision,
-                "permissionDecisionReason": explain_text(command, outcome),
+                "permissionDecisionReason": explain_text(
+                    command,
+                    outcome,
+                    if dont_ask {
+                        super::adapters::LaunchMode::Headless
+                    } else {
+                        super::adapters::LaunchMode::Interactive
+                    },
+                ),
             }
         })
         .to_string(),
@@ -1341,12 +1397,8 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W, env: EnvLookup<'_>) -> Ctx
 pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let cfg = CtxConfig::load(&args.repo, env)?;
     let command = args.command.join(" ");
-    let outcome = evaluate(
-        &cfg.safety,
-        &command,
-        super::adapters::LaunchMode::Interactive,
-    );
-    writeln!(w, "{}", explain_text(&command, &outcome))?;
+    let outcome = evaluate(&cfg.safety, &command, args.mode);
+    writeln!(w, "{}", explain_text(&command, &outcome, args.mode))?;
     Ok(outcome.verdict.exit_code())
 }
 
@@ -2757,6 +2809,155 @@ mod tests {
         assert!(text.contains("built-in"));
     }
 
+    /// The same rule means two different things now, so `explain` has to say
+    /// which launch it is talking about (2026-08-24).
+    #[test]
+    fn explain_states_what_the_verdict_does_in_each_launch_mode() {
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "git push*--force*".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let interactive = explain_text("git push --force x", &ask, LaunchMode::Interactive);
+        assert!(interactive.contains("built-in"), "got {interactive}");
+        assert!(interactive.contains("prompts"), "got {interactive}");
+
+        let headless = explain_text("git push --force x", &ask, LaunchMode::Headless);
+        assert!(headless.contains("fails closed"), "got {headless}");
+        assert!(
+            headless.contains("dontAsk"),
+            "the headless consequence must name the mode that produces it: {headless}"
+        );
+    }
+
+    /// An unmatched command explains the DIFFERENT default it hit per mode --
+    /// the single most confusing thing about the new posture if it is not
+    /// spelled out.
+    #[test]
+    fn explain_names_the_mode_specific_default_for_an_unmatched_command() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        for (mode, expected) in [
+            (LaunchMode::Interactive, "allow"),
+            (LaunchMode::Headless, "ask"),
+        ] {
+            let args = ExplainArgs {
+                repo: repo.path().to_path_buf(),
+                mode,
+                command: vec!["some-unknown-tool".to_string(), "--flag".to_string()],
+            };
+            let mut out = Vec::new();
+            run_explain(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains(expected), "{mode:?}: got {text}");
+            assert!(
+                text.contains("no deny, ask or allow rule matched"),
+                "got {text}"
+            );
+        }
+    }
+
+    /// The SQL classifier's synthetic rule has to explain itself too, or an
+    /// operator sees a verdict with a pattern they cannot find in
+    /// `zirv ctx safety list`.
+    #[test]
+    fn explain_names_the_sql_classifier_when_it_is_what_decided() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let args = ExplainArgs {
+            repo: repo.path().to_path_buf(),
+            mode: LaunchMode::Interactive,
+            command: vec![
+                "psql".to_string(),
+                "-c".to_string(),
+                "DROP TABLE users".to_string(),
+            ],
+        };
+        let mut out = Vec::new();
+        let code = run_explain(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
+        assert_eq!(code, Verdict::Ask.exit_code());
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("sql"), "got {text}");
+        assert!(text.contains("prompts"), "got {text}");
+    }
+
+    /// Issue #102's suppression, re-scoped (2026-08-24). A hook `ask` under
+    /// `dontAsk` is still an unsatisfiable prompt claude converts into a
+    /// denial that would strip the operator's own `permissions.allow`, so the
+    /// fall-through rule itself is unchanged. What changed is WHICH launches
+    /// can reach it: zirv no longer pins `dontAsk` on an interactive launch,
+    /// so the only two remaining populations are a headless zirv launch and
+    /// an operator who pinned `dontAsk` in their own trailing flags. Pinned
+    /// end to end against the argv the adapter actually builds, not a
+    /// hand-written mode string.
+    #[test]
+    fn the_dont_ask_suppression_is_reachable_only_from_the_headless_posture() {
+        use crate::commands::ctx::adapters::{AgentAdapter, claude::ClaudeAdapter};
+
+        let adapter = ClaudeAdapter::new(None);
+        let mode_of = |mode| -> String {
+            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            let position = args
+                .iter()
+                .position(|a| a == "--permission-mode")
+                .expect("a --permission-mode token");
+            args[position + 1].clone()
+        };
+
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "git push*--force*".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+
+        let emitted = hook_output(
+            "git push --force x",
+            &ask,
+            &mode_of(LaunchMode::Interactive),
+        )
+        .expect("an interactive launch must genuinely prompt");
+        assert!(
+            emitted.contains("\"permissionDecision\":\"ask\""),
+            "got {emitted}"
+        );
+
+        assert!(
+            hook_output("git push --force x", &ask, &mode_of(LaunchMode::Headless)).is_none(),
+            "a headless launch has nobody to prompt: the hook must fall through"
+        );
+
+        // The operator's own pin, unchanged: zirv never overrides an explicit
+        // operator choice, so the suppression still applies there.
+        assert!(hook_output("git push --force x", &ask, "dontAsk").is_none());
+    }
+
+    /// Deny is unaffected by mode, in every posture.
+    #[test]
+    fn hook_output_deny_still_denies_in_every_permission_mode() {
+        let deny = Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(Rule {
+                pattern: "sudo *".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        for mode in ["dontAsk", "default", ""] {
+            let output = hook_output("sudo rm -rf /", &deny, mode).expect("deny still denies");
+            assert!(
+                output.contains("\"permissionDecision\":\"deny\""),
+                "mode {mode}: got {output}"
+            );
+        }
+    }
+
     #[test]
     fn explain_names_the_matched_rule_and_its_origin() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2765,6 +2966,7 @@ mod tests {
         let empty: HashMap<String, String> = HashMap::new();
         let args = ExplainArgs {
             repo: repo.path().to_path_buf(),
+            mode: LaunchMode::Interactive,
             // The built-in ask pattern catches force-pushes in any argument
             // position and still reports its built-in origin.
             command: vec![
