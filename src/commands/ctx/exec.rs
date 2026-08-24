@@ -3686,6 +3686,28 @@ mod tests {
     /// appended the launch mail's text (already consumed, stale) instead of
     /// the nudge's; it must instead carry the nudge's guidance, and the
     /// launch mail's text must never reach argv a second time.
+    ///
+    /// KNOWN ISSUE (perf/test-suite-speed fix round 1, 2026-08-24): this
+    /// test fails deterministically under `cargo nextest run` on at least
+    /// one dev machine (100% reproducible, alone or as part of the suite)
+    /// while passing reliably under serial `cargo test`, on an unmodified
+    /// `exec.rs` -- i.e. a pre-existing latent issue, not something this
+    /// branch introduced, newly surfaced by nextest's one-fresh-process-
+    /// per-test model. The most likely mechanism, read from `supervise_run`
+    /// (`limit_hit`/`pace::scan_for_limit` against `tap.try_lines()`): the
+    /// "limit" stage's fake agent (`fake-codex-agent.sh`) prints its limit
+    /// line and exits immediately with no delay, so if the output tap's own
+    /// reader has not yet drained that line by the time `child.wait()`
+    /// observes the exit, the limit is missed and the run falls through as
+    /// a plain exit instead of parking -- a race that a cold, freshly
+    /// spawned process (nextest) is more likely to lose than a long-running
+    /// one (serial `cargo test`) that already paid its startup cost on an
+    /// earlier test. Not fixed here: it is a production-logic race
+    /// (`supervise_run`'s tap-vs-exit ordering), not a test-config issue,
+    /// and deserves its own investigation rather than a rushed change to a
+    /// hot supervision path. Included in `.config/nextest.toml`'s
+    /// `exec-nudge-restart` group for now (same family shape), though that
+    /// group does not fix this specific mechanism.
     #[test]
     fn a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_launch_mail() {
         let tmp = crate::commands::ctx::testenv::repo();

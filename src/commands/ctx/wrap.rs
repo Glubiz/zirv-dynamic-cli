@@ -6703,6 +6703,19 @@ mod tests {
         assert_eq!(status.exit_code(), 0);
     }
 
+    // KNOWN ISSUE (perf/test-suite-speed, item 3b follow-up): the 24-test
+    // wrap::/resume:: nesting-guard baseline on this machine is caused by
+    // this whole file's real-spawn harnesses never scrubbing
+    // `dash::spawnreq::DASH_REQUESTS_ENV` (deliberately excluded from
+    // `sessions::SUPERVISION_ENV`, which they do scrub) before spawning a
+    // real `zirv`, so a session that is itself running under `zirv ctx
+    // dash` -- as every one of these development sessions is -- leaks its
+    // own `ZIRV_CTX_DASH_REQUESTS` into the child and trips the guard.
+    // Adding that scrub fixes the guard trip, but unmasks a second, separate
+    // bug: `h.child.wait()` below has no timeout, and once the child's real
+    // execution path is no longer short-circuited by the guard, it hung
+    // (reproduced twice, ~20+ min combined). Fix both together -- the scrub
+    // alone trades a fast known failure for a hang, which is worse.
     #[cfg(unix)]
     #[test]
     fn a_broken_transcript_path_never_stops_the_session() {
