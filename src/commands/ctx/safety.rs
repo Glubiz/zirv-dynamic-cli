@@ -1323,6 +1323,167 @@ mod tests {
         );
     }
 
+    // -- THE ACCEPTANCE CORPUS ------------------------------------------
+    //
+    // The operator's primary acceptance criterion (2026-08-24), expressed as
+    // a test:
+    //
+    //   "The endless permission prompts are THE pain point zirv must fix for
+    //    every wrapped harness. Only truly dangerous commands may prompt; an
+    //    arbitrary read command (or everyday dev command) must NEVER prompt
+    //    -- including commands zirv has never seen."
+    //
+    // A failure here is a PRODUCT regression. Do not "fix" it by editing the
+    // corpus: if a command in the everyday list started prompting, the ask
+    // set or the interactive default is wrong, not this test.
+
+    /// Half one: nothing an ordinary developer does in a day may prompt, and
+    /// neither may anything zirv has never heard of.
+    #[test]
+    fn the_product_requirement_no_everyday_or_novel_command_ever_prompts() {
+        let policy = SafetyPolicy::default();
+        let everyday = [
+            // Reads.
+            "ls -la",
+            "cat src/main.rs",
+            "head -n 40 Cargo.toml",
+            "tail -f logs/app.log",
+            "rg TODO src/",
+            "grep -rn fixme .",
+            "find . -name '*.rs'",
+            "wc -l src/main.rs",
+            "git status",
+            "git diff --stat",
+            "git log --oneline -20",
+            "pwd",
+            "which cargo",
+            // Everyday mutation -- allowed, per the criterion.
+            "cargo build",
+            "cargo test --all-features",
+            "cargo fmt",
+            "cargo clippy --all-targets",
+            "npm install",
+            "npm run build",
+            "npx tsc --noEmit",
+            "pip install -r requirements.txt",
+            "go build ./...",
+            "make release",
+            "pytest -q",
+            "mkdir -p src/features/billing",
+            "touch src/features/billing/mod.rs",
+            "cp README.md README.bak",
+            "mv old.rs new.rs",
+            "git add -A",
+            "git commit -m \"wire the billing module\"",
+            "git checkout -b feature/billing",
+            "git pull --rebase",
+            "git push origin feature/billing",
+            "gh pr create --fill",
+            // Network reads.
+            "curl https://api.example.com/health",
+            "wget https://example.com/fixtures/data.csv",
+            // Read-only SQL (Task 6 wires the classifier; before that this
+            // line passes via the interactive default, after it via the
+            // classifier -- correct either way).
+            "psql -c 'SELECT count(*) FROM users'",
+            // zirv's own CLI, which the injected prompt mandates.
+            "zirv ctx status",
+            "zirv agent codex \"review this\"",
+            // Commands zirv has never classified at all -- the case a finite
+            // allow-list can never cover, and the reason the interactive
+            // default is `allow`.
+            "some-tool-zirv-has-never-heard-of --flag",
+            "bazel build //src:all",
+            "terraform plan",
+            "kubectl get pods",
+            "just build",
+            "deno task test",
+        ];
+        let mut prompted: Vec<&str> = Vec::new();
+        for command in everyday {
+            let verdict = evaluate(&policy, command, LaunchMode::Interactive).verdict;
+            if verdict != Verdict::Allow {
+                prompted.push(command);
+            }
+        }
+        assert!(
+            prompted.is_empty(),
+            "PRODUCT REQUIREMENT VIOLATED -- these everyday/novel commands would interrupt the \
+             operator: {prompted:#?}"
+        );
+    }
+
+    /// Half two: the short list that IS allowed to interrupt. Kept in the
+    /// same test module as half one on purpose -- the two together are the
+    /// requirement, and reading one without the other invites widening the
+    /// ask set until half one starts failing.
+    #[test]
+    fn the_product_requirement_only_genuinely_dangerous_commands_prompt() {
+        let policy = SafetyPolicy::default();
+        let dangerous = [
+            "rm -rf ./build",
+            "rm -fr /tmp/scratch",
+            "git push --force origin main",
+            "git push origin -f",
+            "git push origin --delete old-branch",
+            "git reset --hard HEAD~3",
+            "git rebase -i HEAD~5",
+            "git clean -fdx",
+            "find . -name '*.tmp' -delete",
+            "taskkill /IM node.exe /F",
+            "Stop-Process -Name node",
+            "pkill -f webpack",
+            "Remove-Item -Recurse -Force ./dist",
+            "dd if=backup.img of=/dev/sdb",
+            "mkfs.ext4 /dev/sdb1",
+            "diskpart",
+            "fdisk -l /dev/sda",
+            "reg delete HKCU\\Software\\Example /f",
+            "shutdown /r /t 0",
+        ];
+        let mut silent: Vec<&str> = Vec::new();
+        for command in dangerous {
+            let verdict = evaluate(&policy, command, LaunchMode::Interactive).verdict;
+            if verdict != Verdict::Ask {
+                silent.push(command);
+            }
+        }
+        assert!(
+            silent.is_empty(),
+            "these dangerous commands would run without asking (or died silently instead of \
+             asking): {silent:#?}"
+        );
+    }
+
+    /// The headless counterpart of half one: with nobody watching, an
+    /// unclassified command must NOT be waved through. This is the asymmetry
+    /// the two defaults exist for, asserted directly so a future change
+    /// cannot make headless permissive by copying the interactive answer.
+    #[test]
+    fn the_headless_posture_does_not_inherit_the_interactive_permissiveness() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "some-tool-zirv-has-never-heard-of --flag",
+            "terraform apply",
+            "kubectl delete pod x",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Headless).verdict,
+                Verdict::Ask,
+                "{command} must still fail closed with nobody present"
+            );
+        }
+        // The everyday allow-listed families are still silent headlessly --
+        // fail-closed is about the UNCLASSIFIED, not about everything.
+        for command in ["cargo build", "git status", "ls -la"] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Headless).verdict,
+                Verdict::Allow,
+                "{command} is explicitly allow-listed and must not prompt in any mode"
+            );
+        }
+    }
+
     // -- built-in defaults --------------------------------------------
 
     /// THE requirement, at the classifier level: an interactive launch must
