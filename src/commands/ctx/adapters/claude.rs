@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -343,6 +344,8 @@ pub struct ClaudeAdapter {
     home: Option<PathBuf>,
     #[cfg(test)]
     forced_file_support: Option<bool>,
+    #[cfg(test)]
+    forced_launch_settings: Option<Option<PathBuf>>,
 }
 
 impl ClaudeAdapter {
@@ -359,6 +362,10 @@ impl ClaudeAdapter {
             home: None,
             #[cfg(test)]
             forced_file_support: None,
+            #[cfg(test)]
+            forced_launch_settings: Some(Some(PathBuf::from(
+                "zirv-test-claude-launch-settings.json",
+            ))),
         }
     }
 
@@ -375,6 +382,21 @@ impl ClaudeAdapter {
     #[cfg(test)]
     pub fn with_file_support_forced(mut self, supported: bool) -> Self {
         self.forced_file_support = Some(supported);
+        self
+    }
+
+    /// Test seam: avoids touching the developer's real home while pinning
+    /// successful and failed settings-file materialization deterministically.
+    #[cfg(test)]
+    pub fn with_launch_settings_forced(mut self, path: Option<PathBuf>) -> Self {
+        self.forced_launch_settings = Some(path);
+        self
+    }
+
+    /// Test seam: exercises the real private-file writer under `with_home`.
+    #[cfg(test)]
+    fn with_live_launch_settings(mut self) -> Self {
+        self.forced_launch_settings = None;
         self
     }
 
@@ -398,6 +420,121 @@ impl ClaudeAdapter {
             .clone()
             .or_else(|| crate::utils::home_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Materializes the per-launch safety layer under the operator-owned
+    /// Zirv home. The write is atomic and private on Unix; if either step
+    /// fails, the caller deliberately falls back to Claude's native prompt
+    /// flow without adding a blanket Bash allow.
+    fn launch_settings_path(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(forced) = &self.forced_launch_settings {
+            return forced.clone();
+        }
+
+        let dir = self.home_dir().join(".zirv").join("runtime");
+        let path = dir.join("claude-launch-settings.json");
+        let result = (|| -> std::io::Result<()> {
+            super::super::state::create_private_dir_all(&dir)?;
+            let mut body = serde_json::to_string_pretty(&launch_settings_value())
+                .map_err(std::io::Error::other)?;
+            body.push('\n');
+            super::super::state::write_private(&path, &body)
+        })();
+        match result {
+            Ok(()) => Some(path),
+            Err(error) => {
+                warn_launch_settings_once(&path, &error);
+                None
+            }
+        }
+    }
+}
+
+/// A launch-local settings layer is stronger than relying on a one-time
+/// `zirv setup apply`: every process Zirv starts attests the classifier it is
+/// using, and a later reset or minimal Claude profile cannot silently remove
+/// it. The operator's ordinary settings remain in force for keys omitted
+/// here; Claude merges hook arrays across settings levels and applies the
+/// most restrictive PreToolUse verdict (`deny > ask > allow`).
+fn launch_settings_value() -> Value {
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut settings = serde_json::json!({
+        "disableAllHooks": false,
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx safety check"
+                }]
+            }]
+        },
+        "permissions": {
+            "ask": ["Bash(dangerouslyDisableSandbox:true)"],
+            "deny": [
+                "Read(~/.ssh/**)",
+                "Read(~/.aws/**)",
+                "Read(~/.azure/**)",
+                "Read(~/.config/gcloud/**)",
+                "Read(~/.config/gh/hosts.yml)",
+                "Read(~/.kube/config)",
+                "Read(~/.docker/config.json)",
+                "Read(~/.npmrc)",
+                "Read(~/.pypirc)",
+                "Read(~/.netrc)",
+                "Read(~/.git-credentials)"
+            ]
+        },
+        "env": {
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"
+        }
+    });
+
+    // Claude's OS sandbox is currently supported on macOS, Linux and WSL2,
+    // but not native Windows. On supported hosts it is the hard containment
+    // boundary beneath Zirv's semantic classifier: compatible Bash commands
+    // need no prompt, initialization fails closed, and an incompatible
+    // command may leave the sandbox only through the explicit ask rule above.
+    #[cfg(not(windows))]
+    if let Some(object) = settings.as_object_mut() {
+        object.insert(
+            "sandbox".to_string(),
+            serde_json::json!({
+            "enabled": true,
+            "autoAllowBashIfSandboxed": true,
+            "allowUnsandboxedCommands": true,
+            "failIfUnavailable": true,
+            "filesystem": {
+                "denyRead": [
+                    "~/.ssh",
+                    "~/.aws",
+                    "~/.azure",
+                    "~/.config/gcloud",
+                    "~/.config/gh/hosts.yml",
+                    "~/.kube/config",
+                    "~/.docker/config.json",
+                    "~/.npmrc",
+                    "~/.pypirc",
+                    "~/.netrc",
+                    "~/.git-credentials"
+                ]
+            }
+            }),
+        );
+    }
+
+    settings
+}
+
+fn warn_launch_settings_once(path: &Path, error: &std::io::Error) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "zirv: warning: could not attest Claude safety settings at {}: {error}; \
+             falling back to native permission prompts without widening Bash",
+            path.display()
+        );
     }
 }
 
@@ -874,8 +1011,9 @@ impl AgentAdapter for ClaudeAdapter {
     /// appended last, unchanged from before this method took a
     /// `SafetyPolicy` parameter.
     ///
-    /// Byte-identical to the pre-#83 hardcoded projection under the shipped
-    /// default, modulo the scratchpad rules below: `safety::builtin_deny`/
+    /// The permission-list tokens remain byte-identical to the pre-#83
+    /// hardcoded projection under the shipped default, modulo the scratchpad
+    /// rules below: `safety::builtin_deny`/
     /// `builtin_allow` strip exactly `SHIPPED_POSTURE_DENY`/`_ALLOW`'s own
     /// `Bash(...)` wrapper and this method re-adds it, so the round trip
     /// reproduces the original strings verbatim, in the original order --
@@ -905,6 +1043,13 @@ impl AgentAdapter for ClaudeAdapter {
     /// The conservative projection therefore emits no blanket Bash allow:
     /// the hook's explicit `"allow"` carries ordinary commands, while an
     /// ask verdict cannot accidentally be bypassed by native pre-approval.
+    /// Every projected launch also carries a Zirv-owned `--settings` layer
+    /// that attests this hook for the process. On macOS/Linux/WSL2 it enables
+    /// Claude's OS sandbox in auto-allow mode, fails closed if that boundary
+    /// cannot start, denies common credential paths to Bash and the built-in
+    /// Read tool, and scrubs cloud credentials from child environments.
+    /// Native Windows receives the hook/read/env layer but no unsupported
+    /// sandbox key.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
@@ -975,12 +1120,17 @@ impl AgentAdapter for ClaudeAdapter {
             "dontAsk"
         };
 
-        vec![
+        let mut args = vec![
             "--permission-mode".to_string(),
             permission_mode.to_string(),
             format!("--allowedTools={allow}"),
             format!("--disallowedTools={deny}"),
-        ]
+        ];
+        if let Some(path) = self.launch_settings_path() {
+            args.push("--settings".to_string());
+            args.push(path.display().to_string());
+        }
+        args
     }
 
     /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
@@ -1709,6 +1859,105 @@ mod tests {
         );
     }
 
+    /// Every supervised Claude launch carries a Zirv-owned, per-run settings
+    /// layer. This is the attestation that the command classifier is really
+    /// installed for this process; relying on a one-time global setup leaves
+    /// upgraded, reset, and deliberately minimal profiles unguarded.
+    #[test]
+    fn launch_settings_attest_the_safety_hook_and_sandbox_escape_gate() {
+        let settings = launch_settings_value();
+        assert_eq!(settings["disableAllHooks"], false);
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/0/matcher"),
+            Some(&serde_json::json!("Bash"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
+            Some(&serde_json::json!("zirv ctx safety check"))
+        );
+        assert!(
+            settings["permissions"]["ask"]
+                .as_array()
+                .is_some_and(|rules| rules
+                    .contains(&serde_json::json!("Bash(dangerouslyDisableSandbox:true)"))),
+            "an unsandboxed retry must cross an explicit approval boundary: {settings}"
+        );
+        assert_eq!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_settings_enable_containment_and_common_credential_denials() {
+        let settings = launch_settings_value();
+        assert_eq!(settings["sandbox"]["enabled"], true);
+        assert_eq!(settings["sandbox"]["autoAllowBashIfSandboxed"], true);
+        let files = settings["sandbox"]["filesystem"]["denyRead"]
+            .as_array()
+            .expect("credential file rules");
+        assert!(files.iter().any(|entry| entry == "~/.ssh"));
+        let read_denies = settings["permissions"]["deny"]
+            .as_array()
+            .expect("built-in Read credential denials");
+        assert!(read_denies.iter().any(|entry| entry == "Read(~/.ssh/**)"));
+    }
+
+    #[test]
+    fn every_projected_launch_names_the_attested_settings_file() {
+        let path = PathBuf::from("C:/safe/zirv-claude-launch-settings.json");
+        let adapter = ClaudeAdapter::new(None).with_launch_settings_forced(Some(path.clone()));
+        for mode in [
+            super::super::LaunchMode::Interactive,
+            super::super::LaunchMode::Headless,
+        ] {
+            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            let index = args
+                .iter()
+                .position(|arg| arg == "--settings")
+                .expect("the launch must carry its hook settings");
+            assert_eq!(args.get(index + 1), Some(&path.display().to_string()));
+        }
+    }
+
+    #[test]
+    fn launch_settings_are_materialized_atomically_under_the_zirv_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let adapter = ClaudeAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_live_launch_settings();
+        let path = adapter
+            .launch_settings_path()
+            .expect("settings materialized");
+        assert_eq!(
+            path,
+            home.path()
+                .join(".zirv/runtime/claude-launch-settings.json")
+        );
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("read materialized settings"),
+        )
+        .expect("valid settings JSON");
+        assert_eq!(written, launch_settings_value());
+    }
+
+    /// If the private settings file cannot be materialized, the projection
+    /// falls back to Design B: no broad Bash allow. Claude's native flow may
+    /// prompt, but a missing guard can never turn into silent full access.
+    #[test]
+    fn an_unattested_launch_falls_back_without_widening_bash() {
+        let adapter = ClaudeAdapter::new(None).with_launch_settings_forced(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        assert!(!args.iter().any(|arg| arg == "--settings"));
+        let allow = args
+            .iter()
+            .find(|arg| arg.starts_with("--allowedTools="))
+            .expect("allowed tools");
+        assert!(!allow.contains("Bash(*)"), "unattested widening: {allow}");
+    }
+
     /// THE requirement, at the argv level: an interactive launch must not
     /// carry a finite Bash allow-list under a prompting permission mode,
     /// because everything off the end of that list is a prompt. Design A
@@ -1823,7 +2072,7 @@ mod tests {
             &Default::default(),
             super::super::LaunchMode::Headless,
         );
-        assert_eq!(args.len(), 4, "got {args:?}");
+        assert_eq!(args.len(), 6, "got {args:?}");
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1926,6 +2175,8 @@ mod tests {
                 "dontAsk".to_string(),
                 format!("--allowedTools={}", expected_allow.join(",")),
                 format!("--disallowedTools={}", expected_deny.join(",")),
+                "--settings".to_string(),
+                "zirv-test-claude-launch-settings.json".to_string(),
             ]
         );
     }

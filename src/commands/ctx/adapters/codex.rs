@@ -57,6 +57,11 @@ pub struct CodexAdapter {
     /// the machine running the test suite.
     #[cfg(test)]
     forced_on_request_approval_support: Option<bool>,
+    /// Test seam for the current CLI's `--approve-for-me` automatic
+    /// boundary reviewer. Kept separate from `on-request`: older builds may
+    /// support the approval mode without supporting automatic review.
+    #[cfg(test)]
+    forced_auto_review_support: Option<bool>,
 }
 
 impl CodexAdapter {
@@ -74,6 +79,8 @@ impl CodexAdapter {
             forced_ignore_flags_support: None,
             #[cfg(test)]
             forced_on_request_approval_support: None,
+            #[cfg(test)]
+            forced_auto_review_support: None,
         }
     }
 
@@ -98,6 +105,13 @@ impl CodexAdapter {
         self
     }
 
+    /// Test seam: see the field's own doc comment.
+    #[cfg(test)]
+    pub fn with_auto_review_forced(mut self, supported: bool) -> Self {
+        self.forced_auto_review_support = Some(supported);
+        self
+    }
+
     /// Whether the installed codex-cli's own top-level `codex --help`
     /// documents the `on-request` value of `-a, --ask-for-approval`
     /// (2026-08-24, cross-harness permissions design).
@@ -119,6 +133,17 @@ impl CodexAdapter {
             return forced;
         }
         probe_on_request_approval_support(&self.program, &self.bin_args)
+    }
+
+    /// Whether the installed top-level CLI documents `--approve-for-me`,
+    /// which routes only sandbox-boundary approvals through Codex's own
+    /// security reviewer. Unknown/older binaries retain plain `on-request`.
+    fn auto_review_supported(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_auto_review_support {
+            return forced;
+        }
+        probe_auto_review_support(&self.program, &self.bin_args)
     }
 
     /// Issue #89: whether the installed codex-cli's own `codex exec --help`
@@ -277,6 +302,7 @@ const ON_REQUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// point at a different binary, or a different version resolved off a
 /// different `PATH`, and each has its own answer.
 static ON_REQUEST_APPROVAL_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
+static AUTO_REVIEW_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
 
 fn probe_on_request_approval_support(program: &str, bin_args: &[String]) -> bool {
     let key = (PathBuf::from(program), bin_args.to_vec());
@@ -292,11 +318,37 @@ fn probe_on_request_approval_support(program: &str, bin_args: &[String]) -> bool
     detected
 }
 
+fn probe_auto_review_support(program: &str, bin_args: &[String]) -> bool {
+    let key = (PathBuf::from(program), bin_args.to_vec());
+    let cache = AUTO_REVIEW_SUPPORT.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = cache.lock() else {
+        return false;
+    };
+    if let Some(cached) = map.get(&key) {
+        return *cached;
+    }
+    let detected = detect_top_level_help_marker(program, bin_args, "--approve-for-me");
+    map.insert(key, detected);
+    detected
+}
+
 /// Runs `<program> [bin_args] --help` and reports whether its output names
 /// BOTH `--ask-for-approval` and the `on-request` value. Any doubt at all --
 /// binary missing, timeout, output missing either string -- reads as
 /// unsupported, and the caller keeps `never`.
 fn detect_on_request_approval(program: &str, bin_args: &[String]) -> bool {
+    detect_top_level_help_markers(program, bin_args, &["--ask-for-approval", "on-request"])
+}
+
+fn detect_top_level_help_marker(program: &str, bin_args: &[String], marker: &str) -> bool {
+    detect_top_level_help_markers(program, bin_args, &[marker])
+}
+
+/// Runs one bounded top-level help probe and requires every named marker.
+/// This is shared by the approval-mode and automatic-review capability
+/// checks so their resolution, cmd-shim guard, timeout and failure polarity
+/// cannot drift.
+fn detect_top_level_help_markers(program: &str, bin_args: &[String], markers: &[&str]) -> bool {
     // The same resolution the real launch uses, exactly like
     // `detect_ignore_flags` -- otherwise the probe and the spawn could
     // disagree on Windows about whether this is a `.cmd` shim.
@@ -341,7 +393,7 @@ fn detect_on_request_approval(program: &str, bin_args: &[String]) -> bool {
     while Instant::now() < deadline {
         if matches!(child.try_wait(), Ok(Some(_))) {
             let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
-            return text.contains("--ask-for-approval") && text.contains("on-request");
+            return markers.iter().all(|marker| text.contains(marker));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -670,7 +722,8 @@ impl AgentAdapter for CodexAdapter {
              sandbox blocks -- paired with --sandbox read-only when repo_fs_write/shell_exec \
              are also denied, which is what actually makes this hold";
         // 2026-08-24: the interactive posture pins `--ask-for-approval
-        // on-request` when the installed binary's own `--help` documents it.
+        // on-request` when the installed binary's own `--help` documents it,
+        // plus `--approve-for-me` when independently advertised.
         // Degraded, never Enforced, and the wording has to carry two facts an
         // operator would otherwise assume wrongly: what actually contains the
         // damage here is the SANDBOX, not a command classifier; and codex
@@ -679,10 +732,11 @@ impl AgentAdapter for CodexAdapter {
         // silence and everyday-command silence are not carried onto this
         // harness the way they are onto claude.
         const APPROVAL_ASK_INTERACTIVE: &str = "-a, --ask-for-approval on-request paired with --sandbox workspace-write, probed \
-             live against the installed codex-cli's own --help before it is used: the sandbox is \
-             what contains damage, and codex escalates on its own sandbox-boundary decision with \
-             no per-command mechanism to receive zirv's [safety] classification, so approval \
-             granularity here is codex's own rather than zirv's";
+             live against the installed codex-cli's own --help before it is used; when separately \
+             advertised, --approve-for-me routes those boundary requests through codex's native \
+             security reviewer: the sandbox is what contains damage, and codex has no per-command \
+             mechanism to receive zirv's [safety] classification, so approval granularity here is \
+             codex's own rather than zirv's";
 
         match (capability, stance) {
             (Capability::RepoFsWrite, Stance::Deny) => CapabilityDescriptor::degraded(SANDBOX),
@@ -757,8 +811,11 @@ impl AgentAdapter for CodexAdapter {
     ///
     /// **Interactive** upgrades the approval mode to `on-request`: the
     /// session works freely inside the workspace sandbox and escalates only
-    /// when it needs to leave it, so the operator sees a prompt when
-    /// something real is at stake and not otherwise.
+    /// when it needs to leave it. When the installed CLI also advertises
+    /// `--approve-for-me`, its native security reviewer auto-clears lower-
+    /// risk boundary requests, denies critical ones, and leaves only high-
+    /// risk decisions to the operator. Both capabilities are probed
+    /// independently so older CLIs retain the last posture they support.
     ///
     /// Deliberately **not** `untrusted`, which was this design's first
     /// answer: `untrusted` prompts for everything outside codex's own narrow
@@ -789,17 +846,22 @@ impl AgentAdapter for CodexAdapter {
         mode: super::LaunchMode,
     ) -> Vec<String> {
         let _ = (sandbox, safety);
-        let approval = if mode.is_interactive() && self.on_request_approval_supported() {
+        let interactive_approval = mode.is_interactive() && self.on_request_approval_supported();
+        let approval = if interactive_approval {
             "on-request"
         } else {
             "never"
         };
-        vec![
+        let mut args = vec![
             "--sandbox".to_string(),
             "workspace-write".to_string(),
             "--ask-for-approval".to_string(),
             approval.to_string(),
-        ]
+        ];
+        if interactive_approval && self.auto_review_supported() {
+            args.push("--approve-for-me".to_string());
+        }
+        args
     }
 
     fn launch_prefix_len(&self) -> usize {
@@ -1564,7 +1626,9 @@ mod tests {
     /// forbids.
     #[test]
     fn an_interactive_launch_uses_the_low_noise_on_request_approval_mode() {
-        let adapter = CodexAdapter::new(None).with_on_request_approval_forced(true);
+        let adapter = CodexAdapter::new(None)
+            .with_on_request_approval_forced(true)
+            .with_auto_review_forced(true);
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
@@ -1577,12 +1641,32 @@ mod tests {
                 "workspace-write".to_string(),
                 "--ask-for-approval".to_string(),
                 "on-request".to_string(),
+                "--approve-for-me".to_string(),
             ]
         );
         assert!(
             !args.iter().any(|a| a == "untrusted"),
             "untrusted is the noisy polarity this task exists to avoid: {args:?}"
         );
+    }
+
+    #[test]
+    fn interactive_auto_review_is_capability_probed_and_never_used_headlessly() {
+        for (mode, supported, expected) in [
+            (super::super::LaunchMode::Interactive, true, true),
+            (super::super::LaunchMode::Interactive, false, false),
+            (super::super::LaunchMode::Headless, true, false),
+        ] {
+            let adapter = CodexAdapter::new(None)
+                .with_on_request_approval_forced(true)
+                .with_auto_review_forced(supported);
+            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            assert_eq!(
+                args.iter().any(|arg| arg == "--approve-for-me"),
+                expected,
+                "mode={mode:?}, supported={supported}: {args:?}"
+            );
+        }
     }
 
     /// The fail-closed half: an installed codex whose own `--help` does not
@@ -1592,7 +1676,9 @@ mod tests {
     /// meant to tune.
     #[test]
     fn an_interactive_launch_falls_back_to_never_when_the_probe_is_unsure() {
-        let adapter = CodexAdapter::new(None).with_on_request_approval_forced(false);
+        let adapter = CodexAdapter::new(None)
+            .with_on_request_approval_forced(false)
+            .with_auto_review_forced(false);
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
@@ -1615,7 +1701,9 @@ mod tests {
     #[test]
     fn a_headless_launch_keeps_never_regardless_of_what_the_probe_says() {
         for supported in [true, false] {
-            let adapter = CodexAdapter::new(None).with_on_request_approval_forced(supported);
+            let adapter = CodexAdapter::new(None)
+                .with_on_request_approval_forced(supported)
+                .with_auto_review_forced(supported);
             let args = adapter.default_sandbox_args(
                 &Default::default(),
                 &Default::default(),
@@ -1637,14 +1725,14 @@ mod tests {
     /// The invariant that holds whatever is installed -- the assertion that
     /// is safe to make without the forcing seam.
     #[test]
-    fn every_codex_posture_is_a_sandboxed_four_token_pair() {
+    fn every_codex_posture_keeps_the_explicit_workspace_sandbox_pair() {
         let adapter = CodexAdapter::new(None);
         for mode in [
             super::super::LaunchMode::Interactive,
             super::super::LaunchMode::Headless,
         ] {
             let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
-            assert_eq!(args.len(), 4, "got {args:?}");
+            assert!(matches!(args.len(), 4 | 5), "got {args:?}");
             assert_eq!(
                 &args[0..2],
                 &["--sandbox".to_string(), "workspace-write".to_string()]
@@ -1665,7 +1753,9 @@ mod tests {
     /// reports the gap rather than faking parity with claude.
     #[test]
     fn codex_projects_no_per_command_safety_rules_at_all() {
-        let adapter = CodexAdapter::new(None).with_on_request_approval_forced(true);
+        let adapter = CodexAdapter::new(None)
+            .with_on_request_approval_forced(true)
+            .with_auto_review_forced(false);
         let safety = crate::commands::ctx::safety::SafetyPolicy::default();
         let args = adapter.default_sandbox_args(
             &Default::default(),

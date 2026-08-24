@@ -439,21 +439,41 @@ fn collapse_whitespace(s: &str) -> String {
     out
 }
 
-/// Splits `command` on shell separators (`;`, `&&`, `||`, `|`, newline).
-/// Not a shell parser: quoting is not tracked, so a separator character
-/// inside a quoted string (e.g. `bash -c 'a; b'`) still splits -- an
-/// explicit non-goal, see `evaluate`'s own doc comment and `Modules/Command
-/// Safety.md`. `&&`/`||` are matched before a lone `|`, so a two-character
+/// Splits `command` on shell separators (`;`, `&&`, `||`, `|`, newline)
+/// while keeping quoted data together. An outer shell wrapper is unwrapped
+/// and passed through this function again, so `bash -c 'a; b'` still yields
+/// both executable nodes without treating a harmless `printf 'a; b'` string
+/// as code. `&&`/`||` are matched before a lone `|`, so a two-character
 /// operator is never split in half.
 fn split_segments(command: &str) -> Vec<String> {
     let chars: Vec<char> = command.chars().collect();
     let mut segments = Vec::new();
     let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
-        if c == ';' || c == '\n' {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            i += 1;
+        } else if c == '\\' && quote != Some('\'') {
+            current.push(c);
+            escaped = true;
+            i += 1;
+        } else if let Some(active) = quote {
+            current.push(c);
+            if c == active {
+                quote = None;
+            }
+            i += 1;
+        } else if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+            current.push(c);
+            i += 1;
+        } else if c == ';' || c == '\n' {
             segments.push(std::mem::take(&mut current));
             i += 1;
         } else if (c == '&' && next == Some('&')) || (c == '|' && next == Some('|')) {
@@ -469,6 +489,147 @@ fn split_segments(command: &str) -> Vec<String> {
     }
     segments.push(current);
     segments
+}
+
+const MAX_STRUCTURAL_DEPTH: usize = 16;
+const MAX_STRUCTURAL_CANDIDATES: usize = 128;
+
+/// Finds the `)` closing a `$(` command substitution. Nested substitutions
+/// are skipped as their own balanced units and quoted parentheses stay data.
+/// The depth bound makes hostile hook input incapable of growing the call
+/// stack without limit; the OS sandbox remains the independent hard boundary
+/// beneath any input too exotic for this intentionally small parser.
+fn command_substitution_end(chars: &[char], start: usize, depth: usize) -> Option<usize> {
+    if depth >= MAX_STRUCTURAL_DEPTH {
+        return None;
+    }
+    let mut parens = 1usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut i = start;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' && quote.is_none() {
+            quote = Some('\'');
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            quote = if quote == Some('"') { None } else { Some('"') };
+            i += 1;
+            continue;
+        }
+        if c == '$' && chars.get(i + 1) == Some(&'(') {
+            let nested_end = command_substitution_end(chars, i + 2, depth + 1)?;
+            i = nested_end + 1;
+            continue;
+        }
+        if quote == Some('"') {
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            parens = parens.saturating_add(1);
+        } else if c == ')' {
+            parens -= 1;
+            if parens == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn backtick_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, c) in chars[start..].iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if *c == '\\' {
+            escaped = true;
+        } else if *c == '`' {
+            return Some(start + offset);
+        }
+    }
+    None
+}
+
+/// Extracts executable text from `$()` and legacy backtick substitutions.
+/// Single-quoted occurrences stay inert data; double quotes still permit
+/// substitutions, matching POSIX shell semantics. Malformed/unbalanced text
+/// yields no invented candidate rather than turning an arbitrary suffix into
+/// a destructive command.
+fn command_substitutions(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < chars.len() && out.len() < MAX_STRUCTURAL_CANDIDATES {
+        let c = chars[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' && quote.is_none() {
+            quote = Some('\'');
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            quote = if quote == Some('"') { None } else { Some('"') };
+            i += 1;
+            continue;
+        }
+        if c == '$' && chars.get(i + 1) == Some(&'(') {
+            if let Some(end) = command_substitution_end(&chars, i + 2, 0) {
+                out.push(chars[i + 2..end].iter().collect());
+                i = end + 1;
+                continue;
+            }
+        }
+        if c == '`'
+            && quote != Some('\'')
+            && let Some(end) = backtick_end(&chars, i + 1)
+        {
+            out.push(chars[i + 1..end].iter().collect());
+            i = end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Strips a single matching pair of leading/trailing `'`/`"` quotes, if
@@ -510,9 +671,7 @@ fn strip_program_dir(segment: &str) -> String {
 /// (quotes stripped) when `segment`'s leading token names one of these
 /// shells and the next token selects its inline-command flag. `None`
 /// otherwise -- not a recognised shell-wrapper invocation, or something a
-/// *second* layer of unwrapping would be needed for (`bash -c 'bash -c
-/// ...'`), which this module deliberately does not chase -- see `evaluate`'s
-/// own doc comment.
+/// otherwise. The caller applies this recursively with a hard depth bound.
 fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
     let bare = strip_program_dir(segment);
     let mut parts = bare.splitn(2, ' ');
@@ -520,15 +679,19 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
     let rest = parts.next().unwrap_or("").trim();
 
     if matches!(program.as_str(), "bash" | "sh" | "zsh") {
-        let after_flag = rest.strip_prefix("-c").map(str::trim_start).unwrap_or(rest);
+        let mut rest_parts = rest.splitn(2, ' ');
+        let flag = rest_parts.next().unwrap_or("");
+        if !flag.starts_with('-') || !flag[1..].contains('c') {
+            return None;
+        }
+        let after_flag = rest_parts.next().unwrap_or("").trim_start();
         return Some(strip_quotes(after_flag).to_string());
     }
     if matches!(program.as_str(), "cmd" | "cmd.exe") {
         let after_flag = rest
             .strip_prefix("/c")
             .or_else(|| rest.strip_prefix("/C"))
-            .map(str::trim_start)
-            .unwrap_or(rest);
+            .map(str::trim_start)?;
         return Some(strip_quotes(after_flag).to_string());
     }
     if matches!(
@@ -543,29 +706,49 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
     None
 }
 
-/// Every string [`evaluate`] checks `command` against: the raw command
-/// first (so a whole-string pattern like the built-in `"* | sh"` keeps
-/// matching exactly as it did before this fix), then one entry per shell
-/// separator segment (whitespace-collapsed, leading-directory stripped),
-/// plus -- for a segment that is itself a one-layer shell-wrapper invocation
-/// -- its unwrapped inner command, normalized the same way. See `evaluate`'s
-/// own doc comment for what this deliberately does not chase (nested
-/// wrapping, quoted separators, encoding/`eval`).
-fn normalize_segments(command: &str) -> Vec<String> {
-    let mut candidates = vec![command.to_string()];
+fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if candidates.len() < MAX_STRUCTURAL_CANDIDATES && !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<String>) {
+    if depth > MAX_STRUCTURAL_DEPTH || candidates.len() >= MAX_STRUCTURAL_CANDIDATES {
+        return;
+    }
+    let whole = collapse_whitespace(command);
+    if !whole.is_empty() {
+        push_candidate(candidates, strip_program_dir(&whole));
+    }
     for raw_segment in split_segments(command) {
+        if candidates.len() >= MAX_STRUCTURAL_CANDIDATES {
+            break;
+        }
         let collapsed = collapse_whitespace(&raw_segment);
         if collapsed.is_empty() {
             continue;
         }
-        candidates.push(strip_program_dir(&collapsed));
-        if let Some(inner) = unwrap_shell_wrapper(&collapsed) {
-            let inner_collapsed = collapse_whitespace(&inner);
-            if !inner_collapsed.is_empty() {
-                candidates.push(strip_program_dir(&inner_collapsed));
+        push_candidate(candidates, strip_program_dir(&collapsed));
+        if depth < MAX_STRUCTURAL_DEPTH {
+            if let Some(inner) = unwrap_shell_wrapper(&collapsed) {
+                visit_executable_nodes(&inner, depth + 1, candidates);
+            }
+            for inner in command_substitutions(&raw_segment) {
+                visit_executable_nodes(&inner, depth + 1, candidates);
             }
         }
     }
+}
+
+/// Every executable string [`evaluate`] checks: the raw command first (so a
+/// whole-string pattern like `"* | sh"` is stable), then quote-aware compound
+/// segments, recursively unwrapped inline shells, and command substitutions.
+/// The fixed depth/candidate ceilings keep hook input deterministic and
+/// bounded; encoding, dynamic `eval`, variable expansion and script-file
+/// contents remain outside this lightweight analyzer's declared scope.
+fn normalize_segments(command: &str) -> Vec<String> {
+    let mut candidates = vec![command.to_string()];
+    visit_executable_nodes(command, 0, &mut candidates);
     candidates
 }
 
@@ -1172,6 +1355,8 @@ struct HookToolPayload {
 #[serde(default)]
 struct HookToolInput {
     command: String,
+    #[serde(rename = "dangerouslyDisableSandbox")]
+    dangerously_disable_sandbox: bool,
 }
 
 impl HookToolPayload {
@@ -1370,7 +1555,26 @@ fn run_check_hook_mode<W: Write>(cfg: &CtxConfig, w: &mut W, stdin: &str) -> Ctx
     } else {
         super::adapters::LaunchMode::Interactive
     };
-    let outcome = evaluate(&cfg.safety, command, mode);
+    let mut outcome = evaluate(&cfg.safety, command, mode);
+    // Claude marks an explicit retry outside its OS sandbox on the Bash
+    // input itself. That boundary must never inherit an ordinary command's
+    // silent `allow`: a human approves it interactively, while a headless
+    // worker has nobody to ask and is denied. Preserve a stronger semantic
+    // deny and its more specific explanation when the command already hit
+    // one.
+    if payload.tool_input.dangerously_disable_sandbox && outcome.verdict != Verdict::Deny {
+        outcome = Outcome {
+            verdict: if mode.is_interactive() {
+                Verdict::Ask
+            } else {
+                Verdict::Deny
+            },
+            matched: Some(Rule {
+                pattern: "<sandbox: unsandboxed retry>".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+    }
     if let Some(output) = hook_output(command, &outcome, &payload.permission_mode) {
         writeln!(w, "{output}")?;
     }
@@ -1745,6 +1949,43 @@ mod tests {
             Verdict::Ask,
             "powershell -Command must be unwrapped"
         );
+    }
+
+    /// Dippy's most useful transferable property is structural coverage:
+    /// every executable node contributes a verdict and the worst one wins.
+    /// Zirv keeps its own allow-on-unknown interactive contract, but nested
+    /// substitutions and recursively wrapped shells cannot hide a known
+    /// destructive operation behind that outer allow.
+    #[test]
+    fn evaluate_checks_nested_executable_nodes_most_restrictive_first() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "echo $(rm -rf ./target)",
+            "echo \"$(psql -c 'DROP TABLE users')\"",
+            "bash -c \"sh -c 'rm -rf ./target'\"",
+            "echo `git push --force origin main`",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "nested executable must narrow the outer allow: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_command_text_is_not_misclassified_as_an_executable_node() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "printf '%s\\n' 'cargo test; rm -rf ./target'",
+            "printf '%s\\n' '$(rm -rf ./target)'",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "quoted data must stay data: {command}"
+            );
+        }
     }
 
     /// A whole-string pattern (the built-in `"* | sh"` deny, written against
@@ -2743,6 +2984,43 @@ mod tests {
             HookToolPayload::parse(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)
                 .expect("parses");
         assert_eq!(payload.permission_mode, "");
+    }
+
+    #[test]
+    fn hook_tool_payload_parses_the_unsandboxed_retry_marker() {
+        let payload = HookToolPayload::parse(
+            r#"{"tool_name":"Bash","tool_input":{"command":"make release","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#,
+        )
+        .expect("parses");
+        assert!(payload.tool_input.dangerously_disable_sandbox);
+
+        let ordinary =
+            HookToolPayload::parse(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)
+                .expect("parses");
+        assert!(!ordinary.tool_input.dangerously_disable_sandbox);
+    }
+
+    #[test]
+    fn an_unsandboxed_retry_asks_interactively_and_denies_headlessly() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        for (mode, expected) in [("default", "ask"), ("dontAsk", "deny")] {
+            let stdin = format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"some-unknown-tool --flag","dangerouslyDisableSandbox":true}},"permission_mode":"{mode}"}}"#
+            );
+            let mut out = Vec::new();
+            run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                text.contains(&format!(r#""permissionDecision":"{expected}""#)),
+                "mode {mode}: got {text}"
+            );
+            assert!(text.contains("unsandboxed retry"), "got {text}");
+        }
     }
 
     /// End-to-end through `run_check_hook_mode`, the same core `run_check`'s
