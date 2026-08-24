@@ -1672,6 +1672,11 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["safety", "interactive_default"],
         "ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT",
     ),
+    // `safety.sql` (2026-08-24): same reasoning as the two `safety` keys
+    // above. Turning the SQL classifier off removes an `Ask` it would
+    // otherwise impose on a write statement reaching a broad allow rule or
+    // the permissive interactive default -- loosening only.
+    (&["safety", "sql"], "ZIRV_CTX_SAFETY_SQL"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -2149,6 +2154,31 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// SECURITY: `safety.sql` joins `safety.allow`/`safety.default`/
+    /// `safety.interactive_default` as operator-only. Turning the SQL
+    /// classifier off removes the `Ask` narrowing it applies to a write
+    /// statement that would otherwise reach the permissive interactive
+    /// default -- there is no narrowing reading of `off`.
+    #[test]
+    fn a_repo_ctx_toml_cannot_turn_the_sql_classifier_off() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[safety]\nsql = \"off\"\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set safety.sql");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a security refusal: {err}"
+        );
     }
 
     #[test]
@@ -4192,6 +4222,7 @@ mod tests {
         ("safety", "allow"),
         ("safety", "default"),
         ("safety", "interactive_default"),
+        ("safety", "sql"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like

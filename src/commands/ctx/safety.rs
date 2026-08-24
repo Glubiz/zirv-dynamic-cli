@@ -151,6 +151,40 @@ pub struct Rule {
 /// `resolve`'s output, and what `CtxConfig::safety` holds after `load`.
 /// `Clone`/`PartialEq` mirror `CtxConfig`'s own derives, which this type is
 /// a field of.
+/// Whether the SQL statement classifier ([`sql_outcome`]) participates in
+/// [`evaluate`].
+///
+/// `On` is the shipped default. `Off` is the operator's own escape hatch for
+/// a workflow the classifier prompts on too often, and it is `REPO_FORBIDDEN`
+/// (`config.rs`) for the same reason `safety.allow`/`safety.default`/
+/// `safety.interactive_default` are: turning it off removes the classifier's
+/// `Ask` narrowing, which can only ever make the effective policy looser, so
+/// there is no narrowing reading of `off` for a repo layer to be trusted with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SqlMode {
+    #[default]
+    On,
+    Off,
+}
+
+impl SqlMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SqlMode::On => "on",
+            SqlMode::Off => "off",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "on" => Some(SqlMode::On),
+            "off" => Some(SqlMode::Off),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SafetyPolicy {
     pub deny: Vec<Rule>,
@@ -170,6 +204,7 @@ pub struct SafetyPolicy {
     /// is the loosest verdict there is, so a checkout that could set it
     /// could silence every prompt for the session it sits in.
     pub interactive_default: Verdict,
+    pub sql: SqlMode,
 }
 
 impl Default for SafetyPolicy {
@@ -184,6 +219,7 @@ impl Default for SafetyPolicy {
             allow: builtin_allow(),
             default: Verdict::Ask,
             interactive_default: Verdict::Allow,
+            sql: SqlMode::On,
         }
     }
 }
@@ -333,24 +369,45 @@ fn evaluate_candidates(policy: &SafetyPolicy, command: &str, fallback: Verdict) 
     })
 }
 
-/// Matches `command` against `policy` for one launch posture.
+/// Matches `command` against `policy` for one launch posture, then lets the
+/// SQL classifier ([`sql_outcome`]) adjust the answer within two strict
+/// rules:
 ///
-/// `mode` decides ONE thing: the verdict for a command that matched no rule
-/// at all. Interactively that is `policy.interactive_default` (`Allow` by
-/// default -- the primary acceptance criterion: a command zirv has never seen
-/// must not prompt), headlessly `policy.default` (`Ask`, unchanged, because
-/// nobody is present). It never changes what a MATCHED rule says: a
-/// dangerous family asks and a denied family dies in both postures.
+/// - It may **narrow** to `Ask` whenever it cannot prove the statement
+///   read-only. A broad `Bash(psql *)` allow rule -- or, interactively, the
+///   permissive unmatched-command default -- must not become a way to run
+///   `DROP TABLE` unprompted.
+/// - It may **widen** to `Allow` only when no rule matched at all
+///   (`matched.is_none()`, i.e. the mode's own default was about to apply).
+///   An operator's or a repo's own `ask`/`deny` entry naming the client is an
+///   explicit statement about that client and the classifier does not
+///   overrule it; `Deny` is never overridden in any case.
 ///
-/// Pure: no clock, filesystem or environment access, so identical inputs
-/// always produce an identical `Outcome` -- the same discipline `rot.rs`
-/// holds its own scoring functions to.
+/// `mode` still decides only the unmatched-command verdict -- see
+/// [`SafetyPolicy::default_verdict`]. Everything else about the pre-existing
+/// behaviour is unchanged: `command` is checked raw and per normalized
+/// segment, and the most restrictive outcome across all of them wins (see
+/// [`evaluate_candidates`]).
+///
+/// Pure: no clock, filesystem or environment access.
 pub fn evaluate(
     policy: &SafetyPolicy,
     command: &str,
     mode: super::adapters::LaunchMode,
 ) -> Outcome {
-    evaluate_candidates(policy, command, policy.default_verdict(mode))
+    let base = evaluate_candidates(policy, command, policy.default_verdict(mode));
+    if policy.sql == SqlMode::Off {
+        return base;
+    }
+    let Some(sql) = sql_outcome(command) else {
+        return base;
+    };
+    match (base.verdict, sql.verdict) {
+        (Verdict::Deny, _) => base,
+        (Verdict::Allow, Verdict::Ask) => sql,
+        (_, Verdict::Allow) if base.matched.is_none() => sql,
+        _ => base,
+    }
 }
 
 /// Collapses runs of ASCII/Unicode whitespace to a single space and trims
@@ -899,6 +956,7 @@ struct SafetyLayer {
     allow: Vec<String>,
     default: Option<Verdict>,
     interactive_default: Option<Verdict>,
+    sql: Option<SqlMode>,
 }
 
 fn parse_layer(layer: Option<toml::Value>, origin: &str) -> CtxResult<SafetyLayer> {
@@ -997,12 +1055,22 @@ pub fn resolve(
         None => home_layer.interactive_default.unwrap_or(Verdict::Allow),
     };
 
+    let sql = match env("ZIRV_CTX_SAFETY_SQL") {
+        Some(raw) => SqlMode::parse(&raw)
+            .ok_or_else(|| format!("ZIRV_CTX_SAFETY_SQL: expected on or off, got '{raw}'"))?,
+        // Home-layer only, exactly like `default`/`interactive_default`
+        // above: this key is `REPO_FORBIDDEN`, and this arm never reads
+        // `repo_layer.sql` -- the same defense in depth `allow` already has.
+        None => home_layer.sql.unwrap_or_default(),
+    };
+
     Ok(SafetyPolicy {
         deny,
         ask,
         allow,
         default,
         interactive_default,
+        sql,
     })
 }
 
@@ -1256,6 +1324,7 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W, env: EnvLookup<'_>) -> Ctx
         "default (interactive): {}",
         cfg.safety.interactive_default.label()
     )?;
+    writeln!(w, "sql classifier: {}", cfg.safety.sql.label())?;
     for (label, rules) in [
         ("deny", &cfg.safety.deny),
         ("ask", &cfg.safety.ask),
@@ -1387,6 +1456,7 @@ mod tests {
             allow: allow.iter().map(|p| rule(p)).collect(),
             default,
             interactive_default: Verdict::Allow,
+            sql: SqlMode::On,
         }
     }
 
@@ -1778,6 +1848,126 @@ mod tests {
                 .contains("not provably"),
             "the ask reason must say what it could not prove"
         );
+    }
+
+    /// The classifier only ever speaks where no rule spoke. Nothing in the
+    /// shipped policy matches `psql`, so on a headless launch the `ask`
+    /// default would have applied -- the upgrade to `allow` is what makes
+    /// read-only SQL silent even there.
+    #[test]
+    fn evaluate_upgrades_a_read_only_statement_that_no_rule_matched() {
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            assert_eq!(
+                evaluate(&policy, "psql -c 'SELECT 1'", mode).verdict,
+                Verdict::Allow,
+                "{mode:?}"
+            );
+        }
+        // And the narrowing direction reaches the interactive default, which
+        // would otherwise have allowed the write outright.
+        assert_eq!(
+            evaluate(
+                &policy,
+                "psql -c 'DROP TABLE users'",
+                LaunchMode::Interactive,
+            )
+            .verdict,
+            Verdict::Ask
+        );
+        assert_eq!(
+            evaluate(&policy, "psql -c 'DROP TABLE users'", LaunchMode::Headless,).verdict,
+            Verdict::Ask
+        );
+    }
+
+    /// SECURITY: the upgrade must never undo an operator's or a repo's own
+    /// narrowing. A `[safety] ask` entry naming the client wins over a
+    /// provably read-only statement -- the operator asked to be asked.
+    #[test]
+    fn the_sql_upgrade_never_overrides_a_matched_rule() {
+        let asked = policy_with(&[], &["psql *"], &[], Verdict::Ask);
+        assert_eq!(
+            evaluate(&asked, "psql -c 'SELECT 1'", LaunchMode::Interactive,).verdict,
+            Verdict::Ask,
+            "an operator's own ask entry must win over the read-only upgrade"
+        );
+        let denied = policy_with(&["psql *"], &[], &[], Verdict::Ask);
+        assert_eq!(
+            evaluate(&denied, "psql -c 'SELECT 1'", LaunchMode::Interactive,).verdict,
+            Verdict::Deny,
+            "deny is never overridden by the classifier"
+        );
+    }
+
+    /// The narrowing direction always applies, including over a broad allow
+    /// rule covering the client, and including over the permissive
+    /// interactive default.
+    #[test]
+    fn the_sql_classifier_narrows_a_broad_allow_rule() {
+        let policy = policy_with(&[], &[], &["psql *"], Verdict::Ask);
+        assert_eq!(
+            evaluate(&policy, "psql -c 'SELECT 1'", LaunchMode::Interactive,).verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(
+                &policy,
+                "psql -c 'DROP TABLE users'",
+                LaunchMode::Interactive,
+            )
+            .verdict,
+            Verdict::Ask,
+            "a broad allow must not cover a statement the classifier cannot prove read-only"
+        );
+    }
+
+    /// A compound command whose non-SQL half is dangerous still resolves
+    /// through the ordinary worst-wins fold.
+    #[test]
+    fn a_compound_command_containing_sql_still_takes_the_worst_verdict() {
+        let policy = SafetyPolicy::default();
+        assert_eq!(
+            evaluate(
+                &policy,
+                "psql -c 'SELECT 1' && sudo rm -rf /",
+                LaunchMode::Interactive,
+            )
+            .verdict,
+            Verdict::Deny
+        );
+    }
+
+    /// `[safety] sql = "off"` is the operator's own escape hatch, and it is
+    /// operator-only: turning the classifier off removes its `Ask`
+    /// narrowing, which can only ever loosen the effective policy.
+    #[test]
+    fn the_operator_may_turn_the_sql_classifier_off() {
+        let home = table("[safety]\nsql = \"off\"\n").and_then(|v| v.get("safety").cloned());
+        let empty = env_from(&[]);
+        let policy = resolve(home, None, &|k| empty.get(k).cloned()).expect("resolves");
+        assert_eq!(policy.sql, SqlMode::Off);
+        // With the classifier off, nothing matches `psql` and each mode's own
+        // unmatched default applies to both statements alike.
+        assert_eq!(
+            evaluate(&policy, "psql -c 'DROP TABLE t'", LaunchMode::Headless,).verdict,
+            Verdict::Ask
+        );
+        assert_eq!(
+            evaluate(&policy, "psql -c 'DROP TABLE t'", LaunchMode::Interactive,).verdict,
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn the_environment_overrides_the_sql_mode_and_rejects_a_bad_value() {
+        let vars = env_from(&[("ZIRV_CTX_SAFETY_SQL", "off")]);
+        let policy = resolve(None, None, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(policy.sql, SqlMode::Off);
+
+        let bad = env_from(&[("ZIRV_CTX_SAFETY_SQL", "maybe")]);
+        let err = resolve(None, None, &|k| bad.get(k).cloned()).expect_err("must reject");
+        assert!(err.to_string().contains("ZIRV_CTX_SAFETY_SQL"), "got {err}");
     }
 
     // -- THE ACCEPTANCE CORPUS ------------------------------------------

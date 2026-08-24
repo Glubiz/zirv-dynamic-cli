@@ -1051,6 +1051,7 @@ checkout:
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
 | `safety.interactive_default` | `ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT` |
+| `safety.sql` | `ZIRV_CTX_SAFETY_SQL` |
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
