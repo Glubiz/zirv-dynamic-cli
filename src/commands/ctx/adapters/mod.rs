@@ -146,10 +146,12 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
         "--disallowedTools",
         "--allowedTools",
         "--permission-mode",
+        "--settings",
         "--sandbox",
         "-s",
         "--ask-for-approval",
         "-a",
+        "--approve-for-me",
     ];
     flags.iter().any(|f| {
         POLICY_FLAG_NAMES
@@ -599,10 +601,15 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
     ("Bash(git rebase *)", "rewrites commit history"),
     ("Bash(git filter-branch *)", "rewrites commit history"),
     ("Bash(git clean *)", "irreversibly deletes untracked files"),
-    // `find` asks ONLY on its delete action and on an exec that runs a
-    // delete. `find -exec grep`/`-exec sed -n` are everyday read-only work
-    // and must not prompt, which is why the old blanket `find*-exec*` entry
-    // is not carried over.
+    // These three glob entries name the most common shapes literally; the
+    // general case -- ANY `find -exec`/`-ok`/`-execdir`/`-okdir` action that
+    // is not on a small proven-safe allow-list (`find -exec sh -c ...`,
+    // `find -exec chmod -R 777 ...`, `-ok rm ...`, ...) -- is caught by
+    // `safety::apply_find_exec_outcome` (`is_risky_find_exec`) instead: an
+    // ask-unless-proven-safe semantic gate, not another glob to keep
+    // enumerating. `find -exec grep`/`-exec sed -n` are everyday read-only
+    // work and must not prompt, which is why a blanket `find*-exec*` glob
+    // entry is still not carried over here.
     ("Bash(find*-delete*)", "find's own delete action"),
     (
         "Bash(find*-exec rm*)",
