@@ -349,6 +349,7 @@ pub(crate) fn run_with_clock<W: Write>(
         super::prompt::PromptRole::Worker,
         &state,
         now_secs(),
+        super::adapters::LaunchMode::Headless,
     )
     .composed;
     // Known before argv is touched, because it decides how argv is read: the
@@ -569,7 +570,12 @@ pub(crate) fn run_with_clock<W: Write>(
     let policy_extra = if policy_skip {
         Vec::new()
     } else {
-        adapters::policy_launch_args(&cfg, adapter.as_ref(), &user_extra)
+        adapters::policy_launch_args(
+            &cfg,
+            adapter.as_ref(),
+            &user_extra,
+            adapters::LaunchMode::Headless,
+        )
     };
     // Visible, not silent: the shipped-default posture (or the operator's
     // own opt-out/override) is announced once, here, at session start --
@@ -1023,6 +1029,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 super::prompt::PromptRole::Worker,
                 &state,
                 now_secs(),
+                super::adapters::LaunchMode::Headless,
             )
             .composed;
             // C7: `registry_short`, not `short_id(session)` -- `session`
@@ -1729,6 +1736,7 @@ mod tests {
             super::super::prompt::PromptRole::Worker,
             &state,
             1,
+            crate::commands::ctx::adapters::LaunchMode::Headless,
         )
         .composed
         .expect("a worker launch still composes a prompt");

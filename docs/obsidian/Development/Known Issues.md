@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-24 (feat/cross-harness-permissions, v2.26.0 hardening): cross-shell semantic classification, immutable launch-policy attestation and private command-hash audit landed; native-Windows Claude's lack of an OS containment boundary remains explicit -->
 <!-- Updated 2026-08-24 (fix/codex-pane-messaging, review round F1-F7 on PR #116): amended the #114 entry -- the settle gap is now a deferred, tick-drained submit (Pane::pending_submit/drain_pending_submits) instead of a blocking sleep on the dashboard's UI thread, and wrap.rs's own /compact and mail-advisory injections share the same shape; also closed a report-back persistence gap (a restored worker pane used to permanently lose its report_to target) -->
 <!-- Updated 2026-08-24 (fix/codex-pane-messaging, issues #114/#115, v2.25.2): resolved the codex-pane paste-burst CR-fold that left a nudge/mail/report-back injection typed but unsubmitted, and the silent report-back-omission/no-reminder gap for a dashboard-spawned worker; residual noted that live-codex behavioral proof of both is pending the Docker matrix -->
 <!-- Updated 2026-08-24 (perf/test-suite-speed, PR #113, v2.25.1): resolved four test-hermeticity gaps surfaced while switching the suite to nextest's per-process isolation (real-$HOME leak in context_cli.rs/handoff.rs/handover.rs, review.rs's dash_channel_active hard-coded env read, a 24-name DASH_REQUESTS_ENV ambient-failure baseline in wrap.rs/resume.rs when run under a dash session, and the fake-codex-agent.sh --help-probe mode-shift that caused CI run 32723969751's one deterministic failure); recorded the drain_to_eof supervise-race fix and a still-open read_until blocking-read residual -->
@@ -57,6 +58,16 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Native Windows Claude has no OS containment boundary
+
+Claude's own sandbox supports macOS, Linux, and WSL2, not native Windows. `ClaudeAdapter` therefore omits the unsupported `sandbox` object from its per-launch settings on Windows while still attesting the `Bash|PowerShell` hook, built-in credential denials, and subprocess credential scrubbing. Since v2.28.0 the classifier itself is platform-neutral: case-folded executable basenames/extensions, `cmd.exe`/PowerShell separators and wrappers, credential-file access, recursive cleanup, remote HTTP effects, infrastructure/service destruction, and package/release operations reach the same verdict as Unix spellings. That closes the obvious native-shell bypasses but remains a high-signal tripwire, not a complete shell/interpreter parser: an arbitrary interpreter invocation can express a destructive effect the finite analyzer cannot recognize, and native Windows has no Claude OS sandbox underneath it to contain that unknown effect.
+
+This cannot be closed honestly inside an argv adapter until Claude supports native Windows containment or Zirv gains a separately verified Windows sandbox broker. Landstrip and Arapuca were evaluated as possible cross-platform brokers; both are young dependencies, and Landstrip's own Windows contract differs materially from its Unix write controls. Microsoft MXC explicitly labels itself preview rather than a security boundary. None is safe to insert invisibly into every launch today. Operators with this threat model should run Claude under WSL2 or use Codex's workspace-write sandbox on Windows; setting `sandbox.enabled = false` is an explicit operator opt-out, not a fix. A future broker must be independently adversarially tested on all three operating systems, fail closed when unavailable, preserve an interactive approval channel instead of swallowing prompt retries, and expose its effective policy in the audit before this issue can be closed.
+
+## Rust 1.96.1 / MSVC debug artifact instability observed during v2.28.0 verification
+
+On this Windows host, an existing incremental test link first failed with `LNK1103: debugging information corrupt`, followed by an access violation in `link.exe`. A fresh worktree-local Cargo target then hit one Rust 1.96.1 ICE while dependencies compiled in parallel (`rustc_span::symbol::Ident::as_str`, `allocator-api2`); retrying that clean target with incremental compilation disabled and one build job completed, after which build, clippy, no-run compilation and the full 2,414-test serial run were stable. No Zirv process was killed and no source fix was implicated. If the exact compiler/PDB signatures recur, use a clean target plus `CARGO_INCREMENTAL=0`/one job before diagnosing application code; do not `taskkill` a live Zirv session to clear build artifacts.
 
 ## `OutputTap::try_lines`'s "final drain" could still lose a fast-exiting child's last line
 
@@ -116,10 +127,6 @@ Blocking detector rules are kept to structural accessibility hazards with relati
 ## `stamp_verified_in_place` normalizes CRLF to LF on a Windows checkout
 
 `memory.rs`'s `stamp_verified_in_place` (the write path of `zirv memory verify`) splits the file on `text.lines()`, which strips both `\n` and `\r\n` without recording which one it saw, then rejoins every line with a plain `\n` (`out.join("\n")`). A memory file checked out with Windows line endings survives a verify call with its byte content correct but every one of its line endings silently converted from `\r\n` to `\n`.
-
-## The canonical permissions policy has no enforcement caller yet, and a malformed repo `[policy]` table still erases an operator's own narrowing
-
-`policy.rs`'s `EffectivePolicy`/`evaluate`/`PolicyReport` are fully built and tested but have no production caller — issue #44 (the context compiler) is what will pin a stance onto a real launch, and issue #46 (`zirv ctx status`) what will render a report. Until then, `hook.rs`'s `a_malformed_repo_policy_table_still_erases_the_operators_own_policy_narrowing` test pins a real, recorded gap: `cfg_or_operator_only_gate`'s error arm (reached when a repo `[policy]` table fails to parse) falls back to `CtxConfig::default()`, whose `policy` field is all-`Allow` — the exact trust hole review finding 1 already closed for `[agents]` (which does have an operator-only salvage path), but not yet for `[policy]`. **This is a MUST-close item, not an accepted residual:** issue #44 must add the same salvage path `AgentGate` already has and flip this test's assertion from `Stance::Allow` to `Stance::Deny`, or the canonical policy model would ship on top of a hole one malformed repo file can already open.
 
 ## Two hand-maintained exhaustiveness guards can't catch a variant that is never appended to their own array
 

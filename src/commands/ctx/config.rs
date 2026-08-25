@@ -1663,6 +1663,20 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // `sandbox.extra_allow` right above.
     (&["safety", "allow"], "ZIRV_CTX_SAFETY_ALLOW"),
     (&["safety", "default"], "ZIRV_CTX_SAFETY_DEFAULT"),
+    // `safety.interactive_default` (2026-08-24): the unmatched-command
+    // verdict on an interactive launch, default `allow`. Same reasoning as
+    // `safety.default` right above and then some -- `allow` is the loosest
+    // verdict there is, so a checkout that could set it could silence every
+    // prompt for the session it is checked out in.
+    (
+        &["safety", "interactive_default"],
+        "ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT",
+    ),
+    // `safety.sql` (2026-08-24): same reasoning as the two `safety` keys
+    // above. Turning the SQL classifier off removes an `Ask` it would
+    // otherwise impose on a write statement reaching a broad allow rule or
+    // the permissive interactive default -- loosening only.
+    (&["safety", "sql"], "ZIRV_CTX_SAFETY_SQL"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -2140,6 +2154,31 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// SECURITY: `safety.sql` joins `safety.allow`/`safety.default`/
+    /// `safety.interactive_default` as operator-only. Turning the SQL
+    /// classifier off removes the `Ask` narrowing it applies to a write
+    /// statement that would otherwise reach the permissive interactive
+    /// default -- there is no narrowing reading of `off`.
+    #[test]
+    fn a_repo_ctx_toml_cannot_turn_the_sql_classifier_off() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[safety]\nsql = \"off\"\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set safety.sql");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a security refusal: {err}"
+        );
     }
 
     #[test]
@@ -3721,7 +3760,11 @@ mod tests {
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         assert!(
             claude
-                .default_sandbox_args(&Default::default(), &Default::default())
+                .default_sandbox_args(
+                    &Default::default(),
+                    &Default::default(),
+                    super::super::adapters::LaunchMode::Headless,
+                )
                 .iter()
                 .any(|a| a.starts_with("--allowedTools=")),
             "the generated permission set must still reach the argv"
@@ -3848,7 +3891,11 @@ mod tests {
             ..CtxConfig::default()
         };
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
-        let args = claude.default_sandbox_args(&cfg.sandbox, &Default::default());
+        let args = claude.default_sandbox_args(
+            &cfg.sandbox,
+            &Default::default(),
+            super::super::adapters::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -4174,6 +4221,8 @@ mod tests {
         ("safety", "ask"),
         ("safety", "allow"),
         ("safety", "default"),
+        ("safety", "interactive_default"),
+        ("safety", "sql"),
     ];
 
     /// The lines belonging to table `path` in a sample-config file like

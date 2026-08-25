@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -343,6 +344,8 @@ pub struct ClaudeAdapter {
     home: Option<PathBuf>,
     #[cfg(test)]
     forced_file_support: Option<bool>,
+    #[cfg(test)]
+    forced_launch_settings: Option<Option<PathBuf>>,
 }
 
 impl ClaudeAdapter {
@@ -359,6 +362,10 @@ impl ClaudeAdapter {
             home: None,
             #[cfg(test)]
             forced_file_support: None,
+            #[cfg(test)]
+            forced_launch_settings: Some(Some(PathBuf::from(
+                "zirv-test-claude-launch-settings.json",
+            ))),
         }
     }
 
@@ -375,6 +382,21 @@ impl ClaudeAdapter {
     #[cfg(test)]
     pub fn with_file_support_forced(mut self, supported: bool) -> Self {
         self.forced_file_support = Some(supported);
+        self
+    }
+
+    /// Test seam: avoids touching the developer's real home while pinning
+    /// successful and failed settings-file materialization deterministically.
+    #[cfg(test)]
+    pub fn with_launch_settings_forced(mut self, path: Option<PathBuf>) -> Self {
+        self.forced_launch_settings = Some(path);
+        self
+    }
+
+    /// Test seam: exercises the real private-file writer under `with_home`.
+    #[cfg(test)]
+    fn with_live_launch_settings(mut self) -> Self {
+        self.forced_launch_settings = None;
         self
     }
 
@@ -398,6 +420,137 @@ impl ClaudeAdapter {
             .clone()
             .or_else(|| crate::utils::home_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Materializes the per-launch safety layer under the operator-owned
+    /// Zirv home. The write is atomic and private on Unix; if either step
+    /// fails, the caller deliberately falls back to Claude's native prompt
+    /// flow without adding a blanket Bash allow.
+    fn launch_settings_path(&self, safety: &super::super::safety::SafetyPolicy) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(forced) = &self.forced_launch_settings {
+            return forced.clone();
+        }
+
+        let dir = self.home_dir().join(".zirv").join("runtime");
+        let fingerprint = super::super::safety::policy_fingerprint(safety).ok()?;
+        let policy_dir = dir.join("policies");
+        let policy_path = policy_dir.join(format!("{fingerprint}.json"));
+        let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
+        let result = (|| -> std::io::Result<()> {
+            super::super::state::create_private_dir_all(&dir)?;
+            super::super::state::create_private_dir_all(&policy_dir)?;
+            let mut policy_body =
+                serde_json::to_string_pretty(safety).map_err(std::io::Error::other)?;
+            policy_body.push('\n');
+            super::super::state::write_private(&policy_path, &policy_body)?;
+            let settings =
+                launch_settings_value(safety, &policy_path).map_err(std::io::Error::other)?;
+            let mut body =
+                serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?;
+            body.push('\n');
+            super::super::state::write_private(&path, &body)
+        })();
+        match result {
+            Ok(()) => Some(path),
+            Err(error) => {
+                warn_launch_settings_once(&path, &error);
+                None
+            }
+        }
+    }
+}
+
+/// A launch-local settings layer is stronger than relying on a one-time
+/// `zirv setup apply`: every process Zirv starts attests the classifier it is
+/// using, and a later reset or minimal Claude profile cannot silently remove
+/// it. The operator's ordinary settings remain in force for keys omitted
+/// here; Claude merges hook arrays across settings levels and applies the
+/// most restrictive PreToolUse verdict (`deny > ask > allow`).
+fn launch_settings_value(
+    safety: &super::super::safety::SafetyPolicy,
+    policy_path: &Path,
+) -> Result<Value, serde_json::Error> {
+    let fingerprint = super::super::safety::policy_fingerprint(safety)?;
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut settings = serde_json::json!({
+        "disableAllHooks": false,
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash|PowerShell",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx safety check"
+                }]
+            }]
+        },
+        "permissions": {
+            "ask": ["Bash(dangerouslyDisableSandbox:true)"],
+            "deny": [
+                "Read(~/.ssh/**)",
+                "Read(~/.aws/**)",
+                "Read(~/.azure/**)",
+                "Read(~/.config/gcloud/**)",
+                "Read(~/.config/gh/hosts.yml)",
+                "Read(~/.kube/config)",
+                "Read(~/.docker/config.json)",
+                "Read(~/.npmrc)",
+                "Read(~/.pypirc)",
+                "Read(~/.netrc)",
+                "Read(~/.git-credentials)"
+            ]
+        },
+        "env": {
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            super::super::safety::POLICY_FINGERPRINT_ENV: fingerprint,
+            super::super::safety::POLICY_SNAPSHOT_ENV: policy_path.display().to_string()
+        }
+    });
+
+    // Claude's OS sandbox is currently supported on macOS, Linux and WSL2,
+    // but not native Windows. On supported hosts it is the hard containment
+    // boundary beneath Zirv's semantic classifier: compatible Bash commands
+    // need no prompt, initialization fails closed, and an incompatible
+    // command may leave the sandbox only through the explicit ask rule above.
+    #[cfg(not(windows))]
+    if let Some(object) = settings.as_object_mut() {
+        object.insert(
+            "sandbox".to_string(),
+            serde_json::json!({
+            "enabled": true,
+            "autoAllowBashIfSandboxed": true,
+            "allowUnsandboxedCommands": true,
+            "failIfUnavailable": true,
+            "filesystem": {
+                "denyRead": [
+                    "~/.ssh",
+                    "~/.aws",
+                    "~/.azure",
+                    "~/.config/gcloud",
+                    "~/.config/gh/hosts.yml",
+                    "~/.kube/config",
+                    "~/.docker/config.json",
+                    "~/.npmrc",
+                    "~/.pypirc",
+                    "~/.netrc",
+                    "~/.git-credentials"
+                ]
+            }
+            }),
+        );
+    }
+
+    Ok(settings)
+}
+
+fn warn_launch_settings_once(path: &Path, error: &std::io::Error) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "zirv: warning: could not attest Claude safety settings at {}: {error}; \
+             falling back to native permission prompts without widening Bash",
+            path.display()
+        );
     }
 }
 
@@ -721,13 +874,15 @@ impl AgentAdapter for ClaudeAdapter {
     ///   scopes writes by path, and the available pin denies writes
     ///   everywhere, in-repo included.
     ///
-    /// No stance reports as `Enforced` or `Degraded` at `Ask`: the pin can
-    /// only deny outright, and claude's interactive ask-by-default comes
-    /// from the operator's own settings, not from anything zirv pins.
+    /// Interactive `Ask` reports as `Degraded` only where zirv now pins the
+    /// default permission mode and its own safety-hook/path allow-list seam;
+    /// headless `Ask` remains operator-controlled because `dontAsk` cannot
+    /// carry that prompt posture.
     fn policy_support(
         &self,
         capability: crate::commands::ctx::policy::Capability,
         stance: crate::commands::ctx::policy::Stance,
+        mode: super::LaunchMode,
     ) -> crate::commands::ctx::policy::CapabilityDescriptor {
         use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
 
@@ -740,10 +895,39 @@ impl AgentAdapter for ClaudeAdapter {
              resolve in headless `-p` mode";
         const SETTINGS: &str = "claude's own permission prompts and `.claude/settings.json` permissions, which zirv \
              reads and never rewrites";
+        // 2026-08-24: an INTERACTIVE launch carries `--permission-mode
+        // default` plus the `zirv ctx safety check` PreToolUse hook as the
+        // sole prompting gate. That is a real, verified per-run mechanism, so
+        // an `Ask` stance stops being purely operator-controlled -- but only
+        // `Degraded`: the hook is registered for the `Bash` tool alone, so
+        // every other tool still lands on claude's own settings.
+        //
+        // KNOWN RESIDUAL (2026-08-24, filed rather than guessed at): this
+        // `Degraded` claim assumes `launch_settings_path` actually wrote the
+        // per-launch settings file this description promises. That write is
+        // best-effort (`launch_settings_path`'s own doc comment) -- if it
+        // fails, THIS launch has no hook and no deny at all, yet
+        // `policy_support` is a static descriptor with no per-launch
+        // success/failure to consult, so it still reports `Degraded` here.
+        // Closing this needs either threading the real write outcome into
+        // `policy_support` (a signature change reaching every caller) or an
+        // argv-based fallback that does not depend on writing a file at
+        // all; both are out of scope for this pass, so the gap is
+        // documented rather than silently left implied-fixed.
+        const ASK_INTERACTIVE: &str = "--permission-mode default plus the `zirv ctx safety check` PreToolUse hook as the \
+             sole prompting gate, which allows everyday and unclassified commands outright and \
+             prompts only on zirv's own short dangerous-command list; the hook matches the Bash \
+             tool only, so every other tool still falls to claude's own settings";
+        const OUTSIDE_REPO_ASK_INTERACTIVE: &str = "--permission-mode default with --allowedTools scoped to Edit(./**) plus the \
+             workspace scratchpad: a write outside those paths is not pre-approved, so claude \
+             prompts rather than failing silently";
 
         match capability {
             Capability::RepoFsWrite | Capability::ShellExec => match stance {
                 Stance::Deny => CapabilityDescriptor::enforced(TOOL_PIN),
+                Stance::Ask if mode.is_interactive() => {
+                    CapabilityDescriptor::degraded(ASK_INTERACTIVE)
+                }
                 Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
             },
             Capability::ToolAccess => match stance {
@@ -752,14 +936,21 @@ impl AgentAdapter for ClaudeAdapter {
             },
             Capability::Approval => match stance {
                 Stance::Deny => CapabilityDescriptor::unsupported(APPROVAL_UNSUPPORTED),
+                Stance::Ask if mode.is_interactive() => {
+                    CapabilityDescriptor::degraded(ASK_INTERACTIVE)
+                }
                 Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
             },
-            // Network, git push/destructive git, and path-scoped writes --
-            // see this method's own doc for why each is advisory rather than
-            // carried by the pin above.
-            Capability::Network
-            | Capability::GitPushDestructive
-            | Capability::OutsideRepoFsWrite => CapabilityDescriptor::advisory_only(),
+            Capability::OutsideRepoFsWrite => match stance {
+                Stance::Ask if mode.is_interactive() => {
+                    CapabilityDescriptor::degraded(OUTSIDE_REPO_ASK_INTERACTIVE)
+                }
+                Stance::Ask | Stance::Allow => CapabilityDescriptor::operator_controlled(SETTINGS),
+                Stance::Deny => CapabilityDescriptor::advisory_only(),
+            },
+            Capability::Network | Capability::GitPushDestructive => {
+                CapabilityDescriptor::advisory_only()
+            }
         }
     }
 
@@ -849,8 +1040,9 @@ impl AgentAdapter for ClaudeAdapter {
     /// appended last, unchanged from before this method took a
     /// `SafetyPolicy` parameter.
     ///
-    /// Byte-identical to the pre-#83 hardcoded projection under the shipped
-    /// default, modulo the scratchpad rules below: `safety::builtin_deny`/
+    /// The permission-list tokens remain byte-identical to the pre-#83
+    /// hardcoded projection under the shipped default, modulo the scratchpad
+    /// rules below: `safety::builtin_deny`/
     /// `builtin_allow` strip exactly `SHIPPED_POSTURE_DENY`/`_ALLOW`'s own
     /// `Bash(...)` wrapper and this method re-adds it, so the round trip
     /// reproduces the original strings verbatim, in the original order --
@@ -872,31 +1064,51 @@ impl AgentAdapter for ClaudeAdapter {
     /// path is per-machine, and the constant has to stay `&'static`.
     /// Appended after the safety-derived allow entries, before the
     /// operator's own `sandbox.extra_allow`.
+    ///
+    /// **Cross-harness permissions (2026-08-24): Design B.** A live probe
+    /// against Claude Code 2.1.241 reached `permissionMode: default`, but the
+    /// account rate-limited before the Bash request, so whether a hook's
+    /// `"ask"` overrides a native `Bash(*)` allow could not be established.
+    /// The conservative projection therefore emits no blanket Bash allow:
+    /// the hook's explicit `"allow"` carries ordinary commands, while an
+    /// ask verdict cannot accidentally be bypassed by native pre-approval.
+    /// Every projected launch also carries a Zirv-owned `--settings` layer
+    /// that attests this hook for the process. On macOS/Linux/WSL2 it enables
+    /// Claude's OS sandbox in auto-allow mode, fails closed if that boundary
+    /// cannot start, denies common credential paths to Bash and the built-in
+    /// Read tool, and scrubs cloud credentials from child environments.
+    /// Native Windows receives the hook/read/env layer but no unsupported
+    /// sandbox key.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
         safety: &crate::commands::ctx::safety::SafetyPolicy,
+        mode: super::LaunchMode,
     ) -> Vec<String> {
+        // The non-`Bash(...)` surface is pre-approved in BOTH modes: file
+        // scope, the harness dirs, WebFetch/WebSearch. These are outside
+        // `[safety]`'s command-only domain (see `safety::
+        // command_pattern_from_bash_rule`), so the safety hook -- registered
+        // for the `Bash` tool alone -- cannot speak for them, and leaving
+        // them off the list would prompt on every file read.
         let mut allow_entries: Vec<String> = super::SHIPPED_POSTURE_ALLOW
             .iter()
             .filter(|(rule, _)| !rule.starts_with("Bash("))
             .map(|(rule, _)| rule.to_string())
             .collect();
-        allow_entries.extend(
-            safety
-                .allow
-                .iter()
-                .map(|rule| format!("Bash({})", rule.pattern)),
-        );
+
+        if !mode.is_interactive() {
+            allow_entries.extend(
+                safety
+                    .allow
+                    .iter()
+                    .map(|rule| format!("Bash({})", rule.pattern)),
+            );
+        }
         allow_entries.extend(super::scratchpad_rules(&std::env::temp_dir()));
         allow_entries.extend(sandbox.extra_allow.iter().cloned());
         let allow = allow_entries.join(",");
 
-        // `SHIPPED_POSTURE_DENY` gained two non-`Bash` entries of its own
-        // (issue #104): `Edit(~/.zirv/**)`/`Read(~/.claude/.credentials.json)`,
-        // filtered out of `safety.deny` the same way the allow side's
-        // non-`Bash` entries are -- prepended directly, same treatment as
-        // `allow_entries` above.
         let mut deny_entries: Vec<String> = super::SHIPPED_POSTURE_DENY
             .iter()
             .filter(|(rule, _)| !rule.starts_with("Bash("))
@@ -908,15 +1120,46 @@ impl AgentAdapter for ClaudeAdapter {
                 .iter()
                 .map(|rule| format!("Bash({})", rule.pattern)),
         );
+        // The ask set is a hard rule ONLY headlessly. Interactively it must
+        // reach a prompt, which means it belongs on neither list: the hook's
+        // own "ask" decision is what stops it. Headlessly there is nobody to
+        // answer, so folding it into the deny list turns what `dontAsk`
+        // would refuse by omission into an explicit, named refusal.
+        if !mode.is_interactive() {
+            deny_entries.extend(
+                safety
+                    .ask
+                    .iter()
+                    .map(|rule| format!("Bash({})", rule.pattern)),
+            );
+        }
         deny_entries.extend(sandbox.extra_deny.iter().cloned());
         let deny = deny_entries.join(",");
 
-        vec![
+        // `dontAsk` is "don't prompt, deny if not pre-approved" (the
+        // installed CLI's own `--help` text, quoted in this method's doc
+        // comment) -- correct with no human present, and exactly wrong with
+        // one. `default` prompts for anything not pre-approved, which is what
+        // lets the safety hook's own decisions be the whole story. Never
+        // `acceptEdits`/`bypassPermissions`: both were probed live and both
+        // auto-run unapproved destructive actions.
+        let permission_mode = if mode.is_interactive() {
+            "default"
+        } else {
+            "dontAsk"
+        };
+
+        let mut args = vec![
             "--permission-mode".to_string(),
-            "dontAsk".to_string(),
+            permission_mode.to_string(),
             format!("--allowedTools={allow}"),
             format!("--disallowedTools={deny}"),
-        ]
+        ];
+        if let Some(path) = self.launch_settings_path(safety) {
+            args.push("--settings".to_string());
+            args.push(path.display().to_string());
+        }
+        args
     }
 
     /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
@@ -1050,6 +1293,14 @@ impl AgentAdapter for ClaudeAdapter {
 mod tests {
     use super::*;
     use crate::commands::ctx::event::{NormalizedEvent, input_hash};
+
+    fn test_launch_settings() -> Value {
+        launch_settings_value(
+            &Default::default(),
+            Path::new("zirv-test-safety-policy.json"),
+        )
+        .expect("settings")
+    }
 
     pub(crate) fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1632,13 +1883,258 @@ mod tests {
     /// unapproved action -- `bypassPermissions`/`acceptEdits` were probed
     /// and rejected for doing the opposite.
     #[test]
-    fn default_sandbox_args_uses_the_verified_dont_ask_mode() {
+    fn default_sandbox_args_uses_the_verified_dont_ask_mode_when_headless() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         assert_eq!(
             &args[0..2],
             &["--permission-mode".to_string(), "dontAsk".to_string()]
         );
+    }
+
+    /// Every supervised Claude launch carries a Zirv-owned, per-run settings
+    /// layer. This is the attestation that the command classifier is really
+    /// installed for this process; relying on a one-time global setup leaves
+    /// upgraded, reset, and deliberately minimal profiles unguarded.
+    #[test]
+    fn launch_settings_attest_the_safety_hook_and_sandbox_escape_gate() {
+        let settings = test_launch_settings();
+        assert_eq!(settings["disableAllHooks"], false);
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/0/matcher"),
+            Some(&serde_json::json!("Bash|PowerShell"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
+            Some(&serde_json::json!("zirv ctx safety check"))
+        );
+        assert!(
+            settings["permissions"]["ask"]
+                .as_array()
+                .is_some_and(|rules| rules
+                    .contains(&serde_json::json!("Bash(dangerouslyDisableSandbox:true)"))),
+            "an unsandboxed retry must cross an explicit approval boundary: {settings}"
+        );
+        assert_eq!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+    }
+
+    #[test]
+    fn launch_settings_bind_the_hook_to_an_immutable_policy_snapshot() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("C:/safe/policies/policy.json");
+        let settings = launch_settings_value(&policy, policy_path).expect("settings");
+        let expected =
+            super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
+
+        assert_eq!(
+            settings["env"][super::super::super::safety::POLICY_FINGERPRINT_ENV],
+            expected
+        );
+        assert_eq!(
+            settings["env"][super::super::super::safety::POLICY_SNAPSHOT_ENV],
+            policy_path.display().to_string()
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/0/matcher"),
+            Some(&serde_json::json!("Bash|PowerShell")),
+            "the identical hook must guard both native Windows and Unix shell tools"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_settings_enable_containment_and_common_credential_denials() {
+        let settings = test_launch_settings();
+        assert_eq!(settings["sandbox"]["enabled"], true);
+        assert_eq!(settings["sandbox"]["autoAllowBashIfSandboxed"], true);
+        let files = settings["sandbox"]["filesystem"]["denyRead"]
+            .as_array()
+            .expect("credential file rules");
+        assert!(files.iter().any(|entry| entry == "~/.ssh"));
+        let read_denies = settings["permissions"]["deny"]
+            .as_array()
+            .expect("built-in Read credential denials");
+        assert!(read_denies.iter().any(|entry| entry == "Read(~/.ssh/**)"));
+    }
+
+    #[test]
+    fn every_projected_launch_names_the_attested_settings_file() {
+        let path = PathBuf::from("C:/safe/zirv-claude-launch-settings.json");
+        let adapter = ClaudeAdapter::new(None).with_launch_settings_forced(Some(path.clone()));
+        for mode in [
+            super::super::LaunchMode::Interactive,
+            super::super::LaunchMode::Headless,
+        ] {
+            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            let index = args
+                .iter()
+                .position(|arg| arg == "--settings")
+                .expect("the launch must carry its hook settings");
+            assert_eq!(args.get(index + 1), Some(&path.display().to_string()));
+        }
+    }
+
+    #[test]
+    fn launch_settings_are_materialized_atomically_under_the_zirv_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let adapter = ClaudeAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_live_launch_settings();
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let fingerprint =
+            super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
+        let path = adapter
+            .launch_settings_path(&policy)
+            .expect("settings materialized");
+        assert_eq!(
+            path,
+            home.path()
+                .join(".zirv")
+                .join("runtime")
+                .join(format!("claude-launch-settings-{fingerprint}.json"))
+        );
+        let policy_path = home
+            .path()
+            .join(".zirv")
+            .join("runtime")
+            .join("policies")
+            .join(format!("{fingerprint}.json"));
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("read materialized settings"),
+        )
+        .expect("valid settings JSON");
+        assert_eq!(
+            written,
+            launch_settings_value(&policy, &policy_path).expect("settings")
+        );
+        let snapshotted: super::super::super::safety::SafetyPolicy = serde_json::from_str(
+            &std::fs::read_to_string(policy_path).expect("read policy snapshot"),
+        )
+        .expect("valid policy JSON");
+        assert_eq!(snapshotted, policy);
+    }
+
+    /// If the private settings file cannot be materialized, the projection
+    /// falls back to Design B: no broad Bash allow. Claude's native flow may
+    /// prompt, but a missing guard can never turn into silent full access.
+    #[test]
+    fn an_unattested_launch_falls_back_without_widening_bash() {
+        let adapter = ClaudeAdapter::new(None).with_launch_settings_forced(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        assert!(!args.iter().any(|arg| arg == "--settings"));
+        let allow = args
+            .iter()
+            .find(|arg| arg.starts_with("--allowedTools="))
+            .expect("allowed tools");
+        assert!(!allow.contains("Bash(*)"), "unattested widening: {allow}");
+    }
+
+    /// THE requirement, at the argv level: an interactive launch must not
+    /// carry a finite Bash allow-list under a prompting permission mode,
+    /// because everything off the end of that list is a prompt. Design A
+    /// blanket-allows Bash and lets the safety hook gate; Design B (see the
+    /// plan's Task 3 Step 1) drops the blanket entry and lets the hook's own
+    /// explicit `"allow"` carry it. This test pins what BOTH designs share:
+    /// the mode is `default`, and no per-command Bash allow-list is emitted.
+    #[test]
+    fn the_interactive_projection_never_emits_a_finite_bash_allow_list() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        assert_eq!(
+            &args[0..2],
+            &["--permission-mode".to_string(), "default".to_string()]
+        );
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        for family in ["Bash(cargo *)", "Bash(git *)", "Bash(npm *)"] {
+            assert!(
+                !allow_arg.contains(family),
+                "a per-family Bash allow-list means every OTHER command prompts: {allow_arg}"
+            );
+        }
+        // The non-Bash surface is still pre-approved: those tools are outside
+        // `[safety]`'s command-only domain, so the hook cannot speak for them.
+        assert!(allow_arg.contains("Edit(./**)"), "got {allow_arg}");
+        assert!(allow_arg.contains("Read(./**)"), "got {allow_arg}");
+        assert!(allow_arg.contains("WebFetch"), "got {allow_arg}");
+    }
+
+    /// The ask set must never be pre-approved and never hard-denied on an
+    /// interactive launch: pre-approving it would skip the prompt this whole
+    /// change exists to produce, and denying it would be the silent death it
+    /// exists to remove.
+    #[test]
+    fn the_interactive_projection_leaves_the_ask_set_to_the_hook() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        let deny_arg = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        for (rule, _) in super::super::SHIPPED_POSTURE_ASK {
+            assert!(
+                !deny_arg.contains(rule),
+                "interactive must let '{rule}' reach a prompt, not die: {deny_arg}"
+            );
+        }
+        for (rule, _) in super::super::SHIPPED_POSTURE_DENY {
+            assert!(
+                deny_arg.contains(rule),
+                "the deny set must still be a hard rule: {deny_arg}"
+            );
+        }
+    }
+
+    /// Headless is untouched by all of the above.
+    #[test]
+    fn the_headless_projection_is_unchanged_by_the_interactive_inversion() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
+        assert_eq!(
+            &args[0..2],
+            &["--permission-mode".to_string(), "dontAsk".to_string()]
+        );
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        assert!(allow_arg.contains("Bash(cargo *)"), "got {allow_arg}");
+        assert!(
+            !allow_arg.contains("Bash(*)"),
+            "no blanket allow headlessly: {allow_arg}"
+        );
+        let deny_arg = args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        for (rule, _) in super::super::SHIPPED_POSTURE_ASK {
+            assert!(
+                deny_arg.contains(rule),
+                "headless has nobody to prompt, so ask folds into deny: {deny_arg}"
+            );
+        }
     }
 
     /// Fix round 2 (2026-08-22): `dontAsk` alone denies every unapproved
@@ -1650,8 +2146,12 @@ mod tests {
     #[test]
     fn default_sandbox_args_generates_the_allow_and_deny_lists_from_the_shared_source() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
-        assert_eq!(args.len(), 4, "got {args:?}");
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
+        assert_eq!(args.len(), 6, "got {args:?}");
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1690,7 +2190,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_allows_zirvs_own_commands() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1714,9 +2218,13 @@ mod tests {
     /// this refactor could not have silently changed a live-verified
     /// permission set.
     #[test]
-    fn default_sandbox_args_stays_byte_identical_to_the_pre_safety_shipped_default() {
+    fn the_headless_projection_is_byte_exact_against_the_shipped_constants() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
 
         // `SHIPPED_POSTURE_ALLOW`'s own non-`Bash(...)` entries (`Read(./
         // **)`/`Edit(./**)` and the rest) are prepended separately only
@@ -1729,10 +2237,15 @@ mod tests {
             .map(|(rule, _)| rule.to_string())
             .collect();
         expected_allow.extend(super::super::scratchpad_rules(&std::env::temp_dir()));
-        let expected_deny: Vec<String> = super::super::SHIPPED_POSTURE_DENY
+        let mut expected_deny: Vec<String> = super::super::SHIPPED_POSTURE_DENY
             .iter()
             .map(|(rule, _)| rule.to_string())
             .collect();
+        expected_deny.extend(
+            super::super::SHIPPED_POSTURE_ASK
+                .iter()
+                .map(|(rule, _)| rule.to_string()),
+        );
 
         assert_eq!(
             args,
@@ -1741,6 +2254,8 @@ mod tests {
                 "dontAsk".to_string(),
                 format!("--allowedTools={}", expected_allow.join(",")),
                 format!("--disallowedTools={}", expected_deny.join(",")),
+                "--settings".to_string(),
+                "zirv-test-claude-launch-settings.json".to_string(),
             ]
         );
     }
@@ -1757,7 +2272,11 @@ mod tests {
             extra_allow: vec!["Bash(just test *)".to_string()],
             extra_deny: vec!["Bash(terraform apply *)".to_string()],
         };
-        let args = adapter.default_sandbox_args(&sandbox, &Default::default());
+        let args = adapter.default_sandbox_args(
+            &sandbox,
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1776,7 +2295,7 @@ mod tests {
             "got {deny_arg}"
         );
         assert!(
-            deny_arg.contains("Bash(rm -rf *)"),
+            deny_arg.contains("Bash(sudo *)"),
             "the shipped deny entries must still be present, not replaced: {deny_arg}"
         );
     }
@@ -1790,7 +2309,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_scopes_file_edits_to_the_workspace_not_bare_write() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1811,7 +2334,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_allows_the_scratchpad_and_claude_memory_dir() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let allow_arg = args
             .iter()
             .find(|a| a.starts_with("--allowedTools="))
@@ -1834,7 +2361,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_denies_editing_the_operator_zirv_layer() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         let deny_arg = args
             .iter()
             .find(|a| a.starts_with("--disallowedTools="))
@@ -1846,7 +2377,11 @@ mod tests {
     #[test]
     fn default_sandbox_args_never_emits_the_dangerous_bypass_flag() {
         let adapter = ClaudeAdapter::new(None);
-        let args = adapter.default_sandbox_args(&Default::default(), &Default::default());
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
         assert!(
             !args
                 .iter()

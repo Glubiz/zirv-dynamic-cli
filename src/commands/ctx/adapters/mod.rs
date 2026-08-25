@@ -85,6 +85,46 @@ pub(crate) fn classify_model_flag(arg: &str) -> Option<ModelFlagForm<'_>> {
     None
 }
 
+/// Whether the launch this argv is being built for has a human sitting in
+/// front of it who can answer an approval prompt.
+///
+/// This is the one distinction zirv's shipped posture could not previously
+/// express, and it is why `--permission-mode dontAsk` had to be applied to
+/// interactive sessions too: with no way to say "someone is watching", the
+/// only safe answer was the fail-closed one. Every real-launch seam
+/// (`chat.rs`, `wrap.rs`, `dash/mod.rs`, `handover.rs`, `exec.rs`,
+/// `run_loop.rs`, `agent.rs`) now states its own answer, and the compiler
+/// -- not a comment -- is what keeps a new seam from forgetting to.
+///
+/// `ValueEnum` so `zirv ctx safety explain --mode <...>` can take it
+/// directly; the derived value names are already `interactive`/`headless`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LaunchMode {
+    /// `zirv chat`, `zirv ctx wrap`, a dashboard pane, a live handover swap:
+    /// the harness's own TUI is on a terminal the operator is watching, so an
+    /// `Ask` verdict becomes a real prompt they can answer.
+    Interactive,
+    /// `zirv ctx exec`, `zirv ctx loop`, `zirv ctx agent`: nobody is present,
+    /// so an `Ask` verdict is an unanswerable prompt and must fail closed.
+    Headless,
+}
+
+// Task 1 lands these accessors before the later policy/report tasks consume
+// them in production; the seam tests exercise both in the meantime.
+#[allow(dead_code)]
+impl LaunchMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            LaunchMode::Interactive => "interactive",
+            LaunchMode::Headless => "headless",
+        }
+    }
+
+    pub fn is_interactive(self) -> bool {
+        matches!(self, LaunchMode::Interactive)
+    }
+}
+
 /// Whether `flags` already pins one of the CLI-level policy flags
 /// `AgentAdapter::policy_args`/`default_sandbox_args` might otherwise
 /// prepend: claude's `--disallowedTools`/`--allowedTools`/`--permission-
@@ -106,10 +146,12 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
         "--disallowedTools",
         "--allowedTools",
         "--permission-mode",
+        "--settings",
         "--sandbox",
         "-s",
         "--ask-for-approval",
         "-a",
+        "--approve-for-me",
     ];
     flags.iter().any(|f| {
         POLICY_FLAG_NAMES
@@ -283,6 +325,19 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Bash(uniq *)", "filter duplicate lines, read-only"),
     ("Bash(tr *)", "translate or delete characters, read-only"),
     ("Bash(cut *)", "extract fields from input, read-only"),
+    // Moved out of SHIPPED_POSTURE_DENY (2026-08-24, primary acceptance
+    // criterion): fetching a URL is everyday dev work -- checking an API,
+    // downloading a fixture -- and denying the tool wholesale is exactly the
+    // over-blocking this round exists to remove. The real danger, a download
+    // piped straight into a shell, is denied on its own below.
+    (
+        "Bash(curl *)",
+        "fetch a URL; piping into a shell is denied below",
+    ),
+    (
+        "Bash(wget *)",
+        "fetch a URL; piping into a shell is denied below",
+    ),
 ];
 
 /// Projects the operator's scratchpad temp directory into the two claude
@@ -358,65 +413,53 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "Read(~/.claude/.credentials.json)",
         "the harness's own stored OAuth credentials",
     ),
-    ("Bash(rm -rf *)", "recursive force-delete"),
+    // Self-destructive (2026-08-24): this session itself runs under zirv, so
+    // killing a zirv process kills the supervisor that would have asked the
+    // question. `evaluate_single` walks the whole deny list before it looks
+    // at ask at all, so these beat the broad `taskkill *`/`rm -rf *` entries
+    // in SHIPPED_POSTURE_ASK with no ordering rule needed.
+    ("Bash(taskkill*zirv*)", "kills the supervising zirv session"),
     (
-        "Bash(rm -fr *)",
-        "recursive force-delete, flag-order variant",
+        "Bash(Stop-Process*zirv*)",
+        "kills the supervising zirv session, PowerShell spelling",
     ),
-    // Git push destructive-argument family (2026-08-23, issue #111):
-    // mid-string wildcards close the argument-reordering bypass the old
-    // flag-anchored patterns had (`git push origin --force` slipped past
-    // `Bash(git push --force *)`). `git push*--force*` also covers
-    // `--force-with-lease`, since that flag's own text contains `--force`
-    // as a substring. The short-flag forms are matched with a leading
-    // space (`" -f"`/`" -d"`) so a branch literally named `feature-fix` or
-    // similar is never mistaken for the flag -- see this constant's own
-    // doc comment.
+    ("Bash(pkill*zirv*)", "kills the supervising zirv session"),
+    ("Bash(killall*zirv*)", "kills the supervising zirv session"),
     (
-        "Bash(git push*--force*)",
-        "force-push (covers --force-with-lease too), any argument position",
+        "Bash(rm -rf*zirv*)",
+        "destroys zirv's own state or operator layer",
     ),
     (
-        "Bash(git push* -f *)",
-        "force-push, short-flag form, followed by more arguments",
+        "Bash(rm -fr*zirv*)",
+        "destroys zirv's own state or operator layer, flag-order variant",
     ),
     (
-        "Bash(git push* -f)",
-        "force-push, short-flag form, as the final argument",
+        "Bash(Remove-Item*zirv*)",
+        "destroys zirv's own state or operator layer, PowerShell spelling",
+    ),
+    // The actual danger `curl`/`wget` were denied wholesale for, now denied
+    // precisely instead: a remote download executed as a shell script. These
+    // are whole-string patterns, matched against the raw command -- which
+    // `evaluate` always checks as its first candidate.
+    (
+        "Bash(* | sh)",
+        "a remote download executed as a shell script",
     ),
     (
-        "Bash(git push*--delete*)",
-        "deletes a remote branch, any argument position",
+        "Bash(* | bash)",
+        "a remote download executed as a shell script",
     ),
     (
-        "Bash(git push* -d *)",
-        "deletes a remote branch, short-flag form, followed by more arguments",
+        "Bash(* | zsh)",
+        "a remote download executed as a shell script",
     ),
     (
-        "Bash(git push* -d)",
-        "deletes a remote branch, short-flag form, as the final argument",
+        "Bash(*| sh)",
+        "a remote download executed as a shell script, no space before the pipe",
     ),
     (
-        "Bash(git push* :*)",
-        "empty-src refspec delete (git push origin :branch)",
-    ),
-    (
-        "Bash(git push* +*)",
-        "force-refspec push (git push origin +branch)",
-    ),
-    (
-        "Bash(git reset*--hard*)",
-        "destroys uncommitted work and can discard commits, any argument position",
-    ),
-    ("Bash(git rebase *)", "rewrites commit history"),
-    ("Bash(git filter-branch *)", "rewrites commit history"),
-    (
-        "Bash(curl *)",
-        "can pipe a remote download straight into a shell",
-    ),
-    (
-        "Bash(wget *)",
-        "can pipe a remote download straight into a shell",
+        "Bash(*| bash)",
+        "a remote download executed as a shell script, no space before the pipe",
     ),
     ("Bash(sudo *)", "privilege escalation"),
     ("Bash(su *)", "privilege escalation"),
@@ -461,20 +504,6 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ("Bash(diff *.aws*)", "reads AWS credential files"),
     ("Bash(diff *.ssh*)", "reads SSH private keys"),
     ("Bash(diff *.netrc*)", "reads stored HTTP credentials"),
-    // `find`'s own delete/exec actions (2026-08-23, issue #111): the
-    // read-only `Bash(find *)` allow above is only read-only up to these.
-    (
-        "Bash(find*-delete*)",
-        "find's own delete action; not covered by the read-only find allow above",
-    ),
-    (
-        "Bash(find*-exec*)",
-        "find's own exec action can run an arbitrary command",
-    ),
-    (
-        "Bash(find*-ok*)",
-        "find's own interactive-exec action can run an arbitrary command",
-    ),
     ("Bash(cargo publish *)", "publishes a crate; irreversible"),
     ("Bash(npm publish *)", "publishes a package; irreversible"),
     (
@@ -496,7 +525,132 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ),
     ("Bash(gh secret *)", "reads or writes repository secrets"),
     ("Bash(gh codespace ssh*)", "opens a shell into a codespace"),
+];
+
+/// The short, closed list of families zirv's shipped posture wants a HUMAN to
+/// see before they run (2026-08-24, cross-harness permissions design).
+///
+/// **This list is deliberately narrow, and adding to it is a product
+/// decision, not a hardening reflex.** The primary acceptance criterion is
+/// that an everyday dev command -- and a command zirv has never seen -- never
+/// prompts. Every entry here is a prompt an operator will actually be
+/// interrupted by, so the bar for membership is "genuinely dangerous and
+/// hard to undo", not "mutates something". `cargo build`, `npm install`,
+/// `git commit`, `mkdir`, an in-repo file write, a plain `curl` and an
+/// unrecognised tool are all `Allow`, and must stay that way -- pinned by
+/// `the_product_requirement_no_everyday_or_novel_command_ever_prompts` in
+/// `safety.rs`.
+///
+/// **Split from [`SHIPPED_POSTURE_DENY`] by reversibility, not by danger.**
+/// `git push --force` is recoverable from a reflog and `rm -rf ./target`
+/// from a rebuild, so both ask. `cargo publish` is irreversible and
+/// `cat ~/.ssh/id_rsa` has already leaked by the time anyone sees the
+/// prompt, so both stay denied.
+///
+/// **Deny still wins**: `safety::evaluate_single` walks deny before ask, so
+/// the specific `Bash(taskkill*zirv*)` deny beats the broad
+/// `Bash(taskkill *)` ask here with no ordering rule of its own.
+///
+/// Projected differently per launch mode: claude's INTERACTIVE argv leaves
+/// these off `--allowedTools`, so the safety hook's `"ask"` decision is what
+/// prompts on them; claude's HEADLESS argv folds them into
+/// `--disallowedTools` alongside the deny set, since nobody is present to
+/// answer (see `ClaudeAdapter::default_sandbox_args`).
+pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
+    ("Bash(rm -rf *)", "recursive force-delete"),
+    (
+        "Bash(rm -fr *)",
+        "recursive force-delete, flag-order variant",
+    ),
+    (
+        "Bash(git push*--force*)",
+        "force-push (covers --force-with-lease too), any argument position",
+    ),
+    (
+        "Bash(git push* -f *)",
+        "force-push, short-flag form, followed by more arguments",
+    ),
+    (
+        "Bash(git push* -f)",
+        "force-push, short-flag form, as the final argument",
+    ),
+    (
+        "Bash(git push*--delete*)",
+        "deletes a remote branch, any argument position",
+    ),
+    (
+        "Bash(git push* -d *)",
+        "deletes a remote branch, short-flag form, followed by more arguments",
+    ),
+    (
+        "Bash(git push* -d)",
+        "deletes a remote branch, short-flag form, as the final argument",
+    ),
+    (
+        "Bash(git push* :*)",
+        "empty-src refspec delete (git push origin :branch)",
+    ),
+    (
+        "Bash(git push* +*)",
+        "force-refspec push (git push origin +branch)",
+    ),
+    (
+        "Bash(git reset*--hard*)",
+        "destroys uncommitted work and can discard commits, any argument position",
+    ),
+    ("Bash(git rebase *)", "rewrites commit history"),
+    ("Bash(git filter-branch *)", "rewrites commit history"),
     ("Bash(git clean *)", "irreversibly deletes untracked files"),
+    // These three glob entries name the most common shapes literally; the
+    // general case -- ANY `find -exec`/`-ok`/`-execdir`/`-okdir` action that
+    // is not on a small proven-safe allow-list (`find -exec sh -c ...`,
+    // `find -exec chmod -R 777 ...`, `-ok rm ...`, ...) -- is caught by
+    // `safety::apply_find_exec_outcome` (`is_risky_find_exec`) instead: an
+    // ask-unless-proven-safe semantic gate, not another glob to keep
+    // enumerating. `find -exec grep`/`-exec sed -n` are everyday read-only
+    // work and must not prompt, which is why a blanket `find*-exec*` glob
+    // entry is still not carried over here.
+    ("Bash(find*-delete*)", "find's own delete action"),
+    (
+        "Bash(find*-exec rm*)",
+        "find's exec action invoking a delete",
+    ),
+    (
+        "Bash(find*-exec*rm -rf*)",
+        "find's exec action invoking a recursive force-delete",
+    ),
+    // Process termination. The zirv-specific spellings are DENIED above and
+    // win, since deny is walked first.
+    ("Bash(taskkill *)", "terminates a running process"),
+    (
+        "Bash(Stop-Process *)",
+        "terminates a running process, PowerShell spelling",
+    ),
+    ("Bash(pkill *)", "terminates running processes by name"),
+    ("Bash(killall *)", "terminates running processes by name"),
+    (
+        "Bash(Remove-Item*-Recurse*)",
+        "recursive delete, PowerShell spelling",
+    ),
+    // Raw device and partition tools.
+    (
+        "Bash(dd *)",
+        "writes raw blocks; can destroy a whole device",
+    ),
+    ("Bash(mkfs*)", "formats a filesystem; destroys its contents"),
+    ("Bash(mkswap *)", "reformats a device as swap"),
+    ("Bash(diskpart*)", "Windows disk partitioning tool"),
+    ("Bash(fdisk *)", "disk partitioning tool"),
+    ("Bash(format *)", "formats a volume; destroys its contents"),
+    // Registry MUTATION only -- `reg query` is read-only and must not prompt.
+    (
+        "Bash(reg delete*)",
+        "deletes a Windows registry key or value",
+    ),
+    ("Bash(reg add*)", "writes a Windows registry key or value"),
+    ("Bash(reg import*)", "bulk-writes the Windows registry"),
+    ("Bash(shutdown *)", "powers off or restarts the machine"),
+    ("Bash(reboot*)", "restarts the machine"),
 ];
 
 /// The last model-flag occurrence in `flags`, in any form `classify_model_
@@ -934,8 +1088,9 @@ pub trait AgentAdapter: std::fmt::Debug {
         &self,
         capability: super::policy::Capability,
         stance: super::policy::Stance,
+        mode: LaunchMode,
     ) -> super::policy::CapabilityDescriptor {
-        let _ = (capability, stance);
+        let _ = (capability, stance, mode);
         super::policy::CapabilityDescriptor::advisory_only()
     }
 
@@ -1014,8 +1169,9 @@ pub trait AgentAdapter: std::fmt::Debug {
         &self,
         sandbox: &super::config::SandboxConfig,
         safety: &super::safety::SafetyPolicy,
+        mode: LaunchMode,
     ) -> Vec<String> {
-        let _ = (sandbox, safety);
+        let _ = (sandbox, safety, mode);
         Vec::new()
     }
 
@@ -1880,9 +2036,10 @@ pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter
 /// The argv `policy_launch_args` prepends ahead of an operator's own
 /// trailing flags, at every real-launch seam this codebase builds
 /// (`agent.rs::worker_launch_flags`, `exec.rs`, `run_loop.rs`, `wrap.rs`,
-/// `chat.rs::dash_orchestrator_pane`, `dash::mod::fulfill_spawn_request`) --
-/// the one function all six call, so "operator's own choice always wins" and
-/// the shipped-default posture can never drift between seams.
+/// `chat.rs::dash_orchestrator_pane`, `dash::mod::fulfill_spawn_request`,
+/// `handover.rs::resolve_swap_launch`) -- the one function all seven call,
+/// so "operator's own choice always wins" and the shipped-default posture
+/// can never drift between seams.
 ///
 /// `Vec::new()` when `flags_pin_policy(flags)`: the operator's own explicit
 /// flag wins outright, nothing of zirv's own is prepended at all. Otherwise:
@@ -1897,12 +2054,13 @@ pub fn policy_launch_args(
     cfg: &CtxConfig,
     adapter: &dyn AgentAdapter,
     flags: &[String],
+    mode: LaunchMode,
 ) -> Vec<String> {
     if flags_pin_policy(flags) {
         return Vec::new();
     }
     let mut out = if cfg.sandbox.enabled {
-        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety)
+        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety, mode)
     } else {
         Vec::new()
     };
@@ -2277,6 +2435,56 @@ pub fn command_matches_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interactive/headless seam itself (2026-08-24, cross-harness
+    /// permissions): the enum every real-launch call site now has to answer
+    /// with. Landing the parameter with no behaviour change is deliberate --
+    /// the compiler forces all seven seams to state their own posture
+    /// before any task actually branches on it.
+    #[test]
+    fn launch_mode_names_the_two_postures_the_projection_splits_on() {
+        assert_eq!(LaunchMode::Interactive.label(), "interactive");
+        assert_eq!(LaunchMode::Headless.label(), "headless");
+        assert!(LaunchMode::Interactive.is_interactive());
+        assert!(!LaunchMode::Headless.is_interactive());
+    }
+
+    /// The Task 1 seam becomes load-bearing once Tasks 3 and 7 project the
+    /// two postures differently. Pin that distinction at the shared seam,
+    /// with codex's live capability probe forced out of the assertion.
+    #[test]
+    fn launch_mode_projects_the_two_postures_differently() {
+        let cfg = CtxConfig::default();
+        let claude = claude::ClaudeAdapter::new(None);
+        let interactive = policy_launch_args(&cfg, &claude, &[], LaunchMode::Interactive);
+        let headless = policy_launch_args(&cfg, &claude, &[], LaunchMode::Headless);
+        assert_ne!(interactive, headless);
+        assert!(
+            interactive
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "default"])
+        );
+        assert!(
+            headless
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "dontAsk"])
+        );
+
+        let codex = codex::CodexAdapter::new(None).with_on_request_approval_forced(true);
+        let interactive = policy_launch_args(&cfg, &codex, &[], LaunchMode::Interactive);
+        let headless = policy_launch_args(&cfg, &codex, &[], LaunchMode::Headless);
+        assert_ne!(interactive, headless);
+        assert!(
+            interactive
+                .windows(2)
+                .any(|w| w == ["--ask-for-approval", "on-request"])
+        );
+        assert!(
+            headless
+                .windows(2)
+                .any(|w| w == ["--ask-for-approval", "never"])
+        );
+    }
 
     /// A permissive `CtxConfig` (every agent enabled, no `agent_bin`
     /// override) for tests that only care about selection, not gating.

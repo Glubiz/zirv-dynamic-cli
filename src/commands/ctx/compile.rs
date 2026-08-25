@@ -335,6 +335,7 @@ pub fn compile(
     role: PromptRole,
     state: &StateDir,
     now: u64,
+    mode: super::adapters::LaunchMode,
 ) -> CompiledContext {
     compile_with_harness_roster(
         home,
@@ -346,6 +347,7 @@ pub fn compile(
         state,
         now,
         role == PromptRole::Orchestrator,
+        mode,
     )
 }
 
@@ -376,6 +378,7 @@ pub fn compile_with_harness_roster(
     state: &StateDir,
     now: u64,
     include_harness_roster: bool,
+    mode: super::adapters::LaunchMode,
 ) -> CompiledContext {
     let slug = super::state::repo_slug(repo);
     let (memory_entries, retrieved_memory) = gather_memory(state, repo, &slug, cfg, now);
@@ -423,7 +426,7 @@ pub fn compile_with_harness_roster(
     // Computed from `cfg.policy` alone, never from `composed`'s text: the
     // canonical context layer's prose can steer a session, but it cannot
     // touch this. See this module's own doc comment.
-    let policy = policy::evaluate(&cfg.policy, adapter);
+    let policy = policy::evaluate(&cfg.policy, adapter, mode);
 
     CompiledContext {
         composed,
@@ -438,6 +441,7 @@ pub fn compile_with_harness_roster(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ctx::adapters::LaunchMode;
     use crate::commands::ctx::adapters::claude::ClaudeAdapter;
     use crate::commands::ctx::adapters::codex::CodexAdapter;
     use crate::commands::ctx::policy::{EffectivePolicy, Stance};
@@ -460,7 +464,17 @@ mod tests {
     ) -> CompiledContext {
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
-        compile(None, repo, false, cfg, adapter, role, &state, now_secs())
+        compile(
+            None,
+            repo,
+            false,
+            cfg,
+            adapter,
+            role,
+            &state,
+            now_secs(),
+            LaunchMode::Headless,
+        )
     }
 
     #[test]
@@ -490,6 +504,7 @@ mod tests {
             PromptRole::Worker,
             &state,
             now,
+            LaunchMode::Headless,
         );
         let second = compile(
             None,
@@ -500,6 +515,7 @@ mod tests {
             PromptRole::Worker,
             &state,
             now,
+            LaunchMode::Headless,
         );
         assert_eq!(first, second);
     }
@@ -581,7 +597,7 @@ mod tests {
         // computed policy must still reflect the operator's own `Deny`,
         // proving the report is derived from `cfg.policy` and never from
         // injected text.
-        let expected = policy::evaluate(&cfg.policy, &adapter);
+        let expected = policy::evaluate(&cfg.policy, &adapter, LaunchMode::Headless);
         assert_eq!(compiled.policy, expected);
         let shell_exec = compiled
             .policy
@@ -735,6 +751,7 @@ mod tests {
             PromptRole::Worker,
             &state,
             now_secs(),
+            LaunchMode::Headless,
         );
         assert!(compiled.composed.is_none());
         assert!(compiled.provenance.is_empty());
@@ -831,6 +848,7 @@ mod tests {
             PromptRole::Worker,
             &state,
             now_secs(),
+            LaunchMode::Headless,
         );
         assert_eq!(compiled.core_memory.selected_entries, 1);
         assert_eq!(compiled.retrieved_memory.selected_entries, 1);

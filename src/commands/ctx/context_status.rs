@@ -663,6 +663,7 @@ pub fn run_with<W: Write>(
                 PromptRole::Orchestrator,
                 &state,
                 now,
+                super::adapters::LaunchMode::Interactive,
             );
             (adapter.name(), compiled)
         })

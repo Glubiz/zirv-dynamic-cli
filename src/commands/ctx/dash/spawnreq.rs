@@ -58,6 +58,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// this field existed. It reaches the pane's argv as a `--model` token, so
 /// `dash::fulfill_spawn_request` re-checks it rather than trusting the
 /// requester's own filtering.
+///
+/// `interactive` (2026-08-24, cross-harness permissions hardening): whether
+/// the REQUESTER can vouch that a human is present to answer an `Ask`
+/// prompt raised on the pane this spawns -- true only for a spawn a human
+/// directly triggered from the dashboard's own live TUI (the Spawn
+/// overlay). `#[serde(default)]` makes `false` (`Headless`, fail-closed)
+/// what an older request -- or a scripted/headless one, like `zirv ctx
+/// agent`'s own request-file write, which cannot prove a human is watching
+/// the dashboard that will fulfil it -- deserialises to. `worker_pane_
+/// extra_args`/`compose_worker_prompt` are what actually read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub agent: String,
@@ -66,6 +76,8 @@ pub struct SpawnRequest {
     pub requested_by: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 /// The dashboard's answer to one [`SpawnRequest`]. `ok: false` always
@@ -340,6 +352,7 @@ mod tests {
             cwd: PathBuf::from("/repo"),
             requested_by: "abcd1234".to_string(),
             model: None,
+            interactive: false,
         }
     }
 

@@ -6,6 +6,7 @@ use super::CtxResult;
 use super::state::StateDir;
 
 pub const LOG_FILE: &str = "decisions.jsonl";
+pub const SAFETY_LOG_DIR: &str = "safety-decisions";
 
 #[derive(Debug, Serialize)]
 pub struct Decision<'a> {
@@ -18,10 +19,42 @@ pub struct Decision<'a> {
     pub detail: &'a str,
 }
 
+/// Privacy-preserving evidence for one command-policy decision. Commands are
+/// represented only by their SHA-256 identity: an operator can correlate a
+/// known command during an incident without turning the state directory into
+/// a second transcript full of source, paths, tokens, or shell secrets.
+#[derive(Debug, Serialize)]
+pub struct SafetyDecision<'a> {
+    pub ts: u64,
+    pub session: &'a str,
+    pub mode: &'a str,
+    pub verdict: &'a str,
+    pub command_sha256: &'a str,
+    pub policy_sha256: &'a str,
+    pub launch_policy_sha256: Option<&'a str>,
+    pub attestation: &'a str,
+    pub matched_pattern: Option<&'a str>,
+    pub origin: Option<&'a str>,
+    pub platform: &'a str,
+}
+
 pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
     let dir = state.logs();
     super::state::create_private_dir_all(&dir)?;
     let mut file = super::state::open_private_append(&dir.join(LOG_FILE))?;
+    writeln!(file, "{}", serde_json::to_string(decision)?)?;
+    Ok(())
+}
+
+/// Appends to one UTC-day bucket. Daily files put a hard time boundary around
+/// retention/rotation without a cross-process truncate race between the many
+/// short-lived hook processes that may be writing concurrently.
+pub fn append_safety(state: &StateDir, decision: &SafetyDecision<'_>) -> CtxResult<()> {
+    let dir = state.logs().join(SAFETY_LOG_DIR);
+    super::state::create_private_dir_all(&dir)?;
+    let day = decision.ts / 86_400;
+    let path = dir.join(format!("{day:010}.jsonl"));
+    let mut file = super::state::open_private_append(&path)?;
     writeln!(file, "{}", serde_json::to_string(decision)?)?;
     Ok(())
 }
@@ -133,5 +166,40 @@ mod tests {
         )
         .expect("append must create its directory");
         assert!(state.logs().join("decisions.jsonl").is_file());
+    }
+
+    #[test]
+    fn safety_audit_records_structured_evidence_without_the_raw_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        append_safety(
+            &state,
+            &SafetyDecision {
+                ts: 1_700_000_000,
+                session: "abc",
+                mode: "interactive",
+                verdict: "ask",
+                command_sha256: "0123456789abcdef",
+                policy_sha256: "fedcba9876543210",
+                launch_policy_sha256: Some("aabbccdd"),
+                attestation: "valid",
+                matched_pattern: Some("curl * --data *"),
+                origin: Some("built-in"),
+                platform: "windows",
+            },
+        )
+        .expect("append");
+
+        let dir = state.logs().join("safety-decisions");
+        let file = std::fs::read_dir(&dir)
+            .expect("audit dir")
+            .next()
+            .expect("one file")
+            .expect("entry")
+            .path();
+        let text = std::fs::read_to_string(file).expect("audit");
+        assert!(text.contains("\"command_sha256\":\"0123456789abcdef\""));
+        assert!(text.contains("\"policy_sha256\":\"fedcba9876543210\""));
+        assert!(!text.contains("secret-value-from-command"));
     }
 }

@@ -200,3 +200,5 @@ model = "fable"
 # ask = ["kubectl delete*"]          # additional ask patterns, unioned with the built-in set. Default: [] (built-in set only).
 # allow = ["just test*"]             # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_ALLOW): additional allow patterns, operator-only. Default: [] (built-in set only).
 # default = "ask"                    # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_DEFAULT): verdict for a command matching no rule. Default: "ask".
+# interactive_default = "allow"      # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT): verdict for a command matching no rule on an INTERACTIVE launch. Default: "allow" -- a command zirv has never seen must not prompt. `default` above still governs headless launches.
+# sql = "on"                         # REPO-FORBIDDEN (ZIRV_CTX_SAFETY_SQL): "on" classifies psql/mysql/mariadb/sqlite3/duckdb/sqlcmd statements (a single provably read-only SELECT/EXPLAIN/SHOW is allowed, everything else asks); "off" disables it. Default: "on".

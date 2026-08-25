@@ -3008,6 +3008,7 @@ pub(crate) mod tests {
             target_model: None,
             force: true,
             requested_at: 0,
+            interactive: false,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -3092,6 +3093,7 @@ pub(crate) mod tests {
             target_model: None,
             force: true,
             requested_at: 0,
+            interactive: false,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
