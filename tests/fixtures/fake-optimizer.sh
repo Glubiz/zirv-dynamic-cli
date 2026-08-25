@@ -14,11 +14,21 @@ case "${FAKE_OPTIMIZER_MODE:-good}" in
   hang) while true; do sleep 1; done ;;
   garbage) printf 'Everything looks fine to me.\n' ;;
   *)
+    repo_claude=$(printf '%s\n' "$prompt" | sed -n 's/^## \(.*\) (repo CLAUDE.md)$/\1/p' | sed -n '1p')
+    global_claude=$(printf '%s\n' "$prompt" | sed -n 's/^## \(.*\) (global CLAUDE.md)$/\1/p' | sed -n '1p')
+    user_settings=$(printf '%s\n' "$prompt" | sed -n 's/^## \(.*\) (user settings.json)$/\1/p' | sed -n '1p')
+    [ -n "$repo_claude" ] || repo_claude=/repo/CLAUDE.md
+    [ -n "$global_claude" ] || global_claude=/home/CLAUDE.md
+    [ -n "$user_settings" ] || user_settings=/home/.claude/settings.json
     printf '### FINDING\n'
     printf 'kind: contradiction\n'
     printf 'severity: high\n'
     printf 'title: Commit message rules disagree between layers\n'
-    printf 'evidence: /repo/CLAUDE.md:4, /home/CLAUDE.md:2\n'
+    if [ -n "$prompt" ]; then
+      printf 'evidence: %s:2, %s:2\n' "$repo_claude" "$global_claude"
+    else
+      printf 'evidence: %s:4, %s:2\n' "$repo_claude" "$global_claude"
+    fi
     printf 'detail: The repo file requires a scope and the global file forbids one.\n'
     printf 'diff:\n'
     printf '```diff\n'
@@ -33,7 +43,7 @@ case "${FAKE_OPTIMIZER_MODE:-good}" in
     printf 'kind: contradiction\n'
     printf 'severity: warning\n'
     printf 'title: A hook contradicts a written instruction\n'
-    printf 'evidence: /home/.claude/settings.json\n'
+    printf 'evidence: %s:1\n' "$user_settings"
     printf 'detail: The Stop hook blocks while the instructions promise it never does.\n'
     ;;
 esac

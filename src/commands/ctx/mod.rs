@@ -262,6 +262,27 @@ pub(crate) mod testenv {
         command.env_remove("CLAUDECODE");
         command.env_remove(super::dash::spawnreq::DASH_REQUESTS_ENV);
     }
+
+    #[cfg(unix)]
+    pub(crate) fn scrub_operator_profile_env_for_test(builder: &mut portable_pty::CommandBuilder) {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("ZIRV_CTX_")
+                || key.to_string_lossy().starts_with("ZIRV_AGENT_")
+            {
+                builder.env_remove(key);
+            }
+        }
+    }
+
+    pub(crate) fn scrub_operator_profile_env_for_test_cmd(command: &mut std::process::Command) {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("ZIRV_CTX_")
+                || key.to_string_lossy().starts_with("ZIRV_AGENT_")
+            {
+                command.env_remove(key);
+            }
+        }
+    }
 }
 
 /// Every ctx entry point returns this. Matches the error style used by the

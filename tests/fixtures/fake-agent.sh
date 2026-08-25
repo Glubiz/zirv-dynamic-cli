@@ -57,15 +57,14 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$session" ] || { echo "fake-agent: no --session-id given" >&2; exit 64; }
 
-if [ -n "${FAKE_AGENT_SESSION_ENV_LOG:-}" ]; then
-  printf '%s\n' "${ZIRV_CTX_SESSION:-}" >> "$FAKE_AGENT_SESSION_ENV_LOG"
-fi
-
 mode="${FAKE_AGENT_MODE:-healthy}"
 if [ -n "${FAKE_AGENT_MODE_FILE:-}" ] && [ -s "${FAKE_AGENT_MODE_FILE}" ]; then
   mode=$("$head_bin" -n 1 "$FAKE_AGENT_MODE_FILE")
   "$tail_bin" -n +2 "$FAKE_AGENT_MODE_FILE" > "$FAKE_AGENT_MODE_FILE.next"
   "$mv_bin" "$FAKE_AGENT_MODE_FILE.next" "$FAKE_AGENT_MODE_FILE"
+fi
+if [ -n "${FAKE_AGENT_SESSION_ENV_LOG:-}" ]; then
+  printf '%s\n' "${ZIRV_CTX_SESSION:-}" >> "$FAKE_AGENT_SESSION_ENV_LOG"
 fi
 turns="${FAKE_AGENT_TURNS:-12}"
 

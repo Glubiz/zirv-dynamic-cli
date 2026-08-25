@@ -745,6 +745,24 @@ fn is_bare_exe_name(token: &str) -> bool {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
 }
 
+fn is_optional_zirv_config_reference(surface: &Surface, token: &str) -> bool {
+    let zirv_managed = matches!(
+        surface.layer,
+        Layer::ContextCommon | Layer::ContextClaude | Layer::ContextCodex
+    ) || context_cli::is_managed(&surface.text);
+    zirv_managed
+        && matches!(
+            token,
+            ".settings.toml"
+                | ".zirv/.settings.toml"
+                | ".zirv/ctx.toml"
+                | ".zirv/verify.toml"
+                | ".zirv/.shortcuts.yaml"
+                | "system-prompt.md"
+                | ".zirv/system-prompt.md"
+        )
+}
+
 /// A once-per-run index of every file's bare basename under `repo`, up to
 /// `MAX_NESTED_DEPTH` (issue #109): lets a bare basename token in prose
 /// (`rot.rs`, no `/` or `\` in it) be recognised as a real file living
@@ -952,6 +970,9 @@ pub fn lint_dead_references(
         for (index, line) in surface.text.lines().enumerate() {
             for token in backticked(line) {
                 if !looks_like_path(token) {
+                    continue;
+                }
+                if is_optional_zirv_config_reference(surface, token) {
                     continue;
                 }
                 // (2026-08-23, issue #109) A `<...>` placeholder segment is
@@ -1635,6 +1656,57 @@ pub fn parse_judgment(markdown: &str) -> Vec<Finding> {
     findings
 }
 
+fn judgment_evidence_is_supplied(
+    reference: &str,
+    surfaces: &[Surface],
+    excerpt_lines: usize,
+) -> bool {
+    surfaces.iter().any(|surface| {
+        let path = surface.path.display().to_string();
+        let Some(line) = reference
+            .strip_prefix(&path)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .and_then(|line| line.parse::<usize>().ok())
+        else {
+            return false;
+        };
+        line > 0 && line <= surface.text.lines().count().min(excerpt_lines)
+    })
+}
+
+pub fn validate_judgment_findings(
+    findings: Vec<Finding>,
+    surfaces: &[Surface],
+    excerpt_lines: usize,
+) -> Vec<Finding> {
+    let before = findings.len();
+    let mut accepted: Vec<Finding> = findings
+        .into_iter()
+        .filter(|finding| {
+            !finding.evidence.is_empty()
+                && finding
+                    .evidence
+                    .iter()
+                    .all(|item| judgment_evidence_is_supplied(item, surfaces, excerpt_lines))
+        })
+        .collect();
+    let rejected = before.saturating_sub(accepted.len());
+    if rejected > 0 {
+        accepted.push(Finding {
+            kind: "judgment-validation",
+            severity: Severity::Info,
+            title: format!("Rejected {rejected} ungrounded model finding(s)"),
+            evidence: Vec::new(),
+            detail: "The model cited evidence outside the exact optimizer surfaces and line \
+                     excerpts supplied by Zirv, so the finding was not accepted. Native harness \
+                     memory and other ambient context are not report evidence."
+                .to_string(),
+            proposed_diff: None,
+        });
+    }
+    accepted
+}
+
 /// M1: `newest_transcripts` samples machine-wide across every project with a
 /// recent session, not just this repository, and the report used to say
 /// nothing about it. Named here so a reader is not surprised by a finding
@@ -1882,7 +1954,11 @@ pub fn run_with<W: Write>(
                 adapters::announce_sandbox_residual_once(adapter.as_ref(), cfg.chrome.events);
                 match handoff::run_model(adapter.as_ref(), &model, &prompt, JUDGMENT_TIMEOUT) {
                     Ok(answer) => {
-                        findings.extend(parse_judgment(&answer));
+                        findings.extend(validate_judgment_findings(
+                            parse_judgment(&answer),
+                            &surfaces,
+                            DEFAULT_EXCERPT_LINES,
+                        ));
                         model_used = true;
                     }
                     Err(e) => {
@@ -3461,6 +3537,49 @@ mod tests {
     }
 
     #[test]
+    fn optional_zirv_config_surfaces_with_explicit_repo_placeholders_are_not_dead() {
+        let repo = tempfile::tempdir().expect("repo");
+        let surfaces = vec![surface_of(
+            Layer::ContextCommon,
+            "/repo/.zirv/context/common.md",
+            "- settings live at `<repo>/.zirv/.settings.toml`\n\
+             - optional verification lives at `<repo>/.zirv/verify.toml`\n\
+             - prompt lives at `<repo>/.zirv/system-prompt.md`\n\
+             - context lives under `<repo>/.zirv/context/*.md`\n\
+             - memory lives under `<repo>/.zirv/memory/`\n",
+        )];
+
+        assert!(
+            lint_dead_references(&surfaces, repo.path(), None, &|_| true).is_empty(),
+            "declarative optional Zirv surfaces are not mandatory file references"
+        );
+    }
+
+    #[test]
+    fn optional_zirv_config_surfaces_in_legacy_managed_wording_are_not_dead() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join("src")).expect("src");
+        std::fs::write(repo.path().join("src/settings.rs"), "").expect("settings module");
+        let legacy = "<!-- zirv:managed-context-file -->\n\
+                      - `src/settings.rs` reads the per-agent `.settings.toml` gate.\n\
+                      - `.zirv/ctx.toml`, `.zirv/verify.toml`, and `.zirv/.shortcuts.yaml` are config.\n\
+                      - repo-owned `system-prompt.md` is optional.\n";
+        let surfaces = vec![
+            surface_of(
+                Layer::ContextCommon,
+                "/repo/.zirv/context/common.md",
+                legacy,
+            ),
+            surface_of(Layer::RepoClaudeMd, "/repo/CLAUDE.md", legacy),
+        ];
+
+        assert!(
+            lint_dead_references(&surfaces, repo.path(), None, &|_| true).is_empty(),
+            "known optional Zirv configuration is not a dead file reference"
+        );
+    }
+
+    #[test]
     fn a_hook_command_that_is_not_installed_is_a_dead_reference() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let surfaces = vec![surface_of(
@@ -4383,6 +4502,47 @@ mod tests {
             findings[1].proposed_diff, None,
             "not every finding has a diff"
         );
+    }
+
+    #[test]
+    fn a_model_finding_citing_native_memory_is_rejected_with_a_validation_note() {
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "- use zirv-managed memory only\n",
+        )];
+        let answer = "### FINDING\nkind: contradiction\nseverity: high\n\
+                      title: Legacy memory conflict\n\
+                      evidence: memory:never-fable-code-review.md\n\
+                      detail: Ambient Claude memory says something else.\n";
+
+        let findings = validate_judgment_findings(parse_judgment(answer), &surfaces, 40);
+
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert_eq!(findings[0].kind, "judgment-validation");
+        assert_eq!(findings[0].severity, Severity::Info);
+        assert!(!findings[0].detail.contains("never-fable"));
+    }
+
+    #[test]
+    fn model_findings_are_accepted_only_for_supplied_excerpt_lines() {
+        let surfaces = vec![surface_of(
+            Layer::RepoClaudeMd,
+            "/repo/CLAUDE.md",
+            "line one\nline two\n",
+        )];
+        let answer = "### FINDING\nkind: contradiction\nseverity: high\n\
+                      title: Grounded conflict\n\
+                      evidence: /repo/CLAUDE.md:2\n\
+                      detail: Two supplied rules conflict.\n";
+
+        let findings = validate_judgment_findings(parse_judgment(answer), &surfaces, 40);
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert_eq!(findings[0].title, "Grounded conflict");
+
+        let outside_excerpt = answer.replace(":2", ":3");
+        let findings = validate_judgment_findings(parse_judgment(&outside_excerpt), &surfaces, 40);
+        assert_eq!(findings[0].kind, "judgment-validation");
     }
 
     #[test]

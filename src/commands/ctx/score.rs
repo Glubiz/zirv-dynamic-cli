@@ -954,6 +954,7 @@ mod tests {
     #[test]
     fn a_config_change_rebuilds_instead_of_reusing_the_checkpoint() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
         let mut env = state_env(dir.path());
         let transcript = dir.path().join("session.jsonl");
         let body = std::fs::read_to_string(write_transcript(dir.path(), 14, false, 170_000))
@@ -1230,6 +1231,7 @@ mod tests {
     #[test]
     fn prints_one_line_of_json_with_the_documented_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
         let transcript = write_transcript(dir.path(), 12, false, 170_000);
         let args = ScoreArgs {
             transcript,
@@ -1254,6 +1256,7 @@ mod tests {
     #[test]
     fn an_inactive_marker_signal_serializes_as_null() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
         let transcript = write_transcript(dir.path(), 12, true, 120_000);
         let args = ScoreArgs {
             transcript,

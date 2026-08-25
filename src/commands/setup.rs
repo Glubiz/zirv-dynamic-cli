@@ -63,6 +63,8 @@ pub enum SetupVerb {
     Status(StatusArgs),
     /// Apply the complete, non-destructive Zirv AI setup.
     Apply(ApplyArgs),
+    /// Configure the operator-owned orchestrator, worker, review, and sandbox profile.
+    Profile(ProfileArgs),
     /// Back up and reset Claude/Codex custom settings.
     Reset(ResetArgs),
     /// List or restore a previous `apply`/`reset` backup.
@@ -93,6 +95,48 @@ pub struct ApplyArgs {
     pub no_codex_hooks: bool,
     #[arg(long)]
     pub memory_source: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ProfileArgs {
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    #[arg(long, conflicts_with = "clear_agent")]
+    pub agent: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub clear_agent: bool,
+    #[arg(long, conflicts_with = "clear_chat_model")]
+    pub chat_model: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub clear_chat_model: bool,
+    #[arg(long, conflicts_with = "clear_worker_claude")]
+    pub worker_claude: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub clear_worker_claude: bool,
+    #[arg(long, conflicts_with = "clear_worker_codex")]
+    pub worker_codex: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub clear_worker_codex: bool,
+    #[arg(long, conflicts_with = "clear_review_claude")]
+    pub review_claude: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub clear_review_claude: bool,
+    #[arg(long, conflicts_with = "clear_review_codex")]
+    pub review_codex: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub clear_review_codex: bool,
+    #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+    pub sandbox_enabled: Option<bool>,
+    #[arg(long)]
+    pub context_max_common_bytes: Option<usize>,
+    #[arg(long, conflicts_with = "clear_system_prompt")]
+    pub system_prompt_file: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    pub clear_system_prompt: bool,
+    #[arg(long, default_value_t = false)]
+    pub wrap_claude_statusline: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -260,6 +304,19 @@ struct HarnessStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct EffectiveProfileStatus {
+    agent: Option<String>,
+    chat_model: Option<String>,
+    worker_claude: Option<String>,
+    worker_codex: Option<String>,
+    review_claude: Option<String>,
+    review_codex: Option<String>,
+    sandbox_enabled: bool,
+    context_max_common_bytes: usize,
+    system_prompt_present: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct SetupStatus {
     schema_version: u32,
     repo: PathBuf,
@@ -285,6 +342,7 @@ struct SetupStatus {
     /// -- the safety hook is claude-only, see `CLAUDE_SAFETY_HOOK`'s doc
     /// comment). Schema_version 2, same as `claude_hooks_total`.
     codex_hooks_total: usize,
+    profile: EffectiveProfileStatus,
     claude: HarnessStatus,
     codex: HarnessStatus,
 }
@@ -658,6 +716,377 @@ fn set_home_ctx_toml_string(
     value: &str,
 ) -> SetupResult<()> {
     set_home_ctx_toml_value(home, table, key, toml::Value::String(value.to_string()))
+}
+
+#[derive(Debug)]
+struct ProfileMutation {
+    table: Option<&'static str>,
+    key: &'static str,
+    value: Option<toml::Value>,
+}
+
+impl ProfileMutation {
+    fn label(&self) -> String {
+        self.table
+            .map(|table| format!("{table}.{}", self.key))
+            .unwrap_or_else(|| self.key.to_string())
+    }
+}
+
+fn push_profile_string(
+    mutations: &mut Vec<ProfileMutation>,
+    table: Option<&'static str>,
+    key: &'static str,
+    value: &Option<String>,
+    clear: bool,
+) {
+    if let Some(value) = value {
+        mutations.push(ProfileMutation {
+            table,
+            key,
+            value: Some(toml::Value::String(value.clone())),
+        });
+    } else if clear {
+        mutations.push(ProfileMutation {
+            table,
+            key,
+            value: None,
+        });
+    }
+}
+
+fn profile_mutations(args: &ProfileArgs) -> SetupResult<Vec<ProfileMutation>> {
+    if let Some(agent) = args.agent.as_deref()
+        && !matches!(agent, "claude" | "codex")
+    {
+        return Err(format!("unknown agent '{agent}'; known adapters: claude, codex").into());
+    }
+    for (key, model) in [
+        ("chat.model", args.chat_model.as_deref()),
+        ("worker.claude", args.worker_claude.as_deref()),
+        ("worker.codex", args.worker_codex.as_deref()),
+        ("review.claude", args.review_claude.as_deref()),
+        ("review.codex", args.review_codex.as_deref()),
+    ] {
+        if let Some(model) = model {
+            ctx::config::validate_model_str(key, model)?;
+        }
+    }
+    if args.context_max_common_bytes == Some(0) {
+        return Err("context.max_common_bytes must be greater than zero".into());
+    }
+
+    let mut mutations = Vec::new();
+    push_profile_string(&mut mutations, None, "agent", &args.agent, args.clear_agent);
+    push_profile_string(
+        &mut mutations,
+        Some("chat"),
+        "model",
+        &args.chat_model,
+        args.clear_chat_model,
+    );
+    push_profile_string(
+        &mut mutations,
+        Some("worker"),
+        "claude",
+        &args.worker_claude,
+        args.clear_worker_claude,
+    );
+    push_profile_string(
+        &mut mutations,
+        Some("worker"),
+        "codex",
+        &args.worker_codex,
+        args.clear_worker_codex,
+    );
+    push_profile_string(
+        &mut mutations,
+        Some("review"),
+        "claude",
+        &args.review_claude,
+        args.clear_review_claude,
+    );
+    push_profile_string(
+        &mut mutations,
+        Some("review"),
+        "codex",
+        &args.review_codex,
+        args.clear_review_codex,
+    );
+    if let Some(enabled) = args.sandbox_enabled {
+        mutations.push(ProfileMutation {
+            table: Some("sandbox"),
+            key: "enabled",
+            value: Some(toml::Value::Boolean(enabled)),
+        });
+    }
+    if let Some(bytes) = args.context_max_common_bytes {
+        mutations.push(ProfileMutation {
+            table: Some("context"),
+            key: "max_common_bytes",
+            value: Some(toml::Value::Integer(
+                i64::try_from(bytes)
+                    .map_err(|_| "context.max_common_bytes is too large for TOML")?,
+            )),
+        });
+    }
+    if mutations.is_empty()
+        && args.system_prompt_file.is_none()
+        && !args.clear_system_prompt
+        && !args.wrap_claude_statusline
+    {
+        return Err(
+            "provide at least one profile change, --system-prompt-file, --clear-system-prompt, or \
+             --wrap-claude-statusline"
+                .into(),
+        );
+    }
+    Ok(mutations)
+}
+
+fn profile_value<'a>(root: &'a toml::Table, mutation: &ProfileMutation) -> Option<&'a toml::Value> {
+    match mutation.table {
+        Some(table) => root
+            .get(table)
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get(mutation.key)),
+        None => root.get(mutation.key),
+    }
+}
+
+fn apply_profile_mutation(root: &mut toml::Table, mutation: &ProfileMutation) -> SetupResult<()> {
+    match mutation.table {
+        Some(table) => {
+            if mutation.value.is_some() {
+                let target = root
+                    .entry(table.to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| format!("`[{table}]` is not a table"))?;
+                target.insert(
+                    mutation.key.to_string(),
+                    mutation.value.clone().expect("checked above"),
+                );
+            } else if let Some(target) = root.get_mut(table) {
+                let target = target
+                    .as_table_mut()
+                    .ok_or_else(|| format!("`[{table}]` is not a table"))?;
+                target.remove(mutation.key);
+                if target.is_empty() {
+                    root.remove(table);
+                }
+            }
+        }
+        None => {
+            if let Some(value) = &mutation.value {
+                root.insert(mutation.key.to_string(), value.clone());
+            } else {
+                root.remove(mutation.key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn describe_profile_value(value: Option<&toml::Value>) -> String {
+    match value {
+        Some(toml::Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => "<unset>".to_string(),
+    }
+}
+
+fn run_profile<W: Write>(args: &ProfileArgs, writer: &mut W) -> SetupResult<i32> {
+    let _repo = resolved_repo(&args.repo)?;
+    let home = home_dir()?;
+    let path = home
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join(ctx::config::CTX_CONFIG_FILE);
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!("refusing to write symlink {}", path.display()).into());
+    }
+    let original = if path.is_file() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut root = if original.is_empty() {
+        toml::Table::new()
+    } else {
+        toml::from_str::<toml::Table>(&original)?
+    };
+    let mutations = profile_mutations(args)?;
+    let mut changed = false;
+
+    writeln!(
+        writer,
+        "profile target: {}",
+        ctx::state::display_path(&path)
+    )?;
+    for mutation in &mutations {
+        let current = profile_value(&root, mutation);
+        let differs = current != mutation.value.as_ref();
+        let before = describe_profile_value(current);
+        let after = describe_profile_value(mutation.value.as_ref());
+        if !differs {
+            writeln!(writer, "  {}: unchanged ({before})", mutation.label())?;
+        } else {
+            writeln!(writer, "  {}: {before} -> {after}", mutation.label())?;
+            apply_profile_mutation(&mut root, mutation)?;
+            changed = true;
+        }
+    }
+
+    let system_prompt_path = home
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join(ctx::prompt::PROMPT_FILE);
+    if std::fs::symlink_metadata(&system_prompt_path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!("refusing to write symlink {}", system_prompt_path.display()).into());
+    }
+    let desired_system_prompt = if let Some(source) = &args.system_prompt_file {
+        if std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(format!(
+                "refusing symlinked system prompt source {}",
+                source.display()
+            )
+            .into());
+        }
+        Some(Some(std::fs::read_to_string(source).map_err(|error| {
+            format!(
+                "could not read system prompt source {}: {error}",
+                source.display()
+            )
+        })?))
+    } else if args.clear_system_prompt {
+        Some(None)
+    } else {
+        None
+    };
+    let current_system_prompt = if system_prompt_path.is_file() {
+        Some(std::fs::read_to_string(&system_prompt_path)?)
+    } else {
+        None
+    };
+    let system_prompt_changed = desired_system_prompt
+        .as_ref()
+        .is_some_and(|desired| desired.as_ref() != current_system_prompt.as_ref());
+    if let Some(desired) = &desired_system_prompt {
+        writeln!(
+            writer,
+            "system prompt target: {}",
+            ctx::state::display_path(&system_prompt_path)
+        )?;
+        if let Some(source) = &args.system_prompt_file {
+            writeln!(writer, "  source: {}", ctx::state::display_path(source))?;
+        }
+        if system_prompt_changed {
+            writeln!(
+                writer,
+                "  system prompt: {} bytes -> {}",
+                current_system_prompt.as_ref().map_or(0, String::len),
+                desired
+                    .as_ref()
+                    .map(|prompt| format!("{} bytes", prompt.len()))
+                    .unwrap_or_else(|| "<absent>".to_string())
+            )?;
+        } else {
+            writeln!(writer, "  system prompt: unchanged")?;
+        }
+    }
+
+    let statusline_state = if args.wrap_claude_statusline {
+        let settings_path = claude_config_dir(&home).join("settings.json");
+        let settings = load_json_object(&settings_path)?;
+        let state = classify_statusline_command(
+            settings
+                .pointer("/statusLine/command")
+                .and_then(Value::as_str),
+        );
+        writeln!(
+            writer,
+            "statusline target: {}",
+            ctx::state::display_path(&settings_path)
+        )?;
+        match state {
+            StatuslineStatus::CustomNotWrapped => {
+                let existing = settings
+                    .pointer("/statusLine/command")
+                    .and_then(Value::as_str)
+                    .expect("classified custom statusline");
+                writeln!(
+                    writer,
+                    "  statusLine.command: {existing} -> {}",
+                    wrap_statusline_command(existing)
+                )?;
+            }
+            StatuslineStatus::TeeInstalled | StatuslineStatus::TeeWrappingCustom => {
+                writeln!(
+                    writer,
+                    "  statusLine.command: unchanged (tee already installed)"
+                )?;
+            }
+            StatuslineStatus::Absent => {
+                return Err(
+                    "cannot wrap Claude statusLine: no existing command is configured".into(),
+                );
+            }
+        }
+        Some(state)
+    } else {
+        None
+    };
+
+    if args.dry_run {
+        writeln!(writer, "profile dry run complete; no files changed")?;
+        return Ok(0);
+    }
+
+    if changed || system_prompt_changed {
+        std::fs::create_dir_all(path.parent().ok_or("profile path has no parent")?)?;
+        let mut targets = Vec::new();
+        if changed {
+            targets.push(path.clone());
+        }
+        if system_prompt_changed {
+            targets.push(system_prompt_path.clone());
+        }
+        write_backup_run(
+            &home.join(".zirv/backups/ai-reset"),
+            BackupKind::Apply,
+            ResetProvider::All,
+            ResetScope::Global,
+            &home.join(crate::utils::SCRIPT_DIR_NAME),
+            &targets,
+        )?;
+    }
+    if changed {
+        std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+    }
+    if system_prompt_changed {
+        match desired_system_prompt.expect("a changed prompt has a desired state") {
+            Some(prompt) => std::fs::write(&system_prompt_path, prompt)?,
+            None => std::fs::remove_file(&system_prompt_path)?,
+        }
+    }
+    if statusline_state == Some(StatuslineStatus::CustomNotWrapped) {
+        wrap_claude_statusline_command(&home)?;
+    }
+    writeln!(
+        writer,
+        "profile complete; {}",
+        if changed
+            || system_prompt_changed
+            || statusline_state == Some(StatuslineStatus::CustomNotWrapped)
+        {
+            "changes applied"
+        } else {
+            "already up to date"
+        }
+    )?;
+    Ok(0)
 }
 
 /// True when `home_zirv_dir` (the operator's `~/.zirv`) holds neither
@@ -1677,8 +2106,9 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
                 .count()
         })
         .unwrap_or(0);
+    let cfg = ctx::config::CtxConfig::load(repo, &ctx::config::env_from_process())?;
     Ok(SetupStatus {
-        schema_version: 2,
+        schema_version: 3,
         repo: repo.to_path_buf(),
         zirv_initialized: repo.join(".zirv").is_dir(),
         context_common: ctx::context::common_path(repo).is_file(),
@@ -1690,6 +2120,20 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
         claude_statusline,
         codex_hooks_installed,
         codex_hooks_total: HARNESS_HOOKS.len(),
+        profile: EffectiveProfileStatus {
+            agent: cfg.agent,
+            chat_model: cfg.chat.model,
+            worker_claude: cfg.worker.claude,
+            worker_codex: cfg.worker.codex,
+            review_claude: cfg.review.claude,
+            review_codex: cfg.review.codex,
+            sandbox_enabled: cfg.sandbox.enabled,
+            context_max_common_bytes: cfg.context.max_common_bytes,
+            system_prompt_present: home
+                .join(crate::utils::SCRIPT_DIR_NAME)
+                .join(ctx::prompt::PROMPT_FILE)
+                .is_file(),
+        },
         claude: HarnessStatus {
             installed: executable_exists("claude"),
             settings_present: claude_settings_path.is_file(),
@@ -1751,6 +2195,27 @@ fn run_status<W: Write>(args: &StatusArgs, writer: &mut W) -> SetupResult<i32> {
         writer,
         "  Codex integration: {}/{} hooks",
         status.codex_hooks_installed, status.codex_hooks_total
+    )?;
+    writeln!(
+        writer,
+        "  profile: agent={}, chat.model={}, sandbox.enabled={}, context.max_common_bytes={}, system-prompt={}",
+        status.profile.agent.as_deref().unwrap_or("auto"),
+        status.profile.chat_model.as_deref().unwrap_or("default"),
+        status.profile.sandbox_enabled,
+        status.profile.context_max_common_bytes,
+        if status.profile.system_prompt_present {
+            "present"
+        } else {
+            "absent"
+        }
+    )?;
+    writeln!(
+        writer,
+        "  workers: claude={}, codex={}; reviewers: claude={}, codex={}",
+        status.profile.worker_claude.as_deref().unwrap_or("default"),
+        status.profile.worker_codex.as_deref().unwrap_or("default"),
+        status.profile.review_claude.as_deref().unwrap_or("default"),
+        status.profile.review_codex.as_deref().unwrap_or("default")
     )?;
     Ok(0)
 }
@@ -2823,6 +3288,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     let result = match &cli.verb {
         Some(SetupVerb::Status(args)) => run_status(args, &mut writer),
         Some(SetupVerb::Apply(args)) => run_apply(args, &mut writer),
+        Some(SetupVerb::Profile(args)) => run_profile(args, &mut writer),
         Some(SetupVerb::Reset(args)) => run_reset(args, &mut writer),
         Some(SetupVerb::Restore(args)) => run_restore(args, &mut writer),
         None => run_guided(&mut writer),
@@ -2849,6 +3315,39 @@ mod tests {
         let apply = SetupCli::try_parse_from(["zirv setup", "apply", "--dry-run"]).expect("apply");
         assert!(matches!(apply.verb, Some(SetupVerb::Apply(_))));
 
+        let profile = SetupCli::try_parse_from([
+            "zirv setup",
+            "profile",
+            "--agent",
+            "claude",
+            "--chat-model",
+            "fable",
+            "--worker-codex",
+            "gpt-5.6-sol",
+            "--review-claude",
+            "sonnet",
+            "--sandbox-enabled",
+            "true",
+            "--context-max-common-bytes",
+            "8192",
+            "--wrap-claude-statusline",
+            "--dry-run",
+        ])
+        .expect("profile");
+        match profile.verb {
+            Some(SetupVerb::Profile(args)) => {
+                assert_eq!(args.agent.as_deref(), Some("claude"));
+                assert_eq!(args.chat_model.as_deref(), Some("fable"));
+                assert_eq!(args.worker_codex.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(args.review_claude.as_deref(), Some("sonnet"));
+                assert_eq!(args.sandbox_enabled, Some(true));
+                assert_eq!(args.context_max_common_bytes, Some(8192));
+                assert!(args.wrap_claude_statusline);
+                assert!(args.dry_run);
+            }
+            other => panic!("expected profile, got {other:?}"),
+        }
+
         let reset = SetupCli::try_parse_from([
             "zirv setup",
             "reset",
@@ -2868,6 +3367,245 @@ mod tests {
             }
             other => panic!("expected reset, got {other:?}"),
         }
+    }
+
+    fn profile_args(repo: &Path) -> ProfileArgs {
+        ProfileArgs {
+            repo: repo.to_path_buf(),
+            agent: None,
+            clear_agent: false,
+            chat_model: None,
+            clear_chat_model: false,
+            worker_claude: None,
+            clear_worker_claude: false,
+            worker_codex: None,
+            clear_worker_codex: false,
+            review_claude: None,
+            clear_review_claude: false,
+            review_codex: None,
+            clear_review_codex: false,
+            sandbox_enabled: None,
+            context_max_common_bytes: None,
+            system_prompt_file: None,
+            clear_system_prompt: false,
+            wrap_claude_statusline: false,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn profile_dry_run_previews_then_wet_run_merges_backs_up_and_is_idempotent() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = HomeGuard::set(home.path());
+        let _vars = VarGuard::set(&[
+            ("ZIRV_CTX_AGENT", None),
+            ("ZIRV_CTX_CHAT_MODEL", None),
+            ("ZIRV_CTX_WORKER_MODEL_CODEX", None),
+            ("ZIRV_CTX_REVIEW_MODEL_CLAUDE", None),
+            ("ZIRV_CTX_SANDBOX", None),
+        ]);
+        let config_path = home.path().join(".zirv/ctx.toml");
+        std::fs::create_dir_all(config_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &config_path,
+            "agent = \"codex\"\n\n[memory]\nharvest = true\n\n[sandbox]\nenabled = false\n",
+        )
+        .expect("seed config");
+
+        let mut args = profile_args(repo.path());
+        args.agent = Some("claude".to_string());
+        args.chat_model = Some("fable".to_string());
+        args.worker_codex = Some("gpt-5.6-sol".to_string());
+        args.review_claude = Some("sonnet".to_string());
+        args.sandbox_enabled = Some(true);
+        args.context_max_common_bytes = Some(8192);
+        args.dry_run = true;
+        let mut preview = Vec::new();
+        run_profile(&args, &mut preview).expect("dry run");
+        let preview = String::from_utf8(preview).expect("utf8");
+        assert!(preview.contains("agent: codex -> claude"), "got {preview}");
+        assert!(preview.contains("sandbox.enabled: false -> true"));
+        assert!(preview.contains("context.max_common_bytes: <unset> -> 8192"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("unchanged config"),
+            "agent = \"codex\"\n\n[memory]\nharvest = true\n\n[sandbox]\nenabled = false\n"
+        );
+        assert!(all_runs(&[home.path().join(".zirv/backups/ai-reset")]).is_empty());
+
+        args.dry_run = false;
+        run_profile(&args, &mut Vec::new()).expect("wet run");
+        let root: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("configured profile"))
+                .expect("toml");
+        assert_eq!(root["agent"].as_str(), Some("claude"));
+        assert_eq!(root["chat"]["model"].as_str(), Some("fable"));
+        assert_eq!(root["worker"]["codex"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(root["review"]["claude"].as_str(), Some("sonnet"));
+        assert_eq!(root["sandbox"]["enabled"].as_bool(), Some(true));
+        assert_eq!(root["context"]["max_common_bytes"].as_integer(), Some(8192));
+        assert_eq!(root["memory"]["harvest"].as_bool(), Some(true));
+        let backup_root = home.path().join(".zirv/backups/ai-reset");
+        assert_eq!(all_runs(std::slice::from_ref(&backup_root)).len(), 1);
+
+        let setup_status = status(repo.path()).expect("status");
+        assert_eq!(setup_status.schema_version, 3);
+        assert_eq!(setup_status.profile.agent.as_deref(), Some("claude"));
+        assert_eq!(setup_status.profile.chat_model.as_deref(), Some("fable"));
+        assert_eq!(
+            setup_status.profile.worker_codex.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            setup_status.profile.review_claude.as_deref(),
+            Some("sonnet")
+        );
+        assert!(setup_status.profile.sandbox_enabled);
+        assert_eq!(setup_status.profile.context_max_common_bytes, 8192);
+
+        run_profile(&args, &mut Vec::new()).expect("idempotent wet run");
+        assert_eq!(
+            all_runs(&[backup_root]).len(),
+            1,
+            "an unchanged profile must not create another backup"
+        );
+    }
+
+    #[test]
+    fn profile_can_clear_model_routing_keys_without_removing_unrelated_values() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = HomeGuard::set(home.path());
+        let config_path = home.path().join(".zirv/ctx.toml");
+        std::fs::create_dir_all(config_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &config_path,
+            "[review]\nclaude = \"sonnet\"\ncodex = \"gpt-5.6-terra\"\n",
+        )
+        .expect("seed config");
+
+        let mut args = profile_args(repo.path());
+        args.clear_review_claude = true;
+        run_profile(&args, &mut Vec::new()).expect("clear review model");
+
+        let root: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("configured profile"))
+                .expect("toml");
+        assert!(root["review"].get("claude").is_none());
+        assert_eq!(root["review"]["codex"].as_str(), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn profile_rejects_a_zero_common_context_budget() {
+        let repo = tempfile::tempdir().expect("repo");
+        let mut args = profile_args(repo.path());
+        args.context_max_common_bytes = Some(0);
+
+        let error = profile_mutations(&args).expect_err("zero budget must be rejected");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn profile_explicitly_wraps_a_declined_custom_statusline_after_dry_run() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = HomeGuard::set(home.path());
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "statusLine": {"type": "command", "command": "ccusage statusline"}
+            }))
+            .expect("json"),
+        )
+        .expect("settings");
+        set_home_ctx_toml_bool(home.path(), "setup", "statusline_wrap_offered", true)
+            .expect("declined marker");
+
+        let mut args = profile_args(repo.path());
+        args.wrap_claude_statusline = true;
+        args.dry_run = true;
+        run_profile(&args, &mut Vec::new()).expect("preview wrap");
+        let before = load_json_object(&settings_path).expect("before");
+        assert_eq!(
+            before
+                .pointer("/statusLine/command")
+                .and_then(Value::as_str),
+            Some("ccusage statusline")
+        );
+
+        args.dry_run = false;
+        run_profile(&args, &mut Vec::new()).expect("wrap");
+        let after = load_json_object(&settings_path).expect("after");
+        assert_eq!(
+            after.pointer("/statusLine/command").and_then(Value::as_str),
+            Some("zirv ctx usage tee -- ccusage statusline")
+        );
+        let backup_root = home.path().join(".zirv/backups/ai-reset");
+        assert_eq!(all_runs(std::slice::from_ref(&backup_root)).len(), 1);
+
+        run_profile(&args, &mut Vec::new()).expect("idempotent wrap");
+        assert_eq!(all_runs(&[backup_root]).len(), 1);
+    }
+
+    #[test]
+    fn profile_installs_and_clears_the_global_system_prompt_with_backups() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let source_dir = tempfile::tempdir().expect("source");
+        let _home = HomeGuard::set(home.path());
+        let target = home.path().join(".zirv/system-prompt.md");
+        let source = source_dir.path().join("orchestrator.md");
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&target, "old routing\n").expect("old prompt");
+        std::fs::write(&source, "use zirv agent codex\n").expect("new prompt");
+
+        let mut args = profile_args(repo.path());
+        args.system_prompt_file = Some(source.clone());
+        args.dry_run = true;
+        let mut preview = Vec::new();
+        run_profile(&args, &mut preview).expect("preview prompt");
+        let preview = String::from_utf8(preview).expect("utf8");
+        assert!(
+            preview.contains(&source.display().to_string()),
+            "got {preview}"
+        );
+        assert!(preview.contains("12 bytes -> 21 bytes"), "got {preview}");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("unchanged"),
+            "old routing\n"
+        );
+
+        args.dry_run = false;
+        run_profile(&args, &mut Vec::new()).expect("install prompt");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("installed"),
+            "use zirv agent codex\n"
+        );
+        let backup_root = home.path().join(".zirv/backups/ai-reset");
+        assert_eq!(all_runs(std::slice::from_ref(&backup_root)).len(), 1);
+        assert!(
+            status(repo.path())
+                .expect("status")
+                .profile
+                .system_prompt_present
+        );
+
+        run_profile(&args, &mut Vec::new()).expect("idempotent install");
+        assert_eq!(all_runs(std::slice::from_ref(&backup_root)).len(), 1);
+
+        let mut clear = profile_args(repo.path());
+        clear.clear_system_prompt = true;
+        run_profile(&clear, &mut Vec::new()).expect("clear prompt");
+        assert!(!target.exists());
+        assert_eq!(all_runs(&[backup_root]).len(), 2);
+        assert!(
+            !status(repo.path())
+                .expect("status")
+                .profile
+                .system_prompt_present
+        );
     }
 
     #[test]
@@ -3394,7 +4132,7 @@ mod tests {
         )
         .expect("status");
         let value: Value = serde_json::from_slice(&output).expect("status json");
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         for key in [
             "repo",
             "zirv_initialized",
@@ -3403,10 +4141,27 @@ mod tests {
             "claude_hooks_total",
             "codex_hooks_installed",
             "codex_hooks_total",
+            "profile",
             "claude",
             "codex",
         ] {
             assert!(value.get(key).is_some(), "missing stable status key {key}");
+        }
+        for key in [
+            "agent",
+            "chat_model",
+            "worker_claude",
+            "worker_codex",
+            "review_claude",
+            "review_codex",
+            "sandbox_enabled",
+            "context_max_common_bytes",
+            "system_prompt_present",
+        ] {
+            assert!(
+                value["profile"].get(key).is_some(),
+                "missing stable profile key {key}"
+            );
         }
     }
 

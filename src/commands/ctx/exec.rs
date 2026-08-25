@@ -4436,6 +4436,8 @@ mod tests {
         std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _agent =
+            crate::commands::ctx::testenv::VarGuard::set(&[("ZIRV_CTX_AGENT", Some("claude"))]);
         // C10: a guard, not a bare set/remove pair. The cleanup below used
         // to sit *after* `writer.join().expect(...)`, so a panicking writer
         // thread (or any failing assertion) skipped it entirely and leaked

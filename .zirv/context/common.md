@@ -29,16 +29,16 @@ before claiming done.
 - `src/main.rs`, `src/input.rs` -- raw-argv built-in interception, then clap, then script lookup; `src/commands/` -- create, init, help, version, setup.
 - `src/commands/workflow/` -- skill/capability, engine/classify, verification/review, artifact/telemetry.
 - `src/script_runner/` -- script.rs (model + run loop), command.rs (`${var}`), command_types.rs, options.rs, mod.rs.
-- `src/utils.rs` (parsing, shortcuts, reserved names); `src/settings.rs` (per-agent `.settings.toml` gate).
+- `src/utils.rs` (parsing, shortcuts, reserved names); `src/settings.rs` (per-agent `<repo>/.zirv/.settings.toml` gate).
 - `src/commands/ctx/` -- mod/config/state/log; event+rot; adapters/{claude,codex}; score handoff resume hook status handover; run_loop exec wrap (supervisors); signal supervise term; pace usage window poll; optimize prompt compile context memory memory_cli mail sessions policy safety chat agent announce chrome; dash/ (mod pane ui spawnreq roster).
 
 ## Conventions
 
 - Rust edition 2024. Command options use `#[serde(default)]` or `Option<T>`. Optional script params take a `?` suffix (`"branch?"`). Scripts live in `.zirv/` (local) or `~/.zirv/` (global).
-- Reserved built-ins a script can never shadow (case-insensitive): ctx, chat, agent, skill, workflow, test, verify, artifact, memory, context, setup, help, version, init, create, frontend. `.zirv/ctx.toml`, `.zirv/.settings.toml`, `.zirv/verify.toml`, `.zirv/.shortcuts.yaml` are config, not scripts.
+- Reserved built-ins a script can never shadow (case-insensitive): ctx, chat, agent, skill, workflow, test, verify, artifact, memory, context, setup, help, version, init, create, frontend. `<repo>/.zirv/ctx.toml`, `<repo>/.zirv/.settings.toml`, `<repo>/.zirv/verify.toml`, and `<repo>/.zirv/.shortcuts.yaml` are config, not scripts.
 - `rot.rs` is pure: no fs, clock, env, or net inside it, so identical events always produce an identical verdict. All I/O lives one layer up in `score.rs`.
 - `wrap` must never make a session worse: no `unwrap`/`expect` on its hot path, raw-mode restore in explicit arms (release profile is `panic = "abort"`), and any supervision failure degrades to pure passthrough.
-- Repo-owned surfaces are UNTRUSTED and may only NARROW, never widen: `<repo>/.zirv/ctx.toml`, `system-prompt.md`, `context/*.md`, `memory/`, repo skills and checks. `REPO_FORBIDDEN` keys in `config.rs` hard-error from a repo layer; only `~/.zirv/ctx.toml`, `ZIRV_CTX_*`, or a flag may set them.
+- Repo-owned surfaces are UNTRUSTED and may only NARROW, never widen: `<repo>/.zirv/ctx.toml`, `<repo>/.zirv/system-prompt.md`, `<repo>/.zirv/context/*.md`, `<repo>/.zirv/memory/`, repo skills and checks. `REPO_FORBIDDEN` keys in `config.rs` hard-error from a repo layer; only `~/.zirv/ctx.toml`, `ZIRV_CTX_*`, or a flag may set them.
 - Tests stay inline in `#[cfg(test)] mod tests`; `tests/fixtures/` is data only.
 
 ## After completing work -- mandatory

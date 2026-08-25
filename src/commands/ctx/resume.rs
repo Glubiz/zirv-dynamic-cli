@@ -351,6 +351,7 @@ mod tests {
         .expect("write stub");
 
         let mut command = std::process::Command::new(&zirv);
+        crate::commands::ctx::testenv::scrub_operator_profile_env_for_test_cmd(&mut command);
         command
             .args(["ctx", "resume", "--agent", "claude"])
             .current_dir(tmp.path())
