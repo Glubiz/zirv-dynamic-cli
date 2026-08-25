@@ -137,6 +137,36 @@ pub fn dash_active() -> bool {
     DASH_ACTIVE.load(Ordering::SeqCst)
 }
 
+/// Whether the dashboard successfully negotiated and pushed the kitty
+/// keyboard-enhancement flags (`DISAMBIGUATE_ESCAPE_CODES`), and therefore
+/// whether the emergency handler and panic hook owe the terminal a matching
+/// pop on top of [`DASH_RESET`]. Set by `dash::mod`'s
+/// `push_keyboard_enhancement` right after a successful push, cleared by
+/// `teardown_terminal` right after its own ordinary pop. Deliberately not
+/// folded into [`DASH_ACTIVE`]: a push can succeed independently of the
+/// alternate screen being entered, and a stray pop must never fire for a
+/// stack entry zirv never pushed.
+static KBD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_kbd_enhanced(enhanced: bool) {
+    KBD_ENHANCED.store(enhanced, Ordering::SeqCst);
+}
+
+pub fn kbd_enhanced() -> bool {
+    KBD_ENHANCED.load(Ordering::SeqCst)
+}
+
+/// The bytes that pop one entry off the terminal's kitty keyboard-
+/// enhancement stack (`CSI < u`). A fixed constant for the same
+/// async-signal-safety reason [`DASH_RESET`] is one: this is written from
+/// the same emergency handler and panic hook, where formatting is not
+/// allowed.
+const KBD_ENHANCEMENT_POP: &[u8] = b"\x1b[<u";
+
+pub fn kbd_enhancement_pop_bytes() -> &'static [u8] {
+    KBD_ENHANCEMENT_POP
+}
+
 /// The bytes that put a terminal back after a dashboard session: cursor
 /// shown, mouse reporting off, scroll region reset, alternate screen left.
 /// Used by the dashboard's own teardown, its panic hook, and the
@@ -294,6 +324,12 @@ fn restore_console_from_handler() {
     // shell with no cursor, still on the alternate buffer.
     if dash_active() {
         write_stdout_raw(DASH_RESET);
+    }
+    // Independent of `dash_active`: a push can have succeeded without the
+    // dashboard's alternate screen being up, so this is gated solely on
+    // whether zirv itself pushed the kitty stack entry.
+    if kbd_enhanced() {
+        write_stdout_raw(KBD_ENHANCEMENT_POP);
     }
     restore_stashed_console_modes();
 }
@@ -1212,6 +1248,30 @@ mod tests {
         set_bar_active(false);
         assert!(!bar_active());
         assert_eq!(emergency_reset_bytes(bar_active()), b"");
+    }
+
+    #[test]
+    fn the_kbd_enhanced_flag_round_trips() {
+        // Same guard shape as `the_bar_active_flag_round_trips` -- a failing
+        // assertion below must not leave the process-global flag set for
+        // every later test.
+        struct KbdFlagGuard(bool);
+        impl Drop for KbdFlagGuard {
+            fn drop(&mut self) {
+                set_kbd_enhanced(self.0);
+            }
+        }
+        let _restore = KbdFlagGuard(kbd_enhanced());
+
+        set_kbd_enhanced(true);
+        assert!(kbd_enhanced());
+        set_kbd_enhanced(false);
+        assert!(!kbd_enhanced());
+    }
+
+    #[test]
+    fn kbd_enhancement_pop_bytes_is_the_csi_pop_sequence() {
+        assert_eq!(kbd_enhancement_pop_bytes(), b"\x1b[<u");
     }
 
     /// C6: `SIG_IGN` is inherited across `fork`/`exec` and is how a parent

@@ -1248,6 +1248,9 @@ impl AgentAdapter for ClaudeAdapter {
             turn_signal: true,
             system_prompt: true,
             events: true,
+            // claude's own composer submits a same-burst trailing `\r`
+            // correctly -- issue #118 is codex-specific.
+            defer_injection_submit: false,
         }
     }
 

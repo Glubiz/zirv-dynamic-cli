@@ -735,6 +735,23 @@ fn dialog_width(area_width: u16) -> u16 {
     area_width.saturating_sub(4).max(1).min(area_width.max(1))
 }
 
+/// Splits a draft/input string on `\n` into one dialog-line entry per visual
+/// row, so `render_dialog`'s `lines.len() + 2` box sizing stays correct for a
+/// multi-line draft: the first row keeps the `> ` prompt prefix, every
+/// continuation row gets a two-space prefix that lines up under it.
+fn draft_lines(text: &str) -> Vec<String> {
+    text.split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                format!("> {line}")
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect()
+}
+
 fn render_dialog(f: &mut Frame, area: Rect, title: &str, lines: &[String]) {
     // Nothing to draw into: every renderer below would either be a no-op or
     // have to reason about a zero-sized rect. One guard, at the one place
@@ -769,7 +786,7 @@ fn render_draft_dialog(
     items: &[String],
     cursor: usize,
 ) {
-    let mut lines = vec![format!("> {input}")];
+    let mut lines = draft_lines(input);
     for (i, item) in items.iter().enumerate() {
         let marker = if i == cursor { '>' } else { ' ' };
         lines.push(format!("{marker} {item}"));
@@ -793,18 +810,17 @@ fn preview(text: &str, max_chars: usize) -> String {
 
 fn render_mail_dialog(f: &mut Frame, area: Rect, view: &MailView) {
     let lines = if let Some(draft) = &view.compose {
-        vec![
-            format!(
-                "compose to: {}",
-                if draft.to.trim().is_empty() {
-                    "any"
-                } else {
-                    draft.to.as_str()
-                }
-            ),
-            format!("> {}", draft.body),
-            "Enter to send, Esc to cancel".to_string(),
-        ]
+        let mut lines = vec![format!(
+            "compose to: {}",
+            if draft.to.trim().is_empty() {
+                "any"
+            } else {
+                draft.to.as_str()
+            }
+        )];
+        lines.extend(draft_lines(&draft.body));
+        lines.push("Enter to send, Esc to cancel".to_string());
+        lines
     } else if view.items.is_empty() {
         vec!["(no mail)".to_string(), "c compose, Esc close".to_string()]
     } else {
@@ -825,10 +841,9 @@ fn render_mail_dialog(f: &mut Frame, area: Rect, view: &MailView) {
 
 fn render_memory_dialog(f: &mut Frame, area: Rect, view: &MemoryView) {
     let lines = if let Some(input) = &view.input {
-        vec![
-            format!("> {input}"),
-            "Enter to save, Esc to cancel".to_string(),
-        ]
+        let mut lines = draft_lines(input);
+        lines.push("Enter to save, Esc to cancel".to_string());
+        lines
     } else if view.entries.is_empty() {
         vec!["(no memory entries)".to_string(), "Esc close".to_string()]
     } else {
@@ -893,11 +908,9 @@ fn render_nudge_dialog(f: &mut Frame, area: Rect, draft: &NudgeDraft) {
         NudgeTarget::ViewOnlySession(short) => format!("session {short} (headless)"),
         NudgeTarget::None => "(no target selected)".to_string(),
     };
-    let lines = vec![
-        format!("to: {target}"),
-        format!("> {}", draft.input),
-        "Enter to send, Esc to cancel".to_string(),
-    ];
+    let mut lines = vec![format!("to: {target}")];
+    lines.extend(draft_lines(&draft.input));
+    lines.push("Enter to send, Esc to cancel".to_string());
     render_dialog(f, area, "nudge", &lines);
 }
 
@@ -2339,6 +2352,19 @@ mod tests {
             assert!(dialog_width(w) >= 1);
             assert!(dialog_width(w) <= w.max(1));
         }
+    }
+
+    #[test]
+    fn draft_lines_splits_on_newline_with_a_two_space_continuation_prefix() {
+        assert_eq!(
+            draft_lines("line one\nline two"),
+            vec!["> line one".to_string(), "  line two".to_string()]
+        );
+    }
+
+    #[test]
+    fn draft_lines_keeps_a_single_line_draft_as_one_row() {
+        assert_eq!(draft_lines("hello"), vec!["> hello".to_string()]);
     }
 
     #[test]

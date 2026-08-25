@@ -84,6 +84,16 @@ pub struct Capabilities {
     /// an always-empty parse -- the same distinction `score::cached_score`'s
     /// own doc comment already draws for a missing transcript.
     pub events: bool,
+    /// Whether this agent's own composer folds a same-write trailing `\r`
+    /// into pasted text, so an injection into it must write the text and its
+    /// submitting `\r` as two genuinely separate writes rather than one
+    /// burst (issue #118). Verified `true` for codex against its ratatui
+    /// composer (issue #114, fixed for the dashboard in PR #116); `false`
+    /// for claude, whose composer submits a same-burst trailing `\r`
+    /// correctly. See `wrap::write_mail_advisory` and
+    /// `dash::pane::inject_visible` for the two callers this actually
+    /// changes behavior for.
+    pub defer_injection_submit: bool,
 }
 
 /// Raw material for handoffs, extracted per-agent because it needs fields the
