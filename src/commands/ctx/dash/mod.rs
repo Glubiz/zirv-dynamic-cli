@@ -2099,8 +2099,25 @@ fn same_directory(a: &Path, b: &Path) -> bool {
 /// resolved against `path` before canonicalising, so a main worktree and any
 /// of its linked siblings canonicalise to the exact same `PathBuf` even
 /// though git reports the two differently.
+///
+/// Code review (issue #119, round 2): this is an authorization check -- its
+/// answer decides whether a spawn request gets to run a real agent -- so it
+/// must not trust an inherited environment that a request's own process
+/// could have set. `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` (and
+/// `GIT_INDEX_FILE`, for the same family of override) all redirect where
+/// `git` looks for repo state regardless of `-C`'s argument; left inherited,
+/// any one of them set in the dashboard's own process would make `git`
+/// resolve to the SAME overridden value for both `req_cwd` and `repo`,
+/// making the equality this function backs trivially true for two genuinely
+/// unrelated repos. Stripped here, at the one seam that shells out to `git`
+/// for this decision, rather than trusted to already be absent from the
+/// dashboard's environment.
 fn git_common_dir(path: &Path) -> Option<PathBuf> {
     let output = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .arg("-C")
         .arg(path)
         .arg("rev-parse")
@@ -2797,6 +2814,7 @@ fn fulfill_spawn_request(
         spec,
         state,
         &spawn_cwd,
+        repo,
         size,
         &turn_env,
         adapter.capabilities().turn_signal,
@@ -3495,6 +3513,7 @@ fn spawn_restored_pane(
     match Pane::spawn(
         spec,
         state,
+        repo,
         repo,
         size,
         &turn_env,
@@ -4398,6 +4417,7 @@ pub fn run_dashboard(
     let first_pane = match Pane::spawn(
         first,
         state,
+        repo,
         repo,
         size,
         &turn_env,
@@ -7814,6 +7834,7 @@ mod tests {
                 spec,
                 &state,
                 &repo,
+                &repo,
                 (80, 24),
                 &[],
                 true,
@@ -9298,6 +9319,24 @@ mod tests {
         );
     }
 
+    /// Mirror of the test above in the other direction: a dashboard whose
+    /// own `repo` IS the linked worktree must accept a request naming the
+    /// MAIN checkout as `cwd` -- `git_common_dir` is symmetric, so nothing
+    /// about which side is the "main" worktree and which is "linked" should
+    /// matter to the acceptance decision.
+    #[test]
+    fn accepted_spawn_cwd_accepts_the_main_checkout_from_a_dashboard_hosted_in_a_worktree() {
+        let Some((_root, main, linked)) = git_repo_with_linked_worktree() else {
+            return;
+        };
+        assert_eq!(
+            accepted_spawn_cwd(&main, &linked),
+            Some(main.clone()),
+            "the main checkout must be accepted by a dashboard whose own repo is a linked \
+             worktree, and hosted at its own path"
+        );
+    }
+
     /// The same acceptance, exercised through the full `fulfill_spawn_
     /// request` gate (via `refusal_for`'s sibling -- run to `Ok`, not a
     /// refusal) rather than only the extracted decision function, so a wiring
@@ -10046,6 +10085,7 @@ mod tests {
                 spec,
                 &state,
                 &repo,
+                &repo,
                 (80, 24),
                 &[],
                 true,
@@ -10319,6 +10359,7 @@ mod tests {
                     spec,
                     state,
                     repo,
+                    repo,
                     (80, 24),
                     &[],
                     true,
@@ -10462,6 +10503,7 @@ mod tests {
                 spec,
                 &state,
                 &repo,
+                &repo,
                 (80, 24),
                 &[],
                 true,
@@ -10557,6 +10599,7 @@ mod tests {
             Pane::spawn(
                 spec,
                 &state,
+                &repo,
                 &repo,
                 (80, 24),
                 &[],
@@ -10666,6 +10709,7 @@ mod tests {
         let mut pane = Pane::spawn(
             spec,
             state,
+            repo,
             repo,
             (80, 24),
             &[],
@@ -11011,6 +11055,7 @@ mod tests {
                 spec,
                 &state,
                 &repo,
+                &repo,
                 (80, 24),
                 &[],
                 true,
@@ -11114,6 +11159,7 @@ mod tests {
                 spec,
                 &state,
                 &repo,
+                &repo,
                 (80, 24),
                 &[],
                 true,
@@ -11197,6 +11243,7 @@ mod tests {
             Pane::spawn(
                 spec,
                 &state,
+                &repo,
                 &repo,
                 (80, 24),
                 &[],
@@ -11310,6 +11357,7 @@ mod tests {
             Pane::spawn(
                 spec,
                 &state,
+                &repo,
                 &repo,
                 (80, 24),
                 &[],
@@ -11431,6 +11479,7 @@ mod tests {
                 orch_spec,
                 &state,
                 &repo,
+                &repo,
                 (80, 24),
                 &[],
                 true,
@@ -11440,6 +11489,7 @@ mod tests {
             Pane::spawn(
                 worker_spec,
                 &state,
+                &repo,
                 &repo,
                 (80, 24),
                 &[],
@@ -12173,6 +12223,7 @@ mod tests {
                 spec,
                 &state,
                 &repo,
+                &repo,
                 (80, 24),
                 &[],
                 true,
@@ -12229,6 +12280,7 @@ mod tests {
             Pane::spawn(
                 spec,
                 &state,
+                &repo,
                 &repo,
                 (80, 24),
                 &[],
