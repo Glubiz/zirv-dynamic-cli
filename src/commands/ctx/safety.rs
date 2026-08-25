@@ -614,6 +614,60 @@ fn apply_orchestrator_outcome(command: &str, base: Outcome) -> Outcome {
 /// command text.
 const SHELL_PIPE_TARGETS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
 
+/// Wrapper/launcher programs whose own name is never the interesting part of
+/// a pipe target -- each of these goes on to run some OTHER program, so
+/// `curl x | env sh`, `| sudo sh`, `| timeout 5 sh` must still be read as
+/// piping into `sh`, not compared against `env`/`sudo`/`timeout`. Matched by
+/// program name, same normalization as everywhere else in this module.
+const SHELL_PIPE_WRAPPER_PROGRAMS: &[&str] = &[
+    "env", "exec", "command", "nohup", "sudo", "timeout", "stdbuf", "setsid", "xargs", "nice",
+    "ionice",
+];
+
+/// How many wrapper layers [`unwrap_pipe_wrapper`] will peel before giving up
+/// -- small and finite so a deliberately long wrapper chain in an untrusted
+/// command string cannot make this classifier do unbounded work.
+const MAX_PIPE_WRAPPER_DEPTH: u8 = 8;
+
+/// Resolves the last pipeline stage's leading tokens past any
+/// [`SHELL_PIPE_WRAPPER_PROGRAMS`] layers to the program that actually ends
+/// up executing -- `env sh`, `env -i VAR=x sh`, `sudo timeout 5 sh` all
+/// resolve to `sh`.
+///
+/// Not a shell parser: it only understands the wrapper's own leading flags
+/// (a single token starting with `-`), `env`'s leading `VAR=value`
+/// assignments, and `timeout`'s one mandatory DURATION positional before its
+/// command. Anything else just stops the unwrapping at whatever token it is
+/// looking at -- the fail-safe direction, since the caller then falls back
+/// to comparing the wrapper's own name, exactly the behavior this replaces.
+fn unwrap_pipe_wrapper<'a>(tokens: &[&'a str], depth: u8) -> Option<&'a str> {
+    let first = *tokens.first()?;
+    let program = sql_program_name(first);
+    if depth == 0 || !SHELL_PIPE_WRAPPER_PROGRAMS.contains(&program.as_str()) {
+        return Some(first);
+    }
+    let mut i = 1usize;
+    if program == "timeout" {
+        while tokens.get(i).is_some_and(|t| t.starts_with('-')) {
+            i += 1;
+        }
+        if tokens.get(i).is_some() {
+            i += 1; // the mandatory DURATION positional.
+        }
+    }
+    loop {
+        match tokens.get(i) {
+            Some(t) if t.starts_with('-') => i += 1,
+            Some(t) if program == "env" && t.contains('=') => i += 1,
+            _ => break,
+        }
+    }
+    if i >= tokens.len() {
+        return None;
+    }
+    unwrap_pipe_wrapper(&tokens[i..], depth - 1)
+}
+
 /// Splits `command` on a bare `|` (not `||`) while keeping quoted data
 /// together -- the same quote-handling `split_segments` already applies,
 /// narrowed to just the pipe operator so the caller can inspect the LAST
@@ -669,6 +723,10 @@ fn pipeline_stages(command: &str) -> Vec<String> {
 /// `adapters::SHIPPED_POSTURE_DENY` only catch the exact spacing they spell
 /// out; this walks the actual pipeline stages and compares the last one's
 /// PROGRAM NAME instead, so no spacing/shell-name combination escapes it.
+/// The last stage's leading tokens are also resolved past any
+/// [`SHELL_PIPE_WRAPPER_PROGRAMS`] layer (`| env sh`, `| sudo sh`, `| timeout
+/// 5 sh`, ...) via [`unwrap_pipe_wrapper`] before the program-name compare,
+/// so a wrapper cannot hide the real shell behind its own name.
 fn is_pipe_into_shell(command: &str) -> bool {
     let stages = pipeline_stages(command);
     if stages.len() < 2 {
@@ -678,10 +736,11 @@ fn is_pipe_into_shell(command: &str) -> bool {
         return false;
     };
     let collapsed = collapse_whitespace(last);
-    let Some(first_token) = collapsed.split(' ').next() else {
+    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    let Some(resolved) = unwrap_pipe_wrapper(&tokens, MAX_PIPE_WRAPPER_DEPTH) else {
         return false;
     };
-    let program = sql_program_name(first_token);
+    let program = sql_program_name(resolved);
     SHELL_PIPE_TARGETS.contains(&program.as_str())
 }
 
