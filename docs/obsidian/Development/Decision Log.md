@@ -24,6 +24,13 @@ last-verified: 2026-08-25
 
 ## Decisions
 
+### 2026-08-25 — Permission-audit recommendations gate on a protected-family list, independent of reusability (issue #132)
+**Context:** `zirv ctx permissions audit`'s `is_reusable` judges only whether a family's saved approval would keep matching the next equivalent invocation (no long literal, no filter pipe). Review found `git push --force origin main` is `reusable` by that definition — no long literal, no pipe — yet issue #132 explicitly requires destructive git, publish/release, credential/secret, and global-install families to keep prompting no matter how mechanically repeatable the command looks.
+**Decision:** Added a second, independent classifier, `is_protected_family(family, sample)`, checked on the actual command text (not just the flag-stripped family key, since `git push --force` and `git push origin feature` share one family). `recommendation_for` consults it ahead of `reusable` and returns a distinct "protected family" message that overrides an otherwise-reusable "grant a standing allow" verdict; `group_requests` protects a whole family if any single member's raw command classifies as protected.
+**Rejected:** Folding the protection check into `is_reusable` itself — that conflates two different questions ("would this text repeat" vs. "should this ever be silently approved") and would have made `is_reusable`'s own name misleading to a caller checking just repeatability.
+**Consequences:** A future protected family must be added to `is_protected_family`'s own match arms; the reusability model needs no further change to keep excluding safety-sensitive families.
+**Spec / link:** `src/commands/ctx/permissions.rs` `is_protected_family`/`recommendation_for`/`group_requests`; [[Command Safety]]'s "Permission audit" section; issue #132.
+
 ### 2026-08-25 — Optimizer findings require exact supplied `path:line` evidence
 **Context:** A real Claude optimizer child loaded legacy native auto-memory that Zirv had neither collected nor included in its prompt, then returned a High finding citing those ambient `memory:*` keys. Accepting that output made the report unauditable and broke the memory-summary rule that keys/bodies never enter the judgment path.
 **Decision:** After parsing, accept a model finding only when it has evidence and every item exactly names a supplied surface path plus a positive line inside the bounded excerpt sent to the child. Reject the entire ungrounded finding and add one informational validation note without echoing rejected evidence text.
