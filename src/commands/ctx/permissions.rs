@@ -290,11 +290,7 @@ pub(crate) fn is_protected_family(family: &str, sample: &str) -> bool {
         // but exactly the family issue #132 names as one that must keep
         // prompting rather than being silently granted a standing allow.
         "git push" => {
-            has("--force")
-                || has("--force-with-lease")
-                || has("-f")
-                || has("--delete")
-                || has("-d")
+            has("--force") || has("--force-with-lease") || has("-f") || has("--delete") || has("-d")
         }
         "git reset" => has("--hard"),
         "git clean" => has("--force") || has_bundled_short_force,
@@ -557,9 +553,7 @@ pub(crate) fn group_requests(requests: &[PermissionRequest]) -> Vec<FamilyGroup>
             // shape (`git push origin x` alongside `git push --force origin
             // main`) must not be recommended a standing allow just because
             // its first-observed member looked routine.
-            let protected = members
-                .iter()
-                .any(|m| is_protected_family(&family, &m.raw));
+            let protected = members.iter().any(|m| is_protected_family(&family, &m.raw));
             FamilyGroup {
                 count: members.len(),
                 reusable,

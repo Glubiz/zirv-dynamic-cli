@@ -3765,10 +3765,7 @@ mod tests {
     #[test]
     fn unwrap_env_prefix_bails_out_on_split_string_rather_than_misparse_it() {
         assert_eq!(unwrap_env_prefix("env -S 'rm -rf /'"), None);
-        assert_eq!(
-            unwrap_env_prefix("env --split-string 'rm -rf /'"),
-            None
-        );
+        assert_eq!(unwrap_env_prefix("env --split-string 'rm -rf /'"), None);
         assert_eq!(unwrap_env_prefix("env --split-string='rm -rf /'"), None);
     }
 
