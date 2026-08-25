@@ -23,11 +23,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -219,7 +221,12 @@ fn csi_tilde(n: u8, mods: KeyModifiers) -> Vec<u8> {
 /// `CSI <n> ; <mod> ~` forms, so `Ctrl+Left` moves a word rather than one
 /// character. M8: the CONTROL arm maps the non-alphabetic control combinations
 /// crossterm pre-maps to a plain char (Ctrl+Space, Ctrl+\`]^_`) to their real
-/// C0 bytes, so they no longer type a literal digit or space.
+/// C0 bytes, so they no longer type a literal digit or space -- covering
+/// both the legacy digit-alias shape an un-negotiated terminal sends
+/// (Ctrl+\/]/^/_ arriving as `Char('4'..'7')`) and the literal-character
+/// shape a terminal sends once the kitty keyboard protocol is negotiated
+/// (`push_keyboard_enhancement`), where those same keys arrive as
+/// `Char('\\'/']'/'^'/'_')` instead.
 ///
 /// Deliberately makes no special case for a raw control byte arriving as
 /// `KeyCode::Char('\u{01}')` (or any other `Char('\u{0N}')`) with no
@@ -302,11 +309,17 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
             // a plain char. Without these they typed a literal `4`/`7`/space
             // instead of the C0 byte the operator meant.
             match c {
-                ' ' => vec![0x00], // Ctrl+Space -> NUL
-                '4' => vec![0x1c], // Ctrl+\  (delivered as Char('4'))
-                '5' => vec![0x1d], // Ctrl+]
-                '6' => vec![0x1e], // Ctrl+^
-                '7' => vec![0x1f], // Ctrl+_
+                ' ' => vec![0x00],  // Ctrl+Space -> NUL
+                '4' => vec![0x1c],  // Ctrl+\  (legacy alias, delivered as Char('4'))
+                '5' => vec![0x1d],  // Ctrl+]  (legacy alias, delivered as Char('5'))
+                '6' => vec![0x1e],  // Ctrl+^  (legacy alias, delivered as Char('6'))
+                '7' => vec![0x1f],  // Ctrl+_  (legacy alias, delivered as Char('7'))
+                '\\' => vec![0x1c], // Ctrl+\  (literal, delivered once kitty is negotiated)
+                ']' => vec![0x1d],  // Ctrl+]  (literal, delivered once kitty is negotiated)
+                '^' => vec![0x1e],  // Ctrl+^  (literal, delivered once kitty is negotiated)
+                '_' => vec![0x1f],  // Ctrl+_  (literal, delivered once kitty is negotiated)
+                '/' => vec![0x1f],  // Ctrl+/  (kitty delivers the literal; same C0 as Ctrl+_)
+                '@' => vec![0x00],  // Ctrl+@  (kitty delivers the literal; NUL)
                 _ => {
                     let upper = c.to_ascii_uppercase();
                     if upper.is_ascii_alphabetic() {
@@ -1701,6 +1714,41 @@ fn claim_pane_nudges(panes: &[Pane], state: &StateDir, notices: &mut Vec<Notice>
     }
 }
 
+/// Best-effort kitty keyboard-enhancement negotiation, requesting only
+/// `DISAMBIGUATE_ESCAPE_CODES` -- never event-type/release reporting, which
+/// would flood the per-tick input drain with a keydown+keyup pair for every
+/// keystroke nothing here reads. Without this, a unix terminal sends a plain
+/// `\r` for Shift+Enter and `encode_key`'s Shift+Enter branch can never see
+/// the modifier at all: it is simply not on the wire.
+///
+/// Must run before anything starts reading stdin: `supports_keyboard_enhancement`'s
+/// own docs say it blocks on the same terminal query/reply cycle `event::read`/
+/// `poll` use, so calling it once the dashboard's own event loop (below) has
+/// started would have the two race over the same bytes. Nothing else reads
+/// stdin before `run_dashboard` calls this during setup.
+///
+/// Any probe or push failure is silent and leaves the terminal exactly as it
+/// was -- this is an enhancement, never a requirement, matching this
+/// dashboard's rule that a supervision/UI failure must never make a session
+/// worse. Returns whether the push actually happened, so the caller knows
+/// whether teardown owes the terminal a matching pop. On success also arms
+/// `term::set_kbd_enhanced`, so a panic or an external kill that never
+/// reaches `teardown_terminal` still knows to pop the stack entry it pushed.
+fn push_keyboard_enhancement() -> bool {
+    let pushed = match supports_keyboard_enhancement() {
+        Ok(true) => execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok(),
+        _ => false,
+    };
+    if pushed {
+        term::set_kbd_enhanced(true);
+    }
+    pushed
+}
+
 /// Restores the shared terminal on the way out of `run_dashboard`: disables
 /// raw mode, then writes `term::dash_reset_bytes()` -- cursor shown, scroll
 /// region un-fenced, alternate screen left -- to **stdout**, which is the
@@ -1714,10 +1762,16 @@ fn claim_pane_nudges(panes: &[Pane], state: &StateDir, notices: &mut Vec<Notice>
 /// Idempotent, and called from every exit arm, matching the `RawGuard`/
 /// `SessionGuard` precedent this plan's Global Constraints call for --
 /// `panic = "abort"` in the release profile means `Drop` is not a safety
-/// net here either.
-fn teardown_terminal() {
+/// net here either. `keyboard_enhancement_pushed` is whatever
+/// `push_keyboard_enhancement` returned during setup -- `false` at any call
+/// site that could not have pushed yet (an abort before that point).
+fn teardown_terminal(keyboard_enhancement_pushed: bool) {
     term::set_dash_active(false);
     let _ = disable_raw_mode();
+    if keyboard_enhancement_pushed {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        term::set_kbd_enhanced(false);
+    }
     let mut stdout = io::stdout();
     let _ = stdout.write_all(term::dash_reset_bytes());
     let _ = stdout.flush();
@@ -1745,6 +1799,11 @@ type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'sta
 ///    slice (see `term.rs`) -- so nothing was reset and the cursor was never
 ///    shown again.
 /// 3. It wrote to stderr, but the alternate screen was entered on stdout.
+///
+/// A fourth: if `push_keyboard_enhancement` had succeeded, the kitty
+/// keyboard-enhancement stack entry it pushed was never popped either --
+/// `term::kbd_enhanced()` records whether that push happened, since this
+/// hook is installed before the push and so cannot close over the answer.
 fn install_panic_hook() -> Arc<PanicHook> {
     let previous: Arc<PanicHook> = Arc::new(std::panic::take_hook());
     let chained = Arc::clone(&previous);
@@ -1752,6 +1811,9 @@ fn install_panic_hook() -> Arc<PanicHook> {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
         let _ = stdout.write_all(term::dash_reset_bytes());
+        if term::kbd_enhanced() {
+            let _ = stdout.write_all(term::kbd_enhancement_pop_bytes());
+        }
         let _ = stdout.flush();
         chained(info);
     }));
@@ -2795,6 +2857,14 @@ pub fn mail_overlay_reduce(
                 view.compose = None;
                 (Some(view), None)
             }
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                draft.body.push('\n');
+                (Some(view), None)
+            }
             KeyCode::Enter => {
                 if draft.body.trim().is_empty() {
                     return (Some(view), None);
@@ -2891,6 +2961,14 @@ pub fn spawn_overlay_reduce(
 ) -> (Option<ui::SpawnDraft>, Option<SpawnEffect>) {
     match key.code {
         KeyCode::Esc => (None, None),
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            draft.input.push('\n');
+            (Some(draft), None)
+        }
         KeyCode::Enter => {
             let line = draft.input.trim();
             let Some((agent, prompt)) = line.split_once(char::is_whitespace) else {
@@ -2938,6 +3016,14 @@ pub fn memory_overlay_reduce(
         return match key.code {
             KeyCode::Esc => {
                 view.input = None;
+                (Some(view), None)
+            }
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                input.push('\n');
                 (Some(view), None)
             }
             KeyCode::Enter => {
@@ -3932,6 +4018,67 @@ fn submit_nudge(
     }
 }
 
+/// What confirming the nudge dialog asks the caller to do: hand `text` to
+/// `submit_nudge` against `target`, exactly as `Enter` already did before
+/// this reducer existed. Unlike `SpawnEffect`, there is no `Notice` case --
+/// blank text on `Enter` is, and always was, a silent no-op (see
+/// `nudge_overlay_reduce`'s own doc comment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NudgeSubmit {
+    target: ui::NudgeTarget,
+    text: String,
+}
+
+/// Pure: the same reducer shape as `mail_overlay_reduce`/`spawn_overlay_reduce`/
+/// `memory_overlay_reduce`, extracted out of the inline `match key.code` this
+/// overlay used to run directly in `run_dashboard`'s event loop so it can be
+/// unit-tested the same way the other three are. Behavior is unchanged by the
+/// extraction: `Enter` always closes the dialog (`None`) and submits only
+/// when the trimmed input is non-blank -- a blank `Enter` was already a
+/// silent close-without-submitting before this existed, and stays one; this
+/// is the one overlay here that does not reopen with a notice on an empty
+/// submission, unlike `spawn_overlay_reduce`'s `SPAWN_USAGE_NOTICE`.
+/// Shift+Enter/Alt+Enter insert a newline instead of submitting, matching
+/// every other compose-style overlay in this module.
+pub(crate) fn nudge_overlay_reduce(
+    mut draft: ui::NudgeDraft,
+    key: KeyEvent,
+) -> (Option<ui::NudgeDraft>, Option<NudgeSubmit>) {
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            draft.input.push('\n');
+            (Some(draft), None)
+        }
+        KeyCode::Enter => {
+            let text = draft.input.trim().to_string();
+            if text.is_empty() {
+                return (None, None);
+            }
+            (
+                None,
+                Some(NudgeSubmit {
+                    target: draft.target,
+                    text,
+                }),
+            )
+        }
+        KeyCode::Backspace => {
+            draft.input.pop();
+            (Some(draft), None)
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            draft.input.push(c);
+            (Some(draft), None)
+        }
+        _ => (Some(draft), None),
+    }
+}
+
 /// HIGH-2: the most input events one tick drains before it stops to do its
 /// per-tick maintenance and redraw. A paste is delivered as one key event per
 /// character, so without a per-tick drain the loop ran a full maintenance pass
@@ -4203,7 +4350,10 @@ pub fn run_dashboard(
         return Err(format!("dashboard: enable_raw_mode failed: {e}").into());
     }
     if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
-        teardown_terminal();
+        // Nothing has pushed the keyboard-enhancement flags yet -- that
+        // happens further down, once the alternate screen and mouse
+        // reporting are both up -- so teardown owes no matching pop here.
+        teardown_terminal(false);
         abort_setup(&mut panes, cfg, &requests_dir);
         restore_panic_hook(&previous_panic_hook);
         return Err(format!("dashboard: EnterAlternateScreen failed: {e}").into());
@@ -4252,6 +4402,15 @@ pub fn run_dashboard(
         }
     }
 
+    // Kitty keyboard enhancement: negotiated here, after raw mode/the
+    // alternate screen/mouse reporting are all up and before anything below
+    // starts reading stdin (the event loop, further down, is the first --
+    // see `push_keyboard_enhancement`'s own doc comment for why that
+    // ordering is load-bearing, not incidental). `keyboard_enhancement_pushed`
+    // is threaded through every `teardown_terminal` call from here on so the
+    // matching pop only ever fires when the push actually happened.
+    let keyboard_enhancement_pushed = push_keyboard_enhancement();
+
     // Task 2: the opt-in input diagnostic. `None`, and entirely inert, unless
     // `ZIRV_CTX_DASH_KEYLOG` names a path.
     let mut keylog = KeyLog::from_env();
@@ -4268,7 +4427,7 @@ pub fn run_dashboard(
     let mut terminal = match Terminal::new(backend) {
         Ok(t) => t,
         Err(e) => {
-            teardown_terminal();
+            teardown_terminal(keyboard_enhancement_pushed);
             abort_setup(&mut panes, cfg, &requests_dir);
             restore_panic_hook(&previous_panic_hook);
             return Err(format!("dashboard: could not attach to the terminal: {e}").into());
@@ -4819,36 +4978,26 @@ pub fn run_dashboard(
                                             );
                                         }
                                     }
-                                    ui::Overlay::Nudge(mut draft) => match key.code {
-                                        KeyCode::Esc => {}
-                                        KeyCode::Enter => {
-                                            let text = draft.input.trim().to_string();
-                                            if !text.is_empty() {
-                                                submit_nudge(
-                                                    draft.target,
-                                                    &text,
-                                                    &mut panes,
-                                                    &mut nudge_queues,
-                                                    repo,
-                                                    env,
-                                                    &mut errors,
-                                                    &mut notices,
-                                                    Instant::now(),
-                                                );
-                                            }
+                                    ui::Overlay::Nudge(draft) => {
+                                        let (next, submit) = nudge_overlay_reduce(draft, key);
+                                        overlay = match next {
+                                            Some(d) => ui::Overlay::Nudge(d),
+                                            None => ui::Overlay::None,
+                                        };
+                                        if let Some(NudgeSubmit { target, text }) = submit {
+                                            submit_nudge(
+                                                target,
+                                                &text,
+                                                &mut panes,
+                                                &mut nudge_queues,
+                                                repo,
+                                                env,
+                                                &mut errors,
+                                                &mut notices,
+                                                Instant::now(),
+                                            );
                                         }
-                                        KeyCode::Backspace => {
-                                            draft.input.pop();
-                                            overlay = ui::Overlay::Nudge(draft);
-                                        }
-                                        KeyCode::Char(c)
-                                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                        {
-                                            draft.input.push(c);
-                                            overlay = ui::Overlay::Nudge(draft);
-                                        }
-                                        _ => overlay = ui::Overlay::Nudge(draft),
-                                    },
+                                    }
                                     // Issue #84.
                                     ui::Overlay::Handover(mut draft) => match key.code {
                                         KeyCode::Esc => {}
@@ -5662,7 +5811,7 @@ pub fn run_dashboard(
         }
     };
 
-    teardown_terminal();
+    teardown_terminal(keyboard_enhancement_pushed);
     restore_panic_hook(&previous_panic_hook);
     // After the teardown, never before: the alternate screen is gone by now, so
     // this lands in the operator's own scrollback rather than on a surface
@@ -7274,6 +7423,36 @@ mod tests {
     }
 
     #[test]
+    fn mail_overlay_shift_enter_inserts_a_newline_and_does_not_submit() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "line one".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        let next = next.expect("stays open");
+        assert_eq!(next.compose.expect("still composing").body, "line one\n");
+        assert!(effect.is_none(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn mail_overlay_alt_enter_inserts_a_newline_and_does_not_submit() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "line one".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::ALT));
+        let next = next.expect("stays open");
+        assert_eq!(next.compose.expect("still composing").body, "line one\n");
+        assert!(effect.is_none(), "alt+enter must not submit");
+    }
+
+    #[test]
     fn mail_overlay_enter_on_an_item_emits_consume_and_removes_it_from_the_list() {
         let view = ui::MailView {
             items: vec![(PathBuf::from("/a"), "claude".to_string(), "one".to_string())],
@@ -7366,6 +7545,26 @@ mod tests {
                 body: "new body".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn memory_overlay_shift_enter_inserts_a_newline_and_does_not_submit() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("new body".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, Some("new body\n".to_string()));
+        assert!(effect.is_none(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn memory_overlay_alt_enter_inserts_a_newline_and_does_not_submit() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("new body".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::ALT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, Some("new body\n".to_string()));
+        assert!(effect.is_none(), "alt+enter must not submit");
     }
 
     #[test]
@@ -9314,6 +9513,24 @@ mod tests {
     }
 
     #[test]
+    fn spawn_dialog_shift_enter_inserts_a_newline_and_does_not_submit() {
+        let draft = type_line("claude");
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "claude\n");
+        assert!(effect.is_none(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn spawn_dialog_alt_enter_inserts_a_newline_and_does_not_submit() {
+        let draft = type_line("claude");
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::ALT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "claude\n");
+        assert!(effect.is_none(), "alt+enter must not submit");
+    }
+
+    #[test]
     fn spawn_dialog_needs_both_an_agent_and_a_prompt() {
         for line in ["", "   ", "claude", "claude   "] {
             let draft = type_line(line);
@@ -9361,6 +9578,92 @@ mod tests {
             }
             other => panic!("expected a Submit, got {other:?}"),
         }
+    }
+
+    // The nudge overlay's own reducer, extracted out of the inline
+    // `match key.code` `run_dashboard`'s event loop used to run directly, so
+    // it can be tested the same way the other three overlay reducers are.
+
+    fn nudge_draft(target: ui::NudgeTarget, input: &str) -> ui::NudgeDraft {
+        ui::NudgeDraft {
+            target,
+            input: input.to_string(),
+        }
+    }
+
+    #[test]
+    fn nudge_overlay_esc_closes_the_dialog() {
+        let draft = nudge_draft(ui::NudgeTarget::None, "half-typed");
+        let (next, submit) = nudge_overlay_reduce(draft, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(submit.is_none());
+    }
+
+    #[test]
+    fn nudge_overlay_backspace_edits_the_input() {
+        let draft = nudge_draft(ui::NudgeTarget::None, "hix");
+        let (next, _) = nudge_overlay_reduce(draft, key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(next.expect("stays open").input, "hi");
+    }
+
+    #[test]
+    fn nudge_overlay_typing_accumulates_the_input() {
+        let draft = nudge_draft(ui::NudgeTarget::None, "h");
+        let (next, effect) = nudge_overlay_reduce(draft, press('i'));
+        assert!(effect.is_none(), "typing emits no effect");
+        assert_eq!(next.expect("stays open").input, "hi");
+    }
+
+    #[test]
+    fn nudge_overlay_enter_on_blank_input_closes_without_submitting() {
+        let draft = nudge_draft(ui::NudgeTarget::AttachedPane("aaaa1111".to_string()), "   ");
+        let (next, submit) = nudge_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            next.is_none(),
+            "a blank Enter is a silent close, not a reopen"
+        );
+        assert!(submit.is_none());
+    }
+
+    #[test]
+    fn nudge_overlay_enter_on_nonblank_input_closes_and_submits() {
+        let draft = nudge_draft(
+            ui::NudgeTarget::AttachedPane("aaaa1111".to_string()),
+            "heads up",
+        );
+        let (next, submit) = nudge_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "a submitted dialog closes");
+        assert_eq!(
+            submit,
+            Some(NudgeSubmit {
+                target: ui::NudgeTarget::AttachedPane("aaaa1111".to_string()),
+                text: "heads up".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn nudge_overlay_shift_enter_inserts_a_newline_and_does_not_submit() {
+        let draft = nudge_draft(
+            ui::NudgeTarget::AttachedPane("aaaa1111".to_string()),
+            "line one",
+        );
+        let (next, submit) = nudge_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "line one\n");
+        assert!(submit.is_none(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn nudge_overlay_alt_enter_inserts_a_newline_and_does_not_submit() {
+        let draft = nudge_draft(
+            ui::NudgeTarget::AttachedPane("aaaa1111".to_string()),
+            "line one",
+        );
+        let (next, submit) = nudge_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::ALT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "line one\n");
+        assert!(submit.is_none(), "alt+enter must not submit");
     }
 
     // Task 12: the startup restore dialog's pure reducer, `build_restore_view`,
@@ -11477,18 +11780,48 @@ mod tests {
             "Ctrl+Space is NUL"
         );
         assert_eq!(
-            encode_key(key(KeyCode::Char('_'), KeyModifiers::CONTROL)),
-            vec![b'_'],
-            "Ctrl+_ arrives as a bare '_' on some terminals -- passed through"
-        );
-        assert_eq!(
             encode_key(key(KeyCode::Char('7'), KeyModifiers::CONTROL)),
             vec![0x1f],
-            "Ctrl+_ delivered as Char('7') is 0x1f"
+            "Ctrl+_ delivered as the legacy Char('7') alias is 0x1f"
         );
         assert_eq!(
             encode_key(key(KeyCode::Char('4'), KeyModifiers::CONTROL)),
             vec![0x1c]
+        );
+        // Under the kitty keyboard protocol (negotiated by
+        // `push_keyboard_enhancement`) these same keys arrive with their
+        // literal character instead of the legacy '4'..'7' aliases above --
+        // a bare '_' used to be passed through unchanged here, typing a
+        // literal underscore instead of Ctrl+_.
+        assert_eq!(
+            encode_key(key(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
+            vec![0x1c],
+            "Ctrl+\\ delivered literally under kitty"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+            vec![0x1d],
+            "Ctrl+] delivered literally under kitty"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char('^'), KeyModifiers::CONTROL)),
+            vec![0x1e],
+            "Ctrl+^ delivered literally under kitty"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char('_'), KeyModifiers::CONTROL)),
+            vec![0x1f],
+            "Ctrl+_ delivered literally under kitty"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL)),
+            vec![0x1f],
+            "Ctrl+/ delivered literally under kitty shares Ctrl+_'s C0 byte"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Char('@'), KeyModifiers::CONTROL)),
+            vec![0x00],
+            "Ctrl+@ delivered literally under kitty is NUL"
         );
         // The alphabetic branch is untouched.
         assert_eq!(

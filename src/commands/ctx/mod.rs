@@ -44,6 +44,19 @@ pub mod usage;
 pub mod window;
 pub mod wrap;
 
+/// The minimum gap a deferred injection leaves between writing its text and
+/// the lone `\r` that submits it (issue #114, PR #116). Shared by
+/// `dash::pane` (the dashboard's own visible injections) and `wrap` (the T13
+/// mail-advisory injection into a `Capabilities::defer_injection_submit`
+/// adapter, issue #118): both write the injected text first, flush, then
+/// write the submitting `\r` no sooner than this gap later, because a
+/// same-burst text+`\r` reads to a codex-shaped composer as a paste and
+/// folds the `\r` into the pasted text instead of submitting it. See
+/// `dash::pane::write_injection_phase1`'s own doc comment for the full
+/// story, and `dash::pane::write_submit_cr`/`dash::pane::submit_is_due` for
+/// the write and the deadline check both callers share too.
+pub(crate) const INJECTION_SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Shared helpers for the supervisor tests, which drive real child processes
 /// and therefore have to steer process-wide state carefully.
 #[cfg(test)]

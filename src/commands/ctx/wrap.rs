@@ -48,7 +48,7 @@ use super::signal::TurnSignal;
 use super::state::StateDir;
 use super::supervise::Watcher;
 use super::term::{RawGuard, STDIN_FD, window_size};
-use super::{CtxResult, adapters};
+use super::{CtxResult, INJECTION_SUBMIT_DELAY, adapters};
 
 const PUMP_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_SIZE: (u16, u16) = (80, 24);
@@ -712,6 +712,23 @@ fn mail_advisory_bytes(count: usize, from_agent: &str, from_short: &str) -> Vec<
     bytes
 }
 
+/// Phase 1 of a deferred mail advisory (issue #118): the labelled line with
+/// no control bytes of its own, flushed alone -- `mail_advisory_bytes`'s own
+/// text half, minus the trailing `\r` it appends for the single-burst path.
+/// See `write_mail_advisory`'s own doc comment for when this is used instead
+/// of that single write.
+fn write_mail_advisory_phase1(
+    sink: &mut dyn Write,
+    count: usize,
+    from_agent: &str,
+    from_short: &str,
+) -> std::io::Result<()> {
+    let text = mail_advisory_line(count, from_agent, from_short).into_bytes();
+    sink.write_all(&text)?;
+    sink.flush()?;
+    Ok(())
+}
+
 /// What one mail poll concluded. Both non-empty arms carry the ids they
 /// covered, so the pump commits them only once the corresponding write
 /// actually landed.
@@ -745,6 +762,12 @@ pub struct MailWatch {
     last_poll: Option<Instant>,
     injected: super::mail::AdvisedIds,
     announced: super::mail::AdvisedIds,
+    /// Issue #118: a `defer_injection_submit` adapter's still-owed
+    /// mail-advisory `\r` (`write_mail_advisory`'s phase 2) and the deadline
+    /// it is due -- `dash::pane`'s own `pending_submit` field, mirrored here
+    /// for the same reason: the pump loop's drain has to be able to answer
+    /// "is this due yet" without a real clock in a pure test.
+    pending_submit: Option<Instant>,
 }
 
 impl MailWatch {
@@ -837,6 +860,87 @@ impl MailWatch {
             self.announced.insert(id);
         }
     }
+
+    /// Whether an earlier deferred injection's `\r` is still owed at all,
+    /// regardless of whether its deadline has passed -- what
+    /// `write_mail_advisory` checks before a *new* injection's own phase 1,
+    /// so two advisories can never interleave into one garbled line.
+    fn has_pending_submit(&self) -> bool {
+        self.pending_submit.is_some()
+    }
+
+    /// Whether a deferred injection's `\r` is due to be written as of `now`
+    /// -- `dash::pane::submit_is_due`'s own pure check, reused rather than
+    /// reimplemented (the two share `INJECTION_SUBMIT_DELAY` already, so
+    /// there is no reason for the due-check itself to drift apart too).
+    fn pending_submit_due(&self, now: Instant) -> bool {
+        super::dash::pane::submit_is_due(self.pending_submit, now)
+    }
+
+    fn arm_pending_submit(&mut self, deadline: Instant) {
+        self.pending_submit = Some(deadline);
+    }
+
+    fn clear_pending_submit(&mut self) {
+        self.pending_submit = None;
+    }
+}
+
+/// Writes one mail advisory into `writer` (issue #118), single-burst
+/// (`mail_advisory_bytes`) or split into `write_mail_advisory_phase1` plus a
+/// deferred `dash::pane::write_submit_cr`, by whether `defer`
+/// (`Capabilities::defer_injection_submit`) is set for the wrapped adapter.
+///
+/// The single-burst shape is the pre-#118 behavior, byte-for-byte unchanged
+/// -- a turn-signal-capable adapter's composer (claude) submits a same-burst
+/// trailing `\r` correctly, so there is nothing to defer against. The
+/// deferred shape mirrors `dash::pane::inject_visible`: phase 1 lands and
+/// `MailWatch::pending_submit` is armed for `INJECTION_SUBMIT_DELAY` later,
+/// which the pump loop's own periodic drain (see the mail poll arm's call
+/// site) submits once due. If an earlier deferred injection's own `\r` is
+/// still owed when this one starts, it is flushed first
+/// (best-effort -- a failed flush here just leaves it for the next tick's
+/// drain to retry, same as always), so the two writes can never interleave
+/// into one line the child would read as a single, garbled submission.
+///
+/// Returns whether this call's own text landed -- the same "was the child
+/// actually told" signal the caller's `MailWatch::commit_injected`/
+/// `note_announcement` branch on, regardless of which shape wrote it. A
+/// deferred write is marked advised (`commit_injected`) at this, its
+/// phase-1, moment -- not once the drain's own `\r` lands -- the same
+/// bookkeeping moment `dash::pane::inject_visible` already commits its own
+/// pane state at.
+fn write_mail_advisory(
+    mail_watch: &mut MailWatch,
+    writer: &std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    defer: bool,
+    count: usize,
+    from_agent: &str,
+    from_short: &str,
+) -> bool {
+    if !defer {
+        let bytes = mail_advisory_bytes(count, from_agent, from_short);
+        return match writer.lock() {
+            Ok(mut sink) => sink.write_all(&bytes).and_then(|()| sink.flush()).is_ok(),
+            Err(_) => false,
+        };
+    }
+    if mail_watch.has_pending_submit()
+        && let Ok(mut sink) = writer.lock()
+        && super::dash::pane::write_submit_cr(&mut *sink).is_ok()
+    {
+        mail_watch.clear_pending_submit();
+    }
+    let wrote = match writer.lock() {
+        Ok(mut sink) => {
+            write_mail_advisory_phase1(&mut *sink, count, from_agent, from_short).is_ok()
+        }
+        Err(_) => false,
+    };
+    if wrote {
+        mail_watch.arm_pending_submit(Instant::now() + INJECTION_SUBMIT_DELAY);
+    }
+    wrote
 }
 
 /// Finding #7: `handover::take_request`'s own cadence gate, the same "is it
@@ -863,20 +967,40 @@ fn unread_mail_counts(
     super::mail::unread_counts(state, repo, agent, session_short, mail_enabled)
 }
 
-/// Known residual (PR #116 follow-up): this writes text and its submitting
-/// `\r` in one burst, the same shape dash::pane's injections had before the
-/// F1/F2 fix -- a codex-shaped composer that reads a same-burst `\r` as part
-/// of a paste could in principle fold it into a literal newline here too.
-/// It is deliberately NOT split into dash::pane's deferred two-phase submit:
-/// the wrapped child's own `read -r` line-reader needs the CR in-band to
-/// complete and make the injected text observable in the output stream, and
-/// splitting it (commit 15a7db9, reverted) made `read_until` block past its
-/// budget in the two T13 real-pty tests below, which starved out to CI's
-/// 180s hard kill instead of failing fast. Tracked as a follow-up rather
-/// than fixed here.
-pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
-    // A TUI submits on carriage return, not newline.
-    write!(sink, "{compact_command} {COMPACT_FOCUS}\r")?;
+/// Capability-gated two-phase, the same shape [`write_mail_advisory`] uses
+/// for the T13 mail-advisory injection, and for the same reason: this site
+/// IS reachable for a `defer_injection_submit` adapter (codex), not only
+/// for claude. `Action::Compact`/`Action::Restart` fire only once
+/// `may_inject` is true, which requires `state.signals_seen > 0` -- and
+/// codex's own adapter never advances that counter itself -- but a live
+/// handover (`perform_handover_swap`) can swap the adapter in place
+/// mid-pump-loop without resetting that supervision state, so a
+/// pre-handover claude session's Compact verdict can still fire this
+/// against a freshly swapped-in codex child. Claude's composer submits a
+/// same-burst trailing `\r` correctly, so `defer` is `false` there; a
+/// codex successor needs the same paste-fold protection
+/// `write_mail_advisory` already gives its mail advisory.
+pub fn inject_compact(sink: &mut dyn Write, compact_command: &str, defer: bool) -> CtxResult<()> {
+    // A TUI submits on carriage return, not newline. Built as a full string
+    // first and written in one `write_all` call, the same convention
+    // `mail_advisory_bytes`/`write_mail_advisory_phase1` use -- `write!`
+    // directly on a generic sink can fragment one format string across
+    // several `write_all` calls, which would blur the phase boundary this
+    // function depends on.
+    let text = format!("{compact_command} {COMPACT_FOCUS}");
+    if !defer {
+        sink.write_all(format!("{text}\r").as_bytes())?;
+        sink.flush()?;
+        return Ok(());
+    }
+    sink.write_all(text.as_bytes())?;
+    sink.flush()?;
+    // A plain blocking sleep is fine here, unlike `write_mail_advisory`'s
+    // non-blocking arm-and-drain: the pump loop calls `verify_compaction`
+    // immediately after this and blocks there anyway, so there is no
+    // responsiveness cost to blocking inline first.
+    std::thread::sleep(INJECTION_SUBMIT_DELAY);
+    sink.write_all(b"\r")?;
     sink.flush()?;
     Ok(())
 }
@@ -1807,7 +1931,15 @@ pub fn run_with(
         .map_err(|_| "cpr filter poisoned")?
         .arm(Instant::now());
 
-    // stdin to PTY.
+    // stdin to PTY. Accepted race (issue #118 follow-up): this drain has no
+    // owed-CR flush of its own, unlike `Pane::write_operator_input`, so an
+    // operator keystroke landing inside a deferred injection's narrow
+    // pending window can merge into that not-yet-submitted advisory line.
+    // Deliberately not fixed -- a deferred injection only ever starts once
+    // the transcript is idle-quiet, which keeps the window narrow, and the
+    // failure mode is a garbled advisory line, never a lost or misdirected
+    // submit. This input hot path must stay failure-free, so no
+    // cross-thread state is added here to guard against it.
     let input_tx = tx.clone();
     let input_writer = std::sync::Arc::clone(&writer);
     let input_filter = std::sync::Arc::clone(&cpr_filter);
@@ -2338,7 +2470,11 @@ struct HandoverOutcome {
 /// `session_guard`/`session` are never touched here beyond `adopt_child_pid`:
 /// the session keeps its existing registry short id throughout, which is
 /// what makes mail sent before the swap still deliverable after it, and
-/// `zirv ctx nudge` still resolve to the same address.
+/// `zirv ctx nudge` still resolve to the same address. `mail_watch` IS
+/// touched, though, at the moment the writer sink is swapped: any owed
+/// `\r` armed against the old child (`MailWatch::pending_submit`) is
+/// cleared there, since the fresh successor never saw the text that CR
+/// would submit.
 ///
 /// The handoff packet rides the same channel every wrap restart already
 /// uses -- the interactive launch's own positional/task prompt
@@ -2352,6 +2488,7 @@ fn perform_handover_swap(
     session_guard: &mut super::sessions::SessionGuard,
     pair: &mut portable_pty::PtyPair,
     writer: &std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    mail_watch: &mut MailWatch,
     generation: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     tx: &mpsc::Sender<PumpEvent>,
     cpr_filter: &std::sync::Arc<std::sync::Mutex<CprFilter>>,
@@ -2454,6 +2591,10 @@ fn perform_handover_swap(
     );
     if let Ok(mut sink) = writer.lock() {
         *sink = fresh_writer;
+        // Issue #118 follow-up: a mail advisory's owed `\r` was armed
+        // against the OLD child; the fresh successor never saw the text it
+        // would submit, so it must not inherit the obligation either.
+        mail_watch.clear_pending_submit();
     }
     if let Ok(mut filter) = cpr_filter.lock() {
         filter.arm(Instant::now());
@@ -2704,6 +2845,7 @@ fn pump(
                     session_guard,
                     pair,
                     writer,
+                    &mut mail_watch,
                     &generation,
                     &tx,
                     cpr_filter,
@@ -2831,12 +2973,13 @@ fn pump(
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
             }
             Action::Compact => {
+                let defer = adapter.capabilities().defer_injection_submit;
                 let injected = writer
                     .lock()
                     .map_err(|_| "pty writer poisoned".to_string())
                     .and_then(|mut sink| {
                         let command = adapter.compact_command().unwrap_or("/compact");
-                        inject_compact(&mut *sink, command).map_err(|e| e.to_string())
+                        inject_compact(&mut *sink, command, defer).map_err(|e| e.to_string())
                     });
 
                 // Arm the cooldown before verifying so a failed verification
@@ -2998,6 +3141,10 @@ fn pump(
                                 if let Ok(mut sink) = writer.lock() {
                                     *sink = fresh_writer;
                                 }
+                                // A CR still owed to the replaced child must
+                                // not be typed into the fresh one (same rule
+                                // as the handover swap above).
+                                mail_watch.clear_pending_submit();
                                 // The fresh pty ran its own console-host probe,
                                 // so the terminal is about to answer that one
                                 // too; see `CprFilter`.
@@ -3125,8 +3272,9 @@ fn pump(
                 // question this is, and it is already an operator-only,
                 // non-`REPO_FORBIDDEN` timing knob over a session the
                 // operator chose to run interactively.
+                let caps = adapter.capabilities();
                 let ready = mail_inject_ready(
-                    adapter.capabilities().turn_signal,
+                    caps.turn_signal,
                     supervision,
                     now,
                     debounce,
@@ -3141,27 +3289,31 @@ fn pump(
                         let landed = announcer.try_emit(&Event::MailWaiting { count });
                         mail_watch.note_announcement(&ids, landed);
                     }
-                    // Known residual (PR #116 follow-up): same single-burst
-                    // text+`\r` shape as `inject_compact` above, and the
-                    // same reason it stays that way -- see that function's
-                    // doc comment. Deferring this CR (commit 15a7db9,
-                    // reverted) also made `commit_injected` fire before the
-                    // child had genuinely consumed the advisory, which is
-                    // only correct once the write and the submit are one
-                    // atomic step again.
+                    // Issue #118: single-burst for a turn-signal-capable
+                    // adapter (claude); `inject_compact` above now shares
+                    // this same capability-gated two-phase shape, for the
+                    // same reason -- see that function's own doc comment.
+                    // For a `defer_injection_submit` adapter (codex)
+                    // `write_mail_advisory` splits this into a phase-1 write
+                    // and a deadline the drain just below this match
+                    // submits later; either way `commit_injected` fires on
+                    // `wrote` alone, i.e. at phase 1, the same "advised"
+                    // moment `dash::pane::inject_visible` already commits
+                    // its own state at.
                     MailAction::Inject {
                         count,
                         from_agent,
                         from_short,
                         ids,
                     } => {
-                        let bytes = mail_advisory_bytes(count, &from_agent, &from_short);
-                        let wrote = match writer.lock() {
-                            Ok(mut sink) => {
-                                sink.write_all(&bytes).and_then(|()| sink.flush()).is_ok()
-                            }
-                            Err(_) => false,
-                        };
+                        let wrote = write_mail_advisory(
+                            &mut mail_watch,
+                            writer,
+                            caps.defer_injection_submit,
+                            count,
+                            &from_agent,
+                            &from_short,
+                        );
                         if wrote {
                             mail_watch.commit_injected(&ids);
                         } else {
@@ -3174,6 +3326,21 @@ fn pump(
                     }
                 }
             }
+        }
+
+        // Issue #118: drains a still-owed mail-advisory `\r`
+        // (`MailWatch::pending_submit`) once its deadline has passed --
+        // unconditioned by `mail_polling_enabled`/`mail_watch.due` above,
+        // because this is finishing a write an earlier tick already
+        // committed (`commit_injected` already fired at phase 1), not a new
+        // poll, so it must not wait on either gate. A failed write here is
+        // safe to simply retry on a later tick -- see
+        // `dash::pane::write_submit_cr`'s own doc comment.
+        if mail_watch.pending_submit_due(Instant::now())
+            && let Ok(mut sink) = writer.lock()
+            && super::dash::pane::write_submit_cr(&mut *sink).is_ok()
+        {
+            mail_watch.clear_pending_submit();
         }
 
         if let Ok(size) = window_size(STDIN_FD)
@@ -3503,7 +3670,7 @@ mod tests {
     /// exercise raw-mode passthrough end to end.
     #[cfg(unix)]
     pub(crate) struct Harness {
-        pub reader: Box<dyn Read + Send>,
+        pub reader: ChunkReader,
         pub writer: Box<dyn Write + Send>,
         pub child: Box<dyn portable_pty::Child + Send + Sync>,
         /// C9: keeps the throwaway state/HOME directory alive for as long as
@@ -3651,7 +3818,7 @@ mod tests {
         let child = pair.slave.spawn_command(cmd).expect("spawn wrap");
         drop(pair.slave);
         Harness {
-            reader: pair.master.try_clone_reader().expect("reader"),
+            reader: ChunkReader::spawn(pair.master.try_clone_reader().expect("reader")),
             writer: pair.master.take_writer().expect("writer"),
             child,
             _sandbox: sandbox,
@@ -3663,21 +3830,63 @@ mod tests {
         spawn_wrap_with_flags(extra_env, &["--agent", "claude"], wrapped)
     }
 
-    /// Reads until `needle` appears or the timeout expires.
+    /// Bounds `read_until`'s own blocking risk (issue #118): a raw pty
+    /// reader's `.read()` call can block indefinitely once the child stops
+    /// writing (a wedged stub, a hung child), and `read_until` used to check
+    /// its own deadline only *between* calls to `.read()` -- so a single
+    /// hung read blocked past the whole budget, turning a bounded assertion
+    /// failure into CI's 180s hard kill instead of a fast, informative one.
+    /// A dedicated thread owns the real reader and only ever talks back
+    /// through a channel, so `read_until`'s own loop can bound its wait with
+    /// `recv_timeout` regardless of what the blocking read on the other end
+    /// is doing. The thread exits on its own once the read errors, hits
+    /// EOF, or its send finds nobody left listening; if the read itself is
+    /// permanently wedged, the thread simply outlives the test along with
+    /// it, exactly as a direct blocking read would have.
     #[cfg(unix)]
-    pub(crate) fn read_until(
-        reader: &mut Box<dyn Read + Send>,
-        needle: &str,
-        timeout: Duration,
-    ) -> String {
+    pub(crate) struct ChunkReader {
+        rx: mpsc::Receiver<Vec<u8>>,
+    }
+
+    #[cfg(unix)]
+    impl ChunkReader {
+        pub(crate) fn spawn(mut reader: Box<dyn Read + Send>) -> Self {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self { rx }
+        }
+    }
+
+    /// Reads until `needle` appears or the timeout expires. Bounded by
+    /// `ChunkReader`'s own background thread: this loop only ever blocks on
+    /// `recv_timeout` against the remaining budget, so a reader that never
+    /// produces data still returns -- with whatever text had already
+    /// accumulated -- within `timeout` rather than hanging past it.
+    #[cfg(unix)]
+    pub(crate) fn read_until(reader: &mut ChunkReader, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         let mut seen = String::new();
-        let mut buf = [0u8; 1024];
-        while Instant::now() < deadline {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match reader.rx.recv_timeout(deadline - now) {
+                Ok(chunk) => {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
                     if seen.contains(needle) {
                         return seen;
                     }
@@ -3686,6 +3895,34 @@ mod tests {
             }
         }
         seen
+    }
+
+    /// Issue #118: proves `read_until` cannot block past its own budget even
+    /// against a reader that never produces data and never hits EOF -- the
+    /// exact shape of a wedged child. A `UnixStream::pair()` gives a reader
+    /// end and a write end that is simply held open and never written to or
+    /// dropped, so `ChunkReader`'s background thread sits blocked in its own
+    /// `.read()` for as long as the test runs, exactly like a hung real pty
+    /// read would. Before this fix that block was `read_until`'s own: this
+    /// test would have hung for the full budget (and, against a real hung
+    /// child, past it) rather than returning.
+    #[cfg(unix)]
+    #[test]
+    fn read_until_returns_within_its_budget_against_a_reader_that_never_produces_data() {
+        let (never_writes, _held_open) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut reader = ChunkReader::spawn(Box::new(never_writes));
+        let budget = Duration::from_secs(1);
+
+        let started = Instant::now();
+        let seen = read_until(&mut reader, "anything", budget);
+        let elapsed = started.elapsed();
+
+        assert_eq!(seen, "", "nothing was ever written");
+        assert!(
+            elapsed < budget + Duration::from_millis(500),
+            "must return within budget plus a small epsilon, took {elapsed:?}"
+        );
     }
 
     /// Finds `flag`'s value in a space-joined argv rendering (`stub-tui.sh`
@@ -5346,6 +5583,173 @@ mod tests {
         );
     }
 
+    /// Records each `write_all` call as its own chunk, shared via an inner
+    /// `Arc<Mutex<_>>` so a clone can be boxed into a
+    /// `writer: &Arc<Mutex<Box<dyn Write + Send>>>` (the pump loop's own
+    /// type) while the test keeps a handle to inspect what landed --
+    /// `dash::pane`'s own `RecordingWriter` test double, mirrored here
+    /// because wrap's mail-advisory writes go through that `Arc<Mutex<_>>`
+    /// seam rather than a bare `&mut dyn Write`.
+    #[derive(Clone, Default)]
+    struct RecordingWriter {
+        chunks: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.chunks.lock().expect("lock").push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn recording_writer() -> (
+        RecordingWriter,
+        std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    ) {
+        let recorder = RecordingWriter::default();
+        let boxed: Box<dyn Write + Send> = Box::new(recorder.clone());
+        (recorder, std::sync::Arc::new(std::sync::Mutex::new(boxed)))
+    }
+
+    /// Issue #118: phase 1 of a deferred mail advisory carries no control
+    /// bytes of its own -- the trailing `\r` `mail_advisory_bytes` appends
+    /// for the single-burst path is deliberately absent here, mirroring
+    /// `dash::pane::write_injection_phase1_writes_only_the_labelled_line`.
+    #[test]
+    fn write_mail_advisory_phase1_writes_only_the_labelled_line() {
+        let mut writer = RecordingWriter::default();
+        write_mail_advisory_phase1(&mut writer, 1, "claude", "aaaa1111")
+            .expect("write must succeed against an in-memory sink");
+
+        let chunks = writer.chunks.lock().expect("lock");
+        assert_eq!(chunks.len(), 1, "phase 1 is exactly one write: {chunks:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&chunks[0]),
+            mail_advisory_line(1, "claude", "aaaa1111")
+        );
+        assert!(
+            !chunks[0].iter().any(|b| *b < 0x20 || *b == 0x7f),
+            "phase 1 carries no control bytes of its own: {:?}",
+            String::from_utf8_lossy(&chunks[0])
+        );
+    }
+
+    /// Issue #118: for a turn-signal-capable adapter (claude,
+    /// `defer_injection_submit: false`) `write_mail_advisory` stays exactly
+    /// the single burst it always was -- the shape the two real-pty T13
+    /// tests below still pin byte-for-byte.
+    #[test]
+    fn write_mail_advisory_stays_single_burst_for_a_non_deferring_adapter() {
+        let mut mail_watch = MailWatch::default();
+        let (recorder, writer) = recording_writer();
+
+        let wrote = write_mail_advisory(&mut mail_watch, &writer, false, 1, "claude", "aaaa1111");
+        assert!(wrote);
+        assert!(
+            !mail_watch.has_pending_submit(),
+            "a single-burst write owes nothing"
+        );
+
+        let chunks = recorder.chunks.lock().expect("lock");
+        assert_eq!(chunks.len(), 1, "one write, not two: {chunks:?}");
+        assert_eq!(
+            chunks[0],
+            mail_advisory_bytes(1, "claude", "aaaa1111"),
+            "identical to the pre-#118 single-burst shape"
+        );
+    }
+
+    /// Issue #118: for a `defer_injection_submit` adapter (codex)
+    /// `write_mail_advisory` writes the labelled text alone first -- no
+    /// trailing `\r` -- and arms `MailWatch::pending_submit` instead of
+    /// writing the CR inline. The real-pty test below proves the pump
+    /// loop's own drain is what actually submits it later.
+    #[test]
+    fn write_mail_advisory_defers_the_submitting_cr_for_a_deferring_adapter() {
+        let mut mail_watch = MailWatch::default();
+        let (recorder, writer) = recording_writer();
+
+        let wrote = write_mail_advisory(&mut mail_watch, &writer, true, 1, "claude", "aaaa1111");
+        assert!(wrote);
+        assert!(
+            mail_watch.has_pending_submit(),
+            "the CR is owed until the drain writes it"
+        );
+
+        {
+            let chunks = recorder.chunks.lock().expect("lock");
+            assert_eq!(chunks.len(), 1, "phase 1 alone so far: {chunks:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&chunks[0]),
+                mail_advisory_line(1, "claude", "aaaa1111"),
+                "no control byte of its own"
+            );
+        }
+
+        assert!(
+            super::super::dash::pane::write_submit_cr(&mut *writer.lock().expect("lock")).is_ok(),
+            "the drain's own write, exercised directly rather than through the pump loop"
+        );
+        let chunks = recorder.chunks.lock().expect("lock");
+        assert_eq!(
+            chunks.len(),
+            2,
+            "phase 2 lands as its own write: {chunks:?}"
+        );
+        assert_eq!(chunks[1], b"\r".to_vec());
+    }
+
+    /// Issue #118: a second deferred injection must not interleave its own
+    /// text with an earlier one's still-owed `\r` -- that would garble both
+    /// into one line the child reads as a single submission. The owed CR is
+    /// flushed first, as its own write, before the new text.
+    #[test]
+    fn write_mail_advisory_flushes_an_owed_cr_before_a_new_deferred_injection() {
+        let mut mail_watch = MailWatch::default();
+        let (recorder, writer) = recording_writer();
+
+        assert!(write_mail_advisory(
+            &mut mail_watch,
+            &writer,
+            true,
+            1,
+            "claude",
+            "aaaa1111"
+        ));
+        assert!(write_mail_advisory(
+            &mut mail_watch,
+            &writer,
+            true,
+            2,
+            "codex",
+            "bbbb2222"
+        ));
+        assert!(
+            mail_watch.has_pending_submit(),
+            "the second injection re-arms its own pending CR"
+        );
+
+        let chunks = recorder.chunks.lock().expect("lock");
+        assert_eq!(
+            chunks.len(),
+            3,
+            "the first advisory's owed CR, then the second's text: {chunks:?}"
+        );
+        assert_eq!(
+            chunks[0],
+            mail_advisory_line(1, "claude", "aaaa1111").into_bytes()
+        );
+        assert_eq!(chunks[1], b"\r".to_vec());
+        assert_eq!(
+            chunks[2],
+            mail_advisory_line(2, "codex", "bbbb2222").into_bytes()
+        );
+    }
+
     #[test]
     fn mail_polling_is_skipped_entirely_when_mail_is_disabled() {
         assert!(
@@ -5589,7 +5993,7 @@ mod tests {
     #[test]
     fn the_injected_command_carries_focus_instructions_and_ends_with_a_carriage_return() {
         let mut sink: Vec<u8> = Vec::new();
-        inject_compact(&mut sink, "/compact").expect("inject");
+        inject_compact(&mut sink, "/compact", false).expect("inject");
         let text = String::from_utf8(sink).expect("utf8");
         assert!(text.starts_with("/compact "), "got {text:?}");
         assert!(text.contains(COMPACT_FOCUS));
@@ -5599,6 +6003,52 @@ mod tests {
         );
         assert_eq!(text.matches('\r').count(), 1, "exactly one submit");
         assert!(!text.contains('\n'), "no stray newline: {text:?}");
+    }
+
+    /// Issue #118 follow-up: `inject_compact` is reachable for a
+    /// `defer_injection_submit` adapter (codex) too, once a live handover
+    /// swaps the adapter mid-pump-loop -- see this function's own doc
+    /// comment. Non-deferring stays exactly the pre-existing single burst:
+    /// one write, command text and the submitting CR together.
+    #[test]
+    fn inject_compact_stays_single_burst_for_a_non_deferring_adapter() {
+        let mut writer = RecordingWriter::default();
+        inject_compact(&mut writer, "/compact", false).expect("inject");
+        let chunks = writer.chunks.lock().expect("lock");
+        assert_eq!(chunks.len(), 1, "one write, not two: {chunks:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&chunks[0]),
+            format!("/compact {COMPACT_FOCUS}\r")
+        );
+    }
+
+    /// For a deferring adapter the command text lands first with no
+    /// trailing CR, then the lone CR lands as its own write once
+    /// `INJECTION_SUBMIT_DELAY` has passed -- mirroring
+    /// `write_mail_advisory`'s deferred shape, but blocking inline rather
+    /// than arming `MailWatch::pending_submit`: the pump loop calls
+    /// `verify_compaction` immediately after this and blocks there anyway,
+    /// so there is no responsiveness cost to blocking here first.
+    #[test]
+    fn inject_compact_defers_the_submitting_cr_for_a_deferring_adapter() {
+        let mut writer = RecordingWriter::default();
+        let started = std::time::Instant::now();
+        inject_compact(&mut writer, "/compact", true).expect("inject");
+        assert!(
+            started.elapsed() >= INJECTION_SUBMIT_DELAY,
+            "the CR must not land before the submit delay has passed"
+        );
+        let chunks = writer.chunks.lock().expect("lock");
+        assert_eq!(
+            chunks.len(),
+            2,
+            "phase 1 text, then the lone CR: {chunks:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&chunks[0]),
+            format!("/compact {COMPACT_FOCUS}")
+        );
+        assert_eq!(chunks[1], b"\r".to_vec());
     }
 
     #[test]
@@ -6027,6 +6477,84 @@ mod tests {
         assert!(
             !after.contains("zirv ctx inbox"),
             "nor fall back to the announcement channel for it: {after:?}"
+        );
+
+        h.writer.write_all(b"/exit\r").expect("write");
+        h.writer.flush().expect("flush");
+        let _ = read_until(&mut h.reader, "bye", Duration::from_secs(10));
+        let _ = h.child.wait();
+    }
+
+    /// Issue #118, codex variant of the two T13 tests above: for a
+    /// `defer_injection_submit` adapter the mail advisory's own submitting
+    /// `\r` is written by the pump loop's periodic drain
+    /// (`MailWatch::pending_submit_due`), not in the same burst as the text.
+    /// `--agent codex` also means no turn signal is ever sent -- codex's own
+    /// adapter never registers one (`register_turn_signal` is a no-op) --
+    /// so readiness here comes only from `signal_less_mail_ready`'s quiet
+    /// window (`ZIRV_CTX_DASH_IDLE_QUIET_MS` below keeps that window short
+    /// enough for a test).
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_wraps_deferred_mail_advisory_is_submitted_by_the_pump_loops_own_drain() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let script = fixture("stub-tui.sh").display().to_string();
+        let mut h = spawn_wrap_with_flags(
+            &[
+                ("ZIRV_CTX_DASH_IDLE_QUIET_MS", "300".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["--agent", "codex"],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
+
+        store_mail_for_cwd(&state, "do-not-type-this-body");
+
+        let seen = read_until(
+            &mut h.reader,
+            "[zirv \u{25b8} mail]",
+            Duration::from_secs(15),
+        );
+        assert!(
+            seen.contains("[zirv \u{25b8} mail]"),
+            "the advisory text still reaches a signal-less, defer-capable adapter's child: {seen:?}"
+        );
+
+        // The advisory's own `[zirv ▸ mail]` marker above lands as soon as
+        // phase 1's write is echoed by the child's own pty -- before its
+        // deferred `\r` has necessarily been drained. Typing the sync line
+        // immediately would race the drain: if it wins, its own `\r`
+        // submits the still-open line early and both texts merge into one
+        // (proving nothing). Sleeping past the drain's own worst-case
+        // latency (`INJECTION_SUBMIT_DELAY` plus one more `PUMP_POLL` tick)
+        // makes the ordering deterministic instead.
+        std::thread::sleep(INJECTION_SUBMIT_DELAY + PUMP_POLL + Duration::from_millis(300));
+
+        // Proof the drain actually ran, not just that the text arrived:
+        // phase 1 alone (`write_mail_advisory_phase1`) carries no `\r`, so
+        // the stub's `read -r` cannot complete on it alone. A sync line
+        // typed now, after the sleep above, can only have its own `echo:`
+        // answer arrive once *some* `\r` reached the child ahead of it in
+        // the input queue -- and nothing but the pump loop's own periodic
+        // drain could have written that one, since wrap never sends this
+        // session a turn signal at all.
+        h.writer.write_all(b"sync-after-advisory\r").expect("write");
+        h.writer.flush().expect("flush");
+        let synced = read_until(
+            &mut h.reader,
+            "echo: sync-after-advisory",
+            Duration::from_secs(15),
+        );
+        assert!(
+            synced.contains("echo: sync-after-advisory"),
+            "the deferred `\\r` must have landed for the stub's read -r to reach the sync line: \
+             {synced:?}"
+        );
+        assert!(
+            !synced.contains("do-not-type-this-body"),
+            "the mail body must never be typed into the agent: {synced:?}"
         );
 
         h.writer.write_all(b"/exit\r").expect("write");
@@ -6884,7 +7412,7 @@ mod tests {
         crate::commands::ctx::testenv::scrub_supervision_env_for_test(&mut cmd);
         let mut child = pair.slave.spawn_command(cmd).expect("spawn");
         drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let mut reader = ChunkReader::spawn(pair.master.try_clone_reader().expect("reader"));
         let mut writer = pair.master.take_writer().expect("writer");
 
         let seen = read_until(&mut reader, "stub-tui ready", Duration::from_secs(10));

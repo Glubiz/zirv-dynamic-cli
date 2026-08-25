@@ -1212,6 +1212,7 @@ pub fn evidence_from_transcripts(
             // real parsing already scores an empty stream as healthy, which
             // is the correct "not rotted" answer for this evidence count.
             events: true,
+            defer_injection_submit: false,
         };
         if rot::score_events(&events, caps, cfg).verdict == Verdict::Restart {
             evidence.rot_sessions += 1;

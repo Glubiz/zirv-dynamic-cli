@@ -1041,6 +1041,10 @@ impl AgentAdapter for CodexAdapter {
             // `zirv ctx status`'s usage/rot cells, and the pacing gate all
             // light up for a codex session.
             events: true,
+            // Issue #118: verified against codex's own ratatui composer
+            // (issue #114) -- a same-burst text+`\r` is read as a paste and
+            // the `\r` is folded into the pasted text rather than submitted.
+            defer_injection_submit: true,
         }
     }
 

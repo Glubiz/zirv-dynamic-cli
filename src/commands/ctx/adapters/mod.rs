@@ -2543,6 +2543,7 @@ mod tests {
             turn_signal: true,
             system_prompt: true,
             events: true,
+            defer_injection_submit: true,
         };
         assert!(missing_capability_labels(all_true).is_empty());
 

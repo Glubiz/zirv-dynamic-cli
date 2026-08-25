@@ -347,18 +347,10 @@ fn visible_injection_line(label: &str, body: &str) -> String {
 }
 
 /// The minimum gap `inject_visible` leaves between writing an injected line
-/// and the lone `\r` that submits it -- issue #114.
-///
-/// Observed against codex's ratatui composer: a burst of bytes that arrive
-/// within a few milliseconds of each other is read as a paste, and a `\r`
-/// inside that burst is folded into the pasted text as a literal newline
-/// rather than read as a submit keypress. The injected line then sits typed
-/// but unsubmitted in the composer until a human happens to press Enter. A
-/// real terminal never produces a paste and a keypress in the same instant,
-/// so the two writes are separated by at least this gap, which is enough for
-/// the child's TUI to see the line arrive, settle, and then see the `\r`
-/// arrive on its own as an ordinary keypress rather than as the tail of the
-/// paste burst.
+/// and the lone `\r` that submits it -- issue #114. Moved to
+/// `crate::commands::ctx::INJECTION_SUBMIT_DELAY` (issue #118) so `wrap`
+/// can share the exact same value rather than pin its own copy; see that
+/// constant's own doc comment for the full paste-fold story.
 ///
 /// A hardcoded constant, deliberately not a new `.zirv` config key: an older
 /// installed zirv binary hard-fails on an unknown settings key (see
@@ -380,10 +372,13 @@ fn visible_injection_line(label: &str, body: &str) -> String {
 /// deadline has passed, so the effective gap may run one tick longer than
 /// this constant under load -- which is fine; nothing about the paste-fold
 /// fix requires the gap to be exact, only that it not collapse to zero.
-/// `wrap`'s own pump loop reuses this same constant and the same shape for
-/// its `Action::Compact`/T13 mail-advisory injections (F4) -- see this
-/// module's own `write_submit_cr`, which both call.
-pub(crate) const INJECTION_SUBMIT_DELAY: Duration = Duration::from_millis(50);
+///
+/// `wrap`'s own pump loop reuses this constant and `write_submit_cr` below
+/// for its T13 mail-advisory injection, but only into a
+/// `Capabilities::defer_injection_submit` adapter (codex) -- its
+/// `Action::Compact` stays single-burst, because that call site is only
+/// ever reachable for claude (see `wrap::inject_compact`'s own doc comment).
+pub(crate) use super::super::INJECTION_SUBMIT_DELAY;
 
 /// Phase 1 of a deferred visible injection: the labelled line
 /// ([`visible_injection_line`], scrubbed) with **no** control bytes of its
@@ -2714,10 +2709,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// F4 (review, PR #116): `write_submit_cr` is the one function both
-    /// `dash::pane`'s deferred injections and `wrap`'s own
-    /// `Action::Compact`/T13 mail-advisory injections call for phase 2 -- a
-    /// due pane's submission is always exactly this one byte.
+    /// F4 (review, PR #116; issue #118): `write_submit_cr` is the one
+    /// function both `dash::pane`'s deferred injections and `wrap`'s own
+    /// T13 mail-advisory injection into a `defer_injection_submit` adapter
+    /// call for phase 2 -- a due pane's submission is always exactly this
+    /// one byte. (`wrap::inject_compact`/`Action::Compact` stays
+    /// single-burst; that call site is only ever reachable for claude, see
+    /// its own doc comment.)
     #[test]
     fn write_submit_cr_writes_exactly_one_byte() {
         let mut writer = RecordingWriter { chunks: Vec::new() };
