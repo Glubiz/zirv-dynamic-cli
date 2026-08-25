@@ -1176,6 +1176,13 @@ fn on_quit(
             .to_string(),
             short: pane.short().to_string(),
             title: pane.title().to_string(),
+            // F3 (review, PR #116): persisted so a restore
+            // (`spawn_restored_pane`) can hand a worker pane back its
+            // report-back target and reminder-sent state -- without this,
+            // every restored worker pane lost `report_to` for good, so
+            // `report_back_reminder_sweep` could never remind it again.
+            report_to: pane.report_to().map(str::to_string),
+            report_reminder_sent: pane.report_reminder_sent(),
         })
         .collect();
     let panes_for_roster = merge_unoffered(live, unoffered);
@@ -2285,6 +2292,44 @@ fn compose_worker_prompt(
     } else {
         composed
     };
+    // Issue #115: `with_report_back_layer`/`task_prompt_with_report_back_
+    // fallback` (the latter is `worker_task_prompt`'s own equivalent, for an
+    // adapter with no system-prompt injection) both silently omit the block
+    // whenever `req.requested_by` fails `is_addressable_short` -- reasonably,
+    // since there is no real address to hand the worker a command for, but
+    // silently: nothing told the operator that a worker pane was launched
+    // with no way to report its outcome back. Logged here, once, for
+    // whichever adapter shape this request actually launches (this
+    // function's own `composed` above already reflects a capable adapter's
+    // path; a fallback-only adapter's omission is this exact same fact about
+    // `req.requested_by`, so one check here covers both call sites named in
+    // issue #115 without double-logging one spawn twice).
+    //
+    // F6 (review, PR #116): this used to restate the addressability
+    // predicate inline (`!prompt::is_addressable_short(&req.requested_by)`)
+    // rather than asking `report_to_for` -- the one function that already
+    // computes, and is the single source of truth for, "does this pane get
+    // a report-back target" (`Pane::set_report_to`'s own caller uses it
+    // too). A drift between the two predicates would have logged
+    // "report-back-omitted" for a pane that in fact got a target, or stayed
+    // silent for one that did not.
+    if cfg.mail.enabled && report_to_for(req, cfg).is_none() {
+        let _ = super::log::append(
+            state,
+            &super::log::Decision {
+                ts: super::state::now_secs(),
+                session: registry_short,
+                verb: "dash",
+                verdict: "n/a",
+                score: 0,
+                action: "report-back-omitted",
+                detail: &format!(
+                    "requested_by {:?} is not addressable; no report-back instruction was attached",
+                    req.requested_by
+                ),
+            },
+        );
+    }
     (composed, mail_entries, mail_messages)
 }
 
@@ -2603,7 +2648,7 @@ fn fulfill_spawn_request(
 
     // O2: retryable. A pty that could not be opened is an environment
     // failure, not a policy one -- the headless path has no pty to open.
-    let pane = Pane::spawn(
+    let mut pane = Pane::spawn(
         spec,
         state,
         repo,
@@ -2613,6 +2658,11 @@ fn fulfill_spawn_request(
         Duration::from_millis(cfg.dash.idle_quiet_ms),
     )
     .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
+    // Issue #115: set eagerly here even for adapter shapes whose fallback
+    // channel turned out unsafe (`fallback_is_safe == false` above) -- a
+    // worker that received no report-back text at all in its launch prompt
+    // still benefits from the reminder pointing it at the right command.
+    pane.set_report_to(report_to_for(req, cfg));
     let short = pane.short().to_string();
     panes.push(pane);
     nudge_queues.push(VecDeque::new());
@@ -3282,7 +3332,20 @@ fn spawn_restored_pane(
         adapter.capabilities().turn_signal,
         Duration::from_millis(cfg.dash.idle_quiet_ms),
     ) {
-        Ok(pane) => {
+        Ok(mut pane) => {
+            // F3 (review, PR #116): restore the report-back target and
+            // reminder-sent state the roster carried for this pane.
+            // `set_report_to` always resets `report_reminder_sent` to
+            // `false` (the right default for a *freshly spawned* pane), so
+            // the sent flag is restored afterwards, only when the roster
+            // says it was already true -- a restore resurrects the SAME
+            // logical session, so an already-reminded worker must not be
+            // reminded again (contrast `Pane::handover`'s F5 reset, which
+            // is right for a successor session, not this one).
+            pane.set_report_to(candidate.report_to.clone());
+            if candidate.report_reminder_sent {
+                pane.mark_report_reminder_sent();
+            }
             panes.push(pane);
             nudge_queues.push(VecDeque::new());
         }
@@ -3628,6 +3691,101 @@ fn mail_sweep(
     }
 }
 
+/// Issue #115: whether a freshly spawned worker pane should be told, later,
+/// by `report_back_reminder_sweep`, to report its outcome back to
+/// `req.requested_by` -- `Some(id)` only when the requester is addressable
+/// (`prompt::is_addressable_short`) AND mail delivery is enabled, the same
+/// two conditions `compose_worker_prompt`/`worker_task_prompt` already
+/// require before actually attaching a report-back instruction to a worker
+/// pane's launch prompt. Pure and split out of `fulfill_spawn_request` for
+/// the same testability reason `compose_worker_prompt`/`pane_model_args`
+/// were: whether this pane gets a reminder target is a fact about `req` and
+/// `cfg` alone, not about spawning a pty.
+fn report_to_for(req: &spawnreq::SpawnRequest, cfg: &CtxConfig) -> Option<String> {
+    if cfg.mail.enabled && prompt::is_addressable_short(&req.requested_by) {
+        Some(req.requested_by.clone())
+    } else {
+        None
+    }
+}
+
+/// Issue #115: the exact reminder body `report_back_reminder_sweep` injects.
+/// Names the same command `prompt::report_back_command` already told this
+/// worker at launch (so a worker that never actually saw that instruction --
+/// a Windows shim launch where even the fallback channel was unsafe -- still
+/// learns the right command from the reminder alone), and is deliberately
+/// phrased so firing when the report was already sent is harmless: see
+/// `report_back_reminder_sweep`'s own doc comment for why no durable
+/// "already sent" signal gates this.
+fn report_back_reminder_body(report_to: &str) -> String {
+    format!(
+        "If you have already sent your report, ignore this. Otherwise, your task session appears \
+         to have gone idle -- report the outcome now with: {}",
+        prompt::report_back_command(report_to)
+    )
+}
+
+/// Once-per-tick (same `FACTS_THROTTLE` cadence as `mail_sweep`, and called
+/// alongside it) one-shot completion reminder: every **worker** pane
+/// (`Verb::Dash`) spawned with a `report_to` address
+/// (`Pane::set_report_to`), that has produced output at least once
+/// (`Pane::has_produced_output` -- "this session actually ran," not merely
+/// "spawned and never started") and is currently `injectable()`, gets
+/// [`report_back_reminder_body`] injected exactly once via `inject_visible`,
+/// labelled `"report-back"`. `Pane::report_reminder_sent` is set the moment
+/// that injection succeeds, so a pane can never be reminded twice -- a
+/// failed injection is left unmarked and simply retried on a later tick,
+/// the same as every other `inject_visible` caller in this module.
+///
+/// No gating on whether the worker's report has actually already gone out:
+/// the only place mail delivery is logged today is the RECIPIENT's own
+/// consume (`mail::consume_and_log`'s `"mail-consumed"` decision-log entry,
+/// written when the report is *read*, not when it is *sent*), so there is no
+/// durable, cheap "this session already sent mail to `report_to`" signal to
+/// gate on. The reminder therefore fires unconditionally, once, and is
+/// worded to be a harmless no-op for a worker that already reported --
+/// checking `mail::list` for a still-unread, matching outbound message was
+/// considered, but that only proves the report has not yet been *read*, not
+/// that it was never *sent* (a message this reminder would still be right to
+/// suppress), so it would trade a rare harmless duplicate reminder for a
+/// silent gap whenever the requester's own session had already consumed the
+/// report before this sweep ever ran.
+fn report_back_reminder_sweep(panes: &mut [Pane], state: &StateDir, errors: &mut Vec<String>) {
+    for pane in panes.iter_mut() {
+        if pane.verb() != sessions::Verb::Dash || pane.report_reminder_sent() {
+            continue;
+        }
+        let Some(report_to) = pane.report_to().map(str::to_string) else {
+            continue;
+        };
+        if !pane.has_produced_output() || !pane.injectable() {
+            continue;
+        }
+        let body = report_back_reminder_body(&report_to);
+        match pane.inject_visible("report-back", &body) {
+            Ok(()) => {
+                pane.mark_report_reminder_sent();
+                let session = pane.session_id().to_string();
+                let _ = super::log::append(
+                    state,
+                    &super::log::Decision {
+                        ts: super::state::now_secs(),
+                        session: &session,
+                        verb: "dash",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "report-back-reminder",
+                        detail: &format!("reminded to report back to {report_to}"),
+                    },
+                );
+            }
+            Err(e) => {
+                push_error(errors, format!("report-back reminder: {e}"));
+            }
+        }
+    }
+}
+
 /// Once-per-tick FIFO drain: for every pane whose queue has something
 /// deliverable right now, injects exactly the next one (never the whole
 /// queue at once -- one visible line per tick keeps the child's input
@@ -3645,6 +3803,35 @@ fn deliver_queued_nudges(
             && let Err(e) = pane.inject_visible("nudge from operator", &text)
         {
             push_error(errors, format!("nudge delivery: {e}"));
+        }
+    }
+}
+
+/// F1/F2 (review, PR #116): drains every pane's deferred injection
+/// submission (`Pane::pending_submit`) whose settle deadline has passed --
+/// the lone `\r` `Pane::inject_visible` no longer writes inline. See
+/// `dash::pane::INJECTION_SUBMIT_DELAY`'s own doc comment for the bug this
+/// replaced: blocking the dashboard's single UI thread for the settle gap
+/// inside every injection meant `mail_sweep`, `report_back_reminder_sweep`
+/// and `deliver_queued_nudges` -- all iterating every pane, all in the same
+/// tick -- could serially freeze redraw and input for the sum of their
+/// delays (up to ~1.35s across nine panes and three sweeps).
+///
+/// Called every tick, unthrottled by `FACTS_THROTTLE`: a 50ms deadline has
+/// to be checked far more often than once a second, or an injection would
+/// sit unsubmitted for up to a second past its own deadline. `Pane::
+/// submit_pending` is itself cheap and safe to call on a pane with nothing
+/// pending (a no-op `Ok(())`), and a write that fails simply leaves that
+/// pane's `pending_submit` set for the next tick to retry -- see
+/// `dash::pane::write_submit_cr`'s own doc comment for why a retried lone
+/// `\r` is always safe.
+fn drain_pending_submits(panes: &mut [Pane], errors: &mut Vec<String>) {
+    let now = Instant::now();
+    for pane in panes.iter_mut() {
+        if pane.pending_submit_due(now)
+            && let Err(e) = pane.submit_pending()
+        {
+            push_error(errors, format!("submit {}: {e}", pane.short()));
         }
     }
 }
@@ -4340,8 +4527,14 @@ pub fn run_dashboard(
             last_mail_sweep = sweep_now;
             mail_sweep(&mut panes, cfg, state, repo, &mut advised_mail, &mut errors);
             claim_pane_nudges(&panes, state, &mut notices, sweep_now);
+            // Issue #115: same cadence as the mail sweep just above -- a
+            // one-shot reminder has no sub-tick latency requirement either.
+            report_back_reminder_sweep(&mut panes, state, &mut errors);
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
+        // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s
+        // own doc comment.
+        drain_pending_submits(&mut panes, &mut errors);
 
         // Facts + sidebar rows, computed BEFORE input handling: the Nudge
         // dialog's attached-vs-view-only routing and the SelectUp/SelectDown
@@ -8496,6 +8689,49 @@ mod tests {
         assert!(!composed.sources.contains(&prompt::PromptSource::ReportBack));
     }
 
+    /// Issue #115: the omission just proved above (`a_worker_panes_prompt_
+    /// omits_the_report_back_line_for_an_unknown_requester`) used to be
+    /// entirely silent -- nothing told the operator that this worker pane
+    /// was launched with no way to report its outcome back. It must now
+    /// show up on the decision log.
+    #[test]
+    fn compose_worker_prompt_logs_the_omission_for_an_unaddressable_requester() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+
+        let mut req = spawn_request("do the work", repo);
+        req.requested_by = "unknown".to_string();
+        let (composed, _, _) = compose_worker_prompt(
+            &req,
+            &super::super::adapters::claude::ClaudeAdapter::new(None),
+            "cccc3333",
+            &cfg,
+            &state,
+            repo,
+            &slug,
+        );
+
+        let composed = composed.expect("a worker pane composes a prompt");
+        assert!(
+            !composed.text.contains("zirv ctx send --to-session"),
+            "the block is still omitted, unchanged:\n{}",
+            composed.text
+        );
+
+        let lines = super::super::log::tail(&state, 5).expect("tail");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("\"action\":\"report-back-omitted\"") && l.contains("unknown")),
+            "the omission must be logged, naming the unaddressable requester: {lines:?}"
+        );
+    }
+
     /// G2: an operator who disabled mail delivery must not have a worker told
     /// to `zirv ctx send` its outcome back anyway -- `zirv ctx send` itself
     /// refuses outright when `cfg.mail.enabled` is false, so the instruction
@@ -8531,6 +8767,13 @@ mod tests {
         assert!(
             mail_entries.is_empty(),
             "mail disabled also suppresses the mail-layer listing, unchanged from before"
+        );
+        let lines = super::super::log::tail(&state, 5).expect("tail");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("\"action\":\"report-back-omitted\"")),
+            "mail disabled means there was nothing to omit -- no loud-omission log entry: {lines:?}"
         );
     }
 
@@ -9209,6 +9452,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
+            ..Default::default()
         }];
         let view = build_restore_view(&candidates);
         assert_eq!(view.entries.len(), 1);
@@ -9743,6 +9987,298 @@ mod tests {
         }
     }
 
+    /// F1/F2 (review, PR #116): `drain_pending_submits` is what the tick
+    /// loop calls in place of the old inline sleep -- it must leave a
+    /// too-early pending submit alone and only drain it once
+    /// `INJECTION_SUBMIT_DELAY` has genuinely elapsed, with no error
+    /// surfaced for the happy path.
+    #[test]
+    fn drain_pending_submits_drains_a_due_injection_and_leaves_an_early_one_alone() {
+        use super::pane::tests::long_lived_argv;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "dddddddd-2222-4333-8444-555555555555";
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk pending-submit".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let mut errors = Vec::new();
+
+        panes[0]
+            .inject_visible("nudge from operator", "hello")
+            .expect("inject");
+        assert!(panes[0].has_pending_submit(), "sanity: a submit is owed");
+
+        // Too early: the drain must not touch it yet.
+        drain_pending_submits(&mut panes, &mut errors);
+        assert!(
+            panes[0].has_pending_submit(),
+            "a pending submit inside its settle gap must not be drained early"
+        );
+        assert!(errors.is_empty());
+
+        std::thread::sleep(
+            crate::commands::ctx::dash::pane::INJECTION_SUBMIT_DELAY + Duration::from_millis(20),
+        );
+        drain_pending_submits(&mut panes, &mut errors);
+        assert!(
+            !panes[0].has_pending_submit(),
+            "due once the settle gap has actually elapsed"
+        );
+        assert!(errors.is_empty(), "the happy path surfaces no error");
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    // Issue #115: report-back reminder.
+
+    /// Pure: `report_to_for`'s address gate. `spawn_request`'s own default
+    /// `requested_by` ("aaaa1111") is already addressable, so this is the
+    /// baseline every other case below is checked against.
+    #[test]
+    fn report_to_for_is_some_for_an_addressable_requester_with_mail_enabled() {
+        let cfg = CtxConfig::default();
+        let req = spawn_request("do the work", Path::new("."));
+        assert_eq!(report_to_for(&req, &cfg), Some("aaaa1111".to_string()));
+    }
+
+    #[test]
+    fn report_to_for_is_none_when_mail_is_disabled() {
+        let mut cfg = CtxConfig::default();
+        cfg.mail.enabled = false;
+        let req = spawn_request("do the work", Path::new("."));
+        assert_eq!(
+            report_to_for(&req, &cfg),
+            None,
+            "no reminder target without mail delivery to reach it through"
+        );
+    }
+
+    #[test]
+    fn report_to_for_is_none_for_an_unaddressable_requester() {
+        let cfg = CtxConfig::default();
+        let mut req = spawn_request("do the work", Path::new("."));
+        req.requested_by = "unknown".to_string();
+        assert_eq!(
+            report_to_for(&req, &cfg),
+            None,
+            "the same 'unknown' placeholder that suppresses the report-back \
+             prompt layer must also suppress the reminder target"
+        );
+    }
+
+    #[test]
+    fn report_back_reminder_body_names_the_exact_send_command() {
+        let body = report_back_reminder_body("aaaa1111");
+        assert!(
+            body.contains("zirv ctx send --to-session aaaa1111 --message"),
+            "the reminder must name the exact command, with the requester's id: {body:?}"
+        );
+        assert!(
+            body.to_lowercase().contains("already sent"),
+            "phrased so firing after the report already went out is a harmless no-op: {body:?}"
+        );
+    }
+
+    /// A worker pane with no durable turn signal (the codex shape issue
+    /// #115 is actually about) that has printed its startup output and then
+    /// gone quiet -- `report_back_reminder_sweep`'s own two preconditions,
+    /// `has_produced_output` and `injectable`, both genuinely true rather
+    /// than assumed. Mirrors `pane.rs`'s own `a_signal_less_pane_becomes_
+    /// idle_after_the_quiet_period_and_not_before`, reused here because four
+    /// tests below all need the identical setup.
+    fn spawn_idle_signal_less_worker_pane(state: &StateDir, repo: &Path, session_id: &str) -> Pane {
+        use super::pane::tests::silent_after_first_line_argv;
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: silent_after_first_line_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk report-back".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            state,
+            repo,
+            (80, 24),
+            &[],
+            false,
+            Duration::from_millis(200),
+        )
+        .expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if pane.last_line().contains("hello") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pane.last_line().contains("hello"),
+            "the startup line must land before this test can mean anything: {:?}",
+            pane.last_line()
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut became_injectable = false;
+        while std::time::Instant::now() < deadline {
+            pane.drain();
+            if pane.injectable() {
+                became_injectable = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            became_injectable,
+            "the pane must become injectable once its quiet window closes, with no turn \
+             signal ever sent"
+        );
+        pane
+    }
+
+    #[test]
+    fn report_back_reminder_sweep_fires_once_for_an_idle_worker_pane_with_report_to() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "dddddddd-2222-4333-8444-555555555555";
+        let mut pane = spawn_idle_signal_less_worker_pane(&state, &repo, session_id);
+        pane.set_report_to(Some("aaaa1111".to_string()));
+        assert!(!pane.report_reminder_sent(), "not yet reminded");
+
+        let mut panes = vec![pane];
+        let mut errors = Vec::new();
+        report_back_reminder_sweep(&mut panes, &state, &mut errors);
+
+        assert!(errors.is_empty(), "the injection must succeed: {errors:?}");
+        assert!(
+            panes[0].report_reminder_sent(),
+            "the reminder must be marked sent once it was actually injected"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    #[test]
+    fn report_back_reminder_sweep_never_fires_when_report_to_is_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "eeeeeeee-2222-4333-8444-555555555555";
+        let pane = spawn_idle_signal_less_worker_pane(&state, &repo, session_id);
+        assert_eq!(
+            pane.report_to(),
+            None,
+            "a freshly spawned pane carries no reminder target until told one"
+        );
+
+        let mut panes = vec![pane];
+        let mut errors = Vec::new();
+        report_back_reminder_sweep(&mut panes, &state, &mut errors);
+
+        assert!(errors.is_empty(), "got {errors:?}");
+        assert!(
+            !panes[0].report_reminder_sent(),
+            "no target means no reminder, ever"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// A second sweep, on an already-reminded pane, must not inject a second
+    /// time -- neither observably (`report_reminder_sent` stays exactly the
+    /// one flip from `false` to `true`) nor on the decision log (exactly one
+    /// `"report-back-reminder"` entry, not two).
+    #[test]
+    fn report_back_reminder_sweep_never_fires_twice() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "ffffffff-2222-4333-8444-555555555555";
+        let mut pane = spawn_idle_signal_less_worker_pane(&state, &repo, session_id);
+        pane.set_report_to(Some("aaaa1111".to_string()));
+
+        let mut panes = vec![pane];
+        let mut errors = Vec::new();
+        report_back_reminder_sweep(&mut panes, &state, &mut errors);
+        assert!(
+            panes[0].report_reminder_sent(),
+            "reminded on the first sweep"
+        );
+
+        // Drain whatever turned up so the second sweep sees a genuinely idle
+        // pane again, not one still `injected_awaiting_turn` from the first
+        // reminder -- the same wait `spawn_idle_signal_less_worker_pane`
+        // itself already does, reused here rather than duplicated.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            panes[0].drain();
+            if panes[0].injectable() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        report_back_reminder_sweep(&mut panes, &state, &mut errors);
+        assert!(errors.is_empty(), "got {errors:?}");
+        assert!(
+            panes[0].report_reminder_sent(),
+            "still marked sent, unchanged"
+        );
+
+        let lines = super::super::log::tail(&state, 10).expect("tail");
+        let reminders: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("\"action\":\"report-back-reminder\""))
+            .collect();
+        assert_eq!(
+            reminders.len(),
+            1,
+            "exactly one reminder was ever logged, not two: {lines:?}"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
     /// D4: with every pane reaped there is nothing left to draw, supervise or
     /// type into, so the loop quits through its ordinary exit path rather than
     /// holding the alternate screen open on a blank frame forever.
@@ -9794,6 +10330,7 @@ mod tests {
             role: roster::ROLE_ORCHESTRATOR.to_string(),
             short: "aaaa1111".to_string(),
             title: "orch".to_string(),
+            ..Default::default()
         };
         let worker = roster::RosterPane {
             agent: "codex".to_string(),
@@ -9801,6 +10338,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
+            ..Default::default()
         };
         let taken = roster::Roster {
             written: 1_000,
@@ -9832,6 +10370,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "aaaa1111".to_string(),
             title: "wrk claude".to_string(),
+            ..Default::default()
         };
         let unoffered = roster::RosterPane {
             agent: "codex".to_string(),
@@ -9839,6 +10378,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -9872,6 +10412,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: "bbbb2222".to_string(),
             title: "wrk codex".to_string(),
+            ..Default::default()
         };
         let pending = ui::Overlay::Restore(build_restore_view(std::slice::from_ref(&candidate)));
         let answered = ui::Overlay::None;
@@ -10582,6 +11123,7 @@ mod tests {
             role: roster::ROLE_WORKER.to_string(),
             short: short.to_string(),
             title: format!("wrk {short}"),
+            ..Default::default()
         }
     }
 
@@ -10779,6 +11321,74 @@ mod tests {
             written.panes, deferred_restore,
             "the spawn-failed candidate is offered again next launch"
         );
+    }
+
+    /// F3 (review, PR #116): a successfully restored worker pane gets its
+    /// `report_to`/`report_reminder_sent` back from the roster entry that
+    /// named them -- before this fix the roster carried no such fields at
+    /// all, so `spawn_restored_pane` never set `report_to` on the pane it
+    /// spawned and a restored worker's requester silently lost its
+    /// completion reminder for good.
+    ///
+    /// The candidate's own argv is deliberately not a real agent (`ping`
+    /// with extra positional args it will reject and exit on almost
+    /// immediately) -- only the pty spawn itself has to succeed here, the
+    /// same ABSOLUTE rule every other test in this module already follows.
+    #[test]
+    fn spawn_restored_pane_restores_report_to_and_reminder_sent_from_the_roster() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.report_to = Some("aaaa1111".to_string());
+        candidate.report_reminder_sent = true;
+        let cfg = CtxConfig {
+            #[cfg(windows)]
+            agent_bin: Some("ping -n 3 127.0.0.1".to_string()),
+            #[cfg(unix)]
+            agent_bin: Some("sleep 3".to_string()),
+            ..Default::default()
+        };
+
+        let mut panes = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = Vec::new();
+        let mut deferred_restore = Vec::new();
+
+        spawn_restored_pane(
+            &candidate,
+            &mut panes,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert!(
+            errors.is_empty(),
+            "a trivially spawnable program must restore cleanly: {errors:?}"
+        );
+        assert_eq!(panes.len(), 1, "the candidate spawned exactly one pane");
+        assert_eq!(
+            panes[0].report_to(),
+            Some("aaaa1111"),
+            "the roster's report_to must reach the restored pane"
+        );
+        assert!(
+            panes[0].report_reminder_sent(),
+            "a restore resurrects the SAME logical session, so an \
+             already-reminded worker must not be reminded again"
+        );
+
+        panes[0].finish_shutdown().expect("shutdown");
     }
 
     // R8: the loop has to be able to give up on a dead input stream.

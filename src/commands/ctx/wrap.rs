@@ -863,6 +863,17 @@ fn unread_mail_counts(
     super::mail::unread_counts(state, repo, agent, session_short, mail_enabled)
 }
 
+/// Known residual (PR #116 follow-up): this writes text and its submitting
+/// `\r` in one burst, the same shape dash::pane's injections had before the
+/// F1/F2 fix -- a codex-shaped composer that reads a same-burst `\r` as part
+/// of a paste could in principle fold it into a literal newline here too.
+/// It is deliberately NOT split into dash::pane's deferred two-phase submit:
+/// the wrapped child's own `read -r` line-reader needs the CR in-band to
+/// complete and make the injected text observable in the output stream, and
+/// splitting it (commit 15a7db9, reverted) made `read_until` block past its
+/// budget in the two T13 real-pty tests below, which starved out to CI's
+/// 180s hard kill instead of failing fast. Tracked as a follow-up rather
+/// than fixed here.
 pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
     // A TUI submits on carriage return, not newline.
     write!(sink, "{compact_command} {COMPACT_FOCUS}\r")?;
@@ -3130,6 +3141,14 @@ fn pump(
                         let landed = announcer.try_emit(&Event::MailWaiting { count });
                         mail_watch.note_announcement(&ids, landed);
                     }
+                    // Known residual (PR #116 follow-up): same single-burst
+                    // text+`\r` shape as `inject_compact` above, and the
+                    // same reason it stays that way -- see that function's
+                    // doc comment. Deferring this CR (commit 15a7db9,
+                    // reverted) also made `commit_injected` fire before the
+                    // child had genuinely consumed the advisory, which is
+                    // only correct once the write and the submit are one
+                    // atomic step again.
                     MailAction::Inject {
                         count,
                         from_agent,
