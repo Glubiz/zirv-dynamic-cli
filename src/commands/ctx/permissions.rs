@@ -684,7 +684,10 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].family, "gh issue");
         assert_eq!(requests[0].result, "escalated");
-        assert!(!requests[0].reusable);
+        // A `--body-file` request has no long inline literal and no filter
+        // pipe, so it IS reusable -- the not-reusable shapes are covered by
+        // the fixture-driven tests below.
+        assert!(requests[0].reusable);
     }
 
     #[test]
