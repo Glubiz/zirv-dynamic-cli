@@ -24,6 +24,13 @@ last-verified: 2026-08-25
 
 ## Decisions
 
+### 2026-08-25 — Worktree panes keep the dashboard's repo identity for state/mail; only the process cwd follows the worktree (issue #119)
+**Context:** Issue #119 asked for a dashboard spawn request naming a linked `git worktree add` sibling of its own repo to be accepted rather than refused outright. Accepting it raised a second question: should the resulting pane's session state (registry `Record`, `repo_slug`, mailbox) be keyed to the worktree path it actually runs in, or to the dashboard's own repo?
+**Decision:** `Pane::spawn` now takes `cwd` and `repo` as separate parameters. The child process runs at `cwd` (the worktree, when accepted via `accepted_spawn_cwd`). Its `sessions::Record` — and therefore `repo_slug`, mailbox routing, and `zirv ctx nudge --to-session` lookups — is always stamped with the dashboard's own `repo`, never `cwd`.
+**Rejected:** Keying the `Record` to the worktree path instead — the session/state store is shared across every pane a dashboard hosts, so a worktree-hosted pane registering under a different `repo_slug` would file into a mailbox nothing else sweeps, silently breaking report-back and nudge for that one pane.
+**Consequences:** Every other ordinary (non-worktree) spawn passes the same path for both parameters, so this is invisible to the common case. A future caller that adds a third path-shaped parameter to `Pane::spawn` must decide deliberately which of `cwd`/`repo` it should follow.
+**Spec / link:** `src/commands/ctx/dash/{mod,pane}.rs` (`accepted_spawn_cwd`, `git_common_dir`, `Pane::spawn`); [[Ctx Supervisors]]; issue #119.
+
 ### 2026-08-25 — Optimizer findings require exact supplied `path:line` evidence
 **Context:** A real Claude optimizer child loaded legacy native auto-memory that Zirv had neither collected nor included in its prompt, then returned a High finding citing those ambient `memory:*` keys. Accepting that output made the report unauditable and broke the memory-summary rule that keys/bodies never enter the judgment path.
 **Decision:** After parsing, accept a model finding only when it has evidence and every item exactly names a supplied surface path plus a positive line inside the bounded excerpt sent to the child. Reject the entire ungrounded finding and add one informational validation note without echoing rejected evidence text.
