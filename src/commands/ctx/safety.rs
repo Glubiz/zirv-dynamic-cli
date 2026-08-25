@@ -1276,16 +1276,26 @@ fn is_shell_identifier_assignment(token: &str) -> bool {
 
 /// One layer of `env` prefix unwrapping (issue #132): peels `env`, `env -u
 /// VAR`, `env VAR=value` chains (any mix, any order of `-`-flags and
-/// assignments), and a bare leading `VAR=value` assignment chain with no
-/// `env` program at all (`FOO=bar zirv setup profile ...`) -- so
-/// classification and command-family grouping see the underlying command an
-/// environment-clean wrapper hides, not the wrapper's own name or the first
-/// assignment token. Mirrors [`unwrap_pipe_wrapper`]'s own `env` handling
-/// (that helper's narrower, pipe-target-only sibling), generalized into an
-/// ordinary one-layer `Option<String>` unwrap so [`visit_executable_nodes`]
-/// can chain it exactly like [`unwrap_shell_wrapper`]. `None` when `segment`
-/// carries no such prefix at all, or when peeling it away would leave
-/// nothing behind.
+/// assignments), `env -C DIR`/`--chdir DIR`/`--chdir=DIR` (2026-08-25 review:
+/// these take a directory argument the way `-u` takes a variable name, so
+/// they must consume it the same two-token way or the directory itself gets
+/// mistaken for the start of the wrapped command), and a bare leading
+/// `VAR=value` assignment chain with no `env` program at all (`FOO=bar zirv
+/// setup profile ...`) -- so classification and command-family grouping see
+/// the underlying command an environment-clean wrapper hides, not the
+/// wrapper's own name or the first assignment token. Mirrors
+/// [`unwrap_pipe_wrapper`]'s own `env` handling (that helper's narrower,
+/// pipe-target-only sibling), generalized into an ordinary one-layer
+/// `Option<String>` unwrap so [`visit_executable_nodes`] can chain it
+/// exactly like [`unwrap_shell_wrapper`]. `None` when `segment` carries no
+/// such prefix at all, when peeling it away would leave nothing behind, OR
+/// when `-S`/`--split-string` is present anywhere in the flags: that option
+/// re-splits its own argument by shell quoting rules into the actual argv,
+/// so the token layout this function assumes (one flag, then either its
+/// value or the wrapped command) does not hold, and guessing would risk
+/// hiding the real command rather than revealing it -- bailing out and
+/// leaving the whole `env -S '...'` segment unclassified-by-this-layer is
+/// the safe failure, not a silent misparse.
 pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     let bare = strip_program_dir(segment);
     let collapsed = collapse_whitespace(&bare);
@@ -1296,7 +1306,10 @@ pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
         let mut i = 1usize;
         loop {
             match tokens.get(i) {
-                Some(t) if *t == "-u" => i = i.saturating_add(2),
+                Some(t) if matches!(*t, "-u" | "-C" | "--chdir") => i = i.saturating_add(2),
+                Some(t) if matches!(*t, "-S" | "--split-string") => return None,
+                Some(t) if t.starts_with("--split-string=") => return None,
+                Some(t) if t.starts_with("--chdir=") => i += 1,
                 Some(t) if t.starts_with('-') => i += 1,
                 Some(t) if is_shell_identifier_assignment(t) => i += 1,
                 _ => break,
@@ -3688,6 +3701,75 @@ mod tests {
             Verdict::Ask,
             "powershell -Command must be unwrapped"
         );
+    }
+
+    /// Issue #132 review (2026-08-25, code-review round): `unwrap_env_prefix`
+    /// is wired into `visit_executable_nodes` and changes live `evaluate()`
+    /// behavior -- an `env`-wrapped or bare-assignment-prefixed destructive
+    /// command must classify identically to its unwrapped form, not slip
+    /// past the deny/ask sets because a wrapper hid it. Nothing in this file
+    /// exercised `unwrap_env_prefix` through `evaluate()` before this test.
+    #[test]
+    fn evaluate_sees_through_an_env_wrapper_to_the_underlying_command() {
+        let policy = SafetyPolicy::default();
+        let bare = evaluate(
+            &policy,
+            "git push --force origin main",
+            LaunchMode::Interactive,
+        );
+        let env_wrapped = evaluate(
+            &policy,
+            "env -u FOO git push --force origin main",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(bare.verdict, Verdict::Ask, "sanity: the bare form asks");
+        assert_eq!(
+            env_wrapped.verdict, bare.verdict,
+            "an env -u wrapper must not hide a push --force from classification"
+        );
+
+        let bare_rm = evaluate(&policy, "rm -rf /", LaunchMode::Interactive);
+        let assignment_wrapped = evaluate(&policy, "FOO=bar rm -rf /", LaunchMode::Interactive);
+        assert_eq!(bare_rm.verdict, Verdict::Ask, "sanity: the bare form asks");
+        assert_eq!(
+            assignment_wrapped.verdict, bare_rm.verdict,
+            "a bare VAR=value prefix with no env program must not hide rm -rf either"
+        );
+    }
+
+    /// Issue #132 review: `env -C DIR`/`--chdir DIR`/`--chdir=DIR` take a
+    /// directory argument the same shape `-u VAR` takes a variable name, and
+    /// must be consumed the same two-token way -- otherwise the directory
+    /// itself gets treated as (or hides) the start of the wrapped command.
+    #[test]
+    fn unwrap_env_prefix_consumes_the_chdir_flags_argument() {
+        assert_eq!(
+            unwrap_env_prefix("env -C /tmp git push --force origin main"),
+            Some("git push --force origin main".to_string())
+        );
+        assert_eq!(
+            unwrap_env_prefix("env --chdir /tmp git push --force origin main"),
+            Some("git push --force origin main".to_string())
+        );
+        assert_eq!(
+            unwrap_env_prefix("env --chdir=/tmp git push --force origin main"),
+            Some("git push --force origin main".to_string())
+        );
+    }
+
+    /// Issue #132 review: `-S`/`--split-string` re-splits its own argument by
+    /// shell quoting rules into the real argv, so this function's simple
+    /// "one flag, then a value or the command" token walk cannot safely
+    /// unwrap past it -- it must bail out (`None`) rather than misparse the
+    /// split-string payload as the wrapped command.
+    #[test]
+    fn unwrap_env_prefix_bails_out_on_split_string_rather_than_misparse_it() {
+        assert_eq!(unwrap_env_prefix("env -S 'rm -rf /'"), None);
+        assert_eq!(
+            unwrap_env_prefix("env --split-string 'rm -rf /'"),
+            None
+        );
+        assert_eq!(unwrap_env_prefix("env --split-string='rm -rf /'"), None);
     }
 
     /// Dippy's most useful transferable property is structural coverage:

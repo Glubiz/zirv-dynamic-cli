@@ -118,15 +118,16 @@ fn family_depth(program: &str) -> usize {
     }
 }
 
-/// Normalizes a raw command/tool invocation to a stable family key: unwraps
-/// `env`/shell wrappers, drops to the first pipeline stage (the real
-/// command; a trailing `| jq ...` is a downstream formatting stage, not a
-/// different family), then keeps the program name plus as many leading
-/// non-flag tokens as [`family_depth`] says are part of this program's own
-/// stable invocation shape (`gh issue`, `zirv setup apply`, `cargo`).
-pub(crate) fn family_of(raw: &str) -> String {
-    let first_stage = pipeline_stages(raw).into_iter().next().unwrap_or_default();
-    let mut current = first_stage;
+/// Peels `env`/shell-wrapper layers off `segment` (bounded to 4 layers,
+/// matching `safety.rs`'s own structural-candidate depth), returning the
+/// innermost command text -- `env -u FOO zirv ...` or `/bin/zsh -lc '...'`
+/// collapse to the wrapped command underneath. Shared by [`family_of`] (the
+/// leading command) and [`is_reusable`] (2026-08-25 review: a decorated
+/// pipe target like `... | env NO_COLOR=1 jq .` must still be recognised as
+/// `jq`, not missed because the filter check only looked at the bare last
+/// stage).
+fn unwrap_wrappers(segment: &str) -> String {
+    let mut current = segment.to_string();
     for _ in 0..4 {
         if let Some(inner) = unwrap_env_prefix(&current) {
             current = inner;
@@ -138,6 +139,18 @@ pub(crate) fn family_of(raw: &str) -> String {
         }
         break;
     }
+    current
+}
+
+/// Normalizes a raw command/tool invocation to a stable family key: unwraps
+/// `env`/shell wrappers, drops to the first pipeline stage (the real
+/// command; a trailing `| jq ...` is a downstream formatting stage, not a
+/// different family), then keeps the program name plus as many leading
+/// non-flag tokens as [`family_depth`] says are part of this program's own
+/// stable invocation shape (`gh issue`, `zirv setup apply`, `cargo`).
+pub(crate) fn family_of(raw: &str) -> String {
+    let first_stage = pipeline_stages(raw).into_iter().next().unwrap_or_default();
+    let current = unwrap_wrappers(&first_stage);
     let collapsed = collapse_whitespace(&strip_program_dir(&current));
     let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
     let Some(first) = tokens.first() else {
@@ -211,7 +224,12 @@ pub(crate) fn is_reusable(raw: &str) -> bool {
     if stages.len() > 1
         && let Some(last) = stages.last()
     {
-        let collapsed = collapse_whitespace(&strip_program_dir(last));
+        // 2026-08-25 review: unwrap the last stage's own env/shell wrapper
+        // before matching the filter program name, so `| env NO_COLOR=1 jq
+        // .` is still recognised as a `jq` pipe target and not missed
+        // because the wrapper sat in front of it.
+        let unwrapped = unwrap_wrappers(last);
+        let collapsed = collapse_whitespace(&strip_program_dir(&unwrapped));
         let first = collapsed.split(' ').next().unwrap_or("");
         if matches!(
             sql_program_name(first).as_str(),
@@ -223,7 +241,94 @@ pub(crate) fn is_reusable(raw: &str) -> bool {
     true
 }
 
-fn recommendation_for(family: &str, reusable: bool) -> String {
+/// Command families issue #132 requires stay prompting no matter how
+/// reusable the saved approval would otherwise be: "keep global writes,
+/// destructive operations, secrets, and publish/release actions prompting
+/// unless explicitly enabled by the operator." `git push --force origin
+/// main` is a perfectly REUSABLE family by [`is_reusable`]'s own definition
+/// (no long literal, no filter pipe) -- that is exactly why reusability
+/// alone cannot gate the recommendation; a protected family must never be
+/// recommended a standing allow regardless.
+///
+/// `sample` (not just `family`) is what a caller must classify against:
+/// `family_of` strips flags, so `git push --force origin main` and `git
+/// push origin feature` both normalize to the family `"git push"` --
+/// distinguishing them needs the actual command text, which is why this
+/// function takes both.
+///
+/// Pure: token/substring matching only, no fs/clock/env, the same
+/// discipline `safety.rs`'s own classifiers hold to. This is a
+/// recommendation heuristic for `zirv ctx permissions audit`'s report, not
+/// a hard safety gate -- `safety.rs`'s `SHIPPED_POSTURE_DENY`/`_ASK` remain
+/// the actual enforcement boundary a launch is projected against.
+pub(crate) fn is_protected_family(family: &str, sample: &str) -> bool {
+    let tokens: Vec<String> = sample
+        .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`'))
+        .filter(|t| !t.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let has = |word: &str| tokens.iter().any(|t| t == word);
+    let has_bundled_short_force = tokens.iter().any(|t| {
+        t.starts_with('-')
+            && !t.starts_with("--")
+            && t.len() > 1
+            && t[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && t.contains('f')
+    });
+    let lower_sample = sample.to_ascii_lowercase();
+    let writes_into_a_global_install_path = matches!(
+        family,
+        "cp" | "copy" | "xcopy" | "copy-item" | "mv" | "move" | "install"
+    ) && (lower_sample.contains("program files")
+        || lower_sample.contains("/usr/local/")
+        || lower_sample.contains("/usr/bin/")
+        || lower_sample.contains("/usr/sbin/")
+        || lower_sample.contains("c:\\windows\\"));
+
+    let family_protected = match family {
+        // Destructive git: recoverable in principle (a reflog, a rebuild)
+        // but exactly the family issue #132 names as one that must keep
+        // prompting rather than being silently granted a standing allow.
+        "git push" => {
+            has("--force")
+                || has("--force-with-lease")
+                || has("-f")
+                || has("--delete")
+                || has("-d")
+        }
+        "git reset" => has("--hard"),
+        "git clean" => has("--force") || has_bundled_short_force,
+        "git branch" => has("-d") || has("--delete"),
+        // History rewrites: always protected, no flag needed.
+        "git rebase" | "git filter-branch" => true,
+        // A tag alone is harmless; a tag pushed to a remote is a release.
+        "git tag" => has("push"),
+        // Publish/release: irreversible by nature.
+        "cargo publish" | "npm publish" | "gh release" | "cargo install" => true,
+        // Credential/secret surfaces.
+        "gh auth" | "git credential" | "ssh-keygen" | "security" => true,
+        // Global binary/config installs.
+        "choco" | "winget" => true,
+        "npm install" | "npm" => has("-g") || has("--global"),
+        _ => false,
+    };
+
+    family_protected
+        || writes_into_a_global_install_path
+        || has("token")
+        || has("keychain")
+        || has("keyring")
+}
+
+fn recommendation_for(family: &str, protected: bool, reusable: bool) -> String {
+    if protected {
+        return format!(
+            "'{family}' is a protected family: stays prompting unless the operator explicitly \
+             enables it (destructive git, a global binary/config install, a credential/secret \
+             command, or a publish/release action -- issue #132). Do not grant a standing allow, \
+             regardless of reusability."
+        );
+    }
     if reusable {
         format!(
             "Grant '{family}' a standing allow in the operator's [safety]/[policy] \
@@ -447,12 +552,20 @@ pub(crate) fn group_requests(requests: &[PermissionRequest]) -> Vec<FamilyGroup>
         .map(|family| {
             let members = &by_family[&family];
             let reusable = members.iter().all(|m| m.reusable);
+            // Any member's raw command classifying as protected protects
+            // the whole group -- a family that is SOMETIMES a destructive
+            // shape (`git push origin x` alongside `git push --force origin
+            // main`) must not be recommended a standing allow just because
+            // its first-observed member looked routine.
+            let protected = members
+                .iter()
+                .any(|m| is_protected_family(&family, &m.raw));
             FamilyGroup {
                 count: members.len(),
                 reusable,
                 sample: members[0].raw.clone(),
                 cause: members[0].cause.clone(),
-                recommendation: recommendation_for(&family, reusable),
+                recommendation: recommendation_for(&family, protected, reusable),
                 family,
             }
         })
@@ -639,6 +752,16 @@ mod tests {
     fn a_pipe_into_a_text_filter_is_not_reusable() {
         assert!(!is_reusable("gh issue list --limit 5 | jq '.[].title'"));
         assert!(!is_reusable("gh pr view 12 --json body | jq -r .body"));
+    }
+
+    /// 2026-08-25 review: `is_reusable` used to check only the BARE last
+    /// pipe stage, so an `env`-decorated filter target slipped past the
+    /// `jq`/`grep`/`awk`/`sed` check entirely and was misjudged reusable.
+    #[test]
+    fn a_decorated_pipe_filter_is_still_recognised_as_not_reusable() {
+        assert!(!is_reusable(
+            "gh issue list --limit 5 | env NO_COLOR=1 jq ."
+        ));
     }
 
     // -------------------------------------------------------------
@@ -900,16 +1023,17 @@ mod tests {
     #[test]
     fn codex_fixture_covers_reusable_and_one_off_command_shapes() {
         let requests = extract_codex_requests(CODEX_FIXTURE, "fixture-session");
-        // 9 escalated `exec` requests in the fixture; the successful
+        // 11 escalated `exec` requests in the fixture; the successful
         // `custom_tool_call_output` line and the non-`exec` `apply_patch`
         // line must both be skipped.
-        assert_eq!(requests.len(), 9, "{requests:#?}");
+        assert_eq!(requests.len(), 11, "{requests:#?}");
 
         let groups = group_requests(&requests);
         let by_family: HashMap<&str, &FamilyGroup> =
             groups.iter().map(|g| (g.family.as_str(), g)).collect();
 
-        // Routine, operator-approvable families: reusable.
+        // Routine, operator-approvable families: reusable, and NOT flagged
+        // protected -- recommendation grants a standing allow.
         assert!(
             by_family["zirv setup apply"].reusable,
             "{:?}",
@@ -934,6 +1058,54 @@ mod tests {
             !by_family["gh issue"].reusable,
             "{:?}",
             by_family["gh issue"]
+        );
+
+        // ctc_3, the `&&`-chained five-gate validation batch, asserted on
+        // its own family and recommendation, not folded into an aggregate
+        // count: it normalizes to "cargo build" (the first invocation in
+        // the chain), is reusable (no long literal, no filter pipe), and
+        // -- being neither destructive/global-write/credential/publish --
+        // is recommended a standing allow, not left prompting.
+        let cargo_build = by_family["cargo build"];
+        assert_eq!(cargo_build.count, 1);
+        assert!(cargo_build.reusable, "{cargo_build:?}");
+        assert!(
+            cargo_build.recommendation.contains("Grant 'cargo build'"),
+            "{:?}",
+            cargo_build
+        );
+        assert!(
+            !cargo_build.recommendation.contains("protected family"),
+            "an ordinary validation batch must not be flagged protected: {:?}",
+            cargo_build
+        );
+
+        // A global machine-wide install (`choco install ...`) is REUSABLE
+        // by `is_reusable`'s own definition (no long literal, no pipe), but
+        // must still be recommended `ask`, never a standing allow -- issue
+        // #132's "keep global writes ... prompting unless the operator
+        // explicitly enables it."
+        let choco = by_family["choco"];
+        assert!(choco.reusable, "{choco:?}");
+        assert!(
+            choco.recommendation.contains("protected family"),
+            "{:?}",
+            choco
+        );
+        assert!(
+            !choco.recommendation.contains("standing allow in"),
+            "a protected family must never be told to grant a standing allow: {:?}",
+            choco
+        );
+
+        // Publish/release: also reusable by the same definition, also must
+        // stay protected regardless.
+        let publish = by_family["cargo publish"];
+        assert!(publish.reusable, "{publish:?}");
+        assert!(
+            publish.recommendation.contains("protected family"),
+            "{:?}",
+            publish
         );
     }
 
@@ -968,9 +1140,41 @@ mod tests {
         assert!(by_family["zirv ctx status"].reusable);
         assert!(!by_family["gh issue"].reusable);
         assert!(by_family["Read"].reusable);
-        // Force-push is a genuinely dangerous, non-Bash-tool-only concern --
-        // still classified as its own family and still denied, never
-        // silently softened by the audit itself.
         assert_eq!(by_family["git push"].result, "denied");
+    }
+
+    /// Force-push is a genuinely dangerous, non-Bash-tool-only concern.
+    /// `is_reusable("git push --force origin main")` is TRUE (no long
+    /// literal, no filter pipe) -- exactly why reusability alone must never
+    /// drive the recommendation: this test proves the "never softened"
+    /// claim by actually reading the group's recommendation, not just its
+    /// `result`/`reusable` fields, which a reusable-but-protected family
+    /// would otherwise pass unnoticed.
+    #[test]
+    fn claude_fixture_force_push_stays_protected_despite_being_reusable() {
+        let requests = extract_claude_requests(CLAUDE_FIXTURE, "fixture-session");
+        let groups = group_requests(&requests);
+        let git_push = groups
+            .iter()
+            .find(|g| g.family == "git push")
+            .expect("the force-push group");
+        assert!(
+            git_push.reusable,
+            "sanity: --force has no long literal or pipe, so is_reusable says true: {git_push:?}"
+        );
+        assert!(
+            git_push.recommendation.contains("protected family"),
+            "{git_push:?}"
+        );
+        assert!(
+            git_push
+                .recommendation
+                .contains("stays prompting unless the operator explicitly enables it"),
+            "{git_push:?}"
+        );
+        assert!(
+            !git_push.recommendation.contains("standing allow in"),
+            "a protected family must never be told to grant a standing allow: {git_push:?}"
+        );
     }
 }
