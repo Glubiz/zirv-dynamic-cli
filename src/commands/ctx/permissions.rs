@@ -877,4 +877,85 @@ mod tests {
         // Below threshold: no transcripts at all -> zero requests.
         assert!(noisy_audit(AuditAgent::Codex, &[]).is_none());
     }
+
+    // -------------------------------------------------------------
+    // Regression fixtures (issue #132 acceptance criterion: "Add
+    // regression fixtures covering all command shapes listed above and
+    // assert that routine approved families stop re-prompting while
+    // protected families still prompt.")
+    // -------------------------------------------------------------
+
+    const CODEX_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/codex-rollout-permission-requests.jsonl");
+    const CLAUDE_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/claude-transcript-permission-requests.jsonl");
+
+    #[test]
+    fn codex_fixture_covers_reusable_and_one_off_command_shapes() {
+        let requests = extract_codex_requests(CODEX_FIXTURE, "fixture-session");
+        // 9 escalated `exec` requests in the fixture; the successful
+        // `custom_tool_call_output` line and the non-`exec` `apply_patch`
+        // line must both be skipped.
+        assert_eq!(requests.len(), 9, "{requests:#?}");
+
+        let groups = group_requests(&requests);
+        let by_family: HashMap<&str, &FamilyGroup> =
+            groups.iter().map(|g| (g.family.as_str(), g)).collect();
+
+        // Routine, operator-approvable families: reusable.
+        assert!(by_family["zirv setup apply"].reusable, "{:?}", by_family["zirv setup apply"]);
+        assert!(by_family["git fetch"].reusable);
+        assert!(by_family["zirv commit"].reusable);
+        // The bare invocation (ctc_4) and its `env -u ...`-wrapped twin
+        // (ctc_5) must normalize to the SAME family, not two separate
+        // one-offs -- the exact gap issue #132 names ("environment-clean
+        // wrappers ... were saved as exact invocations rather than the
+        // underlying zirv capability").
+        assert_eq!(by_family["zirv setup apply"].count, 2);
+
+        // The pipe-into-`jq` requests and the long inline issue body all
+        // collapse to the SAME "gh issue" family as the reusable
+        // `--body-file` request -- exactly the noise issue #132 reports:
+        // one family, mixed reusability, so the group as a whole must not
+        // be reported reusable.
+        assert_eq!(by_family["gh issue"].count, 4);
+        assert!(!by_family["gh issue"].reusable, "{:?}", by_family["gh issue"]);
+    }
+
+    #[test]
+    fn codex_fixture_marks_the_long_body_and_jq_pipe_families_not_reusable() {
+        let requests = extract_codex_requests(CODEX_FIXTURE, "fixture-session");
+        let long_body = requests
+            .iter()
+            .find(|r| r.raw.contains("much longer inline issue body"))
+            .expect("the long-body request");
+        assert!(!long_body.reusable, "{long_body:?}");
+
+        let jq_pipe = requests
+            .iter()
+            .filter(|r| r.raw.contains("| jq"))
+            .collect::<Vec<_>>();
+        assert_eq!(jq_pipe.len(), 2);
+        assert!(jq_pipe.iter().all(|r| !r.reusable), "{jq_pipe:#?}");
+    }
+
+    #[test]
+    fn claude_fixture_covers_bash_and_non_bash_denials() {
+        let requests = extract_claude_requests(CLAUDE_FIXTURE, "fixture-session");
+        // 4 permission denials in the fixture: zirv ctx status, the long-body
+        // gh issue create, the Read denial, and the force-push. The
+        // successful nextest run and the ordinary (non-permission) failure
+        // must both be excluded.
+        assert_eq!(requests.len(), 4, "{requests:#?}");
+
+        let by_family: HashMap<&str, &PermissionRequest> =
+            requests.iter().map(|r| (r.family.as_str(), r)).collect();
+        assert!(by_family["zirv ctx status"].reusable);
+        assert!(!by_family["gh issue"].reusable);
+        assert!(by_family["Read"].reusable);
+        // Force-push is a genuinely dangerous, non-Bash-tool-only concern --
+        // still classified as its own family and still denied, never
+        // silently softened by the audit itself.
+        assert_eq!(by_family["git push"].result, "denied");
+    }
 }
