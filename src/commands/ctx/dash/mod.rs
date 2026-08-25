@@ -7258,6 +7258,8 @@ mod tests {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _agent =
+            crate::commands::ctx::testenv::VarGuard::set(&[("ZIRV_CTX_AGENT", Some("claude"))]);
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path();
         let cfg = CtxConfig::default();

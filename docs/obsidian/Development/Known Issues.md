@@ -14,6 +14,8 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-25 (fix/121-123-setup-optimize, issue #123, v2.28.0): recorded that a workspace-sandboxed parent can block a nested Claude/Codex judgment child from its home state; run_model now exposes bounded sanitized stderr so the cause is visible, but the parent boundary still requires running the same report-only command outside that sandbox when judgment is desired -->
+
 <!-- Updated 2026-08-25 (fix/118-injection-deferral-and-dash-newlines, issue #118, v2.27.0): resolved the read_until blocking-read test residual (bounded via a background-thread ChunkReader + recv_timeout); corrected the #114 entry below -- only the T13 mail advisory defers now, capability-gated via the new Capabilities::defer_injection_submit, while wrap's own /compact injection stays single-burst by reachability (unreachable for codex) rather than sharing dash::pane's deferred shape; recorded two new residuals: Shift+Enter is indistinguishable from plain Enter in a dashboard overlay on a terminal with no kitty keyboard-enhancement support (Alt+Enter is the universal fallback), and a multi-line nudge delivered into an attached pane still flattens to one line via scrub_controls, deliberately -->
 <!-- Updated 2026-08-24 (feat/cross-harness-permissions, v2.26.0 hardening): cross-shell semantic classification, immutable launch-policy attestation and private command-hash audit landed; native-Windows Claude's lack of an OS containment boundary remains explicit -->
 <!-- Updated 2026-08-24 (fix/codex-pane-messaging, review round F1-F7 on PR #116): amended the #114 entry -- the settle gap is now a deferred, tick-drained submit (Pane::pending_submit/drain_pending_submits) instead of a blocking sleep on the dashboard's UI thread, and wrap.rs's own /compact and mail-advisory injections share the same shape; also closed a report-back persistence gap (a restored worker pane used to permanently lose its report_to target) -->
@@ -59,6 +61,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## A parent workspace sandbox can block nested optimizer judgment children
+
+`zirv ctx optimize` launches a fresh Claude/Codex CLI for its judgment pass. When Zirv itself is run inside a parent workspace sandbox that cannot read or write the harness's home-state directories, the nested CLI can exit before producing a judgment; the deterministic checks still complete. Since v2.28.0, the skip message includes bounded, sanitized child stderr instead of only `model exited with status 1`. To obtain the model pass, re-run the same report-only command from a shell outside that parent sandbox; do not widen the distiller's own read-only restrictions.
 
 ## Native Windows Claude has no OS containment boundary
 

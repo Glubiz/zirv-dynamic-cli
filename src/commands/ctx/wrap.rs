@@ -3726,6 +3726,7 @@ mod tests {
             .expect("openpty");
 
         let mut cmd = CommandBuilder::new(zirv_bin());
+        crate::commands::ctx::testenv::scrub_operator_profile_env_for_test(&mut cmd);
         cmd.arg("ctx");
         cmd.arg("wrap");
         for flag in flags {
@@ -4160,6 +4161,7 @@ mod tests {
     #[test]
     fn allow_nested_overrides_the_guard() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
         let env: std::collections::HashMap<String, String> = [(
             adapters::SESSION_ENV.to_string(),
             "abcdef12-3456-4789-8abc-def012345678".to_string(),
@@ -4191,6 +4193,7 @@ mod tests {
     #[test]
     fn the_allow_nested_environment_variable_overrides_the_guard_too() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
         let env: std::collections::HashMap<String, String> = [
             (
                 adapters::SESSION_ENV.to_string(),
@@ -4226,6 +4229,7 @@ mod tests {
     #[test]
     fn a_wrap_outside_any_session_is_not_gated() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
         let mut args = wrap_args_in(&["echo", "hello"], false);
         args.agent = None;
         let err = run_with(
@@ -4516,6 +4520,7 @@ mod tests {
     #[test]
     fn the_undetected_command_error_names_the_registry_rather_than_claude() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
         let args = WrapArgs {
             agent: None,
             no_supervise: false,
@@ -4664,8 +4669,8 @@ mod tests {
     }
 
     /// Bug B (harness/model parity, 2026-08-22): the shipped-default
-    /// "sandboxed, no prompts" posture reaches a plain (non-dashboard)
-    /// `wrap` launch too, not only the seams a human never watches. Not
+    /// sandbox posture reaches a plain (non-dashboard) `wrap` launch too,
+    /// not only the seams a human never watches. Not
     /// runnable on this Windows dev machine (`#[cfg(unix)]`, mirroring
     /// every neighbouring live-argv test in this module); intended for CI.
     #[cfg(unix)]
@@ -4688,10 +4693,12 @@ mod tests {
                 || seen.contains("--sandbox\nworkspace-write"),
             "the shipped sandbox posture must reach a plain wrap launch: {seen:?}"
         );
-        assert!(
-            seen.contains("--ask-for-approval never") || seen.contains("--ask-for-approval\nnever"),
-            "got: {seen:?}"
-        );
+        let never =
+            seen.contains("--ask-for-approval never") || seen.contains("--ask-for-approval\nnever");
+        let reviewed = (seen.contains("--ask-for-approval on-request")
+            || seen.contains("--ask-for-approval\non-request"))
+            && seen.contains("--approve-for-me");
+        assert!(never || reviewed, "got: {seen:?}");
 
         h.writer.write_all(b"/exit\r").expect("write");
         h.writer.flush().expect("flush");
@@ -7391,6 +7398,7 @@ mod tests {
             })
             .expect("openpty");
         let mut cmd = CommandBuilder::new(zirv_bin());
+        crate::commands::ctx::testenv::scrub_operator_profile_env_for_test(&mut cmd);
         cmd.arg("ctx");
         cmd.arg("wrap");
         cmd.arg("--agent");
@@ -7404,6 +7412,9 @@ mod tests {
             "ZIRV_CTX_STATE_DIR",
             tmp.path().join("state").display().to_string(),
         );
+        for home in ["HOME", "USERPROFILE"] {
+            cmd.env(home, tmp.path().display().to_string());
+        }
         // T8: hermetic against the developer's/agent's own environment --
         // see the identical comment on `spawn_wrap`'s pty harness above.
         // This test builds its own `CommandBuilder` rather than going
@@ -7608,6 +7619,7 @@ mod tests {
             wrapped: &[&str],
         ) -> std::process::Child {
             let mut cmd = std::process::Command::new(zirv_bin());
+            crate::commands::ctx::testenv::scrub_operator_profile_env_for_test_cmd(&mut cmd);
             cmd.arg("ctx").arg("wrap");
             cmd.args(flags);
             cmd.arg("--");

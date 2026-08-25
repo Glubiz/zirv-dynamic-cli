@@ -170,6 +170,54 @@ not invent progress that is not evidenced below.\n\n\
 }
 
 const DISTILL_POLL: Duration = Duration::from_millis(25);
+const MODEL_STDERR_CAPTURE_BYTES: usize = 8 * 1024;
+const MODEL_STDERR_REPORT_BYTES: usize = 2 * 1024;
+
+fn read_bounded<R: Read>(mut reader: R, limit: usize) -> Vec<u8> {
+    let mut captured = Vec::with_capacity(limit);
+    let mut chunk = [0_u8; 1024];
+    while let Ok(count) = reader.read(&mut chunk) {
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(captured.len());
+        captured.extend_from_slice(&chunk[..count.min(remaining)]);
+    }
+    captured
+}
+
+fn sanitized_model_stderr(stderr: &[u8], prompt: &str) -> String {
+    let decoded = String::from_utf8_lossy(stderr);
+    let prompt_lines = prompt
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let mut sanitized = String::new();
+    let mut redacted_prompt_line = false;
+    for line in decoded.lines() {
+        let clean: String = line
+            .chars()
+            .filter(|character| !character.is_control() || *character == '\t')
+            .collect();
+        if prompt_lines
+            .iter()
+            .any(|prompt_line| clean.contains(prompt_line))
+        {
+            if !redacted_prompt_line {
+                sanitized.push_str("[model prompt content redacted]\n");
+                redacted_prompt_line = true;
+            }
+        } else {
+            sanitized.push_str(&clean);
+            sanitized.push('\n');
+        }
+        if sanitized.len() >= MODEL_STDERR_REPORT_BYTES {
+            sanitized.truncate(MODEL_STDERR_REPORT_BYTES);
+            break;
+        }
+    }
+    sanitized.trim().to_string()
+}
 
 /// Turns the operator's own model config into the `model: &str`
 /// `distiller_cmd`/`run_model`/`distill`/`distill_or_structural` all take:
@@ -224,7 +272,7 @@ pub fn run_model(
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     // L: the same FIX 2a chokepoint `supervise::spawn_tapped` applies to
     // every headless `exec`/`loop` spawn. This distiller child is spawned
@@ -244,7 +292,15 @@ pub fn run_model(
         let _ = tx.send(buffer);
     });
 
+    let stderr = child.stderr.take().ok_or("model stderr unavailable")?;
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let buffer = read_bounded(stderr, MODEL_STDERR_CAPTURE_BYTES);
+        let _ = stderr_tx.send(buffer);
+    });
+
     let mut stdin = child.stdin.take().ok_or("model stdin unavailable")?;
+    let prompt_for_stderr = prompt.to_owned();
     let prompt = prompt.to_owned();
     // Dropping `stdin` at the end of this closure is what signals end of
     // input to the model. A write failure here (broken pipe, because the
@@ -279,7 +335,20 @@ pub fn run_model(
     };
 
     if !status.success() {
-        return Err(format!("model exited with status {}", status.code().unwrap_or(-1)).into());
+        let stderr = stderr_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or_default();
+        let stderr = sanitized_model_stderr(&stderr, &prompt_for_stderr);
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
+        return Err(format!(
+            "model exited with status {}{detail}",
+            status.code().unwrap_or(-1)
+        )
+        .into());
     }
 
     let answer = rx.recv_timeout(timeout).unwrap_or_default();
@@ -902,6 +971,32 @@ mod tests {
         }
         let err = result.expect_err("non-zero exit surfaces");
         assert!(err.to_string().contains('4'), "report the exit code: {err}");
+        assert!(
+            err.to_string().contains("fake model blocked by sandbox"),
+            "report bounded model stderr: {err}"
+        );
+    }
+
+    #[test]
+    fn model_stderr_is_bounded_sanitized_and_does_not_echo_the_prompt() {
+        let prompt = "private optimizer prompt line\nanother private line";
+        let stderr = format!(
+            "\u{1b}[31mpermission denied\u{1b}[0m\nprompt was: {prompt}\n{}",
+            "x".repeat(MODEL_STDERR_CAPTURE_BYTES * 2)
+        );
+        let sanitized = sanitized_model_stderr(stderr.as_bytes(), prompt);
+
+        assert!(sanitized.contains("permission denied"), "got {sanitized}");
+        assert!(
+            sanitized.contains("[model prompt content redacted]"),
+            "got {sanitized}"
+        );
+        assert!(!sanitized.contains("private optimizer prompt line"));
+        assert!(sanitized.len() <= MODEL_STDERR_REPORT_BYTES);
+        assert!(
+            !sanitized.contains('\u{1b}'),
+            "control bytes must be stripped"
+        );
     }
 
     /// L: `run_model` is spawned directly, not through `supervise::
@@ -1250,7 +1345,7 @@ mod tests {
 
         let args = HandoffArgs {
             transcript,
-            agent: None,
+            agent: Some("claude".to_string()),
             session_id: None,
             stdout: true,
             no_model: true,

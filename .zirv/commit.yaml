@@ -18,7 +18,12 @@ commands:
     options:
       proceed_on_failure: false
       interactive: false
-  - command: "git push origin"
+  - command: "branch=\"$(git branch --show-current)\"; test -n \"$branch\" && test \"$branch\" != main && test \"$branch\" != master"
+    description: "Refuse to push a protected or detached branch"
+    options:
+      proceed_on_failure: false
+      interactive: false
+  - command: "git push --set-upstream origin HEAD"
     description: "Push the commit to the remote repository"
     options:
       proceed_on_failure: false

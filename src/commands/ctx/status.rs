@@ -934,6 +934,7 @@ mod tests {
     #[test]
     fn status_mentions_the_usage_windows() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
         let env = env_for(state.root());
@@ -973,6 +974,7 @@ mod tests {
     #[test]
     fn status_shows_unknown_for_a_usage_window_that_has_expired() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
         let env = env_for(state.root());

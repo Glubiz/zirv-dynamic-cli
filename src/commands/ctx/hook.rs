@@ -705,6 +705,7 @@ mod tests {
     #[test]
     fn run_scores_a_real_transcript_and_advises() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
         let transcript = rotting_transcript(dir.path());
 
         let state = dir.path().join("state");
@@ -787,6 +788,7 @@ mod tests {
     #[test]
     fn a_failure_heavy_session_queues_an_optimize_recommendation() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
         let transcript = dir.path().join("t.jsonl");
         let mut text = String::new();
         for i in 0..12 {
@@ -884,6 +886,7 @@ mod tests {
     #[test]
     fn a_correction_heavy_session_queues_one_even_with_clean_tools() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
         let transcript = correction_heavy_transcript(dir.path());
 
         let state = dir.path().join("state");
@@ -913,6 +916,7 @@ mod tests {
     #[test]
     fn a_healthy_correction_heavy_session_prints_only_the_optimize_hint() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
         let transcript = correction_heavy_transcript(dir.path());
 
         let state = dir.path().join("state");

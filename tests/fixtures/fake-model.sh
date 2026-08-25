@@ -45,7 +45,10 @@ prompt=$(cat)
 [ -z "${FAKE_MODEL_PROMPT_LOG:-}" ] || printf '%s' "$prompt" > "$FAKE_MODEL_PROMPT_LOG"
 
 case "${FAKE_MODEL_MODE:-good}" in
-  fail) exit 4 ;;
+  fail)
+    printf 'fake model blocked by sandbox\n' >&2
+    exit 4
+    ;;
   hang) while true; do "$sleep_bin" 1; done ;;
   garbage) printf 'I had a look and things seem mostly fine.\n' ;;
   harvest)
