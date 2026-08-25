@@ -4476,7 +4476,9 @@ mod tests {
     /// first.
     #[test]
     fn a_repo_cannot_widen_its_way_to_a_permissive_launch_on_either_adapter() {
-        use super::super::adapters::{AgentAdapter, claude::ClaudeAdapter, codex::CodexAdapter};
+        use super::super::adapters::{
+            AgentAdapter, LaunchMode, claude::ClaudeAdapter, codex::CodexAdapter,
+        };
 
         let home = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
@@ -4499,7 +4501,7 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
 
         let claude = ClaudeAdapter::new(None);
-        let claude_args = claude.policy_args(&cfg.policy);
+        let claude_args = claude.policy_args(&cfg.policy, LaunchMode::Interactive);
         assert_eq!(
             claude_args,
             claude.read_only_args(),
@@ -4507,7 +4509,7 @@ mod tests {
         );
 
         let codex = CodexAdapter::new(None);
-        let codex_args = codex.policy_args(&cfg.policy);
+        let codex_args = codex.policy_args(&cfg.policy, LaunchMode::Interactive);
         assert!(
             codex_args.contains(&"--sandbox".to_string())
                 && codex_args.contains(&"read-only".to_string())
