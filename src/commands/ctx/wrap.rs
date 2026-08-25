@@ -1325,6 +1325,20 @@ pub(in crate::commands::ctx) fn apply_interactive_gate(
 /// printing it to a caller-supplied stdout writer, the same stream the
 /// wrapped session's own pty bytes already occupy, is exactly the kind of
 /// silently-lost diagnostic that motivated the fix.
+/// Pure mapping from "is this launch's stdio a real terminal" to the
+/// `LaunchMode` `compile`/`policy_launch_args` should use (2026-08-24
+/// hardening, finding 5): a non-tty launch fails closed to `Headless`
+/// rather than inheriting the permissive `Interactive` posture. Split out
+/// so the mapping itself -- as opposed to the `is_terminal()` calls that
+/// feed it -- is directly unit-testable.
+fn launch_mode_from_interactive(interactive: bool) -> super::adapters::LaunchMode {
+    if interactive {
+        super::adapters::LaunchMode::Interactive
+    } else {
+        super::adapters::LaunchMode::Headless
+    }
+}
+
 pub fn run_with(
     args: &WrapArgs,
     repo: &Path,
@@ -1432,7 +1446,15 @@ pub fn run_with(
     // arrive (worst case). A non-interactive `wrap` invocation is out of
     // scope for this fix -- `exec`/`loop` are the supervisors for headless
     // work, and already gate correctly.
-    if !args.no_supervise && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    //
+    // `interactive_launch` is also the real signal `compile`/`policy_
+    // launch_args` below need (2026-08-24 hardening): before this, both
+    // hardcoded `LaunchMode::Interactive` regardless of whether stdio was
+    // actually a terminal, so a non-tty `wrap` invocation (piped stdio, a
+    // CI runner, a script) got the permissive interactive posture instead
+    // of failing closed to `Headless`.
+    let interactive_launch = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !args.no_supervise && interactive_launch {
         let gate = pace::interactive_gate(&state_dir, &cfg, adapter.provider(), true);
         apply_interactive_gate(gate, args.force_pace)?;
     }
@@ -1463,7 +1485,7 @@ pub fn run_with(
         role,
         &state_dir,
         super::state::now_secs(),
-        super::adapters::LaunchMode::Interactive,
+        launch_mode_from_interactive(interactive_launch),
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -1535,7 +1557,7 @@ pub fn run_with(
             &cfg,
             adapter.as_ref(),
             rest,
-            adapters::LaunchMode::Interactive,
+            launch_mode_from_interactive(interactive_launch),
         )
     };
     // Visible, not silent: the shipped-default posture (or the operator's
@@ -3247,6 +3269,24 @@ mod tests {
             size,
             900,
         )
+    }
+
+    /// Finding 5 (2026-08-24 review): `run_with` used to hardcode
+    /// `LaunchMode::Interactive` for both `compile()` and `policy_launch_
+    /// args()` regardless of whether stdio was actually a terminal. This
+    /// tests the corrected pure mapping directly -- no pty, no process
+    /// stdio -- since that is the one piece of the fix that does not
+    /// require an actual terminal to exercise.
+    #[test]
+    fn launch_mode_from_interactive_maps_the_boolean_to_the_right_mode() {
+        assert_eq!(
+            launch_mode_from_interactive(true),
+            super::super::adapters::LaunchMode::Interactive
+        );
+        assert_eq!(
+            launch_mode_from_interactive(false),
+            super::super::adapters::LaunchMode::Headless
+        );
     }
 
     /// Item 2 (Usage and Pacing follow-up): the status bar used to read the
