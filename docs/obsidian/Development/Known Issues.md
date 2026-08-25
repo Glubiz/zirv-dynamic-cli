@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-25 (feat/132-codex-permission-audit, issue #132, v2.29.0): recorded that zirv ctx permissions audit reports and recommends but does not yet write an approval into [safety]/[policy] on the operator's behalf -->
 <!-- Updated 2026-08-25 (fix/121-123-setup-optimize, issue #123, v2.28.0): recorded that a workspace-sandboxed parent can block a nested Claude/Codex judgment child from its home state; run_model now exposes bounded sanitized stderr so the cause is visible, but the parent boundary still requires running the same report-only command outside that sandbox when judgment is desired -->
 
 <!-- Updated 2026-08-25 (fix/118-injection-deferral-and-dash-newlines, issue #118, v2.27.0): resolved the read_until blocking-read test residual (bounded via a background-thread ChunkReader + recv_timeout); corrected the #114 entry below -- only the T13 mail advisory defers now, capability-gated via the new Capabilities::defer_injection_submit, while wrap's own /compact injection stays single-burst by reachability (unreachable for codex) rather than sharing dash::pane's deferred shape; recorded two new residuals: Shift+Enter is indistinguishable from plain Enter in a dashboard overlay on a terminal with no kitty keyboard-enhancement support (Alt+Enter is the universal fallback), and a multi-line nudge delivered into an attached pane still flattens to one line via scrub_controls, deliberately -->
@@ -61,6 +62,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## `zirv ctx permissions audit` reports and recommends but does not apply a policy change
+
+Issue #132's acceptance criteria include "compile operator-owned managed policy into reusable approvals" and "allow an operator to approve a bounded repository verification workflow once." `permissions.rs`'s `audit_report`/`render_report` group escalated/denied requests by family and name the exact `[safety]`/`[policy]` change each `FamilyGroup.recommendation` string describes, but nothing writes that change into `~/.zirv/ctx.toml` (or any config layer) on the operator's behalf yet. An operator has to add the recommended rule by hand. Closing this needs the same shape `optimize.rs`'s own `proposed_diff` findings already use for surface edits, applied to `[safety]`/`[policy]` instead — filed rather than half-built inside this round.
 
 ## A parent workspace sandbox can block nested optimizer judgment children
 
