@@ -43,12 +43,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// advisory only (the caller's own session short, or `"unknown"`): nothing
 /// in the fulfilment path trusts it for anything but a label.
 ///
-/// `cwd` is the repo the requester was invoked in, and it is **checked, not
-/// honoured**: `dash::fulfill_spawn_request` refuses outright when it names
-/// anything but the dashboard's own repo. Spawning a pane into a directory
-/// the operator never opened is not something a request gets to ask for, and
-/// silently ignoring the field would let a request from another repo run
-/// here without either side noticing.
+/// `cwd` is the repo the requester was invoked in, and it is **checked
+/// before it is honoured**: `dash::fulfill_spawn_request` (via `dash::
+/// accepted_spawn_cwd`) refuses outright when `cwd` names neither the
+/// dashboard's own repo nor a linked `git worktree add` sibling of it
+/// (issue #119). Spawning a pane into a directory the operator never opened
+/// is not something a request gets to ask for, and silently ignoring the
+/// field would let a request from another repo run here without either side
+/// noticing -- but a linked worktree of the dashboard's own repo *is* opened,
+/// just at a different path, so an accepted request's pane runs at `cwd`
+/// itself rather than being redirected into the dashboard's own checkout.
 ///
 /// `model` is the one trailing flag a pane can honour: the model the requester
 /// pinned for this worker (`zirv agent <name> "<prompt>" -- --model <m>`, in

@@ -2087,6 +2087,76 @@ fn same_directory(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
+/// The canonicalised git "common dir" that owns `path` -- the shared `.git`
+/// directory a plain repo and every `git worktree add`-linked sibling of it
+/// all point back at -- or `None` if `git` is missing, `path` is not inside a
+/// git working tree, or the process exits non-zero. Best-effort and
+/// shell-out only, same precedent as `compile::changed_repo_paths`.
+///
+/// `git rev-parse --git-common-dir` prints a path RELATIVE to `path` for a
+/// main worktree (typically just `.git`) but an ABSOLUTE one for a linked
+/// worktree (it points back at the main checkout's `.git`). Both forms are
+/// resolved against `path` before canonicalising, so a main worktree and any
+/// of its linked siblings canonicalise to the exact same `PathBuf` even
+/// though git reports the two differently.
+fn git_common_dir(path: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(raw);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        path.join(candidate)
+    };
+    std::fs::canonicalize(&resolved).ok()
+}
+
+/// Whether a spawn request naming `req_cwd` may be fulfilled by a dashboard
+/// whose own repo is `repo`, and if so, the directory the freshly spawned
+/// pane should actually run in.
+///
+/// Two ways to accept:
+/// - the fast, filesystem-only path (`same_directory`): `req_cwd` and `repo`
+///   canonicalise to the identical directory.
+/// - linked git worktrees of the same repository (issue #119): `req_cwd` and
+///   `repo` sit in different working trees but share the same
+///   `git_common_dir`, which is exactly what distinguishes "another linked
+///   worktree of this repo" from "a genuinely unrelated repo".
+///
+/// `None` (refuse) covers everything else, including two independent
+/// repositories, a `req_cwd` with no git ancestry at all, and `git` being
+/// unavailable -- refusing is always the safe default here, never the
+/// permissive one.
+///
+/// The accepted pane cwd is always `req_cwd`, never `repo`: a linked
+/// worktree's pane must actually run inside that worktree, not inside the
+/// dashboard's own checkout (issue #119's actual bug -- the dashboard used to
+/// accept-and-then-still-spawn into its own `repo` once this gate is
+/// loosened, which would silently run the requester's task in the wrong
+/// working tree).
+fn accepted_spawn_cwd(req_cwd: &Path, repo: &Path) -> Option<PathBuf> {
+    if same_directory(req_cwd, repo) {
+        return Some(req_cwd.to_path_buf());
+    }
+    match (git_common_dir(req_cwd), git_common_dir(repo)) {
+        (Some(a), Some(b)) if a == b => Some(req_cwd.to_path_buf()),
+        _ => None,
+    }
+}
+
 /// The `extra` argv a freshly spawned **dashboard pane** launches with: its
 /// composed-prompt injection arguments plus `AgentAdapter::session_pin_args`,
 /// which pins the harness's own conversation to the uuid this pane is
@@ -2525,21 +2595,25 @@ fn fulfill_spawn_request(
         return Err(SpawnRefusal::policy(ARGV_GUARD_REFUSAL));
     }
     // `cwd` used to be written by the requester and then never looked at.
-    // Honouring it would mean this dashboard spawning panes into a directory
-    // its operator never opened; ignoring it silently would mean a request
-    // from another repo quietly running here instead. Refusing is the honest
-    // contract, and it is the one the requester can see in the ack.
+    // Honouring it outright would mean this dashboard spawning panes into any
+    // directory its operator never opened; ignoring it silently would mean a
+    // request from another repo quietly running here instead. `accepted_
+    // spawn_cwd` is the middle ground (issue #119): a linked `git worktree
+    // add` sibling of this dashboard's own repo is accepted -- and hosted at
+    // its own path, not this repo's -- while a genuinely unrelated repo is
+    // still refused with the same honest contract as before, visible to the
+    // requester in the ack.
     //
     // O2: retryable. A repo mismatch means *this* dashboard cannot host the
     // pane, not that the task is disallowed -- the requester's own headless
     // run happens in its own repo and is exactly the right answer.
-    if !same_directory(&req.cwd, repo) {
+    let Some(spawn_cwd) = accepted_spawn_cwd(&req.cwd, repo) else {
         return Err(SpawnRefusal::channel(format!(
             "this dashboard only spawns panes in its own repo ({}); the request named {}",
             repo.display(),
             req.cwd.display()
         )));
-    }
+    };
     // R2: every pane in the vector is a live one -- `reap_ended_panes` takes
     // an exited pane out on the very next tick -- so the cap is a plain
     // `len()` again rather than a filtered count over a vector that only ever
@@ -2710,10 +2784,19 @@ fn fulfill_spawn_request(
 
     // O2: retryable. A pty that could not be opened is an environment
     // failure, not a policy one -- the headless path has no pty to open.
+    //
+    // `spawn_cwd`, not `repo`: a request accepted via the linked-worktree
+    // path (issue #119) must actually run inside that worktree's own working
+    // tree, never inside the dashboard's own checkout -- see `accepted_
+    // spawn_cwd`'s doc comment. Every other input to this spawn
+    // (`build_turn_env`, `slug`, `compose_worker_prompt`'s state paths)
+    // stays keyed off the dashboard's own `repo` on purpose: the session/
+    // state store is shared across every pane this dashboard hosts,
+    // regardless of which worktree a given pane's argv actually runs in.
     let mut pane = Pane::spawn(
         spec,
         state,
-        repo,
+        &spawn_cwd,
         size,
         &turn_env,
         adapter.capabilities().turn_signal,
@@ -9126,6 +9209,161 @@ mod tests {
             "got {reason}"
         );
         assert!(reason.contains("definitely-not-this-repo"), "got {reason}");
+    }
+
+    /// Whether `git` is on `PATH` at all in this test environment -- the
+    /// worktree-acceptance tests below need a real `git` binary to shell out
+    /// to (same precedent as `compile::changed_repo_paths`'s own tests), and
+    /// must skip gracefully rather than fail on a machine that somehow lacks
+    /// one, exactly like every other conditionally-skipped test in this
+    /// module (`#[cfg(windows)]`, the pty-needing tests, etc).
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A real temp git repo (`git init`, one commit so `git worktree add` has
+    /// something to branch a linked sibling from) plus one linked worktree
+    /// created with `git worktree add`. Returns `None` (callers skip) if
+    /// `git` itself is unavailable or any setup step fails -- these are
+    /// integration tests against the real binary, not something a broken
+    /// local git install should be able to fail loudly on.
+    fn git_repo_with_linked_worktree() -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return None;
+        }
+        let root = tempfile::tempdir().ok()?;
+        let main = root.path().join("main");
+        std::fs::create_dir_all(&main).ok()?;
+        let linked = root.path().join("linked");
+
+        let run = |args: &[&str], cwd: &Path| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+
+        if !run(&["init", "-q"], &main) {
+            return None;
+        }
+        if !run(&["config", "user.email", "test@example.com"], &main) {
+            return None;
+        }
+        if !run(&["config", "user.name", "test"], &main) {
+            return None;
+        }
+        std::fs::write(main.join("README.md"), "hello\n").ok()?;
+        if !run(&["add", "README.md"], &main) {
+            return None;
+        }
+        if !run(&["commit", "-q", "-m", "initial"], &main) {
+            return None;
+        }
+        let linked_str = linked.to_string_lossy().to_string();
+        if !run(
+            &["worktree", "add", &linked_str, "-b", "feature-branch"],
+            &main,
+        ) {
+            return None;
+        }
+
+        Some((root, main, linked))
+    }
+
+    /// F119: the actual bug report -- a linked `git worktree add` sibling of
+    /// the dashboard's own repo must be accepted, and the pane it spawns must
+    /// actually run at the worktree's own path (never redirected into the
+    /// dashboard's own checkout).
+    #[test]
+    fn accepted_spawn_cwd_accepts_a_linked_worktree_of_the_same_repo() {
+        let Some((_root, main, linked)) = git_repo_with_linked_worktree() else {
+            return;
+        };
+        // The accepted cwd is `req_cwd` exactly as given, not a canonicalised
+        // form -- canonicalising is only how the *decision* is made
+        // (`same_directory`/`git_common_dir`), never what the pane's cwd
+        // becomes (see `accepted_spawn_cwd`'s own doc comment).
+        assert_eq!(
+            accepted_spawn_cwd(&linked, &main),
+            Some(linked.clone()),
+            "a linked worktree must be accepted and hosted at its own path"
+        );
+    }
+
+    /// The same acceptance, exercised through the full `fulfill_spawn_
+    /// request` gate (via `refusal_for`'s sibling -- run to `Ok`, not a
+    /// refusal) rather than only the extracted decision function, so a wiring
+    /// mistake between `accepted_spawn_cwd` and the gate itself would still
+    /// be caught. Stops short of a real pty spawn (no agent binary is
+    /// guaranteed to exist in a test environment): this only proves the gate
+    /// itself no longer refuses a linked worktree, mirroring `refusal_for`'s
+    /// own "assert before any spawn" contract -- so it drives the earlier,
+    /// pre-spawn refusal checks into a state where the *repo* gate would be
+    /// the only thing standing between this request and a real spawn, then
+    /// confirms the pane-cap refusal fires (proving the repo gate did not).
+    #[test]
+    fn fulfill_spawn_request_no_longer_refuses_a_linked_worktree_at_the_repo_gate() {
+        let Some((_root, main, linked)) = git_repo_with_linked_worktree() else {
+            return;
+        };
+        let mut cfg = CtxConfig::default();
+        // Forces a refusal *after* the repo gate (the pane cap, checked
+        // right after it) so this test can assert the repo gate itself was
+        // satisfied without needing a real agent binary to complete a pty
+        // spawn.
+        cfg.dash.max_panes = 0;
+        let reason = refusal_for(&spawn_request("do the work", &linked), &cfg, &main);
+        assert!(
+            reason.contains("pane limit reached"),
+            "the repo gate must have accepted the linked worktree, leaving the pane cap as \
+             the refusal; got {reason}"
+        );
+    }
+
+    /// The negative half of issue #119: two independent temp git repos --
+    /// neither a worktree of the other -- must still refuse, with the exact
+    /// same message shape the pre-existing `..._refuses_a_request_naming_
+    /// another_repo` test already covers for a non-git path.
+    #[test]
+    fn fulfill_spawn_request_refuses_two_independent_git_repos() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo_a = root.path().join("repo-a");
+        let repo_b = root.path().join("repo-b");
+        std::fs::create_dir_all(&repo_a).expect("mkdir repo-a");
+        std::fs::create_dir_all(&repo_b).expect("mkdir repo-b");
+        for repo in [&repo_a, &repo_b] {
+            let init = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .arg("init")
+                .arg("-q")
+                .output()
+                .expect("git init");
+            assert!(init.status.success(), "git init must succeed in {repo:?}");
+        }
+
+        let cfg = CtxConfig::default();
+        let reason = refusal_for(&spawn_request("do the work", &repo_b), &cfg, &repo_a);
+        assert!(
+            reason.contains("only spawns panes in its own repo"),
+            "got {reason}"
+        );
+        assert!(
+            reason.contains("repo-b"),
+            "names the request's own repo: {reason}"
+        );
     }
 
     /// F13: the cap is enforced where a pane is created by something other
