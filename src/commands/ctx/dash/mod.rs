@@ -1299,6 +1299,10 @@ fn handover_pane(
         target_model: Some(target_model.to_string()),
         force: false,
         requested_at: super::state::now_secs(),
+        // `handover_pane` is only ever reached from the dashboard's own
+        // Handover overlay's `KeyCode::Enter` -- a human at this exact
+        // dashboard's live TUI just chose this swap.
+        interactive: true,
     };
     let role = if pane.verb() == sessions::Verb::Chat {
         prompt::PromptRole::Orchestrator
@@ -2064,7 +2068,14 @@ fn worker_pane_extra_args(
         cfg,
         adapter,
         &[],
-        adapters::LaunchMode::Interactive,
+        // Real signal, not an assumed one (2026-08-24 hardening): only a
+        // request that can vouch a human is present gets the permissive
+        // interactive posture; a scripted/headless spawn fails closed.
+        if req.interactive {
+            adapters::LaunchMode::Interactive
+        } else {
+            adapters::LaunchMode::Headless
+        },
     ));
     extra.extend(pane_launch_extra(adapter, prompt_args, session_id));
     extra
@@ -2235,7 +2246,11 @@ fn compose_worker_prompt(
         prompt::PromptRole::Worker,
         state,
         super::state::now_secs(),
-        super::adapters::LaunchMode::Interactive,
+        if req.interactive {
+            super::adapters::LaunchMode::Interactive
+        } else {
+            super::adapters::LaunchMode::Headless
+        },
     )
     .composed;
     let system_prompt_supported = adapter.system_prompt_supported(&[]);
@@ -4471,6 +4486,11 @@ pub fn run_dashboard(
                                                     // spawn takes the operator's own
                                                     // configured worker default.
                                                     model: None,
+                                                    // A human is, by construction, at
+                                                    // this exact dashboard's own live
+                                                    // TUI right now -- this is the one
+                                                    // spawn path that can honestly say so.
+                                                    interactive: true,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 let fulfilled = fulfill_spawn_request(
@@ -8082,6 +8102,11 @@ mod tests {
             cwd: cwd.to_path_buf(),
             requested_by: "aaaa1111".to_string(),
             model: None,
+            // Every existing caller of this fixture models the ordinary
+            // human-at-the-dashboard spawn overlay; a test that needs the
+            // scripted/headless shape builds its own request literal with
+            // `interactive: false` instead of going through this helper.
+            interactive: true,
         }
     }
 
@@ -8875,6 +8900,41 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--ask-for-approval", "on-request"]),
             "got {codex_extra:?}"
+        );
+    }
+
+    /// Finding 10 (2026-08-24 review): `worker_pane_extra_args` used to
+    /// hardcode `LaunchMode::Interactive` regardless of the requesting
+    /// `SpawnRequest`'s own `interactive` field, so a scripted/headless
+    /// spawn (`interactive: false`, the `#[serde(default)]` a request from
+    /// `zirv ctx agent` or an older build carries) got the permissive
+    /// interactive posture instead of failing closed. Claude's own
+    /// `default_sandbox_args` is independently verified (`default_sandbox_
+    /// args_uses_the_verified_dont_ask_mode_when_headless`) to use
+    /// `--permission-mode dontAsk` under `Headless` and `default` under
+    /// `Interactive`, so that flag's value is the observable signal here.
+    #[test]
+    fn worker_pane_extra_args_fails_closed_to_headless_for_a_non_interactive_request() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let cfg = CtxConfig::default();
+        let repo = tmp.path().to_path_buf();
+        let mut req = spawn_request("do the work", &repo);
+        req.interactive = false;
+
+        let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let extra = worker_pane_extra_args(
+            &req,
+            &cfg,
+            &claude,
+            Vec::new(),
+            "dddddddd-1111-4333-8444-555555555555",
+        );
+        assert!(
+            extra.contains(&"--permission-mode".to_string())
+                && extra.contains(&"dontAsk".to_string()),
+            "a non-interactive spawn request must not get the permissive interactive posture: got {extra:?}"
         );
     }
 

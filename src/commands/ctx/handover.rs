@@ -27,7 +27,7 @@
 //! checkout. A literal model id (anything not one of `cheap`/`standard`/
 //! `deep`) always passes through unresolved.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -128,6 +128,15 @@ pub struct HandoverRequest {
     pub target_model: Option<String>,
     pub force: bool,
     pub requested_at: u64,
+    /// Whether the REQUESTER can vouch that a human is present to answer an
+    /// `Ask` prompt on the fresh successor session this swap launches
+    /// (2026-08-24, cross-harness permissions hardening) -- true only for a
+    /// swap a human directly triggered from the dashboard's own live pane.
+    /// `#[serde(default)]` makes `false` (`Headless`, fail-closed) what an
+    /// older request, or one this module cannot otherwise vouch for,
+    /// deserialises to. `resolve_swap_launch` is what actually reads it.
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -203,7 +212,11 @@ pub fn resolve_swap_launch(
         cfg,
         new_adapter.as_ref(),
         &[],
-        adapters::LaunchMode::Interactive,
+        if req.interactive {
+            adapters::LaunchMode::Interactive
+        } else {
+            adapters::LaunchMode::Headless
+        },
     );
     if let Some(model) = &req.target_model {
         extra.extend(new_adapter.model_args(model));
@@ -357,6 +370,12 @@ pub fn run_with<W: Write>(
         target_model: target_model.clone(),
         force: args.force,
         requested_at: super::state::now_secs(),
+        // Real signal, not an assumption: this CLI command can be typed by
+        // a human directly in the wrapped session's own terminal, or run
+        // headlessly/scripted -- `is_terminal()` on this process's own
+        // stdio is the same check `wrap.rs`'s launch-time gate already uses
+        // to answer the identical question (2026-08-24 hardening).
+        interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
     };
     write_request(&state, &short, &req)?;
 
@@ -592,6 +611,7 @@ mod tests {
             target_model: Some("gpt-5.6-terra".to_string()),
             force: false,
             requested_at: 1,
+            interactive: false,
         };
         write_request(&state, "abcd1234", &req).expect("write");
         let claimed = take_request(&state, "abcd1234").expect("present");
@@ -620,6 +640,33 @@ mod tests {
         assert!(back.ok);
         assert_eq!(back.to_agent.as_deref(), Some("codex"));
         assert!(take_ack(&state, "abcd1234").is_none(), "consumed once only");
+    }
+
+    /// Finding 10 (2026-08-24 review): `resolve_swap_launch` used to
+    /// hardcode `LaunchMode::Interactive` regardless of the requesting
+    /// `HandoverRequest`'s own `interactive` field, so a swap this module
+    /// cannot vouch a human is watching (`interactive: false`, what
+    /// `#[serde(default)]` gives an older request too) got the permissive
+    /// interactive posture instead of failing closed. Claude's own
+    /// `default_sandbox_args` is independently verified to use
+    /// `--permission-mode dontAsk` under `Headless`, so that flag's value
+    /// is the observable signal here.
+    #[test]
+    fn resolve_swap_launch_fails_closed_to_headless_for_a_non_interactive_request() {
+        let cfg = CtxConfig::default();
+        let req = HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: false,
+            requested_at: 0,
+            interactive: false,
+        };
+        let (_, extra) = resolve_swap_launch(&cfg, &req).expect("resolves");
+        assert!(
+            extra.contains(&"--permission-mode".to_string())
+                && extra.contains(&"dontAsk".to_string()),
+            "a non-interactive handover request must not get the permissive interactive posture: got {extra:?}"
+        );
     }
 
     /// A `--dry-run` invocation must provably mutate nothing: no request or

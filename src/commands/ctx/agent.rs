@@ -339,6 +339,10 @@ fn try_join_dashboard<W: Write>(
         cwd: repo.to_path_buf(),
         requested_by,
         model: pinned_model.map(str::to_string),
+        // This is a scripted request-file hand-off to whatever dashboard
+        // picks it up next -- this call site cannot vouch that a human is
+        // watching that dashboard, so it does not claim `interactive`.
+        interactive: false,
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
