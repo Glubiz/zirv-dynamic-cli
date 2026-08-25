@@ -901,6 +901,19 @@ impl AgentAdapter for ClaudeAdapter {
         // an `Ask` stance stops being purely operator-controlled -- but only
         // `Degraded`: the hook is registered for the `Bash` tool alone, so
         // every other tool still lands on claude's own settings.
+        //
+        // KNOWN RESIDUAL (2026-08-24, filed rather than guessed at): this
+        // `Degraded` claim assumes `launch_settings_path` actually wrote the
+        // per-launch settings file this description promises. That write is
+        // best-effort (`launch_settings_path`'s own doc comment) -- if it
+        // fails, THIS launch has no hook and no deny at all, yet
+        // `policy_support` is a static descriptor with no per-launch
+        // success/failure to consult, so it still reports `Degraded` here.
+        // Closing this needs either threading the real write outcome into
+        // `policy_support` (a signature change reaching every caller) or an
+        // argv-based fallback that does not depend on writing a file at
+        // all; both are out of scope for this pass, so the gap is
+        // documented rather than silently left implied-fixed.
         const ASK_INTERACTIVE: &str = "--permission-mode default plus the `zirv ctx safety check` PreToolUse hook as the \
              sole prompting gate, which allows everyday and unclassified commands outright and \
              prompts only on zirv's own short dangerous-command list; the hook matches the Bash \

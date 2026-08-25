@@ -301,6 +301,17 @@ const ON_REQUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`IGNORE_FLAGS_SUPPORT`] uses, for the identical reason: `agent_bin` can
 /// point at a different binary, or a different version resolved off a
 /// different `PATH`, and each has its own answer.
+///
+/// KNOWN LIMITATION (2026-08-24, filed rather than guessed at): the cache
+/// is keyed on `(program, bin_args)`, not on the resolved binary's mtime or
+/// version string, so it never invalidates if the SAME path is upgraded or
+/// downgraded mid-process (a codex-cli reinstall while a long-lived `zirv
+/// ctx` session, dashboard, or supervisor keeps running). A stale cached
+/// `true` after a downgrade that dropped `--approve-for-me`/on-request
+/// approval support would pass an unsupported flag; a stale cached `false`
+/// after an upgrade that added it merely withholds a capability, the safe
+/// direction. Bounding this needs a cache-busting signal (mtime/version)
+/// this module does not currently probe for; out of scope for this pass.
 static ON_REQUEST_APPROVAL_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
 static AUTO_REVIEW_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
 
