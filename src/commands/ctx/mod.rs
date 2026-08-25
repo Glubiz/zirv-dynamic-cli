@@ -24,6 +24,7 @@ pub mod memory_cli;
 pub mod memory_optimize;
 pub mod optimize;
 pub mod pace;
+pub mod permissions;
 pub mod policy;
 pub mod poll;
 pub mod prompt;
@@ -367,6 +368,8 @@ pub enum CtxVerb {
     Safety(safety::SafetyArgs),
     /// Swap the orchestrator seat's model or harness in place, same session id.
     Handover(handover::HandoverArgs),
+    /// Audit recent transcripts for escalated/denied permission requests.
+    Permissions(permissions::PermissionsArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -454,6 +457,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Nudge(a) => sessions::run_nudge(a, &mut out),
         CtxVerb::Safety(a) => safety::run(a, &mut out),
         CtxVerb::Handover(a) => handover::run(a, &mut out),
+        CtxVerb::Permissions(a) => permissions::run(a, &mut out),
     };
 
     match result {

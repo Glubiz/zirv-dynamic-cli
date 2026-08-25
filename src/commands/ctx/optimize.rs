@@ -1394,6 +1394,65 @@ pub fn friction_findings(evidence: &Evidence, cfg: &OptimizeConfig) -> Vec<Findi
     findings
 }
 
+/// Issue #132: "surface the same summary in setup/optimization output when
+/// approval noise exceeds a documented threshold." Runs
+/// `permissions::noisy_audit` for whichever agent this optimize run resolved
+/// (`None` when no adapter is available, matching every other findings pass
+/// in this file) over the same session sample size the rest of the report
+/// uses, and turns a noisy result into one `Finding` pointing at the full
+/// `zirv ctx permissions audit` report rather than repeating it inline.
+pub fn permission_noise_findings(
+    agent_name: Option<&str>,
+    sessions_sampled: usize,
+) -> Vec<Finding> {
+    let Some(name) = agent_name else {
+        return Vec::new();
+    };
+    let agent = match name {
+        "codex" => super::permissions::AuditAgent::Codex,
+        "claude" => super::permissions::AuditAgent::Claude,
+        _ => return Vec::new(),
+    };
+    let root = match agent {
+        super::permissions::AuditAgent::Codex => crate::utils::home_dir()
+            .ok()
+            .map(|h| h.join(".codex").join("sessions")),
+        super::permissions::AuditAgent::Claude => window::projects_root().ok(),
+    };
+    let files = root
+        .map(|r| newest_transcripts(&r, sessions_sampled))
+        .unwrap_or_default();
+    let Some(report) = super::permissions::noisy_audit(agent, &files) else {
+        return Vec::new();
+    };
+    let evidence: Vec<String> = report
+        .groups
+        .iter()
+        .take(5)
+        .map(|g| format!("{} x{}", g.family, g.count))
+        .collect();
+    let top_recommendation = report
+        .groups
+        .first()
+        .map(|g| g.recommendation.clone())
+        .unwrap_or_default();
+    vec![Finding {
+        kind: "permission-noise",
+        severity: Severity::Warning,
+        title: format!(
+            "{} escalated/denied permission requests across {} sampled {} sessions",
+            report.total_requests, report.sessions_scanned, report.agent
+        ),
+        evidence,
+        detail: format!(
+            "Run `zirv ctx permissions audit --agent {} --sessions {sessions_sampled}` for the \
+             full grouped report. Top recommendation: {top_recommendation}",
+            report.agent
+        ),
+        proposed_diff: None,
+    }]
+}
+
 // N7: a read-only summary of this repo's memory bank for the report's own
 // "Memory bank" section. Deliberately NOT folded into `collect_surfaces` or
 // `judgment_prompt`: a memory entry's key or body must never reach the
@@ -1917,6 +1976,10 @@ pub fn run_with<W: Write>(
         &on_path,
     ));
     findings.extend(friction_findings(&evidence, &cfg.optimize));
+    findings.extend(permission_noise_findings(
+        adapter.as_ref().ok().map(|a| a.name()),
+        sample,
+    ));
     // A layer that failed to *parse* degraded to defaults rather than
     // aborting `CtxConfig::load` (see `config::UnparsableLayer`), so it never
     // reaches the `Err` arm above -- this is the one surface a report-only
@@ -4344,6 +4407,17 @@ mod tests {
                 .any(|e| e.contains("decision log")),
             "say where it came from: {supervisor:?}"
         );
+    }
+
+    /// Issue #132: no adapter resolved (or a resolved adapter of an unknown
+    /// name) means no audit can run, so the finding is silently skipped
+    /// rather than guessing an agent -- same fail-quiet spirit as every
+    /// other findings pass, which never fails the whole report over a
+    /// missing adapter.
+    #[test]
+    fn permission_noise_findings_is_empty_with_no_resolved_agent() {
+        assert!(permission_noise_findings(None, 5).is_empty());
+        assert!(permission_noise_findings(Some("some-future-agent"), 5).is_empty());
     }
 
     #[test]

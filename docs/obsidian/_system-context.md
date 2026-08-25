@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-24
+last-verified: 2026-08-25
 ---
 
 # _system-context
@@ -38,7 +38,7 @@ Dispatch order matters: `ctx` and top-level `--help` are matched on **raw argv**
 | Development workflows | `src/commands/workflow/` | [[Workflows]] | Skills/capabilities, durable lifecycle state, risk classification, verification, review, artifacts, telemetry |
 | Utilities | `src/utils.rs` | [[Utilities]] | File parsing, reserved names, shortcuts struct, home dir, Levenshtein "did you mean" |
 | Ctx hub / verb tree | `src/commands/ctx/{mod,config,state,log}.rs` | [[Ctx Subsystem]] | `CtxCli`/`CtxVerb`, dispatch + parse-failure classification, layered `CtxConfig`, `StateDir`, decision log |
-| Ctx verb modules | `src/commands/ctx/{score,handoff,resume,hook,status,chat,agent,mail,sessions,memory,memory_cli,safety,handover}.rs` | [[Ctx Subsystem]] | One module per verb: read-transcript/decide/maybe-write-state, the meta-harness verbs (chat/agent/mail, `mail`'s `send --all` fan-out via per-session read markers), the session registry + nudge, the memory bank, its top-level `zirv memory` management surface, the harness-neutral command safety classifier ([[Command Safety]], issue #83), and `handover` (swaps the orchestrator seat's model/harness in place under the same registry short id, issue #84) |
+| Ctx verb modules | `src/commands/ctx/{score,handoff,resume,hook,status,chat,agent,mail,sessions,memory,memory_cli,safety,permissions,handover}.rs` | [[Ctx Subsystem]] | One module per verb: read-transcript/decide/maybe-write-state, the meta-harness verbs (chat/agent/mail, `mail`'s `send --all` fan-out via per-session read markers), the session registry + nudge, the memory bank, its top-level `zirv memory` management surface, the harness-neutral command safety classifier ([[Command Safety]], issue #83), the escalated/denied permission-request audit (`permissions audit`, issue #132), and `handover` (swaps the orchestrator seat's model/harness in place under the same registry short id, issue #84) |
 | Ctx supervisors | `src/commands/ctx/{run_loop,exec,wrap}.rs` + `{signal,supervise,term}.rs` + `dash/{mod,pane,ui,spawnreq,roster}.rs` | [[Ctx Supervisors]] | The three process supervisors, turn-signal sockets, shared process/terminal primitives, and the `dash` session multiplexer `zirv chat` opens on a capable terminal |
 | Ctx adapters | `src/commands/ctx/adapters/{mod,claude,codex}.rs` | [[Ctx Adapters]] | `AgentAdapter` trait; claude (full capabilities) and codex (launch-supported; turn-boundary/token event parsing and rot scoring now derived from its rollout JSON, issue #86; tool-call/tool-result/compaction mapping and turn signal remain issue #11) |
 | Rot engine | `src/commands/ctx/{event,rot}.rs` | [[Rot Engine]] | Pure normalized-event scoring → `Verdict` |
@@ -66,6 +66,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 | `usage` | Report usage windows, or tee the statusline to record them. |
 | `optimize` | Report-only analysis of the config surfaces that steer every session. |
 | `safety` | `check`/`list`/`explain` against zirv's harness-neutral command safety policy; `check` is also Claude's launch-attested `PreToolUse` hook. |
+| `permissions audit` | Transcript-backed audit of recent escalated/denied command-permission requests, grouped by normalized command family (issue #132). |
 | `handover` | Swap the orchestrator seat's model or harness in place, same registry short id (issue #84). |
 
 ## Key Flows
