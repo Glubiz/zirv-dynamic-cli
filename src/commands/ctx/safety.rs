@@ -1255,6 +1255,66 @@ fn is_inline_command_flag(flag: &str) -> bool {
     cluster.chars().all(|c| c.is_ascii_alphabetic()) && cluster.ends_with('c')
 }
 
+/// Whether `token` is a shell-style `VAR=value` assignment: a leading
+/// identifier (letters/digits/underscore, not starting with a digit)
+/// followed by `=`. Guards [`unwrap_env_prefix`] against mistaking an
+/// ordinary flag value containing `=` (`--foo=bar`) for an environment
+/// assignment -- a `-`-prefixed token never reaches this check in the first
+/// place, but a bare positional like `a=b` (not a real assignment token
+/// shape) still needs the identifier shape enforced.
+fn is_shell_identifier_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// One layer of `env` prefix unwrapping (issue #132): peels `env`, `env -u
+/// VAR`, `env VAR=value` chains (any mix, any order of `-`-flags and
+/// assignments), and a bare leading `VAR=value` assignment chain with no
+/// `env` program at all (`FOO=bar zirv setup profile ...`) -- so
+/// classification and command-family grouping see the underlying command an
+/// environment-clean wrapper hides, not the wrapper's own name or the first
+/// assignment token. Mirrors [`unwrap_pipe_wrapper`]'s own `env` handling
+/// (that helper's narrower, pipe-target-only sibling), generalized into an
+/// ordinary one-layer `Option<String>` unwrap so [`visit_executable_nodes`]
+/// can chain it exactly like [`unwrap_shell_wrapper`]. `None` when `segment`
+/// carries no such prefix at all, or when peeling it away would leave
+/// nothing behind.
+fn unwrap_env_prefix(segment: &str) -> Option<String> {
+    let bare = strip_program_dir(segment);
+    let collapsed = collapse_whitespace(&bare);
+    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    let first = *tokens.first()?;
+
+    if sql_program_name(first) == "env" {
+        let mut i = 1usize;
+        loop {
+            match tokens.get(i) {
+                Some(t) if *t == "-u" => i = i.saturating_add(2),
+                Some(t) if t.starts_with('-') => i += 1,
+                Some(t) if is_shell_identifier_assignment(t) => i += 1,
+                _ => break,
+            }
+        }
+        return (i < tokens.len()).then(|| tokens[i..].join(" "));
+    }
+
+    let mut i = 0usize;
+    while tokens.get(i).is_some_and(|t| is_shell_identifier_assignment(t)) {
+        i += 1;
+    }
+    if i == 0 || i >= tokens.len() {
+        return None;
+    }
+    Some(tokens[i..].join(" "))
+}
+
 fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
     if candidates.len() < MAX_STRUCTURAL_CANDIDATES && !candidates.contains(&candidate) {
         candidates.push(candidate);
@@ -1280,6 +1340,9 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
         push_candidate(candidates, strip_program_dir(&collapsed));
         if depth < MAX_STRUCTURAL_DEPTH {
             if let Some(inner) = unwrap_shell_wrapper(&collapsed) {
+                visit_executable_nodes(&inner, depth + 1, candidates);
+            }
+            if let Some(inner) = unwrap_env_prefix(&collapsed) {
                 visit_executable_nodes(&inner, depth + 1, candidates);
             }
             for inner in command_substitutions(&raw_segment) {
