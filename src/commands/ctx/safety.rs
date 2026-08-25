@@ -2316,18 +2316,14 @@ fn strip_sql_comments(statement: &str) -> Option<String> {
                 }
                 j += 1;
             }
-            match end {
-                Some(end) => {
-                    for c in &chars[i..end + closing.len()] {
-                        out.push(*c);
-                    }
-                    i = end + closing.len();
-                    continue;
-                }
-                // An unterminated dollar-quote: cannot see where it ends, so
-                // cannot see the real statement either.
-                None => return None,
+            // An unterminated dollar-quote: cannot see where it ends, so
+            // cannot see the real statement either.
+            let end = end?;
+            for c in &chars[i..end + closing.len()] {
+                out.push(*c);
             }
+            i = end + closing.len();
+            continue;
         }
         if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
             while i < chars.len() && chars[i] != '\n' {
