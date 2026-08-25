@@ -673,7 +673,7 @@ fn unwrap_pipe_wrapper<'a>(tokens: &[&'a str], depth: u8) -> Option<&'a str> {
 /// narrowed to just the pipe operator so the caller can inspect the LAST
 /// pipeline stage specifically. `;`/`&`/`&&`/`||` never introduce a
 /// pipeline boundary here; they stay inside whatever stage they fall in.
-fn pipeline_stages(command: &str) -> Vec<String> {
+pub(crate) fn pipeline_stages(command: &str) -> Vec<String> {
     let chars: Vec<char> = command.chars().collect();
     let mut stages = Vec::new();
     let mut current = String::new();
@@ -905,7 +905,7 @@ pub fn evaluate(
 /// Collapses runs of ASCII/Unicode whitespace to a single space and trims
 /// the ends -- so `"rm  -rf /"` (a doubled-space bypass of a literal-space
 /// glob pattern) compares identically to `"rm -rf /"`.
-fn collapse_whitespace(s: &str) -> String {
+pub(crate) fn collapse_whitespace(s: &str) -> String {
     let mut out = String::new();
     let mut prev_space = false;
     for c in s.trim().chars() {
@@ -1143,7 +1143,7 @@ fn strip_quotes(s: &str) -> &str {
 /// invoked through" reasoning `adapters::resolve_program` already applies
 /// elsewhere. Handles both `/` and `\` (a wrapped harness can run on either
 /// platform, regardless of which one zirv itself is running on).
-fn strip_program_dir(segment: &str) -> String {
+pub(crate) fn strip_program_dir(segment: &str) -> String {
     let mut parts = segment.splitn(2, ' ');
     let Some(program) = parts.next() else {
         return segment.to_string();
@@ -1161,7 +1161,7 @@ fn strip_program_dir(segment: &str) -> String {
 /// shells and the next token selects its inline-command flag. `None`
 /// otherwise -- not a recognised shell-wrapper invocation, or something a
 /// otherwise. The caller applies this recursively with a hard depth bound.
-fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
+pub(crate) fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
     let bare = strip_program_dir(segment);
     let mut parts = bare.splitn(2, ' ');
     let program = parts.next().unwrap_or("").to_ascii_lowercase();
@@ -1286,7 +1286,7 @@ fn is_shell_identifier_assignment(token: &str) -> bool {
 /// can chain it exactly like [`unwrap_shell_wrapper`]. `None` when `segment`
 /// carries no such prefix at all, or when peeling it away would leave
 /// nothing behind.
-fn unwrap_env_prefix(segment: &str) -> Option<String> {
+pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     let bare = strip_program_dir(segment);
     let collapsed = collapse_whitespace(&bare);
     let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
@@ -2187,7 +2187,7 @@ fn sql_tokens(command: &str) -> Option<Vec<String>> {
 
 /// The bare, lowercased program name for `first_token`, with any Windows
 /// executable extension removed.
-fn sql_program_name(first_token: &str) -> String {
+pub(crate) fn sql_program_name(first_token: &str) -> String {
     let bare = first_token
         .rsplit(['/', '\\'])
         .next()
