@@ -1401,7 +1401,10 @@ pub fn friction_findings(evidence: &Evidence, cfg: &OptimizeConfig) -> Vec<Findi
 /// in this file) over the same session sample size the rest of the report
 /// uses, and turns a noisy result into one `Finding` pointing at the full
 /// `zirv ctx permissions audit` report rather than repeating it inline.
-pub fn permission_noise_findings(agent_name: Option<&str>, sessions_sampled: usize) -> Vec<Finding> {
+pub fn permission_noise_findings(
+    agent_name: Option<&str>,
+    sessions_sampled: usize,
+) -> Vec<Finding> {
     let Some(name) = agent_name else {
         return Vec::new();
     };

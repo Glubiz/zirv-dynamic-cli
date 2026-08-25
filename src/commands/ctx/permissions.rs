@@ -32,8 +32,8 @@ use serde_json::Value;
 
 use super::CtxResult;
 use super::safety::{
-    collapse_whitespace, pipeline_stages, sql_program_name, strip_program_dir,
-    unwrap_env_prefix, unwrap_shell_wrapper,
+    collapse_whitespace, pipeline_stages, sql_program_name, strip_program_dir, unwrap_env_prefix,
+    unwrap_shell_wrapper,
 };
 
 /// Which agent's transcripts to audit.
@@ -213,7 +213,10 @@ pub(crate) fn is_reusable(raw: &str) -> bool {
     {
         let collapsed = collapse_whitespace(&strip_program_dir(last));
         let first = collapsed.split(' ').next().unwrap_or("");
-        if matches!(sql_program_name(first).as_str(), "jq" | "grep" | "awk" | "sed") {
+        if matches!(
+            sql_program_name(first).as_str(),
+            "jq" | "grep" | "awk" | "sed"
+        ) {
             return false;
         }
     }
@@ -393,8 +396,7 @@ pub fn extract_claude_requests(text: &str, session: &str) -> Vec<PermissionReque
                     if !text_val.contains("Permission to use") {
                         continue;
                     }
-                    let Some(tool_use_id) = entry.get("tool_use_id").and_then(Value::as_str)
-                    else {
+                    let Some(tool_use_id) = entry.get("tool_use_id").and_then(Value::as_str) else {
                         continue;
                     };
                     let Some(used) = uses.get(tool_use_id) else {
@@ -413,7 +415,8 @@ pub fn extract_claude_requests(text: &str, session: &str) -> Vec<PermissionReque
                         family,
                         cause: "permission-mode dontAsk denial".to_string(),
                         result: "denied".to_string(),
-                        reusable: !is_bash || is_reusable(&used.command.clone().unwrap_or_default()),
+                        reusable: !is_bash
+                            || is_reusable(&used.command.clone().unwrap_or_default()),
                     });
                 }
                 _ => {}
@@ -597,15 +600,15 @@ mod tests {
     #[test]
     fn family_of_collapses_wrappers_to_the_underlying_command() {
         assert_eq!(family_of("gh issue create --title x"), "gh issue");
-        assert_eq!(
-            family_of("/bin/zsh -lc 'gh issue view 42'"),
-            "gh issue"
-        );
+        assert_eq!(family_of("/bin/zsh -lc 'gh issue view 42'"), "gh issue");
         assert_eq!(
             family_of("env -u FOO zirv setup profile --repo ."),
             "zirv setup profile"
         );
-        assert_eq!(family_of("cargo nextest run --no-fail-fast"), "cargo nextest");
+        assert_eq!(
+            family_of("cargo nextest run --no-fail-fast"),
+            "cargo nextest"
+        );
         assert_eq!(family_of("git fetch origin"), "git fetch");
         assert_eq!(family_of("curl https://example.com/health"), "curl");
     }
@@ -773,7 +776,8 @@ mod tests {
         }).to_string();
         let ok_result = serde_json::json!({
             "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "hi"}]}
-        }).to_string();
+        })
+        .to_string();
         let text = format!("{use_line}\n{ok_result}");
         assert!(extract_claude_requests(&text, "s").is_empty());
     }
@@ -906,7 +910,11 @@ mod tests {
             groups.iter().map(|g| (g.family.as_str(), g)).collect();
 
         // Routine, operator-approvable families: reusable.
-        assert!(by_family["zirv setup apply"].reusable, "{:?}", by_family["zirv setup apply"]);
+        assert!(
+            by_family["zirv setup apply"].reusable,
+            "{:?}",
+            by_family["zirv setup apply"]
+        );
         assert!(by_family["git fetch"].reusable);
         assert!(by_family["zirv commit"].reusable);
         // The bare invocation (ctc_4) and its `env -u ...`-wrapped twin
@@ -922,7 +930,11 @@ mod tests {
         // one family, mixed reusability, so the group as a whole must not
         // be reported reusable.
         assert_eq!(by_family["gh issue"].count, 4);
-        assert!(!by_family["gh issue"].reusable, "{:?}", by_family["gh issue"]);
+        assert!(
+            !by_family["gh issue"].reusable,
+            "{:?}",
+            by_family["gh issue"]
+        );
     }
 
     #[test]

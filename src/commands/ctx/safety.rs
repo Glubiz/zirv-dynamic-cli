@@ -1306,7 +1306,10 @@ pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     }
 
     let mut i = 0usize;
-    while tokens.get(i).is_some_and(|t| is_shell_identifier_assignment(t)) {
+    while tokens
+        .get(i)
+        .is_some_and(|t| is_shell_identifier_assignment(t))
+    {
         i += 1;
     }
     if i == 0 || i >= tokens.len() {
