@@ -2205,11 +2205,60 @@ fn sql_invocation(command: &str) -> Option<SqlInvocation> {
     }
 }
 
+/// Recognizes a PostgreSQL dollar-quote OPENING delimiter (`$$`, or `$tag$`
+/// with `tag` limited to ASCII alphanumerics/underscore) starting exactly at
+/// `chars[i]`. Returns the tag text (empty for the untagged `$$` form) and
+/// the index just past the delimiter's closing `$`. `None` when `chars[i]`
+/// is not `$`, or the run of tag characters after it is never closed by a
+/// second `$` (so `$1` inside an arithmetic-looking expression, or a bare
+/// `$` used some other way, is never mistaken for an opener).
+fn dollar_quote_open(chars: &[char], i: usize) -> Option<(String, usize)> {
+    if chars.get(i) != Some(&'$') {
+        return None;
+    }
+    let mut j = i + 1;
+    let mut tag = String::new();
+    while let Some(&c) = chars.get(j) {
+        if c == '$' {
+            return Some((tag, j + 1));
+        }
+        if c.is_ascii_alphanumeric() || c == '_' {
+            tag.push(c);
+            j += 1;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
 /// Removes `--` line comments and `/* ... */` block comments so a comment
 /// cannot hide a write keyword from [`statement_is_read_only`]. `None` when a
-/// block comment is never closed -- unparseable, so the caller falls back to
-/// `Ask`. Each removed comment leaves one space behind, so two tokens it sat
-/// between cannot fuse into one word.
+/// block comment is never closed, a quoted string is never closed, a
+/// dollar-quoted string (PostgreSQL's `$$...$$`/`$tag$...$tag$`) is never
+/// closed, or a trailing backslash escapes past the end of the statement --
+/// every one of those is "cannot see the real statement", so the caller
+/// falls back to `Ask` rather than guess. Each removed comment leaves one
+/// space behind, so two tokens it sat between cannot fuse into one word.
+///
+/// Two escaping conventions are modeled so a comment marker or write keyword
+/// hidden behind them cannot be swallowed as part of an ordinary string that
+/// closed EARLIER than it actually does:
+/// - A backslash inside a `'`/`"`-quoted string always escapes the next
+///   character (MySQL's default `NO_BACKSLASH_ESCAPES`-off behavior) and
+///   never itself closes the string. This is a deliberate superset even for
+///   clients where a bare `''` string does not honor backslash escaping
+///   (e.g. PostgreSQL without an `E'...'` prefix): treating the escape as
+///   real only ever makes the scanner consider MORE of the input to still be
+///   inside the string, which cannot hide a write -- it can only turn a
+///   would-be comment marker into ordinary (still-visible) string content or
+///   leave the string unterminated, both `Ask`, never a wrongly-erased
+///   comment.
+/// - A dollar-quoted string (`$$...$$`/`$tag$...$tag$`) is copied through
+///   verbatim as one opaque region, exactly like a `'`/`"` string, so a `/*`
+///   or `--` INSIDE it is never mistaken for a real comment start and a `;`
+///   or write keyword AFTER its close is never mistaken for still being
+///   inside it.
 fn strip_sql_comments(statement: &str) -> Option<String> {
     let chars: Vec<char> = statement.chars().collect();
     let mut out = String::new();
@@ -2217,6 +2266,24 @@ fn strip_sql_comments(statement: &str) -> Option<String> {
     let mut quote: Option<char> = None;
     while i < chars.len() {
         if let Some(active) = quote {
+            if chars[i] == '\\' {
+                // An escaped character never closes the string, whatever it
+                // is -- see this function's doc comment for why treating
+                // this as real even where it might not be is still the
+                // fail-safe direction.
+                out.push(chars[i]);
+                match chars.get(i + 1) {
+                    Some(&next) => {
+                        out.push(next);
+                        i += 2;
+                    }
+                    // A trailing backslash with nothing after it: the string
+                    // never closes, caught by the `quote.is_some()` check
+                    // below.
+                    None => i += 1,
+                }
+                continue;
+            }
             out.push(chars[i]);
             if chars[i] == active {
                 // A doubled quote (`''`/`""`) is SQL's own escaped-quote
@@ -2237,6 +2304,30 @@ fn strip_sql_comments(statement: &str) -> Option<String> {
             out.push(chars[i]);
             i += 1;
             continue;
+        }
+        if let Some((tag, body_start)) = dollar_quote_open(&chars, i) {
+            let closing: Vec<char> = format!("${tag}$").chars().collect();
+            let mut j = body_start;
+            let mut end = None;
+            while j + closing.len() <= chars.len() {
+                if chars[j..j + closing.len()] == closing[..] {
+                    end = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            match end {
+                Some(end) => {
+                    for c in &chars[i..end + closing.len()] {
+                        out.push(*c);
+                    }
+                    i = end + closing.len();
+                    continue;
+                }
+                // An unterminated dollar-quote: cannot see where it ends, so
+                // cannot see the real statement either.
+                None => return None,
+            }
         }
         if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
             while i < chars.len() && chars[i] != '\n' {
