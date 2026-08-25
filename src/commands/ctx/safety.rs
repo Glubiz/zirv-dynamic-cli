@@ -760,14 +760,27 @@ fn apply_pipe_to_shell_outcome(command: &str, base: Outcome) -> Outcome {
 /// `find -exec`/`-ok` actions this classifier already knows are read-only
 /// (or close enough that raising them to `Ask` would just be everyday-work
 /// noise): the shipped `adapters::SHIPPED_POSTURE_ASK` comment names
-/// `-exec grep`/`-exec sed -n` as the motivating examples for not blanket-
-/// asking on every `-exec`.
+/// `-exec grep` as the motivating example for not blanket-asking on every
+/// `-exec`.
+///
+/// ADMISSION RULE (a security decision, not a style choice): a program
+/// belongs on this list ONLY if it cannot execute another program and
+/// cannot write outside the arguments explicitly handed to it on this
+/// command line -- no shell-escape, no `eval`/`system()`-style primitive, no
+/// `-exec`-like flag of its own, and no write/in-place mode (`-i`, a
+/// redirection built into the tool itself, ...). `awk` (`system()`, and
+/// piping to a command via `"cmd" | getline`/`print | "cmd"`) and GNU `sed`
+/// (the `e` command runs its argument as a shell command; `w`/`-i` write
+/// files) were REMOVED from this list on 2026-08-24 because both are
+/// documented GTFOBins command-execution primitives -- `find . -exec awk
+/// 'BEGIN{system("id")}' {} \;` and `find . -exec sed '1e id' {} \;` were
+/// classifying `Allow`, a complete escape from this module's ask-unless-
+/// proven-safe design. Any future addition needs the same audit spelled out
+/// here, not just "it looks like a reader".
 const FIND_EXEC_SAFE_PROGRAMS: &[&str] = &[
     "grep",
     "egrep",
     "fgrep",
-    "sed",
-    "awk",
     "cat",
     "ls",
     "wc",
