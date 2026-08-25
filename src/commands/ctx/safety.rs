@@ -269,6 +269,33 @@ fn attestation_failure(mode: super::adapters::LaunchMode) -> Outcome {
     }
 }
 
+/// Issue #139: whether the launch-time policy snapshot's verdict for one
+/// command diverges from the currently-resolved policy's own verdict for
+/// the SAME command, and in which direction. `evaluate_with_attestation_
+/// evidence` always keeps the stricter of the two answers -- a repo may
+/// narrow a running session immediately, while an operator widening the
+/// policy takes effect only on the next launch -- but that fold used to be
+/// invisible: the hook's own explanation named the interactive/headless
+/// DEFAULT as if it were the configured posture, while `zirv ctx safety
+/// explain` for the identical command (bypassing attestation entirely)
+/// reported the current, wider policy. This enum is what lets both
+/// surfaces agree and say WHY, instead of silently disagreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDivergence {
+    /// The launch snapshot and the current policy agree for this command --
+    /// the common case: no snapshot at all, an invalid/corrupt one (both
+    /// already explained by `AttestedEvaluation::status`), or one whose
+    /// verdict for this command happens to match today's policy.
+    Unchanged,
+    /// The pinned launch snapshot's verdict is STRICTER than the current
+    /// policy's own verdict for this command would be: an operator widened
+    /// the policy after this session launched, and the widening has not
+    /// taken effect yet (by design -- see this enum's own doc comment).
+    /// Carries the current policy's own verdict so an explanation can name
+    /// what it would have been.
+    SnapshotStricter { current_verdict: Verdict },
+}
+
 /// Evaluates against both the immutable launch snapshot and the policy as it
 /// resolves now, then keeps the stricter answer. A repo may therefore narrow
 /// a running session immediately, while an operator widening their policy
@@ -276,11 +303,13 @@ fn attestation_failure(mode: super::adapters::LaunchMode) -> Outcome {
 /// this is a deliberately persistent/outside-Zirv hook and preserve its
 /// current-policy behavior; a partial, corrupt, or hash-mismatched
 /// attestation fails closed.
+#[derive(Debug)]
 struct AttestedEvaluation {
     outcome: Outcome,
     current_fingerprint: String,
     launch_fingerprint: Option<String>,
     status: &'static str,
+    divergence: SnapshotDivergence,
 }
 
 fn evaluate_with_attestation_evidence(
@@ -299,6 +328,7 @@ fn evaluate_with_attestation_evidence(
                     current_fingerprint,
                     launch_fingerprint: None,
                     status: "not-present",
+                    divergence: SnapshotDivergence::Unchanged,
                 };
             }
             (Some(fingerprint), Some(path)) => (fingerprint, path),
@@ -308,6 +338,7 @@ fn evaluate_with_attestation_evidence(
                     current_fingerprint,
                     launch_fingerprint: fingerprint,
                     status: "invalid",
+                    divergence: SnapshotDivergence::Unchanged,
                 };
             }
         };
@@ -321,6 +352,7 @@ fn evaluate_with_attestation_evidence(
             current_fingerprint,
             launch_fingerprint: Some(expected_fingerprint),
             status: "invalid",
+            divergence: SnapshotDivergence::Unchanged,
         };
     };
     if policy_fingerprint(&launch).ok().as_deref() != Some(expected_fingerprint.as_str()) {
@@ -329,11 +361,20 @@ fn evaluate_with_attestation_evidence(
             current_fingerprint,
             launch_fingerprint: Some(expected_fingerprint),
             status: "invalid",
+            divergence: SnapshotDivergence::Unchanged,
         };
     }
 
     let current_outcome = evaluate(current, command, mode);
     let launch_outcome = evaluate(&launch, command, mode);
+    let divergence = if verdict_rank(launch_outcome.verdict) > verdict_rank(current_outcome.verdict)
+    {
+        SnapshotDivergence::SnapshotStricter {
+            current_verdict: current_outcome.verdict,
+        }
+    } else {
+        SnapshotDivergence::Unchanged
+    };
     let outcome = if verdict_rank(current_outcome.verdict) >= verdict_rank(launch_outcome.verdict) {
         current_outcome
     } else {
@@ -344,6 +385,7 @@ fn evaluate_with_attestation_evidence(
         current_fingerprint,
         launch_fingerprint: Some(expected_fingerprint),
         status: "valid",
+        divergence,
     }
 }
 
@@ -3341,7 +3383,18 @@ fn mode_consequence(verdict: Verdict, mode: super::adapters::LaunchMode) -> &'st
     }
 }
 
-fn explain_text(command: &str, outcome: &Outcome, mode: super::adapters::LaunchMode) -> String {
+/// Issue #139: `divergence` names, in words, when `outcome` is stricter than
+/// what the current policy would produce for the same command -- see
+/// [`SnapshotDivergence`]'s own doc comment for why this exists. `Unchanged`
+/// (every pre-existing caller, and any attested one whose snapshot agrees
+/// with today's policy) leaves this function's output byte-for-byte what it
+/// was before this parameter existed.
+fn explain_text(
+    command: &str,
+    outcome: &Outcome,
+    mode: super::adapters::LaunchMode,
+    divergence: SnapshotDivergence,
+) -> String {
     let head = match &outcome.matched {
         Some(rule) => format!(
             "`{command}` is {} because it matched the {} rule `{}` from {}.",
@@ -3358,7 +3411,16 @@ fn explain_text(command: &str, outcome: &Outcome, mode: super::adapters::LaunchM
             outcome.verdict.label()
         ),
     };
-    format!("{head} {}", mode_consequence(outcome.verdict, mode))
+    let mut text = format!("{head} {}", mode_consequence(outcome.verdict, mode));
+    if let SnapshotDivergence::SnapshotStricter { current_verdict } = divergence {
+        text.push_str(&format!(
+            " Note: the launch snapshot (pinned at session start) is stricter than your current \
+             policy, which would {}; restart the session (zirv chat) to adopt the widened \
+             policy.",
+            current_verdict.label()
+        ));
+    }
+    text
 }
 
 /// The documented PreToolUse decision envelope -- the identical shape
@@ -3395,7 +3457,12 @@ fn explain_text(command: &str, outcome: &Outcome, mode: super::adapters::LaunchM
 /// pinned `dontAsk` themselves -- `adapters::flags_pin_policy` already makes
 /// zirv stand down entirely for the latter. Pinned end to end by
 /// `the_dont_ask_suppression_is_reachable_only_from_the_headless_posture`.
-fn hook_output(command: &str, outcome: &Outcome, permission_mode: &str) -> Option<String> {
+fn hook_output(
+    command: &str,
+    outcome: &Outcome,
+    permission_mode: &str,
+    divergence: SnapshotDivergence,
+) -> Option<String> {
     let dont_ask = permission_mode == "dontAsk";
     let decision = match outcome.verdict {
         Verdict::Deny => "deny",
@@ -3430,6 +3497,7 @@ fn hook_output(command: &str, outcome: &Outcome, permission_mode: &str) -> Optio
                     } else {
                         super::adapters::LaunchMode::Interactive
                     },
+                    divergence,
                 ),
             }
         })
@@ -3532,7 +3600,12 @@ fn run_check_hook_mode_with_env<W: Write>(
             }
         };
     }
-    if let Some(output) = hook_output(command, &outcome, &payload.permission_mode) {
+    if let Some(output) = hook_output(
+        command,
+        &outcome,
+        &payload.permission_mode,
+        evidence.divergence,
+    ) {
         writeln!(w, "{output}")?;
     }
     audit_hook_decision(&payload, command, mode, &outcome, &evidence, env);
@@ -3603,12 +3676,31 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W, env: EnvLookup<'_>) -> Ctx
     Ok(0)
 }
 
+/// Issue #139: previously bypassed attestation entirely, evaluating only the
+/// currently-resolved policy -- which is exactly why this command and the
+/// hook (`run_check_hook_mode_with_env`, which always goes through
+/// `evaluate_with_attestation_evidence`) could disagree about the identical
+/// command: the hook would report the pinned launch snapshot's stricter
+/// verdict while this reported today's wider one, with no way for the
+/// operator to see why.
+///
+/// Now routed through the SAME evidence function the hook uses, always --
+/// not merely when the attestation env vars happen to be set, since
+/// `evaluate_with_attestation_evidence` itself already degrades correctly
+/// when they are absent (`status: "not-present"`, `divergence: Unchanged`,
+/// `outcome` a plain `evaluate` call): the two ARE the "without the env vars"
+/// case, so this command's behavior is byte-for-byte unchanged when they are
+/// not set, and now agrees with the hook when they are.
 pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let cfg = CtxConfig::load(&args.repo, env)?;
     let command = args.command.join(" ");
-    let outcome = evaluate(&cfg.safety, &command, args.mode);
-    writeln!(w, "{}", explain_text(&command, &outcome, args.mode))?;
-    Ok(outcome.verdict.exit_code())
+    let evidence = evaluate_with_attestation_evidence(&cfg.safety, &command, args.mode, env);
+    writeln!(
+        w,
+        "{}",
+        explain_text(&command, &evidence.outcome, args.mode, evidence.divergence)
+    )?;
+    Ok(evidence.outcome.verdict.exit_code())
 }
 
 pub fn run<W: Write>(args: &SafetyArgs, w: &mut W) -> CtxResult<i32> {
@@ -3714,6 +3806,157 @@ mod tests {
                 Some("<attestation: invalid launch policy snapshot>")
             );
         }
+    }
+
+    /// Issue #139: the divergence direction itself, computed straight from
+    /// `evaluate_with_attestation_evidence` -- not merely the outcome
+    /// (already covered by `an_attested_launch_keeps_the_stricter_policy_
+    /// and_fails_closed_on_tampering` above), but the field an explanation
+    /// surface reads to decide whether to say anything at all.
+    #[test]
+    fn evaluate_with_attestation_evidence_reports_snapshot_stricter_when_the_current_policy_widened()
+     {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = tmp.path().join("policy.json");
+        let current = SafetyPolicy::default();
+
+        // The operator widened the interactive default AFTER this session's
+        // own launch pinned `ask` -- the shipped default is already `allow`,
+        // so the LAUNCH snapshot is the one narrowed here, compared against
+        // the still-default (wider) current policy.
+        let mut stricter_launch = current.clone();
+        stricter_launch.interactive_default = Verdict::Ask;
+        std::fs::write(
+            &snapshot,
+            serde_json::to_string(&stricter_launch).expect("serializes"),
+        )
+        .expect("writes");
+        let strict_fingerprint = policy_fingerprint(&stricter_launch).expect("fingerprints");
+        let env = env_from(&[
+            (POLICY_FINGERPRINT_ENV, &strict_fingerprint),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+
+        let evidence = evaluate_with_attestation_evidence(
+            &current,
+            "some-tool-zirv-has-never-heard-of",
+            LaunchMode::Interactive,
+            &|key| env.get(key).cloned(),
+        );
+        assert_eq!(evidence.outcome.verdict, Verdict::Ask, "{evidence:?}");
+        assert_eq!(
+            evidence.divergence,
+            SnapshotDivergence::SnapshotStricter {
+                current_verdict: Verdict::Allow
+            },
+            "the snapshot is stricter than today's policy for this unmatched command"
+        );
+    }
+
+    /// The `Unchanged` half: an attested launch whose snapshot agrees with
+    /// the current policy for a given command must not report a divergence,
+    /// even though attestation is active.
+    #[test]
+    fn evaluate_with_attestation_evidence_reports_unchanged_when_the_snapshot_agrees() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = tmp.path().join("policy.json");
+        let launch = SafetyPolicy::default();
+        std::fs::write(
+            &snapshot,
+            serde_json::to_string(&launch).expect("serializes"),
+        )
+        .expect("writes");
+        let fingerprint = policy_fingerprint(&launch).expect("fingerprints");
+        let env = env_from(&[
+            (POLICY_FINGERPRINT_ENV, &fingerprint),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+
+        let evidence = evaluate_with_attestation_evidence(
+            &launch,
+            "cargo build",
+            LaunchMode::Interactive,
+            &|key| env.get(key).cloned(),
+        );
+        assert_eq!(evidence.divergence, SnapshotDivergence::Unchanged);
+    }
+
+    /// Issue #139's own root cause, end to end: `zirv ctx safety explain`
+    /// used to bypass attestation entirely, so it disagreed with the hook
+    /// for the identical command whenever a session's launch snapshot was
+    /// stricter than the current policy. Now routed through the same
+    /// evidence function, the two surfaces agree, and `explain`'s own text
+    /// names the divergence explicitly.
+    #[test]
+    fn run_explain_agrees_with_the_hook_when_the_launch_snapshot_is_stricter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let snapshot = tmp.path().join("policy.json");
+        let stricter_launch = SafetyPolicy {
+            interactive_default: Verdict::Ask,
+            ..SafetyPolicy::default()
+        };
+        std::fs::write(
+            &snapshot,
+            serde_json::to_string(&stricter_launch).expect("serializes"),
+        )
+        .expect("writes");
+        let fingerprint = policy_fingerprint(&stricter_launch).expect("fingerprints");
+        let env = env_from(&[
+            (POLICY_FINGERPRINT_ENV, &fingerprint),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+
+        let args = ExplainArgs {
+            repo: repo.clone(),
+            mode: LaunchMode::Interactive,
+            command: vec!["some-tool-zirv-has-never-heard-of".to_string()],
+        };
+        let mut out = Vec::new();
+        let code = run_explain(&args, &mut out, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, Verdict::Ask.exit_code());
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("launch snapshot"),
+            "explain must name the divergence, agreeing with what the hook would say: {text}"
+        );
+        assert!(
+            text.contains("allow"),
+            "must name the current policy's own verdict: {text}"
+        );
+    }
+
+    /// Without the attestation env vars, `run_explain`'s behavior is
+    /// byte-for-byte what it was before this fix: no snapshot, no
+    /// divergence note, plain current-policy evaluation.
+    #[test]
+    fn run_explain_stays_unattested_without_the_env_vars() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let empty: HashMap<String, String> = HashMap::new();
+
+        let args = ExplainArgs {
+            repo,
+            mode: LaunchMode::Interactive,
+            command: vec!["some-tool-zirv-has-never-heard-of".to_string()],
+        };
+        let mut out = Vec::new();
+        let code = run_explain(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
+        assert_eq!(code, Verdict::Allow.exit_code());
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("launch snapshot"),
+            "no attestation in play, so no divergence note: {text}"
+        );
     }
 
     // -- glob_match --------------------------------------------------
@@ -5138,8 +5381,13 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        let output = hook_output("npm install", &allow, "default")
-            .expect("an allow must be stated, not implied by silence");
+        let output = hook_output(
+            "npm install",
+            &allow,
+            "default",
+            SnapshotDivergence::Unchanged,
+        )
+        .expect("an allow must be stated, not implied by silence");
         assert!(
             output.contains("\"permissionDecision\":\"allow\""),
             "got {output}"
@@ -5157,7 +5405,15 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        assert!(hook_output("npm install", &allow, "dontAsk").is_none());
+        assert!(
+            hook_output(
+                "npm install",
+                &allow,
+                "dontAsk",
+                SnapshotDivergence::Unchanged
+            )
+            .is_none()
+        );
     }
 
     /// The operator's override still works in both directions, and is
@@ -5540,7 +5796,7 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        assert!(hook_output("ls", &allow, "dontAsk").is_none());
+        assert!(hook_output("ls", &allow, "dontAsk", SnapshotDivergence::Unchanged).is_none());
 
         let deny = Outcome {
             verdict: Verdict::Deny,
@@ -5549,7 +5805,8 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("rm -rf /", &deny, "default").expect("deny produces output");
+        let output = hook_output("rm -rf /", &deny, "default", SnapshotDivergence::Unchanged)
+            .expect("deny produces output");
         assert!(output.contains("\"permissionDecision\":\"deny\""));
         assert!(output.contains("\"hookEventName\":\"PreToolUse\""));
 
@@ -5560,7 +5817,8 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("git push", &ask, "default").expect("ask produces output");
+        let output = hook_output("git push", &ask, "default", SnapshotDivergence::Unchanged)
+            .expect("ask produces output");
         assert!(output.contains("\"permissionDecision\":\"ask\""));
     }
 
@@ -5581,7 +5839,7 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        assert!(hook_output("git push", &ask, "dontAsk").is_none());
+        assert!(hook_output("git push", &ask, "dontAsk", SnapshotDivergence::Unchanged).is_none());
     }
 
     #[test]
@@ -5593,7 +5851,8 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("rm -rf /", &deny, "dontAsk").expect("deny still denies");
+        let output = hook_output("rm -rf /", &deny, "dontAsk", SnapshotDivergence::Unchanged)
+            .expect("deny still denies");
         assert!(output.contains("\"permissionDecision\":\"deny\""));
     }
 
@@ -5609,7 +5868,8 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("git push", &ask, "").expect("ask still asks");
+        let output = hook_output("git push", &ask, "", SnapshotDivergence::Unchanged)
+            .expect("ask still asks");
         assert!(output.contains("\"permissionDecision\":\"ask\""));
     }
 
@@ -6112,15 +6372,83 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let interactive = explain_text("git push --force x", &ask, LaunchMode::Interactive);
+        let interactive = explain_text(
+            "git push --force x",
+            &ask,
+            LaunchMode::Interactive,
+            SnapshotDivergence::Unchanged,
+        );
         assert!(interactive.contains("built-in"), "got {interactive}");
         assert!(interactive.contains("prompts"), "got {interactive}");
 
-        let headless = explain_text("git push --force x", &ask, LaunchMode::Headless);
+        let headless = explain_text(
+            "git push --force x",
+            &ask,
+            LaunchMode::Headless,
+            SnapshotDivergence::Unchanged,
+        );
         assert!(headless.contains("fails closed"), "got {headless}");
         assert!(
             headless.contains("dontAsk"),
             "the headless consequence must name the mode that produces it: {headless}"
+        );
+    }
+
+    /// Issue #139: when the launch snapshot is stricter than the current
+    /// policy for this command, the explanation must say so explicitly --
+    /// not silently describe the stricter verdict as if it were the
+    /// configured posture.
+    #[test]
+    fn explain_names_the_snapshot_divergence_when_the_launch_snapshot_is_stricter() {
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: None,
+        };
+        let text = explain_text(
+            "some-tool-zirv-has-never-heard-of",
+            &ask,
+            LaunchMode::Interactive,
+            SnapshotDivergence::SnapshotStricter {
+                current_verdict: Verdict::Allow,
+            },
+        );
+        assert!(
+            text.contains("launch snapshot"),
+            "must name the snapshot as the source of the divergence: {text}"
+        );
+        assert!(
+            text.contains("stricter"),
+            "must say the snapshot is stricter, not just different: {text}"
+        );
+        assert!(
+            text.contains("allow"),
+            "must name what the current policy would actually do: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("restart"),
+            "must name the remedy (restart the session): {text}"
+        );
+    }
+
+    /// The `Unchanged` case (the overwhelming majority: no attestation, or
+    /// one whose snapshot agrees with today's policy) must never mention the
+    /// snapshot at all -- the divergence note is additive, not a permanent
+    /// fixture of every explanation.
+    #[test]
+    fn explain_says_nothing_about_the_snapshot_when_unchanged() {
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: None,
+        };
+        let text = explain_text(
+            "some-tool-zirv-has-never-heard-of",
+            &ask,
+            LaunchMode::Interactive,
+            SnapshotDivergence::Unchanged,
+        );
+        assert!(
+            !text.contains("launch snapshot"),
+            "must not mention a snapshot that never diverged: {text}"
         );
     }
 
@@ -6214,6 +6542,7 @@ mod tests {
             "git push --force x",
             &ask,
             &mode_of(LaunchMode::Interactive),
+            SnapshotDivergence::Unchanged,
         )
         .expect("an interactive launch must genuinely prompt");
         assert!(
@@ -6222,13 +6551,27 @@ mod tests {
         );
 
         assert!(
-            hook_output("git push --force x", &ask, &mode_of(LaunchMode::Headless)).is_none(),
+            hook_output(
+                "git push --force x",
+                &ask,
+                &mode_of(LaunchMode::Headless),
+                SnapshotDivergence::Unchanged,
+            )
+            .is_none(),
             "a headless launch has nobody to prompt: the hook must fall through"
         );
 
         // The operator's own pin, unchanged: zirv never overrides an explicit
         // operator choice, so the suppression still applies there.
-        assert!(hook_output("git push --force x", &ask, "dontAsk").is_none());
+        assert!(
+            hook_output(
+                "git push --force x",
+                &ask,
+                "dontAsk",
+                SnapshotDivergence::Unchanged
+            )
+            .is_none()
+        );
     }
 
     /// Deny is unaffected by mode, in every posture.
@@ -6242,7 +6585,8 @@ mod tests {
             }),
         };
         for mode in ["dontAsk", "default", ""] {
-            let output = hook_output("sudo rm -rf /", &deny, mode).expect("deny still denies");
+            let output = hook_output("sudo rm -rf /", &deny, mode, SnapshotDivergence::Unchanged)
+                .expect("deny still denies");
             assert!(
                 output.contains("\"permissionDecision\":\"deny\""),
                 "mode {mode}: got {output}"

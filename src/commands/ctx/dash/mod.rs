@@ -7017,6 +7017,7 @@ mod tests {
             started_at: 0,
             reachable: true,
             owner_pid,
+            safety_policy_sha256: None,
         }
     }
 

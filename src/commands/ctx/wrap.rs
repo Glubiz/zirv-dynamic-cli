@@ -1760,7 +1760,17 @@ pub fn run_with(
     // Best-effort, released right after `pump` returns below -- `wrap`'s own
     // control flow always funnels through that one point, unlike `exec`'s
     // scattered early returns, so a single release suffices here.
-    let record = super::sessions::Record::new(session.as_str(), adapter.name(), repo, verb);
+    // Issue #139: recorded so `zirv ctx status` can compare this launch's
+    // pinned policy against whatever the repo/operator layers resolve to
+    // right now and surface a "policy snapshot stale" line when they
+    // diverge -- see `sessions::Record::safety_policy_sha256`'s own doc
+    // comment. `policy_fingerprint` is pure and deterministic, so this is
+    // guaranteed to match whatever fingerprint `ClaudeAdapter::launch_
+    // settings_path` embedded in this same launch's own settings file,
+    // since both are computed from the identical `cfg.safety` value.
+    let safety_policy_sha256 = super::safety::policy_fingerprint(&cfg.safety).ok();
+    let record = super::sessions::Record::new(session.as_str(), adapter.name(), repo, verb)
+        .with_safety_policy_sha256(safety_policy_sha256);
     let record = if server.is_some() {
         record
     } else {
