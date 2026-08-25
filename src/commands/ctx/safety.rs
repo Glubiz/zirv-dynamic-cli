@@ -1121,6 +1121,295 @@ fn command_substitutions(command: &str) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------
+// Opaque-literal carve-out (issue #136): quoted commit-message arguments
+// and single-quoted heredoc bodies are DATA, never executable structure,
+// and must not be fed through the deny/ask matcher as if they were code.
+// ---------------------------------------------------------------------
+
+/// Stable placeholder [`redact_opaque_message`] substitutes for a commit-
+/// message argument's value. Deliberately not empty (an empty candidate
+/// string would just vanish from matching, which is a different, weaker
+/// guarantee than "this text is opaque data") and deliberately contains no
+/// parentheses, quotes, or shell metacharacters of its own, so it can never
+/// be mistaken for new executable structure by anything downstream that
+/// re-scans a candidate this module has already produced.
+const OPAQUE_MESSAGE_PLACEHOLDER: &str = "<opaque:message>";
+
+/// Stable placeholder [`redact_single_quoted_heredocs`] substitutes for a
+/// heredoc body's lines. See [`OPAQUE_MESSAGE_PLACEHOLDER`]'s own doc
+/// comment for why this is non-empty and metacharacter-free.
+const OPAQUE_HEREDOC_BODY_PLACEHOLDER: &str = "<opaque:heredoc-body>";
+
+/// One whitespace-delimited, quote-aware token found while scanning a
+/// command/segment string, plus its exact `[start, end)` CHAR range (not
+/// byte range -- this module works in `Vec<char>` throughout, matching
+/// [`command_substitution_end`]/[`split_segments`]) in the source text, so a
+/// caller can splice a replacement into that exact span without disturbing
+/// anything else. Quote characters are kept as part of `text`/the span
+/// (never stripped here) so a caller can tell whether the value was quoted
+/// at all.
+struct QuotedToken {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+/// Splits `chars` into whitespace-separated tokens, treating a `'`/`"`-
+/// quoted run (backslash-escaped characters skipped, matching every other
+/// quote tracker in this module) as part of the SAME token even when it
+/// contains embedded whitespace -- so a huge, multi-line quoted commit
+/// message is one token, exactly as a real shell would see it, not many.
+fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = i;
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if c == '\\' && quote != Some('\'') {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if let Some(active) = quote {
+                if c == active {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            if matches!(c, '\'' | '"') {
+                quote = Some(c);
+                i += 1;
+                continue;
+            }
+            if c.is_whitespace() {
+                break;
+            }
+            i += 1;
+        }
+        tokens.push(QuotedToken {
+            text: chars[start..i].iter().collect(),
+            start,
+            end: i,
+        });
+    }
+    tokens
+}
+
+/// Whether `tokens`' leading two tokens name one of the commit-message-
+/// bearing invocations issue #136 scopes this carve-out to: `git commit`,
+/// `git tag`, `git notes`, or `hg commit`. Case-insensitive on the program/
+/// subcommand names only (a real shell resolves `Git`/`GIT` identically on
+/// case-insensitive filesystems); nothing else about the segment is
+/// normalized here.
+fn is_message_bearing_invocation(tokens: &[QuotedToken]) -> bool {
+    let Some(program) = tokens.first() else {
+        return false;
+    };
+    let Some(subcommand) = tokens.get(1) else {
+        return false;
+    };
+    match program.text.to_ascii_lowercase().as_str() {
+        "git" => matches!(
+            subcommand.text.to_ascii_lowercase().as_str(),
+            "commit" | "tag" | "notes"
+        ),
+        "hg" => subcommand.text.eq_ignore_ascii_case("commit"),
+        _ => false,
+    }
+}
+
+/// Narrows `[start, end)` to the INTERIOR of a matching pair of leading/
+/// trailing `'`/`"` quotes, if the span is quoted -- so a redaction keeps the
+/// quote characters themselves (the result still reads as `-m "..."`, not
+/// `-m ...`) and only blanks what was actually inside them. Returns the span
+/// unchanged when it is not quoted (an attached `-mvalue` short form, for
+/// instance, blanks the whole value since there is no quote pair to keep).
+fn value_interior_span(chars: &[char], start: usize, end: usize) -> (usize, usize) {
+    if end.saturating_sub(start) >= 2 {
+        let first = chars[start];
+        let last = chars[end - 1];
+        if (first == '\'' || first == '"') && first == last {
+            return (start + 1, end - 1);
+        }
+    }
+    (start, end)
+}
+
+/// Issue #136: when `text`'s leading two tokens name a commit-message-
+/// bearing invocation ([`is_message_bearing_invocation`]) and it carries a
+/// `-m`/`--message` argument -- the separated form (`-m "..."`), the
+/// attached short form (`-m...`), or the joined long form (`--message=...`)
+/// -- returns a copy of `text` with every such argument's VALUE replaced by
+/// [`OPAQUE_MESSAGE_PLACEHOLDER`]. Returns `None` when `text` does not name
+/// one of these invocations, or names one with no message argument at all
+/// (nothing to redact, so the original text is preserved byte-for-byte by
+/// every caller).
+///
+/// Deliberately blunt: a message argument's value is replaced WHOLESALE,
+/// including any `$(...)`/backtick command substitution it happens to
+/// contain, rather than trying to preserve a live substitution span inside
+/// it. This is safe, not a regression against "a `$(...)` inside a
+/// DOUBLE-quoted message must still be classified" (issue #136's own
+/// constraint): this function is only ever applied to the text a caller is
+/// about to push as a DIRECT match candidate ([`visit_executable_nodes`]'s
+/// two `push_candidate` call sites) -- [`command_substitutions`]'s own
+/// extraction always runs against the UNREDACTED original segment text
+/// first, independently of this function, so a live substitution is still
+/// found and recursively classified as its own candidate at `depth + 1`
+/// regardless of what this function does to the surrounding prose.
+fn redact_opaque_message(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let tokens = tokenize_quoted(&chars);
+    if !is_message_bearing_invocation(&tokens) {
+        return None;
+    }
+    let mut redactions: Vec<(usize, usize)> = Vec::new();
+    let mut i = 2usize;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if token.text == "-m" || token.text == "--message" {
+            if let Some(value) = tokens.get(i + 1) {
+                redactions.push(value_interior_span(&chars, value.start, value.end));
+                i += 2;
+                continue;
+            }
+        } else if let Some(rest) = token.text.strip_prefix("--message=") {
+            let flag_len = token.text.chars().count() - rest.chars().count();
+            redactions.push(value_interior_span(
+                &chars,
+                token.start + flag_len,
+                token.end,
+            ));
+        } else if token.text.starts_with("-m") && token.text.chars().count() > 2 {
+            redactions.push(value_interior_span(&chars, token.start + 2, token.end));
+        }
+        i += 1;
+    }
+    if redactions.is_empty() {
+        return None;
+    }
+    Some(apply_span_redactions(
+        &chars,
+        redactions,
+        OPAQUE_MESSAGE_PLACEHOLDER,
+    ))
+}
+
+/// Splices `placeholder` into every `[start, end)` span of `chars`,
+/// preserving everything outside them verbatim. Spans are sorted and any
+/// span that starts before the previous one's end is skipped (defends
+/// against overlap rather than panicking or corrupting output on
+/// pathological input -- this module fails closed on doubt elsewhere too).
+fn apply_span_redactions(
+    chars: &[char],
+    mut spans: Vec<(usize, usize)>,
+    placeholder: &str,
+) -> String {
+    spans.sort_by_key(|s| s.0);
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        if start < cursor {
+            continue;
+        }
+        out.extend(chars[cursor..start].iter());
+        out.push_str(placeholder);
+        cursor = end.max(start);
+    }
+    out.extend(chars[cursor..].iter());
+    out
+}
+
+/// Issue #136: locates a `<<'DELIM'` single-quoted heredoc marker on `line`
+/// (a POSIX single-quoted delimiter, unlike a bare `<<DELIM`, makes the
+/// heredoc body fully literal -- no parameter or command substitution
+/// happens inside it) and returns the delimiter word. `<<-DELIM` (the
+/// tab-stripping form) is recognized too. Only the FIRST `<<` on the line is
+/// considered; a line naming more than one heredoc is not a shape this
+/// scanner needs to handle for the carve-out's scope.
+fn single_quoted_heredoc_delimiter(line: &str) -> Option<String> {
+    let idx = line.find("<<")?;
+    let after = &line[idx + 2..];
+    let after = after.strip_prefix('-').unwrap_or(after);
+    let after = after.trim_start();
+    let mut rest = after.strip_prefix('\'')?;
+    let end = rest.find('\'')?;
+    rest = &rest[..end];
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// Issue #136: blanks the BODY of every single-quoted heredoc (`<<'DELIM'
+/// ... \nDELIM`) in `command`, replacing the literal lines between the
+/// opening marker and the terminator line with
+/// [`OPAQUE_HEREDOC_BODY_PLACEHOLDER`]. A single-quoted heredoc delimiter is
+/// POSIX-literal DATA even when the heredoc feeds a real command's stdin
+/// (`cat <<'EOF' ... EOF`) -- exactly the shape a commit message documenting
+/// dangerous command names by NAME (not running them) legitimately produces
+/// via `git commit -m "$(cat <<'EOF' ...prose... EOF)"`.
+///
+/// Applied once, at the very top of [`normalize_segments`], to the FULL
+/// command text before anything else runs -- so every candidate downstream,
+/// including one [`command_substitutions`] pulls out of a live `$(...)`
+/// (`command_substitutions` itself is untouched: it simply never receives
+/// the raw heredoc prose, because by the time `normalize_segments` calls
+/// into `visit_executable_nodes` the text it hands it is already
+/// heredoc-safe), sees the opaque body rather than the original prose. A
+/// malformed/truncated heredoc (no terminator line found) is left alone
+/// rather than guessed at -- the safe failure for this module's "any doubt
+/// reads as unsupported" discipline is to redact nothing, never to redact
+/// too much.
+fn redact_single_quoted_heredocs(command: &str) -> String {
+    let lines: Vec<&str> = command.split('\n').collect();
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        out_lines.push(line.to_string());
+        i += 1;
+        let Some(delim) = single_quoted_heredoc_delimiter(line) else {
+            continue;
+        };
+        let body_start = i;
+        let mut terminator = None;
+        while i < lines.len() {
+            if lines[i].trim_end_matches('\r') == delim {
+                terminator = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let Some(terminator) = terminator else {
+            // No real terminator: leave the rest of the text untouched --
+            // nothing after `body_start` was consumed, so rewind and let
+            // the outer loop keep copying lines verbatim.
+            i = body_start;
+            continue;
+        };
+        if terminator > body_start {
+            out_lines.push(OPAQUE_HEREDOC_BODY_PLACEHOLDER.to_string());
+        }
+        out_lines.push(lines[terminator].to_string());
+        i = terminator + 1;
+    }
+    out_lines.join("\n")
+}
+
 /// Strips a single matching pair of leading/trailing `'`/`"` quotes, if
 /// present. Not recursive, not shell-aware (an escaped quote inside is left
 /// alone) -- one layer, matching this module's "one layer of unwrapping"
@@ -1337,13 +1626,25 @@ fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
     }
 }
 
+/// Issue #136: pushes `whole`/a segment as a matchable candidate, but when
+/// [`redact_opaque_message`] recognizes it as a commit-message-bearing
+/// invocation, pushes the REDACTED variant INSTEAD of the raw one -- not in
+/// addition to it. Adding the redacted form alongside the original would do
+/// nothing: [`evaluate_candidates`]'s worst-case fold still sees the
+/// original's prose and still denies on it. Only replacing the candidate
+/// that would otherwise carry the prose closes the gap.
+fn push_executable_candidate(candidates: &mut Vec<String>, text: String) {
+    let text = redact_opaque_message(&text).unwrap_or(text);
+    push_candidate(candidates, strip_program_dir(&text));
+}
+
 fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<String>) {
     if depth > MAX_STRUCTURAL_DEPTH || candidates.len() >= MAX_STRUCTURAL_CANDIDATES {
         return;
     }
     let whole = collapse_whitespace(command);
     if !whole.is_empty() {
-        push_candidate(candidates, strip_program_dir(&whole));
+        push_executable_candidate(candidates, whole);
     }
     for raw_segment in split_segments(command) {
         if candidates.len() >= MAX_STRUCTURAL_CANDIDATES {
@@ -1353,7 +1654,7 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
         if collapsed.is_empty() {
             continue;
         }
-        push_candidate(candidates, strip_program_dir(&collapsed));
+        push_executable_candidate(candidates, collapsed.clone());
         if depth < MAX_STRUCTURAL_DEPTH {
             if let Some(inner) = unwrap_shell_wrapper(&collapsed) {
                 visit_executable_nodes(&inner, depth + 1, candidates);
@@ -1361,6 +1662,18 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
             if let Some(inner) = unwrap_env_prefix(&collapsed) {
                 visit_executable_nodes(&inner, depth + 1, candidates);
             }
+            // ISSUE #136: extraction runs against `raw_segment` -- the
+            // UNREDACTED text (only ever heredoc-sanitized by
+            // `normalize_segments`'s own top-level pass before this
+            // function is ever called, never message-redacted) -- so a
+            // live `$(...)`/backtick substitution inside a commit message
+            // is still found and independently classified at `depth + 1`,
+            // completely unaffected by `push_executable_candidate` above
+            // redacting the SAME segment's own direct-match candidate.
+            // `command_substitutions` itself is untouched (this comment is
+            // the only change near it): it never even sees a redacted
+            // string, because `push_executable_candidate` builds one only
+            // for the candidate list, never for further extraction input.
             for inner in command_substitutions(&raw_segment) {
                 visit_executable_nodes(&inner, depth + 1, candidates);
             }
@@ -1374,9 +1687,21 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
 /// The fixed depth/candidate ceilings keep hook input deterministic and
 /// bounded; encoding, dynamic `eval`, variable expansion and script-file
 /// contents remain outside this lightweight analyzer's declared scope.
+///
+/// Issue #136: `command` is heredoc-sanitized ([`redact_single_quoted_
+/// heredocs`]) ONCE here, at the very top, before it reaches
+/// [`visit_executable_nodes`] or the raw candidate below -- see that
+/// function's own doc comment for why one top-level pass is enough for
+/// every nested candidate too. The raw candidate itself additionally goes
+/// through [`redact_opaque_message`] (mirroring `push_executable_candidate`
+/// exactly): the "raw command" candidate must not carry a commit message's
+/// prose either, or `evaluate_candidates`'s worst-case fold would still deny
+/// on it regardless of what every other candidate says.
 fn normalize_segments(command: &str) -> Vec<String> {
-    let mut candidates = vec![command.to_string()];
-    visit_executable_nodes(command, 0, &mut candidates);
+    let sanitized = redact_single_quoted_heredocs(command);
+    let raw_candidate = redact_opaque_message(&sanitized).unwrap_or_else(|| sanitized.clone());
+    let mut candidates = vec![raw_candidate];
+    visit_executable_nodes(&sanitized, 0, &mut candidates);
     candidates
 }
 
@@ -4539,6 +4864,130 @@ mod tests {
             prompted.is_empty(),
             "PRODUCT REQUIREMENT VIOLATED -- these everyday/novel commands would interrupt the \
              operator: {prompted:#?}"
+        );
+    }
+
+    /// Issue #136: a commit message that documents dangerous primitives BY
+    /// NAME (never runs them) must not be denied just because the deny
+    /// matcher used to see the message's own prose as if it were code.
+    #[test]
+    fn a_commit_message_naming_denied_primitives_is_allowed_on_the_interactive_default() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -m \"awk system() and sed -i are dangerous; rm -rf too\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "the message is documentation, not code: {outcome:?}"
+        );
+    }
+
+    /// The same carve-out for every other message-bearing invocation and
+    /// argument spelling this scanner recognizes: `--message=`, the attached
+    /// `-m<value>` short form, `git tag -m`, `git notes -m`, and `hg commit
+    /// -m`.
+    #[test]
+    fn every_message_bearing_invocation_and_flag_spelling_is_covered() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "git commit --message=\"rm -rf / and sed -i are both dangerous\"",
+            "git commit -m\"awk system() calls arbitrary commands\"",
+            "git tag -m \"this tag documents rm -rf and curl | sh\" v1.0.0",
+            "git notes add -m \"awk, sed -i, and rm -rf all discussed here\"",
+            "hg commit -m \"sed -i and rm -rf mentioned for documentation\"",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "got {outcome:?} for {command}"
+            );
+        }
+    }
+
+    /// Issue #136's own reproduction: a commit message built from a
+    /// single-quoted heredoc (`$(cat <<'EOF' ...prose... EOF)`), the shape
+    /// zirv's own vault-keeper/commit workflow actually generates for a
+    /// multi-paragraph message. The heredoc body is POSIX-literal DATA fed
+    /// to `cat`'s stdin, never executable structure, even though it names
+    /// every deny-listed primitive by name.
+    #[test]
+    fn a_heredoc_built_commit_message_naming_denied_primitives_is_allowed() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -m \"$(cat <<'EOF'\nfix(safety): remove code-execution primitives from the find-exec allowlist\n\nawk (system()) and sed (-i / e) can execute arbitrary commands; rm -rf too.\nEOF\n)\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a heredoc-built message is documentation, not code: {outcome:?}"
+        );
+    }
+
+    /// The other half of issue #136's constraint: a message containing a
+    /// LIVE double-quoted `$(...)` command substitution must still escalate
+    /// -- `redact_opaque_message` never touches the text `command_
+    /// substitutions` extracts from, so a genuinely dangerous nested command
+    /// hidden inside a commit message is still found and classified.
+    #[test]
+    fn a_live_command_substitution_inside_a_commit_message_still_escalates() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -m \"danger: $(rm -rf /)\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a live $(...) inside a double-quoted message must still be classified: {outcome:?}"
+        );
+    }
+
+    /// A single-quoted heredoc body is opaque even without any surrounding
+    /// commit-message shape -- e.g. piped straight into a file-writing tool
+    /// the way a generated README or fixture might be authored -- so the
+    /// carve-out is a general opaque-literal rule, not a `git commit`
+    /// special case wearing a disguise.
+    #[test]
+    fn a_bare_single_quoted_heredoc_body_is_opaque_regardless_of_the_feeding_command() {
+        let policy = SafetyPolicy::default();
+        let command =
+            "cat <<'EOF' > notes.txt\nawk system() and sed -i and rm -rf are dangerous\nEOF";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "the heredoc body is data written to a file, not code: {outcome:?}"
+        );
+    }
+
+    /// A DOUBLE-quoted heredoc delimiter (`<<"EOF"` or bare `<<EOF`) still
+    /// permits parameter/command substitution inside the body per POSIX, so
+    /// it must NOT be redacted -- only a single-quoted delimiter is fully
+    /// literal. This also guards against `single_quoted_heredoc_delimiter`
+    /// over-matching an unrelated `<<` (e.g. a left-shift-looking snippet in
+    /// prose) that never carries a single-quoted word right after it.
+    #[test]
+    fn a_double_quoted_or_bare_heredoc_delimiter_is_left_alone() {
+        let policy = SafetyPolicy::default();
+        let live = "cat <<EOF\n$(rm -rf /)\nEOF";
+        let outcome = evaluate(&policy, live, LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a bare (non-single-quoted) heredoc still substitutes: {outcome:?}"
+        );
+    }
+
+    /// The opaque-literal carve-out is scoped narrowly: an ordinary command
+    /// with no commit-message shape and no heredoc still classifies its
+    /// arguments normally -- this is not a blanket "quoted text is safe"
+    /// rule.
+    #[test]
+    fn unrelated_quoted_arguments_are_still_classified_normally() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "sh -c 'rm -rf /'", LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a quoted shell -c payload is still executable, not a message argument: {outcome:?}"
         );
     }
 
