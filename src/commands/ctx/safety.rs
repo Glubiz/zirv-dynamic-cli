@@ -1340,6 +1340,28 @@ fn redact_opaque_message(text: &str) -> Option<String> {
             ));
         } else if token.text.starts_with("-m") && token.text.chars().count() > 2 {
             redactions.push(value_interior_span(&chars, token.start + 2, token.end));
+        } else if let Some(value_offset) = short_message_flag_value_offset(&token.text) {
+            let token_len = token.text.chars().count();
+            if value_offset >= token_len {
+                // Separate form (`-am "msg"`, `-qam "msg"`, ...): the
+                // cluster carries no attached value, so the value is the
+                // NEXT token -- identical to the exact `-m`/`--message`
+                // case above.
+                if let Some(value) = tokens.get(i + 1) {
+                    redactions.push(value_interior_span(&chars, value.start, value.end));
+                    i += 2;
+                    continue;
+                }
+            } else {
+                // Attached form (`-amFoo`): everything after the `m` is the
+                // value, identical to the plain `-m<value>` attached case
+                // above.
+                redactions.push(value_interior_span(
+                    &chars,
+                    token.start + value_offset,
+                    token.end,
+                ));
+            }
         }
         i += 1;
     }
@@ -1351,6 +1373,42 @@ fn redact_opaque_message(text: &str) -> Option<String> {
         redactions,
         OPAQUE_MESSAGE_PLACEHOLDER,
     ))
+}
+
+/// Issue #136 (MINOR fix, review round): whether `token_text` is a
+/// combined short-flag cluster whose message-taking flag is `m` (`-am`,
+/// `-qam`, ...) -- git/hg's combined short-option spelling for the same
+/// `-m` a plain `-m`/`-m<value>` token already covers, so `git commit -am
+/// "msg"` was missing this carve-out's redaction entirely (`"-am".starts_
+/// with("-m")` is false) and reproduced the original false-positive for
+/// that one spelling. Mirrors [`is_inline_command_flag`]'s own "cluster of
+/// ASCII letters" validation, so an unrelated long flag that merely
+/// contains an `m` character somewhere is never mistaken for one -- this is
+/// only ever called on tokens already known to start with a single `-`
+/// (never `--`), the same guard `is_inline_command_flag` applies to its own
+/// cluster check.
+///
+/// Returns `None` when `token_text` is not a single-dash, all-ASCII-letter
+/// cluster ending in (or containing) `m`. Otherwise returns the char index,
+/// WITHIN `token_text`, of the first character after the `m` -- equal to
+/// `token_text.chars().count()` when there is no attached value (the value
+/// is the NEXT token, `-am "msg"`), or an interior index when the value is
+/// attached directly (`-amFoo`).
+fn short_message_flag_value_offset(token_text: &str) -> Option<usize> {
+    if !token_text.starts_with('-') || token_text.starts_with("--") {
+        return None;
+    }
+    let mut offset = 1usize;
+    for c in token_text.chars().skip(1) {
+        offset += 1;
+        if c == 'm' {
+            return Some(offset);
+        }
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+    }
+    None
 }
 
 /// Splices `placeholder` into every `[start, end)` span of `chars`,
@@ -1378,22 +1436,68 @@ fn apply_span_redactions(
     out
 }
 
-/// Issue #136: locates a `<<'DELIM'` single-quoted heredoc marker on `line`
-/// (a POSIX single-quoted delimiter, unlike a bare `<<DELIM`, makes the
-/// heredoc body fully literal -- no parameter or command substitution
-/// happens inside it) and returns the delimiter word. `<<-DELIM` (the
-/// tab-stripping form) is recognized too. Only the FIRST `<<` on the line is
-/// considered; a line naming more than one heredoc is not a shape this
-/// scanner needs to handle for the carve-out's scope.
-fn single_quoted_heredoc_delimiter(line: &str) -> Option<String> {
-    let idx = line.find("<<")?;
-    let after = &line[idx + 2..];
-    let after = after.strip_prefix('-').unwrap_or(after);
-    let after = after.trim_start();
-    let mut rest = after.strip_prefix('\'')?;
-    let end = rest.find('\'')?;
-    rest = &rest[..end];
-    (!rest.is_empty()).then(|| rest.to_string())
+/// Issue #136 (BLOCKER fix, review round): parses a `<<[-]'DELIM'` heredoc
+/// marker starting exactly at `chars[start]` (`chars[start..start+2]` is
+/// already confirmed to be `<<` by the caller, which only calls this from a
+/// position its own quote/comment state machine has already proven is BARE
+/// text -- see [`redact_single_quoted_heredocs`]'s own doc comment for why
+/// that gate matters). `<<-DELIM` (the tab-stripping form) is recognized
+/// too. Returns the delimiter word and the index just past the closing
+/// quote, or `None` when the text at `start` is not actually this exact
+/// shape (a bare `<<EOF`, a double-quoted `<<"EOF"`, an unterminated quote,
+/// an empty delimiter, or a delimiter that would span a newline) -- the
+/// caller then treats `start` as ordinary `<` text, never guessing.
+fn parse_single_quoted_heredoc_marker(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut i = start + 2;
+    if chars.get(i) == Some(&'-') {
+        i += 1;
+    }
+    while matches!(chars.get(i), Some(' ') | Some('\t')) {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'\'') {
+        return None;
+    }
+    i += 1;
+    let delim_start = i;
+    while matches!(chars.get(i), Some(c) if *c != '\'' && *c != '\n') {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'\'') {
+        return None;
+    }
+    let delim: String = chars[delim_start..i].iter().collect();
+    i += 1;
+    (!delim.is_empty()).then_some((delim, i))
+}
+
+/// Finds the terminator line for a heredoc body starting at `body_start`
+/// (the first character after the opener line's own trailing newline): the
+/// first line whose content, `\r`-trimmed, equals `delim` exactly. Returns
+/// the `[start, end)` char range of that line (`end` is the line's own
+/// newline, exclusive) or `None` when no line in the rest of the text
+/// matches -- a malformed/truncated heredoc, left alone rather than guessed
+/// at.
+fn find_heredoc_terminator(
+    chars: &[char],
+    body_start: usize,
+    delim: &str,
+) -> Option<(usize, usize)> {
+    let mut line_start = body_start;
+    loop {
+        let mut j = line_start;
+        while j < chars.len() && chars[j] != '\n' {
+            j += 1;
+        }
+        let line: String = chars[line_start..j].iter().collect();
+        if line.trim_end_matches('\r') == delim {
+            return Some((line_start, j));
+        }
+        if j >= chars.len() {
+            return None;
+        }
+        line_start = j + 1;
+    }
 }
 
 /// Issue #136: blanks the BODY of every single-quoted heredoc (`<<'DELIM'
@@ -1405,51 +1509,178 @@ fn single_quoted_heredoc_delimiter(line: &str) -> Option<String> {
 /// dangerous command names by NAME (not running them) legitimately produces
 /// via `git commit -m "$(cat <<'EOF' ...prose... EOF)"`.
 ///
+/// **BLOCKER fix (review round, 2026-08-25):** a `<<'DELIM'` marker only
+/// opens a heredoc when it is scanned OUTSIDE any active quote (except a
+/// live `$(...)`, which reopens bare scanning even when textually nested
+/// inside a quote -- see [`redact_heredocs_scan`]'s own doc comment) and
+/// OUTSIDE an unquoted `#` comment. The original line-based scanner had
+/// neither notion -- `# see <<'X' for reference` on one line, `rm -rf /` on
+/// the next, and a line reading just `X` was misread as a real heredoc, and
+/// because this function runs ONCE on the full raw command before anything
+/// else (including [`command_substitutions`]'s own extraction, since by the
+/// time [`normalize_segments`] calls into [`visit_executable_nodes`] the
+/// text it hands it is already heredoc-processed), the live `rm -rf /` line
+/// was blanked to the opaque placeholder in EVERY downstream candidate --
+/// the classifier never saw it, and a `Deny` silently became `Allow`. Same
+/// failure for a fake marker inside an ordinary double-quoted argument
+/// (`echo "see <<'X' here"`). The scan (in [`redact_heredocs_scan`] below)
+/// mirrors the exact quote-tracking state machine [`tokenize_quoted`]/
+/// [`split_segments`] already implement (same escape handling, same
+/// `'`/`"`/`` ` `` quote-char set), extended with one more bit of state --
+/// whether the scanner is inside an unquoted `#` comment, cleared at the
+/// next newline -- so `<<` is only ever inspected as a possible heredoc
+/// opener when both are clear.
+///
 /// Applied once, at the very top of [`normalize_segments`], to the FULL
-/// command text before anything else runs -- so every candidate downstream,
-/// including one [`command_substitutions`] pulls out of a live `$(...)`
-/// (`command_substitutions` itself is untouched: it simply never receives
-/// the raw heredoc prose, because by the time `normalize_segments` calls
-/// into `visit_executable_nodes` the text it hands it is already
-/// heredoc-safe), sees the opaque body rather than the original prose. A
-/// malformed/truncated heredoc (no terminator line found) is left alone
-/// rather than guessed at -- the safe failure for this module's "any doubt
-/// reads as unsupported" discipline is to redact nothing, never to redact
-/// too much.
+/// command text before anything else runs -- so every candidate downstream
+/// sees the opaque body rather than the original prose. `command_
+/// substitutions` itself stays untouched by this function's own code; it
+/// simply never receives the raw heredoc prose. A malformed/truncated
+/// heredoc (no terminator line found) is left alone rather than guessed at
+/// -- the safe failure for this module's "any doubt reads as unsupported"
+/// discipline is to redact nothing, never to redact too much.
 fn redact_single_quoted_heredocs(command: &str) -> String {
-    let lines: Vec<&str> = command.split('\n').collect();
-    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let chars: Vec<char> = command.chars().collect();
+    redact_heredocs_scan(&chars, 0)
+}
+
+/// The scan [`redact_single_quoted_heredocs`] delegates to, recursive over
+/// `$(...)` spans so a heredoc issued FROM one is still found -- see that
+/// function's own doc comment for the shape this exists to keep passing
+/// (`git commit -m "$(cat <<'EOF' ...prose... EOF)"`, a live substitution
+/// nested inside an outer double-quoted string). A double quote does not
+/// neuter command substitution, so this cannot simply treat "inside any
+/// quote" as "heredoc detection off" -- doing that broke exactly the
+/// shape above (a real single-quoted heredoc that only *reads* as nested
+/// in a quote because of the enclosing `"..."`, when the `$(` right before
+/// it actually reopens live shell syntax). Only a SINGLE-quoted `$(...)`
+/// stays inert, mirroring [`command_substitutions`]'s own established rule
+/// (1086-1092) -- reused here via [`command_substitution_end`], the exact
+/// function `command_substitutions` itself calls to find where such a span
+/// ends, so the two can never disagree about where one stops.
+///
+/// `depth` mirrors every other recursive walk in this module
+/// (`MAX_STRUCTURAL_DEPTH`): a pathological input with many nested
+/// `$(...)` cannot grow this scan's call stack without limit; past the cap
+/// the remaining text is copied through unscanned rather than guessed at.
+fn redact_heredocs_scan(chars: &[char], depth: usize) -> String {
+    if depth >= MAX_STRUCTURAL_DEPTH {
+        return chars.iter().collect();
+    }
+    let mut out = String::with_capacity(chars.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut in_comment = false;
     let mut i = 0usize;
-    while i < lines.len() {
-        let line = lines[i];
-        out_lines.push(line.to_string());
-        i += 1;
-        let Some(delim) = single_quoted_heredoc_delimiter(line) else {
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\n' {
+            in_comment = false;
+            escaped = false;
+            out.push(c);
+            i += 1;
             continue;
-        };
-        let body_start = i;
-        let mut terminator = None;
-        while i < lines.len() {
-            if lines[i].trim_end_matches('\r') == delim {
-                terminator = Some(i);
-                break;
+        }
+        if in_comment {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if escaped {
+            out.push(c);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            out.push(c);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        // A live `$(...)` reopens bare-code scanning for its own content
+        // regardless of any enclosing quote -- except a single-quoted one,
+        // which stays inert (the one case `quote != Some('\'')` excludes)
+        // -- so a heredoc issued from inside it is still found even though
+        // textually it sits inside an outer `"..."`. Recursing (rather than
+        // just skipping over the span unscanned) is what keeps `git commit
+        // -m "$(cat <<'EOF' ...)"` working.
+        if c == '$'
+            && chars.get(i + 1) == Some(&'(')
+            && quote != Some('\'')
+            && let Some(end) = command_substitution_end(chars, i + 2, 0)
+        {
+            out.push('$');
+            out.push('(');
+            out.push_str(&redact_heredocs_scan(&chars[i + 2..end], depth + 1));
+            out.push(')');
+            i = end + 1;
+            continue;
+        }
+        if let Some(active) = quote {
+            out.push(c);
+            if c == active {
+                quote = None;
             }
             i += 1;
-        }
-        let Some(terminator) = terminator else {
-            // No real terminator: leave the rest of the text untouched --
-            // nothing after `body_start` was consumed, so rewind and let
-            // the outer loop keep copying lines verbatim.
-            i = body_start;
             continue;
-        };
-        if terminator > body_start {
-            out_lines.push(OPAQUE_HEREDOC_BODY_PLACEHOLDER.to_string());
         }
-        out_lines.push(lines[terminator].to_string());
-        i = terminator + 1;
+        if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '#' {
+            in_comment = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Bare text: only here (no active quote, no active comment, not
+        // escaped, not inside a live `$(...)` handled above) may `<<` be
+        // inspected as a heredoc opener at all.
+        if c == '<'
+            && chars.get(i + 1) == Some(&'<')
+            && let Some((delim, marker_end)) = parse_single_quoted_heredoc_marker(chars, i)
+        {
+            out.extend(chars[i..marker_end].iter());
+            i = marker_end;
+            // The rest of the opener's own line is copied verbatim
+            // (unscanned) -- matches this scanner's own scope: only the
+            // first heredoc marker found while bare-scanning is acted
+            // on, exactly like the line-based version this replaces.
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                out.push('\n');
+                i += 1;
+            }
+            let body_start = i;
+            match find_heredoc_terminator(chars, i, &delim) {
+                Some((term_start, term_end)) => {
+                    if term_start > body_start {
+                        out.push_str(OPAQUE_HEREDOC_BODY_PLACEHOLDER);
+                        out.push('\n');
+                    }
+                    out.extend(chars[term_start..term_end].iter());
+                    i = term_end;
+                }
+                None => {
+                    // No terminator anywhere in the rest of the text:
+                    // copy it all verbatim, unchanged, and stop.
+                    out.extend(chars[body_start..].iter());
+                    i = chars.len();
+                }
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
     }
-    out_lines.join("\n")
+    out
 }
 
 /// Strips a single matching pair of leading/trailing `'`/`"` quotes, if
@@ -5204,7 +5435,7 @@ mod tests {
     /// A DOUBLE-quoted heredoc delimiter (`<<"EOF"` or bare `<<EOF`) still
     /// permits parameter/command substitution inside the body per POSIX, so
     /// it must NOT be redacted -- only a single-quoted delimiter is fully
-    /// literal. This also guards against `single_quoted_heredoc_delimiter`
+    /// literal. This also guards against `parse_single_quoted_heredoc_marker`
     /// over-matching an unrelated `<<` (e.g. a left-shift-looking snippet in
     /// prose) that never carries a single-quoted word right after it.
     #[test]
@@ -5231,6 +5462,112 @@ mod tests {
             outcome.verdict,
             Verdict::Allow,
             "a quoted shell -c payload is still executable, not a message argument: {outcome:?}"
+        );
+    }
+
+    // -- Issue #136 review round (BLOCKER): heredoc detection must be
+    // quote/comment-aware -------------------------------------------------
+
+    /// BLOCKER regression (a): the reviewer's own PoC. A `<<'X'` mentioned
+    /// inside a `#` comment must never be mistaken for a real heredoc
+    /// opener -- if it were, the line-based scanner this replaces would
+    /// blank the LIVE `rm -rf /` line between the comment and the line
+    /// reading `X` in every candidate, and a `Deny` would silently become
+    /// `Allow`.
+    #[test]
+    fn a_heredoc_marker_mentioned_inside_a_comment_never_hides_a_live_command() {
+        let policy = SafetyPolicy::default();
+        let command = "# see <<'X' for reference\nrm -rf /\nX";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a fake heredoc marker inside a comment must not blank the live rm -rf / line: {outcome:?}"
+        );
+    }
+
+    /// BLOCKER regression (b): the identical failure mode, but the fake
+    /// marker sits inside an ordinary double-quoted argument instead of a
+    /// comment.
+    #[test]
+    fn a_heredoc_marker_mentioned_inside_a_double_quoted_argument_never_hides_a_live_command() {
+        let policy = SafetyPolicy::default();
+        let command = "echo \"see <<'X' for reference\"\nrm -rf /\nX";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a fake heredoc marker inside a double-quoted argument must not blank the live rm -rf / line: {outcome:?}"
+        );
+    }
+
+    /// BLOCKER regression (c): a REAL single-quoted heredoc, scanned
+    /// starting from bare (unquoted, uncommented) text, must still redact
+    /// its body -- the quote/comment-awareness fix must not overcorrect
+    /// into never recognizing a real heredoc at all.
+    #[test]
+    fn a_real_single_quoted_heredoc_still_redacts_its_body() {
+        let policy = SafetyPolicy::default();
+        let command = "cat <<'EOF'\nawk system() and sed -i and rm -rf are all dangerous\nEOF";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a real single-quoted heredoc body is still POSIX-literal data: {outcome:?}"
+        );
+    }
+
+    /// BLOCKER regression (d): a real heredoc body containing `#` and
+    /// quote characters of its own must still redact correctly -- once the
+    /// scanner is inside a confirmed heredoc body, `#`/`'`/`"` inside it are
+    /// data, not comment/quote syntax, and must not confuse terminator
+    /// detection or leak the primitive names past redaction.
+    #[test]
+    fn a_real_heredoc_body_containing_comments_and_quotes_still_redacts_correctly() {
+        let policy = SafetyPolicy::default();
+        let command =
+            "cat <<'EOF'\n# awk and sed -i are dangerous\nrm -rf \"quoted 'nested' text\" too\nEOF";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "the heredoc body's own # and quotes are data, not live syntax: {outcome:?}"
+        );
+    }
+
+    // -- Issue #136 review round (MINOR): combined short flags -----------
+
+    /// MINOR regression: `git commit -am "..."` (the combined `-a -m`
+    /// short-flag spelling) must redact the message exactly like a bare
+    /// `-m` would -- `"-am".starts_with("-m")` is false, so the original
+    /// carve-out missed this one spelling entirely and reproduced the
+    /// false-positive denial for it.
+    #[test]
+    fn combined_short_flag_am_redacts_the_message() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -am \"awk system() and sed -i and rm -rf are dangerous\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "the combined -am short flag must redact its message too: {outcome:?}"
+        );
+    }
+
+    /// The `-am` carve-out stays scoped to the same message-bearing
+    /// invocations as every other spelling -- it is not a blanket "any
+    /// `-am`-flagged command is safe" rule. Asserted directly against
+    /// `redact_opaque_message` (the same way this module already asserts
+    /// directly against other private classifiers like `sql_outcome`)
+    /// rather than through the full `evaluate` pipeline, so the assertion
+    /// is about the gate itself, not incidental to whichever other
+    /// classifier might otherwise flag the unrelated program.
+    #[test]
+    fn combined_short_flag_am_gate_only_applies_to_message_bearing_invocations() {
+        assert_eq!(
+            redact_opaque_message("some-other-tool -am \"rm -rf / and sed -i are dangerous\""),
+            None,
+            "an unrelated program's -am flag must not be treated as a redactable message"
         );
     }
 
