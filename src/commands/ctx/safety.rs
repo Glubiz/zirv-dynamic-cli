@@ -1431,6 +1431,39 @@ fn provably_generated_cleanup(command: &str) -> bool {
 // Infrastructure/service destructive-action classifier
 // ---------------------------------------------------------------------
 
+/// Every kubectl/helm GLOBAL flag this classifier knows takes its value as a
+/// SEPARATE next token (not attached with `=`) -- so [`first_positional`]
+/// must skip both the flag and its value, not just the flag, or the value
+/// itself gets misread as the verb: `kubectl --context prod delete pod x`
+/// must still find `delete`, not stop at `prod`. `-n`/`--namespace` were the
+/// only two originally handled; this is every other realistic kubectl/helm
+/// global connection/auth flag that also takes a separate value, so a global
+/// flag before the verb can no longer hide it.
+const KUBE_HELM_VALUE_FLAGS: &[&str] = &[
+    "-n",
+    "--namespace",
+    "--context",
+    "--kubeconfig",
+    "--cluster",
+    "--user",
+    "--as",
+    "--as-group",
+    "--server",
+    "-s",
+    "--token",
+    "--request-timeout",
+    "--cache-dir",
+    "--tls-server-name",
+    "--client-certificate",
+    "--client-key",
+    "--certificate-authority",
+    "--kube-context",
+    "--kube-apiserver",
+    "--registry-config",
+    "--repository-config",
+    "--repository-cache",
+];
+
 /// The first token after the program name that is not a flag (`-`/`/`
 /// prefixed) and not a cargo `+toolchain` selector (`+nightly`) -- the verb
 /// an orchestrator/distribution classifier reads to decide the action
@@ -1491,10 +1524,10 @@ fn is_destructive_orchestrator_action(command: &str) -> bool {
         "pulumi" => first_positional(&tokens, &[]).is_some_and(|action| {
             matches!(action.to_ascii_lowercase().as_str(), "destroy" | "cancel")
         }),
-        "kubectl" => first_positional(&tokens, &["-n", "--namespace"]).is_some_and(|action| {
+        "kubectl" => first_positional(&tokens, KUBE_HELM_VALUE_FLAGS).is_some_and(|action| {
             matches!(action.to_ascii_lowercase().as_str(), "delete" | "drain")
         }),
-        "helm" => first_positional(&tokens, &["-n", "--namespace"]).is_some_and(|action| {
+        "helm" => first_positional(&tokens, KUBE_HELM_VALUE_FLAGS).is_some_and(|action| {
             matches!(action.to_ascii_lowercase().as_str(), "uninstall" | "delete")
         }),
         "docker" => {
