@@ -811,9 +811,26 @@ impl Pane {
     /// `spec.agent_name` anyway (to build `argv`/`turn_env`), so it passes
     /// `adapter.capabilities().turn_signal` and `dash.idle_quiet_ms` straight
     /// through rather than this module re-resolving the adapter itself.
+    ///
+    /// `cwd` and `repo` are deliberately separate parameters (issue #119,
+    /// code review round): `cwd` is where the child process actually runs
+    /// (`command.cwd(cwd)`) -- for a dashboard-accepted linked `git worktree
+    /// add` sibling, that is the worktree's own path -- while `repo` is the
+    /// identity this pane's `sessions::Record` is stamped with
+    /// (`Record::new(.., repo, ..)`), which drives `repo_slug` and therefore
+    /// every mailbox lookup (`mail_sweep`, `apply_mail_effect`,
+    /// `build_mail_view`, `zirv ctx nudge --to-session`). Those two must stay
+    /// keyed off the *dashboard's own* repo regardless of which worktree the
+    /// pane's argv runs in: the session/state store is shared across every
+    /// pane this dashboard hosts, and a worktree-hosted pane whose `Record`
+    /// pointed at the worktree instead would register under a mailbox slug
+    /// nothing sweeps. Every ordinary (non-worktree) spawn passes the same
+    /// path for both.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         spec: PaneSpec,
         state: &StateDir,
+        cwd: &Path,
         repo: &Path,
         size: (u16, u16),
         turn_env: &[(String, String)],
@@ -852,7 +869,7 @@ impl Pane {
         for arg in rest {
             command.arg(arg);
         }
-        command.cwd(repo);
+        command.cwd(cwd);
 
         sessions::scrub_supervision_env(&mut command);
         for (key, value) in turn_env {
@@ -2932,8 +2949,17 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
         let spec = test_spec("11111111-2222-4333-8444-555555555555");
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
 
         assert_eq!(pane.agent(), "test-agent");
         assert_eq!(pane.title(), "wrk test");
@@ -2965,6 +2991,62 @@ pub(crate) mod tests {
         pane.shutdown("").expect("shutdown must be idempotent");
     }
 
+    /// Code review (issue #119, round 2), BLOCKER: a worktree-hosted pane's
+    /// child runs at `cwd` (the worktree), but its registry `Record` -- and
+    /// therefore `repo_slug`, and therefore which mailbox `mail_sweep`/
+    /// `zirv ctx nudge --to-session` reads for it -- must stay keyed off the
+    /// dashboard's own `repo`, never the worktree it happens to run in. Two
+    /// distinct paths prove the split actually reached `Record::new`
+    /// (`sessions::resolve_prefix`, the real lookup path `zirv ctx nudge`
+    /// itself uses) rather than only the two `Pane::spawn` parameters being
+    /// accepted syntactically.
+    #[test]
+    fn a_pane_spawned_at_a_different_cwd_keeps_the_dashboard_repo_in_its_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let dashboard_repo = tmp.path().join("dashboard-repo");
+        let worktree_cwd = tmp.path().join("linked-worktree");
+        std::fs::create_dir_all(&dashboard_repo).expect("mkdir dashboard-repo");
+        std::fs::create_dir_all(&worktree_cwd).expect("mkdir linked-worktree");
+        assert_ne!(
+            dashboard_repo, worktree_cwd,
+            "the two paths must actually differ for this test to mean anything"
+        );
+
+        let mut spec = test_spec("33333333-2222-4333-8444-555555555555");
+        // Long-lived, not `trivial_argv()`: `sessions::resolve_prefix` below
+        // only returns a `Liveness::Live` record, and a process that has
+        // already exited by the time this test gets to it would make the
+        // lookup racy rather than proving anything about `Record::repo`.
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &worktree_cwd,
+            &dashboard_repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let record = sessions::resolve_prefix(&state, pane.short())
+            .expect("the freshly spawned pane must be live and resolvable");
+        assert_eq!(
+            record.repo, dashboard_repo,
+            "Record::repo must be the dashboard's own repo, not the pane's cwd"
+        );
+        assert_eq!(
+            record.repo_slug,
+            super::super::super::state::repo_slug(&dashboard_repo),
+            "repo_slug (the mailbox key mail_sweep/nudge --to-session actually use) must \
+             follow Record::repo"
+        );
+
+        pane.shutdown("").expect("shutdown");
+    }
+
     /// Finding #2: a failure in the *successor's* setup (here, a missing
     /// adapter binary -- `resolve_program` does not check existence, so
     /// `ready()`/`resolve_swap_launch` succeed and the OS spawn itself is
@@ -2983,8 +3065,17 @@ pub(crate) mod tests {
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
         spec.agent_name = "claude".to_string();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
 
         let old_agent_name = pane.agent().to_string();
         assert!(
@@ -3069,8 +3160,17 @@ pub(crate) mod tests {
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
         spec.agent_name = "claude".to_string();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
 
         pane.set_report_to(Some("aaaa1111".to_string()));
         pane.mark_report_reminder_sent();
@@ -3134,8 +3234,17 @@ pub(crate) mod tests {
         let session_id = "33333333-2222-4333-8444-555555555555";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
@@ -3176,8 +3285,17 @@ pub(crate) mod tests {
         let session_id = "55555555-2222-4333-8444-555555555555";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
@@ -3238,8 +3356,17 @@ pub(crate) mod tests {
         let session_id = "66666666-2222-4333-8444-777777777777";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
@@ -3281,8 +3408,17 @@ pub(crate) mod tests {
         let session_id = "44444444-2222-4333-8444-555555555555";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
 
         assert!(
             signal_until_idle(&mut pane, &state, session_id),
@@ -3334,8 +3470,8 @@ pub(crate) mod tests {
         let mut spec = test_spec(session_id);
         spec.argv = silent_after_first_line_argv();
         let idle_quiet = Duration::from_millis(1000);
-        let mut pane =
-            Pane::spawn(spec, &state, &repo, (80, 24), &[], false, idle_quiet).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, &repo, (80, 24), &[], false, idle_quiet)
+            .expect("spawn");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
@@ -3397,8 +3533,8 @@ pub(crate) mod tests {
         let mut spec = test_spec(session_id);
         spec.argv = silent_after_first_line_argv();
         let idle_quiet = Duration::from_millis(200);
-        let mut pane =
-            Pane::spawn(spec, &state, &repo, (80, 24), &[], true, idle_quiet).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, &repo, (80, 24), &[], true, idle_quiet)
+            .expect("spawn");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
@@ -3445,8 +3581,8 @@ pub(crate) mod tests {
         let mut spec = test_spec(session_id);
         spec.argv = silent_after_first_line_argv();
         let idle_quiet = Duration::from_millis(500);
-        let mut pane =
-            Pane::spawn(spec, &state, &repo, (80, 24), &[], false, idle_quiet).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, &repo, (80, 24), &[], false, idle_quiet)
+            .expect("spawn");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
@@ -3533,8 +3669,8 @@ pub(crate) mod tests {
         let mut spec = test_spec(session_id);
         spec.argv = silent_after_first_line_argv();
         let idle_quiet = Duration::from_millis(500);
-        let mut pane =
-            Pane::spawn(spec, &state, &repo, (80, 24), &[], false, idle_quiet).expect("spawn");
+        let mut pane = Pane::spawn(spec, &state, &repo, &repo, (80, 24), &[], false, idle_quiet)
+            .expect("spawn");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
@@ -3608,8 +3744,17 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
         let spec = test_spec("22222222-2222-4333-8444-555555555555");
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
 
         pane.shutdown("")
             .expect("first shutdown releases the guard");
@@ -3677,8 +3822,17 @@ pub(crate) mod tests {
 
         let mut spec = test_spec("66666666-2222-4333-8444-555555555555");
         spec.argv = long_lived_argv();
-        let mut pane = Pane::spawn(spec, &state, &repo, (80, 24), &[], true, DEFAULT_IDLE_QUIET)
-            .expect("spawn");
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
         let short = pane.short().to_string();
         let record_path = state.sessions().join(format!("{short}.json"));
         assert!(
