@@ -702,52 +702,14 @@ pub fn mail_advisory_line(count: usize, from_agent: &str, from_short: &str) -> S
     )
 }
 
-/// F4 (review, PR #116): what `pump`'s own deferred submit is waiting to
-/// finish once its deadline passes -- the same "phase 1 now, phase 2 later"
-/// shape `dash::pane::inject_visible`/`Pane::pending_submit` uses, and for
-/// the same reason: a burst that arrives on the receiving TUI within a few
-/// milliseconds is read as a paste, folding a `\r` inside it into a literal
-/// newline rather than a submit keypress (issue #114).
-///
-/// `wrap`'s escalation ladder (`Action::Compact`, gated by
-/// `InjectionState::cooldown_at_signal`) and its T13 mail advisory (gated by
-/// `may_inject`/`signal_less_mail_ready`, the same state) can never both want
-/// to write at once -- see the two call sites' own comments -- so a single
-/// `Option<PendingSubmit>` slot in `pump`'s own locals is enough; there is
-/// never a queue to manage.
-#[derive(Debug, Clone)]
-enum PendingSubmitKind {
-    /// Phase 2 landed: verify the compaction actually happened
-    /// (`verify_compaction`) and log/announce the outcome exactly as the
-    /// pre-#116 synchronous write did.
-    Compact,
-    /// Phase 2 landed: the advisory is now genuinely submitted, so these ids
-    /// may finally be marked injected (`MailWatch::commit_injected`) -- not
-    /// before, which is F4's own fix: committing on the write succeeding
-    /// used to run the instant phase 1 landed, before the child had even
-    /// seen the submitting keypress.
-    MailAdvisory { ids: Vec<String> },
-}
-
-#[derive(Debug, Clone)]
-struct PendingSubmit {
-    deadline: Instant,
-    kind: PendingSubmitKind,
-}
-
-/// Pure: whether an outstanding `pending_submit` is due to be drained as of
-/// `now`. Split out of `pump`'s own inline check (fix, PR #116 follow-up) so
-/// the "has the deadline passed" arithmetic is testable without a real pty,
-/// a real child, or any of `wrap`'s own output-driven state -- the whole
-/// point of the fix this backs is that this question must be answerable, and
-/// answered every tick, purely from a clock and the deadline itself, with no
-/// dependency on whether the wrapped child (or the operator's own terminal)
-/// has produced any bytes at all. Same shape as `dash::pane::submit_is_due`,
-/// deliberately not shared with it: that one takes `Option<Instant>` for a
-/// dashboard pane's own slot, this one takes the whole `PendingSubmit` so a
-/// caller never has to remember to project `.deadline` out first.
-fn pending_submit_due(pending: &Option<PendingSubmit>, now: Instant) -> bool {
-    pending.as_ref().is_some_and(|p| now >= p.deadline)
+/// The exact bytes one advisory injection writes: the line, then exactly one
+/// `\r` to submit it -- `inject_compact`'s own convention, and (after
+/// `advisory_identity`'s scrub) the only control byte in the whole write,
+/// which is what makes an injection exactly one submission.
+fn mail_advisory_bytes(count: usize, from_agent: &str, from_short: &str) -> Vec<u8> {
+    let mut bytes = mail_advisory_line(count, from_agent, from_short).into_bytes();
+    bytes.push(b'\r');
+    bytes
 }
 
 /// What one mail poll concluded. Both non-empty arms carry the ids they
@@ -901,37 +863,20 @@ fn unread_mail_counts(
     super::mail::unread_counts(state, repo, agent, session_short, mail_enabled)
 }
 
-/// The full one-write shape a compact injection used to be, kept as a pure,
-/// still-tested invariant helper: phase 1's text (`{command} {COMPACT_FOCUS}`,
-/// no control bytes of its own) then phase 2's lone `\r`
-/// (`dash::pane::write_submit_cr`, `wrap`'s own convention that
-/// `dash::pane`'s doc comments already cite).
-///
-/// F4 (review, PR #116): `pump`'s `Action::Compact` arm no longer calls this
-/// -- like `dash::pane::inject_visible`, it writes phase 1 alone and defers
-/// phase 2 to a scheduled deadline (`PendingSubmit`), so a paste-fold on the
-/// receiving TUI cannot fold the submitting keypress into the injected text.
-/// This function still composes exactly the two primitives production uses,
-/// so it stays an honest invariant to test against rather than a second,
-/// possibly-drifting copy of the same logic.
-///
-/// `#[allow(dead_code)]`: no production caller remains after F4 (mirrors
-/// `read_socket_path`'s own reasoning, above -- a real, still-correct API
-/// with no in-tree caller is not the same thing as code that should be
-/// deleted; this one's callers are its own unit tests).
-#[allow(dead_code)]
+/// Known residual (PR #116 follow-up): this writes text and its submitting
+/// `\r` in one burst, the same shape dash::pane's injections had before the
+/// F1/F2 fix -- a codex-shaped composer that reads a same-burst `\r` as part
+/// of a paste could in principle fold it into a literal newline here too.
+/// It is deliberately NOT split into dash::pane's deferred two-phase submit:
+/// the wrapped child's own `read -r` line-reader needs the CR in-band to
+/// complete and make the injected text observable in the output stream, and
+/// splitting it (commit 15a7db9, reverted) made `read_until` block past its
+/// budget in the two T13 real-pty tests below, which starved out to CI's
+/// 180s hard kill instead of failing fast. Tracked as a follow-up rather
+/// than fixed here.
 pub fn inject_compact(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
-    write_compact_phase1(sink, compact_command)?;
-    super::dash::pane::write_submit_cr(sink)?;
-    Ok(())
-}
-
-/// Phase 1 of a deferred `/compact` injection: the command plus
-/// [`COMPACT_FOCUS`], with **no** trailing `\r` -- a TUI submits on carriage
-/// return, which phase 2 ([`super::dash::pane::write_submit_cr`]) supplies
-/// separately, at least [`super::dash::pane::INJECTION_SUBMIT_DELAY`] later.
-fn write_compact_phase1(sink: &mut dyn Write, compact_command: &str) -> CtxResult<()> {
-    write!(sink, "{compact_command} {COMPACT_FOCUS}")?;
+    // A TUI submits on carriage return, not newline.
+    write!(sink, "{compact_command} {COMPACT_FOCUS}\r")?;
     sink.flush()?;
     Ok(())
 }
@@ -2145,15 +2090,7 @@ fn reset_bar(bar: &BarRuntime) {
     }
     let sequence = super::chrome::bar_reset_sequence(bar.rows);
     let mut reset_ok = false;
-    // `try_lock`, not `lock`: this can run from `pump`'s own hot loop
-    // (`recover_bar_to_full_size`), which must never block on a lock shared
-    // with `spawn_output_thread`'s write to the *outer* stdout -- that write
-    // blocks for as long as nobody is draining the operator's terminal, and a
-    // blocking `.lock()` here would stall the whole pump loop (including the
-    // deferred-submit deadline check) on the same contention. A skipped reset
-    // just leaves `reset_ok` false, which the caller already treats as "try
-    // again later" (`BAR_ACTIVE` stays set for the emergency handler).
-    if let Ok(_guard) = bar.stdout_lock.try_lock() {
+    if let Ok(_guard) = bar.stdout_lock.lock() {
         let mut stdout = std::io::stdout();
         reset_ok = stdout
             .write_all(sequence.as_bytes())
@@ -2590,9 +2527,6 @@ fn pump(
     // Finding #7: `handover::take_request`'s own polling cadence, tracked
     // independently of `mail_watch` -- see the check site's own doc comment.
     let mut last_handover_poll: Option<Instant> = None;
-    // F4 (review, PR #116): at most one deferred injection submission
-    // outstanding at a time -- see `PendingSubmit`'s own doc comment.
-    let mut pending_submit: Option<PendingSubmit> = None;
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -2642,110 +2576,6 @@ fn pump(
                 return Ok(code);
             }
             supervision.on_event(event, Instant::now());
-        }
-
-        // F4 (review, PR #116; fix, PR #116 follow-up): drains `pending_submit`
-        // once its deadline has passed -- the phase-2 half of whichever
-        // injection is outstanding (`Action::Compact` or the T13 mail advisory
-        // below; never both, see `PendingSubmit`'s own doc comment). Checked
-        // here, as the very first thing every tick does after the
-        // non-blocking event drain above and before anything else in this
-        // loop touches `bar.stdout_lock` (`redraw_bar_if_due`, the resize
-        // region write, `recover_bar_to_full_size`) -- that lock is shared
-        // with `spawn_output_thread`'s own write to the *outer* stdout, which
-        // blocks for as long as nobody is draining the operator's terminal
-        // (exactly the gap several of this module's own real-pty tests leave
-        // between reads). A blocking `.lock()` anywhere ahead of this check
-        // used to stall the *entire* rest of the iteration -- including this
-        // drain -- on that contention, so a deferred submit's `\r` could sit
-        // unsent well past its deadline despite `PUMP_POLL` nominally ticking
-        // every ~100ms: the loop was still ticking, just not reaching this
-        // code. Running it first makes the deadline check genuinely
-        // unconditional on child/terminal output, not just apparently so.
-        // The `~100ms` `PUMP_POLL` cadence is well under `INJECTION_SUBMIT_
-        // DELAY`, so the deadline is checked far more often than it needs to
-        // be, which is what "poll the deadline" means here rather than "sleep
-        // for it".
-        let now = Instant::now();
-        if pending_submit_due(&pending_submit, now) {
-            let cr_ok = match writer.lock() {
-                Ok(mut sink) => super::dash::pane::write_submit_cr(&mut *sink).is_ok(),
-                Err(_) => false,
-            };
-            if cr_ok {
-                // `if let` rather than an infallible unwrap/expect: `wrap`'s
-                // own hot-path rule (CLAUDE.md) is no panicking on this loop
-                // under any condition, even one this guard believes cannot
-                // happen. A `None` here would simply mean nothing to finish,
-                // which is a safe no-op.
-                if let Some(pending) = pending_submit.take() {
-                    match pending.kind {
-                        PendingSubmitKind::Compact => {
-                            // Exactly what the old synchronous write did
-                            // right after its own single `write_all`
-                            // succeeded: verify, announce, log. `transcript`
-                            // is read fresh here (not captured at phase 1),
-                            // which only matters if a transcript path
-                            // arrives in the ~50ms settle window -- a strict
-                            // improvement over the old code, which could
-                            // never see one.
-                            let failure = match transcript.path() {
-                                None => Some("no transcript reported, compaction unverifiable"),
-                                Some(path) => {
-                                    let seen = verify_compaction(
-                                        &mut Watcher::new(path.to_path_buf()),
-                                        adapter.as_ref(),
-                                        Instant::now() + inject_timeout,
-                                    )
-                                    .unwrap_or(false);
-                                    if seen {
-                                        None
-                                    } else {
-                                        Some("compaction not verified")
-                                    }
-                                }
-                            };
-                            let verified = failure.is_none();
-                            announcer.emit(&Event::Compact { verified });
-                            if let Some(reason) = failure {
-                                note_failure(
-                                    supervision,
-                                    Some((state_dir, session.as_str())),
-                                    reason,
-                                    announcer,
-                                );
-                            }
-                            let _ = super::log::append(
-                                state_dir,
-                                &super::log::Decision {
-                                    ts: super::state::now_secs(),
-                                    session: session.as_str(),
-                                    verb: "wrap",
-                                    verdict: "compact",
-                                    score: supervision.score,
-                                    action: if verified {
-                                        "inject"
-                                    } else {
-                                        "inject-unverified"
-                                    },
-                                    detail: &transcript
-                                        .path()
-                                        .map(|path| path.display().to_string())
-                                        .unwrap_or_else(|| "no transcript reported".to_string()),
-                                },
-                            );
-                        }
-                        PendingSubmitKind::MailAdvisory { ids } => {
-                            mail_watch.commit_injected(&ids);
-                        }
-                    }
-                }
-            }
-            // else: `cr_ok` was false -- leave `pending_submit` set exactly
-            // as it was, so the next tick retries the lone `\r`. See
-            // `dash::pane::write_submit_cr`'s own doc comment for why a
-            // retried CR is always safe (worst case one extra, harmless
-            // Enter keypress), never a re-send of phase 1's text.
         }
 
         if let Some(server) = server
@@ -2973,71 +2803,68 @@ fn pump(
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
             }
             Action::Compact => {
-                // F4 (review, PR #116): phase 1 only -- the command plus
-                // `COMPACT_FOCUS`, with no trailing `\r`. The old single
-                // `write_all` (text + `\r` together) is exactly the paste-fold
-                // bug F1/F2 fixed for `dash::pane`'s own injections: a
-                // codex-shaped composer reads a burst that arrives within a
-                // few milliseconds as a paste and folds the `\r` into it as a
-                // literal newline rather than a submit keypress, leaving
-                // `/compact` typed but never actually submitted.
                 let injected = writer
                     .lock()
                     .map_err(|_| "pty writer poisoned".to_string())
                     .and_then(|mut sink| {
                         let command = adapter.compact_command().unwrap_or("/compact");
-                        write_compact_phase1(&mut *sink, command).map_err(|e| e.to_string())
+                        inject_compact(&mut *sink, command).map_err(|e| e.to_string())
                     });
 
-                // Arm the cooldown as soon as phase 1 is attempted, exactly
-                // as before -- this is what stops `action_for` from
-                // re-selecting `Action::Compact` on a later tick while this
-                // one's submission is still pending, so there is never more
-                // than one `PendingSubmit` outstanding at a time.
+                // Arm the cooldown before verifying so a failed verification
+                // cannot turn into a retry loop.
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
 
-                match injected {
-                    Ok(()) => {
-                        // Phase 2 (the lone `\r`) and everything that used to
-                        // run right after it -- `verify_compaction`, the
-                        // `Event::Compact` announcement, the decision-log
-                        // entry -- are deferred to the tick that finds this
-                        // deadline has passed; see the drain step below.
-                        pending_submit = Some(PendingSubmit {
-                            deadline: Instant::now() + super::dash::pane::INJECTION_SUBMIT_DELAY,
-                            kind: PendingSubmitKind::Compact,
-                        });
+                // No transcript means no verification is possible, and a
+                // deadline spent polling a file nobody writes would block the
+                // pump for nothing.
+                let failure = match (injected, transcript.path()) {
+                    (Err(_), _) => Some("compact injection failed"),
+                    (Ok(()), None) => Some("no transcript reported, compaction unverifiable"),
+                    (Ok(()), Some(path)) => {
+                        let seen = verify_compaction(
+                            &mut Watcher::new(path.to_path_buf()),
+                            adapter.as_ref(),
+                            Instant::now() + inject_timeout,
+                        )
+                        .unwrap_or(false);
+                        if seen {
+                            None
+                        } else {
+                            Some("compaction not verified")
+                        }
                     }
-                    Err(_) => {
-                        // Phase 1 itself failed: no bytes are known to have
-                        // reached the child, so there is nothing to verify
-                        // and nothing pending -- finalize immediately, the
-                        // same "compact injection failed" outcome the
-                        // synchronous write used to report for this case.
-                        announcer.emit(&Event::Compact { verified: false });
-                        note_failure(
-                            supervision,
-                            Some((state_dir, session.as_str())),
-                            "compact injection failed",
-                            announcer,
-                        );
-                        let _ = super::log::append(
-                            state_dir,
-                            &super::log::Decision {
-                                ts: super::state::now_secs(),
-                                session: session.as_str(),
-                                verb: "wrap",
-                                verdict: "compact",
-                                score: supervision.score,
-                                action: "inject-unverified",
-                                detail: &transcript
-                                    .path()
-                                    .map(|path| path.display().to_string())
-                                    .unwrap_or_else(|| "no transcript reported".to_string()),
-                            },
-                        );
-                    }
+                };
+                let verified = failure.is_none();
+                announcer.emit(&Event::Compact { verified });
+
+                if let Some(reason) = failure {
+                    note_failure(
+                        supervision,
+                        Some((state_dir, session.as_str())),
+                        reason,
+                        announcer,
+                    );
                 }
+                let _ = super::log::append(
+                    state_dir,
+                    &super::log::Decision {
+                        ts: super::state::now_secs(),
+                        session: session.as_str(),
+                        verb: "wrap",
+                        verdict: "compact",
+                        score: supervision.score,
+                        action: if verified {
+                            "inject"
+                        } else {
+                            "inject-unverified"
+                        },
+                        detail: &transcript
+                            .path()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "no transcript reported".to_string()),
+                    },
+                );
             }
             Action::Restart => {
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
@@ -3286,36 +3113,29 @@ fn pump(
                         let landed = announcer.try_emit(&Event::MailWaiting { count });
                         mail_watch.note_announcement(&ids, landed);
                     }
+                    // Known residual (PR #116 follow-up): same single-burst
+                    // text+`\r` shape as `inject_compact` above, and the
+                    // same reason it stays that way -- see that function's
+                    // doc comment. Deferring this CR (commit 15a7db9,
+                    // reverted) also made `commit_injected` fire before the
+                    // child had genuinely consumed the advisory, which is
+                    // only correct once the write and the submit are one
+                    // atomic step again.
                     MailAction::Inject {
                         count,
                         from_agent,
                         from_short,
                         ids,
                     } => {
-                        // F4 (review, PR #116): phase 1 only, same reasoning
-                        // as `Action::Compact` above -- a single write of the
-                        // line plus its submitting `\r` is the same
-                        // paste-fold hazard on a codex-shaped composer.
-                        // `commit_injected` moves from "the write succeeded"
-                        // to "phase 2's `\r` actually landed", below: the old
-                        // code committed the instant this write returned
-                        // `Ok`, which -- once the write was split -- would
-                        // have marked the advisory delivered before the
-                        // child had even seen the keypress that submits it.
-                        let line = mail_advisory_line(count, &from_agent, &from_short);
+                        let bytes = mail_advisory_bytes(count, &from_agent, &from_short);
                         let wrote = match writer.lock() {
-                            Ok(mut sink) => sink
-                                .write_all(line.as_bytes())
-                                .and_then(|()| sink.flush())
-                                .is_ok(),
+                            Ok(mut sink) => {
+                                sink.write_all(&bytes).and_then(|()| sink.flush()).is_ok()
+                            }
                             Err(_) => false,
                         };
                         if wrote {
-                            pending_submit = Some(PendingSubmit {
-                                deadline: Instant::now()
-                                    + super::dash::pane::INJECTION_SUBMIT_DELAY,
-                                kind: PendingSubmitKind::MailAdvisory { ids },
-                            });
+                            mail_watch.commit_injected(&ids);
                         } else {
                             // Same R5 rule on the degrade path: a poisoned
                             // writer plus a swallowed announcement must leave
@@ -4974,55 +4794,6 @@ mod tests {
         assert_eq!(state.signals_seen, 0, "sanity: no signal ever arrived");
     }
 
-    /// Fix (PR #116 follow-up): the two Linux CI tests this backs
-    /// (`a_wrapped_session_is_advised_of_mail_without_its_body_and_without_
-    /// consuming_it`, `a_message_already_advised_into_the_session_is_never_
-    /// advised_again`) both timed out at CI's 180s hard limit rather than
-    /// failing their own much shorter `read_until` budgets -- the deferred
-    /// mail advisory's `\r` never landed, so the child never saw a complete
-    /// line to answer. Real-pty and Windows-gated, so this suite cannot run
-    /// them directly; what it *can* run everywhere is the one fact the fix
-    /// actually rests on -- `pending_submit_due` is a pure function of a
-    /// deadline and a clock, with no notion of "has the child produced any
-    /// bytes" anywhere in its signature or its body. Proven with a fake
-    /// clock (`Instant`s computed by hand, no real sleeping) rather than
-    /// letting `pump`'s child-output plumbing anywhere near it.
-    #[test]
-    fn pending_submit_due_depends_only_on_the_deadline_never_on_output() {
-        let now = Instant::now();
-
-        assert!(
-            !pending_submit_due(&None, now),
-            "nothing outstanding is never due"
-        );
-
-        let not_yet = PendingSubmit {
-            deadline: now + crate::commands::ctx::dash::pane::INJECTION_SUBMIT_DELAY,
-            kind: PendingSubmitKind::MailAdvisory {
-                ids: vec!["m1".to_string()],
-            },
-        };
-        assert!(
-            !pending_submit_due(&Some(not_yet), now),
-            "the settle gap has not elapsed yet"
-        );
-
-        // The precise regression: advance the clock past the deadline with
-        // *zero* child output, exactly what a quiet wrapped session looks
-        // like. A drain gated on anything derived from pty activity would
-        // stay false here forever; a drain gated purely on the deadline (what
-        // `pending_submit_due` is) flips true the instant the clock does.
-        let due = PendingSubmit {
-            deadline: now + crate::commands::ctx::dash::pane::INJECTION_SUBMIT_DELAY,
-            kind: PendingSubmitKind::Compact,
-        };
-        let quiet_child_later = now + crate::commands::ctx::dash::pane::INJECTION_SUBMIT_DELAY;
-        assert!(
-            pending_submit_due(&Some(due), quiet_child_later),
-            "due the instant the clock reaches the deadline, with no output at all"
-        );
-    }
-
     #[test]
     fn a_new_turn_clears_the_typing_flag() {
         let now = Instant::now();
@@ -5459,22 +5230,6 @@ mod tests {
         );
     }
 
-    /// F4 (review, PR #116): `wrap`'s production path no longer writes an
-    /// advisory's line and its submitting `\r` in one burst (the same
-    /// paste-fold bug F1/F2 fixed for `dash::pane`'s own injections --
-    /// see `MailAction::Inject`'s handling in `pump`), but the byte-shape
-    /// invariant these tests pin still holds identically across the two
-    /// writes: `mail_advisory_line`'s own text (phase 1, no control bytes of
-    /// its own) followed by `dash::pane::write_submit_cr`'s lone `\r`
-    /// (phase 2, the only control byte either write carries). Composed here
-    /// exactly the way production composes them, so these tests exercise
-    /// the real byte shape rather than a copy of it.
-    fn deferred_mail_advisory_bytes(count: usize, from_agent: &str, from_short: &str) -> Vec<u8> {
-        let mut bytes = mail_advisory_line(count, from_agent, from_short).into_bytes();
-        bytes.push(b'\r');
-        bytes
-    }
-
     #[test]
     fn a_mail_advisory_never_carries_a_message_body() {
         let facts = mail_facts(&[unread_message(
@@ -5488,7 +5243,7 @@ mod tests {
             "the body is dropped at the facts seam: {facts:?}"
         );
 
-        let bytes = deferred_mail_advisory_bytes(1, &facts[0].from_agent, &facts[0].from_short);
+        let bytes = mail_advisory_bytes(1, &facts[0].from_agent, &facts[0].from_short);
         let text = String::from_utf8(bytes).expect("utf8");
         assert!(
             !text.contains("do-not-type-this-body"),
@@ -5499,7 +5254,7 @@ mod tests {
 
     #[test]
     fn the_injected_advisory_is_one_line_ending_in_a_single_carriage_return() {
-        let bytes = deferred_mail_advisory_bytes(2, "claude", "aaaa1111");
+        let bytes = mail_advisory_bytes(2, "claude", "aaaa1111");
         let text = String::from_utf8(bytes).expect("utf8");
 
         assert!(text.ends_with('\r'), "a TUI submits on carriage return");
@@ -5529,7 +5284,7 @@ mod tests {
     #[test]
     fn a_sender_name_full_of_control_bytes_cannot_break_out_of_the_advisory_line() {
         let hostile = "evil\r/exit\r\u{1b}[2Jmore";
-        let bytes = deferred_mail_advisory_bytes(1, hostile, &"x".repeat(500));
+        let bytes = mail_advisory_bytes(1, hostile, &"x".repeat(500));
         let text = String::from_utf8(bytes).expect("utf8");
 
         assert_eq!(
