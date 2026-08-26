@@ -4376,10 +4376,30 @@ pub fn run_dashboard(
     // a leaked dir (plus a surviving pane's inherited `ZIRV_CTX_DASH_REQUESTS`)
     // would wedge every future `zirv chat`. Written right after the dir exists
     // and the env is set; removed with the whole token dir on a clean quit.
-    let _ = super::state::write_private(
+    //
+    // Fix round 1 (issue #144, codex): before `agent::try_join_dashboard`
+    // gained its own liveness gate, a failed write here was harmless -- the
+    // directory alone was enough for a request to be joined. Now it means
+    // "no `zirv ctx agent`/`zirv agent` invocation can ever join this
+    // dashboard", silently, for this dashboard's entire lifetime. Never
+    // fatal to the dashboard itself (never-make-it-worse: a dashboard that
+    // works but cannot be joined beats one that failed to start at all over
+    // a write it does not strictly need to run), but the operator has to be
+    // told, the same way the directory-creation failure just above already
+    // is.
+    if let Err(e) = super::state::write_private(
         &spawnreq::owner_pid_path(&requests_dir),
         &std::process::id().to_string(),
-    );
+    ) {
+        push_error(
+            &mut errors,
+            format!(
+                "dashboard: could not write {}, so no delegated agent can join this dashboard \
+                 (it will still run headless instead): {e}",
+                spawnreq::owner_pid_path(&requests_dir).display()
+            ),
+        );
+    }
     // And clear any sibling token dirs a previously-crashed dashboard left
     // whose owner pid is no longer alive (best-effort). Our own dir, whose pid
     // we just wrote and is alive, is never swept.

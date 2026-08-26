@@ -290,6 +290,46 @@ fn try_join_dashboard<W: Write>(
     if !dir.is_dir() {
         return None;
     }
+    // Issue #144: a clean quit removes this directory (`dash::on_quit`), but
+    // an abnormal exit (crash, kill) leaves it behind -- `dir.is_dir()` alone
+    // cannot tell the two apart. Without this check, a request got written
+    // into a dead dashboard's leftover directory, nobody was ever going to
+    // answer it, and this call burned the *entire* `ack_timeout` finding
+    // that out -- the exact "dashboard did not answer" symptom reported,
+    // even while some other, unrelated dashboard is genuinely running
+    // elsewhere. `sessions::dashboard_owner_liveness` is the same liveness
+    // test `sessions::nested_session_evidence` already applies to this exact
+    // directory-existence signal (see that function's own doc comment) --
+    // sharing it is what keeps the two readers of `DASH_REQUESTS_ENV` from
+    // disagreeing about what "live" means.
+    //
+    // Fix round 1 (both reviewers): this refusal used to be silent, matching
+    // the directory-missing case just above -- but that case means "no
+    // dashboard was ever here", while this one means "a directory that once
+    // WAS a dashboard channel is not one any more", which is exactly the
+    // ambiguity issue #144's own acceptance criteria asked to be made
+    // diagnosable. Named here, not folded into the generic "did not answer"
+    // wording below: this refusal is immediate (no ack ever attempted), so
+    // reusing that wording would falsely imply a timeout was waited out.
+    match super::sessions::dashboard_owner_liveness(&dir) {
+        super::sessions::OwnerLiveness::Live => {}
+        super::sessions::OwnerLiveness::Dead(pid) => {
+            eprintln!(
+                "zirv ctx agent: {} names a dashboard that already quit (owner.pid names dead \
+                 pid {pid}); running headless",
+                dir.display()
+            );
+            return None;
+        }
+        super::sessions::OwnerLiveness::Missing => {
+            eprintln!(
+                "zirv ctx agent: {} has no readable owner.pid, so no dashboard can be confirmed \
+                 live; running headless",
+                dir.display()
+            );
+            return None;
+        }
+    }
     // A pane is not a supervised headless run: the restart budget, the
     // wall-clock limit and the trailing `-- flags` all belong to
     // `exec::run_with`, and a `SpawnRequest` carries none of them. Silently
@@ -346,13 +386,19 @@ fn try_join_dashboard<W: Write>(
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
-        Err(_) => {
-            eprintln!("zirv ctx agent: dashboard did not answer; running headless");
+        Err(e) => {
+            eprintln!(
+                "zirv ctx agent: could not write a spawn request into {}: {e}; running headless",
+                dir.display()
+            );
             return None;
         }
     };
     let Some(stem) = spawnreq::request_stem(&path) else {
-        eprintln!("zirv ctx agent: dashboard did not answer; running headless");
+        eprintln!(
+            "zirv ctx agent: could not derive a request stem from {}; running headless",
+            path.display()
+        );
         return None;
     };
     match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
@@ -383,7 +429,11 @@ fn try_join_dashboard<W: Write>(
         //   double-run of the operator's task if this guessed the other way.
         None => {
             if std::fs::remove_file(&path).is_ok() {
-                eprintln!("zirv ctx agent: dashboard did not answer; running headless");
+                eprintln!(
+                    "zirv ctx agent: dashboard did not answer within {ack_timeout:?} (request \
+                     was {}); running headless",
+                    path.display()
+                );
                 return None;
             }
             wait_out_a_claimed_request(&dir, &stem, claim_extension, w)
@@ -1225,15 +1275,7 @@ mod tests {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-
-        let requests_dir = tmp.path().join("requests");
-        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
-
-        let mut env = base_env(&tmp.path().join("state"));
-        env.insert(
-            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
-            requests_dir.display().to_string(),
-        );
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
 
         let responder = std::thread::spawn({
             let dir = requests_dir.clone();
@@ -1302,15 +1344,7 @@ mod tests {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
-
-        let requests_dir = tmp.path().join("requests");
-        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
-
-        let mut env = base_env(&tmp.path().join("state"));
-        env.insert(
-            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
-            requests_dir.display().to_string(),
-        );
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
 
         let responder = std::thread::spawn({
             let dir = requests_dir.clone();
@@ -1335,9 +1369,21 @@ mod tests {
 
     /// A live requests directory, and the `AgentArgs`/env pair that reaches
     /// it: the shape every `try_join_dashboard`-level test below shares.
+    ///
+    /// Issue #144: also writes `owner.pid` naming this test process itself
+    /// (guaranteed live for as long as the test runs), matching the real
+    /// dashboard's own startup sequence -- `try_join_dashboard` now checks
+    /// `sessions::dashboard_owner_is_live` before using this channel at all,
+    /// so a "live" fixture with no pidfile would be refused before ever
+    /// reaching the responder every test below sets up.
     fn live_dashboard_dir(root: &Path) -> (PathBuf, HashMap<String, String>) {
         let requests_dir = root.join("requests");
         std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+        std::fs::write(
+            requests_dir.parent().expect("parent").join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write owner.pid");
         let mut env = base_env(&root.join("state"));
         env.insert(
             crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
@@ -1486,6 +1532,115 @@ mod tests {
         assert!(
             leftover.is_empty(),
             "the request must not be left for a later tick to pick up: {leftover:?}"
+        );
+    }
+
+    /// Issue #144: `sessions::nested_session_evidence` was hardened to treat
+    /// a `DASH_REQUESTS_ENV` directory whose `owner.pid` names a dead process
+    /// as no evidence of a live dashboard (see that module's own
+    /// `only_a_live_dashboard_owner_pidfile_counts_as_a_dashboard_owner`),
+    /// but `try_join_dashboard` was never updated to match: it only ever
+    /// checked `dir.is_dir()`. A directory a crashed or force-quit dashboard
+    /// left behind (a clean quit removes it; an abnormal exit does not) is
+    /// therefore wrongly treated as a live channel by this side of the
+    /// rendezvous -- a request is written into it, nobody is listening, and
+    /// the caller burns the *entire* ack timeout finding that out. That is
+    /// exactly the "dashboard did not answer" symptom the issue reports, and
+    /// it fires even while some other, unrelated dashboard is genuinely
+    /// running elsewhere.
+    #[test]
+    fn a_dead_dashboards_leftover_directory_is_refused_immediately() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+        std::fs::write(
+            requests_dir.parent().expect("parent").join("owner.pid"),
+            crate::commands::ctx::testenv::dead_pid().to_string(),
+        )
+        .expect("write owner.pid");
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let started = std::time::Instant::now();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(
+            joined.is_none(),
+            "no live dashboard owns this directory; falls back to headless"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a dead dashboard's leftover directory must be refused immediately, never waited \
+             out against the full ack timeout"
+        );
+        assert!(
+            std::fs::read_dir(&requests_dir)
+                .expect("read requests dir")
+                .flatten()
+                .next()
+                .is_none(),
+            "no request may be written into a dead dashboard's directory at all"
+        );
+    }
+
+    /// The other half of `dashboard_owner_liveness`'s three-way split: a
+    /// requests directory with no `owner.pid` at all (rather than one naming
+    /// a dead pid) must be refused exactly the same way -- immediately, with
+    /// no request ever written. Distinct code path from the dead-pid test
+    /// above (`OwnerLiveness::Missing` vs `OwnerLiveness::Dead`), so both are
+    /// covered rather than assuming one implies the other.
+    #[test]
+    fn a_dashboard_directory_with_no_owner_pid_is_refused_immediately() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        // Deliberately not `live_dashboard_dir`: this is exactly the one
+        // thing it always writes that this test needs absent.
+        let requests_dir = tmp.path().join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            requests_dir.display().to_string(),
+        );
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let started = std::time::Instant::now();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(
+            joined.is_none(),
+            "no owner.pid means no dashboard can be confirmed live; falls back to headless"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a missing owner.pid must be refused immediately, never waited out against the \
+             full ack timeout"
+        );
+        assert!(
+            std::fs::read_dir(&requests_dir)
+                .expect("read requests dir")
+                .flatten()
+                .next()
+                .is_none(),
+            "no request may be written when no dashboard owner can be confirmed"
         );
     }
 
