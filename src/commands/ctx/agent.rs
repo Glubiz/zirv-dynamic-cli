@@ -13,7 +13,7 @@
 //! taught to delegate further.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::CtxResult;
@@ -267,16 +267,19 @@ const EXIT_DASH_UNCONFIRMED: i32 = 1;
 /// caller's own headless path must NOT run.
 ///
 /// `None` means the caller falls through to today's headless behavior
-/// unchanged, which covers: no dashboard to ask (env unset, or the directory
-/// is gone -- both silent, byte-for-byte the pre-Task-11 behavior); options a
-/// pane cannot honour (`--max-restarts`/`--timeout-secs`/`-- flags` other than
-/// a lone `--model` pin, notice printed); a prompt that would be misread as a
-/// flag (notice printed); a request that could not even be written (notice
-/// printed); an unclaimed ack
-/// timeout (notice printed, since that is a live channel that simply did not
-/// respond); and a `retryable` refusal, where the dashboard has answered that
-/// it spawned nothing for a reason that says nothing about whether the task
-/// may run (O2).
+/// unchanged, which covers: no dashboard channel at all (`DASH_REQUESTS_ENV`
+/// unset -- silent, byte-for-byte the pre-Task-11 behavior); the inherited
+/// directory absent or its owner dead, AND issue #145's own fallback scan of
+/// every other `<state>/dash/*` token directory (`live_join_target`) also
+/// found nothing live (notice printed, naming every candidate considered);
+/// options a pane cannot honour (`--max-restarts`/`--timeout-secs`/`--
+/// flags` other than a lone `--model` pin, notice printed); a prompt that
+/// would be misread as a flag (notice printed); a request that could not
+/// even be written (notice printed); an unclaimed ack timeout (notice
+/// printed, since that is a live channel that simply did not respond); and a
+/// `retryable` refusal, where the dashboard has answered that it spawned
+/// nothing for a reason that says nothing about whether the task may run
+/// (O2).
 fn try_join_dashboard<W: Write>(
     args: &AgentArgs,
     prompt: &str,
@@ -286,50 +289,8 @@ fn try_join_dashboard<W: Write>(
     ack_timeout: Duration,
     claim_extension: Duration,
 ) -> Option<CtxResult<i32>> {
-    let dir = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from)?;
-    if !dir.is_dir() {
-        return None;
-    }
-    // Issue #144: a clean quit removes this directory (`dash::on_quit`), but
-    // an abnormal exit (crash, kill) leaves it behind -- `dir.is_dir()` alone
-    // cannot tell the two apart. Without this check, a request got written
-    // into a dead dashboard's leftover directory, nobody was ever going to
-    // answer it, and this call burned the *entire* `ack_timeout` finding
-    // that out -- the exact "dashboard did not answer" symptom reported,
-    // even while some other, unrelated dashboard is genuinely running
-    // elsewhere. `sessions::dashboard_owner_liveness` is the same liveness
-    // test `sessions::nested_session_evidence` already applies to this exact
-    // directory-existence signal (see that function's own doc comment) --
-    // sharing it is what keeps the two readers of `DASH_REQUESTS_ENV` from
-    // disagreeing about what "live" means.
-    //
-    // Fix round 1 (both reviewers): this refusal used to be silent, matching
-    // the directory-missing case just above -- but that case means "no
-    // dashboard was ever here", while this one means "a directory that once
-    // WAS a dashboard channel is not one any more", which is exactly the
-    // ambiguity issue #144's own acceptance criteria asked to be made
-    // diagnosable. Named here, not folded into the generic "did not answer"
-    // wording below: this refusal is immediate (no ack ever attempted), so
-    // reusing that wording would falsely imply a timeout was waited out.
-    match super::sessions::dashboard_owner_liveness(&dir) {
-        super::sessions::OwnerLiveness::Live => {}
-        super::sessions::OwnerLiveness::Dead(pid) => {
-            eprintln!(
-                "zirv ctx agent: {} names a dashboard that already quit (owner.pid names dead \
-                 pid {pid}); running headless",
-                dir.display()
-            );
-            return None;
-        }
-        super::sessions::OwnerLiveness::Missing => {
-            eprintln!(
-                "zirv ctx agent: {} has no readable owner.pid, so no dashboard can be confirmed \
-                 live; running headless",
-                dir.display()
-            );
-            return None;
-        }
-    }
+    let inherited = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from)?;
+    let dir = live_join_target(&inherited, env)?;
     // A pane is not a supervised headless run: the restart budget, the
     // wall-clock limit and the trailing `-- flags` all belong to
     // `exec::run_with`, and a `SpawnRequest` carries none of them. Silently
@@ -437,6 +398,134 @@ fn try_join_dashboard<W: Write>(
                 return None;
             }
             wait_out_a_claimed_request(&dir, &stem, claim_extension, w)
+        }
+    }
+}
+
+/// The requests directory `try_join_dashboard` should actually offer the
+/// spawn request to, given the one directory it inherited via
+/// `DASH_REQUESTS_ENV` (`inherited`).
+///
+/// The inherited directory is tried first, exactly as before issue #145:
+/// absent outright, or present with a dead/missing `owner.pid`, both refuse
+/// immediately -- no ack wait is ever spent probing a directory that was
+/// never going to answer (issue #144's own fix). Only past that point does
+/// issue #145's fallback run: every OTHER `<state>/dash/*` token directory is
+/// scanned (`dash::discover_live_dash_dirs`) for a live dashboard to offer
+/// the request to instead. The case this recovers: a dashboard restarted (a
+/// fresh token dir, a fresh `owner.pid`) while this process's own shell still
+/// carries the old, now-dead `DASH_REQUESTS_ENV` value inherited from before
+/// the restart -- without this fallback the worker went silently headless
+/// even though a perfectly live dashboard was one directory away.
+///
+/// Selection rule (`dash::select_live_dash_dir`): the live candidate whose
+/// `owner.pid` has the newest mtime wins (`owner.pid` is written exactly
+/// once, at dashboard startup, so its mtime is that dashboard's own start
+/// time -- i.e. the most recently started dashboard wins), tied broken by
+/// the lexicographically greatest `<dash_short>-<token>` directory name for a
+/// deterministic pick when two dashboards start within the filesystem's own
+/// mtime resolution. Deliberately NOT filtered or weighted by the
+/// requester's own repo: a candidate whose repo does not match this
+/// request's `cwd` is not wasted effort to join -- `fulfill_spawn_request`'s
+/// `accepted_spawn_cwd` gate refuses such a request outright with a
+/// `retryable` ack, which `answer_for_ack` already reads as "fall back to
+/// headless" rather than a hard failure, and any request that gate DOES
+/// accept always spawns its pane at the request's own `cwd`, never the
+/// dashboard's own -- so joining a dashboard hosting a different repo is
+/// display-only (the pane simply appears in that dashboard's own sidebar)
+/// and can never misroute the task's working directory. See `dash::
+/// discover_live_dash_dirs`'s own doc comment for the full argument.
+///
+/// Every candidate considered (the inherited directory, and every fallback
+/// one) is logged via `eprintln`, live or not and whichever way this
+/// resolves -- issue #145's own acceptance criterion is that "my pane never
+/// appeared" must be diagnosable from this process's own log alone, with no
+/// need to go spelunking through dashboard-side state to find out why.
+///
+/// `None` only when nothing usable was found anywhere; the caller's existing
+/// headless fallback then runs unchanged.
+fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
+    if inherited.is_dir() {
+        match super::sessions::dashboard_owner_liveness(inherited) {
+            super::sessions::OwnerLiveness::Live => return Some(inherited.to_path_buf()),
+            super::sessions::OwnerLiveness::Dead(pid) => {
+                eprintln!(
+                    "zirv ctx agent: {} names a dashboard that already quit (owner.pid names \
+                     dead pid {pid}); looking for another live dashboard",
+                    inherited.display()
+                );
+            }
+            super::sessions::OwnerLiveness::Missing => {
+                eprintln!(
+                    "zirv ctx agent: {} has no readable owner.pid, so no dashboard can be \
+                     confirmed live; looking for another live dashboard",
+                    inherited.display()
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "zirv ctx agent: {} (inherited via {}) no longer exists; looking for another live \
+             dashboard",
+            inherited.display(),
+            spawnreq::DASH_REQUESTS_ENV
+        );
+    }
+
+    let state = match super::state::StateDir::resolve(env) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!(
+                "zirv ctx agent: could not resolve the state dir to look for another live \
+                 dashboard: {e}; running headless"
+            );
+            return None;
+        }
+    };
+    // The inherited directory may itself live under `state.dash()` and would
+    // otherwise show up a second time here, already explained above -- this
+    // keeps the fallback log free of a duplicate line for the very directory
+    // whose rejection reason was just printed.
+    let others: Vec<super::dash::DashCandidate> = super::dash::discover_live_dash_dirs(&state)
+        .into_iter()
+        .filter(|c| c.requests_dir != inherited)
+        .collect();
+    for candidate in &others {
+        match candidate.status {
+            super::dash::CandidateStatus::Live { .. } => {}
+            super::dash::CandidateStatus::NoOwnerPid => eprintln!(
+                "zirv ctx agent: candidate {} has no owner.pid; skipped",
+                candidate.requests_dir.display()
+            ),
+            super::dash::CandidateStatus::DeadOwner(pid) => eprintln!(
+                "zirv ctx agent: candidate {} names dead pid {pid}; skipped",
+                candidate.requests_dir.display()
+            ),
+        }
+    }
+    match super::dash::select_live_dash_dir(&others) {
+        Some(winner) => {
+            eprintln!(
+                "zirv ctx agent: joining {} instead",
+                winner.requests_dir.display()
+            );
+            Some(winner.requests_dir.clone())
+        }
+        None => {
+            let considered: Vec<String> = others
+                .iter()
+                .map(|c| c.requests_dir.display().to_string())
+                .collect();
+            eprintln!(
+                "zirv ctx agent: no other live dashboard found under {} ({}); running headless",
+                state.dash().display(),
+                if considered.is_empty() {
+                    "no other candidates".to_string()
+                } else {
+                    format!("candidates: {}", considered.join(", "))
+                }
+            );
+            None
         }
     }
 }
@@ -1987,5 +2076,226 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(!msg.is_empty(), "got an error with no message at all");
+    }
+
+    // Issue #145: dashboard discovery fallback. `try_join_dashboard` used to
+    // give up the moment its own inherited `DASH_REQUESTS_ENV` directory was
+    // absent or its owner dead, even when a perfectly live dashboard was
+    // sitting right next to it under `<state>/dash/*` -- the shape left
+    // behind by a dashboard restart, where a pane's own child shell still
+    // carries the old, now-stale env value. These tests build that layout
+    // directly under `<state>/dash/`, matching `StateDir::dash()`'s own
+    // production form, rather than `live_dashboard_dir`'s arbitrary single
+    // directory (which only ever stood in for the one inherited channel).
+
+    #[test]
+    fn a_dead_inherited_dashboard_falls_back_to_a_live_sibling() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+
+        let old_requests = state_dir
+            .join("dash")
+            .join("aaaa1111-oldtoken")
+            .join("requests");
+        std::fs::create_dir_all(&old_requests).expect("mkdir old requests");
+        std::fs::write(
+            old_requests.parent().expect("parent").join("owner.pid"),
+            crate::commands::ctx::testenv::dead_pid().to_string(),
+        )
+        .expect("write dead owner.pid");
+
+        let new_requests = state_dir
+            .join("dash")
+            .join("bbbb2222-newtoken")
+            .join("requests");
+        std::fs::create_dir_all(&new_requests).expect("mkdir new requests");
+        std::fs::write(
+            new_requests.parent().expect("parent").join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write live owner.pid");
+
+        let mut env = base_env(&state_dir);
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            old_requests.display().to_string(),
+        );
+
+        let responder = std::thread::spawn({
+            let dir = new_requests.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"cafe1234","reason":null}"#)
+        });
+
+        let args = joinable_args("claude", "delegated after a dashboard restart");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("falls back to the live sibling dashboard");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8_lossy(&out);
+        assert!(
+            output.contains("spawned in dashboard as cafe1234"),
+            "got {output}"
+        );
+        assert!(
+            request_body.contains("delegated after a dashboard restart"),
+            "the request must actually land in the live sibling's own requests dir: \
+             {request_body}"
+        );
+        assert!(
+            std::fs::read_dir(&old_requests)
+                .expect("read old requests dir")
+                .flatten()
+                .next()
+                .is_none(),
+            "the dead dashboard's own directory must stay untouched"
+        );
+    }
+
+    #[test]
+    fn two_live_siblings_pick_the_most_recently_started_dashboard() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+
+        // The inherited directory is simply gone (e.g. the operator quit that
+        // dashboard outright) -- both candidates below are genuine fallback
+        // siblings, neither privileged by being "the inherited one".
+        let inherited = state_dir
+            .join("dash")
+            .join("aaaa1111-goneinherited")
+            .join("requests");
+
+        let older = state_dir
+            .join("dash")
+            .join("bbbb2222-oldertoken")
+            .join("requests");
+        let newer = state_dir
+            .join("dash")
+            .join("cccc3333-newertoken")
+            .join("requests");
+        std::fs::create_dir_all(&older).expect("mkdir older");
+        std::fs::create_dir_all(&newer).expect("mkdir newer");
+        let older_owner = older.parent().expect("parent").join("owner.pid");
+        let newer_owner = newer.parent().expect("parent").join("owner.pid");
+        std::fs::write(&older_owner, std::process::id().to_string()).expect("write older owner");
+        std::fs::write(&newer_owner, std::process::id().to_string()).expect("write newer owner");
+
+        let base = std::time::SystemTime::now();
+        std::fs::File::options()
+            .write(true)
+            .open(&older_owner)
+            .expect("open older owner.pid")
+            .set_modified(base)
+            .expect("set_modified older");
+        std::fs::File::options()
+            .write(true)
+            .open(&newer_owner)
+            .expect("open newer owner.pid")
+            .set_modified(base + std::time::Duration::from_secs(5))
+            .expect("set_modified newer");
+
+        let mut env = base_env(&state_dir);
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            inherited.display().to_string(),
+        );
+
+        let responder = std::thread::spawn({
+            let dir = newer.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"feed5678","reason":null}"#)
+        });
+
+        let args = joinable_args("claude", "go to the newest dashboard");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("falls back to the most recently started sibling");
+        responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8_lossy(&out);
+        assert!(
+            output.contains("spawned in dashboard as feed5678"),
+            "the newer-mtime sibling must be the one selected: {output}"
+        );
+        assert!(
+            std::fs::read_dir(&older)
+                .expect("read older requests dir")
+                .flatten()
+                .next()
+                .is_none(),
+            "the older sibling must never receive a request when a newer one exists"
+        );
+    }
+
+    /// The other half of issue #145: when nothing under `<state>/dash/*` is
+    /// live either, the fallback gives up (`None`) exactly like before this
+    /// issue's fix -- and the reasons behind that are structured data
+    /// (`dash::DashCandidate`/`CandidateStatus`), not only an `eprintln` a
+    /// test has no seam to observe.
+    #[test]
+    fn no_live_dashboard_anywhere_falls_back_to_headless_with_reasons_available() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state_dir = tmp.path().join("state");
+
+        let dead = state_dir
+            .join("dash")
+            .join("aaaa1111-deadtoken")
+            .join("requests");
+        let ownerless = state_dir
+            .join("dash")
+            .join("bbbb2222-noownertoken")
+            .join("requests");
+        std::fs::create_dir_all(&dead).expect("mkdir dead");
+        std::fs::create_dir_all(&ownerless).expect("mkdir ownerless");
+        let dead_pid_value = crate::commands::ctx::testenv::dead_pid();
+        std::fs::write(
+            dead.parent().expect("parent").join("owner.pid"),
+            dead_pid_value.to_string(),
+        )
+        .expect("write dead owner.pid");
+        // `ownerless` deliberately gets no `owner.pid` at all.
+
+        let inherited = state_dir
+            .join("dash")
+            .join("cccc3333-goneinherited")
+            .join("requests");
+        let env = base_env(&state_dir);
+
+        let target = live_join_target(&inherited, &|k| env.get(k).cloned());
+        assert!(
+            target.is_none(),
+            "no live dashboard exists anywhere, so the fallback must give up"
+        );
+
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir);
+        let candidates = crate::commands::ctx::dash::discover_live_dash_dirs(&state);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "both candidates are still reported, not silently dropped: {candidates:?}"
+        );
+        let dead_status = candidates
+            .iter()
+            .find(|c| c.requests_dir == dead)
+            .expect("dead candidate present")
+            .status;
+        assert_eq!(
+            dead_status,
+            crate::commands::ctx::dash::CandidateStatus::DeadOwner(dead_pid_value)
+        );
+        let ownerless_status = candidates
+            .iter()
+            .find(|c| c.requests_dir == ownerless)
+            .expect("ownerless candidate present")
+            .status;
+        assert_eq!(
+            ownerless_status,
+            crate::commands::ctx::dash::CandidateStatus::NoOwnerPid
+        );
     }
 }

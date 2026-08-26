@@ -555,15 +555,37 @@ pub enum Liveness {
     Stale,
 }
 
+/// Signal-0 liveness probe (`kill -0`, the same check a shell's own `kill -0
+/// <pid>` makes: existence and permission only, nothing is actually sent).
+///
+/// Issue #146: a plain `kill() == 0` check reads a non-zero return as "dead"
+/// outright, which conflates two very different errno values. `ESRCH` (no
+/// such process) genuinely does mean dead. `EPERM` means the process exists
+/// but this caller lacks permission to signal it -- exactly what a sandboxed
+/// `zirv ctx send`/`zirv ctx nudge`, running as a Bash-tool child inside a
+/// dash pane, gets when probing the very sessions it is trying to reach.
+/// Treating that as "dead" made `list` sweep every live record as `Stale`,
+/// so `resolve_prefix` saw zero `Live` candidates and every send/nudge
+/// failed with "no sessions are registered" -- issue #146's exact symptom,
+/// with genuinely live sessions sitting right there in the registry.
+///
+/// `pub(crate)`: the single liveness check shared by this whole module
+/// (`dashboard_owner_liveness`, `short_is_live`, `list`) and, since issue
+/// #145/#146's fix, by `dash::mod` too (`sweep_stale_token_dirs` and its own
+/// discovery scan) -- which used to carry an independent, identically
+/// EPERM-blind copy of this exact check rather than importing this one.
 #[cfg(unix)]
-fn is_alive(pid: u32) -> bool {
+pub(crate) fn is_alive(pid: u32) -> bool {
     // SAFETY: signal 0 sends nothing; it only probes existence and
     // permission, the same check `kill -0` makes from a shell.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]
-fn is_alive(pid: u32) -> bool {
+pub(crate) fn is_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -583,7 +605,7 @@ fn is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn is_alive(_pid: u32) -> bool {
+pub(crate) fn is_alive(_pid: u32) -> bool {
     // No portable liveness check: never sweep a record this platform cannot
     // actually verify.
     true
@@ -825,6 +847,38 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
+/// Extends a [`ResolveError`]'s own display text with where the registry was
+/// actually checked -- the state dir's `sessions()` subdirectory -- and
+/// whether `ZIRV_CTX_STATE_DIR` pinned it or the platform default was used.
+///
+/// Issue #146: "no sessions are registered" alone gives no way to tell "the
+/// registry really is empty" apart from "this call resolved a different
+/// state dir than the one the session actually registered under" -- which is
+/// exactly the shape of the EPERM-blind liveness bug this same issue fixed
+/// (see `is_alive`'s own doc comment): a caller and the supervisor it means
+/// to reach can end up looking at different state dirs, or the same dir
+/// while one of them can no longer confirm the other alive, and either way
+/// the operator sees the identical unhelpful message. Appended, not
+/// substituted: the existing `{err}` text stays the prefix, so anything
+/// already asserting on it keeps passing (`send`/`nudge`'s own call sites).
+pub fn resolve_error_with_diagnostics(
+    err: &ResolveError,
+    state: &StateDir,
+    env: EnvLookup<'_>,
+) -> String {
+    let state_env_note = match non_empty(env(super::state::STATE_ENV)) {
+        Some(_) => format!("{} is set", super::state::STATE_ENV),
+        None => format!(
+            "{} is not set (using the platform default state dir)",
+            super::state::STATE_ENV
+        ),
+    };
+    format!(
+        "{err} (registry checked at {}; {state_env_note})",
+        state.sessions().display()
+    )
+}
+
 /// Resolves a short-id (or full session-id) prefix to the one live record it
 /// names. Only live records are candidates: a stale one has already been
 /// swept from disk by the time a caller could act on it.
@@ -1026,8 +1080,12 @@ pub fn run_nudge_with<W: Write>(
     // filters to live records (a stale one was swept from disk by the time a
     // caller could act on it), so an unknown *or* dead session both surface
     // as the same `NotFound`, naming what is actually there instead.
-    let record =
-        resolve_prefix(&state, &args.prefix).map_err(|e| format!("zirv ctx nudge: {e}"))?;
+    let record = resolve_prefix(&state, &args.prefix).map_err(|e| {
+        format!(
+            "zirv ctx nudge: {}",
+            resolve_error_with_diagnostics(&e, &state, env)
+        )
+    })?;
 
     // NEW-3: a supervisor with no turn-signal socket claims no wake-up
     // markers, so it cannot act on a nudge *or* advise about one -- the
@@ -2066,6 +2124,48 @@ mod tests {
         assert!(refusal.contains("none registered"), "got {refusal}");
     }
 
+    /// Issue #146: the same diagnostic extension as `mail::run_send_with`'s
+    /// own regression test -- a prefix long enough to pass the minimum-length
+    /// guard but matching no live session must name the state dir it was
+    /// actually checked against, not just say "no sessions are registered".
+    #[test]
+    fn an_unresolvable_nudge_prefix_names_the_state_dir_it_was_checked_against() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+
+        let args = NudgeArgs {
+            prefix: "dead0000".to_string(),
+            message: Some("wake up".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect_err("no session is registered under this empty state dir");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no sessions are registered"),
+            "the existing message text stays the prefix: {msg}"
+        );
+        let state = state_in(&state_dir);
+        assert!(
+            msg.contains(&state.sessions().display().to_string()),
+            "must name the registry path actually checked: {msg}"
+        );
+        assert!(
+            msg.contains(super::super::state::STATE_ENV),
+            "must say whether ZIRV_CTX_STATE_DIR was set: {msg}"
+        );
+    }
+
     // NEW-2: the delivery address each supervisor lists its own mail under.
     // Reverting a seam to `None` (loop's old behavior) or to
     // `short_id(current session)` (exec's old behavior) has to break
@@ -2327,6 +2427,36 @@ mod tests {
         )
         .expect("write owner.pid");
         assert_eq!(dashboard_owner_liveness(&live), OwnerLiveness::Live);
+    }
+
+    /// Issue #146: `is_alive` must read `EPERM` (the process exists, this
+    /// caller just cannot signal it) as alive, not dead. Pid 1 is owned by
+    /// root, exists on every unix box, and -- for a non-root caller, which is
+    /// what CI and a sandboxed `zirv ctx send` both run as -- `kill(1, 0)`
+    /// returns exactly `EPERM`. Skipped only for the (rare, unsandboxed) case
+    /// of running as root, where `kill(1, 0)` succeeds outright and the
+    /// assertion holds anyway for a different reason -- so root does not
+    /// need its own branch, only its own explanatory skip.
+    #[cfg(unix)]
+    #[test]
+    fn eperm_against_a_real_process_reads_as_alive_not_dead() {
+        // SAFETY: `geteuid` takes no arguments and only reads process state.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, kill(1, 0) succeeds outright");
+            return;
+        }
+        assert!(
+            is_alive(1),
+            "pid 1 exists and is owned by root; a non-root caller's kill(1, 0) is EPERM, which \
+             must read as alive"
+        );
+    }
+
+    /// The other half: a pid that has genuinely exited (spawned, waited on)
+    /// must still read as dead. `EPERM` must not have swallowed `ESRCH` too.
+    #[test]
+    fn a_waited_on_pid_reads_as_dead() {
+        assert!(!is_alive(dead_pid()));
     }
 
     #[test]

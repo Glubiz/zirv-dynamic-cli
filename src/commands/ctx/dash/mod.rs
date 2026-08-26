@@ -1979,44 +1979,6 @@ fn spawn_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
 }
 
-/// Best-effort process-liveness probe, replicated from `sessions::is_alive`
-/// (private there) so the dashboard's stale-token-dir sweep can decide whether
-/// an `owner.pid` still names a live dashboard without reaching into another
-/// module. Same semantics: an unverifiable platform never reports "dead", so a
-/// dir is never swept on a guess.
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 sends nothing; it only probes existence/permission, the
-    // same check `kill -0` makes from a shell.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    // SAFETY: `handle` is null-checked before any further call, and `code` is
-    // only read after a successful `GetExitCodeProcess`.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let mut code: u32 = 0;
-        let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
-        CloseHandle(handle);
-        alive
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn pid_alive(_pid: u32) -> bool {
-    // No portable probe: never sweep a token dir this platform cannot verify.
-    true
-}
-
 /// CROSS-CUTTING (shared with the supervisor): removes every
 /// `<state>/dash/<short>-<token>` token directory whose `owner.pid` names a
 /// process no longer alive -- a leak from a dashboard that exited abnormally
@@ -2045,10 +2007,110 @@ fn sweep_stale_token_dirs(state: &StateDir) {
         let Ok(pid) = contents.trim().parse::<u32>() else {
             continue;
         };
-        if !pid_alive(pid) {
+        if !sessions::is_alive(pid) {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+}
+
+/// Why one `<state>/dash/*` token directory [`discover_live_dash_dirs`] found
+/// was, or was not, usable -- issue #145's own acceptance criterion ("my pane
+/// never appeared" must be diagnosable from the worker's own log alone) needs
+/// the reason, not just a filtered list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateStatus {
+    /// `started_at` is `owner.pid`'s own mtime. The file is written exactly
+    /// once, at dashboard startup (`run_dashboard`), so its mtime IS that
+    /// dashboard's start time -- used only to rank live candidates against
+    /// each other, never compared against a clock.
+    Live {
+        started_at: std::time::SystemTime,
+    },
+    NoOwnerPid,
+    DeadOwner(u32),
+}
+
+/// One `<state>/dash/<dash_short>-<token>` token directory [`discover_live_
+/// dash_dirs`] considered, and what it found for that directory's own
+/// `requests/` subdirectory -- the same path a live join would write a
+/// `spawnreq::SpawnRequest` into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DashCandidate {
+    pub requests_dir: PathBuf,
+    pub status: CandidateStatus,
+}
+
+/// Issue #145: every `<state>/dash/*` token directory, live or not --
+/// `agent::try_join_dashboard`'s own fallback scan for when the single
+/// directory it inherited via `DASH_REQUESTS_ENV` turned out to be absent or
+/// its `owner.pid` dead. Modeled on [`sweep_stale_token_dirs`]'s identical
+/// walk of the same tree, but reporting rather than deleting: a candidate
+/// this call distrusts is not this function's business to remove, only to
+/// describe -- it never mutates the filesystem, and never blocks on
+/// anything.
+///
+/// Deliberately does not filter or weight candidates by the requester's own
+/// repo. A request whose `cwd` names neither this dashboard's own repo nor a
+/// linked `git worktree add` sibling of it is refused outright by
+/// `fulfill_spawn_request`'s own `accepted_spawn_cwd` gate, with a
+/// `retryable` ack (`SpawnRefusal::channel`) that `agent::answer_for_ack`
+/// already reads as "fall back to headless" rather than a hard failure --
+/// and any request that gate DOES accept always spawns its pane at the
+/// request's own `cwd`, never at the dashboard's own (`accepted_spawn_cwd`'s
+/// own doc comment: "The accepted pane cwd is always `req_cwd`, never
+/// `repo`"). So joining a dashboard hosting a different repo costs at most
+/// one extra round-trip before falling back headless anyway, and can never
+/// misroute the task's working directory -- it is display-only (the pane
+/// simply appears in that other dashboard's own sidebar). See `agent::
+/// live_join_target`'s own doc comment for the selection rule this feeds.
+pub(crate) fn discover_live_dash_dirs(state: &StateDir) -> Vec<DashCandidate> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(state.dash()) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let owner_pid_path = dir.join("owner.pid");
+        let status = std::fs::read_to_string(&owner_pid_path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u32>().ok())
+            .map(|pid| {
+                if !sessions::is_alive(pid) {
+                    return CandidateStatus::DeadOwner(pid);
+                }
+                let started_at = std::fs::metadata(&owner_pid_path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                CandidateStatus::Live { started_at }
+            })
+            .unwrap_or(CandidateStatus::NoOwnerPid);
+        found.push(DashCandidate {
+            requests_dir: dir.join("requests"),
+            status,
+        });
+    }
+    found
+}
+
+/// The winner among [`discover_live_dash_dirs`]'s own candidates: the live
+/// one whose `owner.pid` has the newest mtime (the most recently started
+/// dashboard), tie-broken by comparing `requests_dir` itself -- every
+/// candidate shares the same `<state>/dash/` prefix and `/requests` suffix,
+/// so this is exactly a lexicographic comparison of the `<dash_short>-
+/// <token>` directory name in between, for a deterministic pick when two
+/// dashboards start within the filesystem's own mtime resolution.
+pub(crate) fn select_live_dash_dir(candidates: &[DashCandidate]) -> Option<&DashCandidate> {
+    candidates
+        .iter()
+        .filter_map(|c| match c.status {
+            CandidateStatus::Live { started_at } => Some((c, started_at)),
+            _ => None,
+        })
+        .max_by(|(a, sa), (b, sb)| sa.cmp(sb).then_with(|| a.requests_dir.cmp(&b.requests_dir)))
+        .map(|(c, _)| c)
 }
 
 /// `std::process::Command` -> the flat `program, arg, arg, ...` form
@@ -12485,6 +12547,112 @@ mod tests {
 
         assert!(!dead.exists(), "the dead-owner token dir is swept");
         assert!(live.exists(), "the live-owner token dir is kept");
+    }
+
+    /// Issue #145: `discover_live_dash_dirs` reports every token dir it
+    /// finds, tagged with why -- unlike `sweep_stale_token_dirs` above, it
+    /// must never delete anything, since a dead or ownerless candidate here
+    /// is still worth logging to the operator.
+    #[test]
+    fn discover_live_dash_dirs_reports_every_candidate_without_touching_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        std::fs::create_dir_all(state.dash()).expect("mkdir dash");
+
+        let dead = state.dash().join("aaaa1111-deadtoken");
+        let live = state.dash().join("bbbb2222-livetoken");
+        let ownerless = state.dash().join("cccc3333-notokenowner");
+        std::fs::create_dir_all(&dead).expect("mkdir dead");
+        std::fs::create_dir_all(&live).expect("mkdir live");
+        std::fs::create_dir_all(&ownerless).expect("mkdir ownerless");
+        let dead_pid_value = dead_pid();
+        std::fs::write(dead.join("owner.pid"), dead_pid_value.to_string()).expect("write dead pid");
+        std::fs::write(live.join("owner.pid"), std::process::id().to_string())
+            .expect("write live pid");
+
+        let found = discover_live_dash_dirs(&state);
+        assert_eq!(found.len(), 3, "every token dir is reported: {found:?}");
+        assert!(dead.exists(), "nothing was swept by a discovery call");
+        assert!(live.exists());
+        assert!(ownerless.exists());
+
+        let status_for = |dir: &std::path::Path| {
+            found
+                .iter()
+                .find(|c| c.requests_dir == dir.join("requests"))
+                .map(|c| c.status)
+                .expect("candidate present")
+        };
+        assert_eq!(
+            status_for(&dead),
+            CandidateStatus::DeadOwner(dead_pid_value)
+        );
+        assert!(matches!(status_for(&live), CandidateStatus::Live { .. }));
+        assert_eq!(status_for(&ownerless), CandidateStatus::NoOwnerPid);
+    }
+
+    /// The selection rule `agent::live_join_target` relies on: newest
+    /// `owner.pid` mtime wins among live candidates, dead/ownerless ones are
+    /// never selectable, and an all-dead/absent set of candidates selects
+    /// nothing at all.
+    #[test]
+    fn select_live_dash_dir_picks_the_newest_live_owner() {
+        let older = DashCandidate {
+            requests_dir: PathBuf::from("/state/dash/aaaa-1/requests"),
+            status: CandidateStatus::Live {
+                started_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            },
+        };
+        let newer = DashCandidate {
+            requests_dir: PathBuf::from("/state/dash/bbbb-2/requests"),
+            status: CandidateStatus::Live {
+                started_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+            },
+        };
+        let dead = DashCandidate {
+            requests_dir: PathBuf::from("/state/dash/cccc-3/requests"),
+            status: CandidateStatus::DeadOwner(999_999),
+        };
+
+        let candidates = [older.clone(), newer.clone(), dead];
+        let winner = select_live_dash_dir(&candidates).expect("a live candidate exists");
+        assert_eq!(winner.requests_dir, newer.requests_dir, "newest mtime wins");
+
+        let all_unusable = [
+            DashCandidate {
+                requests_dir: PathBuf::from("/state/dash/x/requests"),
+                status: CandidateStatus::DeadOwner(1),
+            },
+            DashCandidate {
+                requests_dir: PathBuf::from("/state/dash/y/requests"),
+                status: CandidateStatus::NoOwnerPid,
+            },
+        ];
+        assert!(
+            select_live_dash_dir(&all_unusable).is_none(),
+            "no live candidate means no winner"
+        );
+
+        // Tie-break: identical mtimes fall back to the lexicographically
+        // greatest `requests_dir`.
+        let tie_a = DashCandidate {
+            requests_dir: PathBuf::from("/state/dash/aaaa-1/requests"),
+            status: CandidateStatus::Live {
+                started_at: std::time::SystemTime::UNIX_EPOCH,
+            },
+        };
+        let tie_b = DashCandidate {
+            requests_dir: PathBuf::from("/state/dash/bbbb-2/requests"),
+            status: CandidateStatus::Live {
+                started_at: std::time::SystemTime::UNIX_EPOCH,
+            },
+        };
+        let tied = [tie_a.clone(), tie_b.clone()];
+        let winner = select_live_dash_dir(&tied).expect("a winner");
+        assert_eq!(
+            winner.requests_dir, tie_b.requests_dir,
+            "lexicographically-greatest dir name wins the tie: {tie_a:?} vs {tie_b:?}"
+        );
     }
 
     /// A pid guaranteed dead by the time it is used: a real child, waited on.
