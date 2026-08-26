@@ -177,7 +177,7 @@ pub(crate) fn family_of(raw: &str) -> String {
         if token.starts_with('-') {
             break;
         }
-        parts.push((*token).to_string());
+        parts.push(token.to_ascii_lowercase());
     }
     parts.join(" ")
 }
@@ -1055,6 +1055,14 @@ mod tests {
             family_of("gh issue list --limit 5 | jq '.[].title'"),
             "gh issue"
         );
+    }
+
+    #[test]
+    fn a_mixed_case_subcommand_family_stays_protected_end_to_end() {
+        let raw = "DoCkEr RuN -it ubuntu bash";
+        let family = family_of(raw);
+        assert_eq!(family, "docker run");
+        assert!(is_protected_family(&family, raw));
     }
 
     #[test]
