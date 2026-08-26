@@ -585,15 +585,36 @@ fn find_rollout(dir: &Path, filename_suffix: &str) -> Option<PathBuf> {
     None
 }
 
-/// `value` rendered as a quoted TOML basic string, for embedding inside a
-/// `-c key=["..."]`-style config-override argv token (`extra_writable_root_
+/// `value` rendered as a quoted TOML string, for embedding inside a `-c
+/// key=["..."]`-style config-override argv token (`extra_writable_root_
 /// args`, `approval_suppression_args`'s sibling for path values rather than
-/// bare identifiers). Escapes only the two bytes a TOML basic string cannot
-/// contain literally -- `\` and `"` -- which is the whole alphabet a real
-/// filesystem path can ever carry that would otherwise break out of the
-/// quotes; codex's own `-c`/`--config` value parser is TOML, so this mirrors
-/// the escaping any TOML parser requires, not a zirv-invented format.
+/// bare identifiers). codex's own `-c`/`--config` value parser is TOML, so
+/// this always produces syntax any TOML parser accepts, never a
+/// zirv-invented format.
+///
+/// **Prefers a TOML LITERAL string (`'...'`)** -- no escape processing at
+/// all, so a Windows path's `\` survives untouched -- **over a basic string
+/// (`"..."`), specifically to avoid ever emitting a literal `"`.** A real
+/// bug (2026-08-26, found running this branch's own gates on Windows): the
+/// previous basic-string form escaped `\`/`"` correctly per TOML's own
+/// rules, but `guard_cmd_shim_reparse`'s `CMD_REPARSE_METACHARS` refuses any
+/// argument containing a raw `"` outright on a `cmd.exe`/`powershell` shim
+/// launch (CVE-2024-24576's quote-toggle) -- so the moment `extra_writable_
+/// root_args` was wired in (unconditionally, into every dashboard-spawned
+/// worker pane), a codex pane reached through an npm-installed `.cmd` or a
+/// `.ps1` could never launch at all: its own writable-roots argument tripped
+/// the very guard meant to stop injected content, despite carrying nothing
+/// but zirv-computed paths. A literal string sidesteps this rather than
+/// weakening the guard, which stays a correct, unconditional backstop.
+///
+/// Falls back to an escaped basic string only when `value` itself contains a
+/// literal `'`, which a TOML literal string has no way to represent at all
+/// (pathological for a real filesystem path; that case is not, and was never,
+/// spawnable through a shim launch either way).
 fn toml_quoted_string(value: &str) -> String {
+    if !value.contains('\'') && !value.chars().any(|c| c.is_control() && c != '\t') {
+        return format!("'{value}'");
+    }
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
@@ -2250,6 +2271,17 @@ mod tests {
     /// never exact argv, since the config-override string this builds is an
     /// internal choice a test must not lock in more tightly than the
     /// mechanism itself is verified.
+    ///
+    /// A real bug found running this branch's own gates on Windows
+    /// (2026-08-26): `toml_quoted_string`'s basic-string form embeds a
+    /// literal `"` in every writable-root argv token it builds, and
+    /// `guard_cmd_shim_reparse`'s `CMD_REPARSE_METACHARS` refuses `"`
+    /// outright on any `cmd.exe`/`powershell` shim launch (an npm-installed
+    /// `.cmd`, or a `.ps1`) -- so a codex pane spawned through a shim could
+    /// never launch at all once `extra_writable_root_args` was wired in,
+    /// unconditionally, into every dashboard-spawned worker pane. See
+    /// `no_extra_writable_root_arg_ever_trips_the_cmd_shim_reparse_guard`
+    /// below for the direct regression test.
     #[test]
     fn extra_writable_root_args_always_includes_the_mail_dir_but_never_the_bare_state_root() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2275,11 +2307,10 @@ mod tests {
         // state root's path".
         //
         // Built through the same `toml_quoted_string` the implementation
-        // uses, not a bare `"<path>"` wrap: on Windows a raw path contains
-        // `\`, which `toml_quoted_string` doubles to stay valid inside a
-        // TOML basic string, so the naive wrap never matches the real argv
-        // there (found 2026-08-26, Windows dev machine -- the implementation
-        // was already correct, only this assertion was not).
+        // uses, not a bare `"<path>"` wrap: `toml_quoted_string` quotes with
+        // `'...'` (a TOML literal string) whenever it can, not `"..."`, so a
+        // naive double-quote wrap never matches the real argv (found
+        // 2026-08-26, Windows dev machine).
         let quoted_mail = toml_quoted_string(&mail_dir.display().to_string());
         let quoted_state_root = toml_quoted_string(&state_root.path().display().to_string());
         assert!(
@@ -2337,11 +2368,10 @@ mod tests {
 
         let joined = args.join(" ");
         // Same fix as `extra_writable_root_args_always_includes_the_mail_
-        // dir_but_never_the_bare_state_root` above: compare against the
-        // `toml_quoted_string`-escaped form, since a raw Windows path's `\`
-        // is doubled by the implementation to stay valid inside the TOML
-        // basic string, and a bare `.display()` substring check never
-        // matches that escaped form there.
+        // dir_but_never_the_bare_state_root` above: compare against
+        // `toml_quoted_string`'s own quoted form (a TOML literal string,
+        // `'...'`), not a bare `.display()` substring check, which never
+        // matches once the value is quoted.
         assert!(
             joined.contains(&toml_quoted_string(&expected_git_dir.display().to_string())),
             "must name the shared git common dir for a linked worktree: {args:?}"
@@ -2350,6 +2380,37 @@ mod tests {
             joined.contains(&toml_quoted_string(&mail_dir.display().to_string())),
             "must still name the mail subtree too: {args:?}"
         );
+    }
+
+    /// The regression this round fixes, exercised end to end through the
+    /// real guard rather than only inspecting `toml_quoted_string`'s output
+    /// (2026-08-26): `extra_writable_root_args`'s own argv, appended after a
+    /// `cmd.exe /c <shim>` prefix exactly as a real npm-installed codex shim
+    /// launch would carry it, must never trip `guard_cmd_shim_reparse`. This
+    /// is not a hypothetical -- `dash::worker_pane_extra_args` calls
+    /// `extra_writable_root_args` unconditionally for every dashboard-spawned
+    /// worker pane (see that function's own doc comment), so before this fix
+    /// a codex pane reached through a `.cmd` shim could never launch at all.
+    #[test]
+    fn no_extra_writable_root_arg_ever_trips_the_cmd_shim_reparse_guard() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(repo.path())
+            .status()
+            .expect("git init");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let mail_dir = state_root.path().join("mail");
+
+        let adapter = CodexAdapter::new(None);
+        let extra = adapter.extra_writable_root_args(repo.path(), &mail_dir);
+        assert!(!extra.is_empty(), "the mail root alone must still add args");
+
+        let mut shim_args = vec!["/c".to_string(), "codex.cmd".to_string()];
+        shim_args.extend(extra);
+        crate::commands::ctx::adapters::guard_cmd_shim_reparse("cmd.exe", &shim_args)
+            .expect("extra_writable_root_args must never trip the cmd-shim reparse guard");
     }
 
     /// Issue "codex approval hell" (2026-08-26): an operator's own `-c
