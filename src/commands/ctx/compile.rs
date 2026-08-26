@@ -286,9 +286,11 @@ permissions.\n\n";
 
 /// Adds the canonical `.zirv/context/{common,claude,codex}.md` layer to a
 /// composed prompt, right after whatever `prompt::compose` itself already
-/// added (its own repo `system-prompt.md` layer, or the memory/user layers
-/// before it if the repo has no `system-prompt.md`) and before whatever the
-/// caller layers on next (mail, report-back, the operator's own command-line
+/// added (its own repo `system-prompt.md` layer, or the user layer before it
+/// if the repo has no `system-prompt.md` -- `compose` no longer builds a
+/// memory layer at all, v8, issue #155) and before whatever `compile.rs`
+/// layers on next: the single merged memory layer, then whatever the caller
+/// adds after that (mail, report-back, the operator's own command-line
 /// instruction). `None` in means `None` out, the same "no composed prompt,
 /// nothing to add" contract every layer in `prompt.rs` follows: a `--simple`
 /// run or a disabled prompt gets no canonical context layer either, however

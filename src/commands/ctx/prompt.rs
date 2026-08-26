@@ -1243,8 +1243,11 @@ pub fn relayer_recomposed(
 /// regardless of whether the harness layer already sits at index 1 (an
 /// orchestrator role): it always lands right after `Default`, pushing the
 /// harness (and, when present, harness-roster) layers down by one rather than
-/// replacing them, so the final order is Default -> Adapter -> Harness ->
-/// Harnesses -> Memory -> User -> Repo -> CommandLine.
+/// replacing them, so the order out of `compose` itself is Default -> Adapter
+/// -> Harness -> Harnesses -> User -> Repo. Memory is no longer part of this
+/// (v8, issue #155): `compile.rs` appends the canonical context layer and then
+/// the single merged memory layer after `compose` returns, near the tail,
+/// well after this splice has already run.
 fn with_adapter_layer(
     composed: Option<ComposedPrompt>,
     adapter: &dyn AgentAdapter,
