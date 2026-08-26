@@ -856,9 +856,12 @@ pub fn run_send_with<W: Write>(
     // removed), so what gets stored is the resolved short id itself, not a
     // reference to the record that produced it.
     let resolved = match &args.to_session {
-        Some(prefix) => Some(
-            sessions::resolve_prefix(&state, prefix).map_err(|e| format!("zirv ctx send: {e}"))?,
-        ),
+        Some(prefix) => Some(sessions::resolve_prefix(&state, prefix).map_err(|e| {
+            format!(
+                "zirv ctx send: {}",
+                sessions::resolve_error_with_diagnostics(&e, &state, env)
+            )
+        })?),
         None => None,
     };
     let msg = Message {
@@ -1660,6 +1663,51 @@ This should not appear in the body.\n";
         assert_eq!(listed[0].1.from_agent, "claude");
         assert_eq!(listed[0].1.to, "any");
         assert_eq!(listed[0].1.body, "heads up: the webhook route moved");
+    }
+
+    /// Issue #146: a `--to-session` that resolves to nothing used to say only
+    /// "no sessions are registered" -- which looks identical whether the
+    /// registry really is empty or this call simply checked the wrong state
+    /// dir (exactly what an EPERM-blind liveness check, or two processes
+    /// disagreeing on `ZIRV_CTX_STATE_DIR`, produces). The error must now
+    /// name the state dir actually checked, so an operator can tell the two
+    /// apart without guessing.
+    #[test]
+    fn an_unresolvable_to_session_names_the_state_dir_it_was_checked_against() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let mut args = send_args("nobody home");
+        args.to_session = Some("dead0000".to_string());
+        let err = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("no session is registered under this empty state dir");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no sessions are registered"),
+            "the existing message text stays the prefix: {msg}"
+        );
+        let state = StateDir::from_root(state_dir);
+        assert!(
+            msg.contains(&state.sessions().display().to_string()),
+            "must name the registry path actually checked: {msg}"
+        );
+        assert!(
+            msg.contains(super::super::state::STATE_ENV),
+            "must say whether ZIRV_CTX_STATE_DIR was set: {msg}"
+        );
     }
 
     /// This task: the confirmation for an undirected send (`--to-session`

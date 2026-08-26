@@ -24,6 +24,13 @@ last-verified: 2026-08-26
 
 ## Decisions
 
+### 2026-08-26 — `is_alive` reads `EPERM` as alive, not dead (issue #146)
+**Context:** `sessions::is_alive`'s `kill(pid, 0) == 0` check treated any non-zero return as dead, conflating `ESRCH` (genuinely gone) with `EPERM` (the process exists, this caller just lacks permission to signal it) — exactly what a sandboxed `zirv ctx send`/`nudge` running inside a dashboard pane gets probing its own live sessions, so `list`/`resolve_prefix` swept every one as stale and every send/nudge failed with "no sessions are registered" despite live sessions in the registry.
+**Decision:** `is_alive` (widened to `pub(crate)`, and now the single copy — `dash/mod.rs`'s duplicate `pid_alive` was deleted in favor of importing it) reads `EPERM` as alive; only `ESRCH` and a clean `kill() == 0` decide liveness.
+**Rejected:** A second, EPERM-aware probe alongside the strict one, picked per call site — every caller (`dashboard_owner_liveness`, `short_is_live`, `list`, the dash token-dir sweep) wants "can I prove this is dead," not "can I prove this is alive," so a second variant would just be a second place to get the same conflation wrong.
+**Consequences:** A pid the kernel has recycled to an unrelated, foreign-uid process now keeps a stale session/dashboard record alive until that pid frees again — `Record`/`owner.pid` carry no start-time (or other) disambiguator to tell the original process apart from its replacement. Documented as a deliberate trade-off, not fixed here; a follow-up issue for a start-time disambiguator is pending.
+**Spec / link:** `src/commands/ctx/sessions.rs` `is_alive`; [[Ctx Subsystem]]'s "Sessions and Memory" section; issue #146.
+
 ### 2026-08-25 — The heavy-worker budget refuses outright rather than queueing a launch over the limit (issue #133)
 **Context:** Issue #133's own evidence is four kernel bugchecks in 12 minutes under two concurrent unbounded build/test workloads (two cold `cargo build`s plus two full nextest suites) running under zirv supervision with no resource governance. `SuperviseConfig::max_heavy_workers` caps live unattended workers (`Verb::Exec`/`Verb::Dash`) machine-wide; the open design question was what happens to a launch that would exceed it.
 **Decision:** Both gate points (`exec.rs`, immediately before `SessionGuard::register`; `dash::fulfill_spawn_request`, alongside the existing `dash.max_panes` check) refuse the launch outright with a clear error naming the count/limit/config key, rather than queueing it to run once a slot frees up. The dashboard's refusal is non-retryable (`SpawnRefusal::policy`) specifically so a requester's headless fallback cannot simply re-run the same task through `exec.rs`'s identical gate and get refused there too.
