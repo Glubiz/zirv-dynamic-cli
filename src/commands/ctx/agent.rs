@@ -297,15 +297,38 @@ fn try_join_dashboard<W: Write>(
     // answer it, and this call burned the *entire* `ack_timeout` finding
     // that out -- the exact "dashboard did not answer" symptom reported,
     // even while some other, unrelated dashboard is genuinely running
-    // elsewhere. `sessions::dashboard_owner_is_live` is the same liveness
+    // elsewhere. `sessions::dashboard_owner_liveness` is the same liveness
     // test `sessions::nested_session_evidence` already applies to this exact
     // directory-existence signal (see that function's own doc comment) --
     // sharing it is what keeps the two readers of `DASH_REQUESTS_ENV` from
-    // disagreeing about what "live" means. Silent, matching the directory-
-    // missing case just above: this is still "no dashboard to ask", not a
-    // channel failure worth its own diagnostic.
-    if !super::sessions::dashboard_owner_is_live(&dir) {
-        return None;
+    // disagreeing about what "live" means.
+    //
+    // Fix round 1 (both reviewers): this refusal used to be silent, matching
+    // the directory-missing case just above -- but that case means "no
+    // dashboard was ever here", while this one means "a directory that once
+    // WAS a dashboard channel is not one any more", which is exactly the
+    // ambiguity issue #144's own acceptance criteria asked to be made
+    // diagnosable. Named here, not folded into the generic "did not answer"
+    // wording below: this refusal is immediate (no ack ever attempted), so
+    // reusing that wording would falsely imply a timeout was waited out.
+    match super::sessions::dashboard_owner_liveness(&dir) {
+        super::sessions::OwnerLiveness::Live => {}
+        super::sessions::OwnerLiveness::Dead(pid) => {
+            eprintln!(
+                "zirv ctx agent: {} names a dashboard that already quit (owner.pid names dead \
+                 pid {pid}); running headless",
+                dir.display()
+            );
+            return None;
+        }
+        super::sessions::OwnerLiveness::Missing => {
+            eprintln!(
+                "zirv ctx agent: {} has no readable owner.pid, so no dashboard can be confirmed \
+                 live; running headless",
+                dir.display()
+            );
+            return None;
+        }
     }
     // A pane is not a supervised headless run: the restart budget, the
     // wall-clock limit and the trailing `-- flags` all belong to
@@ -1565,6 +1588,59 @@ mod tests {
                 .next()
                 .is_none(),
             "no request may be written into a dead dashboard's directory at all"
+        );
+    }
+
+    /// The other half of `dashboard_owner_liveness`'s three-way split: a
+    /// requests directory with no `owner.pid` at all (rather than one naming
+    /// a dead pid) must be refused exactly the same way -- immediately, with
+    /// no request ever written. Distinct code path from the dead-pid test
+    /// above (`OwnerLiveness::Missing` vs `OwnerLiveness::Dead`), so both are
+    /// covered rather than assuming one implies the other.
+    #[test]
+    fn a_dashboard_directory_with_no_owner_pid_is_refused_immediately() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        // Deliberately not `live_dashboard_dir`: this is exactly the one
+        // thing it always writes that this test needs absent.
+        let requests_dir = tmp.path().join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert(
+            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
+            requests_dir.display().to_string(),
+        );
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let started = std::time::Instant::now();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(
+            joined.is_none(),
+            "no owner.pid means no dashboard can be confirmed live; falls back to headless"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a missing owner.pid must be refused immediately, never waited out against the \
+             full ack timeout"
+        );
+        assert!(
+            std::fs::read_dir(&requests_dir)
+                .expect("read requests dir")
+                .flatten()
+                .next()
+                .is_none(),
+            "no request may be written when no dashboard owner can be confirmed"
         );
     }
 
