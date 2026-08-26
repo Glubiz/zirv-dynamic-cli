@@ -54,6 +54,41 @@ use super::state::StateDir;
 use super::surface::{ContextSurface, Trust};
 use super::{context, memory, retrieval};
 
+/// `log::Decision::action` for a canonical context layer cut by its budget.
+pub const TRUNCATED_ACTION: &str = "context-truncated";
+
+/// The decision-log half of the truncation report. Session-free on purpose:
+/// `compile` runs before most launch paths have minted a session id (see
+/// `run_loop.rs`, which mints one AFTER composing), and the surface path in
+/// `detail` is the identity that actually matters here. `verb` is
+/// `"compile"` for the same reason.
+fn log_truncation_decisions(state: &StateDir, now: u64, provenance: &[ContextProvenance]) {
+    for entry in provenance.iter().filter(|p| p.truncated) {
+        let detail = format!(
+            "{}: {} of {} bytes delivered, {} lost to {}",
+            entry.surface.path().display(),
+            entry.delivered_bytes,
+            entry.raw_bytes,
+            entry
+                .raw_bytes
+                .saturating_sub(entry.delivered_bytes),
+            entry.budget_key,
+        );
+        let _ = super::log::append(
+            state,
+            &super::log::Decision {
+                ts: now,
+                session: "",
+                verb: "compile",
+                verdict: "n/a",
+                score: 0,
+                action: TRUNCATED_ACTION,
+                detail: &detail,
+            },
+        );
+    }
+}
+
 /// One canonical `.zirv/context/*.md` surface actually read and injected --
 /// common, or the harness-specific addition for the adapter this session
 /// launched. Absent (missing file, or empty after trimming) means no entry
@@ -76,6 +111,11 @@ pub struct ContextProvenance {
     /// bytes`) cut this surface short. `delivered_bytes < raw_bytes` exactly
     /// when this is true.
     pub truncated: bool,
+    /// Which configured budget cut this surface -- the exact `ctx.toml` key
+    /// an operator has to raise. Carried as data rather than re-derived from
+    /// the path at each reader, so the decision-log line, the stderr note and
+    /// `zirv context status` can never name three different keys for one cut.
+    pub budget_key: &'static str,
 }
 
 /// The compiled result of one launch-time context assembly: the composed
@@ -244,11 +284,18 @@ fn with_canonical_context_layer(
         return (None, Vec::new());
     };
 
-    let mut candidates: Vec<(context::PrecedenceTier, Layer, PathBuf, usize)> = vec![(
+    let mut candidates: Vec<(
+        context::PrecedenceTier,
+        Layer,
+        PathBuf,
+        usize,
+        &'static str,
+    )> = vec![(
         context::PrecedenceTier::CanonicalCommon,
         Layer::ContextCommon,
         context::common_path(repo),
         cfg.context.max_common_bytes,
+        "context.max_common_bytes",
     )];
     if let Some((layer, path)) = harness_context_layer(adapter_name, repo) {
         candidates.push((
@@ -256,6 +303,7 @@ fn with_canonical_context_layer(
             layer,
             path,
             cfg.context.max_harness_bytes,
+            "context.max_harness_bytes",
         ));
     }
     // `PrecedenceTier`'s derived `Ord` is the single source of truth here
@@ -267,7 +315,7 @@ fn with_canonical_context_layer(
 
     let mut provenance = Vec::new();
     let mut added_any = false;
-    for (_, layer, path, cap) in candidates {
+    for (_, layer, path, cap, budget_key) in candidates {
         let Some((text, raw_bytes, truncated)) = read_context_layer(&path, cap) else {
             continue;
         };
@@ -282,6 +330,7 @@ fn with_canonical_context_layer(
         composed.text.push_str(text.trim_end());
 
         let delivered_bytes = text.len();
+        let display_path = path.display().to_string();
         // `Surface::context_surface` is the existing, already-tested
         // provider/kind/scope-to-`ContextSurface` mapping `optimize.rs`
         // built for exactly this layer (issue #41/#39) -- reused here rather
@@ -294,7 +343,20 @@ fn with_canonical_context_layer(
             raw_bytes,
             delivered_bytes,
             truncated,
+            budget_key,
         });
+        if truncated {
+            // Compose-time, unconditional: this is the operator-visible half
+            // and it costs nothing when nothing was cut. The decision-log
+            // half is gated per call site (`log_truncation`) because a
+            // read-only report compiles too.
+            eprintln!(
+                "zirv: canonical context layer {display_path} was truncated -- \
+                 {delivered_bytes} of {raw_bytes} bytes delivered, {} bytes LOST to \
+                 {budget_key}. Shorten the file or raise the key in ~/.zirv/ctx.toml.",
+                raw_bytes.saturating_sub(delivered_bytes),
+            );
+        }
     }
     if added_any {
         composed.sources.push(PromptSource::Context);
@@ -336,6 +398,7 @@ pub fn compile(
     state: &StateDir,
     now: u64,
     mode: super::adapters::LaunchMode,
+    log_truncation: bool,
 ) -> CompiledContext {
     compile_with_harness_roster(
         home,
@@ -348,6 +411,7 @@ pub fn compile(
         now,
         role == PromptRole::Orchestrator,
         mode,
+        log_truncation,
     )
 }
 
@@ -379,6 +443,7 @@ pub fn compile_with_harness_roster(
     now: u64,
     include_harness_roster: bool,
     mode: super::adapters::LaunchMode,
+    log_truncation: bool,
 ) -> CompiledContext {
     let slug = super::state::repo_slug(repo);
     let (memory_entries, retrieved_memory) = gather_memory(state, repo, &slug, cfg, now);
@@ -422,6 +487,9 @@ pub fn compile_with_harness_roster(
     };
     let (composed, provenance) =
         with_canonical_context_layer(composed, adapter.name(), repo, home, cfg);
+    if log_truncation {
+        log_truncation_decisions(state, now, &provenance);
+    }
 
     // Computed from `cfg.policy` alone, never from `composed`'s text: the
     // canonical context layer's prose can steer a session, but it cannot
@@ -474,6 +542,7 @@ mod tests {
             &state,
             now_secs(),
             LaunchMode::Headless,
+            false,
         )
     }
 
@@ -505,6 +574,7 @@ mod tests {
             &state,
             now,
             LaunchMode::Headless,
+            false,
         );
         let second = compile(
             None,
@@ -516,6 +586,7 @@ mod tests {
             &state,
             now,
             LaunchMode::Headless,
+            false,
         );
         assert_eq!(first, second);
     }
@@ -752,6 +823,7 @@ mod tests {
             &state,
             now_secs(),
             LaunchMode::Headless,
+            false,
         );
         assert!(compiled.composed.is_none());
         assert!(compiled.provenance.is_empty());
@@ -849,6 +921,7 @@ mod tests {
             &state,
             now_secs(),
             LaunchMode::Headless,
+            false,
         );
         assert_eq!(compiled.core_memory.selected_entries, 1);
         assert_eq!(compiled.retrieved_memory.selected_entries, 1);
@@ -857,6 +930,119 @@ mod tests {
         assert!(
             text.contains("lib changes require the compatibility check"),
             "got {text}"
+        );
+    }
+
+    /// Issue #155, Phase 1(a): the single most expensive failure mode of a
+    /// byte budget is one nobody is told about. A cut canonical layer must
+    /// produce BOTH a decision-log entry naming the file and the exact lost
+    /// byte count, AND a stderr note at compose time. Before this, the only
+    /// evidence was `ContextProvenance::truncated`, which nothing but
+    /// `zirv context status` ever reads.
+    #[test]
+    fn a_truncated_canonical_layer_is_logged_with_the_file_and_the_lost_bytes() {
+        let repo = repo_with_context_files(&[("common.md", &"x".repeat(6000))]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.context.max_common_bytes = 4096;
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            true,
+        );
+
+        let cut = compiled
+            .provenance
+            .iter()
+            .find(|p| p.truncated)
+            .expect("the 6000-byte common layer must report as truncated");
+        assert_eq!(cut.raw_bytes, 6000);
+        assert_eq!(cut.delivered_bytes, 4096);
+        assert_eq!(cut.budget_key, "context.max_common_bytes");
+
+        let lines = crate::commands::ctx::log::tail(&state, 20).expect("decision log");
+        let entry = lines
+            .iter()
+            .find(|line| line.contains("context-truncated"))
+            .expect("a context-truncated decision must be written");
+        assert!(entry.contains("common.md"), "got {entry}");
+        assert!(entry.contains("1904"), "must name the LOST bytes: {entry}");
+        assert!(entry.contains("context.max_common_bytes"), "got {entry}");
+    }
+
+    /// The other direction: a layer inside its budget writes nothing at all.
+    /// A truncation warning that fires on healthy sessions is noise, and
+    /// noise is how the real one gets ignored.
+    #[test]
+    fn a_layer_inside_its_budget_writes_no_truncation_decision() {
+        let repo = repo_with_context_files(&[("common.md", "short and well within budget\n")]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &CtxConfig::default(),
+            &ClaudeAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            true,
+        );
+
+        assert!(compiled.provenance.iter().all(|p| !p.truncated));
+        let lines = crate::commands::ctx::log::tail(&state, 20).unwrap_or_default();
+        assert!(
+            !lines.iter().any(|line| line.contains("context-truncated")),
+            "no decision may be written for an untruncated layer: {lines:?}"
+        );
+    }
+
+    /// `zirv context status` compiles once per registered adapter purely to
+    /// REPORT truncation. It must not also WRITE decisions doing so, or every
+    /// status invocation would spam the log with entries describing a session
+    /// that never launched. That is exactly what the explicit
+    /// `log_truncation` parameter exists to force each call site to answer.
+    #[test]
+    fn a_read_only_report_compile_writes_no_truncation_decision() {
+        let repo = repo_with_context_files(&[("common.md", &"x".repeat(6000))]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.context.max_common_bytes = 4096;
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            false,
+        );
+
+        assert!(
+            compiled.provenance.iter().any(|p| p.truncated),
+            "the report still SEES the truncation"
+        );
+        let lines = crate::commands::ctx::log::tail(&state, 20).unwrap_or_default();
+        assert!(
+            !lines.iter().any(|line| line.contains("context-truncated")),
+            "a report must not write decisions: {lines:?}"
         );
     }
 }

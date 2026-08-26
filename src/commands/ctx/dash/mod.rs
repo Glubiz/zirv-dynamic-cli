@@ -2473,6 +2473,7 @@ fn compose_worker_prompt(
         } else {
             super::adapters::LaunchMode::Headless
         },
+        true,
     )
     .composed;
     let system_prompt_supported = adapter.system_prompt_supported(&[]);

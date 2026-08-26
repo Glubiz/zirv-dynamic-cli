@@ -201,6 +201,7 @@ pub(crate) fn run_with_clock<W: Write>(
             &state,
             now_fn(),
             super::adapters::LaunchMode::Headless,
+            true,
         )
         .composed;
         // A fresh session id per cycle is the whole point: the orchestrator
@@ -781,6 +782,7 @@ mod tests {
             &state,
             1,
             crate::commands::ctx::adapters::LaunchMode::Headless,
+            false,
         )
         .composed
         .expect("a cycle still composes a prompt");

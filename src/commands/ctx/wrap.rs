@@ -1621,6 +1621,7 @@ pub fn run_with(
         &state_dir,
         super::state::now_secs(),
         launch_mode_from_interactive(interactive_launch),
+        true,
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -6986,6 +6987,7 @@ mod tests {
             &state,
             1,
             crate::commands::ctx::adapters::LaunchMode::Headless,
+            false,
         )
         .composed
         .expect("a launch still composes a prompt");

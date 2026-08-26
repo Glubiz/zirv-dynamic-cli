@@ -664,6 +664,7 @@ pub fn run_with<W: Write>(
                 &state,
                 now,
                 super::adapters::LaunchMode::Interactive,
+                false,
             );
             (adapter.name(), compiled)
         })
