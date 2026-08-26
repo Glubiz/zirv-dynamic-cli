@@ -125,6 +125,11 @@ pub struct ReviewRunEvidence {
     pub adapter: String,
     pub review_round: u8,
     pub completed_at: u64,
+    /// The HEAD sha this reviewer actually reviewed. `None` for evidence
+    /// written before this field existed -- an older zirv -- which
+    /// `delta_base` reads as a broken chain and falls back to the full diff.
+    #[serde(default)]
+    pub head_sha: Option<String>,
 }
 
 pub fn depth_for_risk(risk: RiskBand) -> ReviewDepth {
@@ -175,6 +180,14 @@ pub struct ReviewPackage {
     pub escalation_reason: Option<String>,
     pub base_sha: String,
     pub head_sha: String,
+    /// The sha the packaged `diff` is actually computed against: `base_sha`
+    /// on round 1 or whenever the evidence chain is broken, otherwise the
+    /// sha the previous round's reviewer actually reviewed.
+    pub diff_base_sha: String,
+    /// Whether `diff` is a delta since `diff_base_sha` rather than the full
+    /// change since `base_sha`. A reviewer must never mistake one for the
+    /// other.
+    pub diff_is_delta: bool,
     pub change_fingerprint: u64,
     pub changed_paths: Vec<PathBuf>,
     pub diff: String,
@@ -206,6 +219,41 @@ fn review_round(state: &WorkflowState, current_fingerprint: u64) -> u8 {
         .unwrap_or(0)
         .saturating_add(1);
     evidence_round.max(attempt_round)
+}
+
+/// The sha a later review round should diff FROM: the HEAD the most recent
+/// completed reviewer actually reviewed.
+///
+/// `None` -- meaning "send the full diff against the workflow's base_sha,
+/// exactly as before" -- whenever the chain cannot be proven intact: round 1,
+/// no evidence at all, evidence written before `head_sha` existed, or a
+/// recorded sha that no longer resolves in this repository (a rebase, a
+/// reset, a fresh clone). A reviewer that silently receives LESS than the
+/// change it is judging is a worse outcome than an expensive review, so
+/// every ambiguous case falls back.
+fn delta_base(state: &WorkflowState, repo: &Path, review_round: u8) -> Option<String> {
+    if review_round <= 1 {
+        return None;
+    }
+    let sha = state
+        .review_evidence
+        .iter()
+        .max_by_key(|evidence| (evidence.review_round, evidence.completed_at))?
+        .head_sha
+        .clone()?;
+    // Must still resolve to a commit in THIS repository, or the diff below
+    // would fail outright rather than degrade.
+    git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{sha}^{{commit}}"),
+        ],
+    )
+    .ok()?;
+    Some(sha)
 }
 
 fn git(repo: &Path, args: &[&str]) -> CtxResult<String> {
@@ -588,10 +636,26 @@ pub fn package(
         None => default_base(&state.repo)?,
     };
     let head_sha = git(&state.repo, &["rev-parse", "HEAD"])?;
+    let current_fingerprint = verification::change_fingerprint(&state.repo)?;
+    let review_round = review_round(state, current_fingerprint);
+    if review_round > MAX_FIX_REVIEW_ROUNDS {
+        return Err(format!(
+            "review/fix loop reached the bounded limit of {MAX_FIX_REVIEW_ROUNDS} rounds; record residual dispositions or start a new workflow"
+        )
+        .into());
+    }
+    // Round 1, or any break in the evidence chain, packages the full diff
+    // against `base_sha` exactly as before. A later round with an intact
+    // chain packages only what changed since the last reviewed sha -- the
+    // reviewer still gets `changed_paths` (against `base_sha`, below) and
+    // `existing_findings` for full context.
+    let diff_base_sha =
+        delta_base(state, &state.repo, review_round).unwrap_or_else(|| base_sha.clone());
+    let diff_is_delta = diff_base_sha != base_sha;
     // `git diff <base>` includes committed branch changes plus current staged
     // and unstaged edits. Git omits untracked files, so include bounded file
     // bodies for those explicitly and union them into the changed path list.
-    let (mut diff, mut diff_truncated) = git_diff_capped(&state.repo, &base_sha)?;
+    let (mut diff, mut diff_truncated) = git_diff_capped(&state.repo, &diff_base_sha)?;
     let untracked: Vec<PathBuf> =
         git(&state.repo, &["ls-files", "--others", "--exclude-standard"])?
             .lines()
@@ -599,6 +663,9 @@ pub fn package(
             .map(PathBuf::from)
             .collect();
     append_untracked(&mut diff, &mut diff_truncated, &state.repo, &untracked)?;
+    // Always the full set of files touched since `base_sha`, never just the
+    // delta -- a reviewer holding a partial diff still needs to know the
+    // complete surface this change reaches.
     let mut changed_paths: BTreeSet<PathBuf> =
         git(&state.repo, &["diff", "--name-only", &base_sha])?
             .lines()
@@ -607,16 +674,8 @@ pub fn package(
             .collect();
     changed_paths.extend(untracked);
     let changed_paths = changed_paths.into_iter().collect();
-    let current_fingerprint = verification::change_fingerprint(&state.repo)?;
     let verification = verification::load_latest(state_dir, &state.repo)?
         .map(|report| VerificationEvidence::from_report(report, current_fingerprint));
-    let review_round = review_round(state, current_fingerprint);
-    if review_round > MAX_FIX_REVIEW_ROUNDS {
-        return Err(format!(
-            "review/fix loop reached the bounded limit of {MAX_FIX_REVIEW_ROUNDS} rounds; record residual dispositions or start a new workflow"
-        )
-        .into());
-    }
     let required_reviews = required_independent_reviews_for(state);
     let escalated = required_reviews > required_independent_reviews(state.classification.risk);
     Ok(ReviewPackage {
@@ -635,6 +694,8 @@ pub fn package(
         }),
         base_sha,
         head_sha,
+        diff_base_sha,
+        diff_is_delta,
         change_fingerprint: current_fingerprint,
         changed_paths,
         diff,
@@ -940,8 +1001,19 @@ fn records_evidence(run: &ReviewerRun, fingerprint_unchanged: bool) -> bool {
 
 fn launch_reviewer(agent: &str, package: &ReviewPackage) -> CtxResult<ReviewerRun> {
     let argv = reviewer_argv(agent)?;
+    // A delta package must never read as a whole change: a reviewer told
+    // "this is the whole diff" when it is only what changed since the last
+    // reviewed commit will report false findings about code it cannot see.
+    let delta_notice = if package.diff_is_delta {
+        format!(
+            "This `diff` covers only what changed since the previously reviewed commit {}; it is NOT the full change. `changed_paths` lists every file this change touches, and `existing_findings` lists what earlier rounds already recorded -- consult those instead of assuming this diff is complete.\n\n",
+            package.diff_base_sha
+        )
+    } else {
+        String::new()
+    };
     let prompt = format!(
-        "Review the following compact Zirv review package. Do not modify files. Return exactly one single-line result prefixed `{REVIEW_RESULT_PREFIX}` followed by JSON shaped as {{\"findings\":[{{\"severity\":\"major\",\"summary\":\"concrete reasoning\",\"path\":\"src/file.rs\",\"line\":12,\"recommended_disposition\":\"accepted\"}}]}}. Use an empty findings array when no concrete issue exists. Do not emit another result line.\n\n{}",
+        "{delta_notice}Review the following compact Zirv review package. Do not modify files. Return exactly one single-line result prefixed `{REVIEW_RESULT_PREFIX}` followed by JSON shaped as {{\"findings\":[{{\"severity\":\"major\",\"summary\":\"concrete reasoning\",\"path\":\"src/file.rs\",\"line\":12,\"recommended_disposition\":\"accepted\"}}]}}. Use an empty findings array when no concrete issue exists. Do not emit another result line.\n\n{}",
         serde_json::to_string(package)?
     );
     let mut child = Command::new(std::env::current_exe()?)
@@ -1042,6 +1114,7 @@ fn run_independent_review(
             adapter: args.agent.clone(),
             review_round: package.review_round,
             completed_at: now_secs(),
+            head_sha: Some(package.head_sha.clone()),
         });
         let overflow = state
             .review_evidence
@@ -1207,6 +1280,13 @@ mod tests {
     /// A repository with one commit, so `package` has a real base, diff and
     /// fingerprint to read.
     fn git_repo() -> tempfile::TempDir {
+        git_repo_with_commits(&["base"])
+    }
+
+    /// A repository with one commit per message, applied in order to the same
+    /// tracked file, so a test can build a deterministic multi-commit history
+    /// and read the shas back with `git_log_shas`.
+    fn git_repo_with_commits(messages: &[&str]) -> tempfile::TempDir {
         let repo = tempdir().unwrap();
         let git = |args: &[&str]| {
             let status = Command::new("git")
@@ -1225,13 +1305,36 @@ mod tests {
             assert!(status.success(), "git {args:?} failed");
         };
         git(&["init", "-q"]);
-        std::fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-q", "-m", "base"]);
+        for message in messages {
+            std::fs::write(repo.path().join("tracked.txt"), format!("{message}\n")).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", message]);
+        }
         repo
     }
 
-    fn review_workflow(repo: &Path, state_dir: &StateDir) -> WorkflowState {
+    /// Commit shas on the current branch, oldest first -- the same order
+    /// `messages` was applied in by `git_repo_with_commits`.
+    fn git_log_shas(repo: &Path) -> Vec<String> {
+        let output = Command::new("git")
+            .args(["log", "--reverse", "--format=%H"])
+            .current_dir(repo)
+            .output()
+            .expect("run git log");
+        assert!(output.status.success(), "git log failed");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A `WorkflowState` at `WorkflowStatus::Running` on a
+    /// `WorkflowPhase::Review` step, for `repo`. `base` is not read back out
+    /// of the state -- there is no field for it -- it exists so a test's
+    /// intent ("this workflow's change is measured from `base`") is legible
+    /// at the call site rather than an unexplained bare repo path.
+    fn running_review_state(repo: &Path, base: &str) -> WorkflowState {
         let classification = super::super::classify::Classification {
             intent: super::super::classify::Intent::Review,
             complexity: super::super::classify::Complexity::Trivial,
@@ -1244,14 +1347,18 @@ mod tests {
             risk_measurement: super::super::classify::RiskMeasurement::Measured,
             reasons: vec![],
         };
-        let state = WorkflowState::start(
+        WorkflowState::start(
             repo.to_path_buf(),
-            "review change".into(),
+            format!("review change since {base}"),
             super::super::engine::WorkflowKind::Review,
             None,
             true,
             classification,
-        );
+        )
+    }
+
+    fn review_workflow(repo: &Path, state_dir: &StateDir) -> WorkflowState {
+        let state = running_review_state(repo, "HEAD");
         engine::save(state_dir, &state, true).unwrap();
         state
     }
@@ -1788,6 +1895,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             adapter: "claude".into(),
             review_round: 1,
             completed_at: now_secs(),
+            head_sha: None,
         });
         assert_eq!(review_round(&state, 10), 1);
         assert_eq!(review_round(&state, 11), 2);
@@ -1797,7 +1905,89 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             adapter: "codex".into(),
             review_round: 2,
             completed_at: now_secs(),
+            head_sha: None,
         });
         assert_eq!(review_round(&state, 12), 3);
+    }
+
+    /// Issue #155, Phase 4(b): round 2 of a fix loop re-sent every byte round
+    /// 1 already sent -- the full diff against the workflow's fixed base_sha,
+    /// to every reviewer, every round, capped at 96 KiB (~24k tokens). Round
+    /// 2 onward diffs from the sha the LAST reviewer actually reviewed.
+    #[test]
+    fn a_later_round_diffs_from_the_last_reviewed_sha_not_the_workflow_base() {
+        let repo = git_repo_with_commits(&["base", "first change", "fix after review"]);
+        let shas = git_log_shas(repo.path()); // oldest first
+        let mut state = running_review_state(repo.path(), &shas[0]);
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "ev-1".to_string(),
+            change_fingerprint: 1,
+            adapter: "codex".to_string(),
+            review_round: 1,
+            completed_at: 10,
+            head_sha: Some(shas[1].clone()),
+        });
+
+        let base = delta_base(&state, repo.path(), 2).expect("a delta base for round 2");
+        assert_eq!(base, shas[1], "the sha round 1 actually reviewed");
+        assert_eq!(
+            delta_base(&state, repo.path(), 1),
+            None,
+            "round 1 has nothing to delta against and must send the full diff"
+        );
+    }
+
+    /// Every way the chain can break must fall back to the FULL diff. A
+    /// reviewer that silently receives less than it needs is a worse outcome
+    /// than an expensive review.
+    #[test]
+    fn a_broken_evidence_chain_falls_back_to_the_full_diff() {
+        let repo = git_repo_with_commits(&["base", "first change"]);
+        let shas = git_log_shas(repo.path());
+        let base_state = running_review_state(repo.path(), &shas[0]);
+
+        // (1) evidence with no recorded sha -- written by an older zirv.
+        let mut no_sha = base_state.clone();
+        no_sha.review_evidence.push(ReviewRunEvidence {
+            id: "ev-1".to_string(),
+            change_fingerprint: 1,
+            adapter: "codex".to_string(),
+            review_round: 1,
+            completed_at: 10,
+            head_sha: None,
+        });
+        assert_eq!(delta_base(&no_sha, repo.path(), 2), None);
+
+        // (2) a recorded sha that no longer resolves -- a rebase or a reset.
+        let mut gone = base_state.clone();
+        gone.review_evidence.push(ReviewRunEvidence {
+            id: "ev-1".to_string(),
+            change_fingerprint: 1,
+            adapter: "codex".to_string(),
+            review_round: 1,
+            completed_at: 10,
+            head_sha: Some("0".repeat(40)),
+        });
+        assert_eq!(delta_base(&gone, repo.path(), 2), None);
+
+        // (3) no evidence at all.
+        assert_eq!(delta_base(&base_state, repo.path(), 2), None);
+    }
+
+    /// The package states plainly which diff a reviewer is holding. A
+    /// reviewer told "this is the whole change" when it is a delta will
+    /// report false findings about code it cannot see.
+    #[test]
+    fn the_package_declares_whether_its_diff_is_a_delta() {
+        let repo = git_repo_with_commits(&["base", "first change"]);
+        let shas = git_log_shas(repo.path());
+        let state = running_review_state(repo.path(), &shas[0]);
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+        assert!(!package.diff_is_delta, "round 1 is never a delta");
+        assert_eq!(package.diff_base_sha, package.base_sha);
+        assert_eq!(package.head_sha.len(), 40);
     }
 }
