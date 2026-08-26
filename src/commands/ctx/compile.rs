@@ -69,9 +69,7 @@ fn log_truncation_decisions(state: &StateDir, now: u64, provenance: &[ContextPro
             entry.surface.path().display(),
             entry.delivered_bytes,
             entry.raw_bytes,
-            entry
-                .raw_bytes
-                .saturating_sub(entry.delivered_bytes),
+            entry.raw_bytes.saturating_sub(entry.delivered_bytes),
             entry.budget_key,
         );
         let _ = super::log::append(
@@ -284,19 +282,14 @@ fn with_canonical_context_layer(
         return (None, Vec::new());
     };
 
-    let mut candidates: Vec<(
-        context::PrecedenceTier,
-        Layer,
-        PathBuf,
-        usize,
-        &'static str,
-    )> = vec![(
-        context::PrecedenceTier::CanonicalCommon,
-        Layer::ContextCommon,
-        context::common_path(repo),
-        cfg.context.max_common_bytes,
-        "context.max_common_bytes",
-    )];
+    let mut candidates: Vec<(context::PrecedenceTier, Layer, PathBuf, usize, &'static str)> =
+        vec![(
+            context::PrecedenceTier::CanonicalCommon,
+            Layer::ContextCommon,
+            context::common_path(repo),
+            cfg.context.max_common_bytes,
+            "context.max_common_bytes",
+        )];
     if let Some((layer, path)) = harness_context_layer(adapter_name, repo) {
         candidates.push((
             context::PrecedenceTier::CanonicalHarnessSpecific,
