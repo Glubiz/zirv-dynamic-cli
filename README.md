@@ -1041,6 +1041,7 @@ checkout:
 | `dash.roster_max_age_secs` | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS` |
 | `dash.max_panes` | `ZIRV_CTX_DASH_MAX_PANES` |
 | `dash.mouse` | `ZIRV_CTX_DASH_MOUSE` |
+| `supervise.max_heavy_workers` | `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
 | `pace.poll_enabled` | `ZIRV_CTX_PACE_POLL` |
 | `pace.poll_min_interval_secs` | `ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS` |

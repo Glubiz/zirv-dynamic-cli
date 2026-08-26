@@ -93,6 +93,32 @@ pub struct SuperviseConfig {
     /// this names no binary, shell command, or model choice, only how many
     /// times a session tolerates being interrupted.
     pub max_nudges: u32,
+    /// Issue #133: the machine-wide cap on live "heavy" workers --
+    /// unattended supervised sessions that can run real build/test-class
+    /// load with nobody watching (`Verb::Exec`, including `zirv agent`'s
+    /// headless fallback which delegates straight into `exec::run_with`, and
+    /// `Verb::Dash` dashboard worker panes -- see
+    /// `sessions::count_heavy_workers`'s own doc comment for exactly which
+    /// verbs count and why). Refuse-not-queue: a spawn that would exceed
+    /// this is rejected outright at `exec.rs`'s registration point and
+    /// `dash::fulfill_spawn_request`, not queued, because a BSOD-triggering
+    /// incident (four kernel bugchecks in 12 minutes, issue #133's own
+    /// evidence) was two concurrent cold `cargo build` + full-nextest
+    /// workloads run under zirv supervision with no governance at all.
+    /// Defaults to 1: the two-parallel-worktree reproduction in #133 needed
+    /// only two to blue-screen the host, so the safe default is a single
+    /// heavy worker at a time -- an operator who has verified their own
+    /// machine can take more raises this explicitly.
+    ///
+    /// `REPO_FORBIDDEN`, the same trust asymmetry as `dash.max_panes`: a
+    /// checked-out repo raising its own concurrency budget is exactly the
+    /// case the cap exists for, so only `~/.zirv/ctx.toml` or
+    /// `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` may set it. Deliberately
+    /// **not** under `[agents]` -- that table is reserved for the distinct,
+    /// per-agent `<repo>/.zirv/.settings.toml` gate (see
+    /// `agents_in_ctx_toml_is_rejected_so_the_two_files_stay_distinct`) --
+    /// this is a `[supervise]` key like every other cap in this struct.
+    pub max_heavy_workers: usize,
 }
 
 impl Default for SuperviseConfig {
@@ -106,6 +132,7 @@ impl Default for SuperviseConfig {
             backoff_base_secs: 60,
             on_failure: None,
             max_nudges: 3,
+            max_heavy_workers: 1,
         }
     }
 }
@@ -957,6 +984,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["supervise", "max_nudges"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS",
+        &["supervise", "max_heavy_workers"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MODEL", &["handoff", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_HANDOFF_TIMEOUT_SECS",
@@ -1577,6 +1609,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         "ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS",
     ),
     (&["dash", "max_panes"], "ZIRV_CTX_DASH_MAX_PANES"),
+    // Issue #133: same trust asymmetry as `dash.max_panes` right above, one
+    // level up -- a repo checkout must not be able to raise the machine-wide
+    // heavy-worker budget any more than it can raise the one dashboard's own
+    // pane cap. See `SuperviseConfig::max_heavy_workers`'s own doc comment
+    // for the BSOD incident this defends against.
+    (
+        &["supervise", "max_heavy_workers"],
+        "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS",
+    ),
     // Mouse capture takes over the terminal's own text selection, so which
     // way that trade goes is the operator's call about their own terminal,
     // not a checked-out repo's.
@@ -2201,6 +2242,11 @@ mod tests {
         assert_eq!(WrapConfig::default().debounce_ms, 3000);
         assert_eq!(SuperviseConfig::default().max_restarts, 2);
         assert_eq!(SuperviseConfig::default().max_nudges, 3);
+        assert_eq!(
+            SuperviseConfig::default().max_heavy_workers,
+            1,
+            "issue #133: a single heavy worker at a time is the safe default"
+        );
         assert_eq!(
             HandoffConfig::default().model,
             None,
@@ -3556,6 +3602,35 @@ mod tests {
         assert_eq!(cfg.supervise.max_nudges, 5);
     }
 
+    /// Issue #133: `supervise.max_heavy_workers` reads from its own env var
+    /// like every other `supervise.*` key.
+    #[test]
+    fn max_heavy_workers_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS", "4")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.max_heavy_workers, 4);
+    }
+
+    /// Issue #133: `max_heavy_workers` is `REPO_FORBIDDEN`, the same trust
+    /// asymmetry as `dash.max_panes` -- a checked-out repo raising its own
+    /// concurrency budget is exactly the case the cap exists for.
+    #[test]
+    fn a_repository_config_may_not_set_max_heavy_workers() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nmax_heavy_workers = 99\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("max_heavy_workers must be REPO_FORBIDDEN");
+        assert!(err.to_string().contains("max_heavy_workers"), "got {err}");
+    }
+
     /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and
     /// `mail.max_delivered_bytes`: a repo checkout must not be able to seed
     /// the bank, grow its own cap, switch automatic harvesting on, or switch
@@ -4146,6 +4221,7 @@ mod tests {
         ("supervise", "backoff_base_secs"),
         ("supervise", "on_failure"),
         ("supervise", "max_nudges"),
+        ("supervise", "max_heavy_workers"),
         ("handoff", "model"),
         ("handoff", "tail_items"),
         ("handoff", "timeout_secs"),
