@@ -1166,6 +1166,10 @@ impl AgentAdapter for CodexAdapter {
             {
                 latest = Some(TranscriptUsage {
                     input_tokens: totals.input_tokens,
+                    // `RolloutTokenTotals` has no cache-class fields at all --
+                    // a guessed class would be worse than an honest zero.
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
                     output_tokens: totals.output_tokens,
                 });
             }
@@ -1596,22 +1600,41 @@ mod tests {
         );
     }
 
+    /// The rollout `TokenCount` fixture both cumulative-snapshot tests below
+    /// share: two snapshots, the second superseding the first.
+    const CODEX_TOKEN_COUNT_FIXTURE: &str = concat!(
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"output_tokens":6}}}}"#,
+    );
+
     #[test]
     fn transcript_usage_uses_the_latest_cumulative_token_snapshot() {
         let adapter = CodexAdapter::new(None);
-        let jsonl = concat!(
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"output_tokens":6}}}}"#,
-        );
         assert_eq!(
-            adapter.transcript_usage(jsonl),
+            adapter.transcript_usage(CODEX_TOKEN_COUNT_FIXTURE),
             Some(TranscriptUsage {
                 input_tokens: 25,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 output_tokens: 6,
             })
         );
         assert!(adapter.transcript_usage_is_cumulative());
+    }
+
+    /// Codex's rollout `TokenCount` totals expose no cache classes at all, so
+    /// its two new fields stay 0 and `context_total()` degrades to exactly
+    /// today's number. Never guess a class an adapter does not report.
+    #[test]
+    fn codex_reports_zero_for_the_cache_classes_it_cannot_see() {
+        let adapter = CodexAdapter::new(None);
+        let usage = adapter
+            .transcript_usage(CODEX_TOKEN_COUNT_FIXTURE)
+            .expect("usage");
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.context_total(), usage.input_tokens);
     }
 
     /// B: `--sandbox read-only` (verified against `codex exec --help` on

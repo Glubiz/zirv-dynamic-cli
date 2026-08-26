@@ -430,6 +430,10 @@ pub struct UsageCheckpoint {
     pub adapter: String,
     pub transcript_bytes: u64,
     pub cumulative_input_tokens: u64,
+    #[serde(default)]
+    pub cumulative_cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cumulative_cache_read_input_tokens: u64,
     pub cumulative_output_tokens: u64,
 }
 
@@ -574,6 +578,8 @@ fn usage_checkpoint(repo: &Path) -> Option<UsageCheckpoint> {
         adapter: adapter_name,
         transcript_bytes,
         cumulative_input_tokens: usage.input_tokens,
+        cumulative_cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cumulative_cache_read_input_tokens: usage.cache_read_input_tokens,
         cumulative_output_tokens: usage.output_tokens,
     })
 }
@@ -595,6 +601,12 @@ fn usage_since(
             input_tokens: usage
                 .input_tokens
                 .saturating_sub(checkpoint.cumulative_input_tokens),
+            cache_creation_input_tokens: usage
+                .cache_creation_input_tokens
+                .saturating_sub(checkpoint.cumulative_cache_creation_input_tokens),
+            cache_read_input_tokens: usage
+                .cache_read_input_tokens
+                .saturating_sub(checkpoint.cumulative_cache_read_input_tokens),
             output_tokens: usage
                 .output_tokens
                 .saturating_sub(checkpoint.cumulative_output_tokens),
@@ -627,18 +639,31 @@ fn enrich_transition_evidence(
         let beginning = UsageCheckpoint {
             transcript_bytes: 0,
             cumulative_input_tokens: 0,
+            cumulative_cache_creation_input_tokens: 0,
+            cumulative_cache_read_input_tokens: 0,
             cumulative_output_tokens: 0,
             ..current.clone()
         };
         if let Some(next) = usage_since(&state.repo, &beginning) {
             let total = observed.get_or_insert_default();
             total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+            total.cache_creation_input_tokens = total
+                .cache_creation_input_tokens
+                .saturating_add(next.cache_creation_input_tokens);
+            total.cache_read_input_tokens = total
+                .cache_read_input_tokens
+                .saturating_add(next.cache_read_input_tokens);
             total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
         }
     }
     if let Some(usage) = observed {
         if evidence.input_tokens.is_none() {
-            evidence.input_tokens = Some(usage.input_tokens);
+            // `context_total()`, not the raw `input_tokens` field: this is
+            // the same combined "real context size" number this call site
+            // always reported, back when `TranscriptUsage::input_tokens` was
+            // the adapter's pre-summed figure. Existing telemetry consumers
+            // must keep seeing that value unchanged (issue #155 Phase 2).
+            evidence.input_tokens = Some(usage.context_total());
         }
         if evidence.output_tokens.is_none() {
             evidence.output_tokens = Some(usage.output_tokens);
@@ -1861,6 +1886,8 @@ mod tests {
             adapter: "claude".into(),
             transcript_bytes: std::fs::metadata(&path).unwrap().len(),
             cumulative_input_tokens: 0,
+            cumulative_cache_creation_input_tokens: 0,
+            cumulative_cache_read_input_tokens: 0,
             cumulative_output_tokens: 0,
         };
         let mut file = std::fs::OpenOptions::new()
@@ -1873,13 +1900,17 @@ mod tests {
         )
         .unwrap();
 
+        let usage = usage_since(repo.path(), &checkpoint).expect("usage");
         assert_eq!(
-            usage_since(repo.path(), &checkpoint),
-            Some(crate::commands::ctx::event::TranscriptUsage {
-                input_tokens: 12,
+            usage,
+            crate::commands::ctx::event::TranscriptUsage {
+                input_tokens: 7,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 5,
                 output_tokens: 3,
-            })
+            }
         );
+        assert_eq!(usage.context_total(), 12, "the pre-2.32.0 combined number");
     }
 
     #[test]

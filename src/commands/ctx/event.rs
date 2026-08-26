@@ -40,12 +40,36 @@ pub struct SessionRef {
     pub cwd: PathBuf,
 }
 
-/// Cumulative token usage read from a harness transcript. Adapters return
-/// `None` when their transcript does not expose a verified usage shape.
+/// Cumulative token usage read from a harness transcript, in the four RAW
+/// classes the provider bills separately. Adapters return `None` when their
+/// transcript does not expose a verified usage shape, and `0` for a class
+/// their transcript genuinely does not report (codex's cumulative
+/// `TokenCount` totals carry no cache classes) -- never a guess.
+///
+/// Recorded raw, not pre-summed (issue #155, 2026-08-26): cache CREATION is
+/// expensive and written once, cache READ is cheap and dominant in a healthy
+/// session, and folding them together at the adapter boundary made the
+/// cache-hit ratio -- the one number that says whether prompt-shape work
+/// helped -- uncomputable anywhere downstream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranscriptUsage {
     pub input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
+}
+
+impl TranscriptUsage {
+    /// The combined "real context size" figure this type carried in
+    /// `input_tokens` before 2.32.0: uncached input plus both cache classes.
+    /// Every caller that genuinely wants ONE context-size number -- rot's
+    /// token gate, status display -- calls this. Saturating, like every other
+    /// token arithmetic in this crate.
+    pub fn context_total(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
 }
 
 /// The only currency the rot engine and supervisors understand.
@@ -152,5 +176,26 @@ mod tests {
             NormalizedEvent::ToolResult { is_error: true },
             NormalizedEvent::ToolResult { is_error: false }
         );
+    }
+
+    /// Issue #155, Phase 2: the four categories are recorded RAW. Before
+    /// this, claude's adapter summed input + cache_creation + cache_read into
+    /// `input_tokens` at the adapter boundary, which made a cache-hit ratio
+    /// -- the one number that says whether prompt-shape work helped --
+    /// uncomputable anywhere downstream.
+    #[test]
+    fn transcript_usage_keeps_the_cache_classes_apart_and_can_still_combine_them() {
+        let usage = TranscriptUsage {
+            input_tokens: 1_000,
+            cache_creation_input_tokens: 8_000,
+            cache_read_input_tokens: 91_000,
+            output_tokens: 500,
+        };
+        assert_eq!(
+            usage.context_total(),
+            100_000,
+            "the pre-2.32.0 combined number"
+        );
+        assert_eq!(TranscriptUsage::default().context_total(), 0);
     }
 }
