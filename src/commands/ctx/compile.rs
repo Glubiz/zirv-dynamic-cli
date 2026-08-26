@@ -191,6 +191,36 @@ fn gather_memory(
     (core, retrieved)
 }
 
+/// The single memory list injected into a composed prompt: the core
+/// selection in its own order, then any retrieval entry not already present.
+///
+/// Deduped on `(shared, key.to_lowercase())`, not on `key` alone: a private
+/// and a shared entry may legitimately carry the same key, and resolving
+/// that conflict is `prompt::select_memory_within_cap`'s job (private
+/// structurally outranks shared there). Case-insensitive because the private
+/// scope never validates or normalizes a key's case, the same reasoning
+/// `select_memory_within_cap`'s own key-conflict suppression already states.
+///
+/// `gather_memory` already filters retrieval against the core keys, so this
+/// is belt-and-braces for that path -- and load-bearing for any future
+/// caller that assembles the two lists differently.
+pub(crate) fn merge_memory_layers(
+    core: &[prompt::MemoryLine],
+    retrieved: &[prompt::MemoryLine],
+) -> Vec<prompt::MemoryLine> {
+    let mut seen: std::collections::HashSet<(bool, String)> = core
+        .iter()
+        .map(|entry| (entry.shared, entry.key.to_lowercase()))
+        .collect();
+    let mut merged = core.to_vec();
+    for entry in retrieved {
+        if seen.insert((entry.shared, entry.key.to_lowercase())) {
+            merged.push(entry.clone());
+        }
+    }
+    merged
+}
+
 fn changed_repo_paths(repo: &Path) -> Vec<String> {
     let mut paths = std::collections::BTreeSet::new();
     for args in [
@@ -455,13 +485,9 @@ pub fn compile_with_harness_roster(
         simple,
         &cfg.prompt,
         role,
-        &memory_entries,
-        cfg.memory.core_max_bytes,
         &harness_lines,
         cfg.context.max_harness_roster_bytes,
     );
-    let composed =
-        prompt::with_memory_layer(composed, &retrieved_memory, cfg.memory.retrieval_max_bytes);
     // Mirrors `compose`'s own gate for `PromptSource::Harnesses` exactly
     // (role == Orchestrator, `cfg.prompt.harnesses`, a non-empty roster) plus
     // the top-level `composed.is_some()` gate every layer in this module
@@ -483,6 +509,18 @@ pub fn compile_with_harness_roster(
     if log_truncation {
         log_truncation_decisions(state, now, &provenance);
     }
+    // Issue #155: the one memory layer, injected last of everything zirv
+    // composes deterministically -- mail and the command-line layer are the
+    // only things after it, and both are already per-launch. The cap is the
+    // sum of the two configured budgets, so neither selection can crowd the
+    // other out of the space it was already allotted.
+    let composed = prompt::with_memory_layer(
+        composed,
+        &merge_memory_layers(&memory_entries, &retrieved_memory),
+        cfg.memory
+            .core_max_bytes
+            .saturating_add(cfg.memory.retrieval_max_bytes),
+    );
 
     // Computed from `cfg.policy` alone, never from `composed`'s text: the
     // canonical context layer's prose can steer a session, but it cannot
@@ -1081,5 +1119,152 @@ mod tests {
             !lines.iter().any(|line| line.contains("context-truncated")),
             "a report must not write decisions: {lines:?}"
         );
+    }
+
+    /// Issue #155, Phase 1(c)+(d): ONE memory layer, and it sits AFTER the
+    /// canonical context layer.
+    ///
+    /// The retrieval half of memory is selected from live `git diff`/`git
+    /// ls-files` output and is recomputed on every recompose (a nudge
+    /// relaunch, a loop cycle, a dashboard sweep). Everything positioned
+    /// after it therefore falls out of the provider's prompt cache whenever
+    /// the working tree moves. Putting the whole memory layer at the tail --
+    /// as late as it can go while still preceding mail -- keeps the ~8 KiB
+    /// canonical context layer in the cacheable prefix.
+    #[test]
+    fn memory_is_one_layer_and_follows_the_canonical_context_layer() {
+        let repo = repo_with_context_files(&[("common.md", "canonical common instructions\n")]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(home.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(repo.path());
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &memory::Entry {
+                key: "deploy-cmd".to_string(),
+                written_by: "test".to_string(),
+                written: 100,
+                verified: 100,
+                source: "explicit".to_string(),
+                body: "zirv deploy".to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+        )
+        .expect("remember");
+
+        let compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            LaunchMode::Interactive,
+            false,
+        );
+        let composed = compiled.composed.expect("composed");
+
+        let memory_positions: Vec<usize> = composed
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == PromptSource::Memory)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            memory_positions.len(),
+            1,
+            "exactly one memory layer, not two: {:?}",
+            composed.sources
+        );
+        let context_position = composed
+            .sources
+            .iter()
+            .position(|s| *s == PromptSource::Context)
+            .expect("a canonical context layer");
+        assert!(
+            context_position < memory_positions[0],
+            "canonical context must precede memory: {:?}",
+            composed.sources
+        );
+
+        let described = composed.describe();
+        assert!(described.starts_with("v8 "), "got {described}");
+        assert_eq!(
+            described.matches("memory").count(),
+            1,
+            "describe() listed memory twice: {described}"
+        );
+    }
+
+    /// Core and retrieval selections still report SEPARATELY -- `zirv context
+    /// status` shows where an entry came from. Only the injection is unified.
+    #[test]
+    fn the_merged_injection_does_not_collapse_the_two_reported_selections() {
+        let core = vec![prompt::MemoryLine {
+            key: "Deploy-Cmd".to_string(),
+            body: "zirv deploy".to_string(),
+            verified: 100,
+            written: 100,
+            shared: false,
+        }];
+        let retrieved = vec![
+            // Same key, different case: the merge must drop it, because
+            // `gather_memory` already excluded it from retrieval by key and a
+            // second copy in the prompt would say the same thing twice.
+            prompt::MemoryLine {
+                key: "deploy-cmd".to_string(),
+                body: "zirv deploy".to_string(),
+                verified: 90,
+                written: 90,
+                shared: false,
+            },
+            prompt::MemoryLine {
+                key: "lint-cmd".to_string(),
+                body: "cargo clippy".to_string(),
+                verified: 80,
+                written: 80,
+                shared: false,
+            },
+        ];
+
+        let merged = merge_memory_layers(&core, &retrieved);
+        assert_eq!(
+            merged.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["Deploy-Cmd", "lint-cmd"],
+            "core order first, retrieval appended, deduped case-insensitively"
+        );
+    }
+
+    /// A shared entry and a private entry may legitimately carry the same
+    /// key: `select_memory_within_cap` resolves that conflict itself, with
+    /// private structurally outranking shared. The merge must not pre-empt
+    /// that by dropping one on key alone -- the dedupe key is (shared, key).
+    #[test]
+    fn merging_keys_on_scope_too_so_the_shared_suppression_rule_still_runs() {
+        let core = vec![prompt::MemoryLine {
+            key: "deploy-cmd".to_string(),
+            body: "private".to_string(),
+            verified: 100,
+            written: 100,
+            shared: false,
+        }];
+        let retrieved = vec![prompt::MemoryLine {
+            key: "deploy-cmd".to_string(),
+            body: "shared".to_string(),
+            verified: 90,
+            written: 90,
+            shared: true,
+        }];
+        assert_eq!(merge_memory_layers(&core, &retrieved).len(), 2);
     }
 }

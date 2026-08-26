@@ -9228,6 +9228,11 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut cfg = CtxConfig::default();
         cfg.memory.core_max_bytes = 40;
+        // Issue #155: the merged memory layer is capped by the SUM of the two
+        // budgets now, not `core_max_bytes` alone -- zero the retrieval half
+        // out so this test's tiny budget still actually bounds what gets
+        // delivered.
+        cfg.memory.retrieval_max_bytes = 0;
         let repo = tmp.path();
         let slug = super::super::state::repo_slug(repo);
 
