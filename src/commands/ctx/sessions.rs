@@ -108,20 +108,60 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// mean "no live dashboard" -- so an abnormally-exited dashboard's leftover
 /// requests directory never wedges a future interactive launch. Only a
 /// readable pidfile naming a live process counts.
-fn dashboard_owner_is_live(requests_dir: &Path) -> bool {
+///
+/// `pub(crate)` (issue #144): also the liveness half of `agent::
+/// try_join_dashboard`'s own gate, so the two readers of `DASH_REQUESTS_ENV`
+/// cannot drift on what "live" means the way they did before -- this guard
+/// used to be the only one of the two that checked `owner.pid` at all, so a
+/// dashboard that exited abnormally left a directory `try_join_dashboard`
+/// still treated as a live channel: a request was written into it, nobody
+/// was listening, and the caller burned the whole ack timeout finding that
+/// out.
+///
+/// A thin `bool` projection of [`dashboard_owner_liveness`] -- see that
+/// function's own doc comment for the reason `try_join_dashboard` needs
+/// instead of just this yes/no answer (fix round 1, both reviewers: a silent
+/// refusal here is undiagnosable, the same complaint issue #144's own
+/// acceptance criteria raised about the three "dashboard did not answer"
+/// messages).
+pub(crate) fn dashboard_owner_is_live(requests_dir: &Path) -> bool {
+    matches!(dashboard_owner_liveness(requests_dir), OwnerLiveness::Live)
+}
+
+/// Why [`dashboard_owner_is_live`] answered the way it did for `requests_dir`
+/// -- the same three-way distinction its own doc comment already draws
+/// ("missing, unreadable, unparseable, or dead-pid... all mean 'no live
+/// dashboard'"), just not collapsed to a bool: `agent::try_join_dashboard`
+/// needs the reason to report ("dead owner pid N" vs "missing owner.pid") to
+/// an operator who would otherwise see this refusal in total silence.
+/// `Missing` folds the unreadable and unparseable cases in with a genuinely
+/// absent file -- all three mean the same thing to a caller reporting this
+/// upward: no pid was ever recorded to check liveness against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerLiveness {
+    Live,
+    Missing,
+    Dead(u32),
+}
+
+pub(crate) fn dashboard_owner_liveness(requests_dir: &Path) -> OwnerLiveness {
     if !requests_dir.is_dir() {
-        return false;
+        return OwnerLiveness::Missing;
     }
     let Some(parent) = requests_dir.parent() else {
-        return false;
+        return OwnerLiveness::Missing;
     };
     let Ok(contents) = std::fs::read_to_string(parent.join("owner.pid")) else {
-        return false;
+        return OwnerLiveness::Missing;
     };
     let Ok(pid) = contents.trim().parse::<u32>() else {
-        return false;
+        return OwnerLiveness::Missing;
     };
-    is_alive(pid)
+    if is_alive(pid) {
+        OwnerLiveness::Live
+    } else {
+        OwnerLiveness::Dead(pid)
+    }
 }
 
 pub fn nested_session_evidence(env: super::config::EnvLookup<'_>) -> Option<String> {
@@ -1034,23 +1074,7 @@ mod tests {
         Record::new(session, "claude", repo, verb)
     }
 
-    /// A pid guaranteed dead by the time it is used: a real child process,
-    /// spawned and waited on, so its exit is deterministic rather than a
-    /// hardcoded number that might collide with something alive on this
-    /// machine.
-    fn dead_pid() -> u32 {
-        let mut cmd = if cfg!(windows) {
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", "exit", "0"]);
-            c
-        } else {
-            std::process::Command::new("true")
-        };
-        let mut child = cmd.spawn().expect("spawn a short-lived process");
-        let pid = child.id();
-        let _ = child.wait();
-        pid
-    }
+    use super::super::testenv::dead_pid;
 
     #[test]
     fn a_record_without_owner_pid_deserializes_as_unowned() {
@@ -2148,6 +2172,44 @@ mod tests {
         let evidence = nested_session_evidence(&|k| env.get(k).cloned())
             .expect("a live dashboard owner is evidence");
         assert!(evidence.contains("dashboard pane"), "got {evidence}");
+    }
+
+    /// Fix round 1 (issue #144): `dashboard_owner_is_live`'s three cases,
+    /// exposed directly through `dashboard_owner_liveness` rather than only
+    /// through the collapsed bool -- `agent::try_join_dashboard` needs the
+    /// `Dead(pid)`/`Missing` distinction to report a refusal it used to give
+    /// in total silence.
+    #[test]
+    fn dashboard_owner_liveness_distinguishes_missing_dead_and_live() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let make = |name: &str| {
+            let requests = tmp.path().join("dash").join(name).join("requests");
+            std::fs::create_dir_all(&requests).expect("mkdir");
+            requests
+        };
+
+        let missing = make("aaaa1111-0001");
+        assert_eq!(dashboard_owner_liveness(&missing), OwnerLiveness::Missing);
+
+        let dead = make("bbbb2222-0002");
+        let dead_pid_value = dead_pid();
+        std::fs::write(
+            dead.parent().expect("parent").join("owner.pid"),
+            dead_pid_value.to_string(),
+        )
+        .expect("write owner.pid");
+        assert_eq!(
+            dashboard_owner_liveness(&dead),
+            OwnerLiveness::Dead(dead_pid_value)
+        );
+
+        let live = make("cccc3333-0003");
+        std::fs::write(
+            live.parent().expect("parent").join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write owner.pid");
+        assert_eq!(dashboard_owner_liveness(&live), OwnerLiveness::Live);
     }
 
     #[test]

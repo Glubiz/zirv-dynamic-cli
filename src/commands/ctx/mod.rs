@@ -284,6 +284,25 @@ pub(crate) mod testenv {
             }
         }
     }
+
+    /// A pid guaranteed dead by the time it is used: a real child process,
+    /// spawned and waited on, so its exit is deterministic rather than a
+    /// hardcoded number that might collide with something alive on this
+    /// machine. Shared by every test standing in for a dashboard that exited
+    /// abnormally, leaving its `owner.pid` naming a process that is gone.
+    pub(crate) fn dead_pid() -> u32 {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit", "0"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = cmd.spawn().expect("spawn a short-lived process");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
 }
 
 /// Every ctx entry point returns this. Matches the error style used by the

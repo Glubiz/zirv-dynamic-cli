@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-25
+last-verified: 2026-08-26
 ---
 
 # Decision Log
@@ -23,6 +23,13 @@ last-verified: 2026-08-25
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-26 — Gate the resume-flag strip on adapter identity, not flag shape (issue #143)
+**Context:** `extra_launch_flags`/`pins_an_existing_conversation` stripped a bare `-c` from every relaunch's argv as claude's own valueless `--continue` shorthand, regardless of which adapter built the launch. Codex's own `-c, --config <key>=<value>` shares that exact bare spelling for an unrelated, value-carrying flag, so every codex restart's own sandbox-posture flag (e.g. `-c approval_policy=never`) had its `-c` token stripped while the value token survived, orphaned on argv — real codex-cli rejected the whole relaunch.
+**Decision:** Added `adapter_has_resume_flags(adapter_name)`, threaded as a new parameter through `extra_launch_flags`/`pins_an_existing_conversation`, gating the entire strip on whether the launching adapter is `"claude"` — the one adapter this flag vocabulary was ever verified against.
+**Rejected:** Disambiguating by the *next* token's shape (a bare `-c` followed by something `key=value`-shaped reads as codex's) — guesses at a convention neither CLI documents and still misfires on a coincidentally `key=value`-shaped claude argument. Moving the flag lists into `AgentAdapter` as a per-adapter trait method — unnecessary churn since only claude has ever had a verified resume story; a name-gated free function needs no trait change.
+**Consequences:** A future adapter inherits "no resume flags recognised" by default until someone verifies and adds its name to `adapter_has_resume_flags` — fail closed to "unverified," matching every other adapter-capability default in this codebase, never a guess.
+**Spec / link:** `src/commands/ctx/exec.rs`'s `adapter_has_resume_flags`/`extra_launch_flags`/`pins_an_existing_conversation`; [[Ctx Supervisors]], [[Ctx Adapters]]; issue #143.
 
 ### 2026-08-25 — Permission-audit recommendations gate on a protected-family list, independent of reusability (issue #132)
 **Context:** `zirv ctx permissions audit`'s `is_reusable` judges only whether a family's saved approval would keep matching the next equivalent invocation (no long literal, no filter pipe). Review found `git push --force origin main` is `reusable` by that definition — no long literal, no pipe — yet issue #132 explicitly requires destructive git, publish/release, credential/secret, and global-install families to keep prompting no matter how mechanically repeatable the command looks.
