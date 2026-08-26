@@ -197,82 +197,86 @@ impl Stance {
 /// report then says, per harness, which of them are real.
 ///
 /// **`network` is the one deliberate exception (2026-08-26, codex approval-
-/// posture round -- see [`Default`]'s own impl below).** Every other
-/// capability's `Allow` default means "zirv adds no argv, the harness's own
-/// native default governs" -- and every harness's own native default for the
-/// other six capabilities happens to already be permissive, so that reads as
-/// "no restriction". Network is different: codex's own native default under
-/// `--sandbox workspace-write` is *already closed* (verified: a real launch
-/// carries `network_access: false` with no zirv-added flag at all), so an
-/// `Allow` default here would not "add no restriction" -- it would flip
-/// `CodexAdapter::policy_args` into actively *widening* codex's own native
-/// default the moment that mapping was wired up, on every unconfigured
-/// install. `network` therefore defaults to [`Stance::Deny`], the only
-/// choice that keeps an unconfigured install's `[policy]` byte-for-byte
-/// consistent with what it has always actually done.
+/// posture round; refined again in the same round's correction pass --
+/// see below).** Every other capability's `Allow` default means "zirv adds
+/// no argv, the harness's own native default governs" -- and every harness's
+/// own native default for the other six capabilities happens to already be
+/// permissive, so that reads as "no restriction". Network is different:
+/// codex's own native default under `--sandbox workspace-write` is *already
+/// closed* (verified: a real launch carries `network_access: false` with no
+/// zirv-added flag at all), so treating an unconfigured `network` the same
+/// as the other six (a plain `Stance` defaulting to `Allow`) would either
+/// widen codex's own native default the moment that mapping was wired up
+/// (if defaulted to `Allow`), or falsely claim zirv itself is denying
+/// network on every unconfigured install (if defaulted to `Stance::Deny` --
+/// this module's own [`evaluate`] would then render a "network: deny" row
+/// nobody asked for, because *codex's own default* is what is closed here,
+/// not a zirv-imposed restriction). `network` is therefore `Option<Stance>`,
+/// not a plain `Stance`: `None` means "no operator layer has ever named
+/// network at all", which [`Default`] gives for free (an `Option`'s own
+/// default), which [`resolve`] preserves as `None` when both layers are
+/// silent (`resolve_network`'s own doc comment), and which [`evaluate`]
+/// reads as "omit this row" rather than reporting a stance zirv never
+/// actually chose. `Some(stance)` means an operator layer did name one, and
+/// is reported exactly like any other capability from there.
 ///
 /// `deny_unknown_fields`: a typo'd capability name hard-errors rather than
 /// silently leaving that capability at `Allow`, which is the failure mode a
 /// permissions surface can least afford.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectivePolicy {
     pub repo_fs_write: Stance,
     pub outside_repo_fs_write: Stance,
     pub shell_exec: Stance,
-    pub network: Stance,
+    pub network: Option<Stance>,
     pub approval: Stance,
     pub git_push_destructive: Stance,
     pub tool_access: Stance,
 }
 
-/// Hand-written, not derived, for exactly one reason: `network` defaults to
-/// [`Stance::Deny`] rather than [`Stance::default()`] -- see the struct's own
-/// doc comment for why. Every other field keeps the ordinary
-/// `Stance::default()` (`Allow`).
-///
-/// This value is deliberately consistent with, but not itself the mechanism
-/// for, `resolve`'s own "nothing configured anywhere" answer for `network`
-/// (`resolve_network`'s `(None, None) => Deny` arm) -- the two are kept in
-/// sync by inspection, not by one calling the other, because `resolve`'s own
-/// fold does NOT read this `Default` impl for `network` at all (2026-08-26,
-/// correction round): see `resolve_network`'s own doc comment for why the
-/// ordinary `narrowed_by`/`Stance::default()` machinery every other
-/// capability uses is the wrong mechanism for this one field, and what
-/// replaces it.
-impl Default for EffectivePolicy {
-    fn default() -> Self {
-        EffectivePolicy {
-            repo_fs_write: Stance::default(),
-            outside_repo_fs_write: Stance::default(),
-            shell_exec: Stance::default(),
-            network: Stance::Deny,
-            approval: Stance::default(),
-            git_push_destructive: Stance::default(),
-            tool_access: Stance::default(),
-        }
-    }
-}
-
 impl EffectivePolicy {
+    /// For `Network`, projects the `Option<Stance>` field down to a plain
+    /// `Stance` by treating "no operator layer ever named it" (`None`) as
+    /// `Deny` -- the same closed answer `resolve_network`'s own "both
+    /// layers silent" case produces, and what codex's own native default
+    /// already does with no zirv-added flag at all. This is a convenience
+    /// for callers that only need "what does zirv want to hold this
+    /// harness to" (the `PolicyReport::render` baseline loop, principally);
+    /// callers that need to tell "never configured" apart from "explicitly
+    /// denied" (`evaluate`, to decide whether to render a row at all) must
+    /// read `self.network` directly instead, which is why `evaluate` does
+    /// not call this method for `Network`.
     pub fn stance(&self, capability: Capability) -> Stance {
         match capability {
             Capability::RepoFsWrite => self.repo_fs_write,
             Capability::OutsideRepoFsWrite => self.outside_repo_fs_write,
             Capability::ShellExec => self.shell_exec,
-            Capability::Network => self.network,
+            Capability::Network => self.network.unwrap_or(Stance::Deny),
             Capability::Approval => self.approval,
             Capability::GitPushDestructive => self.git_push_destructive,
             Capability::ToolAccess => self.tool_access,
         }
     }
 
+    /// No `Network` arm: `network`'s field type (`Option<Stance>`) cannot
+    /// yield a `&mut Stance`, and both callers below (`narrowed_by`'s fold,
+    /// `resolve`'s env-override loop) explicitly skip `Capability::Network`
+    /// and assign `.network` directly instead -- see each one's own doc
+    /// comment for why the ordinary per-capability mechanism is unsound for
+    /// this one field. Reachable only if a future caller adds `Network` to
+    /// one of those loops without also handling it specially first.
     fn stance_mut(&mut self, capability: Capability) -> &mut Stance {
         match capability {
             Capability::RepoFsWrite => &mut self.repo_fs_write,
             Capability::OutsideRepoFsWrite => &mut self.outside_repo_fs_write,
             Capability::ShellExec => &mut self.shell_exec,
-            Capability::Network => &mut self.network,
+            Capability::Network => {
+                unreachable!(
+                    "network has no plain Stance slot (Option<Stance>); callers must skip \
+                     Capability::Network and assign .network directly -- see resolve_network"
+                )
+            }
             Capability::Approval => &mut self.approval,
             Capability::GitPushDestructive => &mut self.git_push_destructive,
             Capability::ToolAccess => &mut self.tool_access,
@@ -285,9 +289,22 @@ impl EffectivePolicy {
     /// return the smaller of two values. This is the whole privilege-widening
     /// defense for the repo layer, and it is a property of `Stance`'s
     /// ordering rather than a check a future edit could drop.
+    ///
+    /// **`Network` is excluded from this loop** (2026-08-26, correction
+    /// round): the proof above depends on `Stance::default()` (`Allow`)
+    /// being both a layer's "I said nothing" value AND the loosest value
+    /// the type can express, which is exactly the property `network`'s own
+    /// `Option<Stance>` deliberately breaks (see `resolve_network`'s own doc
+    /// comment). `.network` is left exactly as `self` had it here; `resolve`
+    /// always overwrites it afterward with `resolve_network`'s own answer,
+    /// so a caller of `narrowed_by` alone (rather than through `resolve`)
+    /// must not read the result's `.network` as meaningful.
     pub fn narrowed_by(self, narrower: EffectivePolicy) -> EffectivePolicy {
         let mut out = self;
         for capability in Capability::ALL {
+            if capability == Capability::Network {
+                continue;
+            }
             let stance = self.stance(capability).max(narrower.stance(capability));
             *out.stance_mut(capability) = stance;
         }
@@ -309,7 +326,7 @@ impl EffectivePolicy {
             repo_fs_write: Stance::Deny,
             outside_repo_fs_write: Stance::Deny,
             shell_exec: Stance::Deny,
-            network: Stance::Deny,
+            network: Some(Stance::Deny),
             approval: Stance::Deny,
             git_push_destructive: Stance::Deny,
             tool_access: Stance::Deny,
@@ -345,7 +362,7 @@ impl EffectivePolicy {
             // the deny set is refused by rule.
             shell_exec: Stance::Ask,
             // `WebFetch`/`WebSearch` are pre-approved.
-            network: Stance::Allow,
+            network: Some(Stance::Allow),
             approval: Stance::Ask,
             // Force-push and history rewrites are in the built-in ask set.
             git_push_destructive: Stance::Ask,
@@ -390,7 +407,13 @@ pub fn resolve(
         .narrowed_by(parse_layer(repo, "<repo>/.zirv/ctx.toml")?);
     resolved.network = resolve_network(home_network, repo_network);
 
+    // `Network` is excluded from this loop and handled separately right
+    // below: its field is `Option<Stance>`, so `stance_mut` cannot name a
+    // `&mut Stance` slot for it (see that method's own doc comment).
     for capability in Capability::ALL {
+        if capability == Capability::Network {
+            continue;
+        }
         let Some(raw) = env(capability.env_var()) else {
             continue;
         };
@@ -402,6 +425,17 @@ pub fn resolve(
             .into());
         };
         *resolved.stance_mut(capability) = stance;
+    }
+
+    if let Some(raw) = env(Capability::Network.env_var()) {
+        let Some(stance) = Stance::parse(&raw) else {
+            return Err(format!(
+                "{}: expected allow, ask or deny, got '{raw}'",
+                Capability::Network.env_var()
+            )
+            .into());
+        };
+        resolved.network = Some(stance);
     }
 
     Ok(resolved)
@@ -445,38 +479,54 @@ fn parse_network_layer(layer: &Option<toml::Value>, origin: &str) -> CtxResult<O
     Ok(parsed.network)
 }
 
-/// `network`'s own home/repo combination (2026-08-26, correction round),
-/// replacing the ordinary `narrowed_by` fold for this one field -- see
-/// `resolve`'s own doc comment for why the shared `max`-based mechanism is
-/// unsound here.
+/// `network`'s own home/repo combination (2026-08-26, correction round;
+/// fixed again the same round -- see below), replacing the ordinary
+/// `narrowed_by` fold for this one field -- see `resolve`'s own doc comment
+/// for why the shared `max`-based mechanism is unsound here.
 ///
-/// The contract: effective `network` is `Allow` only when the OPERATOR
-/// (home, or the `ZIRV_CTX_POLICY_NETWORK` env override applied afterward in
-/// `resolve`) has explicitly said so, AND no layer has explicitly said
-/// `deny`. Concretely:
-/// - Both layers silent -> `Deny`: the safe default, applied HERE rather
-///   than baked into a layer's own parsed value, so "silent" and "explicitly
-///   denied" never collapse into the same input the way they would if this
-///   reused `EffectivePolicy`'s `Default`.
-/// - Repo explicitly `deny` -> `Deny`, regardless of what home said: the one
-///   thing a repo layer may always do is narrow.
-/// - Repo silent or repo explicitly `allow`, home explicitly `allow` ->
-///   `Allow`: home's own explicit choice survives repo's silence (the actual
-///   correction this round makes -- home no longer needs the repo's
-///   cooperation to be heard), and repo's own `allow` is a no-op agreement,
-///   never a grant of its own.
-/// - Repo silent or repo explicitly `allow`, home silent or home explicitly
-///   `deny`/`ask` -> home's own value if it named one (`ask`/`deny`,
-///   preserved for an honest report), else `Deny`: a repo can never grant
-///   network on its own, silent or not.
-fn resolve_network(home: Option<Stance>, repo: Option<Stance>) -> Stance {
-    if repo == Some(Stance::Deny) {
-        return Stance::Deny;
+/// Returns `None` only when NEITHER layer ever names `network` at all: that
+/// is "no operator opinion exists", which [`EffectivePolicy::default`]
+/// itself now represents the same way, and which [`evaluate`] reads as
+/// "omit the row" rather than a stance zirv chose. The moment either layer
+/// names `network`, the answer is `Some` from there on -- narrowing is
+/// always still possible (a repo naming `ask`/`deny` can still tighten a
+/// silent or `allow` home), but the *distinctness* of `ask` from `deny` is
+/// preserved rather than collapsed, because both feed the same `max` as
+/// home does.
+///
+/// **The bug this fixes (2026-08-26): the previous version only special-
+/// cased `repo == Some(Deny)`, so a repo's explicit `network = "ask"`
+/// fell through to `home`'s own value untouched** -- silently dropping the
+/// repo's narrowing the moment home said `allow` (e.g. home `allow` + repo
+/// `ask` resolved to `Allow`, when the repo layer explicitly asked for no
+/// more than `Ask`). A repo may always narrow, regardless of which
+/// non-`Deny` stance it names; treating `deny` as the only narrowing value
+/// a repo can express was the defect. The fix folds both layers through the
+/// same `Stance` ordering the other six capabilities already use, with each
+/// layer's *own* silent-value substituted before the `max`:
+/// `max(home.unwrap_or(Deny), repo.unwrap_or(Allow))`.
+///
+/// - Home's silence substitutes `Deny` (the operator never opted in, so
+///   nothing pulls the result toward `Allow` on its behalf) -- this is what
+///   keeps "nobody said anything" (`None, None`) from ever landing on
+///   `Allow`, without needing a separate case for it below.
+/// - Repo's silence substitutes `Allow` (a repo that names nothing has no
+///   opinion, so it must never pull the result toward `Deny`/`Ask` on its
+///   own) -- this is what lets home's own explicit `allow` survive a silent
+///   repo (`max(Allow, Allow) == Allow`), which the previous version could
+///   only do by special-casing "home said something" as an unconditional
+///   win; here it falls out of the same formula every other case uses.
+/// - Repo explicitly naming `ask` or `deny` now narrows exactly like the
+///   six generically-folded capabilities do: `max` with home's value can
+///   only move toward the repo's stricter stance, never away from it.
+fn resolve_network(home: Option<Stance>, repo: Option<Stance>) -> Option<Stance> {
+    if home.is_none() && repo.is_none() {
+        return None;
     }
-    match home {
-        Some(stance) => stance,
-        None => Stance::Deny,
-    }
+    Some(std::cmp::max(
+        home.unwrap_or(Stance::Deny),
+        repo.unwrap_or(Stance::Allow),
+    ))
 }
 
 /// What zirv can honestly promise for one capability on one harness. There is
@@ -684,6 +734,20 @@ impl PolicyReport {
 /// zirv is imposing nothing, so there is no mechanism to name and nothing an
 /// adapter could usefully say. That is also why every adapter's own
 /// `policy_support` may leave `Allow` to a catch-all arm -- it is never asked.
+///
+/// **`Network` renders no row at all when `policy.network` is `None`**
+/// (2026-08-26, correction round): `None` means no operator layer has ever
+/// named `network`, which is not a stance zirv chose to report -- unlike
+/// every other capability, whose `Stance::default()` (`Allow`) is itself a
+/// real, reportable answer ("operator-controlled, zirv imposes nothing").
+/// Before this, `EffectivePolicy::default()`'s own `network: Stance::Deny`
+/// meant an unconfigured install's report carried a "network: deny" line
+/// implying zirv itself was denying network, when the true state was "no
+/// opinion was ever expressed" -- codex's own native default happens to
+/// already be closed, with no zirv-added flag at all. This is why `Network`
+/// is handled here directly from `policy.network` rather than through the
+/// generic `policy.stance(capability)` call every other capability uses:
+/// `stance()` cannot express "omit this row", only a concrete `Stance`.
 pub fn evaluate(
     policy: &EffectivePolicy,
     adapter: &dyn AgentAdapter,
@@ -691,8 +755,12 @@ pub fn evaluate(
 ) -> PolicyReport {
     let outcomes = Capability::ALL
         .into_iter()
-        .map(|capability| {
-            let stance = policy.stance(capability);
+        .filter_map(|capability| {
+            let stance = if capability == Capability::Network {
+                policy.network?
+            } else {
+                policy.stance(capability)
+            };
             let descriptor = match stance {
                 Stance::Allow => CapabilityDescriptor::operator_controlled(
                     "zirv declares no restriction; the harness's own defaults and the operator's \
@@ -700,12 +768,12 @@ pub fn evaluate(
                 ),
                 _ => adapter.policy_support(capability, stance, mode),
             };
-            CapabilityOutcome {
+            Some(CapabilityOutcome {
                 capability,
                 stance,
                 support: descriptor.support,
                 mechanism: descriptor.mechanism,
-            }
+            })
         })
         .collect();
     PolicyReport {
@@ -741,7 +809,7 @@ mod tests {
         let baseline = EffectivePolicy::interactive_baseline();
         assert_eq!(baseline.repo_fs_write, Stance::Allow);
         assert_eq!(baseline.outside_repo_fs_write, Stance::Ask);
-        assert_eq!(baseline.network, Stance::Allow);
+        assert_eq!(baseline.network, Some(Stance::Allow));
         assert_eq!(baseline.shell_exec, Stance::Ask);
         assert_eq!(baseline.approval, Stance::Ask);
         assert_eq!(baseline.git_push_destructive, Stance::Ask);
@@ -773,6 +841,58 @@ mod tests {
                 expected.label()
             );
         }
+    }
+
+    /// The bug this round fixes (2026-08-26): before `network` became
+    /// `Option<Stance>`, `EffectivePolicy::default()`'s own `network:
+    /// Stance::Deny` meant `evaluate` always produced a `Network` outcome on
+    /// an unconfigured install, and its rendered line read "network access:
+    /// deny -- ..." -- implying zirv itself was denying network, when in
+    /// truth no operator layer had ever named it (codex's own native
+    /// default already denies it, with no zirv-added flag at all). A report
+    /// built from a wholly-default policy must contain no `Network` row and
+    /// no "network" text at all.
+    #[test]
+    fn a_default_policys_report_carries_no_spurious_network_row() {
+        let policy = EffectivePolicy::default();
+        let claude = ClaudeAdapter::new(None);
+        let codex = CodexAdapter::new(None);
+        for adapter in [&claude as &dyn AgentAdapter, &codex as &dyn AgentAdapter] {
+            let report = evaluate(&policy, adapter, adapters::LaunchMode::Headless);
+            assert!(
+                !report
+                    .outcomes
+                    .iter()
+                    .any(|outcome| outcome.capability == Capability::Network),
+                "{}: a default (unconfigured) policy must render no Network row at all",
+                report.adapter
+            );
+            assert!(
+                !report.render().contains("network"),
+                "{}: the rendered report must not mention network at all when unconfigured",
+                report.adapter
+            );
+        }
+    }
+
+    /// Once an operator layer explicitly names `network` (whatever the
+    /// stance), the row comes back -- `evaluate` only omits it for `None`,
+    /// never for a `Some` the operator chose, even `Some(Stance::Deny)`.
+    #[test]
+    fn an_explicitly_configured_network_stance_still_renders_its_row() {
+        let policy = EffectivePolicy {
+            network: Some(Stance::Deny),
+            ..EffectivePolicy::default()
+        };
+        let claude = ClaudeAdapter::new(None);
+        let report = evaluate(&policy, &claude, adapters::LaunchMode::Headless);
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.capability == Capability::Network),
+            "an operator-chosen network stance must still be reported"
+        );
     }
 
     /// A report says which posture it describes, and an interactive one shows
@@ -905,8 +1025,11 @@ mod tests {
     }
 
     /// `network` is the one deliberate exception (see `EffectivePolicy`'s own
-    /// `Default` impl): every other capability's default is `Allow`, "zirv
-    /// declares no restriction of its own".
+    /// doc comment): every other capability's default is `Allow`, "zirv
+    /// declares no restriction of its own"; `network`'s default is `None`,
+    /// "no operator layer has ever named it" -- distinct from `Some(Deny)`,
+    /// which would claim zirv itself denies network on an unconfigured
+    /// install.
     #[test]
     fn a_default_policy_declares_no_restriction_at_all_except_network() {
         let policy = EffectivePolicy::default();
@@ -922,25 +1045,31 @@ mod tests {
             );
         }
         assert_eq!(
-            policy.network,
-            Stance::Deny,
-            "network should default to deny, matching what an unwired install has always done"
+            policy.network, None,
+            "network should default to None -- no operator layer has ever named it, matching \
+             what an unwired install has always done without claiming zirv denies it"
         );
     }
 
     /// The privilege-widening defense, stated directly on the fold: whatever
     /// an untrusted layer says, the result is never looser than the operator's
     /// own stance. Deliberately an explicit all-`Allow` literal, not
-    /// `EffectivePolicy::default()`: `default()` is no longer the uniformly
-    /// loosest possible value (`network` defaults to `Deny`), so it would no
-    /// longer represent "an attempt to widen every capability to `Allow`".
+    /// `EffectivePolicy::default()`: `default()` is not the uniformly loosest
+    /// possible value (`network` defaults to `None`, outside the fold this
+    /// test exercises), so it would not represent "an attempt to widen every
+    /// capability to `Allow`". `network` is left at its own default (`None`)
+    /// on both sides here rather than given a value: it is deliberately
+    /// excluded from `narrowed_by`'s generic loop (see that method's own doc
+    /// comment) and has its own narrowing tests through `resolve`/
+    /// `resolve_network` below, so a value here would only assert that
+    /// `narrowed_by` leaves it untouched, not that anything narrows.
     #[test]
     fn narrowing_never_loosens_any_capability() {
         let operator = EffectivePolicy {
             repo_fs_write: Stance::Ask,
             outside_repo_fs_write: Stance::Deny,
             shell_exec: Stance::Deny,
-            network: Stance::Ask,
+            network: None,
             approval: Stance::Ask,
             git_push_destructive: Stance::Deny,
             tool_access: Stance::Ask,
@@ -949,7 +1078,7 @@ mod tests {
             repo_fs_write: Stance::Allow,
             outside_repo_fs_write: Stance::Allow,
             shell_exec: Stance::Allow,
-            network: Stance::Allow,
+            network: None,
             approval: Stance::Allow,
             git_push_destructive: Stance::Allow,
             tool_access: Stance::Allow,
@@ -957,22 +1086,24 @@ mod tests {
         assert_eq!(operator.narrowed_by(widening_attempt), operator);
     }
 
+    /// `network` is deliberately left at its own default (`None`) on both
+    /// sides: `narrowed_by` excludes it from the generic fold entirely (see
+    /// that method's own doc comment), so this test's job is the other six
+    /// capabilities. `network`'s own narrowing is exercised through
+    /// `resolve`/`resolve_network` in the tests below instead.
     #[test]
     fn narrowing_takes_the_stricter_of_the_two_per_capability() {
         let operator = EffectivePolicy {
             shell_exec: Stance::Ask,
-            network: Stance::Deny,
             ..EffectivePolicy::default()
         };
         let repo = EffectivePolicy {
             shell_exec: Stance::Deny,
-            network: Stance::Allow,
             repo_fs_write: Stance::Ask,
             ..EffectivePolicy::default()
         };
         let narrowed = operator.narrowed_by(repo);
         assert_eq!(narrowed.shell_exec, Stance::Deny);
-        assert_eq!(narrowed.network, Stance::Deny);
         assert_eq!(narrowed.repo_fs_write, Stance::Ask);
     }
 
@@ -1000,7 +1131,7 @@ mod tests {
         assert_eq!(resolved.repo_fs_write, Stance::Ask);
         assert_eq!(resolved.outside_repo_fs_write, Stance::Deny);
         assert_eq!(resolved.shell_exec, Stance::Deny);
-        assert_eq!(resolved.network, Stance::Deny);
+        assert_eq!(resolved.network, Some(Stance::Deny));
         assert_eq!(resolved.approval, Stance::Ask);
         assert_eq!(resolved.git_push_destructive, Stance::Deny);
         assert_eq!(resolved.tool_access, Stance::Ask);
@@ -1008,7 +1139,7 @@ mod tests {
 
     /// The other half of "may narrow, never widen": a repo tightening a stance
     /// the operator left loose is honored, because narrowing is always safe.
-    /// `network` stays `Deny` here, unlike every other untouched capability
+    /// `network` stays `None` here, unlike every other untouched capability
     /// (`repo_fs_write` etc., implicitly `Allow` via the assertions below) --
     /// but for a different reason than those six: nothing (neither home nor
     /// repo) ever names `network` at all here, which is `resolve_network`'s
@@ -1022,17 +1153,18 @@ mod tests {
         let resolved = resolve(None, repo, &|k| vars.get(k).cloned()).expect("resolves");
         assert_eq!(resolved.shell_exec, Stance::Deny);
         assert_eq!(resolved.repo_fs_write, Stance::Allow);
-        assert_eq!(resolved.network, Stance::Deny);
+        assert_eq!(resolved.network, None);
     }
 
     /// Nothing anywhere ever names `network` -- `resolve_network`'s own
-    /// "both layers silent" case, applied as the one safe default rather
-    /// than baked into either layer's own parsed value.
+    /// "both layers silent" case: `None`, not a stance, since no operator
+    /// layer ever expressed an opinion (see `EffectivePolicy`'s own doc
+    /// comment for why `None` rather than a defaulted `Deny` matters here).
     #[test]
-    fn network_is_denied_when_nothing_is_configured_anywhere() {
+    fn network_resolves_to_none_when_nothing_is_configured_anywhere() {
         let vars = env_from(&[]);
         let resolved = resolve(None, None, &|k| vars.get(k).cloned()).expect("resolves");
-        assert_eq!(resolved.network, Stance::Deny);
+        assert_eq!(resolved.network, None);
     }
 
     /// The actual correction this round makes (2026-08-26): home's own
@@ -1047,7 +1179,7 @@ mod tests {
         let home = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
         let vars = env_from(&[]);
         let resolved = resolve(home, None, &|k| vars.get(k).cloned()).expect("resolves");
-        assert_eq!(resolved.network, Stance::Allow);
+        assert_eq!(resolved.network, Some(Stance::Allow));
     }
 
     /// A repo may still always narrow: its own explicit `network = "deny"`
@@ -1058,7 +1190,27 @@ mod tests {
         let repo = table("[policy]\nnetwork = \"deny\"\n").and_then(|v| v.get("policy").cloned());
         let vars = env_from(&[]);
         let resolved = resolve(home, repo, &|k| vars.get(k).cloned()).expect("resolves");
-        assert_eq!(resolved.network, Stance::Deny);
+        assert_eq!(resolved.network, Some(Stance::Deny));
+    }
+
+    /// The bug this round fixes (2026-08-26): a repo's explicit `network =
+    /// "ask"` must narrow a looser home stance exactly like `"deny"` does --
+    /// the previous `resolve_network` only special-cased `repo == Some(Deny)`
+    /// and fell through to home's own value for any other repo stance
+    /// (including `Ask`), so this scenario silently resolved to `Allow`,
+    /// dropping the repo's narrowing entirely. `max(home, repo)` treats every
+    /// repo stance as a potential narrowing input, not just `Deny`.
+    #[test]
+    fn network_ask_narrows_a_looser_home_allow() {
+        let home = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
+        let repo = table("[policy]\nnetwork = \"ask\"\n").and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(home, repo, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(
+            resolved.network,
+            Some(Stance::Ask),
+            "the repo's explicit ask must narrow home's allow, not be dropped in favor of it"
+        );
     }
 
     /// The other half of "a repo may never widen, only narrow": a repo's own
@@ -1070,7 +1222,7 @@ mod tests {
         let repo = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
         let vars = env_from(&[]);
         let resolved = resolve(None, repo, &|k| vars.get(k).cloned()).expect("resolves");
-        assert_eq!(resolved.network, Stance::Deny);
+        assert_eq!(resolved.network, Some(Stance::Deny));
     }
 
     /// When the repo's own `[policy]` table explicitly agrees (`network =
@@ -1083,7 +1235,7 @@ mod tests {
         let repo = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
         let vars = env_from(&[]);
         let resolved = resolve(home, repo, &|k| vars.get(k).cloned()).expect("resolves");
-        assert_eq!(resolved.network, Stance::Allow);
+        assert_eq!(resolved.network, Some(Stance::Allow));
     }
 
     /// The environment override sits above the fold entirely (`resolve`'s own
@@ -1095,7 +1247,7 @@ mod tests {
         let repo = table("[policy]\nnetwork = \"deny\"\n").and_then(|v| v.get("policy").cloned());
         let vars = env_from(&[("ZIRV_CTX_POLICY_NETWORK", "allow")]);
         let resolved = resolve(None, repo, &|k| vars.get(k).cloned()).expect("resolves");
-        assert_eq!(resolved.network, Stance::Allow);
+        assert_eq!(resolved.network, Some(Stance::Allow));
     }
 
     /// The operator's escape hatch above the fold, mirroring
@@ -1108,7 +1260,7 @@ mod tests {
         let vars = env_from(&[("ZIRV_CTX_POLICY_SHELL_EXEC", "allow")]);
         let resolved = resolve(None, repo, &|k| vars.get(k).cloned()).expect("resolves");
         assert_eq!(resolved.shell_exec, Stance::Allow);
-        assert_eq!(resolved.network, Stance::Deny);
+        assert_eq!(resolved.network, Some(Stance::Deny));
     }
 
     #[test]
@@ -1146,7 +1298,7 @@ mod tests {
     #[test]
     fn an_allow_stance_reports_as_operator_controlled_on_every_adapter() {
         let policy = EffectivePolicy {
-            network: Stance::Allow,
+            network: Some(Stance::Allow),
             ..EffectivePolicy::default()
         };
         for adapter in adapters::all(None) {
@@ -1172,6 +1324,10 @@ mod tests {
         for stance in [Stance::Ask, Stance::Deny] {
             let mut policy = EffectivePolicy::default();
             for capability in Capability::ALL {
+                if capability == Capability::Network {
+                    policy.network = Some(stance);
+                    continue;
+                }
                 *policy.stance_mut(capability) = stance;
             }
             for adapter in adapters::all(None) {
@@ -1438,7 +1594,7 @@ mod tests {
             // `Deny`): this test is about `repo_fs_write` alone, and network
             // at its own default would also show up as claude-unenforced
             // (advisory-only), which is not what this test pins.
-            network: Stance::Allow,
+            network: Some(Stance::Allow),
             ..EffectivePolicy::default()
         };
         let claude = ClaudeAdapter::new(None);
@@ -1466,7 +1622,7 @@ mod tests {
     #[test]
     fn unenforced_lists_exactly_the_stances_zirv_cannot_hold_the_harness_to() {
         let policy = EffectivePolicy {
-            network: Stance::Deny,
+            network: Some(Stance::Deny),
             shell_exec: Stance::Deny,
             ..EffectivePolicy::default()
         };
@@ -1489,7 +1645,7 @@ mod tests {
         let policy = EffectivePolicy {
             tool_access: Stance::Deny,
             approval: Stance::Deny,
-            network: Stance::Deny,
+            network: Some(Stance::Deny),
             ..EffectivePolicy::default()
         };
         let claude = ClaudeAdapter::new(None);

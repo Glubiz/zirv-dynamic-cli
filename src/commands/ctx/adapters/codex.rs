@@ -986,12 +986,13 @@ impl AgentAdapter for CodexAdapter {
     /// method already threads `policy` through, so it is the one place that
     /// costs nothing extra to reach it from.
     ///
-    /// `network` defaults to `Deny` (`EffectivePolicy`'s own `Default` impl,
-    /// see its doc comment), matching what an unwired install has always
-    /// done -- codex's own native default under `--sandbox workspace-write`
-    /// is already `network_access: false` with no zirv-added flag at all, so
-    /// `Deny`/`Ask` add nothing here, exactly as codex's shipped baseline
-    /// already behaves. Only the operator's explicit `Allow` adds the
+    /// `network` defaults to `None` (`EffectivePolicy`'s own `Option<Stance>`
+    /// field, see its doc comment) when no operator layer has ever named it,
+    /// which behaves exactly like `Deny`/`Ask` here -- neither adds any argv
+    /// -- matching what an unwired install has always done: codex's own
+    /// native default under `--sandbox workspace-write` is already
+    /// `network_access: false` with no zirv-added flag at all. Only the
+    /// operator's explicit `Some(Stance::Allow)` adds the
     /// `-c sandbox_workspace_write.network_access=true` config override --
     /// verified to work on both the interactive and `exec` command surfaces
     /// (`approval_suppression_args`'s own doc comment cites the same fact for
@@ -1011,7 +1012,7 @@ impl AgentAdapter for CodexAdapter {
         } else {
             Vec::new()
         };
-        if policy.network == Stance::Allow {
+        if policy.network == Some(Stance::Allow) {
             args.push("-c".to_string());
             args.push("sandbox_workspace_write.network_access=true".to_string());
         }
@@ -1790,13 +1791,14 @@ mod tests {
         );
     }
 
-    /// `network` (2026-08-26, codex approval-posture round): `Deny`/`Ask`
-    /// (including `EffectivePolicy::default()`'s own `network: Deny`) add
-    /// nothing here -- codex's own native default under `--sandbox
-    /// workspace-write` is already closed, matching what an unwired install
-    /// has always done. Only the operator's explicit `Allow` adds the config
-    /// override, and as one `-c` occurrence -- never a bare `network_access`
-    /// substring split across two tokens some other way.
+    /// `network` (2026-08-26, codex approval-posture round): `None`
+    /// (including `EffectivePolicy::default()`'s own unconfigured value),
+    /// `Deny` and `Ask` all add nothing here -- codex's own native default
+    /// under `--sandbox workspace-write` is already closed, matching what an
+    /// unwired install has always done. Only the operator's explicit
+    /// `Some(Stance::Allow)` adds the config override, and as one `-c`
+    /// occurrence -- never a bare `network_access` substring split across two
+    /// tokens some other way.
     #[test]
     fn policy_args_adds_the_network_override_only_when_policy_explicitly_allows_it() {
         use crate::commands::ctx::policy::{EffectivePolicy, Stance};
@@ -1812,7 +1814,7 @@ mod tests {
         );
 
         let allowed_policy = EffectivePolicy {
-            network: Stance::Allow,
+            network: Some(Stance::Allow),
             ..EffectivePolicy::default()
         };
         let allowed = adapter.policy_args(&allowed_policy, super::super::LaunchMode::Headless);
@@ -2271,8 +2273,15 @@ mod tests {
         // actually distinguishes "the state root named as its own array
         // element" from "the mail subtree, which happens to start with the
         // state root's path".
-        let quoted_mail = format!("\"{}\"", mail_dir.display());
-        let quoted_state_root = format!("\"{}\"", state_root.path().display());
+        //
+        // Built through the same `toml_quoted_string` the implementation
+        // uses, not a bare `"<path>"` wrap: on Windows a raw path contains
+        // `\`, which `toml_quoted_string` doubles to stay valid inside a
+        // TOML basic string, so the naive wrap never matches the real argv
+        // there (found 2026-08-26, Windows dev machine -- the implementation
+        // was already correct, only this assertion was not).
+        let quoted_mail = toml_quoted_string(&mail_dir.display().to_string());
+        let quoted_state_root = toml_quoted_string(&state_root.path().display().to_string());
         assert!(
             joined.contains(&quoted_mail),
             "must name the mail subtree: {args:?}"
@@ -2327,12 +2336,18 @@ mod tests {
         let args = adapter.extra_writable_root_args(&linked_path, &mail_dir);
 
         let joined = args.join(" ");
+        // Same fix as `extra_writable_root_args_always_includes_the_mail_
+        // dir_but_never_the_bare_state_root` above: compare against the
+        // `toml_quoted_string`-escaped form, since a raw Windows path's `\`
+        // is doubled by the implementation to stay valid inside the TOML
+        // basic string, and a bare `.display()` substring check never
+        // matches that escaped form there.
         assert!(
-            joined.contains(&expected_git_dir.display().to_string()),
+            joined.contains(&toml_quoted_string(&expected_git_dir.display().to_string())),
             "must name the shared git common dir for a linked worktree: {args:?}"
         );
         assert!(
-            joined.contains(&mail_dir.display().to_string()),
+            joined.contains(&toml_quoted_string(&mail_dir.display().to_string())),
             "must still name the mail subtree too: {args:?}"
         );
     }

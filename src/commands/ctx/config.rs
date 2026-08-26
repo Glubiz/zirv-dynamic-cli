@@ -4495,7 +4495,7 @@ mod tests {
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert_eq!(cfg.policy.shell_exec, Stance::Ask);
-        assert_eq!(cfg.policy.network, Stance::Deny);
+        assert_eq!(cfg.policy.network, Some(Stance::Deny));
         assert_eq!(cfg.policy.repo_fs_write, Stance::Allow);
 
         let env = env_map(&[("ZIRV_CTX_POLICY_SHELL_EXEC", "deny")]);
@@ -4503,7 +4503,7 @@ mod tests {
         assert_eq!(cfg.policy.shell_exec, Stance::Deny);
         assert_eq!(
             cfg.policy.network,
-            Stance::Deny,
+            Some(Stance::Deny),
             "the home layer still applies under the env layer"
         );
     }
@@ -4537,7 +4537,7 @@ mod tests {
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert_eq!(cfg.policy.shell_exec, Stance::Deny);
-        assert_eq!(cfg.policy.network, Stance::Deny);
+        assert_eq!(cfg.policy.network, Some(Stance::Deny));
         assert_eq!(cfg.policy.approval, Stance::Ask);
     }
 

@@ -150,13 +150,17 @@ impl LaunchMode {
 /// overridden by zirv's own. `CODEX_CONFIG_OVERRIDE_KEYS` below closes that
 /// gap for the split form (`-c`/`--config` followed by a `key=value` token,
 /// checked pairwise since the key lives in the *next* token, unlike every
-/// other flag this function recognises) and the `=`-joined single-token form
+/// other flag this function recognises), the `=`-joined single-token form
 /// (`--config=approval_policy=...`), mirroring the existing `--sandbox=...`
-/// handling above. All-or-nothing, same as every other flag this function
-/// recognises: pinning just one dimension (e.g. only `approval_policy`)
-/// withholds zirv's *entire* computed prefix, not only the approval half --
-/// `policy_launch_args` has no partial-prefix concept, and this function's
-/// contract has always been "the operator's own flag pins policy outright".
+/// handling above, and (2026-08-26, correction round) codex's own attached
+/// short form -- `-cKEY=VALUE` with no space at all, verified accepted by
+/// codex-cli 0.149.1, mirroring the attached `-mvalue` form
+/// `classify_model_flag` already recognises for `--model`. All-or-nothing,
+/// same as every other flag this function recognises: pinning just one
+/// dimension (e.g. only `approval_policy`) withholds zirv's *entire*
+/// computed prefix, not only the approval half -- `policy_launch_args` has
+/// no partial-prefix concept, and this function's contract has always been
+/// "the operator's own flag pins policy outright".
 ///
 /// Mirrors `agent.rs`'s own `flags_pin_model` in spirit: the operator's own
 /// explicit choice must demonstrably win over a zirv-computed default, not
@@ -196,6 +200,15 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
             return flags
                 .get(i + 1)
                 .is_some_and(|next| names_a_config_override_key(next));
+        }
+        // Codex's attached short form (`-cKEY=VALUE`, no space) -- checked
+        // after the `f == "-c"` split form above so a bare `-c` still falls
+        // through to that pairwise check rather than being consumed here
+        // with an empty attached value.
+        if let Some(rest) = f.strip_prefix("-c") {
+            if !rest.is_empty() && names_a_config_override_key(rest) {
+                return true;
+            }
         }
         false
     })
@@ -1144,15 +1157,19 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// Default is empty: the same "nothing verified to guess" shape every
     /// other optional method on this trait uses, and also the *correct*
     /// answer for the shipped default -- `EffectivePolicy::default()` is
-    /// all-`Allow` (`Stance::Allow`'s own doc comment: "zirv declares no
-    /// restriction of its own"), so an operator who has set no `[policy]`
-    /// table at all gets byte-for-byte the same argv as before this method
-    /// existed, on every adapter. Anything more restrictive requires an
-    /// explicit `[policy]` stance, and anything more *permissive* than the
-    /// default cannot come from this method at all: there is no `Stance`
-    /// value that widens past `Allow`, and a repo checkout cannot set one
-    /// stricter than the operator's own layer either (`policy::resolve`'s
-    /// narrow-only fold -- see that module's doc comment).
+    /// `Allow` on every capability except `network` (`Stance::Allow`'s own
+    /// doc comment: "zirv declares no restriction of its own";
+    /// `EffectivePolicy`'s own doc comment covers `network`'s exception,
+    /// `Option<Stance>` defaulting to `None` -- "no operator layer has ever
+    /// named it" -- rather than a `Stance` this method would need to act
+    /// on), so an operator who has set no `[policy]` table at all gets
+    /// byte-for-byte the same argv as before this method existed, on every
+    /// adapter. Anything more restrictive requires an explicit `[policy]`
+    /// stance, and anything more *permissive* than the default cannot come
+    /// from this method at all: there is no `Stance` value that widens past
+    /// `Allow`, and a repo checkout cannot set one stricter than the
+    /// operator's own layer either (`policy::resolve`'s narrow-only fold --
+    /// see that module's doc comment).
     ///
     /// Only a capability this adapter also names `Enforced`/`Degraded` for in
     /// `policy_support` may ever change this launch's argv: `Ask`/`Allow`
@@ -1231,8 +1248,14 @@ pub trait AgentAdapter: std::fmt::Debug {
     }
 
     /// Extra writable-root argv for a launch whose working directory is
-    /// `cwd`, beyond `default_sandbox_args`'s own baseline sandbox flags --
-    /// added as a distinct method (2026-08-26, codex approval-posture round)
+    /// `cwd`, beyond `default_sandbox_args`'s own baseline sandbox flags.
+    ///
+    /// **Caller contract:** call only where both `cwd` and `mail_dir` are
+    /// already in hand for a launch that is actually happening -- today that
+    /// is `dash::worker_pane_extra_args` alone (see below), called
+    /// unconditionally for every dashboard-spawned worker pane, never
+    /// speculatively for a launch that may not occur. Added as a distinct
+    /// method (2026-08-26, codex approval-posture round)
     /// rather than folded into `default_sandbox_args` itself, since neither
     /// `cwd` nor `mail_dir` is available at that method's existing call site
     /// (`policy_launch_args`) without threading them through all seven
@@ -2616,6 +2639,28 @@ mod tests {
         assert!(flags_pin_policy(&[
             "--config=sandbox_mode=danger-full-access".to_string()
         ]));
+    }
+
+    /// The bug this round fixes: codex-cli 0.149.1 also accepts `-c`'s
+    /// argument attached to the flag itself with no space (`-cKEY=VALUE`),
+    /// mirroring the attached short form `classify_model_flag` already
+    /// recognises for `-m` (`-mopus`). Before this, only the split
+    /// (`-c`/`--config` plus a following token) and `--config=`-joined forms
+    /// were recognised, so an operator spelling their override as
+    /// `-capproval_policy=on-request` was invisible to `flags_pin_policy` and
+    /// zirv's own computed prefix still landed after it.
+    #[test]
+    fn flags_pin_policy_recognizes_codexs_attached_short_config_override_form() {
+        assert!(flags_pin_policy(&[
+            "-capproval_policy=on-request".to_string()
+        ]));
+        assert!(flags_pin_policy(&[
+            "-csandbox_mode=read-only".to_string()
+        ]));
+        // Precision still matters: an attached `-c` naming an unrelated key
+        // must not false-positive, and `-c` itself (no attached value) is the
+        // ordinary split form, already covered above.
+        assert!(!flags_pin_policy(&["-cmodel=gpt-5.6-sol".to_string()]));
     }
 
     /// A bare `-c`/`--config` with no following token, or one overriding an
