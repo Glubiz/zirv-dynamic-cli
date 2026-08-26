@@ -118,6 +118,39 @@ fn has_repeated_meaningful_finding(findings: &[ReviewFinding]) -> bool {
         .any(|key| !seen.insert(key))
 }
 
+/// How many of `incoming` are findings this workflow has not already
+/// recorded, by the same `finding_key` identity `has_repeated_meaningful_
+/// finding` uses -- path:line where a path exists, whitespace-normalised
+/// lowercased summary otherwise. One identity across this module, so the
+/// stop rule and the escalation rule can never disagree about whether a
+/// finding recurred.
+pub fn new_finding_count(existing: &[ReviewFinding], incoming: &[ReviewFinding]) -> usize {
+    let seen: BTreeSet<String> = existing.iter().map(finding_key).collect();
+    let mut fresh = BTreeSet::new();
+    incoming
+        .iter()
+        .map(finding_key)
+        .filter(|key| !seen.contains(key) && fresh.insert(key.clone()))
+        .count()
+}
+
+/// What one completed review round concluded. `converged` is the code
+/// enforcement of the rule `HARNESS_PROMPT` could only ask for: a round that
+/// surfaced nothing new ends the loop successfully, whatever budget remains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundOutcome {
+    pub new_findings: usize,
+    pub converged: bool,
+}
+
+/// The exit code for a completed review round. A converged round is success
+/// regardless of the reviewer's own exit code -- `HARNESS_PROMPT`'s stop rule
+/// is enforced here, in code, rather than left for a caller to reinterpret
+/// prose about when to stop asking for another round.
+fn round_exit_code(outcome: &RoundOutcome, reviewer_code: i32) -> i32 {
+    if outcome.converged { 0 } else { reviewer_code }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewRunEvidence {
     pub id: String,
@@ -890,20 +923,15 @@ fn parse_reviewer_output(output: &str) -> CtxResult<Vec<ReviewerFinding>> {
     Ok(response.findings)
 }
 
-fn append_reviewer_findings(
-    state: &mut WorkflowState,
-    findings: Vec<ReviewerFinding>,
-) -> CtxResult<()> {
-    if state.review_findings.len().saturating_add(findings.len()) > MAX_REVIEW_FINDINGS {
-        return Err(format!(
-            "review results would exceed the workflow limit of {MAX_REVIEW_FINDINGS} findings"
-        )
-        .into());
-    }
-    let created_at = now_secs();
-    state
-        .review_findings
-        .extend(findings.into_iter().map(|finding| ReviewFinding {
+/// Builds the persisted `ReviewFinding`s a reviewer's raw structured output
+/// becomes. Split out of `append_reviewer_findings` so `run_independent_
+/// review` can run `new_finding_count` against the same `ReviewFinding` shape
+/// -- before the findings are merged into `state.review_findings` -- instead
+/// of reasoning about identity twice, once per finding representation.
+fn build_review_findings(findings: Vec<ReviewerFinding>, created_at: u64) -> Vec<ReviewFinding> {
+    findings
+        .into_iter()
+        .map(|finding| ReviewFinding {
             id: uuid::Uuid::new_v4().to_string(),
             severity: finding.severity,
             summary: finding.summary.trim().to_string(),
@@ -912,7 +940,21 @@ fn append_reviewer_findings(
             disposition: FindingDisposition::Open,
             recommended_disposition: finding.recommended_disposition,
             created_at,
-        }));
+        })
+        .collect()
+}
+
+fn append_reviewer_findings(
+    state: &mut WorkflowState,
+    findings: Vec<ReviewFinding>,
+) -> CtxResult<()> {
+    if state.review_findings.len().saturating_add(findings.len()) > MAX_REVIEW_FINDINGS {
+        return Err(format!(
+            "review results would exceed the workflow limit of {MAX_REVIEW_FINDINGS} findings"
+        )
+        .into());
+    }
+    state.review_findings.extend(findings);
     Ok(())
 }
 
@@ -1100,14 +1142,35 @@ fn run_independent_review(
         Vec::new()
     };
     let mut state = engine::load(&state_dir, &state.repo, &args.id)?;
+    // `records_evidence` -- not dashboard-spawned, exit 0, fingerprint intact
+    // -- is exactly "did this round actually complete a review". Only a
+    // completed round can have converged; a dashboard ack or a failed launch
+    // reviewed nothing, so it is never mistaken for zero new findings.
+    let recorded = records_evidence(&run, fingerprint_unchanged);
+    let incoming_findings = build_review_findings(parsed_findings, now_secs());
+    // Computed against the state loaded above, before `append_reviewer_
+    // findings` merges `incoming_findings` into it -- otherwise every finding
+    // would trivially count as "already recorded".
+    let new_findings = if recorded {
+        new_finding_count(&state.review_findings, &incoming_findings)
+    } else {
+        0
+    };
+    let outcome = RoundOutcome {
+        new_findings,
+        converged: recorded && new_findings == 0,
+    };
     if run.dashboard_spawn {
         writeln!(
             writer,
             "the review was spawned as a dashboard pane; review evidence requires a completed \
              run, so none was recorded"
         )?;
-    } else if records_evidence(&run, fingerprint_unchanged) {
-        append_reviewer_findings(&mut state, parsed_findings)?;
+    } else if recorded {
+        // The evidence push, telemetry event and finding merge all still
+        // happen on a converged round: convergence is a stopping rule, not a
+        // skip. What changes is only whether another round is demanded.
+        append_reviewer_findings(&mut state, incoming_findings)?;
         state.review_evidence.push(ReviewRunEvidence {
             id: uuid::Uuid::new_v4().to_string(),
             change_fingerprint: package.change_fingerprint,
@@ -1125,6 +1188,17 @@ fn run_independent_review(
         }
         state.updated_at = now_secs();
         save_state(&state_dir, &state)?;
+        if outcome.converged {
+            let unused_rounds = MAX_FIX_REVIEW_ROUNDS.saturating_sub(package.review_round);
+            writeln!(
+                writer,
+                "round {} surfaced no findings not already recorded in review state; the \
+                 independent review loop is complete ({unused_rounds} of {MAX_FIX_REVIEW_ROUNDS} \
+                 round{} unused)",
+                package.review_round,
+                if unused_rounds == 1 { "" } else { "s" },
+            )?;
+        }
     }
     let (total, meaningful, dismissed) = super::telemetry::finding_counts(&state.review_findings);
     let mut event =
@@ -1137,7 +1211,7 @@ fn run_independent_review(
     event.work_domain = Some(state.classification.work_domain.domain);
     event.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
     event.adapter = Some(args.agent.clone());
-    event.succeeded = Some(records_evidence(&run, fingerprint_unchanged));
+    event.succeeded = Some(recorded);
     event.findings_total = total;
     event.findings_meaningful = meaningful;
     event.findings_dismissed = dismissed;
@@ -1154,7 +1228,7 @@ fn run_independent_review(
             "the change set changed during review; review evidence was not recorded".into(),
         );
     }
-    Ok(code)
+    Ok(round_exit_code(&outcome, code))
 }
 
 pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
@@ -1880,6 +1954,167 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         assert_eq!(required_independent_reviews_for(&state), 2);
         state.review_findings[1].disposition = FindingDisposition::Dismissed;
         assert_eq!(required_independent_reviews_for(&state), 1);
+    }
+
+    /// Builds a `ReviewFinding` at a fixed path:line -- the identity
+    /// `new_finding_count` and `has_repeated_meaningful_finding` both key on.
+    fn finding_at(path: &str, line: u32, summary: &str) -> ReviewFinding {
+        ReviewFinding {
+            id: uuid::Uuid::new_v4().to_string(),
+            severity: FindingSeverity::Major,
+            summary: summary.to_string(),
+            path: Some(PathBuf::from(path)),
+            line: Some(line),
+            disposition: FindingDisposition::Open,
+            recommended_disposition: None,
+            created_at: now_secs(),
+        }
+    }
+
+    /// Builds a pathless `ReviewFinding`, whose identity falls back to the
+    /// whitespace-normalised, lowercased summary.
+    fn finding_without_path(summary: &str) -> ReviewFinding {
+        ReviewFinding {
+            id: uuid::Uuid::new_v4().to_string(),
+            severity: FindingSeverity::Major,
+            summary: summary.to_string(),
+            path: None,
+            line: None,
+            disposition: FindingDisposition::Open,
+            recommended_disposition: None,
+            created_at: now_secs(),
+        }
+    }
+
+    /// Issue #155, Phase 4(c): "stop when a round yields no new findings" was
+    /// prompt text only. A converged change still burned rounds 2 and 3 --
+    /// each one a full reviewer launch over a 96 KiB diff.
+    #[test]
+    fn a_round_with_no_new_findings_converges() {
+        let existing = vec![finding_at("src/lib.rs", 10, "off-by-one in the loop bound")];
+        let repeat = vec![finding_at(
+            "src/lib.rs",
+            10,
+            "off by one in the loop bound!!",
+        )];
+        assert_eq!(
+            new_finding_count(&existing, &repeat),
+            0,
+            "the same path:line is the same finding, whatever the wording"
+        );
+
+        let fresh = vec![finding_at("src/other.rs", 3, "unchecked unwrap")];
+        assert_eq!(new_finding_count(&existing, &fresh), 1);
+        assert_eq!(new_finding_count(&existing, &[]), 0);
+    }
+
+    /// "New" must mean the same thing here as everywhere else in this module,
+    /// or the stop rule and the escalation rule will disagree about whether a
+    /// finding recurred. Both go through `finding_key`.
+    #[test]
+    fn convergence_uses_the_same_identity_as_the_escalation_rule() {
+        let pathless_a = finding_without_path("the error message is swallowed");
+        let pathless_b = finding_without_path("the  error   message is swallowed");
+        assert_eq!(
+            new_finding_count(std::slice::from_ref(&pathless_a), &[pathless_b]),
+            0,
+            "finding_key normalises whitespace for a pathless finding"
+        );
+    }
+
+    /// A converged round is a SUCCESS, not an exhausted budget: it must not
+    /// consume the remaining rounds and must not report failure.
+    #[test]
+    fn a_converged_round_ends_the_loop_successfully_with_rounds_left() {
+        let outcome = RoundOutcome {
+            new_findings: 0,
+            converged: true,
+        };
+        assert!(outcome.converged);
+        assert_eq!(
+            round_exit_code(&outcome, 0),
+            0,
+            "convergence with a zero reviewer exit is success"
+        );
+    }
+
+    /// A non-converged round (genuinely new findings) must keep reporting the
+    /// reviewer's own exit code -- convergence is never allowed to mask a
+    /// real blocking result.
+    #[test]
+    fn a_non_converged_round_keeps_the_reviewers_own_exit_code() {
+        let outcome = RoundOutcome {
+            new_findings: 1,
+            converged: false,
+        };
+        assert_eq!(round_exit_code(&outcome, 0), 0);
+        assert_eq!(round_exit_code(&outcome, 7), 7);
+    }
+
+    /// End-to-end: a round whose reviewer reports only an already-recorded
+    /// finding must still push evidence and merge the finding (convergence is
+    /// a stopping rule, not a skip), but must tell the operator the loop is
+    /// complete and must exit 0.
+    #[test]
+    fn run_independent_review_converges_when_nothing_new_is_reported() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = review_workflow(repo.path(), &state_dir);
+        state
+            .review_findings
+            .push(finding_at("src/lib.rs", 10, "off-by-one in the loop bound"));
+        engine::save(&state_dir, &state, true).unwrap();
+
+        let args = RunReviewArgs {
+            id: state.id.clone(),
+            agent: "claude".into(),
+            base: None,
+            repo: Some(repo.path().to_path_buf()),
+        };
+        let mut out = Vec::new();
+        // The reviewer reports the exact same finding again, just reworded --
+        // still the same `finding_key`, so still zero NEW findings.
+        let code = run_independent_review(&args, &mut out, &|_, _| {
+            Ok(ReviewerRun {
+                code: 0,
+                dashboard_spawn: false,
+                output: Some(format!(
+                    "{REVIEW_RESULT_PREFIX}{{\"findings\":[{{\"severity\":\"major\",\
+                     \"summary\":\"off by one in the loop bound!!\",\"path\":\"src/lib.rs\",\
+                     \"line\":10}}]}}"
+                )),
+            })
+        });
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        assert_eq!(
+            code.expect("the review runs"),
+            0,
+            "a converged round is a success exit"
+        );
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("no findings") && stdout.contains("complete"),
+            "the operator is told the loop converged; got {stdout:?}"
+        );
+
+        let stored = engine::load(&state_dir, repo.path(), &state.id).unwrap();
+        assert_eq!(
+            stored.review_evidence.len(),
+            1,
+            "a converged round is still a completed, recorded review"
+        );
+        assert_eq!(
+            stored.review_findings.len(),
+            2,
+            "the finding merge still happens -- convergence is a stopping rule, not a skip"
+        );
     }
 
     #[test]
