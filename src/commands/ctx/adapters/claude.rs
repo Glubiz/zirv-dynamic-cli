@@ -212,15 +212,21 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
     events
 }
 
-pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
+/// The shared fold behind [`transcript_usage`] and [`sidechain_transcript_usage`]:
+/// every assistant row whose `isSidechain` flag matches `want_sidechain`,
+/// summed into the four raw classes. One fold, two filters, so the main and
+/// sidechain readers can never drift on what counts as an assistant usage
+/// row.
+fn fold_assistant_usage(jsonl: &str, want_sidechain: bool) -> Option<TranscriptUsage> {
     let mut usage = TranscriptUsage::default();
     let mut observed = false;
     for line in jsonl.lines() {
         let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
+        let is_sidechain = row.get("isSidechain").and_then(Value::as_bool) == Some(true);
         if row.get("type").and_then(Value::as_str) != Some("assistant")
-            || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
+            || is_sidechain != want_sidechain
         {
             continue;
         }
@@ -239,6 +245,19 @@ pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
         usage.output_tokens = usage.output_tokens.saturating_add(row.output_tokens);
     }
     observed.then_some(usage)
+}
+
+pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
+    fold_assistant_usage(jsonl, false)
+}
+
+/// The same fold as [`transcript_usage`], over the rows it deliberately
+/// skips: `isSidechain == true` assistant turns, i.e. subagent work. `None`
+/// when the transcript has no sidechain rows at all -- an honest "no data",
+/// never a zeroed reading, the same distinction `transcript_usage`'s own
+/// `observed` flag draws.
+pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
+    fold_assistant_usage(jsonl, true)
 }
 
 const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
@@ -1533,6 +1552,33 @@ mod tests {
         assert_eq!(usage.input_tokens, 1);
         assert_eq!(usage.cache_read_input_tokens, 0);
         assert_eq!(usage.output_tokens, 2);
+    }
+
+    /// Subagent turns live in `isSidechain` rows. They are charged to the
+    /// account (`window::sum_transcripts` walks `subagents/` too) but were
+    /// dropped from workflow accounting entirely. Counted separately here, so
+    /// the main-session number keeps meaning "this session's own context"
+    /// while the child spend stops being invisible.
+    #[test]
+    fn sidechain_usage_is_counted_separately_rather_than_dropped() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":900,"#,
+            r#""cache_read_input_tokens":12000,"output_tokens":90}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
+        let side = sidechain_transcript_usage(jsonl).expect("sidechain usage");
+        assert_eq!(side.input_tokens, 900);
+        assert_eq!(side.cache_read_input_tokens, 12_000);
+        assert_eq!(side.output_tokens, 90);
+
+        assert_eq!(
+            sidechain_transcript_usage(
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":1}}}"#
+            ),
+            None,
+            "no sidechain rows means None, not a zeroed reading"
+        );
     }
 
     #[test]

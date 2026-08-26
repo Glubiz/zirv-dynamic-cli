@@ -503,6 +503,19 @@ pub struct TransitionEvidence {
     pub output_tokens: Option<u64>,
     pub token_usage_source: Option<String>,
     pub worker_count: u32,
+    /// Issue #155, Phase 2: the raw cache classes behind `input_tokens`
+    /// (which keeps its existing "combined context size" meaning), and the
+    /// same four classes read separately over `isSidechain` rows -- subagent
+    /// spend that used to be dropped entirely. `parent_session_id` and
+    /// `work_group_id` are NOT here: they stay on `TelemetryEvent` only,
+    /// populated by Phase 5, never invented here.
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub sidechain_input_tokens: Option<u64>,
+    pub sidechain_cache_creation_input_tokens: Option<u64>,
+    pub sidechain_cache_read_input_tokens: Option<u64>,
+    pub sidechain_output_tokens: Option<u64>,
+    pub session_id: Option<String>,
 }
 
 fn session_identity() -> Option<(String, String)> {
@@ -616,6 +629,30 @@ fn usage_since(
     }
 }
 
+/// The sidechain-only counterpart to [`usage_since`]. Subagent (`isSidechain`)
+/// spend is a Claude Code transcript concept, not a general adapter one, so
+/// this reads the claude free function directly rather than growing the
+/// `AgentAdapter` trait for a shape only one adapter has. Claude's
+/// `transcript_usage` is not cumulative (`transcript_usage_is_cumulative` is
+/// unset for it), so sidechain reads need none of `usage_since`'s
+/// cumulative-checkpoint subtraction either -- summing the same byte range is
+/// exact.
+fn sidechain_usage_since(
+    repo: &Path,
+    checkpoint: &UsageCheckpoint,
+) -> Option<crate::commands::ctx::event::TranscriptUsage> {
+    if checkpoint.adapter != "claude" {
+        return None;
+    }
+    let path = transcript_path(repo, &checkpoint.session_id, &checkpoint.adapter)?;
+    let end = std::fs::metadata(&path).ok()?.len();
+    if end < checkpoint.transcript_bytes {
+        return None;
+    }
+    let body = read_transcript_range(&path, checkpoint.transcript_bytes, end)?;
+    crate::commands::ctx::adapters::claude::sidechain_transcript_usage(&body)
+}
+
 fn enrich_transition_evidence(
     state: &mut WorkflowState,
     mut evidence: TransitionEvidence,
@@ -633,6 +670,9 @@ fn enrich_transition_evidence(
     let mut observed = previous
         .as_ref()
         .and_then(|checkpoint| usage_since(&state.repo, checkpoint));
+    let mut sidechain_observed = previous
+        .as_ref()
+        .and_then(|checkpoint| sidechain_usage_since(&state.repo, checkpoint));
     if let (Some(previous), Some(current)) = (&previous, &current)
         && (previous.session_id != current.session_id || previous.adapter != current.adapter)
     {
@@ -646,6 +686,17 @@ fn enrich_transition_evidence(
         };
         if let Some(next) = usage_since(&state.repo, &beginning) {
             let total = observed.get_or_insert_default();
+            total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+            total.cache_creation_input_tokens = total
+                .cache_creation_input_tokens
+                .saturating_add(next.cache_creation_input_tokens);
+            total.cache_read_input_tokens = total
+                .cache_read_input_tokens
+                .saturating_add(next.cache_read_input_tokens);
+            total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
+        }
+        if let Some(next) = sidechain_usage_since(&state.repo, &beginning) {
+            let total = sidechain_observed.get_or_insert_default();
             total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
             total.cache_creation_input_tokens = total
                 .cache_creation_input_tokens
@@ -671,6 +722,27 @@ fn enrich_transition_evidence(
         if evidence.token_usage_source.is_none() {
             evidence.token_usage_source = Some("harness-transcript-delta".into());
         }
+        if evidence.cache_creation_input_tokens.is_none() {
+            evidence.cache_creation_input_tokens = Some(usage.cache_creation_input_tokens);
+        }
+        if evidence.cache_read_input_tokens.is_none() {
+            evidence.cache_read_input_tokens = Some(usage.cache_read_input_tokens);
+        }
+    }
+    if let Some(usage) = sidechain_observed {
+        if evidence.sidechain_input_tokens.is_none() {
+            evidence.sidechain_input_tokens = Some(usage.input_tokens);
+        }
+        if evidence.sidechain_cache_creation_input_tokens.is_none() {
+            evidence.sidechain_cache_creation_input_tokens =
+                Some(usage.cache_creation_input_tokens);
+        }
+        if evidence.sidechain_cache_read_input_tokens.is_none() {
+            evidence.sidechain_cache_read_input_tokens = Some(usage.cache_read_input_tokens);
+        }
+        if evidence.sidechain_output_tokens.is_none() {
+            evidence.sidechain_output_tokens = Some(usage.output_tokens);
+        }
     }
     if evidence.adapter.is_none() {
         evidence.adapter = current
@@ -680,6 +752,9 @@ fn enrich_transition_evidence(
     }
     if evidence.model.is_none() {
         evidence.model = std::env::var(crate::commands::ctx::adapters::SEAT_MODEL_ENV).ok();
+    }
+    if evidence.session_id.is_none() {
+        evidence.session_id = session_identity().map(|(session_id, _)| session_id);
     }
     state.usage_checkpoint = current;
     evidence
@@ -953,6 +1028,13 @@ pub fn advance_with_evidence(
     event.input_tokens = evidence.input_tokens;
     event.output_tokens = evidence.output_tokens;
     event.token_usage_source = evidence.token_usage_source;
+    event.cache_creation_input_tokens = evidence.cache_creation_input_tokens;
+    event.cache_read_input_tokens = evidence.cache_read_input_tokens;
+    event.sidechain_input_tokens = evidence.sidechain_input_tokens;
+    event.sidechain_cache_creation_input_tokens = evidence.sidechain_cache_creation_input_tokens;
+    event.sidechain_cache_read_input_tokens = evidence.sidechain_cache_read_input_tokens;
+    event.sidechain_output_tokens = evidence.sidechain_output_tokens;
+    event.session_id = evidence.session_id;
     event.succeeded = Some(outcome == StepOutcome::Success);
     event.findings_total = findings_total;
     event.findings_meaningful = findings_meaningful;
@@ -1425,6 +1507,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                         || args.output_tokens.is_some())
                     .then(|| "operator-reported".into()),
                     worker_count: args.workers,
+                    ..Default::default()
                 },
             );
             let state = advance_with_evidence(&state_dir, state, args.outcome, Some(&evidence))?;
@@ -1911,6 +1994,142 @@ mod tests {
             }
         );
         assert_eq!(usage.context_total(), 12, "the pre-2.32.0 combined number");
+    }
+
+    /// The sidechain counterpart of `phase_usage_reads_only_the_appended_
+    /// claude_transcript`: a subagent turn appended in the same byte range
+    /// must be counted, and only that range -- not the whole transcript.
+    #[test]
+    fn sidechain_usage_since_reads_only_the_appended_sidechain_rows() {
+        let home = tempdir().unwrap();
+        let repo = crate::commands::ctx::testenv::repo();
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let path = transcript_path(repo.path(), session_id, "claude").expect("path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":1000,"output_tokens":1000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let checkpoint = UsageCheckpoint {
+            session_id: session_id.into(),
+            adapter: "claude".into(),
+            transcript_bytes: std::fs::metadata(&path).unwrap().len(),
+            cumulative_input_tokens: 0,
+            cumulative_cache_creation_input_tokens: 0,
+            cumulative_cache_read_input_tokens: 0,
+            cumulative_output_tokens: 0,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","isSidechain":true,"message":{{"usage":{{"input_tokens":40,"cache_read_input_tokens":12000,"output_tokens":90}}}}}}"#
+        )
+        .unwrap();
+
+        let usage = sidechain_usage_since(repo.path(), &checkpoint).expect("sidechain usage");
+        assert_eq!(
+            usage,
+            crate::commands::ctx::event::TranscriptUsage {
+                input_tokens: 40,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 12_000,
+                output_tokens: 90,
+            }
+        );
+
+        let codex_checkpoint = UsageCheckpoint {
+            adapter: "codex".into(),
+            ..checkpoint
+        };
+        assert_eq!(
+            sidechain_usage_since(repo.path(), &codex_checkpoint),
+            None,
+            "sidechain rows are a claude transcript concept, not a general adapter one"
+        );
+    }
+
+    /// Wiring test for issue #155 Phase 2: a completed phase must attribute
+    /// spend to the session that produced it, and bucket subagent spend
+    /// separately from the main session's own numbers instead of dropping it.
+    #[test]
+    fn enrich_transition_evidence_buckets_sidechain_spend_and_records_session_lineage() {
+        let home = tempdir().unwrap();
+        let repo = crate::commands::ctx::testenv::repo();
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                crate::commands::ctx::adapters::SESSION_ENV,
+                Some(session_id),
+            ),
+            (crate::commands::ctx::adapters::AGENT_ENV, Some("claude")),
+        ]);
+        let path = transcript_path(repo.path(), session_id, "claude").expect("path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let checkpoint = UsageCheckpoint {
+            session_id: session_id.into(),
+            adapter: "claude".into(),
+            transcript_bytes: std::fs::metadata(&path).unwrap().len(),
+            cumulative_input_tokens: 0,
+            cumulative_cache_creation_input_tokens: 0,
+            cumulative_cache_read_input_tokens: 0,
+            cumulative_output_tokens: 0,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":7,"cache_read_input_tokens":5,"output_tokens":3}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","isSidechain":true,"message":{{"usage":{{"input_tokens":40,"cache_read_input_tokens":12000,"output_tokens":90}}}}}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.usage_checkpoint = Some(checkpoint);
+
+        let evidence = enrich_transition_evidence(&mut state, TransitionEvidence::default());
+
+        assert_eq!(evidence.cache_creation_input_tokens, Some(0));
+        assert_eq!(evidence.cache_read_input_tokens, Some(5));
+        assert_eq!(
+            evidence.sidechain_input_tokens,
+            Some(40),
+            "subagent spend must be counted rather than dropped"
+        );
+        assert_eq!(evidence.sidechain_cache_creation_input_tokens, Some(0));
+        assert_eq!(evidence.sidechain_cache_read_input_tokens, Some(12_000));
+        assert_eq!(evidence.sidechain_output_tokens, Some(90));
+        assert_eq!(evidence.session_id.as_deref(), Some(session_id));
     }
 
     #[test]
