@@ -518,7 +518,8 @@ mod tests {
     /// ahead of an operator's own `-m <value>`.
     #[test]
     fn codexs_short_m_alias_also_pins_the_model_for_worker_launches() {
-        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_exec_ask_for_approval_forced(true);
         let cfg = CtxConfig {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: None,
@@ -573,7 +574,8 @@ mod tests {
     /// of it, exactly as for any other unrelated flag.
     #[test]
     fn a_long_flag_starting_with_m_does_not_false_positive_as_pinning() {
-        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_exec_ask_for_approval_forced(true);
         let cfg = CtxConfig {
             worker: crate::commands::ctx::config::WorkerConfig {
                 claude: None,
@@ -648,7 +650,8 @@ mod tests {
     /// the shipped-default sandbox posture still applies.
     #[test]
     fn codex_gets_no_model_flag_but_still_gets_the_shipped_sandbox_posture() {
-        let adapter = super::super::adapters::codex::CodexAdapter::new(None);
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_exec_ask_for_approval_forced(true);
         let cfg = CtxConfig::default();
         let out = worker_launch_flags(&cfg, "codex", &adapter, &[]);
         assert!(
@@ -694,7 +697,8 @@ mod tests {
             worker_launch_flags(&cfg, "claude", &claude, &[]),
             expected_claude
         );
-        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let codex = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_exec_ask_for_approval_forced(true);
         assert_eq!(
             worker_launch_flags(&cfg, "codex", &codex, &[]),
             vec![
@@ -758,8 +762,9 @@ mod tests {
         expected_claude.push("--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string());
         assert_eq!(claude_flags, expected_claude);
 
-        let codex =
-            super::super::adapters::codex::CodexAdapter::new(None).with_ignore_flags_forced(false);
+        let codex = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_ignore_flags_forced(false)
+            .with_exec_ask_for_approval_forced(true);
         let codex_flags = worker_launch_flags(&cfg, "codex", &codex, &[]);
         assert_eq!(
             codex_flags,
@@ -791,8 +796,9 @@ mod tests {
             },
             ..CtxConfig::default()
         };
-        let codex =
-            super::super::adapters::codex::CodexAdapter::new(None).with_ignore_flags_forced(false);
+        let codex = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_ignore_flags_forced(false)
+            .with_exec_ask_for_approval_forced(true);
         let flags = vec!["--verbose".to_string()];
         let out = worker_launch_flags(&cfg, "codex", &codex, &flags);
         assert_eq!(

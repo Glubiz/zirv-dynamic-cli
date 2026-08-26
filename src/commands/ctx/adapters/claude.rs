@@ -965,8 +965,13 @@ impl AgentAdapter for ClaudeAdapter {
     /// shipped default (`EffectivePolicy::default()`, all `Allow`) returns
     /// empty, so a launch with no `[policy]` configured is byte-for-byte
     /// unaffected.
-    fn policy_args(&self, policy: &crate::commands::ctx::policy::EffectivePolicy) -> Vec<String> {
+    fn policy_args(
+        &self,
+        policy: &crate::commands::ctx::policy::EffectivePolicy,
+        mode: super::LaunchMode,
+    ) -> Vec<String> {
         use crate::commands::ctx::policy::Stance;
+        let _ = mode;
         if policy.repo_fs_write == Stance::Deny || policy.shell_exec == Stance::Deny {
             self.read_only_args()
         } else {
@@ -1831,7 +1836,10 @@ mod tests {
         let adapter = ClaudeAdapter::new(None);
         assert!(
             adapter
-                .policy_args(&crate::commands::ctx::policy::EffectivePolicy::default())
+                .policy_args(
+                    &crate::commands::ctx::policy::EffectivePolicy::default(),
+                    super::super::LaunchMode::Interactive
+                )
                 .is_empty()
         );
     }
@@ -1849,7 +1857,7 @@ mod tests {
             ..EffectivePolicy::default()
         };
         assert_eq!(
-            adapter.policy_args(&policy),
+            adapter.policy_args(&policy, super::super::LaunchMode::Interactive),
             adapter.read_only_args(),
             "policy_args must reuse read_only_args verbatim, never a second literal"
         );
@@ -1863,7 +1871,10 @@ mod tests {
             repo_fs_write: Stance::Deny,
             ..EffectivePolicy::default()
         };
-        assert_eq!(adapter.policy_args(&policy), adapter.read_only_args());
+        assert_eq!(
+            adapter.policy_args(&policy, super::super::LaunchMode::Interactive),
+            adapter.read_only_args()
+        );
     }
 
     /// `Ask` stays `OperatorControlled` (see `policy_support`): claude has no
@@ -1877,7 +1888,11 @@ mod tests {
             shell_exec: Stance::Ask,
             ..EffectivePolicy::default()
         };
-        assert!(adapter.policy_args(&policy).is_empty());
+        assert!(
+            adapter
+                .policy_args(&policy, super::super::LaunchMode::Interactive)
+                .is_empty()
+        );
     }
 
     /// The shipped-default posture (2026-08-22): verified against the real

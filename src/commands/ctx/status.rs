@@ -25,12 +25,36 @@ fn format_age(seconds: u64) -> String {
     }
 }
 
+/// Issue #139: whether `record`'s pinned launch-time safety-policy
+/// fingerprint (`sessions::Record::safety_policy_sha256`) differs from the
+/// fingerprint of the policy `record.repo` resolves to RIGHT NOW. Degrades
+/// silently (`false`) on any doubt at all -- no fingerprint was ever
+/// recorded (an older build, a launch that never attempted attestation, or
+/// one this field is not yet threaded through to), the repo's own config
+/// fails to load, or fingerprinting itself fails -- because a diagnostic
+/// line must never be the reason `zirv ctx status` looks broken. `status.rs`
+/// keeps this one bit of policy I/O at the edge: [`safety::policy_
+/// fingerprint`] itself stays pure, and this function's only job is calling
+/// it and comparing.
+fn policy_snapshot_is_stale(record: &sessions::Record, env: EnvLookup<'_>) -> bool {
+    let Some(stored) = record.safety_policy_sha256.as_deref() else {
+        return false;
+    };
+    let Ok(cfg) = CtxConfig::load(&record.repo, env) else {
+        return false;
+    };
+    let Ok(current) = super::safety::policy_fingerprint(&cfg.safety) else {
+        return false;
+    };
+    stored != current
+}
+
 /// N7: one line per registry record (`<short> <agent> <verb> pid <pid> <age>
 /// live|unreachable|stale <repo_slug>`), plus one line for any `s/*.sock` file that has
 /// no matching registry record -- an older zirv binary that predates the
 /// registry still wrote sockets, and a mixed-version machine must not make
 /// those supervisors disappear from `status` entirely, just less detailed.
-fn sessions_lines(state: &StateDir, now: u64) -> Vec<String> {
+fn sessions_lines(state: &StateDir, now: u64, env: EnvLookup<'_>) -> Vec<String> {
     let mut records = sessions::list(state);
     records.sort_by(|a, b| a.0.short.cmp(&b.0.short));
 
@@ -42,7 +66,7 @@ fn sessions_lines(state: &StateDir, now: u64) -> Vec<String> {
     let mut lines: Vec<String> = records
         .iter()
         .map(|(record, liveness)| {
-            format!(
+            let mut line = format!(
                 "  {}  {}  {}  pid {}  {}  {}  {}",
                 record.short,
                 record.agent,
@@ -61,7 +85,18 @@ fn sessions_lines(state: &StateDir, now: u64) -> Vec<String> {
                     (Liveness::Live, false) => "unreachable",
                 },
                 record.repo_slug,
-            )
+            );
+            // Issue #139: named here, not just silently folded into the
+            // stricter verdict a hook prompt would show -- an operator
+            // reading `status` has no other way to learn a live session is
+            // running a narrower policy than the repo currently resolves
+            // to.
+            if policy_snapshot_is_stale(record, env) {
+                line.push_str(
+                    "  policy snapshot stale (current policy is wider); relaunch to adopt",
+                );
+            }
+            line
         })
         .collect();
 
@@ -254,7 +289,7 @@ pub fn run_with<W: Write>(
     }
 
     writeln!(w, "\nsessions:")?;
-    let session_lines = sessions_lines(&state, crate::commands::ctx::state::now_secs());
+    let session_lines = sessions_lines(&state, crate::commands::ctx::state::now_secs(), env);
     if session_lines.is_empty() {
         writeln!(w, "  no supervised sessions")?;
     } else {
@@ -591,6 +626,150 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("abcdef12"), "session prefix listed: {text}");
         assert!(!text.contains("no supervised sessions"));
+    }
+
+    /// Issue #139: a session whose recorded launch-time policy fingerprint
+    /// no longer matches its OWN repo's currently-resolved policy gets a
+    /// visible "stale" note in `zirv ctx status` -- the whole point of this
+    /// fix is that an operator can see this from `status` instead of only
+    /// experiencing it as an unexplained storm of hook prompts.
+    #[test]
+    fn a_session_whose_launch_snapshot_no_longer_matches_the_repos_policy_is_flagged_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        // A fingerprint that cannot possibly match ANY real policy's own
+        // hash -- the point is only that it differs from whatever
+        // `CtxConfig::load(&repo, env)` resolves for this repo right now.
+        let stale_fingerprint = "0".repeat(64);
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "aaaa1111-2222-4333-8444-555555555555",
+                "claude",
+                &repo,
+                crate::commands::ctx::sessions::Verb::Wrap,
+            )
+            .with_safety_policy_sha256(Some(stale_fingerprint)),
+        );
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("policy snapshot stale"),
+            "must surface the divergence: {text}"
+        );
+        assert!(
+            text.contains("relaunch to adopt"),
+            "must name the remedy: {text}"
+        );
+    }
+
+    /// The absent half: a session whose recorded fingerprint agrees with its
+    /// repo's current policy gets no note at all -- this is not a permanent
+    /// fixture of every session line, only the divergent case.
+    #[test]
+    fn a_session_whose_launch_snapshot_still_matches_the_repos_policy_is_not_flagged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        let current_fingerprint = crate::commands::ctx::safety::policy_fingerprint(
+            &crate::commands::ctx::safety::SafetyPolicy::default(),
+        )
+        .expect("fingerprint");
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "bbbb2222-2222-4333-8444-555555555555",
+                "claude",
+                &repo,
+                crate::commands::ctx::sessions::Verb::Wrap,
+            )
+            .with_safety_policy_sha256(Some(current_fingerprint)),
+        );
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("policy snapshot stale"),
+            "a matching fingerprint must not be flagged: {text}"
+        );
+    }
+
+    /// The load-error half: a session whose OWN repo's config fails to load
+    /// (here, a `REPO_FORBIDDEN` key) must degrade silently -- no stale
+    /// line, no crash -- exactly like every other config-load failure this
+    /// diagnostic verb already tolerates.
+    #[test]
+    fn a_repo_config_load_error_silently_skips_the_stale_check() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        // A DIFFERENT repo than the one `status` is invoked against below --
+        // this is the session's own repo, and the one whose config load
+        // must fail without taking the whole command down with it.
+        let broken_repo = tmp.path().join("broken-repo");
+        std::fs::create_dir_all(broken_repo.join(".zirv")).expect("mkdir");
+        std::fs::write(
+            broken_repo.join(".zirv/ctx.toml"),
+            "agent_bin = \"/tmp/x\"\n",
+        )
+        .expect("write");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "cccc3333-2222-4333-8444-555555555555",
+                "claude",
+                &broken_repo,
+                crate::commands::ctx::sessions::Verb::Wrap,
+            )
+            .with_safety_policy_sha256(Some("0".repeat(64))),
+        );
+
+        let mut out = Vec::new();
+        let code = run_with(&StatusArgs { decisions: 5 }, &mut out, &repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        assert_eq!(
+            code, 0,
+            "the session's own broken repo must not fail status"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("policy snapshot stale"),
+            "a load error must degrade silently, not fabricate a stale claim: {text}"
+        );
+        assert!(
+            text.contains("cccc3333"),
+            "the session itself is still listed: {text}"
+        );
     }
 
     #[test]

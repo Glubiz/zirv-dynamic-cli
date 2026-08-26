@@ -269,6 +269,33 @@ fn attestation_failure(mode: super::adapters::LaunchMode) -> Outcome {
     }
 }
 
+/// Issue #139: whether the launch-time policy snapshot's verdict for one
+/// command diverges from the currently-resolved policy's own verdict for
+/// the SAME command, and in which direction. `evaluate_with_attestation_
+/// evidence` always keeps the stricter of the two answers -- a repo may
+/// narrow a running session immediately, while an operator widening the
+/// policy takes effect only on the next launch -- but that fold used to be
+/// invisible: the hook's own explanation named the interactive/headless
+/// DEFAULT as if it were the configured posture, while `zirv ctx safety
+/// explain` for the identical command (bypassing attestation entirely)
+/// reported the current, wider policy. This enum is what lets both
+/// surfaces agree and say WHY, instead of silently disagreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDivergence {
+    /// The launch snapshot and the current policy agree for this command --
+    /// the common case: no snapshot at all, an invalid/corrupt one (both
+    /// already explained by `AttestedEvaluation::status`), or one whose
+    /// verdict for this command happens to match today's policy.
+    Unchanged,
+    /// The pinned launch snapshot's verdict is STRICTER than the current
+    /// policy's own verdict for this command would be: an operator widened
+    /// the policy after this session launched, and the widening has not
+    /// taken effect yet (by design -- see this enum's own doc comment).
+    /// Carries the current policy's own verdict so an explanation can name
+    /// what it would have been.
+    SnapshotStricter { current_verdict: Verdict },
+}
+
 /// Evaluates against both the immutable launch snapshot and the policy as it
 /// resolves now, then keeps the stricter answer. A repo may therefore narrow
 /// a running session immediately, while an operator widening their policy
@@ -276,11 +303,13 @@ fn attestation_failure(mode: super::adapters::LaunchMode) -> Outcome {
 /// this is a deliberately persistent/outside-Zirv hook and preserve its
 /// current-policy behavior; a partial, corrupt, or hash-mismatched
 /// attestation fails closed.
+#[derive(Debug)]
 struct AttestedEvaluation {
     outcome: Outcome,
     current_fingerprint: String,
     launch_fingerprint: Option<String>,
     status: &'static str,
+    divergence: SnapshotDivergence,
 }
 
 fn evaluate_with_attestation_evidence(
@@ -299,6 +328,7 @@ fn evaluate_with_attestation_evidence(
                     current_fingerprint,
                     launch_fingerprint: None,
                     status: "not-present",
+                    divergence: SnapshotDivergence::Unchanged,
                 };
             }
             (Some(fingerprint), Some(path)) => (fingerprint, path),
@@ -308,6 +338,7 @@ fn evaluate_with_attestation_evidence(
                     current_fingerprint,
                     launch_fingerprint: fingerprint,
                     status: "invalid",
+                    divergence: SnapshotDivergence::Unchanged,
                 };
             }
         };
@@ -321,6 +352,7 @@ fn evaluate_with_attestation_evidence(
             current_fingerprint,
             launch_fingerprint: Some(expected_fingerprint),
             status: "invalid",
+            divergence: SnapshotDivergence::Unchanged,
         };
     };
     if policy_fingerprint(&launch).ok().as_deref() != Some(expected_fingerprint.as_str()) {
@@ -329,11 +361,20 @@ fn evaluate_with_attestation_evidence(
             current_fingerprint,
             launch_fingerprint: Some(expected_fingerprint),
             status: "invalid",
+            divergence: SnapshotDivergence::Unchanged,
         };
     }
 
     let current_outcome = evaluate(current, command, mode);
     let launch_outcome = evaluate(&launch, command, mode);
+    let divergence = if verdict_rank(launch_outcome.verdict) > verdict_rank(current_outcome.verdict)
+    {
+        SnapshotDivergence::SnapshotStricter {
+            current_verdict: current_outcome.verdict,
+        }
+    } else {
+        SnapshotDivergence::Unchanged
+    };
     let outcome = if verdict_rank(current_outcome.verdict) >= verdict_rank(launch_outcome.verdict) {
         current_outcome
     } else {
@@ -344,6 +385,7 @@ fn evaluate_with_attestation_evidence(
         current_fingerprint,
         launch_fingerprint: Some(expected_fingerprint),
         status: "valid",
+        divergence,
     }
 }
 
@@ -1121,6 +1163,526 @@ fn command_substitutions(command: &str) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------
+// Opaque-literal carve-out (issue #136): quoted commit-message arguments
+// and single-quoted heredoc bodies are DATA, never executable structure,
+// and must not be fed through the deny/ask matcher as if they were code.
+// ---------------------------------------------------------------------
+
+/// Stable placeholder [`redact_opaque_message`] substitutes for a commit-
+/// message argument's value. Deliberately not empty (an empty candidate
+/// string would just vanish from matching, which is a different, weaker
+/// guarantee than "this text is opaque data") and deliberately contains no
+/// parentheses, quotes, or shell metacharacters of its own, so it can never
+/// be mistaken for new executable structure by anything downstream that
+/// re-scans a candidate this module has already produced.
+const OPAQUE_MESSAGE_PLACEHOLDER: &str = "<opaque:message>";
+
+/// Stable placeholder [`redact_single_quoted_heredocs`] substitutes for a
+/// heredoc body's lines. See [`OPAQUE_MESSAGE_PLACEHOLDER`]'s own doc
+/// comment for why this is non-empty and metacharacter-free.
+const OPAQUE_HEREDOC_BODY_PLACEHOLDER: &str = "<opaque:heredoc-body>";
+
+/// One whitespace-delimited, quote-aware token found while scanning a
+/// command/segment string, plus its exact `[start, end)` CHAR range (not
+/// byte range -- this module works in `Vec<char>` throughout, matching
+/// [`command_substitution_end`]/[`split_segments`]) in the source text, so a
+/// caller can splice a replacement into that exact span without disturbing
+/// anything else. Quote characters are kept as part of `text`/the span
+/// (never stripped here) so a caller can tell whether the value was quoted
+/// at all.
+struct QuotedToken {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+/// Splits `chars` into whitespace-separated tokens, treating a `'`/`"`-
+/// quoted run (backslash-escaped characters skipped, matching every other
+/// quote tracker in this module) as part of the SAME token even when it
+/// contains embedded whitespace -- so a huge, multi-line quoted commit
+/// message is one token, exactly as a real shell would see it, not many.
+fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = i;
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if c == '\\' && quote != Some('\'') {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if let Some(active) = quote {
+                if c == active {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            if matches!(c, '\'' | '"') {
+                quote = Some(c);
+                i += 1;
+                continue;
+            }
+            if c.is_whitespace() {
+                break;
+            }
+            i += 1;
+        }
+        tokens.push(QuotedToken {
+            text: chars[start..i].iter().collect(),
+            start,
+            end: i,
+        });
+    }
+    tokens
+}
+
+/// Whether `tokens`' leading two tokens name one of the commit-message-
+/// bearing invocations issue #136 scopes this carve-out to: `git commit`,
+/// `git tag`, `git notes`, or `hg commit`. Case-insensitive on the program/
+/// subcommand names only (a real shell resolves `Git`/`GIT` identically on
+/// case-insensitive filesystems); nothing else about the segment is
+/// normalized here.
+fn is_message_bearing_invocation(tokens: &[QuotedToken]) -> bool {
+    let Some(program) = tokens.first() else {
+        return false;
+    };
+    let Some(subcommand) = tokens.get(1) else {
+        return false;
+    };
+    match program.text.to_ascii_lowercase().as_str() {
+        "git" => matches!(
+            subcommand.text.to_ascii_lowercase().as_str(),
+            "commit" | "tag" | "notes"
+        ),
+        "hg" => subcommand.text.eq_ignore_ascii_case("commit"),
+        _ => false,
+    }
+}
+
+/// Narrows `[start, end)` to the INTERIOR of a matching pair of leading/
+/// trailing `'`/`"` quotes, if the span is quoted -- so a redaction keeps the
+/// quote characters themselves (the result still reads as `-m "..."`, not
+/// `-m ...`) and only blanks what was actually inside them. Returns the span
+/// unchanged when it is not quoted (an attached `-mvalue` short form, for
+/// instance, blanks the whole value since there is no quote pair to keep).
+fn value_interior_span(chars: &[char], start: usize, end: usize) -> (usize, usize) {
+    if end.saturating_sub(start) >= 2 {
+        let first = chars[start];
+        let last = chars[end - 1];
+        if (first == '\'' || first == '"') && first == last {
+            return (start + 1, end - 1);
+        }
+    }
+    (start, end)
+}
+
+/// Issue #136: when `text`'s leading two tokens name a commit-message-
+/// bearing invocation ([`is_message_bearing_invocation`]) and it carries a
+/// `-m`/`--message` argument -- the separated form (`-m "..."`), the
+/// attached short form (`-m...`), or the joined long form (`--message=...`)
+/// -- returns a copy of `text` with every such argument's VALUE replaced by
+/// [`OPAQUE_MESSAGE_PLACEHOLDER`]. Returns `None` when `text` does not name
+/// one of these invocations, or names one with no message argument at all
+/// (nothing to redact, so the original text is preserved byte-for-byte by
+/// every caller).
+///
+/// Deliberately blunt: a message argument's value is replaced WHOLESALE,
+/// including any `$(...)`/backtick command substitution it happens to
+/// contain, rather than trying to preserve a live substitution span inside
+/// it. This is safe, not a regression against "a `$(...)` inside a
+/// DOUBLE-quoted message must still be classified" (issue #136's own
+/// constraint): this function is only ever applied to the text a caller is
+/// about to push as a DIRECT match candidate ([`visit_executable_nodes`]'s
+/// two `push_candidate` call sites) -- [`command_substitutions`]'s own
+/// extraction always runs against the UNREDACTED original segment text
+/// first, independently of this function, so a live substitution is still
+/// found and recursively classified as its own candidate at `depth + 1`
+/// regardless of what this function does to the surrounding prose.
+fn redact_opaque_message(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let tokens = tokenize_quoted(&chars);
+    if !is_message_bearing_invocation(&tokens) {
+        return None;
+    }
+    let mut redactions: Vec<(usize, usize)> = Vec::new();
+    let mut i = 2usize;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if token.text == "-m" || token.text == "--message" {
+            if let Some(value) = tokens.get(i + 1) {
+                redactions.push(value_interior_span(&chars, value.start, value.end));
+                i += 2;
+                continue;
+            }
+        } else if let Some(rest) = token.text.strip_prefix("--message=") {
+            let flag_len = token.text.chars().count() - rest.chars().count();
+            redactions.push(value_interior_span(
+                &chars,
+                token.start + flag_len,
+                token.end,
+            ));
+        } else if token.text.starts_with("-m") && token.text.chars().count() > 2 {
+            redactions.push(value_interior_span(&chars, token.start + 2, token.end));
+        } else if let Some(value_offset) = short_message_flag_value_offset(&token.text) {
+            let token_len = token.text.chars().count();
+            if value_offset >= token_len {
+                // Separate form (`-am "msg"`, `-qam "msg"`, ...): the
+                // cluster carries no attached value, so the value is the
+                // NEXT token -- identical to the exact `-m`/`--message`
+                // case above.
+                if let Some(value) = tokens.get(i + 1) {
+                    redactions.push(value_interior_span(&chars, value.start, value.end));
+                    i += 2;
+                    continue;
+                }
+            } else {
+                // Attached form (`-amFoo`): everything after the `m` is the
+                // value, identical to the plain `-m<value>` attached case
+                // above.
+                redactions.push(value_interior_span(
+                    &chars,
+                    token.start + value_offset,
+                    token.end,
+                ));
+            }
+        }
+        i += 1;
+    }
+    if redactions.is_empty() {
+        return None;
+    }
+    Some(apply_span_redactions(
+        &chars,
+        redactions,
+        OPAQUE_MESSAGE_PLACEHOLDER,
+    ))
+}
+
+/// Issue #136 (MINOR fix, review round): whether `token_text` is a
+/// combined short-flag cluster whose message-taking flag is `m` (`-am`,
+/// `-qam`, ...) -- git/hg's combined short-option spelling for the same
+/// `-m` a plain `-m`/`-m<value>` token already covers, so `git commit -am
+/// "msg"` was missing this carve-out's redaction entirely (`"-am".starts_
+/// with("-m")` is false) and reproduced the original false-positive for
+/// that one spelling. Mirrors [`is_inline_command_flag`]'s own "cluster of
+/// ASCII letters" validation, so an unrelated long flag that merely
+/// contains an `m` character somewhere is never mistaken for one -- this is
+/// only ever called on tokens already known to start with a single `-`
+/// (never `--`), the same guard `is_inline_command_flag` applies to its own
+/// cluster check.
+///
+/// Returns `None` when `token_text` is not a single-dash, all-ASCII-letter
+/// cluster ending in (or containing) `m`. Otherwise returns the char index,
+/// WITHIN `token_text`, of the first character after the `m` -- equal to
+/// `token_text.chars().count()` when there is no attached value (the value
+/// is the NEXT token, `-am "msg"`), or an interior index when the value is
+/// attached directly (`-amFoo`).
+fn short_message_flag_value_offset(token_text: &str) -> Option<usize> {
+    if !token_text.starts_with('-') || token_text.starts_with("--") {
+        return None;
+    }
+    let mut offset = 1usize;
+    for c in token_text.chars().skip(1) {
+        offset += 1;
+        if c == 'm' {
+            return Some(offset);
+        }
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+    }
+    None
+}
+
+/// Splices `placeholder` into every `[start, end)` span of `chars`,
+/// preserving everything outside them verbatim. Spans are sorted and any
+/// span that starts before the previous one's end is skipped (defends
+/// against overlap rather than panicking or corrupting output on
+/// pathological input -- this module fails closed on doubt elsewhere too).
+fn apply_span_redactions(
+    chars: &[char],
+    mut spans: Vec<(usize, usize)>,
+    placeholder: &str,
+) -> String {
+    spans.sort_by_key(|s| s.0);
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        if start < cursor {
+            continue;
+        }
+        out.extend(chars[cursor..start].iter());
+        out.push_str(placeholder);
+        cursor = end.max(start);
+    }
+    out.extend(chars[cursor..].iter());
+    out
+}
+
+/// Issue #136 (BLOCKER fix, review round): parses a `<<[-]'DELIM'` heredoc
+/// marker starting exactly at `chars[start]` (`chars[start..start+2]` is
+/// already confirmed to be `<<` by the caller, which only calls this from a
+/// position its own quote/comment state machine has already proven is BARE
+/// text -- see [`redact_single_quoted_heredocs`]'s own doc comment for why
+/// that gate matters). `<<-DELIM` (the tab-stripping form) is recognized
+/// too. Returns the delimiter word and the index just past the closing
+/// quote, or `None` when the text at `start` is not actually this exact
+/// shape (a bare `<<EOF`, a double-quoted `<<"EOF"`, an unterminated quote,
+/// an empty delimiter, or a delimiter that would span a newline) -- the
+/// caller then treats `start` as ordinary `<` text, never guessing.
+fn parse_single_quoted_heredoc_marker(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut i = start + 2;
+    if chars.get(i) == Some(&'-') {
+        i += 1;
+    }
+    while matches!(chars.get(i), Some(' ') | Some('\t')) {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'\'') {
+        return None;
+    }
+    i += 1;
+    let delim_start = i;
+    while matches!(chars.get(i), Some(c) if *c != '\'' && *c != '\n') {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'\'') {
+        return None;
+    }
+    let delim: String = chars[delim_start..i].iter().collect();
+    i += 1;
+    (!delim.is_empty()).then_some((delim, i))
+}
+
+/// Finds the terminator line for a heredoc body starting at `body_start`
+/// (the first character after the opener line's own trailing newline): the
+/// first line whose content, `\r`-trimmed, equals `delim` exactly. Returns
+/// the `[start, end)` char range of that line (`end` is the line's own
+/// newline, exclusive) or `None` when no line in the rest of the text
+/// matches -- a malformed/truncated heredoc, left alone rather than guessed
+/// at.
+fn find_heredoc_terminator(
+    chars: &[char],
+    body_start: usize,
+    delim: &str,
+) -> Option<(usize, usize)> {
+    let mut line_start = body_start;
+    loop {
+        let mut j = line_start;
+        while j < chars.len() && chars[j] != '\n' {
+            j += 1;
+        }
+        let line: String = chars[line_start..j].iter().collect();
+        if line.trim_end_matches('\r') == delim {
+            return Some((line_start, j));
+        }
+        if j >= chars.len() {
+            return None;
+        }
+        line_start = j + 1;
+    }
+}
+
+/// Issue #136: blanks the BODY of every single-quoted heredoc (`<<'DELIM'
+/// ... \nDELIM`) in `command`, replacing the literal lines between the
+/// opening marker and the terminator line with
+/// [`OPAQUE_HEREDOC_BODY_PLACEHOLDER`]. A single-quoted heredoc delimiter is
+/// POSIX-literal DATA even when the heredoc feeds a real command's stdin
+/// (`cat <<'EOF' ... EOF`) -- exactly the shape a commit message documenting
+/// dangerous command names by NAME (not running them) legitimately produces
+/// via `git commit -m "$(cat <<'EOF' ...prose... EOF)"`.
+///
+/// **BLOCKER fix (review round, 2026-08-25):** a `<<'DELIM'` marker only
+/// opens a heredoc when it is scanned OUTSIDE any active quote (except a
+/// live `$(...)`, which reopens bare scanning even when textually nested
+/// inside a quote -- see [`redact_heredocs_scan`]'s own doc comment) and
+/// OUTSIDE an unquoted `#` comment. The original line-based scanner had
+/// neither notion -- `# see <<'X' for reference` on one line, `rm -rf /` on
+/// the next, and a line reading just `X` was misread as a real heredoc, and
+/// because this function runs ONCE on the full raw command before anything
+/// else (including [`command_substitutions`]'s own extraction, since by the
+/// time [`normalize_segments`] calls into [`visit_executable_nodes`] the
+/// text it hands it is already heredoc-processed), the live `rm -rf /` line
+/// was blanked to the opaque placeholder in EVERY downstream candidate --
+/// the classifier never saw it, and a `Deny` silently became `Allow`. Same
+/// failure for a fake marker inside an ordinary double-quoted argument
+/// (`echo "see <<'X' here"`). The scan (in [`redact_heredocs_scan`] below)
+/// mirrors the exact quote-tracking state machine [`tokenize_quoted`]/
+/// [`split_segments`] already implement (same escape handling, same
+/// `'`/`"`/`` ` `` quote-char set), extended with one more bit of state --
+/// whether the scanner is inside an unquoted `#` comment, cleared at the
+/// next newline -- so `<<` is only ever inspected as a possible heredoc
+/// opener when both are clear.
+///
+/// Applied once, at the very top of [`normalize_segments`], to the FULL
+/// command text before anything else runs -- so every candidate downstream
+/// sees the opaque body rather than the original prose. `command_
+/// substitutions` itself stays untouched by this function's own code; it
+/// simply never receives the raw heredoc prose. A malformed/truncated
+/// heredoc (no terminator line found) is left alone rather than guessed at
+/// -- the safe failure for this module's "any doubt reads as unsupported"
+/// discipline is to redact nothing, never to redact too much.
+fn redact_single_quoted_heredocs(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    redact_heredocs_scan(&chars, 0)
+}
+
+/// The scan [`redact_single_quoted_heredocs`] delegates to, recursive over
+/// `$(...)` spans so a heredoc issued FROM one is still found -- see that
+/// function's own doc comment for the shape this exists to keep passing
+/// (`git commit -m "$(cat <<'EOF' ...prose... EOF)"`, a live substitution
+/// nested inside an outer double-quoted string). A double quote does not
+/// neuter command substitution, so this cannot simply treat "inside any
+/// quote" as "heredoc detection off" -- doing that broke exactly the
+/// shape above (a real single-quoted heredoc that only *reads* as nested
+/// in a quote because of the enclosing `"..."`, when the `$(` right before
+/// it actually reopens live shell syntax). Only a SINGLE-quoted `$(...)`
+/// stays inert, mirroring [`command_substitutions`]'s own established rule
+/// (1086-1092) -- reused here via [`command_substitution_end`], the exact
+/// function `command_substitutions` itself calls to find where such a span
+/// ends, so the two can never disagree about where one stops.
+///
+/// `depth` mirrors every other recursive walk in this module
+/// (`MAX_STRUCTURAL_DEPTH`): a pathological input with many nested
+/// `$(...)` cannot grow this scan's call stack without limit; past the cap
+/// the remaining text is copied through unscanned rather than guessed at.
+fn redact_heredocs_scan(chars: &[char], depth: usize) -> String {
+    if depth >= MAX_STRUCTURAL_DEPTH {
+        return chars.iter().collect();
+    }
+    let mut out = String::with_capacity(chars.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\n' {
+            in_comment = false;
+            escaped = false;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if in_comment {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if escaped {
+            out.push(c);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            out.push(c);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        // A live `$(...)` reopens bare-code scanning for its own content
+        // regardless of any enclosing quote -- except a single-quoted one,
+        // which stays inert (the one case `quote != Some('\'')` excludes)
+        // -- so a heredoc issued from inside it is still found even though
+        // textually it sits inside an outer `"..."`. Recursing (rather than
+        // just skipping over the span unscanned) is what keeps `git commit
+        // -m "$(cat <<'EOF' ...)"` working.
+        if c == '$'
+            && chars.get(i + 1) == Some(&'(')
+            && quote != Some('\'')
+            && let Some(end) = command_substitution_end(chars, i + 2, 0)
+        {
+            out.push('$');
+            out.push('(');
+            out.push_str(&redact_heredocs_scan(&chars[i + 2..end], depth + 1));
+            out.push(')');
+            i = end + 1;
+            continue;
+        }
+        if let Some(active) = quote {
+            out.push(c);
+            if c == active {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '#' {
+            in_comment = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Bare text: only here (no active quote, no active comment, not
+        // escaped, not inside a live `$(...)` handled above) may `<<` be
+        // inspected as a heredoc opener at all.
+        if c == '<'
+            && chars.get(i + 1) == Some(&'<')
+            && let Some((delim, marker_end)) = parse_single_quoted_heredoc_marker(chars, i)
+        {
+            out.extend(chars[i..marker_end].iter());
+            i = marker_end;
+            // The rest of the opener's own line is copied verbatim
+            // (unscanned) -- matches this scanner's own scope: only the
+            // first heredoc marker found while bare-scanning is acted
+            // on, exactly like the line-based version this replaces.
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                out.push('\n');
+                i += 1;
+            }
+            let body_start = i;
+            match find_heredoc_terminator(chars, i, &delim) {
+                Some((term_start, term_end)) => {
+                    if term_start > body_start {
+                        out.push_str(OPAQUE_HEREDOC_BODY_PLACEHOLDER);
+                        out.push('\n');
+                    }
+                    out.extend(chars[term_start..term_end].iter());
+                    i = term_end;
+                }
+                None => {
+                    // No terminator anywhere in the rest of the text:
+                    // copy it all verbatim, unchanged, and stop.
+                    out.extend(chars[body_start..].iter());
+                    i = chars.len();
+                }
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Strips a single matching pair of leading/trailing `'`/`"` quotes, if
 /// present. Not recursive, not shell-aware (an escaped quote inside is left
 /// alone) -- one layer, matching this module's "one layer of unwrapping"
@@ -1337,13 +1899,25 @@ fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
     }
 }
 
+/// Issue #136: pushes `whole`/a segment as a matchable candidate, but when
+/// [`redact_opaque_message`] recognizes it as a commit-message-bearing
+/// invocation, pushes the REDACTED variant INSTEAD of the raw one -- not in
+/// addition to it. Adding the redacted form alongside the original would do
+/// nothing: [`evaluate_candidates`]'s worst-case fold still sees the
+/// original's prose and still denies on it. Only replacing the candidate
+/// that would otherwise carry the prose closes the gap.
+fn push_executable_candidate(candidates: &mut Vec<String>, text: String) {
+    let text = redact_opaque_message(&text).unwrap_or(text);
+    push_candidate(candidates, strip_program_dir(&text));
+}
+
 fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<String>) {
     if depth > MAX_STRUCTURAL_DEPTH || candidates.len() >= MAX_STRUCTURAL_CANDIDATES {
         return;
     }
     let whole = collapse_whitespace(command);
     if !whole.is_empty() {
-        push_candidate(candidates, strip_program_dir(&whole));
+        push_executable_candidate(candidates, whole);
     }
     for raw_segment in split_segments(command) {
         if candidates.len() >= MAX_STRUCTURAL_CANDIDATES {
@@ -1353,7 +1927,7 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
         if collapsed.is_empty() {
             continue;
         }
-        push_candidate(candidates, strip_program_dir(&collapsed));
+        push_executable_candidate(candidates, collapsed.clone());
         if depth < MAX_STRUCTURAL_DEPTH {
             if let Some(inner) = unwrap_shell_wrapper(&collapsed) {
                 visit_executable_nodes(&inner, depth + 1, candidates);
@@ -1361,6 +1935,18 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
             if let Some(inner) = unwrap_env_prefix(&collapsed) {
                 visit_executable_nodes(&inner, depth + 1, candidates);
             }
+            // ISSUE #136: extraction runs against `raw_segment` -- the
+            // UNREDACTED text (only ever heredoc-sanitized by
+            // `normalize_segments`'s own top-level pass before this
+            // function is ever called, never message-redacted) -- so a
+            // live `$(...)`/backtick substitution inside a commit message
+            // is still found and independently classified at `depth + 1`,
+            // completely unaffected by `push_executable_candidate` above
+            // redacting the SAME segment's own direct-match candidate.
+            // `command_substitutions` itself is untouched (this comment is
+            // the only change near it): it never even sees a redacted
+            // string, because `push_executable_candidate` builds one only
+            // for the candidate list, never for further extraction input.
             for inner in command_substitutions(&raw_segment) {
                 visit_executable_nodes(&inner, depth + 1, candidates);
             }
@@ -1374,9 +1960,21 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
 /// The fixed depth/candidate ceilings keep hook input deterministic and
 /// bounded; encoding, dynamic `eval`, variable expansion and script-file
 /// contents remain outside this lightweight analyzer's declared scope.
+///
+/// Issue #136: `command` is heredoc-sanitized ([`redact_single_quoted_
+/// heredocs`]) ONCE here, at the very top, before it reaches
+/// [`visit_executable_nodes`] or the raw candidate below -- see that
+/// function's own doc comment for why one top-level pass is enough for
+/// every nested candidate too. The raw candidate itself additionally goes
+/// through [`redact_opaque_message`] (mirroring `push_executable_candidate`
+/// exactly): the "raw command" candidate must not carry a commit message's
+/// prose either, or `evaluate_candidates`'s worst-case fold would still deny
+/// on it regardless of what every other candidate says.
 fn normalize_segments(command: &str) -> Vec<String> {
-    let mut candidates = vec![command.to_string()];
-    visit_executable_nodes(command, 0, &mut candidates);
+    let sanitized = redact_single_quoted_heredocs(command);
+    let raw_candidate = redact_opaque_message(&sanitized).unwrap_or_else(|| sanitized.clone());
+    let mut candidates = vec![raw_candidate];
+    visit_executable_nodes(&sanitized, 0, &mut candidates);
     candidates
 }
 
@@ -3016,7 +3614,18 @@ fn mode_consequence(verdict: Verdict, mode: super::adapters::LaunchMode) -> &'st
     }
 }
 
-fn explain_text(command: &str, outcome: &Outcome, mode: super::adapters::LaunchMode) -> String {
+/// Issue #139: `divergence` names, in words, when `outcome` is stricter than
+/// what the current policy would produce for the same command -- see
+/// [`SnapshotDivergence`]'s own doc comment for why this exists. `Unchanged`
+/// (every pre-existing caller, and any attested one whose snapshot agrees
+/// with today's policy) leaves this function's output byte-for-byte what it
+/// was before this parameter existed.
+fn explain_text(
+    command: &str,
+    outcome: &Outcome,
+    mode: super::adapters::LaunchMode,
+    divergence: SnapshotDivergence,
+) -> String {
     let head = match &outcome.matched {
         Some(rule) => format!(
             "`{command}` is {} because it matched the {} rule `{}` from {}.",
@@ -3033,7 +3642,16 @@ fn explain_text(command: &str, outcome: &Outcome, mode: super::adapters::LaunchM
             outcome.verdict.label()
         ),
     };
-    format!("{head} {}", mode_consequence(outcome.verdict, mode))
+    let mut text = format!("{head} {}", mode_consequence(outcome.verdict, mode));
+    if let SnapshotDivergence::SnapshotStricter { current_verdict } = divergence {
+        text.push_str(&format!(
+            " Note: the launch snapshot (pinned at session start) is stricter than your current \
+             policy, which would {}; restart the session (zirv chat) to adopt the widened \
+             policy.",
+            current_verdict.label()
+        ));
+    }
+    text
 }
 
 /// The documented PreToolUse decision envelope -- the identical shape
@@ -3070,7 +3688,12 @@ fn explain_text(command: &str, outcome: &Outcome, mode: super::adapters::LaunchM
 /// pinned `dontAsk` themselves -- `adapters::flags_pin_policy` already makes
 /// zirv stand down entirely for the latter. Pinned end to end by
 /// `the_dont_ask_suppression_is_reachable_only_from_the_headless_posture`.
-fn hook_output(command: &str, outcome: &Outcome, permission_mode: &str) -> Option<String> {
+fn hook_output(
+    command: &str,
+    outcome: &Outcome,
+    permission_mode: &str,
+    divergence: SnapshotDivergence,
+) -> Option<String> {
     let dont_ask = permission_mode == "dontAsk";
     let decision = match outcome.verdict {
         Verdict::Deny => "deny",
@@ -3105,6 +3728,7 @@ fn hook_output(command: &str, outcome: &Outcome, permission_mode: &str) -> Optio
                     } else {
                         super::adapters::LaunchMode::Interactive
                     },
+                    divergence,
                 ),
             }
         })
@@ -3207,7 +3831,12 @@ fn run_check_hook_mode_with_env<W: Write>(
             }
         };
     }
-    if let Some(output) = hook_output(command, &outcome, &payload.permission_mode) {
+    if let Some(output) = hook_output(
+        command,
+        &outcome,
+        &payload.permission_mode,
+        evidence.divergence,
+    ) {
         writeln!(w, "{output}")?;
     }
     audit_hook_decision(&payload, command, mode, &outcome, &evidence, env);
@@ -3278,12 +3907,31 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W, env: EnvLookup<'_>) -> Ctx
     Ok(0)
 }
 
+/// Issue #139: previously bypassed attestation entirely, evaluating only the
+/// currently-resolved policy -- which is exactly why this command and the
+/// hook (`run_check_hook_mode_with_env`, which always goes through
+/// `evaluate_with_attestation_evidence`) could disagree about the identical
+/// command: the hook would report the pinned launch snapshot's stricter
+/// verdict while this reported today's wider one, with no way for the
+/// operator to see why.
+///
+/// Now routed through the SAME evidence function the hook uses, always --
+/// not merely when the attestation env vars happen to be set, since
+/// `evaluate_with_attestation_evidence` itself already degrades correctly
+/// when they are absent (`status: "not-present"`, `divergence: Unchanged`,
+/// `outcome` a plain `evaluate` call): the two ARE the "without the env vars"
+/// case, so this command's behavior is byte-for-byte unchanged when they are
+/// not set, and now agrees with the hook when they are.
 pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let cfg = CtxConfig::load(&args.repo, env)?;
     let command = args.command.join(" ");
-    let outcome = evaluate(&cfg.safety, &command, args.mode);
-    writeln!(w, "{}", explain_text(&command, &outcome, args.mode))?;
-    Ok(outcome.verdict.exit_code())
+    let evidence = evaluate_with_attestation_evidence(&cfg.safety, &command, args.mode, env);
+    writeln!(
+        w,
+        "{}",
+        explain_text(&command, &evidence.outcome, args.mode, evidence.divergence)
+    )?;
+    Ok(evidence.outcome.verdict.exit_code())
 }
 
 pub fn run<W: Write>(args: &SafetyArgs, w: &mut W) -> CtxResult<i32> {
@@ -3389,6 +4037,157 @@ mod tests {
                 Some("<attestation: invalid launch policy snapshot>")
             );
         }
+    }
+
+    /// Issue #139: the divergence direction itself, computed straight from
+    /// `evaluate_with_attestation_evidence` -- not merely the outcome
+    /// (already covered by `an_attested_launch_keeps_the_stricter_policy_
+    /// and_fails_closed_on_tampering` above), but the field an explanation
+    /// surface reads to decide whether to say anything at all.
+    #[test]
+    fn evaluate_with_attestation_evidence_reports_snapshot_stricter_when_the_current_policy_widened()
+     {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = tmp.path().join("policy.json");
+        let current = SafetyPolicy::default();
+
+        // The operator widened the interactive default AFTER this session's
+        // own launch pinned `ask` -- the shipped default is already `allow`,
+        // so the LAUNCH snapshot is the one narrowed here, compared against
+        // the still-default (wider) current policy.
+        let mut stricter_launch = current.clone();
+        stricter_launch.interactive_default = Verdict::Ask;
+        std::fs::write(
+            &snapshot,
+            serde_json::to_string(&stricter_launch).expect("serializes"),
+        )
+        .expect("writes");
+        let strict_fingerprint = policy_fingerprint(&stricter_launch).expect("fingerprints");
+        let env = env_from(&[
+            (POLICY_FINGERPRINT_ENV, &strict_fingerprint),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+
+        let evidence = evaluate_with_attestation_evidence(
+            &current,
+            "some-tool-zirv-has-never-heard-of",
+            LaunchMode::Interactive,
+            &|key| env.get(key).cloned(),
+        );
+        assert_eq!(evidence.outcome.verdict, Verdict::Ask, "{evidence:?}");
+        assert_eq!(
+            evidence.divergence,
+            SnapshotDivergence::SnapshotStricter {
+                current_verdict: Verdict::Allow
+            },
+            "the snapshot is stricter than today's policy for this unmatched command"
+        );
+    }
+
+    /// The `Unchanged` half: an attested launch whose snapshot agrees with
+    /// the current policy for a given command must not report a divergence,
+    /// even though attestation is active.
+    #[test]
+    fn evaluate_with_attestation_evidence_reports_unchanged_when_the_snapshot_agrees() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = tmp.path().join("policy.json");
+        let launch = SafetyPolicy::default();
+        std::fs::write(
+            &snapshot,
+            serde_json::to_string(&launch).expect("serializes"),
+        )
+        .expect("writes");
+        let fingerprint = policy_fingerprint(&launch).expect("fingerprints");
+        let env = env_from(&[
+            (POLICY_FINGERPRINT_ENV, &fingerprint),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+
+        let evidence = evaluate_with_attestation_evidence(
+            &launch,
+            "cargo build",
+            LaunchMode::Interactive,
+            &|key| env.get(key).cloned(),
+        );
+        assert_eq!(evidence.divergence, SnapshotDivergence::Unchanged);
+    }
+
+    /// Issue #139's own root cause, end to end: `zirv ctx safety explain`
+    /// used to bypass attestation entirely, so it disagreed with the hook
+    /// for the identical command whenever a session's launch snapshot was
+    /// stricter than the current policy. Now routed through the same
+    /// evidence function, the two surfaces agree, and `explain`'s own text
+    /// names the divergence explicitly.
+    #[test]
+    fn run_explain_agrees_with_the_hook_when_the_launch_snapshot_is_stricter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let snapshot = tmp.path().join("policy.json");
+        let stricter_launch = SafetyPolicy {
+            interactive_default: Verdict::Ask,
+            ..SafetyPolicy::default()
+        };
+        std::fs::write(
+            &snapshot,
+            serde_json::to_string(&stricter_launch).expect("serializes"),
+        )
+        .expect("writes");
+        let fingerprint = policy_fingerprint(&stricter_launch).expect("fingerprints");
+        let env = env_from(&[
+            (POLICY_FINGERPRINT_ENV, &fingerprint),
+            (POLICY_SNAPSHOT_ENV, snapshot.to_str().expect("utf8 path")),
+        ]);
+
+        let args = ExplainArgs {
+            repo: repo.clone(),
+            mode: LaunchMode::Interactive,
+            command: vec!["some-tool-zirv-has-never-heard-of".to_string()],
+        };
+        let mut out = Vec::new();
+        let code = run_explain(&args, &mut out, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, Verdict::Ask.exit_code());
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("launch snapshot"),
+            "explain must name the divergence, agreeing with what the hook would say: {text}"
+        );
+        assert!(
+            text.contains("allow"),
+            "must name the current policy's own verdict: {text}"
+        );
+    }
+
+    /// Without the attestation env vars, `run_explain`'s behavior is
+    /// byte-for-byte what it was before this fix: no snapshot, no
+    /// divergence note, plain current-policy evaluation.
+    #[test]
+    fn run_explain_stays_unattested_without_the_env_vars() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let empty: HashMap<String, String> = HashMap::new();
+
+        let args = ExplainArgs {
+            repo,
+            mode: LaunchMode::Interactive,
+            command: vec!["some-tool-zirv-has-never-heard-of".to_string()],
+        };
+        let mut out = Vec::new();
+        let code = run_explain(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
+        assert_eq!(code, Verdict::Allow.exit_code());
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("launch snapshot"),
+            "no attestation in play, so no divergence note: {text}"
+        );
     }
 
     // -- glob_match --------------------------------------------------
@@ -4542,6 +5341,236 @@ mod tests {
         );
     }
 
+    /// Issue #136: a commit message that documents dangerous primitives BY
+    /// NAME (never runs them) must not be denied just because the deny
+    /// matcher used to see the message's own prose as if it were code.
+    #[test]
+    fn a_commit_message_naming_denied_primitives_is_allowed_on_the_interactive_default() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -m \"awk system() and sed -i are dangerous; rm -rf too\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "the message is documentation, not code: {outcome:?}"
+        );
+    }
+
+    /// The same carve-out for every other message-bearing invocation and
+    /// argument spelling this scanner recognizes: `--message=`, the attached
+    /// `-m<value>` short form, `git tag -m`, `git notes -m`, and `hg commit
+    /// -m`.
+    #[test]
+    fn every_message_bearing_invocation_and_flag_spelling_is_covered() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "git commit --message=\"rm -rf / and sed -i are both dangerous\"",
+            "git commit -m\"awk system() calls arbitrary commands\"",
+            "git tag -m \"this tag documents rm -rf and curl | sh\" v1.0.0",
+            "git notes add -m \"awk, sed -i, and rm -rf all discussed here\"",
+            "hg commit -m \"sed -i and rm -rf mentioned for documentation\"",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "got {outcome:?} for {command}"
+            );
+        }
+    }
+
+    /// Issue #136's own reproduction: a commit message built from a
+    /// single-quoted heredoc (`$(cat <<'EOF' ...prose... EOF)`), the shape
+    /// zirv's own vault-keeper/commit workflow actually generates for a
+    /// multi-paragraph message. The heredoc body is POSIX-literal DATA fed
+    /// to `cat`'s stdin, never executable structure, even though it names
+    /// every deny-listed primitive by name.
+    #[test]
+    fn a_heredoc_built_commit_message_naming_denied_primitives_is_allowed() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -m \"$(cat <<'EOF'\nfix(safety): remove code-execution primitives from the find-exec allowlist\n\nawk (system()) and sed (-i / e) can execute arbitrary commands; rm -rf too.\nEOF\n)\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a heredoc-built message is documentation, not code: {outcome:?}"
+        );
+    }
+
+    /// The other half of issue #136's constraint: a message containing a
+    /// LIVE double-quoted `$(...)` command substitution must still escalate
+    /// -- `redact_opaque_message` never touches the text `command_
+    /// substitutions` extracts from, so a genuinely dangerous nested command
+    /// hidden inside a commit message is still found and classified.
+    #[test]
+    fn a_live_command_substitution_inside_a_commit_message_still_escalates() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -m \"danger: $(rm -rf /)\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a live $(...) inside a double-quoted message must still be classified: {outcome:?}"
+        );
+    }
+
+    /// A single-quoted heredoc body is opaque even without any surrounding
+    /// commit-message shape -- e.g. piped straight into a file-writing tool
+    /// the way a generated README or fixture might be authored -- so the
+    /// carve-out is a general opaque-literal rule, not a `git commit`
+    /// special case wearing a disguise.
+    #[test]
+    fn a_bare_single_quoted_heredoc_body_is_opaque_regardless_of_the_feeding_command() {
+        let policy = SafetyPolicy::default();
+        let command =
+            "cat <<'EOF' > notes.txt\nawk system() and sed -i and rm -rf are dangerous\nEOF";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "the heredoc body is data written to a file, not code: {outcome:?}"
+        );
+    }
+
+    /// A DOUBLE-quoted heredoc delimiter (`<<"EOF"` or bare `<<EOF`) still
+    /// permits parameter/command substitution inside the body per POSIX, so
+    /// it must NOT be redacted -- only a single-quoted delimiter is fully
+    /// literal. This also guards against `parse_single_quoted_heredoc_marker`
+    /// over-matching an unrelated `<<` (e.g. a left-shift-looking snippet in
+    /// prose) that never carries a single-quoted word right after it.
+    #[test]
+    fn a_double_quoted_or_bare_heredoc_delimiter_is_left_alone() {
+        let policy = SafetyPolicy::default();
+        let live = "cat <<EOF\n$(rm -rf /)\nEOF";
+        let outcome = evaluate(&policy, live, LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a bare (non-single-quoted) heredoc still substitutes: {outcome:?}"
+        );
+    }
+
+    /// The opaque-literal carve-out is scoped narrowly: an ordinary command
+    /// with no commit-message shape and no heredoc still classifies its
+    /// arguments normally -- this is not a blanket "quoted text is safe"
+    /// rule.
+    #[test]
+    fn unrelated_quoted_arguments_are_still_classified_normally() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "sh -c 'rm -rf /'", LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a quoted shell -c payload is still executable, not a message argument: {outcome:?}"
+        );
+    }
+
+    // -- Issue #136 review round (BLOCKER): heredoc detection must be
+    // quote/comment-aware -------------------------------------------------
+
+    /// BLOCKER regression (a): the reviewer's own PoC. A `<<'X'` mentioned
+    /// inside a `#` comment must never be mistaken for a real heredoc
+    /// opener -- if it were, the line-based scanner this replaces would
+    /// blank the LIVE `rm -rf /` line between the comment and the line
+    /// reading `X` in every candidate, and a `Deny` would silently become
+    /// `Allow`.
+    #[test]
+    fn a_heredoc_marker_mentioned_inside_a_comment_never_hides_a_live_command() {
+        let policy = SafetyPolicy::default();
+        let command = "# see <<'X' for reference\nrm -rf /\nX";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a fake heredoc marker inside a comment must not blank the live rm -rf / line: {outcome:?}"
+        );
+    }
+
+    /// BLOCKER regression (b): the identical failure mode, but the fake
+    /// marker sits inside an ordinary double-quoted argument instead of a
+    /// comment.
+    #[test]
+    fn a_heredoc_marker_mentioned_inside_a_double_quoted_argument_never_hides_a_live_command() {
+        let policy = SafetyPolicy::default();
+        let command = "echo \"see <<'X' for reference\"\nrm -rf /\nX";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_ne!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a fake heredoc marker inside a double-quoted argument must not blank the live rm -rf / line: {outcome:?}"
+        );
+    }
+
+    /// BLOCKER regression (c): a REAL single-quoted heredoc, scanned
+    /// starting from bare (unquoted, uncommented) text, must still redact
+    /// its body -- the quote/comment-awareness fix must not overcorrect
+    /// into never recognizing a real heredoc at all.
+    #[test]
+    fn a_real_single_quoted_heredoc_still_redacts_its_body() {
+        let policy = SafetyPolicy::default();
+        let command = "cat <<'EOF'\nawk system() and sed -i and rm -rf are all dangerous\nEOF";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "a real single-quoted heredoc body is still POSIX-literal data: {outcome:?}"
+        );
+    }
+
+    /// BLOCKER regression (d): a real heredoc body containing `#` and
+    /// quote characters of its own must still redact correctly -- once the
+    /// scanner is inside a confirmed heredoc body, `#`/`'`/`"` inside it are
+    /// data, not comment/quote syntax, and must not confuse terminator
+    /// detection or leak the primitive names past redaction.
+    #[test]
+    fn a_real_heredoc_body_containing_comments_and_quotes_still_redacts_correctly() {
+        let policy = SafetyPolicy::default();
+        let command =
+            "cat <<'EOF'\n# awk and sed -i are dangerous\nrm -rf \"quoted 'nested' text\" too\nEOF";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "the heredoc body's own # and quotes are data, not live syntax: {outcome:?}"
+        );
+    }
+
+    // -- Issue #136 review round (MINOR): combined short flags -----------
+
+    /// MINOR regression: `git commit -am "..."` (the combined `-a -m`
+    /// short-flag spelling) must redact the message exactly like a bare
+    /// `-m` would -- `"-am".starts_with("-m")` is false, so the original
+    /// carve-out missed this one spelling entirely and reproduced the
+    /// false-positive denial for it.
+    #[test]
+    fn combined_short_flag_am_redacts_the_message() {
+        let policy = SafetyPolicy::default();
+        let command = "git commit -am \"awk system() and sed -i and rm -rf are dangerous\"";
+        let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+        assert_eq!(
+            outcome.verdict,
+            Verdict::Allow,
+            "the combined -am short flag must redact its message too: {outcome:?}"
+        );
+    }
+
+    /// The `-am` carve-out stays scoped to the same message-bearing
+    /// invocations as every other spelling -- it is not a blanket "any
+    /// `-am`-flagged command is safe" rule. Asserted directly against
+    /// `redact_opaque_message` (the same way this module already asserts
+    /// directly against other private classifiers like `sql_outcome`)
+    /// rather than through the full `evaluate` pipeline, so the assertion
+    /// is about the gate itself, not incidental to whichever other
+    /// classifier might otherwise flag the unrelated program.
+    #[test]
+    fn combined_short_flag_am_gate_only_applies_to_message_bearing_invocations() {
+        assert_eq!(
+            redact_opaque_message("some-other-tool -am \"rm -rf / and sed -i are dangerous\""),
+            None,
+            "an unrelated program's -am flag must not be treated as a redactable message"
+        );
+    }
+
     /// Half two: the short list that IS allowed to interrupt. Kept in the
     /// same test module as half one on purpose -- the two together are the
     /// requirement, and reading one without the other invites widening the
@@ -4689,8 +5718,13 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        let output = hook_output("npm install", &allow, "default")
-            .expect("an allow must be stated, not implied by silence");
+        let output = hook_output(
+            "npm install",
+            &allow,
+            "default",
+            SnapshotDivergence::Unchanged,
+        )
+        .expect("an allow must be stated, not implied by silence");
         assert!(
             output.contains("\"permissionDecision\":\"allow\""),
             "got {output}"
@@ -4708,7 +5742,15 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        assert!(hook_output("npm install", &allow, "dontAsk").is_none());
+        assert!(
+            hook_output(
+                "npm install",
+                &allow,
+                "dontAsk",
+                SnapshotDivergence::Unchanged
+            )
+            .is_none()
+        );
     }
 
     /// The operator's override still works in both directions, and is
@@ -5091,7 +6133,7 @@ mod tests {
             verdict: Verdict::Allow,
             matched: None,
         };
-        assert!(hook_output("ls", &allow, "dontAsk").is_none());
+        assert!(hook_output("ls", &allow, "dontAsk", SnapshotDivergence::Unchanged).is_none());
 
         let deny = Outcome {
             verdict: Verdict::Deny,
@@ -5100,7 +6142,8 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("rm -rf /", &deny, "default").expect("deny produces output");
+        let output = hook_output("rm -rf /", &deny, "default", SnapshotDivergence::Unchanged)
+            .expect("deny produces output");
         assert!(output.contains("\"permissionDecision\":\"deny\""));
         assert!(output.contains("\"hookEventName\":\"PreToolUse\""));
 
@@ -5111,7 +6154,8 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("git push", &ask, "default").expect("ask produces output");
+        let output = hook_output("git push", &ask, "default", SnapshotDivergence::Unchanged)
+            .expect("ask produces output");
         assert!(output.contains("\"permissionDecision\":\"ask\""));
     }
 
@@ -5132,7 +6176,7 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        assert!(hook_output("git push", &ask, "dontAsk").is_none());
+        assert!(hook_output("git push", &ask, "dontAsk", SnapshotDivergence::Unchanged).is_none());
     }
 
     #[test]
@@ -5144,7 +6188,8 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("rm -rf /", &deny, "dontAsk").expect("deny still denies");
+        let output = hook_output("rm -rf /", &deny, "dontAsk", SnapshotDivergence::Unchanged)
+            .expect("deny still denies");
         assert!(output.contains("\"permissionDecision\":\"deny\""));
     }
 
@@ -5160,7 +6205,8 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let output = hook_output("git push", &ask, "").expect("ask still asks");
+        let output = hook_output("git push", &ask, "", SnapshotDivergence::Unchanged)
+            .expect("ask still asks");
         assert!(output.contains("\"permissionDecision\":\"ask\""));
     }
 
@@ -5663,15 +6709,83 @@ mod tests {
                 origin: Origin::BuiltIn,
             }),
         };
-        let interactive = explain_text("git push --force x", &ask, LaunchMode::Interactive);
+        let interactive = explain_text(
+            "git push --force x",
+            &ask,
+            LaunchMode::Interactive,
+            SnapshotDivergence::Unchanged,
+        );
         assert!(interactive.contains("built-in"), "got {interactive}");
         assert!(interactive.contains("prompts"), "got {interactive}");
 
-        let headless = explain_text("git push --force x", &ask, LaunchMode::Headless);
+        let headless = explain_text(
+            "git push --force x",
+            &ask,
+            LaunchMode::Headless,
+            SnapshotDivergence::Unchanged,
+        );
         assert!(headless.contains("fails closed"), "got {headless}");
         assert!(
             headless.contains("dontAsk"),
             "the headless consequence must name the mode that produces it: {headless}"
+        );
+    }
+
+    /// Issue #139: when the launch snapshot is stricter than the current
+    /// policy for this command, the explanation must say so explicitly --
+    /// not silently describe the stricter verdict as if it were the
+    /// configured posture.
+    #[test]
+    fn explain_names_the_snapshot_divergence_when_the_launch_snapshot_is_stricter() {
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: None,
+        };
+        let text = explain_text(
+            "some-tool-zirv-has-never-heard-of",
+            &ask,
+            LaunchMode::Interactive,
+            SnapshotDivergence::SnapshotStricter {
+                current_verdict: Verdict::Allow,
+            },
+        );
+        assert!(
+            text.contains("launch snapshot"),
+            "must name the snapshot as the source of the divergence: {text}"
+        );
+        assert!(
+            text.contains("stricter"),
+            "must say the snapshot is stricter, not just different: {text}"
+        );
+        assert!(
+            text.contains("allow"),
+            "must name what the current policy would actually do: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("restart"),
+            "must name the remedy (restart the session): {text}"
+        );
+    }
+
+    /// The `Unchanged` case (the overwhelming majority: no attestation, or
+    /// one whose snapshot agrees with today's policy) must never mention the
+    /// snapshot at all -- the divergence note is additive, not a permanent
+    /// fixture of every explanation.
+    #[test]
+    fn explain_says_nothing_about_the_snapshot_when_unchanged() {
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: None,
+        };
+        let text = explain_text(
+            "some-tool-zirv-has-never-heard-of",
+            &ask,
+            LaunchMode::Interactive,
+            SnapshotDivergence::Unchanged,
+        );
+        assert!(
+            !text.contains("launch snapshot"),
+            "must not mention a snapshot that never diverged: {text}"
         );
     }
 
@@ -5765,6 +6879,7 @@ mod tests {
             "git push --force x",
             &ask,
             &mode_of(LaunchMode::Interactive),
+            SnapshotDivergence::Unchanged,
         )
         .expect("an interactive launch must genuinely prompt");
         assert!(
@@ -5773,13 +6888,27 @@ mod tests {
         );
 
         assert!(
-            hook_output("git push --force x", &ask, &mode_of(LaunchMode::Headless)).is_none(),
+            hook_output(
+                "git push --force x",
+                &ask,
+                &mode_of(LaunchMode::Headless),
+                SnapshotDivergence::Unchanged,
+            )
+            .is_none(),
             "a headless launch has nobody to prompt: the hook must fall through"
         );
 
         // The operator's own pin, unchanged: zirv never overrides an explicit
         // operator choice, so the suppression still applies there.
-        assert!(hook_output("git push --force x", &ask, "dontAsk").is_none());
+        assert!(
+            hook_output(
+                "git push --force x",
+                &ask,
+                "dontAsk",
+                SnapshotDivergence::Unchanged
+            )
+            .is_none()
+        );
     }
 
     /// Deny is unaffected by mode, in every posture.
@@ -5793,7 +6922,8 @@ mod tests {
             }),
         };
         for mode in ["dontAsk", "default", ""] {
-            let output = hook_output("sudo rm -rf /", &deny, mode).expect("deny still denies");
+            let output = hook_output("sudo rm -rf /", &deny, mode, SnapshotDivergence::Unchanged)
+                .expect("deny still denies");
             assert!(
                 output.contains("\"permissionDecision\":\"deny\""),
                 "mode {mode}: got {output}"

@@ -1121,8 +1121,22 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// isn't already asking, only to suppress or deny it. Both registered
     /// adapters override this for `Deny` on `RepoFsWrite`/`ShellExec` only,
     /// the same pair `read_only_args`/`distiller_cmd` already pin.
-    fn policy_args(&self, policy: &super::policy::EffectivePolicy) -> Vec<String> {
-        let _ = policy;
+    ///
+    /// `mode` (issue #134, 2026-08-25) exists for the same reason
+    /// `default_sandbox_args` already takes it: codex's projection of a Deny
+    /// stance is command-surface-dependent (`codex exec` rejects
+    /// `--ask-for-approval` on current codex-cli even though the top-level
+    /// interactive `codex` accepts it), so the adapter needs to know which
+    /// surface this argv is headed for to project a working flag rather
+    /// than one the installed binary rejects outright. Claude has no such
+    /// surface split and ignores it, exactly as it already ignores `mode`
+    /// nowhere else on this trait.
+    fn policy_args(
+        &self,
+        policy: &super::policy::EffectivePolicy,
+        mode: LaunchMode,
+    ) -> Vec<String> {
+        let _ = (policy, mode);
         Vec::new()
     }
 
@@ -2045,7 +2059,7 @@ pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter
 /// flag wins outright, nothing of zirv's own is prepended at all. Otherwise:
 /// `adapter.default_sandbox_args()` when `cfg.sandbox.enabled` (the shipped
 /// default -- see that method's own doc comment for the exact posture),
-/// followed by `adapter.policy_args(&cfg.policy)` for any *additional*
+/// followed by `adapter.policy_args(&cfg.policy, mode)` for any *additional*
 /// restriction an explicit `[policy]` `Deny` stance asks for on top of the
 /// baseline. The more specific choice comes last, so it wins if it overlaps
 /// with the baseline (both adapters' relevant flags are single-value; the
@@ -2064,7 +2078,7 @@ pub fn policy_launch_args(
     } else {
         Vec::new()
     };
-    out.extend(adapter.policy_args(&cfg.policy));
+    out.extend(adapter.policy_args(&cfg.policy, mode));
     out
 }
 
@@ -2470,7 +2484,9 @@ mod tests {
                 .any(|w| w == ["--permission-mode", "dontAsk"])
         );
 
-        let codex = codex::CodexAdapter::new(None).with_on_request_approval_forced(true);
+        let codex = codex::CodexAdapter::new(None)
+            .with_on_request_approval_forced(true)
+            .with_exec_ask_for_approval_forced(true);
         let interactive = policy_launch_args(&cfg, &codex, &[], LaunchMode::Interactive);
         let headless = policy_launch_args(&cfg, &codex, &[], LaunchMode::Headless);
         assert_ne!(interactive, headless);
@@ -4121,12 +4137,12 @@ mod tests {
         let policy = crate::commands::ctx::policy::EffectivePolicy::default();
         assert!(
             claude::ClaudeAdapter::new(None)
-                .policy_args(&policy)
+                .policy_args(&policy, LaunchMode::Interactive)
                 .is_empty()
         );
         assert!(
             codex::CodexAdapter::new(None)
-                .policy_args(&policy)
+                .policy_args(&policy, LaunchMode::Interactive)
                 .is_empty()
         );
     }
@@ -4145,8 +4161,10 @@ mod tests {
             ..EffectivePolicy::default()
         };
 
-        let claude_args = claude::ClaudeAdapter::new(None).policy_args(&policy);
-        let codex_args = codex::CodexAdapter::new(None).policy_args(&policy);
+        let claude_args =
+            claude::ClaudeAdapter::new(None).policy_args(&policy, LaunchMode::Interactive);
+        let codex_args =
+            codex::CodexAdapter::new(None).policy_args(&policy, LaunchMode::Interactive);
 
         assert!(
             !claude_args.is_empty(),

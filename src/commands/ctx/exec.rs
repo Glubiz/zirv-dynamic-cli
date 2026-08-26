@@ -822,6 +822,11 @@ pub(crate) fn run_with_clock<W: Write>(
     // released explicitly in every arm that leaves this loop -- the same
     // explicit-arm discipline `RawGuard` follows, since this binary's
     // release profile is `panic = "abort"` and `Drop` is not guaranteed.
+    // Issue #139: see `wrap.rs::run_with`'s identical comment -- pure and
+    // deterministic from the same `cfg.safety` this launch's own settings
+    // file was built from, so `status.rs` can later detect a widened policy
+    // this session's own launch snapshot has not adopted yet.
+    let safety_policy_sha256 = super::safety::policy_fingerprint(&cfg.safety).ok();
     let mut session_guard = super::sessions::SessionGuard::register(
         &state,
         super::sessions::Record::new(
@@ -829,7 +834,8 @@ pub(crate) fn run_with_clock<W: Write>(
             adapter.name(),
             repo,
             super::sessions::Verb::Exec,
-        ),
+        )
+        .with_safety_policy_sha256(safety_policy_sha256),
     );
 
     // Item 10: owned across every cycle of the loop below (the pre-flight

@@ -62,6 +62,18 @@ pub struct CodexAdapter {
     /// support the approval mode without supporting automatic review.
     #[cfg(test)]
     forced_auto_review_support: Option<bool>,
+    /// Test seam for `exec_ask_for_approval_supported`'s answer (issue
+    /// #134): forces whether the installed codex-cli's `codex exec --help`
+    /// is treated as documenting `--ask-for-approval`, instead of spawning a
+    /// real probe against whatever "codex" happens to resolve to on the
+    /// machine running the test suite. Kept separate from
+    /// `forced_on_request_approval_support`: that field forces the
+    /// TOP-LEVEL `codex --help` probe (a different command surface, gating
+    /// the interactive `on-request` value), while this one forces the
+    /// `exec`-scoped probe that gates whether the flag itself may appear on
+    /// a headless `codex exec` launch at all.
+    #[cfg(test)]
+    forced_exec_ask_for_approval_support: Option<bool>,
 }
 
 impl CodexAdapter {
@@ -81,6 +93,8 @@ impl CodexAdapter {
             forced_on_request_approval_support: None,
             #[cfg(test)]
             forced_auto_review_support: None,
+            #[cfg(test)]
+            forced_exec_ask_for_approval_support: None,
         }
     }
 
@@ -109,6 +123,13 @@ impl CodexAdapter {
     #[cfg(test)]
     pub fn with_auto_review_forced(mut self, supported: bool) -> Self {
         self.forced_auto_review_support = Some(supported);
+        self
+    }
+
+    /// Test seam: see the field's own doc comment.
+    #[cfg(test)]
+    pub fn with_exec_ask_for_approval_forced(mut self, supported: bool) -> Self {
+        self.forced_exec_ask_for_approval_support = Some(supported);
         self
     }
 
@@ -165,6 +186,66 @@ impl CodexAdapter {
             return forced;
         }
         probe_ignore_flags_support(&self.program, &self.bin_args)
+    }
+
+    /// Issue #134: whether the installed codex-cli's own `codex exec --help`
+    /// documents `--ask-for-approval` at all. Unlike
+    /// `on_request_approval_supported` (which probes the TOP-LEVEL `codex
+    /// --help` to decide whether the `on-request` VALUE is safe to pass on
+    /// the interactive launch), this probes the `exec`-scoped help text --
+    /// the different command surface the headless launch
+    /// (`headless_cmd`/`headless_cmd_stdin`) actually uses -- to decide
+    /// whether the FLAG ITSELF may be passed at all. Current codex-cli
+    /// (0.149.x) accepts `--ask-for-approval` on the top-level interactive
+    /// launch but rejects it as an unrecognized argument on `codex exec`
+    /// (`error: unexpected argument '--ask-for-approval' found`), so a
+    /// probe scoped to the wrong surface would wrongly conclude the headless
+    /// launch is safe. Fails closed (`false`, i.e. "not supported") on any
+    /// doubt at all -- binary missing, timeout, or `--help` output missing
+    /// the flag -- exactly like every other probe in this module, since a
+    /// false negative here only costs the config-override fallback
+    /// (`-c approval_policy=never`, verified to work on both interactive and
+    /// `exec` launches per `system_prompt_args`'s own doc comment), while a
+    /// false positive would pass an argument the binary rejects and break
+    /// the launch outright.
+    fn exec_ask_for_approval_supported(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_exec_ask_for_approval_support {
+            return forced;
+        }
+        probe_exec_ask_for_approval_support(&self.program, &self.bin_args)
+    }
+
+    /// Issue #134: `codex exec --help` on current codex-cli (0.149.x) no
+    /// longer documents `--ask-for-approval` at all -- passing it breaks a
+    /// headless launch outright (`error: unexpected argument
+    /// '--ask-for-approval' found`) even though the SAME flag is still
+    /// accepted on the top-level interactive `codex` launch. Probed via
+    /// `exec_ask_for_approval_supported` (an `exec`-scoped `--help` probe,
+    /// deliberately separate from `on_request_approval_supported`'s
+    /// top-level probe -- see that method's own doc comment for why the two
+    /// surfaces can disagree), never assumed.
+    ///
+    /// On an interactive launch, or a headless launch whose installed CLI
+    /// still documents the flag, this returns the plain `--ask-for-approval
+    /// <value>` pair -- byte-for-byte what every caller emitted before this
+    /// method existed, so an install that still supports the flag sees no
+    /// change at all. Only when BOTH conditions hold (headless AND
+    /// unsupported) does this fall back to `-c approval_policy=<value>`:
+    /// `-c/--config key=value` overrides are documented on both the
+    /// interactive and `exec` command surfaces (`system_prompt_args`'s own
+    /// doc comment), and `approval_policy` is the config key codex's own
+    /// `~/.codex/config.toml` schema uses for this exact setting (surfaced
+    /// in `codex exec`'s own stdout preamble as `approval: <value>`,
+    /// `policy_support`'s `CONFIG` constant), so this fallback carries the
+    /// identical posture through a mechanism the binary still accepts
+    /// rather than silently dropping the suppression.
+    fn approval_suppression_args(&self, mode: super::LaunchMode, value: &str) -> Vec<String> {
+        if !mode.is_interactive() && !self.exec_ask_for_approval_supported() {
+            vec!["-c".to_string(), format!("approval_policy={value}")]
+        } else {
+            vec!["--ask-for-approval".to_string(), value.to_string()]
+        }
     }
 
     /// Every command starts here so the program and its leading arguments are
@@ -284,6 +365,78 @@ fn detect_ignore_flags(program: &str, bin_args: &[String]) -> bool {
         if matches!(child.try_wait(), Ok(Some(_))) {
             let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
             return text.contains("--ignore-rules") && text.contains("--ignore-user-config");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+/// Process-wide cache of `detect_exec_ask_for_approval_support`'s answer,
+/// keyed exactly like [`IGNORE_FLAGS_SUPPORT`] and for the identical reason.
+static EXEC_ASK_FOR_APPROVAL_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
+
+fn probe_exec_ask_for_approval_support(program: &str, bin_args: &[String]) -> bool {
+    let key = (PathBuf::from(program), bin_args.to_vec());
+    let cache = EXEC_ASK_FOR_APPROVAL_SUPPORT.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = cache.lock() else {
+        return false;
+    };
+    if let Some(cached) = map.get(&key) {
+        return *cached;
+    }
+    let detected = detect_exec_ask_for_approval_support(program, bin_args);
+    map.insert(key, detected);
+    detected
+}
+
+/// Runs `<program> [bin_args] exec --help` and reports whether its output
+/// names `--ask-for-approval`. Mirrors `detect_ignore_flags` exactly (same
+/// resolution, same fail-closed cmd-shim reparse guard, same timeout shape),
+/// differing only in the marker it looks for -- issue #134.
+fn detect_exec_ask_for_approval_support(program: &str, bin_args: &[String]) -> bool {
+    let resolved =
+        super::resolve_program(program).unwrap_or_else(|_| ResolvedProgram::direct(program));
+
+    let mut probe_args: Vec<String> =
+        Vec::with_capacity(resolved.prefix.len() + bin_args.len() + 2);
+    probe_args.extend(resolved.prefix.iter().cloned());
+    probe_args.extend(bin_args.iter().cloned());
+    probe_args.push("exec".to_string());
+    probe_args.push("--help".to_string());
+    if super::guard_cmd_shim_reparse(&resolved.program, &probe_args).is_err() {
+        return false;
+    }
+
+    let Ok(mut child) = Command::new(&resolved.program)
+        .args(&resolved.prefix)
+        .args(bin_args)
+        .arg("exec")
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let mut stdout_pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let deadline = Instant::now() + IGNORE_FLAGS_PROBE_TIMEOUT;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+            return text.contains("--ask-for-approval");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -800,12 +953,25 @@ impl AgentAdapter for CodexAdapter {
     /// human before failing, which is exactly the "codex prompts far more
     /// than claude" symptom this exists to close for a launch that has no
     /// human present to answer (a headless worker).
-    fn policy_args(&self, policy: &crate::commands::ctx::policy::EffectivePolicy) -> Vec<String> {
+    ///
+    /// ISSUE #134 UPDATE (2026-08-25): the second flag is no longer always
+    /// the literal `--ask-for-approval never` token pair -- see
+    /// `approval_suppression_args`'s own doc comment. On a headless launch
+    /// (`mode` here matches `LaunchMode::Headless` exactly on every real
+    /// caller: `policy_launch_args` threads through the same `mode` its own
+    /// caller resolved for `headless_cmd`/`headless_cmd_stdin`) whose
+    /// installed codex-cli's `codex exec --help` no longer documents the
+    /// flag, this projects the config-override form instead so the launch
+    /// does not fail outright with an unrecognized-argument error.
+    fn policy_args(
+        &self,
+        policy: &crate::commands::ctx::policy::EffectivePolicy,
+        mode: super::LaunchMode,
+    ) -> Vec<String> {
         use crate::commands::ctx::policy::Stance;
         if policy.repo_fs_write == Stance::Deny || policy.shell_exec == Stance::Deny {
             let mut args = self.read_only_args();
-            args.push("--ask-for-approval".to_string());
-            args.push("never".to_string());
+            args.extend(self.approval_suppression_args(mode, "never"));
             args
         } else {
             Vec::new()
@@ -863,12 +1029,11 @@ impl AgentAdapter for CodexAdapter {
         } else {
             "never"
         };
-        let mut args = vec![
-            "--sandbox".to_string(),
-            "workspace-write".to_string(),
-            "--ask-for-approval".to_string(),
-            approval.to_string(),
-        ];
+        let mut args = vec!["--sandbox".to_string(), "workspace-write".to_string()];
+        // ISSUE #134: `--ask-for-approval` (or its `-c approval_policy=`
+        // fallback on an unsupporting `codex exec`) via the shared helper --
+        // see `approval_suppression_args`'s own doc comment.
+        args.extend(self.approval_suppression_args(mode, approval));
         if interactive_approval && self.auto_review_supported() {
             args.push("--approve-for-me".to_string());
         }
@@ -1533,7 +1698,10 @@ mod tests {
         let adapter = CodexAdapter::new(None);
         assert!(
             adapter
-                .policy_args(&crate::commands::ctx::policy::EffectivePolicy::default())
+                .policy_args(
+                    &crate::commands::ctx::policy::EffectivePolicy::default(),
+                    super::super::LaunchMode::Headless
+                )
                 .is_empty()
         );
     }
@@ -1550,13 +1718,15 @@ mod tests {
     fn policy_args_pins_the_read_only_sandbox_and_suppresses_approval_prompts_when_shell_exec_is_denied()
      {
         use crate::commands::ctx::policy::{EffectivePolicy, Stance};
-        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(false);
+        let adapter = CodexAdapter::new(None)
+            .with_ignore_flags_forced(false)
+            .with_exec_ask_for_approval_forced(true);
         let policy = EffectivePolicy {
             shell_exec: Stance::Deny,
             ..EffectivePolicy::default()
         };
         assert_eq!(
-            adapter.policy_args(&policy),
+            adapter.policy_args(&policy, super::super::LaunchMode::Headless),
             vec![
                 "--sandbox".to_string(),
                 "read-only".to_string(),
@@ -1570,13 +1740,73 @@ mod tests {
     fn policy_args_pins_the_read_only_sandbox_and_suppresses_approval_prompts_when_repo_fs_write_is_denied()
      {
         use crate::commands::ctx::policy::{EffectivePolicy, Stance};
-        let adapter = CodexAdapter::new(None).with_ignore_flags_forced(false);
+        let adapter = CodexAdapter::new(None)
+            .with_ignore_flags_forced(false)
+            .with_exec_ask_for_approval_forced(true);
         let policy = EffectivePolicy {
             repo_fs_write: Stance::Deny,
             ..EffectivePolicy::default()
         };
         assert_eq!(
-            adapter.policy_args(&policy),
+            adapter.policy_args(&policy, super::super::LaunchMode::Headless),
+            vec![
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ]
+        );
+    }
+
+    /// Issue #134: when the installed codex-cli's own `codex exec --help`
+    /// no longer documents `--ask-for-approval` (current codex-cli 0.149.x),
+    /// a headless Deny-policy launch must fall back to the config-override
+    /// form rather than pass the rejected flag -- the whole point of the
+    /// fix, driven entirely through the forcing seam so this never depends
+    /// on whatever codex happens to be installed on the machine running the
+    /// test suite.
+    #[test]
+    fn policy_args_falls_back_to_the_config_override_when_exec_rejects_the_approval_flag() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = CodexAdapter::new(None)
+            .with_ignore_flags_forced(false)
+            .with_exec_ask_for_approval_forced(false);
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        let args = adapter.policy_args(&policy, super::super::LaunchMode::Headless);
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "-c".to_string(),
+                "approval_policy=never".to_string(),
+            ]
+        );
+        assert!(
+            !args.iter().any(|a| a == "--ask-for-approval"),
+            "must not pass the flag the installed codex-cli rejects: {args:?}"
+        );
+    }
+
+    /// The interactive path is unaffected by the `exec`-scoped probe: even
+    /// when `codex exec --help` would not document the flag, the top-level
+    /// interactive launch still accepts it, so `policy_args` must keep
+    /// emitting the plain flag pair there.
+    #[test]
+    fn policy_args_keeps_the_plain_flag_on_an_interactive_launch_regardless_of_the_exec_probe() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = CodexAdapter::new(None)
+            .with_ignore_flags_forced(false)
+            .with_exec_ask_for_approval_forced(false);
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        assert_eq!(
+            adapter.policy_args(&policy, super::super::LaunchMode::Interactive),
             vec![
                 "--sandbox".to_string(),
                 "read-only".to_string(),
@@ -1598,7 +1828,11 @@ mod tests {
             shell_exec: Stance::Ask,
             ..EffectivePolicy::default()
         };
-        assert!(adapter.policy_args(&policy).is_empty());
+        assert!(
+            adapter
+                .policy_args(&policy, super::super::LaunchMode::Headless)
+                .is_empty()
+        );
     }
 
     /// This never emits `--dangerously-bypass-approvals-and-sandbox` (the
@@ -1621,7 +1855,7 @@ mod tests {
                 ..EffectivePolicy::default()
             },
         ] {
-            let args = adapter.policy_args(&policy);
+            let args = adapter.policy_args(&policy, super::super::LaunchMode::Headless);
             assert!(
                 !args
                     .iter()
@@ -1718,7 +1952,8 @@ mod tests {
         for supported in [true, false] {
             let adapter = CodexAdapter::new(None)
                 .with_on_request_approval_forced(supported)
-                .with_auto_review_forced(supported);
+                .with_auto_review_forced(supported)
+                .with_exec_ask_for_approval_forced(true);
             let args = adapter.default_sandbox_args(
                 &Default::default(),
                 &Default::default(),
@@ -1739,6 +1974,14 @@ mod tests {
 
     /// The invariant that holds whatever is installed -- the assertion that
     /// is safe to make without the forcing seam.
+    ///
+    /// ISSUE #134 UPDATE (2026-08-25): index 2 is no longer always
+    /// `--ask-for-approval` -- a headless launch against a live installed
+    /// `codex` whose `exec --help` no longer documents the flag falls back
+    /// to `-c` (`approval_suppression_args`'s own doc comment). Both are
+    /// valid approval-suppression mechanisms; this only asserts one of them
+    /// is present and the sandbox is never removed, exactly the assertion
+    /// shape this test's own name promises: safe without the forcing seam.
     #[test]
     fn every_codex_posture_keeps_the_explicit_workspace_sandbox_pair() {
         let adapter = CodexAdapter::new(None);
@@ -1747,12 +1990,15 @@ mod tests {
             super::super::LaunchMode::Headless,
         ] {
             let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
-            assert!(matches!(args.len(), 4 | 5), "got {args:?}");
+            assert!(args.len() >= 4, "got {args:?}");
             assert_eq!(
                 &args[0..2],
                 &["--sandbox".to_string(), "workspace-write".to_string()]
             );
-            assert_eq!(args[2], "--ask-for-approval");
+            assert!(
+                args[2] == "--ask-for-approval" || args[2] == "-c",
+                "expected an approval-suppression flag at index 2: {args:?}"
+            );
             assert!(
                 !args
                     .iter()
@@ -1790,7 +2036,7 @@ mod tests {
     /// prompt), verified against the real installed `codex-cli 0.147.0`.
     #[test]
     fn default_sandbox_args_pairs_workspace_write_with_never_ask() {
-        let adapter = CodexAdapter::new(None);
+        let adapter = CodexAdapter::new(None).with_exec_ask_for_approval_forced(true);
         assert_eq!(
             adapter.default_sandbox_args(
                 &Default::default(),
@@ -1802,6 +2048,59 @@ mod tests {
                 "workspace-write".to_string(),
                 "--ask-for-approval".to_string(),
                 "never".to_string(),
+            ]
+        );
+    }
+
+    /// Issue #134: on a headless launch whose installed codex-cli's own
+    /// `codex exec --help` no longer documents `--ask-for-approval` (current
+    /// codex-cli 0.149.x), the shipped-default posture must still suppress
+    /// approval prompts -- via the `-c approval_policy=never` fallback --
+    /// rather than pass the flag the binary rejects outright and break the
+    /// launch.
+    #[test]
+    fn default_sandbox_args_falls_back_to_the_config_override_when_exec_rejects_the_approval_flag()
+    {
+        let adapter = CodexAdapter::new(None).with_exec_ask_for_approval_forced(false);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "-c".to_string(),
+                "approval_policy=never".to_string(),
+            ]
+        );
+    }
+
+    /// The interactive path is unaffected by the `exec`-scoped probe, even
+    /// when it says unsupported: `--sandbox workspace-write` alongside
+    /// `on-request` still uses the plain flag, because the top-level
+    /// interactive `codex` launch is a different command surface that still
+    /// accepts it.
+    #[test]
+    fn default_sandbox_args_interactive_ignores_the_exec_scoped_probe() {
+        let adapter = CodexAdapter::new(None)
+            .with_on_request_approval_forced(true)
+            .with_auto_review_forced(false)
+            .with_exec_ask_for_approval_forced(false);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "on-request".to_string(),
             ]
         );
     }

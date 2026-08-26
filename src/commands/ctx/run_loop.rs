@@ -267,6 +267,8 @@ pub(crate) fn run_with_clock<W: Write>(
             Some(guard) => guard.refresh_session(session.as_str()),
             None => {
                 registry_short = Some(session_short.clone());
+                // Issue #139: see `wrap.rs::run_with`'s identical comment.
+                let safety_policy_sha256 = super::safety::policy_fingerprint(&cfg.safety).ok();
                 session_guard = Some(super::sessions::SessionGuard::register(
                     &state,
                     super::sessions::Record::new(
@@ -274,7 +276,8 @@ pub(crate) fn run_with_clock<W: Write>(
                         adapter.name(),
                         repo,
                         super::sessions::Verb::Loop,
-                    ),
+                    )
+                    .with_safety_policy_sha256(safety_policy_sha256),
                 ));
             }
         }

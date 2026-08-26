@@ -296,6 +296,20 @@ pub struct Record {
     /// deserializes as `None` rather than failing to parse.
     #[serde(default)]
     pub owner_pid: Option<u32>,
+    /// Issue #139: the `safety::policy_fingerprint` of the LAUNCH-TIME
+    /// snapshot this session was pinned to (the same fingerprint value
+    /// written to `POLICY_FINGERPRINT_ENV`/read back by `evaluate_with_
+    /// attestation_evidence`), when the launch computed one at all. `None`
+    /// for a record written by an older build, a launch that never
+    /// attempted attestation (no adapter support, or the fingerprint could
+    /// not be computed), or any session type this field is not yet threaded
+    /// through to. `status.rs` compares this against a freshly loaded
+    /// policy's own fingerprint for `record.repo` to surface a "policy
+    /// snapshot stale" line -- see `Modules/Ctx Subsystem.md`.
+    /// `#[serde(default)]` so an on-disk record from an older build
+    /// deserializes as `None` rather than failing to parse.
+    #[serde(default)]
+    pub safety_policy_sha256: Option<String>,
 }
 
 fn reachable_default() -> bool {
@@ -325,6 +339,10 @@ impl Record {
             // process's own pid on the way to disk, unless a caller has
             // already set one (see its own doc comment).
             owner_pid: None,
+            // Left unset here too: only a caller that actually resolved a
+            // launch-time policy snapshot (and its fingerprint) has
+            // anything to record -- see `with_safety_policy_sha256`.
+            safety_policy_sha256: None,
         }
     }
 
@@ -333,6 +351,17 @@ impl Record {
     /// whether a turn-signal socket actually bound.
     pub fn unreachable(mut self) -> Self {
         self.reachable = false;
+        self
+    }
+
+    /// Issue #139: stamps the launch-time safety-policy fingerprint (see the
+    /// field's own doc comment), chained onto `new` at whichever call site
+    /// already resolved one for this launch. `None` is a legitimate value
+    /// (leaves the field unset, the same as never calling this at all) so a
+    /// caller that only sometimes has a fingerprint (e.g. attestation is
+    /// disabled, or fingerprinting failed) does not need its own branch.
+    pub fn with_safety_policy_sha256(mut self, fingerprint: Option<String>) -> Self {
+        self.safety_policy_sha256 = fingerprint;
         self
     }
 }
