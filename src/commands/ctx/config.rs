@@ -1703,6 +1703,11 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // so both are forbidden outright rather than folded, mirroring
     // `sandbox.extra_allow` right above.
     (&["safety", "allow"], "ZIRV_CTX_SAFETY_ALLOW"),
+    // `safety.escape_allow` (issue #147): the same widening-only reasoning
+    // as `safety.allow` right above, one narrower domain down -- it clears
+    // a family for a `--dangerously-disable-sandbox` retry specifically, so
+    // adding an entry can only ever loosen that gate, never narrow it.
+    (&["safety", "escape_allow"], "ZIRV_CTX_SAFETY_ESCAPE_ALLOW"),
     (&["safety", "default"], "ZIRV_CTX_SAFETY_DEFAULT"),
     // `safety.interactive_default` (2026-08-24): the unmatched-command
     // verdict on an interactive launch, default `allow`. Same reasoning as
@@ -3874,6 +3879,32 @@ mod tests {
         );
     }
 
+    /// Issue #147: `safety.escape_allow` is operator-only, the identical
+    /// asymmetry `repo_layer_cannot_add_sandbox_extra_allow_entries` above
+    /// pins for `sandbox.extra_allow` -- a repo checkout adding to it would
+    /// clear a family for its own `--dangerously-disable-sandbox` retries.
+    #[test]
+    fn repo_layer_cannot_add_safety_escape_allow_entries() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[safety]\nescape_allow = [\"curl *\"]\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not widen the escape-allow list")
+            .to_string();
+        assert!(err.contains("safety.escape_allow"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_SAFETY_ESCAPE_ALLOW"),
+            "names the operator escape hatch: {err}"
+        );
+    }
+
     /// The one list a repo checkout *may* contribute to: adding a deny entry
     /// only ever narrows. The union must include both layers' entries, end
     /// to end through `CtxConfig::load` -- a plain deep merge would let the
@@ -4298,6 +4329,7 @@ mod tests {
         ("safety", "deny"),
         ("safety", "ask"),
         ("safety", "allow"),
+        ("safety", "escape_allow"),
         ("safety", "default"),
         ("safety", "interactive_default"),
         ("safety", "sql"),

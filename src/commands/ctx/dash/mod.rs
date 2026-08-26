@@ -2303,6 +2303,33 @@ fn worker_pane_extra_args(
     extra
 }
 
+/// The env pair, if any, [`fulfill_spawn_request`] pushes into a fresh
+/// worker pane's `turn_env` for the durable interactive-launch pin
+/// (`adapters::LAUNCH_MODE_ENV`, issue #147 amendment). `trusted_interactive`
+/// is the ONLY input -- deliberately not `SpawnRequest.interactive`, which is
+/// untrusted JSON any process able to write into the requests directory can
+/// forge (review round 1, 2026-08-27, Important). Pure and directly testable
+/// so the security property ("a forged request can never produce the pin")
+/// is pinned independent of any particular call site's real process-spawn
+/// behavior; see `fulfill_spawn_request`'s own doc comment for which callers
+/// pass `true` (only the dashboard's own in-process Spawn overlay) versus
+/// `false` (everything else, including every file-dropped request).
+fn spawn_launch_mode_pin(trusted_interactive: bool) -> Option<(String, String)> {
+    adapters::launch_mode_pin_env(if trusted_interactive {
+        adapters::LaunchMode::Interactive
+    } else {
+        adapters::LaunchMode::Headless
+    })
+}
+
+/// The `trusted_interactive` [`handle_spawn_requests`] always passes to
+/// [`fulfill_spawn_request`] for every request it takes off the file-backed
+/// drop directory -- a named constant rather than a bare `false` literal so
+/// a future edit at that call site cannot casually swap it for `req.
+/// interactive` without visibly touching a symbol whose own name states the
+/// invariant.
+const FILE_DROP_TRUSTED_INTERACTIVE: bool = false;
+
 /// Re-validates and fulfils one spawn request: the argv-safety guard, the
 /// requesting repo, the pane cap, the agent gate and adapter resolution
 /// first (a request is data, never authority -- the same checks an
@@ -2316,6 +2343,27 @@ fn worker_pane_extra_args(
 /// the freshly spawned pane's own registry short id; `Err(reason)` is
 /// exactly the text `spawnreq::SpawnAck::reason` carries back to the
 /// requester.
+///
+/// `trusted_interactive` (review round 1, 2026-08-27, Important): whether
+/// THIS SPECIFIC CALL originates from the dashboard's own in-process Spawn
+/// overlay -- a human's keypress in the running dashboard's own event loop,
+/// literally constructing the `SpawnRequest` right there and calling this
+/// function directly -- rather than a request that arrived through the
+/// file-backed drop directory (`spawnreq::take_requests`). `req.interactive`
+/// is data a pane's own `zirv ctx agent` invocation writes as untrusted
+/// JSON, and any process able to reach the requests directory (its path is
+/// only capability-protected, not authenticated) can hand-write a
+/// `req-*.json` claiming `"interactive": true` -- which used to reach
+/// `worker_pane_extra_args`'s (pre-existing) `interactive`-gated posture AND
+/// (issue #147 amendment) the new durable interactive-launch pin below,
+/// letting a forged file grant a freshly spawned pane the fully permissive
+/// posture with nobody actually watching it. `trusted_interactive` is passed
+/// in by the CALLER, never derived from `req` itself: the Spawn-overlay call
+/// site passes `true` (it just built `req` in memory this instant), the
+/// requests-directory poll loop always passes `false` regardless of what
+/// the taken file claims. Scoped to the pin only -- `req.interactive` still
+/// drives `worker_pane_extra_args`'s pre-existing sandbox-posture choice,
+/// unchanged, out of scope for this fix.
 ///
 /// Pushes the new pane (and a matching empty nudge queue, keeping the two
 /// vectors the same length -- see `deliver_queued_nudges`'s own doc comment)
@@ -2663,6 +2711,7 @@ fn worker_task_prompt(
 #[allow(clippy::too_many_arguments)]
 fn fulfill_spawn_request(
     req: &spawnreq::SpawnRequest,
+    trusted_interactive: bool,
     panes: &mut Vec<Pane>,
     nudge_queues: &mut Vec<VecDeque<String>>,
     cfg: &CtxConfig,
@@ -2853,6 +2902,13 @@ fn fulfill_spawn_request(
         spawnreq::DASH_REQUESTS_ENV.to_string(),
         requests_dir.display().to_string(),
     ));
+    // Issue #147 amendment, review round 1 (2026-08-27) correction: routed
+    // through `spawn_launch_mode_pin`, which is `trusted_interactive`-only
+    // and never reads `req.interactive` -- see both that function's and
+    // this one's own doc comments for the full security reasoning.
+    if let Some((key, value)) = spawn_launch_mode_pin(trusted_interactive) {
+        turn_env.push((key, value));
+    }
 
     // T10: the same launch-time pacing gate `wrap::run_with`/this dashboard's
     // own first pane apply, but *non-interactively* here: this spawn happens
@@ -2979,8 +3035,18 @@ fn handle_spawn_requests(
 ) {
     let batch = claim_batch(spawnreq::take_requests(requests_dir));
     for (stem, req) in batch {
+        // `FILE_DROP_TRUSTED_INTERACTIVE` (never a bare `false`, on purpose
+        // -- a named constant is harder to accidentally swap for
+        // `req.interactive` in a future edit than a literal in a long
+        // argument list): every request here came through the file-backed
+        // drop directory (`spawnreq::take_requests`), which is only
+        // capability-protected, not authenticated; see `fulfill_spawn_
+        // request`'s own doc comment. `req.interactive` itself still reaches
+        // this call's other, pre-existing consumers unchanged (`worker_pane_
+        // extra_args`/`compose_worker_prompt`).
         let ack = match fulfill_spawn_request(
             &req,
+            FILE_DROP_TRUSTED_INTERACTIVE,
             panes,
             nudge_queues,
             cfg,
@@ -4426,6 +4492,17 @@ pub fn run_dashboard(
     if let Some(e) = turn_env_err {
         push_error(&mut errors, e);
     }
+    // Issue #147 amendment: the dashboard's own first (orchestrator) pane is
+    // unconditionally the human-attended session the operator is looking
+    // at -- the same fact `dash_orchestrator_pane`'s hardcoded `LaunchMode::
+    // Interactive` already encodes for this pane's own `policy_launch_args`
+    // call -- so the durable interactive-launch pin is always set here,
+    // never conditioned on a request that does not exist for this pane.
+    if let Some((key, value)) =
+        super::adapters::launch_mode_pin_env(super::adapters::LaunchMode::Interactive)
+    {
+        turn_env.push((key, value));
+    }
     // The seat this pane sits in, for the `zirv ctx hook pretool` guard
     // running inside it. This `turn_env` belongs to the first pane and only
     // the first pane -- `fulfill_spawn_request` and the restore path each
@@ -5053,8 +5130,17 @@ pub fn run_dashboard(
                                                     interactive: true,
                                                 };
                                                 let panes_before_spawn = panes.len();
+                                                // `trusted_interactive: true` --
+                                                // this exact call is the
+                                                // dashboard's own live Spawn
+                                                // overlay, a human's keypress in
+                                                // this process's own event loop
+                                                // this instant; see
+                                                // `fulfill_spawn_request`'s own
+                                                // doc comment.
                                                 let fulfilled = fulfill_spawn_request(
                                                     &req,
+                                                    true,
                                                     &mut panes,
                                                     &mut nudge_queues,
                                                     cfg,
@@ -8981,6 +9067,7 @@ mod tests {
         let mut errors = Vec::new();
         fulfill_spawn_request(
             req,
+            false,
             &mut panes,
             &mut queues,
             cfg,
@@ -9581,6 +9668,7 @@ mod tests {
         let mut errors = Vec::new();
         let refusal = fulfill_spawn_request(
             &spawn_request("do the work", &repo),
+            false,
             &mut panes,
             &mut queues,
             &cfg,
@@ -9640,6 +9728,7 @@ mod tests {
         let mut errors = Vec::new();
         let result = fulfill_spawn_request(
             &spawn_request("do the work", &repo),
+            false,
             &mut panes,
             &mut queues,
             &cfg,
@@ -9713,6 +9802,7 @@ mod tests {
         let mut errors = Vec::new();
         let result = fulfill_spawn_request(
             &req,
+            false,
             &mut panes,
             &mut queues,
             &cfg,
@@ -9916,6 +10006,7 @@ mod tests {
         let mut errors = Vec::new();
         let result = fulfill_spawn_request(
             &req,
+            false,
             &mut panes,
             &mut queues,
             &cfg,
@@ -11883,6 +11974,100 @@ mod tests {
             .expect("the refusal is still acked");
         assert!(!ack.ok);
         assert!(panes.is_empty(), "and nothing was spawned");
+    }
+
+    /// SECURITY (review round 1, 2026-08-27, Important): the core
+    /// regression test for the fix. `SpawnRequest.interactive` is untrusted
+    /// JSON -- any process able to reach the requests directory
+    /// (capability-protected by a token in its path, not authenticated) can
+    /// write a `req-*.json` claiming `"interactive": true` regardless of
+    /// whether a human is actually watching any dashboard. `spawn_launch_
+    /// mode_pin` (what `fulfill_spawn_request` actually keys the durable
+    /// interactive-launch pin on) takes `trusted_interactive` as its ONLY
+    /// input, so a forged `req.interactive: true` can never produce the pin
+    /// through `handle_spawn_requests` (the file-drop consumer, which always
+    /// passes `false`) -- only the dashboard's own in-process Spawn overlay,
+    /// which passes `true`, can. Deliberately a pure decision-function test,
+    /// not a real-process env capture: this codebase's own established
+    /// pattern for exactly this class of question (see `worker_pane_extra_
+    /// args_fails_closed_to_headless_for_a_non_interactive_request`,
+    /// `wrap::tests::launch_mode_from_interactive_maps_the_boolean_to_the_
+    /// right_mode`) -- deterministic regardless of host PTY/console
+    /// behavior, unlike reading a real spawned child's own environment back.
+    #[test]
+    fn spawn_launch_mode_pin_ignores_req_interactive_and_only_trusts_the_caller() {
+        assert_eq!(
+            spawn_launch_mode_pin(false),
+            None,
+            "an untrusted spawn -- every file-dropped request, `handle_spawn_requests`'s own \
+             call site -- must never receive the pin, regardless of what a forged \
+             `SpawnRequest.interactive` claims"
+        );
+        assert_eq!(
+            spawn_launch_mode_pin(true),
+            Some((
+                super::super::adapters::LAUNCH_MODE_ENV.to_string(),
+                super::super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE.to_string()
+            )),
+            "only the dashboard's own in-process Spawn overlay, which passes `true`, may pin \
+             Interactive"
+        );
+    }
+
+    /// Companion to the decision-function test above: a forged `req-*.json`
+    /// claiming `"interactive": true` must still be fulfilled as an
+    /// ordinary spawn -- forging the claim is about denying the PIN, not
+    /// about denying the spawn itself (a scripted/headless worker is a
+    /// perfectly legitimate thing for `zirv ctx agent` to request).
+    #[test]
+    fn a_forged_interactive_spawn_request_still_spawns_normally() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+
+        let cfg = CtxConfig {
+            // Same reason as the shim-shape test above: no usage source
+            // means no blind-pace notice muddying this test's own concerns.
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        // The forged request: byte-identical to what any process able to
+        // write into the requests directory could produce -- the point is
+        // that the FILE's own claim is untrusted, not how it got written.
+        let mut req = spawn_request("do the work", &repo);
+        req.interactive = true;
+        let dir = tmp.path().join("requests");
+        spawnreq::write_request(&dir, &req).expect("write forged request");
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+        );
+        assert_eq!(
+            panes.len(),
+            1,
+            "the forged request still spawns a pane -- forging is about the pin, not the spawn \
+             itself: {errors:?}"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
     }
 
     // R7: restoring is creating panes, so it answers to the same cap.
