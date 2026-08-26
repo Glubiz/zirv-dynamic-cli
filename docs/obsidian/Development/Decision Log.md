@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-25
+last-verified: 2026-08-26
 ---
 
 # Decision Log

@@ -1269,7 +1269,7 @@ fn restart_launch_flags(adapter: &dyn AgentAdapter, launch_command: &[String]) -
     } else {
         adapter.launch_prefix_len()
     };
-    super::exec::extra_launch_flags(launch_command, prefix, None)
+    super::exec::extra_launch_flags(launch_command, prefix, None, adapter.name())
 }
 
 /// Item 5 (regression fix): the pty size a restart's fresh session opens at
@@ -7504,6 +7504,33 @@ mod tests {
             assert_eq!(
                 flags_for(&["claude", "fix the parser", "--model", "opus"]),
                 vec!["--model".to_string(), "opus".to_string()]
+            );
+        }
+
+        /// Issue #143: `restart_launch_flags` delegates to `exec::
+        /// extra_launch_flags`, which used to strip a bare `-c` as claude's
+        /// own valueless resume flag regardless of adapter -- codex's own
+        /// `-c, --config <key>=<value>` shares that spelling for an unrelated,
+        /// value-carrying flag. A codex `wrap` restart must keep the pair
+        /// intact rather than dropping `-c` and leaving its value (e.g. the
+        /// shipped-default `approval_policy=never` sandbox posture) orphaned
+        /// on argv, which real codex-cli then rejects outright.
+        #[test]
+        fn a_codex_relaunch_keeps_its_own_c_flag_paired_with_its_value() {
+            let command: Vec<String> = ["codex", "-c", "approval_policy=never", "--model", "gpt"]
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect();
+            let adapter = adapters::select(Some("codex"), &command, &CtxConfig::default())
+                .expect("codex adapter");
+            assert_eq!(
+                restart_launch_flags(adapter.as_ref(), &command),
+                vec![
+                    "-c".to_string(),
+                    "approval_policy=never".to_string(),
+                    "--model".to_string(),
+                    "gpt".to_string(),
+                ]
             );
         }
     }

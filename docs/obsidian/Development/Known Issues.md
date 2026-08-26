@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-25
+last-verified: 2026-08-26
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-26 (fix/143-144-agent-spawn, issues #143/#144, v2.29.2): resolved two bugs behind "codex delegation exits 2" and "dashboard did not answer" -- claude-only resume-flag stripping used to run for every adapter, mangling codex's own -c/--config value on every restart, and try_join_dashboard only checked dir.is_dir(), so a crashed dashboard's leftover directory burned the full ack timeout; recorded a residual, "A sandboxed caller that cannot write into a live dashboard's requests directory looks the same as a dead one," below -->
 <!-- Updated 2026-08-25 (feat/132-codex-permission-audit, issue #132, v2.29.0): recorded that zirv ctx permissions audit reports and recommends but does not yet write an approval into [safety]/[policy] on the operator's behalf -->
 <!-- Updated 2026-08-25 (fix/121-123-setup-optimize, issue #123, v2.28.0): recorded that a workspace-sandboxed parent can block a nested Claude/Codex judgment child from its home state; run_model now exposes bounded sanitized stderr so the cause is visible, but the parent boundary still requires running the same report-only command outside that sandbox when judgment is desired -->
 
@@ -203,6 +204,10 @@ This does not affect the production scenario `signal::probe` exists for: a genui
 `sessions::SessionGuard::register` stamps `owner_pid` with the *registering process's own* pid (`std::process::id()`), which is exactly right for a dashboard pane (registered by the dashboard process itself) but cannot express "owned by dashboard X" from a process that isn't the dashboard at all. `zirv ctx agent <name> <prompt>` run as a **child of a pane's own child** (e.g. a claude session inside a pane spawning `zirv ctx agent` as a subprocess) first tries `agent::try_join_dashboard`; when that request comes back with a `retryable: true` refusal (a channel-level failure, not a policy one — see [[Ctx Subsystem]]), it falls back to plain headless `exec::run_with`, running **inside that spawned `zirv ctx agent` process**, not the dashboard's. `SessionGuard::register` then correctly stamps that process's own pid — which is not the dashboard's — so the resulting session never appears in the spawning dashboard's sidebar, even though it started inside one of that dashboard's own panes. The session is not lost: it still reports its outcome back by mail (`prompt::with_report_back_layer`) and is listed by `zirv ctx status`, just not in any dashboard's panel.
 
 Recorded, not fixed: closing this needs process-independent ownership — e.g. stamping the *dashboard's own registry short id* rather than a pid, threaded down through the spawn-request/fallback path — which is a deliberate non-goal of the round that added `owner_pid` scoping (see [[Decision Log]], [[Ctx Supervisors]] "View-only rows are scoped...").
+
+## A sandboxed caller that cannot write into a live dashboard's requests directory looks the same as a dead one
+
+`agent::try_join_dashboard` (issue #144, 2026-08-26) now refuses a dead dashboard's leftover requests directory immediately via `sessions::dashboard_owner_is_live`, closing the "burn the whole ack timeout" symptom for a *crashed* dashboard. It does not close the sibling case: a directory whose owner genuinely is alive, but that this calling process itself cannot write into — observed for a `zirv ctx agent` invocation run inside a Claude Code session whose own sandbox denies writes to the dashboard's state directory (e.g. `~/Library/Application Support/zirv/ctx` on macOS). `spawnreq::write_request`'s `Err` arm now names the write error and the target path (`"could not write a spawn request into {dir}: {e}"`) rather than repeating the ack-timeout wording verbatim — an improvement in diagnosability made specifically because this case was reported as indistinguishable from "dashboard did not answer" (see issue #144's own comments) — but the caller still falls back to plain headless with no other signal, and nothing in this codebase can make a sandbox grant a write it has already denied. Recorded, not fixed: a request-write failure is a distinct failure mode from "nobody is listening," diagnosable now from stderr, but the underlying constraint (a sandboxed caller can never join *any* dashboard) is an environment boundary, not a bug to close here.
 
 ## The dashboard's quit/restore roster now checks liveness, but three residuals remain
 
