@@ -926,6 +926,50 @@ mod tests {
         );
     }
 
+    /// Issue #155, Phase 1(b): this repository's own canonical context must
+    /// fit the budget zirv ships. Pinned as a test rather than fixed once,
+    /// because the file grows with every session that edits it and a silent
+    /// re-truncation is exactly the failure Task 1.1 exists to surface.
+    /// `CARGO_MANIFEST_DIR` is the real repo, the same seam
+    /// `config.rs::the_repo_ctx_toml_parses_and_stays_exhaustive` uses.
+    #[test]
+    fn this_repositorys_canonical_common_context_fits_the_shipped_budget() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = crate::commands::ctx::context::common_path(repo);
+        let text = std::fs::read_to_string(&path).expect("read .zirv/context/common.md");
+        let cap = CtxConfig::default().context.max_common_bytes;
+        assert!(
+            text.len() <= cap,
+            "{} is {} bytes, over the shipped {cap}-byte context.max_common_bytes budget; \
+             tighten it rather than raising the cap",
+            path.display(),
+            text.len()
+        );
+    }
+
+    /// The harness-specific halves are inside their own independent budget
+    /// too -- they are truncated separately, so a passing common.md says
+    /// nothing about them.
+    #[test]
+    fn this_repositorys_canonical_harness_context_files_fit_the_shipped_budget() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cap = CtxConfig::default().context.max_harness_bytes;
+        for path in [
+            crate::commands::ctx::context::claude_path(repo),
+            crate::commands::ctx::context::codex_path(repo),
+        ] {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            assert!(
+                text.len() <= cap,
+                "{} is {} bytes, over the shipped {cap}-byte context.max_harness_bytes budget",
+                path.display(),
+                text.len()
+            );
+        }
+    }
+
     /// Issue #155, Phase 1(a): the single most expensive failure mode of a
     /// byte budget is one nobody is told about. A cut canonical layer must
     /// produce BOTH a decision-log entry naming the file and the exact lost
