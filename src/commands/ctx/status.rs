@@ -54,8 +54,20 @@ fn policy_snapshot_is_stale(record: &sessions::Record, env: EnvLookup<'_>) -> bo
 /// no matching registry record -- an older zirv binary that predates the
 /// registry still wrote sockets, and a mixed-version machine must not make
 /// those supervisors disappear from `status` entirely, just less detailed.
-fn sessions_lines(state: &StateDir, now: u64, env: EnvLookup<'_>) -> Vec<String> {
-    let mut records = sessions::list(state);
+///
+/// Takes an already-fetched `sessions::list` result rather than calling
+/// `list` itself: `list` sweeps a stale record's file from disk as a side
+/// effect of being called at all, so a caller that needs the registry for
+/// more than one purpose this pass (the heavy-worker count in `run_with`,
+/// below) must fetch it exactly once and share the result, or a second call
+/// would find that record's file already gone.
+fn sessions_lines(
+    records: &[(sessions::Record, Liveness)],
+    state: &StateDir,
+    now: u64,
+    env: EnvLookup<'_>,
+) -> Vec<String> {
+    let mut records = records.to_vec();
     records.sort_by(|a, b| a.0.short.cmp(&b.0.short));
 
     let known: std::collections::BTreeSet<String> = records
@@ -288,8 +300,39 @@ pub fn run_with<W: Write>(
         Err(_) => writeln!(w, "mail: (unreadable)")?,
     }
 
+    // Fetched exactly once and shared below: `sessions::list` sweeps a
+    // stale record's file from disk as a side effect of being called at all
+    // (see its own doc comment), so calling it twice in this same pass --
+    // once for the heavy-worker count, once for `sessions_lines` -- would
+    // have the second call find the first call's swept record already gone,
+    // silently dropping it from the `sessions:` listing below.
+    let session_records = sessions::list(&state);
+
+    // Issue #133: the machine-wide heavy-worker budget's current occupancy.
+    // Sourced from the same `Verb::Exec | Verb::Dash` enumeration the
+    // `exec.rs`/`dash::fulfill_spawn_request` gates use
+    // (`sessions::count_heavy_workers_among`, over the shared `list` result
+    // above), so this line and what those gates would actually refuse never
+    // disagree. Degrades silently (omits the line entirely) on a config load
+    // error -- `cfg_result` may already be an `Err` reported above (a
+    // `REPO_FORBIDDEN` rejection or any other load failure), and this is not
+    // a second place to repeat that failure.
+    if let Ok(cfg) = &cfg_result {
+        let live_heavy = sessions::count_heavy_workers_among(&session_records);
+        writeln!(
+            w,
+            "heavy workers: {live_heavy} of {} slots in use",
+            cfg.supervise.max_heavy_workers
+        )?;
+    }
+
     writeln!(w, "\nsessions:")?;
-    let session_lines = sessions_lines(&state, crate::commands::ctx::state::now_secs(), env);
+    let session_lines = sessions_lines(
+        &session_records,
+        &state,
+        crate::commands::ctx::state::now_secs(),
+        env,
+    );
     if session_lines.is_empty() {
         writeln!(w, "  no supervised sessions")?;
     } else {
@@ -943,6 +986,81 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
 
         assert!(text.contains("mail: 2 unread"), "got {text}");
+    }
+
+    /// Issue #133: `heavy workers: N of M slots in use` counts the same
+    /// `Verb::Exec | Verb::Dash` enumeration the `exec.rs`/`dash` gates use
+    /// (`sessions::count_heavy_workers`) against the resolved
+    /// `supervise.max_heavy_workers`.
+    #[test]
+    fn status_reports_the_heavy_worker_budget_occupancy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let mut env = env_for(state.root());
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS".to_string(),
+            "3".to_string(),
+        );
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let occupant = sessions::SessionGuard::register(
+            &state,
+            sessions::Record::new(
+                "66666666-2222-4333-8444-555555555555",
+                "claude",
+                tmp.path(),
+                sessions::Verb::Exec,
+            ),
+        );
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            text.contains("heavy workers: 1 of 3 slots in use"),
+            "got {text}"
+        );
+
+        drop(occupant);
+    }
+
+    /// A `REPO_FORBIDDEN` config rejection must not add a second failure
+    /// mode on top of the `CONFIG REJECTED` line already reported above --
+    /// the heavy-worker line is simply omitted, degrading silently the same
+    /// way `describe_injection_fallback` already does for an `Err` config.
+    #[test]
+    fn status_omits_the_heavy_worker_line_when_config_fails_to_load() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[supervise]\nmax_heavy_workers = 99\n",
+        )
+        .expect("write");
+
+        let mut out = Vec::new();
+        run_with(&StatusArgs { decisions: 5 }, &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            !text.contains("heavy workers:"),
+            "must degrade silently on a config load error: {text}"
+        );
     }
 
     /// Item 3 (read-once contract): a message directed at a different

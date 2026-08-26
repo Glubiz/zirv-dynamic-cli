@@ -619,6 +619,62 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
     found
 }
 
+/// Issue #133: machine-wide count of live "heavy" workers -- unattended
+/// supervised sessions that can run real build/test-class load with nobody
+/// watching -- for `SuperviseConfig::max_heavy_workers`'s gate.
+///
+/// `Verb::Exec` and `Verb::Dash` count: a bare `zirv ctx exec` registers
+/// `Exec` (`exec.rs`), and so does `zirv agent`'s headless fallback, which
+/// delegates straight into `exec::run_with` rather than registering its own
+/// verb (see `agent.rs`'s own doc comment); a dashboard-spawned worker pane
+/// registers `Dash` (`dash/pane.rs`'s `Record::new` call, distinct from the
+/// dashboard's own orchestrator pane which registers `Chat`). Both are
+/// launched and then left to run unattended -- exactly the class of process
+/// that drove the host to four kernel bugchecks in 12 minutes running two
+/// concurrent cold-build-plus-full-test-suite workloads (issue #133's own
+/// evidence).
+///
+/// `Verb::Wrap` and `Verb::Chat` never count: both are interactive sessions
+/// with an operator at the keyboard driving the pace, not something that can
+/// silently pile up unattended.
+///
+/// `Verb::Loop` is deliberately excluded too -- out of scope for this pass
+/// (see the Decision Log entry on refuse-not-queue): #133's own gate points
+/// are `exec.rs`'s registration call and `dash::fulfill_spawn_request` only;
+/// extending the budget to cover `zirv ctx loop` would need its own gate at
+/// `run_loop.rs`'s registration site, which this change does not add.
+///
+/// Only `Liveness::Live` records count -- `list` already sweeps a dead-pid
+/// record from disk as a side effect before this filters its result, so the
+/// session being registered by the caller of a gate (which has not yet
+/// written its own record) is correctly never included either.
+///
+/// Calls `list` itself, so this is for a caller that has not already fetched
+/// the registry this same pass -- exactly one call per gate check (`exec.rs`,
+/// `dash::fulfill_spawn_request`). A caller that already has a `list` result
+/// in hand (`status.rs`, which also renders every record as a line) must use
+/// [`count_heavy_workers_among`] on that same result instead: `list` sweeps a
+/// stale record's file from disk as a side effect of being called at all
+/// (see its own doc comment), so a second, independent `list` call in the
+/// same request would find that record's file already gone and silently drop
+/// it from whatever the second call renders.
+pub fn count_heavy_workers(state: &StateDir) -> usize {
+    count_heavy_workers_among(&list(state))
+}
+
+/// The pure filter behind [`count_heavy_workers`], over an already-fetched
+/// `list` result -- see that function's own doc comment for why a caller
+/// that already called `list` this pass must use this instead of calling
+/// `count_heavy_workers` (which would call `list` a second time).
+pub fn count_heavy_workers_among(records: &[(Record, Liveness)]) -> usize {
+    records
+        .iter()
+        .filter(|(record, liveness)| {
+            *liveness == Liveness::Live && matches!(record.verb, Verb::Exec | Verb::Dash)
+        })
+        .count()
+}
+
 /// C9 (issue #99, 2026-08-23): an orphaned turn-signal endpoint -- a
 /// `*.sock` file in `state.sockets()` with no matching live session record.
 /// `SignalServer::bind` writes one for every supervised session (a real Unix
@@ -1390,6 +1446,67 @@ mod tests {
             ],
             "records come back ordered by started_at, deterministically"
         );
+    }
+
+    /// Issue #133: `count_heavy_workers` counts live `Exec`/`Dash` records
+    /// only -- `Wrap`, `Chat` (both operator-attended) and `Loop`
+    /// (deliberately out of scope, see the function's own doc comment) must
+    /// never inflate the count.
+    #[test]
+    fn count_heavy_workers_counts_only_exec_and_dash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+
+        for (session, verb) in [
+            ("11111111-2222-4333-8444-555555555555", Verb::Exec),
+            ("22222222-2222-4333-8444-555555555555", Verb::Dash),
+            ("33333333-2222-4333-8444-555555555555", Verb::Wrap),
+            ("44444444-2222-4333-8444-555555555555", Verb::Chat),
+            ("55555555-2222-4333-8444-555555555555", Verb::Loop),
+        ] {
+            let record = record_for(session, &repo, verb);
+            write_record(&state, &record);
+        }
+
+        assert_eq!(
+            count_heavy_workers(&state),
+            2,
+            "only the Exec and Dash records should count as heavy workers"
+        );
+    }
+
+    /// A record whose pid is already dead is swept by `list` and must not
+    /// count -- the same liveness discipline every other `list` consumer
+    /// gets.
+    #[test]
+    fn count_heavy_workers_ignores_dead_pid_records() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+
+        let mut alive = record_for("aaaaaaaa-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        alive.pid = std::process::id();
+        write_record(&state, &alive);
+
+        let mut dead = record_for("bbbbbbbb-2222-4333-8444-555555555555", &repo, Verb::Dash);
+        dead.pid = dead_pid();
+        write_record(&state, &dead);
+
+        assert_eq!(
+            count_heavy_workers(&state),
+            1,
+            "the dead-pid Dash record must be swept, not counted"
+        );
+    }
+
+    /// Nothing registered yet, or an absent `sessions/` directory: the count
+    /// must be zero, not an error.
+    #[test]
+    fn count_heavy_workers_is_zero_with_no_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        assert_eq!(count_heavy_workers(&state), 0);
     }
 
     #[test]

@@ -826,6 +826,28 @@ pub(crate) fn run_with_clock<W: Write>(
     // deterministic from the same `cfg.safety` this launch's own settings
     // file was built from, so `status.rs` can later detect a widened policy
     // this session's own launch snapshot has not adopted yet.
+    // Issue #133: refuse-not-queue. Checked immediately before registration
+    // so the session about to be created is never counted against its own
+    // limit (`count_heavy_workers` only sees records already on disk), and
+    // covers both a bare `zirv ctx exec` and `zirv ctx agent`'s headless
+    // fallback, which delegates straight into this function
+    // (`agent.rs::run_with`). See `SuperviseConfig::max_heavy_workers`'s own
+    // doc comment for why refuse rather than queue: a BSOD-triggering
+    // incident (four kernel bugchecks in 12 minutes) was two concurrent
+    // unbounded build/test workloads under zirv supervision with no
+    // governance at all.
+    let live_heavy = super::sessions::count_heavy_workers(&state);
+    if live_heavy >= cfg.supervise.max_heavy_workers {
+        return Err(format!(
+            "zirv ctx exec: refusing to start a new heavy worker -- {live_heavy} of \
+             {} slots already in use (supervise.max_heavy_workers). Wait for a running \
+             session to finish, or raise the limit in ~/.zirv/ctx.toml \
+             (ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS). See `zirv ctx status` for the list \
+             of running sessions.",
+            cfg.supervise.max_heavy_workers
+        )
+        .into());
+    }
     let safety_policy_sha256 = super::safety::policy_fingerprint(&cfg.safety).ok();
     let mut session_guard = super::sessions::SessionGuard::register(
         &state,
@@ -2132,6 +2154,116 @@ mod tests {
             "exec ran the child rather than refusing: {}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    /// Issue #133: a live `Exec` record already occupying the only heavy-
+    /// worker slot must make a second `zirv ctx exec` refuse outright
+    /// (refuse-not-queue), before it ever registers its own record or spawns
+    /// anything.
+    #[test]
+    fn exec_refuses_a_new_heavy_worker_at_the_machine_wide_limit() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_path = tmp.path().join("state");
+        let state = StateDir::from_root(state_path.clone());
+
+        // Occupies the only slot; kept alive (not dropped) for the whole
+        // test so its record stays on disk through the `run_with` call.
+        let occupant = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "99999999-2222-4333-8444-555555555555",
+                "claude",
+                tmp.path(),
+                crate::commands::ctx::sessions::Verb::Exec,
+            ),
+        );
+
+        let mut env = base_env(&state_path);
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS".to_string(),
+            "1".to_string(),
+        );
+
+        let command: Vec<String> = if cfg!(windows) {
+            ["cmd", "/c", "exit", "0"]
+        } else {
+            ["sh", "-c", "exit 0", "--"]
+        }
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let args = ExecArgs {
+            agent: None,
+            session_id: None,
+            transcript: None,
+            prompt: None,
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: true,
+            command,
+        };
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("a full heavy-worker budget must refuse the launch outright");
+        assert!(err.to_string().contains("max_heavy_workers"), "got {err}");
+
+        drop(occupant);
+    }
+
+    /// The same gate must let a launch through when the budget is not yet
+    /// exhausted -- one live occupant, a limit of two.
+    #[test]
+    fn exec_allows_a_heavy_worker_under_the_machine_wide_limit() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_path = tmp.path().join("state");
+        let state = StateDir::from_root(state_path.clone());
+
+        let occupant = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "88888888-2222-4333-8444-555555555555",
+                "claude",
+                tmp.path(),
+                crate::commands::ctx::sessions::Verb::Exec,
+            ),
+        );
+
+        let mut env = base_env(&state_path);
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS".to_string(),
+            "2".to_string(),
+        );
+
+        let command: Vec<String> = if cfg!(windows) {
+            ["cmd", "/c", "exit", "0"]
+        } else {
+            ["sh", "-c", "exit 0", "--"]
+        }
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let args = ExecArgs {
+            agent: None,
+            session_id: None,
+            transcript: None,
+            prompt: None,
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: true,
+            command,
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("one occupant under a limit of two must not be refused");
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+
+        drop(occupant);
     }
 
     #[test]
