@@ -2944,6 +2944,23 @@ fn clamp_cursor(cursor: usize, len: usize) -> usize {
     if len == 0 { 0 } else { cursor.min(len - 1) }
 }
 
+/// Inserts a newline for every compose-style overlay. These reducers keep
+/// the insertion point at the end of the draft, so an unmodified Enter can
+/// follow Claude Code's portable convention by replacing the trailing
+/// backslash immediately before that point.
+fn insert_compose_newline(input: &mut String, modifiers: KeyModifiers) -> bool {
+    if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+        input.push('\n');
+        return true;
+    }
+    if !input.ends_with('\\') {
+        return false;
+    }
+    input.pop();
+    input.push('\n');
+    true
+}
+
 /// Pure: one keystroke against the mail overlay's current state. Returns the
 /// overlay's next state (`None` closes it -- Esc while browsing) alongside
 /// any effect the caller must execute against real storage. Esc while
@@ -2958,12 +2975,7 @@ pub fn mail_overlay_reduce(
                 view.compose = None;
                 (Some(view), None)
             }
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-            {
-                draft.body.push('\n');
+            KeyCode::Enter if insert_compose_newline(&mut draft.body, key.modifiers) => {
                 (Some(view), None)
             }
             KeyCode::Enter => {
@@ -3062,12 +3074,7 @@ pub fn spawn_overlay_reduce(
 ) -> (Option<ui::SpawnDraft>, Option<SpawnEffect>) {
     match key.code {
         KeyCode::Esc => (None, None),
-        KeyCode::Enter
-            if key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
-            draft.input.push('\n');
+        KeyCode::Enter if insert_compose_newline(&mut draft.input, key.modifiers) => {
             (Some(draft), None)
         }
         KeyCode::Enter => {
@@ -3119,14 +3126,7 @@ pub fn memory_overlay_reduce(
                 view.input = None;
                 (Some(view), None)
             }
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-            {
-                input.push('\n');
-                (Some(view), None)
-            }
+            KeyCode::Enter if insert_compose_newline(input, key.modifiers) => (Some(view), None),
             KeyCode::Enter => {
                 if input.trim().is_empty() {
                     return (Some(view), None);
@@ -4148,12 +4148,7 @@ pub(crate) fn nudge_overlay_reduce(
 ) -> (Option<ui::NudgeDraft>, Option<NudgeSubmit>) {
     match key.code {
         KeyCode::Esc => (None, None),
-        KeyCode::Enter
-            if key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
-            draft.input.push('\n');
+        KeyCode::Enter if insert_compose_newline(&mut draft.input, key.modifiers) => {
             (Some(draft), None)
         }
         KeyCode::Enter => {
@@ -7559,6 +7554,21 @@ mod tests {
     }
 
     #[test]
+    fn mail_overlay_backslash_enter_replaces_the_backslash_with_a_newline() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "line one\\".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.compose.expect("still composing").body, "line one\n");
+        assert!(effect.is_none(), "backslash+enter must not submit");
+    }
+
+    #[test]
     fn mail_overlay_enter_on_an_item_emits_consume_and_removes_it_from_the_list() {
         let view = ui::MailView {
             items: vec![(PathBuf::from("/a"), "claude".to_string(), "one".to_string())],
@@ -7671,6 +7681,16 @@ mod tests {
         let next = next.expect("stays open");
         assert_eq!(next.input, Some("new body\n".to_string()));
         assert!(effect.is_none(), "alt+enter must not submit");
+    }
+
+    #[test]
+    fn memory_overlay_backslash_enter_replaces_the_backslash_with_a_newline() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("new body\\".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, Some("new body\n".to_string()));
+        assert!(effect.is_none(), "backslash+enter must not submit");
     }
 
     #[test]
@@ -9811,6 +9831,15 @@ mod tests {
     }
 
     #[test]
+    fn spawn_dialog_backslash_enter_replaces_the_backslash_with_a_newline() {
+        let draft = type_line("claude line one\\");
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "claude line one\n");
+        assert!(effect.is_none(), "backslash+enter must not submit");
+    }
+
+    #[test]
     fn spawn_dialog_needs_both_an_agent_and_a_prompt() {
         for line in ["", "   ", "claude", "claude   "] {
             let draft = type_line(line);
@@ -9944,6 +9973,18 @@ mod tests {
         let next = next.expect("stays open");
         assert_eq!(next.input, "line one\n");
         assert!(submit.is_none(), "alt+enter must not submit");
+    }
+
+    #[test]
+    fn nudge_overlay_backslash_enter_replaces_the_backslash_with_a_newline() {
+        let draft = nudge_draft(
+            ui::NudgeTarget::AttachedPane("aaaa1111".to_string()),
+            "line one\\",
+        );
+        let (next, submit) = nudge_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "line one\n");
+        assert!(submit.is_none(), "backslash+enter must not submit");
     }
 
     // Task 12: the startup restore dialog's pure reducer, `build_restore_view`,
