@@ -110,9 +110,12 @@ pub struct TelemetryEvent {
     pub fix_round: u8,
     pub artifact_count: u32,
     pub worker_count: u32,
-    /// Issue #155: the raw classes behind `input_tokens`. `input_tokens`
-    /// keeps its existing meaning (uncached input) and these two carry what
-    /// the adapter used to fold into it.
+    /// Issue #155: the raw cache classes alongside `input_tokens`.
+    /// `input_tokens` keeps its pre-2.32.0 meaning for events produced by the
+    /// workflow engine: the COMBINED context total (raw input plus both cache
+    /// classes -- see `engine.rs`'s `usage.context_total()`), not the raw
+    /// uncached class alone. These two fields are the ground truth for any
+    /// cache-hit-ratio math; do not assume `input_tokens` excludes them.
     #[serde(default)]
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
