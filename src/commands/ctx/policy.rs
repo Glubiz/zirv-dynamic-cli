@@ -196,10 +196,25 @@ impl Stance {
 /// what it was. An operator opts in by naming the stances they want; the
 /// report then says, per harness, which of them are real.
 ///
+/// **`network` is the one deliberate exception (2026-08-26, codex approval-
+/// posture round -- see [`Default`]'s own impl below).** Every other
+/// capability's `Allow` default means "zirv adds no argv, the harness's own
+/// native default governs" -- and every harness's own native default for the
+/// other six capabilities happens to already be permissive, so that reads as
+/// "no restriction". Network is different: codex's own native default under
+/// `--sandbox workspace-write` is *already closed* (verified: a real launch
+/// carries `network_access: false` with no zirv-added flag at all), so an
+/// `Allow` default here would not "add no restriction" -- it would flip
+/// `CodexAdapter::policy_args` into actively *widening* codex's own native
+/// default the moment that mapping was wired up, on every unconfigured
+/// install. `network` therefore defaults to [`Stance::Deny`], the only
+/// choice that keeps an unconfigured install's `[policy]` byte-for-byte
+/// consistent with what it has always actually done.
+///
 /// `deny_unknown_fields`: a typo'd capability name hard-errors rather than
 /// silently leaving that capability at `Allow`, which is the failure mode a
 /// permissions surface can least afford.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectivePolicy {
     pub repo_fs_write: Stance,
@@ -209,6 +224,34 @@ pub struct EffectivePolicy {
     pub approval: Stance,
     pub git_push_destructive: Stance,
     pub tool_access: Stance,
+}
+
+/// Hand-written, not derived, for exactly one reason: `network` defaults to
+/// [`Stance::Deny`] rather than [`Stance::default()`] -- see the struct's own
+/// doc comment for why. Every other field keeps the ordinary
+/// `Stance::default()` (`Allow`).
+///
+/// This value is deliberately consistent with, but not itself the mechanism
+/// for, `resolve`'s own "nothing configured anywhere" answer for `network`
+/// (`resolve_network`'s `(None, None) => Deny` arm) -- the two are kept in
+/// sync by inspection, not by one calling the other, because `resolve`'s own
+/// fold does NOT read this `Default` impl for `network` at all (2026-08-26,
+/// correction round): see `resolve_network`'s own doc comment for why the
+/// ordinary `narrowed_by`/`Stance::default()` machinery every other
+/// capability uses is the wrong mechanism for this one field, and what
+/// replaces it.
+impl Default for EffectivePolicy {
+    fn default() -> Self {
+        EffectivePolicy {
+            repo_fs_write: Stance::default(),
+            outside_repo_fs_write: Stance::default(),
+            shell_exec: Stance::default(),
+            network: Stance::Deny,
+            approval: Stance::default(),
+            git_push_destructive: Stance::default(),
+            tool_access: Stance::default(),
+        }
+    }
 }
 
 impl EffectivePolicy {
@@ -321,13 +364,31 @@ impl EffectivePolicy {
 /// hard error rather than a silent fall back to `Allow`: quietly widening a
 /// permissions surface because a value was misspelled is the one outcome this
 /// module exists to prevent.
+///
+/// **`network` is folded separately (2026-08-26, correction round), never
+/// through `narrowed_by`'s ordinary `max`.** The six other capabilities all
+/// share one property `narrowed_by`'s safety proof depends on: `Stance::
+/// default()` (`Allow`) is both a layer's "I said nothing" value AND the
+/// loosest value the type can express, so a layer's silence is provably a
+/// no-op against the fold (`max(x, Allow) == x` always). `network`'s default
+/// answer is `Deny`, not `Allow` -- the loosest value in the type -- so
+/// reusing the same trick (an unmentioned key silently deserializing to
+/// `Stance::Deny` via `EffectivePolicy`'s own `Default`) breaks that proof:
+/// a repo layer that mentions nothing would contribute `Deny` for network
+/// exactly as if it had explicitly denied it, defeating an operator's own
+/// home-level `network = "allow"` even when the repo took no position at
+/// all. `resolve_network` below is the fix -- see its own doc comment.
 pub fn resolve(
     home: Option<toml::Value>,
     repo: Option<toml::Value>,
     env: EnvLookup<'_>,
 ) -> CtxResult<EffectivePolicy> {
+    let home_network = parse_network_layer(&home, "~/.zirv/ctx.toml")?;
+    let repo_network = parse_network_layer(&repo, "<repo>/.zirv/ctx.toml")?;
+
     let mut resolved = parse_layer(home, "~/.zirv/ctx.toml")?
         .narrowed_by(parse_layer(repo, "<repo>/.zirv/ctx.toml")?);
+    resolved.network = resolve_network(home_network, repo_network);
 
     for capability in Capability::ALL {
         let Some(raw) = env(capability.env_var()) else {
@@ -353,6 +414,69 @@ fn parse_layer(layer: Option<toml::Value>, origin: &str) -> CtxResult<EffectiveP
     layer
         .try_into()
         .map_err(|e| format!("{origin}: invalid [policy] section: {e}").into())
+}
+
+/// One `[policy]` layer's raw, unresolved opinion on `network` alone --
+/// `None` when the layer's table (or the whole layer) never mentions the key
+/// at all, distinct from an explicit `network = "allow"`/`"deny"`/`"ask"`.
+/// `EffectivePolicy`/`Stance` cannot carry this distinction (a bare `Stance`
+/// field always deserializes to *some* concrete value, `Stance::default()`
+/// when the key is absent -- see `resolve`'s own doc comment for why that
+/// collapse is exactly the bug this exists to avoid for `network`), so this
+/// is a second, narrow, `Option`-shaped deserialization of the SAME raw TOML
+/// value `parse_layer` already validates -- deliberately not the primary
+/// error path: a malformed layer already fails loudly through `parse_layer`
+/// (called right after this, in `resolve`, with the identical `origin`), so
+/// a parse failure here is either that same error about to be raised again
+/// or genuinely unreachable, never a chance to report something new.
+fn parse_network_layer(layer: &Option<toml::Value>, origin: &str) -> CtxResult<Option<Stance>> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct NetworkOnly {
+        network: Option<Stance>,
+    }
+    let Some(layer) = layer else {
+        return Ok(None);
+    };
+    let parsed: NetworkOnly = layer
+        .clone()
+        .try_into()
+        .map_err(|e| format!("{origin}: invalid [policy] section: {e}"))?;
+    Ok(parsed.network)
+}
+
+/// `network`'s own home/repo combination (2026-08-26, correction round),
+/// replacing the ordinary `narrowed_by` fold for this one field -- see
+/// `resolve`'s own doc comment for why the shared `max`-based mechanism is
+/// unsound here.
+///
+/// The contract: effective `network` is `Allow` only when the OPERATOR
+/// (home, or the `ZIRV_CTX_POLICY_NETWORK` env override applied afterward in
+/// `resolve`) has explicitly said so, AND no layer has explicitly said
+/// `deny`. Concretely:
+/// - Both layers silent -> `Deny`: the safe default, applied HERE rather
+///   than baked into a layer's own parsed value, so "silent" and "explicitly
+///   denied" never collapse into the same input the way they would if this
+///   reused `EffectivePolicy`'s `Default`.
+/// - Repo explicitly `deny` -> `Deny`, regardless of what home said: the one
+///   thing a repo layer may always do is narrow.
+/// - Repo silent or repo explicitly `allow`, home explicitly `allow` ->
+///   `Allow`: home's own explicit choice survives repo's silence (the actual
+///   correction this round makes -- home no longer needs the repo's
+///   cooperation to be heard), and repo's own `allow` is a no-op agreement,
+///   never a grant of its own.
+/// - Repo silent or repo explicitly `allow`, home silent or home explicitly
+///   `deny`/`ask` -> home's own value if it named one (`ask`/`deny`,
+///   preserved for an honest report), else `Deny`: a repo can never grant
+///   network on its own, silent or not.
+fn resolve_network(home: Option<Stance>, repo: Option<Stance>) -> Stance {
+    if repo == Some(Stance::Deny) {
+        return Stance::Deny;
+    }
+    match home {
+        Some(stance) => stance,
+        None => Stance::Deny,
+    }
 }
 
 /// What zirv can honestly promise for one capability on one harness. There is
@@ -625,9 +749,10 @@ mod tests {
     }
 
     /// SECURITY: the baseline is a REPORTED fact, never a fold input.
-    /// `EffectivePolicy::default()` must stay all-`Allow` -- it is what
-    /// `narrowed_by`'s widening defense and `resolve`'s fold rest on, and
-    /// what makes `ZIRV_CTX_POLICY_*` able to loosen at all.
+    /// `EffectivePolicy::default()` must stay all-`Allow` except `network`
+    /// (its own documented exception, `EffectivePolicy`'s `Default` impl) --
+    /// the rest is what `narrowed_by`'s widening defense and `resolve`'s fold
+    /// rest on, and what makes `ZIRV_CTX_POLICY_*` able to loosen at all.
     #[test]
     fn the_interactive_baseline_does_not_touch_the_default_or_the_fold() {
         assert_ne!(
@@ -635,11 +760,17 @@ mod tests {
             EffectivePolicy::default()
         );
         for capability in Capability::ALL {
+            let expected = if capability == Capability::Network {
+                Stance::Deny
+            } else {
+                Stance::Allow
+            };
             assert_eq!(
                 EffectivePolicy::default().stance(capability),
-                Stance::Allow,
-                "{} must still default to allow",
-                capability.key()
+                expected,
+                "{} must still default to {}",
+                capability.key(),
+                expected.label()
             );
         }
     }
@@ -773,10 +904,16 @@ mod tests {
         assert_ne!(closed, EffectivePolicy::default());
     }
 
+    /// `network` is the one deliberate exception (see `EffectivePolicy`'s own
+    /// `Default` impl): every other capability's default is `Allow`, "zirv
+    /// declares no restriction of its own".
     #[test]
-    fn a_default_policy_declares_no_restriction_at_all() {
+    fn a_default_policy_declares_no_restriction_at_all_except_network() {
         let policy = EffectivePolicy::default();
         for capability in Capability::ALL {
+            if capability == Capability::Network {
+                continue;
+            }
             assert_eq!(
                 policy.stance(capability),
                 Stance::Allow,
@@ -784,11 +921,19 @@ mod tests {
                 capability.key()
             );
         }
+        assert_eq!(
+            policy.network,
+            Stance::Deny,
+            "network should default to deny, matching what an unwired install has always done"
+        );
     }
 
     /// The privilege-widening defense, stated directly on the fold: whatever
     /// an untrusted layer says, the result is never looser than the operator's
-    /// own stance.
+    /// own stance. Deliberately an explicit all-`Allow` literal, not
+    /// `EffectivePolicy::default()`: `default()` is no longer the uniformly
+    /// loosest possible value (`network` defaults to `Deny`), so it would no
+    /// longer represent "an attempt to widen every capability to `Allow`".
     #[test]
     fn narrowing_never_loosens_any_capability() {
         let operator = EffectivePolicy {
@@ -800,7 +945,15 @@ mod tests {
             git_push_destructive: Stance::Deny,
             tool_access: Stance::Ask,
         };
-        let widening_attempt = EffectivePolicy::default();
+        let widening_attempt = EffectivePolicy {
+            repo_fs_write: Stance::Allow,
+            outside_repo_fs_write: Stance::Allow,
+            shell_exec: Stance::Allow,
+            network: Stance::Allow,
+            approval: Stance::Allow,
+            git_push_destructive: Stance::Allow,
+            tool_access: Stance::Allow,
+        };
         assert_eq!(operator.narrowed_by(widening_attempt), operator);
     }
 
@@ -855,6 +1008,12 @@ mod tests {
 
     /// The other half of "may narrow, never widen": a repo tightening a stance
     /// the operator left loose is honored, because narrowing is always safe.
+    /// `network` stays `Deny` here, unlike every other untouched capability
+    /// (`repo_fs_write` etc., implicitly `Allow` via the assertions below) --
+    /// but for a different reason than those six: nothing (neither home nor
+    /// repo) ever names `network` at all here, which is `resolve_network`'s
+    /// own "both layers silent" case, not a per-field default -- see that
+    /// function's own doc comment.
     #[test]
     fn a_repo_policy_table_may_tighten_a_stance_the_operator_left_loose() {
         let repo =
@@ -862,6 +1021,80 @@ mod tests {
         let vars = env_from(&[]);
         let resolved = resolve(None, repo, &|k| vars.get(k).cloned()).expect("resolves");
         assert_eq!(resolved.shell_exec, Stance::Deny);
+        assert_eq!(resolved.repo_fs_write, Stance::Allow);
+        assert_eq!(resolved.network, Stance::Deny);
+    }
+
+    /// Nothing anywhere ever names `network` -- `resolve_network`'s own
+    /// "both layers silent" case, applied as the one safe default rather
+    /// than baked into either layer's own parsed value.
+    #[test]
+    fn network_is_denied_when_nothing_is_configured_anywhere() {
+        let vars = env_from(&[]);
+        let resolved = resolve(None, None, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(resolved.network, Stance::Deny);
+    }
+
+    /// The actual correction this round makes (2026-08-26): home's own
+    /// explicit `network = "allow"` must survive a repo whose `[policy]`
+    /// table never mentions `network` at all -- the repo's silence carries
+    /// no opinion of its own, so it cannot defeat the operator's. Before this
+    /// round, a bare `Stance` field made "repo said nothing" and "repo
+    /// explicitly denied" indistinguishable, so this used to (wrongly)
+    /// resolve to `Deny`.
+    #[test]
+    fn network_opens_when_home_allows_it_and_the_repo_says_nothing_at_all() {
+        let home = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(home, None, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(resolved.network, Stance::Allow);
+    }
+
+    /// A repo may still always narrow: its own explicit `network = "deny"`
+    /// defeats home's `allow`, exactly like every other capability.
+    #[test]
+    fn network_stays_denied_when_the_repo_explicitly_denies_it_even_though_home_allows_it() {
+        let home = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
+        let repo = table("[policy]\nnetwork = \"deny\"\n").and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(home, repo, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(resolved.network, Stance::Deny);
+    }
+
+    /// The other half of "a repo may never widen, only narrow": a repo's own
+    /// bare `network = "allow"`, with home silent, must NOT grant network on
+    /// its own -- only the operator (home or env) can ever move `network`
+    /// toward `Allow`.
+    #[test]
+    fn network_stays_denied_when_only_the_repo_explicitly_allows_it_and_home_says_nothing() {
+        let repo = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(None, repo, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(resolved.network, Stance::Deny);
+    }
+
+    /// When the repo's own `[policy]` table explicitly agrees (`network =
+    /// "allow"`), home's own explicit `allow` is what actually carries --
+    /// repo's matching `allow` is a no-op agreement, never a grant of its
+    /// own (see the "repo alone" test above, which pins that half).
+    #[test]
+    fn network_opens_when_home_and_repo_both_explicitly_allow_it() {
+        let home = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
+        let repo = table("[policy]\nnetwork = \"allow\"\n").and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(home, repo, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(resolved.network, Stance::Allow);
+    }
+
+    /// The environment override sits above the fold entirely (`resolve`'s own
+    /// doc comment), so it is the one path guaranteed to open `network`
+    /// regardless of what any repo says -- including a repo that actively
+    /// tries to deny it.
+    #[test]
+    fn env_can_open_network_regardless_of_what_the_repo_says() {
+        let repo = table("[policy]\nnetwork = \"deny\"\n").and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[("ZIRV_CTX_POLICY_NETWORK", "allow")]);
+        let resolved = resolve(None, repo, &|k| vars.get(k).cloned()).expect("resolves");
         assert_eq!(resolved.network, Stance::Allow);
     }
 
@@ -906,10 +1139,16 @@ mod tests {
 
     /// The honesty rule at its most load-bearing: an `Allow` capability is
     /// never reported as something zirv enforces, because zirv is not
-    /// restricting anything.
+    /// restricting anything. `network` is pinned explicitly to `Allow` here
+    /// rather than left at `EffectivePolicy::default()`'s own `Deny`: this
+    /// test is about the `Allow` stance specifically, on every capability,
+    /// not about the default policy.
     #[test]
     fn an_allow_stance_reports_as_operator_controlled_on_every_adapter() {
-        let policy = EffectivePolicy::default();
+        let policy = EffectivePolicy {
+            network: Stance::Allow,
+            ..EffectivePolicy::default()
+        };
         for adapter in adapters::all(None) {
             let report = evaluate(&policy, adapter.as_ref(), adapters::LaunchMode::Headless);
             for outcome in &report.outcomes {
@@ -1195,6 +1434,11 @@ mod tests {
     fn one_policy_evaluates_differently_against_claude_and_codex() {
         let policy = EffectivePolicy {
             repo_fs_write: Stance::Deny,
+            // Pinned explicitly to `Allow` (not left at `default()`'s own
+            // `Deny`): this test is about `repo_fs_write` alone, and network
+            // at its own default would also show up as claude-unenforced
+            // (advisory-only), which is not what this test pins.
+            network: Stance::Allow,
             ..EffectivePolicy::default()
         };
         let claude = ClaudeAdapter::new(None);

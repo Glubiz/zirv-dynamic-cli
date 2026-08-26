@@ -2153,60 +2153,6 @@ fn same_directory(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
-/// The canonicalised git "common dir" that owns `path` -- the shared `.git`
-/// directory a plain repo and every `git worktree add`-linked sibling of it
-/// all point back at -- or `None` if `git` is missing, `path` is not inside a
-/// git working tree, or the process exits non-zero. Best-effort and
-/// shell-out only, same precedent as `compile::changed_repo_paths`.
-///
-/// `git rev-parse --git-common-dir` prints a path RELATIVE to `path` for a
-/// main worktree (typically just `.git`) but an ABSOLUTE one for a linked
-/// worktree (it points back at the main checkout's `.git`). Both forms are
-/// resolved against `path` before canonicalising, so a main worktree and any
-/// of its linked siblings canonicalise to the exact same `PathBuf` even
-/// though git reports the two differently.
-///
-/// Code review (issue #119, round 2): this is an authorization check -- its
-/// answer decides whether a spawn request gets to run a real agent -- so it
-/// must not trust an inherited environment that a request's own process
-/// could have set. `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` (and
-/// `GIT_INDEX_FILE`, for the same family of override) all redirect where
-/// `git` looks for repo state regardless of `-C`'s argument; left inherited,
-/// any one of them set in the dashboard's own process would make `git`
-/// resolve to the SAME overridden value for both `req_cwd` and `repo`,
-/// making the equality this function backs trivially true for two genuinely
-/// unrelated repos. Stripped here, at the one seam that shells out to `git`
-/// for this decision, rather than trusted to already be absent from the
-/// dashboard's environment.
-fn git_common_dir(path: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(path)
-        .arg("rev-parse")
-        .arg("--git-common-dir")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let candidate = PathBuf::from(raw);
-    let resolved = if candidate.is_absolute() {
-        candidate
-    } else {
-        path.join(candidate)
-    };
-    std::fs::canonicalize(&resolved).ok()
-}
-
 /// Whether a spawn request naming `req_cwd` may be fulfilled by a dashboard
 /// whose own repo is `repo`, and if so, the directory the freshly spawned
 /// pane should actually run in.
@@ -2234,7 +2180,10 @@ fn accepted_spawn_cwd(req_cwd: &Path, repo: &Path) -> Option<PathBuf> {
     if same_directory(req_cwd, repo) {
         return Some(req_cwd.to_path_buf());
     }
-    match (git_common_dir(req_cwd), git_common_dir(repo)) {
+    match (
+        adapters::git_common_dir(req_cwd),
+        adapters::git_common_dir(repo),
+    ) {
         (Some(a), Some(b)) if a == b => Some(req_cwd.to_path_buf()),
         _ => None,
     }
@@ -2277,13 +2226,25 @@ fn pane_launch_extra(
 /// only a lone `--model` pin (see `try_join_dashboard` in `agent.rs`) --
 /// there is no generic trailing-flags channel here for an operator to pin a
 /// conflicting `--sandbox`/`--ask-for-approval` through, so `flags_pin_
-/// policy` (inside `policy_launch_args`) is checked against an empty slice.
+/// policy` (inside `policy_launch_args`) is checked against an empty slice --
+/// which is also why `adapters::AgentAdapter::extra_writable_root_args`
+/// below is called unconditionally rather than gated on `flags_pin_policy`
+/// itself: with no trailing flags this pane can ever pin policy with, that
+/// gate is always open here (see task 3's own binding decision: the extra
+/// writable roots only apply "when the operator hasn't pinned policy").
+///
+/// `req.cwd` (issue #119) + `state.mail()` (`zirv ctx send` report-back) are
+/// the two writable roots `CodexAdapter::extra_writable_root_args` may add on
+/// top of `policy_launch_args`'s own sandbox baseline -- see that method's
+/// own doc comment for the mechanism and why they are not threaded through
+/// `policy_launch_args` itself.
 fn worker_pane_extra_args(
     req: &spawnreq::SpawnRequest,
     cfg: &CtxConfig,
     adapter: &dyn adapters::AgentAdapter,
     prompt_args: Vec<String>,
     session_id: &str,
+    state: &StateDir,
 ) -> Vec<String> {
     let mut extra = pane_model_args(req, cfg, adapter);
     extra.extend(adapters::policy_launch_args(
@@ -2299,6 +2260,7 @@ fn worker_pane_extra_args(
             adapters::LaunchMode::Headless
         },
     ));
+    extra.extend(adapter.extra_writable_root_args(&req.cwd, &state.mail()));
     extra.extend(pane_launch_extra(adapter, prompt_args, session_id));
     extra
 }
@@ -2834,7 +2796,7 @@ fn fulfill_spawn_request(
         fallback_is_safe,
     );
 
-    let extra = worker_pane_extra_args(req, cfg, adapter.as_ref(), prompt_args, &session_id);
+    let extra = worker_pane_extra_args(req, cfg, adapter.as_ref(), prompt_args, &session_id, state);
     let argv = flatten_command(adapter.interactive_cmd(Some(&effective_prompt), &extra));
     let spec = PaneSpec {
         agent_name: req.agent.clone(),
@@ -9766,6 +9728,7 @@ mod tests {
         let cfg = CtxConfig::default();
         let repo = tmp.path().to_path_buf();
         let req = spawn_request("do the work", &repo);
+        let state = StateDir::from_root(tmp.path().join("state"));
 
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         let claude_extra = worker_pane_extra_args(
@@ -9774,6 +9737,7 @@ mod tests {
             &claude,
             Vec::new(),
             "cccccccc-1111-4333-8444-555555555555",
+            &state,
         );
         assert!(
             claude_extra.contains(&"--permission-mode".to_string())
@@ -9795,6 +9759,7 @@ mod tests {
             &codex,
             Vec::new(),
             "cccccccc-2222-4333-8444-555555555555",
+            &state,
         );
         assert!(
             codex_extra
@@ -9829,6 +9794,7 @@ mod tests {
         let repo = tmp.path().to_path_buf();
         let mut req = spawn_request("do the work", &repo);
         req.interactive = false;
+        let state = StateDir::from_root(tmp.path().join("state"));
 
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         let extra = worker_pane_extra_args(
@@ -9837,6 +9803,7 @@ mod tests {
             &claude,
             Vec::new(),
             "dddddddd-1111-4333-8444-555555555555",
+            &state,
         );
         assert!(
             extra.contains(&"--permission-mode".to_string())
@@ -9861,6 +9828,7 @@ mod tests {
         };
         let repo = tmp.path().to_path_buf();
         let req = spawn_request("do the work", &repo);
+        let state = StateDir::from_root(tmp.path().join("state"));
         let codex = super::super::adapters::codex::CodexAdapter::new(None);
         let extra = worker_pane_extra_args(
             &req,
@@ -9868,6 +9836,7 @@ mod tests {
             &codex,
             Vec::new(),
             "cccccccc-3333-4333-8444-555555555555",
+            &state,
         );
         assert!(!extra.contains(&"--sandbox".to_string()), "got {extra:?}");
     }
