@@ -595,7 +595,7 @@ pub(crate) fn dash_orchestrator_pane(
     // `--resume <uuid zirv invented>` is ever issued from this entry. A worker
     // pane has no such escape hatch, which is why `dash::fulfill_spawn_request`
     // pins unconditionally.
-    if !super::exec::pins_an_existing_conversation(&argv) {
+    if !super::exec::pins_an_existing_conversation(&argv, adapter.name()) {
         argv.extend(adapter.session_pin_args(session));
     }
 

@@ -82,12 +82,32 @@ pub struct ExecArgs {
 /// would march the fresh child straight back into it and burn the whole
 /// restart budget re-entering rot. The first two carry a value; the rest are
 /// bare.
+///
+/// These are claude's own verified flags (`--session-id`/`--resume`,
+/// `-c`/`--continue`/`--fork-session`) -- see `ClaudeAdapter::resume_args`/
+/// `session_pin_args`. Every matcher below only ever consults this list for
+/// an adapter that actually recognises it (issue #143): codex's own `-c` is
+/// `-c, --config <key>=<value>`, an unrelated WITH-VALUE flag that happens to
+/// share claude's bare resume spelling. Matching it here regardless of
+/// adapter used to strip the bare `-c` token as claude's valueless resume
+/// flag while leaving codex's own value (e.g. `approval_policy=never`)
+/// behind, orphaned on argv -- which real codex-cli then rejects outright.
 pub(crate) const RESUME_FLAGS_WITH_VALUE: [&str; 2] = ["--session-id", "--resume"];
 pub(crate) const RESUME_FLAGS_BARE: [&str; 3] = ["-c", "--continue", "--fork-session"];
 
+/// Whether `adapter_name` is the one adapter [`RESUME_FLAGS_WITH_VALUE`]/
+/// [`RESUME_FLAGS_BARE`] actually describe. Shared by every matcher below so
+/// they cannot drift on which adapter this list applies to.
+fn adapter_has_resume_flags(adapter_name: &str) -> bool {
+    adapter_name.eq_ignore_ascii_case("claude")
+}
+
 /// Pure: whether `args` already pins this launch to a conversation that
 /// exists -- any of [`RESUME_FLAGS_WITH_VALUE`]/[`RESUME_FLAGS_BARE`], in
-/// either the two-token or the `--flag=value` spelling.
+/// either the two-token or the `--flag=value` spelling. Always `false` for an
+/// adapter that does not recognise these flags at all (see
+/// `adapter_has_resume_flags`) -- codex mints its own session id and has no
+/// verified pin flag, so nothing in its own argv could mean this.
 ///
 /// D3: a caller that adds a pin of its own (`chat::dash_orchestrator_pane`,
 /// via `AgentAdapter::session_pin_args`) has to ask this first. `zirv chat --
@@ -96,7 +116,10 @@ pub(crate) const RESUME_FLAGS_BARE: [&str; 3] = ["-c", "--continue", "--fork-ses
 /// launch. Inside a dashboard the resulting pane died immediately and its
 /// corpse was reaped, so the operator saw the session vanish with no error at
 /// all.
-pub(crate) fn pins_an_existing_conversation(args: &[String]) -> bool {
+pub(crate) fn pins_an_existing_conversation(args: &[String], adapter_name: &str) -> bool {
+    if !adapter_has_resume_flags(adapter_name) {
+        return false;
+    }
     args.iter().any(|arg| {
         RESUME_FLAGS_WITH_VALUE.contains(&arg.as_str())
             || RESUME_FLAGS_BARE.contains(&arg.as_str())
@@ -165,17 +188,23 @@ pub fn extract_prompt(command: &[String]) -> Option<String> {
 ///
 /// Three kinds of token are dropped. The prompt, because every relaunch
 /// regenerates it to carry a handoff. Anything pinning the launch to an
-/// existing conversation, because the relaunch is escaping one. And the
-/// leading tokens of the program invocation itself -- `prefix` of them from
-/// the adapter, plus any further positional before the first flag, which is
-/// how `npx claude ...` and a positional prompt both look -- because
-/// `headless_cmd` rebuilds the invocation and re-appending them would leave a
-/// stray argument the agent reads as a second prompt.
+/// existing conversation, because the relaunch is escaping one -- only for
+/// `adapter_name` that actually recognises those flags at all (issue #143,
+/// `adapter_has_resume_flags`); every other adapter's own flags pass through
+/// untouched, including one that happens to share a bare `-c` spelling for a
+/// completely different, value-carrying purpose (codex's `-c, --config
+/// <key>=<value>`). And the leading tokens of the program invocation itself
+/// -- `prefix` of them from the adapter, plus any further positional before
+/// the first flag, which is how `npx claude ...` and a positional prompt both
+/// look -- because `headless_cmd` rebuilds the invocation and re-appending
+/// them would leave a stray argument the agent reads as a second prompt.
 pub fn extra_launch_flags(
     command: &[String],
     prefix: usize,
     known_prompt: Option<&str>,
+    adapter_name: &str,
 ) -> Vec<String> {
+    let recognizes_resume_flags = adapter_has_resume_flags(adapter_name);
     let located = locate_prompt(command, prefix, known_prompt);
     let prompt_at = located.as_ref().map(|(index, _)| *index);
     let prompt_takes_value = located.is_some_and(|(_, value)| value.is_some());
@@ -198,20 +227,23 @@ pub fn extra_launch_flags(
         }
         in_prefix = false;
 
-        if is_joined_form(arg, &RESUME_FLAGS_WITH_VALUE) || is_joined_form(arg, &RESUME_FLAGS_BARE)
-        {
-            continue;
-        }
-        if RESUME_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
-            // A bare `--resume` with a flag after it takes no value, so the
-            // next token belongs to the operator and has to survive.
-            skip_next = command
-                .get(index + 1)
-                .is_some_and(|next| !next.starts_with('-'));
-            continue;
-        }
-        if RESUME_FLAGS_BARE.contains(&arg.as_str()) {
-            continue;
+        if recognizes_resume_flags {
+            if is_joined_form(arg, &RESUME_FLAGS_WITH_VALUE)
+                || is_joined_form(arg, &RESUME_FLAGS_BARE)
+            {
+                continue;
+            }
+            if RESUME_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
+                // A bare `--resume` with a flag after it takes no value, so
+                // the next token belongs to the operator and has to survive.
+                skip_next = command
+                    .get(index + 1)
+                    .is_some_and(|next| !next.starts_with('-'));
+                continue;
+            }
+            if RESUME_FLAGS_BARE.contains(&arg.as_str()) {
+                continue;
+            }
         }
         out.push(arg.clone());
     }
@@ -536,7 +568,7 @@ pub(crate) fn run_with_clock<W: Write>(
     // regenerates fresh): see `extra_launch_flags`. M8: a restart used to
     // rebuild the command from scratch with only zirv's own added flags,
     // silently dropping these.
-    let user_extra = extra_launch_flags(&launch_command, prefix, prompt.as_deref());
+    let user_extra = extra_launch_flags(&launch_command, prefix, prompt.as_deref(), adapter.name());
     // Bug B (harness/model parity, 2026-08-22): the shipped-default
     // "sandboxed, no prompts" posture (`SandboxConfig`) plus any explicit
     // `[policy]` restriction, from the same seam every other real launch now
@@ -1885,7 +1917,7 @@ mod tests {
             "opus".to_string(),
         ];
         assert_eq!(
-            extra_launch_flags(&cmd, 1, None),
+            extra_launch_flags(&cmd, 1, None, "claude"),
             vec!["--model".to_string(), "opus".to_string()]
         );
     }
@@ -1899,7 +1931,7 @@ mod tests {
             "--session-id".to_string(),
             "x".to_string(),
         ];
-        assert!(extra_launch_flags(&cmd, 1, None).is_empty());
+        assert!(extra_launch_flags(&cmd, 1, None, "claude").is_empty());
     }
 
     /// A markdown bullet list is an ordinary prompt. Reading it as a flag left
@@ -1917,7 +1949,7 @@ mod tests {
             "opus".to_string(),
         ];
         assert_eq!(
-            extra_launch_flags(&cmd, 1, Some(prompt)),
+            extra_launch_flags(&cmd, 1, Some(prompt), "claude"),
             vec!["--model".to_string(), "opus".to_string()],
             "the prompt zirv already holds is recognised by value, not by shape"
         );
@@ -1934,7 +1966,7 @@ mod tests {
             "--verbose".to_string(),
         ];
         assert_eq!(
-            extra_launch_flags(&cmd, 1, None),
+            extra_launch_flags(&cmd, 1, None, "claude"),
             vec!["--verbose".to_string()]
         );
     }
@@ -1951,7 +1983,7 @@ mod tests {
             "task".to_string(),
         ];
         assert!(
-            extra_launch_flags(&via_npx, 1, Some("task")).is_empty(),
+            extra_launch_flags(&via_npx, 1, Some("task"), "claude").is_empty(),
             "the launcher's own argument is part of the invocation, not a flag"
         );
 
@@ -1963,10 +1995,10 @@ mod tests {
             "-p".to_string(),
             "task".to_string(),
         ];
-        assert!(extra_launch_flags(&via_env, 2, Some("task")).is_empty());
+        assert!(extra_launch_flags(&via_env, 2, Some("task"), "claude").is_empty());
 
         let positional = vec!["claude".to_string(), "task".to_string()];
-        assert!(extra_launch_flags(&positional, 1, Some("task")).is_empty());
+        assert!(extra_launch_flags(&positional, 1, Some("task"), "claude").is_empty());
     }
 
     /// A restart exists to escape the conversation that rotted. Every spelling
@@ -1986,7 +2018,7 @@ mod tests {
             "opus".to_string(),
         ];
         assert_eq!(
-            extra_launch_flags(&cmd, 1, Some("task")),
+            extra_launch_flags(&cmd, 1, Some("task"), "claude"),
             vec!["--model".to_string(), "opus".to_string()]
         );
     }
@@ -2008,7 +2040,7 @@ mod tests {
         for argv in yes {
             let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
             assert!(
-                pins_an_existing_conversation(&owned),
+                pins_an_existing_conversation(&owned, "claude"),
                 "must be recognised as a pin: {argv:?}"
             );
         }
@@ -2021,10 +2053,24 @@ mod tests {
         for argv in no {
             let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
             assert!(
-                !pins_an_existing_conversation(&owned),
+                !pins_an_existing_conversation(&owned, "claude"),
                 "must not be mistaken for a pin: {argv:?}"
             );
         }
+    }
+
+    /// Issue #143: codex's own `-c, --config <key>=<value>` must never be
+    /// mistaken for claude's bare resume shorthand -- codex has no verified
+    /// pin flag at all (it always mints its own session id), so nothing in
+    /// its own argv can mean "this pins an existing conversation".
+    #[test]
+    fn pins_an_existing_conversation_is_always_false_for_an_adapter_with_no_resume_flags() {
+        let argv = vec![
+            "codex".to_string(),
+            "-c".to_string(),
+            "approval_policy=never".to_string(),
+        ];
+        assert!(!pins_an_existing_conversation(&argv, "codex"));
     }
 
     /// `--resume` with a flag after it took no value, so swallowing the next
@@ -2038,7 +2084,7 @@ mod tests {
             "opus".to_string(),
         ];
         assert_eq!(
-            extra_launch_flags(&cmd, 1, None),
+            extra_launch_flags(&cmd, 1, None, "claude"),
             vec!["--model".to_string(), "opus".to_string()]
         );
     }
@@ -2051,8 +2097,44 @@ mod tests {
             "gpt".to_string(),
         ];
         assert_eq!(
-            extra_launch_flags(&cmd, 1, None),
+            extra_launch_flags(&cmd, 1, None, "codex"),
             vec!["--model".to_string(), "gpt".to_string()]
+        );
+    }
+
+    /// Issue #143: codex's own `-c` (`-c, --config <key>=<value>`) collided
+    /// with claude's bare `-c`/`--continue` resume shorthand. `RESUME_FLAGS_
+    /// BARE` used to be matched regardless of adapter, so a bare `-c` was
+    /// dropped as claude's resume flag -- which takes no value -- while the
+    /// very next token (codex's own config VALUE, e.g.
+    /// `approval_policy=never`) survived untouched, landing on argv detached
+    /// from its own flag. Real codex-cli then rejects it outright: `error:
+    /// unexpected argument 'approval_policy=never' found`.
+    #[test]
+    fn extra_launch_flags_keeps_codexs_own_c_flag_paired_with_its_value() {
+        let cmd = vec![
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "-c".to_string(),
+            "approval_policy=never".to_string(),
+        ];
+        assert_eq!(
+            extra_launch_flags(&cmd, 0, None, "codex"),
+            cmd,
+            "codex's own -c/--config flag must never be mistaken for claude's bare resume \
+             shorthand, which does not exist on this adapter at all"
+        );
+    }
+
+    /// The same collision, the other direction: claude's own bare `-c` must
+    /// still be recognised and stripped exactly as before -- this fix must
+    /// not weaken the resume-flag guard for the adapter it actually protects.
+    #[test]
+    fn extra_launch_flags_still_strips_claudes_own_bare_c_flag() {
+        let cmd = vec!["-c".to_string(), "--model".to_string(), "opus".to_string()];
+        assert_eq!(
+            extra_launch_flags(&cmd, 0, None, "claude"),
+            vec!["--model".to_string(), "opus".to_string()]
         );
     }
 
