@@ -205,10 +205,11 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
         // after the `f == "-c"` split form above so a bare `-c` still falls
         // through to that pairwise check rather than being consumed here
         // with an empty attached value.
-        if let Some(rest) = f.strip_prefix("-c") {
-            if !rest.is_empty() && names_a_config_override_key(rest) {
-                return true;
-            }
+        if let Some(rest) = f.strip_prefix("-c")
+            && !rest.is_empty()
+            && names_a_config_override_key(rest)
+        {
+            return true;
         }
         false
     })
@@ -2654,9 +2655,7 @@ mod tests {
         assert!(flags_pin_policy(&[
             "-capproval_policy=on-request".to_string()
         ]));
-        assert!(flags_pin_policy(&[
-            "-csandbox_mode=read-only".to_string()
-        ]));
+        assert!(flags_pin_policy(&["-csandbox_mode=read-only".to_string()]));
         // Precision still matters: an attached `-c` naming an unrelated key
         // must not false-positive, and `-c` itself (no attached value) is the
         // ordinary split form, already covered above.
