@@ -574,6 +574,14 @@ pub enum Liveness {
 /// #145/#146's fix, by `dash::mod` too (`sweep_stale_token_dirs` and its own
 /// discovery scan) -- which used to carry an independent, identically
 /// EPERM-blind copy of this exact check rather than importing this one.
+///
+/// Documented trade-off, not a bug: reading `EPERM` as alive means a pid the
+/// kernel has recycled to an unrelated, foreign-uid process keeps a stale
+/// session/dashboard record alive until that pid frees again, since this
+/// check has no start-time (or any other) disambiguator to tell the original
+/// process apart from its replacement. Records here carry no such
+/// disambiguator today; tightening this (e.g. cross-checking a start time)
+/// is a deliberate follow-up, not part of this fix.
 #[cfg(unix)]
 pub(crate) fn is_alive(pid: u32) -> bool {
     // SAFETY: signal 0 sends nothing; it only probes existence and

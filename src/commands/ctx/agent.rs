@@ -490,8 +490,20 @@ fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
         .into_iter()
         .filter(|c| c.requests_dir != inherited)
         .collect();
+    // Selected before the log loop below, not after: whether a live candidate
+    // is the winner or merely a live-but-passed-over sibling changes what
+    // gets printed for it, and every candidate -- winner included -- must
+    // appear exactly once. See this function's own doc comment: "every
+    // candidate ... is logged, live or not", which a silent `Live => {}` arm
+    // here used to violate for every live sibling that lost the selection.
+    let winner = super::dash::select_live_dash_dir(&others);
     for candidate in &others {
+        let is_winner = winner.is_some_and(|w| w.requests_dir == candidate.requests_dir);
         match candidate.status {
+            super::dash::CandidateStatus::Live { pid, .. } if !is_winner => eprintln!(
+                "zirv ctx agent: candidate {} is live (owner pid {pid}), not selected",
+                candidate.requests_dir.display()
+            ),
             super::dash::CandidateStatus::Live { .. } => {}
             super::dash::CandidateStatus::NoOwnerPid => eprintln!(
                 "zirv ctx agent: candidate {} has no owner.pid; skipped",
@@ -503,7 +515,7 @@ fn live_join_target(inherited: &Path, env: EnvLookup<'_>) -> Option<PathBuf> {
             ),
         }
     }
-    match super::dash::select_live_dash_dir(&others) {
+    match winner {
         Some(winner) => {
             eprintln!(
                 "zirv ctx agent: joining {} instead",

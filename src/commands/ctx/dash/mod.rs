@@ -2022,9 +2022,13 @@ pub(crate) enum CandidateStatus {
     /// `started_at` is `owner.pid`'s own mtime. The file is written exactly
     /// once, at dashboard startup (`run_dashboard`), so its mtime IS that
     /// dashboard's start time -- used only to rank live candidates against
-    /// each other, never compared against a clock.
+    /// each other, never compared against a clock. `pid` rides along purely
+    /// so a caller logging a live-but-not-selected candidate (`agent::
+    /// live_join_target`) can name it, the same way the `DeadOwner` arm
+    /// already does.
     Live {
         started_at: std::time::SystemTime,
+        pid: u32,
     },
     NoOwnerPid,
     DeadOwner(u32),
@@ -2084,7 +2088,7 @@ pub(crate) fn discover_live_dash_dirs(state: &StateDir) -> Vec<DashCandidate> {
                 let started_at = std::fs::metadata(&owner_pid_path)
                     .and_then(|m| m.modified())
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                CandidateStatus::Live { started_at }
+                CandidateStatus::Live { started_at, pid }
             })
             .unwrap_or(CandidateStatus::NoOwnerPid);
         found.push(DashCandidate {
@@ -2106,7 +2110,7 @@ pub(crate) fn select_live_dash_dir(candidates: &[DashCandidate]) -> Option<&Dash
     candidates
         .iter()
         .filter_map(|c| match c.status {
-            CandidateStatus::Live { started_at } => Some((c, started_at)),
+            CandidateStatus::Live { started_at, .. } => Some((c, started_at)),
             _ => None,
         })
         .max_by(|(a, sa), (b, sb)| sa.cmp(sb).then_with(|| a.requests_dir.cmp(&b.requests_dir)))
@@ -12587,7 +12591,14 @@ mod tests {
             status_for(&dead),
             CandidateStatus::DeadOwner(dead_pid_value)
         );
-        assert!(matches!(status_for(&live), CandidateStatus::Live { .. }));
+        match status_for(&live) {
+            CandidateStatus::Live { pid, .. } => assert_eq!(
+                pid,
+                std::process::id(),
+                "the live candidate's own pid rides along, for a caller that logs it"
+            ),
+            other => panic!("expected Live, got {other:?}"),
+        }
         assert_eq!(status_for(&ownerless), CandidateStatus::NoOwnerPid);
     }
 
@@ -12601,12 +12612,14 @@ mod tests {
             requests_dir: PathBuf::from("/state/dash/aaaa-1/requests"),
             status: CandidateStatus::Live {
                 started_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+                pid: 111,
             },
         };
         let newer = DashCandidate {
             requests_dir: PathBuf::from("/state/dash/bbbb-2/requests"),
             status: CandidateStatus::Live {
                 started_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+                pid: 222,
             },
         };
         let dead = DashCandidate {
@@ -12639,12 +12652,14 @@ mod tests {
             requests_dir: PathBuf::from("/state/dash/aaaa-1/requests"),
             status: CandidateStatus::Live {
                 started_at: std::time::SystemTime::UNIX_EPOCH,
+                pid: 333,
             },
         };
         let tie_b = DashCandidate {
             requests_dir: PathBuf::from("/state/dash/bbbb-2/requests"),
             status: CandidateStatus::Live {
                 started_at: std::time::SystemTime::UNIX_EPOCH,
+                pid: 444,
             },
         };
         let tied = [tie_a.clone(), tie_b.clone()];
