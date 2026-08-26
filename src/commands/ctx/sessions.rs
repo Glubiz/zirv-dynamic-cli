@@ -108,7 +108,16 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// mean "no live dashboard" -- so an abnormally-exited dashboard's leftover
 /// requests directory never wedges a future interactive launch. Only a
 /// readable pidfile naming a live process counts.
-fn dashboard_owner_is_live(requests_dir: &Path) -> bool {
+///
+/// `pub(crate)` (issue #144): also the liveness half of `agent::
+/// try_join_dashboard`'s own gate, so the two readers of `DASH_REQUESTS_ENV`
+/// cannot drift on what "live" means the way they did before -- this guard
+/// used to be the only one of the two that checked `owner.pid` at all, so a
+/// dashboard that exited abnormally left a directory `try_join_dashboard`
+/// still treated as a live channel: a request was written into it, nobody
+/// was listening, and the caller burned the whole ack timeout finding that
+/// out.
+pub(crate) fn dashboard_owner_is_live(requests_dir: &Path) -> bool {
     if !requests_dir.is_dir() {
         return false;
     }
@@ -1034,23 +1043,7 @@ mod tests {
         Record::new(session, "claude", repo, verb)
     }
 
-    /// A pid guaranteed dead by the time it is used: a real child process,
-    /// spawned and waited on, so its exit is deterministic rather than a
-    /// hardcoded number that might collide with something alive on this
-    /// machine.
-    fn dead_pid() -> u32 {
-        let mut cmd = if cfg!(windows) {
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", "exit", "0"]);
-            c
-        } else {
-            std::process::Command::new("true")
-        };
-        let mut child = cmd.spawn().expect("spawn a short-lived process");
-        let pid = child.id();
-        let _ = child.wait();
-        pid
-    }
+    use super::super::testenv::dead_pid;
 
     #[test]
     fn a_record_without_owner_pid_deserializes_as_unowned() {
