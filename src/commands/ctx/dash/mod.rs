@@ -2651,6 +2651,13 @@ fn fulfill_spawn_request(
     // would simply route around the budget (the headless path is gated too,
     // by the identical check in `exec.rs`), the same reasoning `max_panes`
     // right above already applies.
+    //
+    // Review round 1 (2026-08-26), cross-process TOCTOU: this count-then-
+    // register window is not atomic across processes -- a concurrent
+    // `zirv ctx exec` launch (or another dashboard's own spawn) can read the
+    // same live count before either side has registered, so the budget can
+    // be exceeded by one under simultaneous launches. Not closed here; see
+    // `exec.rs`'s identical gate for the full reasoning.
     let live_heavy = sessions::count_heavy_workers(state);
     if live_heavy >= cfg.supervise.max_heavy_workers {
         return Err(SpawnRefusal::policy(format!(

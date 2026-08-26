@@ -836,6 +836,17 @@ pub(crate) fn run_with_clock<W: Write>(
     // incident (four kernel bugchecks in 12 minutes) was two concurrent
     // unbounded build/test workloads under zirv supervision with no
     // governance at all.
+    //
+    // Review round 1 (2026-08-26), cross-process TOCTOU: the count-then-
+    // register window below is not atomic across processes -- two `zirv ctx
+    // exec` launches (or one of these plus a concurrent `dash::fulfill_
+    // spawn_request`) can both read the same live count before either has
+    // registered, so the budget can be exceeded by one under simultaneous
+    // launches. Not closed here: doing so needs a cross-process lock this
+    // registry has never had, and the budget's whole purpose -- keeping
+    // concurrency low, not enforcing an exact ceiling -- tolerates an
+    // occasional off-by-one race far better than it would tolerate the
+    // unbounded concurrency issue #133 actually reports.
     let live_heavy = super::sessions::count_heavy_workers(&state);
     if live_heavy >= cfg.supervise.max_heavy_workers {
         return Err(format!(
