@@ -1990,4 +1990,87 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         assert_eq!(package.diff_base_sha, package.base_sha);
         assert_eq!(package.head_sha.len(), 40);
     }
+
+    /// Integration level, on top of the `delta_base` unit tests above:
+    /// `delta_base` proves the SHA selection in isolation, but this proves
+    /// `package()` actually wires that sha into `git_diff_capped`. The
+    /// content assertions are the ones that would catch a future regression
+    /// where `git_diff_capped` is called against `base_sha` again (or the
+    /// wrong sha) while `diff_is_delta` still reports `true` -- a reviewer
+    /// told "this is a delta" while actually holding the full diff, or the
+    /// wrong slice of it, is a silent correctness bug this field exists to
+    /// rule out. Round 1's change and round 2's fix live in separate files so
+    /// the two diffs have zero textual overlap: a plain `.contains` check on
+    /// the diff string is enough to prove which bytes it actually carries.
+    #[test]
+    fn package_with_an_intact_chain_diffs_only_the_post_round_one_change() {
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("file_a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // The change round 1 actually reviewed.
+        std::fs::write(repo.path().join("file_a.txt"), "first change\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first change"]);
+
+        // The NEW change made in response to round 1's review, in a
+        // different file so it cannot be confused with round 1's change in
+        // the diff text below.
+        std::fs::write(repo.path().join("file_b.txt"), "fix after review\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fix after review"]);
+
+        let shas = git_log_shas(repo.path()); // [base, first change, fix after review]
+        let mut state = running_review_state(repo.path(), &shas[0]);
+        state.review_evidence.push(ReviewRunEvidence {
+            id: "ev-1".to_string(),
+            change_fingerprint: 1,
+            adapter: "codex".to_string(),
+            review_round: 1,
+            completed_at: 10,
+            head_sha: Some(shas[1].clone()),
+        });
+        let state_dir =
+            StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
+
+        let package = package(&state_dir, &state, Some(&shas[0])).expect("package");
+
+        assert!(
+            package.diff_is_delta,
+            "round 2 with an intact evidence chain is a delta"
+        );
+        assert_eq!(
+            package.diff_base_sha, shas[1],
+            "diffs from the sha round 1 actually reviewed, not the workflow base"
+        );
+        assert!(
+            package.diff.contains("fix after review"),
+            "the delta must contain round 2's new change; got {:?}",
+            package.diff
+        );
+        assert!(
+            !package.diff.contains("first change"),
+            "the delta must NOT contain round 1's already-reviewed change -- \
+             that would mean the reviewer is silently under- or over-reviewing; got {:?}",
+            package.diff
+        );
+    }
 }
