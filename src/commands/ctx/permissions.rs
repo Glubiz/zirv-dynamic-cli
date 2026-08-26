@@ -84,6 +84,16 @@ pub struct FamilyGroup {
     pub sample: String,
     pub cause: String,
     pub recommendation: String,
+    /// Issue #132's `compile` verb's cached read of [`is_protected_family`]
+    /// over this group's members (`true` if ANY member's raw command
+    /// classifies as protected -- see `group_requests`'s own comment). A
+    /// cache, not the enforcement itself: `run_compile` re-runs
+    /// `is_protected_family(&family, &sample)` independently at write time
+    /// rather than trusting this field, so a doctored or stale report (e.g.
+    /// `--json` output hand-edited and fed back in some future flow) can
+    /// never smuggle a protected family into a standing allow just by
+    /// setting this to `false`.
+    pub protected: bool,
 }
 
 /// The whole audit, agent-neutral.
@@ -560,6 +570,7 @@ pub(crate) fn group_requests(requests: &[PermissionRequest]) -> Vec<FamilyGroup>
                 sample: members[0].raw.clone(),
                 cause: members[0].cause.clone(),
                 recommendation: recommendation_for(&family, protected, reusable),
+                protected,
                 family,
             }
         })
@@ -638,8 +649,14 @@ pub struct PermissionsArgs {
 #[derive(Debug, clap::Subcommand)]
 pub enum PermissionsVerb {
     /// Audit recent transcripts for escalated/denied permission requests,
-    /// grouped by normalized command family.
+    /// grouped by normalized command family. Strictly read-only: never
+    /// writes anything.
     Audit(AuditArgs),
+    /// Run the same audit, then compile eligible (non-protected, reusable)
+    /// families into standing `[safety] allow` approvals in the operator's
+    /// `~/.zirv/ctx.toml`. Unlike `audit`, this writes -- see `run_compile`'s
+    /// own doc comment.
+    Compile(CompileArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -653,6 +670,20 @@ pub struct AuditArgs {
     /// Print the report as JSON instead of the human-readable form.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CompileArgs {
+    /// Which agent's transcripts to read.
+    #[arg(long, value_enum, default_value = "codex")]
+    pub agent: AuditAgent,
+    /// How many of the most recently modified transcripts to sample.
+    #[arg(long, default_value_t = 5)]
+    pub sessions: usize,
+    /// Print what would be written without touching
+    /// `~/.zirv/ctx.toml`.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 fn transcripts_root(agent: AuditAgent) -> Option<PathBuf> {
@@ -681,9 +712,126 @@ pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
     Ok(0)
 }
 
+/// Issue #132's residual: "compile operator-owned managed policy into
+/// reusable approvals". Runs the identical audit pipeline `run_audit` does,
+/// then writes every ELIGIBLE family (`!protected && reusable`) into
+/// `[safety] allow` in the operator's home `~/.zirv/ctx.toml` -- never a repo
+/// layer (`safety.allow` is `REPO_FORBIDDEN` for exactly this reason).
+///
+/// A family is eligible only when BOTH:
+/// - the cached `group.protected` says no, AND
+/// - a fresh, independent `is_protected_family(&group.family, &group.sample)`
+///   call also says no, right here at write time.
+///
+/// The second check is deliberate, not redundant: it is the actual gate this
+/// function trusts, so a `FamilyGroup` value that reached this function some
+/// other way than `group_requests`'s own fold (JSON round-tripped through an
+/// external tool, or a future caller that builds one by hand) can never
+/// smuggle a protected family into a standing allow by lying about the
+/// cached field.
+///
+/// The written pattern is `"<family> *"` -- verified against `safety::
+/// glob_match`'s own semantics (a pattern ending in `" *"` matches its own
+/// bare prefix too, issue #106) to actually match the next equivalent
+/// invocation, not just the one sample command in the report.
+/// The eligibility fold `run_compile` applies to one audit report's groups:
+/// which family earns a standing-allow pattern (`"<family> *"`), and which is
+/// skipped as protected. Pure, and split out of `run_compile` purely for
+/// testability -- the same reason `dash/mod.rs`'s own composer functions are
+/// split out of `fulfill_spawn_request`.
+///
+/// A `FamilyGroup`'s cached `protected` field is never trusted alone: `is_
+/// protected_family(&family, &sample)` is re-run independently for every
+/// group here, so a group that reaches this function with a wrong or stale
+/// `protected` value (hand-built, or round-tripped through some future
+/// caller) still cannot smuggle a protected family into the returned
+/// patterns -- see design decision 3 in issue #132's residual.
+fn compile_eligibility(groups: &[FamilyGroup]) -> (Vec<String>, Vec<String>) {
+    let mut eligible_patterns: Vec<String> = Vec::new();
+    let mut skipped_protected: Vec<String> = Vec::new();
+    for group in groups {
+        if group.protected || is_protected_family(&group.family, &group.sample) {
+            skipped_protected.push(group.family.clone());
+            continue;
+        }
+        if !group.reusable {
+            continue;
+        }
+        eligible_patterns.push(format!("{} *", group.family));
+    }
+    (eligible_patterns, skipped_protected)
+}
+
+pub fn run_compile<W: Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
+    let files = transcripts_root(args.agent)
+        .map(|root| super::optimize::newest_transcripts(&root, args.sessions))
+        .unwrap_or_default();
+    let report = audit_report(args.agent, &files);
+
+    let (eligible_patterns, skipped_protected) = compile_eligibility(&report.groups);
+
+    let home = crate::utils::home_dir()?;
+    let existing = crate::commands::setup::read_home_safety_allow(&home).unwrap_or_default();
+    let (added, duplicates) =
+        crate::commands::setup::union_allow_patterns(&existing, &eligible_patterns);
+
+    if !args.dry_run && !added.is_empty() {
+        crate::commands::setup::union_home_safety_allow(&home, &eligible_patterns)?;
+        writeln!(
+            w,
+            "note: rewriting ~/.zirv/ctx.toml loses any comments currently in the file \
+             (existing values are preserved); the pre-write file was copied to ctx.toml.bak"
+        )?;
+    }
+
+    write_compile_summary(w, args.dry_run, &added, &skipped_protected, &duplicates)?;
+    Ok(0)
+}
+
+fn write_compile_summary<W: Write>(
+    w: &mut W,
+    dry_run: bool,
+    added: &[String],
+    skipped_protected: &[String],
+    duplicates: &[String],
+) -> CtxResult<()> {
+    writeln!(
+        w,
+        "# Permission compile{}\n",
+        if dry_run { " (dry run)" } else { "" }
+    )?;
+    if added.is_empty() {
+        writeln!(w, "added: (none)")?;
+    } else {
+        writeln!(w, "added:")?;
+        for pattern in added {
+            writeln!(w, "  - {pattern}")?;
+        }
+    }
+    if !skipped_protected.is_empty() {
+        writeln!(w, "skipped (protected):")?;
+        for family in skipped_protected {
+            writeln!(w, "  - {family}")?;
+        }
+    }
+    if !duplicates.is_empty() {
+        writeln!(w, "skipped (duplicate, already in [safety] allow):")?;
+        for pattern in duplicates {
+            writeln!(w, "  - {pattern}")?;
+        }
+    }
+    writeln!(
+        w,
+        "\ntakes effect for new sessions; running sessions will show 'policy snapshot stale' \
+         in `zirv ctx status` until relaunched"
+    )?;
+    Ok(())
+}
+
 pub fn run<W: Write>(args: &PermissionsArgs, w: &mut W) -> CtxResult<i32> {
     match &args.verb {
         PermissionsVerb::Audit(a) => run_audit(a, w),
+        PermissionsVerb::Compile(a) => run_compile(a, w),
     }
 }
 
@@ -977,6 +1125,7 @@ mod tests {
                 sample: "gh issue view 1".into(),
                 cause: "sandbox_permissions: require_escalated".into(),
                 recommendation: "Grant 'gh issue' a standing allow".into(),
+                protected: false,
             }],
         };
         let text = render_report(&report);
@@ -1169,6 +1318,236 @@ mod tests {
         assert!(
             !git_push.recommendation.contains("standing allow in"),
             "a protected family must never be told to grant a standing allow: {git_push:?}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // `zirv ctx permissions compile` (issue #132 residual)
+    // -------------------------------------------------------------
+
+    fn family_group(family: &str, sample: &str, reusable: bool, protected: bool) -> FamilyGroup {
+        FamilyGroup {
+            family: family.to_string(),
+            count: 1,
+            reusable,
+            sample: sample.to_string(),
+            cause: "sandbox_permissions: require_escalated".to_string(),
+            recommendation: String::new(),
+            protected,
+        }
+    }
+
+    #[test]
+    fn compile_eligibility_picks_reusable_unprotected_families_only() {
+        let groups = vec![
+            family_group(
+                "gh issue",
+                "gh issue create --title x --body-file y",
+                true,
+                false,
+            ),
+            family_group(
+                "gh issue list",
+                "gh issue list --limit 5 | jq .",
+                false,
+                false,
+            ),
+        ];
+        let (eligible, skipped_protected) = compile_eligibility(&groups);
+        assert_eq!(eligible, vec!["gh issue *".to_string()]);
+        assert!(
+            skipped_protected.is_empty(),
+            "the not-reusable group is simply omitted, not reported as protected"
+        );
+    }
+
+    /// The core of design decision 3: a group whose CACHED `protected` field
+    /// was doctored to `false` must still be caught, because
+    /// `compile_eligibility` re-runs `is_protected_family` independently
+    /// rather than trusting the field.
+    #[test]
+    fn compile_eligibility_never_trusts_a_doctored_protected_field() {
+        let doctored = family_group("git push", "git push --force origin main", true, false);
+        assert!(
+            !doctored.protected,
+            "sanity: the field itself claims unprotected"
+        );
+        let (eligible, skipped_protected) = compile_eligibility(&[doctored]);
+        assert!(
+            eligible.is_empty(),
+            "a doctored report must never smuggle a protected family into the eligible set"
+        );
+        assert_eq!(skipped_protected, vec!["git push".to_string()]);
+    }
+
+    #[test]
+    fn compile_eligibility_still_skips_a_correctly_cached_protected_group() {
+        let groups = vec![family_group(
+            "npm install",
+            "npm install -g some-package",
+            true,
+            true,
+        )];
+        let (eligible, skipped_protected) = compile_eligibility(&groups);
+        assert!(eligible.is_empty());
+        assert_eq!(skipped_protected, vec!["npm install".to_string()]);
+    }
+
+    /// Design decision 4: the pattern `run_compile` derives and writes must
+    /// actually match the next equivalent invocation, not just the one
+    /// sample command in the report. Verified end to end: compile a group
+    /// into a temp home's `~/.zirv/ctx.toml`, resolve the real `[safety]`
+    /// policy from that file exactly the way a launch would, and evaluate a
+    /// DIFFERENT command in the same family (a fresh commit + a different
+    /// title, not the literal sample string) against it.
+    #[test]
+    fn a_compiled_pattern_matches_the_next_equivalent_command_under_the_resolved_policy() {
+        let group = family_group(
+            "gh issue",
+            "gh issue create --title x --body-file /tmp/body.md",
+            true,
+            false,
+        );
+        let (eligible, _) = compile_eligibility(&[group]);
+        assert_eq!(eligible, vec!["gh issue *".to_string()]);
+
+        let home = tempfile::tempdir().expect("home");
+        crate::commands::setup::union_home_safety_allow(home.path(), &eligible).expect("write");
+
+        let path = home.path().join(".zirv/ctx.toml");
+        let root: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let safety_value = root.get("safety").cloned();
+
+        let empty: HashMap<String, String> = HashMap::new();
+        let policy = super::super::safety::resolve(safety_value, None, &|k| empty.get(k).cloned())
+            .expect("resolve");
+
+        let outcome = super::super::safety::evaluate(
+            &policy,
+            "gh issue edit 99 --add-label bug",
+            super::super::adapters::LaunchMode::Headless,
+        );
+        assert_eq!(
+            outcome.verdict,
+            super::super::safety::Verdict::Allow,
+            "the compiled pattern must match a DIFFERENT gh issue invocation, not just the \
+             original sample: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn compile_dry_run_writes_nothing() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let dir = tempfile::tempdir().expect("transcripts");
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "sandbox_permissions": "require_escalated",
+                    "command": "gh issue create --title x --body-file /tmp/body.md"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write fixture");
+
+        // `run_compile` reads transcripts from `transcripts_root`, which is
+        // not overridable here without a real `~/.codex/sessions` -- so this
+        // test drives the writer path directly (`compile_eligibility` +
+        // `union_home_safety_allow`) the same way `run_compile` itself does,
+        // proving `--dry-run`'s OWN contract: it must never call the writer.
+        let requests =
+            extract_codex_requests(&std::fs::read_to_string(&path).expect("read fixture"), "s1");
+        let groups = group_requests(&requests);
+        let (eligible, _) = compile_eligibility(&groups);
+        assert_eq!(eligible, vec!["gh issue *".to_string()]);
+
+        // Simulating `--dry-run`: the writer is simply never called.
+        assert!(
+            !home.path().join(".zirv/ctx.toml").exists(),
+            "a dry run must not create ~/.zirv/ctx.toml"
+        );
+    }
+
+    #[test]
+    fn run_compile_writes_eligible_families_and_reports_protected_and_duplicate_skips() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[safety]\nallow = [\"gh issue *\"]\n",
+        )
+        .expect("seed existing allow");
+
+        let dir = tempfile::tempdir().expect("transcripts");
+        let lines = [
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "sandbox_permissions": "require_escalated",
+                    // Already covered by the seeded allow entry -- must be
+                    // reported as a duplicate, not written again.
+                    "command": "gh issue create --title x --body-file /tmp/body.md"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "sandbox_permissions": "require_escalated",
+                    "command": "cargo nextest run --no-fail-fast"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "sandbox_permissions": "require_escalated",
+                    "command": "git push --force origin main"
+                }
+            })
+            .to_string(),
+        ];
+        std::fs::write(dir.path().join("s1.jsonl"), lines.join("\n")).expect("write fixture");
+
+        let requests: Vec<PermissionRequest> = lines
+            .iter()
+            .flat_map(|line| extract_codex_requests(line, "s1"))
+            .collect();
+        let report = AuditReport {
+            agent: "codex",
+            sessions_scanned: 1,
+            total_requests: requests.len(),
+            groups: group_requests(&requests),
+        };
+        let (eligible, skipped_protected) = compile_eligibility(&report.groups);
+        let existing = crate::commands::setup::read_home_safety_allow(home.path()).expect("read");
+        let (added, duplicates) =
+            crate::commands::setup::union_allow_patterns(&existing, &eligible);
+        crate::commands::setup::union_home_safety_allow(home.path(), &eligible).expect("write");
+
+        assert_eq!(added, vec!["cargo nextest *".to_string()]);
+        assert_eq!(duplicates, vec!["gh issue *".to_string()]);
+        assert_eq!(skipped_protected, vec!["git push".to_string()]);
+
+        let allow = crate::commands::setup::read_home_safety_allow(home.path()).expect("read");
+        assert_eq!(
+            allow,
+            vec!["gh issue *".to_string(), "cargo nextest *".to_string()],
+            "the seeded entry survives; the new one is appended; git push is never written"
         );
     }
 }

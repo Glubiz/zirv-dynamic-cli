@@ -718,6 +718,126 @@ fn set_home_ctx_toml_string(
     set_home_ctx_toml_value(home, table, key, toml::Value::String(value.to_string()))
 }
 
+/// Reads `~/.zirv/ctx.toml`'s current `[safety] allow` array. Empty (not an
+/// error) when the file, the `[safety]` table, or the `allow` key is absent
+/// -- issue #132's `zirv ctx permissions compile` uses this to compute what
+/// it would add before ever writing anything, so a `--dry-run` and a real
+/// write report the identical split.
+pub(crate) fn read_home_safety_allow(home: &Path) -> SetupResult<Vec<String>> {
+    let path = home
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join(ctx::config::CTX_CONFIG_FILE);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let root: toml::Table = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    Ok(safety_allow_array(&root))
+}
+
+fn safety_allow_array(root: &toml::Table) -> Vec<String> {
+    root.get("safety")
+        .and_then(toml::Value::as_table)
+        .and_then(|safety| safety.get("allow"))
+        .and_then(toml::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Issue #132: pure case-sensitive-exact-string dedupe of `additions` against
+/// `existing` (an `[safety] allow` array's current contents, order
+/// preserved) and against each other, split into what is genuinely new
+/// (`added`, in `additions`' own order) and what already exists
+/// (`duplicates`). No fs -- `zirv ctx permissions compile --dry-run` uses
+/// this alone to report the exact split a real write would produce, without
+/// touching disk; `union_home_safety_allow` below uses it too, on the same
+/// `existing` read fresh from disk, so both paths can never disagree.
+pub(crate) fn union_allow_patterns(
+    existing: &[String],
+    additions: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut added: Vec<String> = Vec::new();
+    let mut duplicates: Vec<String> = Vec::new();
+    for pattern in additions {
+        let already_present =
+            existing.iter().any(|e| e == pattern) || added.iter().any(|a| a == pattern);
+        if already_present {
+            duplicates.push(pattern.clone());
+        } else {
+            added.push(pattern.clone());
+        }
+    }
+    (added, duplicates)
+}
+
+/// Issue #132's writer: unions `additions` into `~/.zirv/ctx.toml`'s
+/// `[safety] allow` array (creating the file/table/key as needed, mirroring
+/// `set_home_ctx_toml_value`'s own read-mutate-write shape) and returns
+/// exactly the patterns that were newly added. Never removes or reorders an
+/// existing entry -- only appends genuinely new ones, deduped via
+/// `union_allow_patterns` against what is already saved. Targets ONLY the
+/// home layer, exactly like every `set_home_ctx_toml_*` writer above: a repo
+/// path is never touched, and `safety.allow` is `REPO_FORBIDDEN` precisely so
+/// a repo layer could not do this to itself even if it tried.
+///
+/// Backs up the pre-write file to `ctx.toml.bak` first, best effort -- a
+/// failed backup must not block a write already behind a confirmed operator
+/// command (`zirv ctx permissions compile`, never run implicitly). Comments
+/// in the file are lost on rewrite, the same accepted trade-off every other
+/// writer here already makes (`toml::Table` round-trips values, not source
+/// text) -- the caller is responsible for warning about that; this function
+/// only writes.
+pub(crate) fn union_home_safety_allow(
+    home: &Path,
+    additions: &[String],
+) -> SetupResult<Vec<String>> {
+    let path = home
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join(ctx::config::CTX_CONFIG_FILE);
+    let mut root: toml::Table = if path.is_file() {
+        toml::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        toml::Table::new()
+    };
+    let existing = safety_allow_array(&root);
+    let (added, _duplicates) = union_allow_patterns(&existing, additions);
+    if added.is_empty() {
+        return Ok(added);
+    }
+
+    if path.is_file() {
+        let backup_name = format!(
+            "{}.bak",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(ctx::config::CTX_CONFIG_FILE)
+        );
+        let _ = std::fs::copy(&path, path.with_file_name(backup_name));
+    }
+
+    let safety_table = root
+        .entry("safety".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("{} `[safety]` is not a table", path.display()))?;
+    let mut merged = existing;
+    merged.extend(added.iter().cloned());
+    safety_table.insert(
+        "allow".to_string(),
+        toml::Value::Array(merged.into_iter().map(toml::Value::String).collect()),
+    );
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+    Ok(added)
+}
+
 #[derive(Debug)]
 struct ProfileMutation {
     table: Option<&'static str>,
@@ -5290,6 +5410,130 @@ mod tests {
         assert!(
             !cfg.memory.enabled,
             "a key written earlier must survive a later, unrelated write"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #132: safety.allow union writer (`zirv ctx permissions compile`)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn union_allow_patterns_splits_new_from_already_present() {
+        let existing = vec!["gh issue *".to_string()];
+        let additions = vec![
+            "gh issue *".to_string(),
+            "cargo nextest *".to_string(),
+            "cargo nextest *".to_string(),
+        ];
+        let (added, duplicates) = union_allow_patterns(&existing, &additions);
+        assert_eq!(added, vec!["cargo nextest *".to_string()]);
+        assert_eq!(
+            duplicates,
+            vec!["gh issue *".to_string(), "cargo nextest *".to_string()],
+            "a pattern already in `existing`, and a repeat within `additions` itself, both count \
+             as duplicates"
+        );
+    }
+
+    #[test]
+    fn read_home_safety_allow_is_empty_when_the_file_is_absent() {
+        let home = tempfile::tempdir().expect("home");
+        assert_eq!(
+            read_home_safety_allow(home.path()).expect("read"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn union_home_safety_allow_creates_the_table_and_key_when_absent() {
+        let home = tempfile::tempdir().expect("home");
+        let added = union_home_safety_allow(
+            home.path(),
+            &["gh issue *".to_string(), "cargo nextest *".to_string()],
+        )
+        .expect("write");
+        assert_eq!(
+            added,
+            vec!["gh issue *".to_string(), "cargo nextest *".to_string()]
+        );
+        assert_eq!(
+            read_home_safety_allow(home.path()).expect("read"),
+            vec!["gh issue *".to_string(), "cargo nextest *".to_string()]
+        );
+    }
+
+    #[test]
+    fn union_home_safety_allow_unions_without_clobbering_existing_entries_or_other_tables() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let _var = VarGuard::set(&[
+            ("ZIRV_CTX_SAFETY_ALLOW", None),
+            ("ZIRV_CTX_CHAT_MODEL", None),
+        ]);
+
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[chat]\nmodel = \"opus\"\n\n[safety]\nallow = [\"git fetch *\"]\n",
+        )
+        .expect("write");
+
+        let added =
+            union_home_safety_allow(home.path(), &["gh issue *".to_string()]).expect("write");
+        assert_eq!(added, vec!["gh issue *".to_string()]);
+
+        let allow = read_home_safety_allow(home.path()).expect("read");
+        assert_eq!(
+            allow,
+            vec!["git fetch *".to_string(), "gh issue *".to_string()],
+            "the pre-existing entry must survive, in its original position, with the new one \
+             appended"
+        );
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = ctx::config::CtxConfig::load(repo.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(
+            cfg.chat.model.as_deref(),
+            Some("opus"),
+            "an unrelated table ([chat]) must be untouched by the [safety] rewrite"
+        );
+    }
+
+    #[test]
+    fn union_home_safety_allow_is_a_noop_when_every_pattern_is_already_present() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[safety]\nallow = [\"gh issue *\"]\n",
+        )
+        .expect("write");
+
+        let added =
+            union_home_safety_allow(home.path(), &["gh issue *".to_string()]).expect("write");
+        assert!(added.is_empty());
+        assert_eq!(
+            read_home_safety_allow(home.path()).expect("read"),
+            vec!["gh issue *".to_string()]
+        );
+    }
+
+    #[test]
+    fn union_home_safety_allow_backs_up_the_pre_write_file() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        let ctx_toml = home.path().join(".zirv/ctx.toml");
+        std::fs::write(&ctx_toml, "[safety]\nallow = [\"git fetch *\"]\n").expect("write");
+
+        union_home_safety_allow(home.path(), &["gh issue *".to_string()]).expect("write");
+
+        let backup = home.path().join(".zirv/ctx.toml.bak");
+        assert!(backup.is_file(), "the pre-write file must be backed up");
+        let backup_text = std::fs::read_to_string(&backup).expect("read backup");
+        assert!(
+            backup_text.contains("git fetch *"),
+            "the backup must be the PRE-write content: {backup_text}"
         );
     }
 
