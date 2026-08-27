@@ -4126,6 +4126,17 @@ fn is_curl_or_wget_get_only(tokens: &[String], scratchpad_roots: &[String]) -> b
 /// mutations). Reuses [`first_positional`]/[`KUBE_HELM_VALUE_FLAGS`] so a
 /// global flag ahead of the verb (`kubectl -n prod get pods`) is not
 /// misread as the verb itself.
+///
+/// Code review fix: two narrowings on top of the above, both deliberately
+/// STRICTER than issue #168's own literal examples.
+/// - `get`/`describe` no longer qualify when the resource being fetched is a
+///   Secret (`secret`/`secrets`, alone, comma-joined with other resources,
+///   or `secret/<name>`-qualified) -- reading a Secret's decoded value IS a
+///   credential dump, however read-only the verb otherwise looks.
+/// - `--raw` disqualifies `get`/`describe`/`config` outright: it bypasses
+///   the resource-name check above entirely (an arbitrary API path, not a
+///   resource-type argument) for `get`/`describe`, and `config view --raw`
+///   prints embedded client certs/tokens in full.
 fn is_kubectl_read_only(tokens: &[String]) -> bool {
     if tokens.first().map(|t| sql_program_name(t)).as_deref() != Some("kubectl") {
         return false;
@@ -4133,12 +4144,22 @@ fn is_kubectl_read_only(tokens: &[String]) -> bool {
     let Some(verb) = first_positional(tokens, KUBE_HELM_VALUE_FLAGS) else {
         return false;
     };
+    let verb_index = tokens.iter().position(|t| t == verb).unwrap_or(0);
+    let rest = &tokens[verb_index..];
+    if rest.iter().any(|t| t == "--raw") {
+        return false;
+    }
     match verb {
-        "get" | "describe" | "logs" | "version" | "api-resources" => true,
-        "config" => {
-            let config_index = tokens.iter().position(|t| t == verb).unwrap_or(0);
-            first_positional(&tokens[config_index..], KUBE_HELM_VALUE_FLAGS) == Some("view")
+        "get" | "describe" => {
+            !first_positional(rest, KUBE_HELM_VALUE_FLAGS).is_some_and(|resource| {
+                resource
+                    .to_ascii_lowercase()
+                    .split(',')
+                    .any(|part| part.starts_with("secret"))
+            })
         }
+        "logs" | "version" | "api-resources" => true,
+        "config" => first_positional(rest, KUBE_HELM_VALUE_FLAGS) == Some("view"),
         _ => false,
     }
 }
@@ -5184,6 +5205,66 @@ mod tests {
                 "{command} should not qualify"
             );
         }
+    }
+
+    /// Code review fix: `kubectl get`/`describe` must not qualify as
+    /// read-only when the resource being fetched is a Secret -- reading a
+    /// Secret's decoded value IS a credential dump, regardless of how
+    /// "read-only" the verb otherwise looks. Deliberately narrows issue
+    /// #168's own literal `kubectl get` example. Every other resource type,
+    /// and every other read verb, keeps working.
+    #[test]
+    fn kubectl_get_describe_reject_secrets_but_keep_other_resources() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "kubectl get secrets",
+            "kubectl get secret",
+            "kubectl get secret my-secret",
+            "kubectl get secret/my-secret",
+            "kubectl describe secrets",
+            "kubectl describe secret my-secret",
+            "kubectl get pods,secrets",
+            "kubectl -n prod get secrets --all-namespaces",
+        ] {
+            assert!(
+                !is_read_only_escape_safe(command, &roots),
+                "{command} should not qualify"
+            );
+        }
+        for command in [
+            "kubectl get pods",
+            "kubectl get pod my-pod",
+            "kubectl describe pod my-pod",
+            "kubectl -n prod get configmaps",
+            "kubectl get deployments",
+        ] {
+            assert!(
+                is_read_only_escape_safe(command, &roots),
+                "{command} should qualify"
+            );
+        }
+    }
+
+    /// Code review fix: `kubectl config view --raw` prints embedded
+    /// credentials (client certs/tokens) in full -- it must not qualify even
+    /// though `config view` otherwise does. `kubectl get/describe --raw`
+    /// bypasses this classifier's own resource-name check entirely (it takes
+    /// a raw API path, not a resource type argument), so it is excluded too,
+    /// as a proactive narrowing directly adjacent to the same gap.
+    #[test]
+    fn kubectl_raw_flag_disqualifies_config_view_and_get_describe() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "kubectl config view --raw",
+            "kubectl get --raw /api/v1/namespaces/default/secrets/foo",
+            "kubectl describe --raw /api/v1/namespaces/default/secrets/foo",
+        ] {
+            assert!(
+                !is_read_only_escape_safe(command, &roots),
+                "{command} should not qualify"
+            );
+        }
+        assert!(is_read_only_escape_safe("kubectl config view", &roots));
     }
 
     /// End-to-end: a read-only kubectl/curl/git/glab retry allows silently
