@@ -1270,15 +1270,22 @@ mod tests {
         assert_eq!(parsed["signals"]["marker_miss_rate"], 0.0);
     }
 
+    /// `score.token_floor`/`token_ceiling` are `REPO_FORBIDDEN` (issue #155,
+    /// Phase 6b): a repo checkout can no longer move them, only the
+    /// operator's own home layer can -- see `config.rs`'s
+    /// `a_repo_ctx_toml_cannot_move_any_of_the_five_token_gate_keys`. This is
+    /// that same trust boundary exercised through `score`'s own entry point.
     #[test]
-    fn repo_config_changes_the_verdict() {
+    fn operator_config_changes_the_verdict() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join(".zirv")).expect("mkdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
         std::fs::write(
-            dir.path().join(".zirv/ctx.toml"),
+            home.path().join(".zirv/ctx.toml"),
             "[score]\ntoken_floor = 500000\ntoken_ceiling = 900000\n",
         )
         .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let transcript = write_transcript(dir.path(), 12, false, 170_000);
         let args = ScoreArgs {
             transcript,

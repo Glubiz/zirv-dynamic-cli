@@ -118,6 +118,14 @@ pub struct Capabilities {
     /// `dash::pane::inject_visible` for the two callers this actually
     /// changes behavior for.
     pub defer_injection_submit: bool,
+    /// The model's usable context window, when the adapter can state one
+    /// (issue #155). `None` means "unknown", which `rot::token_gates` reads
+    /// as "use the absolute `score.token_floor`/`token_ceiling` defaults" --
+    /// never as a guess. Delivered inside `Capabilities` deliberately: this
+    /// struct is already an input to `rot::score_events` and
+    /// `RotState::score`, so capacity reaches the rot engine without adding
+    /// a single fs, clock or env read to a module that must stay pure.
+    pub context_window_tokens: Option<u64>,
 }
 
 /// Raw material for handoffs, extracted per-agent because it needs fields the
@@ -164,6 +172,15 @@ mod tests {
         assert!(!caps.marker_signal);
         assert!(!caps.token_usage);
         assert!(!caps.turn_signal);
+    }
+
+    /// Issue #155, Phase 6(a): capacity is a CAPABILITY, delivered inside the
+    /// struct `rot.rs` already receives. That is what lets rotation
+    /// thresholds become ratios of a real window without adding any fs,
+    /// clock or env access to a module that must stay pure.
+    #[test]
+    fn capabilities_default_to_an_unknown_context_window() {
+        assert_eq!(Capabilities::default().context_window_tokens, None);
     }
 
     #[test]

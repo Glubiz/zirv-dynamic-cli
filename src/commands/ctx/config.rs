@@ -27,8 +27,25 @@ pub fn env_from_process() -> impl Fn(&str) -> Option<String> {
 pub struct ScoreConfig {
     pub window: usize,
     pub min_turns: usize,
-    pub token_floor: u64,
-    pub token_ceiling: u64,
+    /// Explicit absolute override for the token-pressure floor. Wins outright
+    /// over `token_floor_ratio` when set -- an operator who pins a number
+    /// gets that number, capacity or not. `None` (the default) means "derive
+    /// it from the ratio and the resolved capacity instead"; see
+    /// `rot::token_gates`.
+    pub token_floor: Option<u64>,
+    /// Same as `token_floor`, for the ceiling.
+    pub token_ceiling: Option<u64>,
+    /// Fraction of the resolved capacity the floor sits at when no explicit
+    /// `token_floor` is set (issue #155, Phase 6b). Default `0.5`.
+    pub token_floor_ratio: f64,
+    /// Fraction of the resolved capacity the ceiling sits at when no
+    /// explicit `token_ceiling` is set. Default `0.8`.
+    pub token_ceiling_ratio: f64,
+    /// Operator-pinned context-window capacity, overriding whatever the
+    /// adapter itself reports (`Capabilities::context_window_tokens`): the
+    /// operator knows their own seat, and the adapter's default is a guess
+    /// about it. `None` (the default) defers to the adapter.
+    pub model_context_tokens: Option<u64>,
     pub weight_tool_failure: f64,
     pub weight_repetition: f64,
     pub weight_marker: f64,
@@ -44,8 +61,11 @@ impl Default for ScoreConfig {
         Self {
             window: 10,
             min_turns: 10,
-            token_floor: 100_000,
-            token_ceiling: 160_000,
+            token_floor: None,
+            token_ceiling: None,
+            token_floor_ratio: 0.5,
+            token_ceiling_ratio: 0.8,
+            model_context_tokens: None,
             weight_tool_failure: 40.0,
             weight_repetition: 30.0,
             weight_marker: 30.0,
@@ -980,6 +1000,21 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["score", "token_ceiling"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO",
+        &["score", "token_floor_ratio"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO",
+        &["score", "token_ceiling_ratio"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS",
+        &["score", "model_context_tokens"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MARKER", &["score", "marker"], EnvKind::Str),
     (
         "ZIRV_CTX_DEBOUNCE_MS",
@@ -1786,6 +1821,30 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // otherwise impose on a write statement reaching a broad allow rule or
     // the permissive interactive default -- loosening only.
     (&["safety", "sql"], "ZIRV_CTX_SAFETY_SQL"),
+    // Issue #155, Phase 6b: a repo checkout must not be able to move when the
+    // operator's own sessions rotate -- raising the ceiling (or the ratio
+    // that derives it) hides rot from the operator for longer; lowering the
+    // floor fires restarts, and the compaction/handoff they trigger, more
+    // often than the operator chose. Both directions are the checkout
+    // choosing spend/safety behavior for its own operator, the same trust
+    // asymmetry every other entry in this list enforces. All five keys that
+    // feed `rot::token_gates` are forbidden together, absolutes and ratios
+    // alike, so a checkout cannot route around the absolute-override block by
+    // tuning the ratio instead (or vice versa).
+    (&["score", "token_floor"], "ZIRV_CTX_TOKEN_FLOOR"),
+    (&["score", "token_ceiling"], "ZIRV_CTX_TOKEN_CEILING"),
+    (
+        &["score", "token_floor_ratio"],
+        "ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO",
+    ),
+    (
+        &["score", "token_ceiling_ratio"],
+        "ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO",
+    ),
+    (
+        &["score", "model_context_tokens"],
+        "ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -2331,8 +2390,14 @@ mod tests {
         let cfg = ScoreConfig::default();
         assert_eq!(cfg.window, 10);
         assert_eq!(cfg.min_turns, 10);
-        assert_eq!(cfg.token_floor, 100_000);
-        assert_eq!(cfg.token_ceiling, 160_000);
+        assert_eq!(
+            cfg.token_floor, None,
+            "absolute overrides are unset by default -- see rot::token_gates"
+        );
+        assert_eq!(cfg.token_ceiling, None);
+        assert_eq!(cfg.token_floor_ratio, 0.5);
+        assert_eq!(cfg.token_ceiling_ratio, 0.8);
+        assert_eq!(cfg.model_context_tokens, None);
         assert_eq!(cfg.advise_at, 40);
         assert_eq!(cfg.compact_at, 60);
         assert_eq!(cfg.restart_at, 80);
@@ -2371,17 +2436,16 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
-            "[score]\nwindow = 4\ntoken_floor = 50000\nmarker = \"[repo]\"\n",
+            "[score]\nwindow = 4\nmarker = \"[repo]\"\n",
         )
         .expect("write");
 
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert_eq!(cfg.score.window, 4);
-        assert_eq!(cfg.score.token_floor, 50_000);
         assert_eq!(cfg.score.marker, "[repo]");
         assert_eq!(
-            cfg.score.token_ceiling, 160_000,
+            cfg.score.token_ceiling_ratio, 0.8,
             "untouched keys keep defaults"
         );
 
@@ -2389,7 +2453,58 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.score.window, 7);
         assert_eq!(cfg.score.marker, "[env]");
-        assert_eq!(cfg.score.token_floor, 50_000, "repo layer still applies");
+    }
+
+    /// Companion to the test above, for the token gate's own five keys
+    /// specifically: none of them may be set from a repo checkout at all
+    /// (issue #155, Phase 6b) -- see `REPO_FORBIDDEN`'s own comment on the
+    /// `score.token_floor` entry for why both the absolutes and the ratios
+    /// are blocked together.
+    #[test]
+    fn a_repo_ctx_toml_cannot_move_any_of_the_five_token_gate_keys() {
+        for repo_toml in [
+            "[score]\ntoken_floor = 50000\n",
+            "[score]\ntoken_ceiling = 900000\n",
+            "[score]\ntoken_floor_ratio = 0.9\n",
+            "[score]\ntoken_ceiling_ratio = 0.1\n",
+            "[score]\nmodel_context_tokens = 1000000\n",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            let home = tempfile::tempdir().expect("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repo may not set: {repo_toml}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "must be a security refusal for {repo_toml}: {err}"
+            );
+        }
+    }
+
+    /// The operator's own home layer -- unlike the repo layer above -- may
+    /// still set `token_floor`/`token_ceiling` as plain integers, and they
+    /// still parse: the type moved from `u64` to `Option<u64>`, but a
+    /// present value still deserializes to `Some`, so no existing operator
+    /// config breaks.
+    #[test]
+    fn an_operator_layer_still_parses_plain_integer_token_thresholds() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[score]\ntoken_floor = 50000\ntoken_ceiling = 900000\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.token_floor, Some(50_000));
+        assert_eq!(cfg.score.token_ceiling, Some(900_000));
     }
 
     #[test]
@@ -4457,6 +4572,9 @@ mod tests {
         ("score", "min_turns"),
         ("score", "token_floor"),
         ("score", "token_ceiling"),
+        ("score", "token_floor_ratio"),
+        ("score", "token_ceiling_ratio"),
+        ("score", "model_context_tokens"),
         ("score", "weight_tool_failure"),
         ("score", "weight_repetition"),
         ("score", "weight_marker"),

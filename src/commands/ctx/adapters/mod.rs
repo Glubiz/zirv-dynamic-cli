@@ -1140,6 +1140,30 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
 
+    /// This adapter's usable context window for `model`, when it can state
+    /// one. `None` -- the default -- means no verified capacity, which
+    /// leaves rotation on its absolute thresholds. Never guess: an
+    /// overstated capacity raises the restart ceiling past what the seat
+    /// holds, and overrunning a window is worse than rotating early.
+    fn context_window_tokens(&self, _model: Option<&str>) -> Option<u64> {
+        None
+    }
+
+    /// [`capabilities`](Self::capabilities) with the context window resolved
+    /// for a KNOWN model. Callers that have a model string to hand use this;
+    /// everything else keeps calling `capabilities()`, which carries the
+    /// adapter's own conservative default.
+    // Issue #155: no production caller yet -- Phase 6(b)'s rot.rs threshold
+    // work is what calls this with a real model string, the same "accessor
+    // lands ahead of its production caller" pattern `tail_delegations` used.
+    #[allow(dead_code)]
+    fn capabilities_for_model(&self, model: Option<&str>) -> Capabilities {
+        Capabilities {
+            context_window_tokens: self.context_window_tokens(model),
+            ..self.capabilities()
+        }
+    }
+
     /// A verified harness-owned way to present a local artifact directly in
     /// that harness's UI, without launching a browser or development server.
     /// Current Claude Code and Codex CLI adapters intentionally keep the
@@ -2864,6 +2888,7 @@ mod tests {
             system_prompt: true,
             events: true,
             defer_injection_submit: true,
+            context_window_tokens: None,
         };
         assert!(missing_capability_labels(all_true).is_empty());
 
