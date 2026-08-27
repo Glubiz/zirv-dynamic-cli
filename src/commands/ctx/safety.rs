@@ -5484,6 +5484,104 @@ mod tests {
         }
     }
 
+    // -- issue #168, decision (h): the full regression corpus -------------
+
+    /// One row per command shape the issue's own examples and this plan's
+    /// design decisions name, each checked across BOTH `permission_mode`s
+    /// hook-mode branches on (`"default"` interactive-ish, `"dontAsk"`
+    /// headless-ish) and BOTH values of `dangerouslyDisableSandbox` --
+    /// `expected_substring` is what the hook's stdout JSON must contain in
+    /// every one of those four combinations for that row.
+    #[test]
+    fn issue_168_regression_corpus() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let scratchpad = scratchpad_write_root(&std::env::temp_dir());
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // (command template, expected substring in the hook's JSON output)
+        // `{scratchpad}`/`{cwd}` are substituted before use.
+        //
+        // `locate` is deliberately absent from `allow_rows`: it is one of
+        // this plan's decision (f) shapes at the BASE classifier only (never
+        // hard-denies, see the read_only_find_locate_rg tests above) -- it
+        // was never added to any escape-safe family (built-in, or by this
+        // plan's Task 2), so an unsandboxed retry of it legitimately
+        // escalates, same as any other unlisted-family command. Folding it
+        // into this corpus's "never ask/deny across BOTH sandbox-flag
+        // values" sweep would require either widening `is_read_only_escape_
+        // safe` beyond this plan's own stated Task 2 scope, or weakening the
+        // pre-existing retry-escalation floor -- neither of which this task
+        // is for.
+        let allow_rows: &[&str] = &[
+            "gh issue view 155",
+            "gh pr checks 159",
+            "gh api repos/x/y",
+            "git fetch && git branch -r",
+            "zirv ctx status",
+            "zirv ctx remember key value",
+            "cd {cwd} && git log",
+            "grep -r TODO . > {scratchpad}/out.log",
+            "find . -name '*.rs'",
+            "rg TODO .",
+        ];
+        let escalate_rows: &[&str] = &[
+            "gh pr create --title x",
+            "git push origin main",
+            "kubectl exec -it pod -- sh",
+            "curl -X POST https://example.com",
+            "cd {cwd} && rm -rf .",
+            "echo secret > /etc/passwd",
+        ];
+
+        for template in allow_rows {
+            let command = template
+                .replace("{scratchpad}", &scratchpad)
+                .replace("{cwd}", &cwd);
+            for permission_mode in ["default", "dontAsk"] {
+                for dangerously_disable_sandbox in [true, false] {
+                    let stdin = format!(
+                        r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}","dangerouslyDisableSandbox":{dangerously_disable_sandbox}}},"permission_mode":"{permission_mode}"}}"#
+                    );
+                    let mut out = Vec::new();
+                    run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+                    let text = String::from_utf8(out).expect("utf8");
+                    assert!(
+                        !text.contains(r#""permissionDecision":"ask""#)
+                            && !text.contains(r#""permissionDecision":"deny""#),
+                        "ALLOW row {command:?} (permission_mode={permission_mode}, dangerouslyDisableSandbox={dangerously_disable_sandbox}) must never prompt or deny: got {text}"
+                    );
+                }
+            }
+        }
+
+        for template in escalate_rows {
+            let command = template
+                .replace("{scratchpad}", &scratchpad)
+                .replace("{cwd}", &cwd);
+            for (permission_mode, dangerously_disable_sandbox, expected) in
+                [("default", true, "ask"), ("dontAsk", true, "deny")]
+            {
+                let stdin = format!(
+                    r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}","dangerouslyDisableSandbox":{dangerously_disable_sandbox}}},"permission_mode":"{permission_mode}"}}"#
+                );
+                let mut out = Vec::new();
+                run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
+                let text = String::from_utf8(out).expect("utf8");
+                assert!(
+                    text.contains(&format!(r#""permissionDecision":"{expected}""#)),
+                    "ESCALATE row {command:?} (permission_mode={permission_mode}, dangerouslyDisableSandbox={dangerously_disable_sandbox}) expected {expected}: got {text}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_policy_fingerprint_is_stable_and_changes_with_every_effective_posture() {
         let original = SafetyPolicy::default();
