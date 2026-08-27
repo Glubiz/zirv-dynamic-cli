@@ -124,18 +124,88 @@ fn native_codex_path(repo: &Path) -> PathBuf {
     repo.join("AGENTS.md")
 }
 
+/// The prefix of a generated file's canonical-content provenance line. Sits
+/// on the line immediately after [`MANAGED_MARKER`], so it is inside the
+/// managed prefix [`is_managed`] recognises and a zirv old enough not to know
+/// about it still reads the file as managed.
+pub const CANONICAL_HASH_PREFIX: &str = "<!-- zirv:canonical-sha256:";
+
+/// SHA-256 over the exact canonical inputs a render used, as 64 lowercase
+/// hex characters.
+///
+/// Domain-separated by length prefix, not by a delimiter: hashing
+/// `common + harness` directly would give `("ab","c")` and `("a","bc")` the
+/// same digest, and a collision here would make `compile.rs` skip injecting
+/// content the native file does not actually hold -- a silent instruction
+/// loss, which is the one failure this whole phase must not introduce.
+///
+/// Hashes the TRIMMED text, matching what [`render_generated`] actually
+/// writes, so trailing-whitespace churn in `.zirv/context/` cannot
+/// invalidate a file whose delivered bytes are unchanged. An absent or
+/// all-whitespace input is `None`/empty for both, so the two agree.
+pub fn canonical_sha256(common: Option<&str>, harness_specific: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let normalize = |t: Option<&str>| -> String {
+        t.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+    let common = normalize(common);
+    let harness = normalize(harness_specific);
+    let mut hasher = Sha256::new();
+    hasher.update(b"zirv-canonical-v1");
+    for part in [&common, &harness] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The hash a generated file states it was rendered from, if it states one.
+/// `None` for a file generated before this change, for a native file, or for
+/// a malformed line -- every one of which correctly means "cannot prove
+/// equality", which `compile.rs` reads as "inject as before".
+///
+/// Issue #155, Task 3.1 produces this reader; only its own tests call it
+/// until Task 3.2 wires `compile.rs`'s injection-skip to it, so
+/// `#[allow(dead_code)]` documents the gap as deliberate rather than an
+/// oversight, the same way `announce.rs`'s macOS-only variant is marked.
+#[allow(dead_code)]
+pub fn embedded_canonical_sha256(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .take(4)
+        .find_map(|line| line.trim().strip_prefix(CANONICAL_HASH_PREFIX))?;
+    let hex = line.trim().strip_suffix("-->")?.trim();
+    (hex.len() == 64
+        && hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+    .then(|| hex.to_string())
+}
+
 /// Renders one generated compatibility file: the managed marker, then the
-/// canonical common text (if any and non-blank), then the harness-specific
-/// canonical text (if any and non-blank). A pure function of its two
-/// arguments -- no clock, no environment, no filesystem read of its own --
-/// so two calls with the same inputs always produce the same bytes, and the
-/// only way two harnesses' generated files could ever share content is if
-/// the caller passed the same `harness_specific` text to both, which
-/// `run_generate` never does (see this module's own doc).
+/// canonical-content provenance hash, then the canonical common text (if any
+/// and non-blank), then the harness-specific canonical text (if any and
+/// non-blank). A pure function of its two arguments -- no clock, no
+/// environment, no filesystem read of its own -- so two calls with the same
+/// inputs always produce the same bytes, and the only way two harnesses'
+/// generated files could ever share content is if the caller passed the same
+/// `harness_specific` text to both, which `run_generate` never does (see
+/// this module's own doc).
 fn render_generated(common: Option<&str>, harness_specific: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(MANAGED_MARKER);
     out.push('\n');
+
+    out.push_str(CANONICAL_HASH_PREFIX);
+    out.push_str(&canonical_sha256(common, harness_specific));
+    out.push_str(" -->\n");
 
     let common = common.map(str::trim).filter(|s| !s.is_empty());
     let harness = harness_specific.map(str::trim).filter(|s| !s.is_empty());
@@ -619,9 +689,15 @@ mod tests {
     }
 
     #[test]
-    fn render_generated_with_no_canonical_content_is_just_the_marker() {
+    fn render_generated_with_no_canonical_content_is_just_the_marker_and_hash() {
         let text = render_generated(None, None);
-        assert_eq!(text, format!("{MANAGED_MARKER}\n"));
+        assert_eq!(
+            text,
+            format!(
+                "{MANAGED_MARKER}\n{CANONICAL_HASH_PREFIX}{} -->\n",
+                canonical_sha256(None, None)
+            )
+        );
     }
 
     #[test]
@@ -668,6 +744,84 @@ mod tests {
         assert!(!claude_out.contains("Codex-only"));
         assert!(codex_out.contains("Codex-only"));
         assert!(!codex_out.contains("Claude-only"));
+    }
+
+    // -- canonical-content hash: provenance stamp for Task 3.2's dedupe -----
+
+    /// Issue #155, Phase 3: a generated file states, in its own bytes, which
+    /// canonical content it was rendered from. That is what lets `compile.rs`
+    /// prove -- not guess -- that the harness has already read these exact
+    /// instructions natively, and skip re-injecting them.
+    #[test]
+    fn a_generated_file_carries_the_hash_of_the_canonical_content_it_rendered() {
+        let rendered = render_generated(Some("common text"), Some("claude text"));
+        let embedded = embedded_canonical_sha256(&rendered).expect("a hash line");
+        assert_eq!(
+            embedded,
+            canonical_sha256(Some("common text"), Some("claude text"))
+        );
+        assert_eq!(embedded.len(), 64);
+        assert!(
+            embedded
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+        assert!(
+            is_managed(&rendered),
+            "the hash line must sit INSIDE the managed prefix, so an older binary still \
+             recognises the file as managed"
+        );
+    }
+
+    /// Domain separation: the two halves must not be concatenable into each
+    /// other. Without a length-or-delimiter-committed hash, moving one
+    /// character across the boundary would produce the same digest, and the
+    /// dedupe would then skip injecting content the file does NOT hold.
+    #[test]
+    fn the_canonical_hash_cannot_be_collided_by_moving_the_boundary() {
+        assert_ne!(
+            canonical_sha256(Some("ab"), Some("c")),
+            canonical_sha256(Some("a"), Some("bc"))
+        );
+        assert_ne!(
+            canonical_sha256(Some("x"), None),
+            canonical_sha256(None, Some("x"))
+        );
+    }
+
+    /// The hash is computed over the same TRIMMED text `render_generated`
+    /// actually writes, so trailing-whitespace churn in `.zirv/context/`
+    /// never invalidates a file whose delivered bytes did not change.
+    #[test]
+    fn the_canonical_hash_ignores_whitespace_the_render_itself_trims() {
+        assert_eq!(
+            canonical_sha256(Some("common text"), None),
+            canonical_sha256(Some("\n\n  common text  \n"), None)
+        );
+        assert_eq!(
+            canonical_sha256(Some("common"), Some("   ")),
+            canonical_sha256(Some("common"), None),
+            "an all-whitespace harness file renders nothing, so it must hash as nothing"
+        );
+    }
+
+    /// A file with no hash line at all -- one generated by an older zirv --
+    /// reads as `None`, never as an error and never as a wrong hash.
+    #[test]
+    fn a_file_generated_before_this_change_has_no_embedded_hash() {
+        let old = format!("{MANAGED_MARKER}\n\ncommon text\n");
+        assert!(is_managed(&old));
+        assert_eq!(embedded_canonical_sha256(&old), None);
+    }
+
+    /// Regeneration stays byte-for-byte deterministic: no clock, no session
+    /// detail. `generate_one`'s `Unchanged` outcome depends on it.
+    #[test]
+    fn rendering_twice_with_the_same_inputs_produces_identical_bytes() {
+        assert_eq!(
+            render_generated(Some("common"), Some("harness")),
+            render_generated(Some("common"), Some("harness"))
+        );
     }
 
     // -- is_managed -----------------------------------------------------
