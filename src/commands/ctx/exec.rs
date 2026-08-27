@@ -5294,20 +5294,31 @@ mod tests {
         let repo_for_writer = tmp.path().to_path_buf();
         let session_log_for_writer = session_log.clone();
         let writer = std::thread::spawn(move || -> Vec<String> {
-            // 2s, not the old 5s (which already exceeded this test's own 3s
-            // per-cycle timeout even before any contention): honest against
-            // the time actually available, and a give-up on either wait now
-            // panics instead of silently skipping its own nudge -- which,
-            // for the *second* wait especially, would have let this test
-            // pass for the wrong reason (proving nothing about the cap,
-            // only that no second nudge was ever attempted). See
+            // 2s: the first hang-mode agent only has to spawn and write its
+            // one line, no termination involved, so this is comfortably
+            // honest against the time actually available. A give-up here
+            // panics instead of silently skipping its own nudge -- see
             // `wait_for_lines_or_panic`'s own doc comment.
             let first = wait_for_lines_or_panic(&session_log_for_writer, 1, Duration::from_secs(2));
             debug_assert!(!first.is_empty());
             nudge_live_session(&state_for_writer, &repo_for_writer, "first nudge, honored");
 
+            // 10s, not 2s: unlike the first wait, this one sits behind a
+            // real `terminate()` of the first hang-mode child -- on Windows
+            // that is a synchronous `taskkill /T /F` spawn, verified (via
+            // temporary timing instrumentation, since removed) to cost
+            // 1.4-1.9s on an ordinarily loaded dev machine even outside this
+            // test, well before the handoff/compile/relaunch work that
+            // follows it. A 2s budget here was never honest against that
+            // cost, and failed deterministically under real host
+            // contention (confirmed independent of any code change: the
+            // same failure reproduces at a commit two revisions before this
+            // one) -- 10s leaves the same order-of-magnitude margin the
+            // sibling `a_nudge_restart_carries_a_handoff_forward_like_
+            // every_other_restart` test already gives its own 20s wait
+            // against the same taskkill cost.
             let second =
-                wait_for_lines_or_panic(&session_log_for_writer, 2, Duration::from_secs(2));
+                wait_for_lines_or_panic(&session_log_for_writer, 2, Duration::from_secs(10));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
