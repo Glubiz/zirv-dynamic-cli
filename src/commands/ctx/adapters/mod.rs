@@ -1023,6 +1023,17 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
+    /// This agent's own layer for a `PromptRole::SubOrchestrator` session --
+    /// a coordinator handed one scope, which may dispatch Workers but not
+    /// spawn another coordinator (see `PromptRole::SubOrchestrator`).
+    ///
+    /// Defaults to the Worker layer: an adapter with nothing coordinator-
+    /// specific to say should say the safer thing, not the more permissive
+    /// one.
+    fn sub_orchestrator_system_prompt(&self) -> Option<&'static str> {
+        self.worker_system_prompt()
+    }
+
     /// The user-facing flag name `system_prompt_args` emits, when the agent has
     /// one. Lets a caller find and merge a user's own use of the flag instead
     /// of silently overriding it with a second occurrence. `None` when the

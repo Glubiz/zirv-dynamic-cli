@@ -64,8 +64,9 @@ outcomes, including failures, plainly.
 - Before reporting development work done, run this harness's own /code-review over the full diff \
 at a single-reviewer effort level (low or medium), routed to the review model named in the \
 harness roster, never this seat's own model, and never a high-or-above fan-out, which forks \
-agents that inherit the seat's expensive model. A session that also carries the zirv meta-harness \
-layer follows that layer's cross-harness review round on top.";
+agents that inherit the seat's expensive model. If a `zirv workflow` review gate is active for \
+this change, that gate is the single source of truth and this native review does not run at all: \
+`zirv workflow review run` is the round.";
 
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
@@ -89,6 +90,30 @@ fork-type subagents, which inherit this session's model and ignore overrides.
 spawned you owns review rounds.
 - Your final message is your report: lead with the outcome, keep it self-contained, and never dump \
 raw file contents into it.";
+
+/// Claude's own layer for a `PromptRole::SubOrchestrator` session (see
+/// `AgentAdapter::sub_orchestrator_system_prompt`), spliced in place of
+/// [`ORCHESTRATOR_PROMPT`] and [`WORKER_PROMPT`] for that role. Unlike a
+/// Worker, a sub-orchestrator may split its own scope and dispatch Workers
+/// via `zirv agent` -- so it gets that delegation vocabulary -- but unlike
+/// the Orchestrator it must never learn to spawn another coordinator: an
+/// unbounded delegation tree is exactly the cost failure this role exists to
+/// bound. It also does not carry the Orchestrator layer's own review-round
+/// rules -- the Orchestrator owns review gates.
+pub const SUB_ORCHESTRATOR_PROMPT: &str = "\
+zirv sub-orchestrator conventions (claude)
+
+You are a sub-orchestrator: you coordinate ONE scope handed to you by an orchestrator, you do not \
+decide which harnesses run.
+
+- Split your scope and dispatch delegated workers with `zirv agent <name> \"<prompt>\" -- --model \
+<m>`, always naming the cheapest model that can do the task.
+- Do not spawn another sub-orchestrator or a dashboard coordinator: delegation stops at one level \
+below you.
+- Keep your own replies to decisions and outcomes, not implementation: do not read large files or \
+write code yourself unless the change is trivial.
+- When every child you dispatched is done, report your scope's result back plainly, including any \
+failures.";
 
 fn text_of(message: &Value) -> String {
     message
@@ -816,6 +841,10 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn worker_system_prompt(&self) -> Option<&'static str> {
         Some(WORKER_PROMPT)
+    }
+
+    fn sub_orchestrator_system_prompt(&self) -> Option<&'static str> {
+        Some(SUB_ORCHESTRATOR_PROMPT)
     }
 
     /// Counted over the argv the operator wrote, not over the argv `base()`
@@ -2813,6 +2842,34 @@ mod tests {
         }
     }
 
+    /// The trimmed coordination layer is real text, materially shorter than
+    /// the orchestrator layer -- the whole point is that a coordinator seat
+    /// costs less than the seat that spawned it -- and it must never coach
+    /// onward coordinator spawning.
+    #[test]
+    fn the_sub_orchestrator_layer_is_short_and_forbids_spawning_coordinators() {
+        assert!(SUB_ORCHESTRATOR_PROMPT.len() < ORCHESTRATOR_PROMPT.len());
+        assert!(SUB_ORCHESTRATOR_PROMPT.contains("zirv agent"));
+        assert!(
+            SUB_ORCHESTRATOR_PROMPT.contains("sub-orchestrator"),
+            "must name what it must not spawn"
+        );
+    }
+
+    /// Claude actually wires `SUB_ORCHESTRATOR_PROMPT` into the adapter
+    /// trait rather than leaving the const unused and falling back to the
+    /// default (`worker_system_prompt`) -- the three role layers must all be
+    /// distinct texts.
+    #[test]
+    fn claude_has_its_own_sub_orchestrator_layer_distinct_from_the_other_two() {
+        let layer = ClaudeAdapter::new(None)
+            .sub_orchestrator_system_prompt()
+            .expect("claude has a sub-orchestrator layer");
+        assert_eq!(layer, SUB_ORCHESTRATOR_PROMPT);
+        assert_ne!(layer, WORKER_PROMPT);
+        assert_ne!(layer, ORCHESTRATOR_PROMPT);
+    }
+
     /// The claude ladder, top to bottom: fable/mythos, opus, sonnet, haiku.
     /// `review_model_below` returns the tier one below `seat`; an unknown or
     /// absent seat assumes the top tier, and haiku (already the floor) maps
@@ -3131,6 +3188,22 @@ mod tests {
             ),
             "the model-routing bullet's pin clause must carve out the review-model exception: \
              {ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// The specific sentence being corrected: the orchestrator layer used to
+    /// say a session carrying the zirv meta-harness layer follows that
+    /// layer's cross-harness review round "on top" of its own /code-review.
+    /// That instruction is what turned one change into three review rounds.
+    #[test]
+    fn the_orchestrator_layer_no_longer_stacks_a_review_round_on_top() {
+        assert!(
+            !ORCHESTRATOR_PROMPT.contains("on top"),
+            "the stacking instruction must be gone"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow"),
+            "and must instead defer to the workflow gate when one is active"
         );
     }
 
