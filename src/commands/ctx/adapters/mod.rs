@@ -1136,6 +1136,30 @@ pub trait AgentAdapter: std::fmt::Debug {
         false
     }
 
+    /// Whether [`parse_events`](Self::parse_events) can ever emit
+    /// [`NormalizedEvent::ToolCall`] for this agent -- i.e., whether
+    /// `--max-tool-calls` (issue #155, Phase 5(d)) has any real signal to
+    /// count against. `true` by default, since most adapters' `parse_events`
+    /// are built directly off verified tool-call records in their own
+    /// transcript.
+    ///
+    /// Issue #155 review finding C2: `CodexAdapter` overrides this to
+    /// `false` -- its own `parse_events` doc comment explains there is no
+    /// verified rollout shape for a tool call at all, so it deliberately
+    /// never emits one. Left silently `true` here, `--max-tool-calls` would
+    /// accept the flag for a codex worker and then never advance toward it,
+    /// which reads as "budget respected" forever rather than "budget not
+    /// enforceable". `exec::run_with_clock` checks this once, at
+    /// argument-validation time, and refuses the flag outright rather than
+    /// let it fail silently on every poll after that.
+    ///
+    /// Deliberately outside [`Capabilities`]: nothing in `rot.rs` or
+    /// anything scored reads this, so it does not belong in the struct that
+    /// exists to feed those signals.
+    fn counts_tool_calls(&self) -> bool {
+        true
+    }
+
     fn compact_command(&self) -> Option<&'static str>;
     fn quit_sequence(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;

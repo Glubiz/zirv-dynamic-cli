@@ -360,6 +360,18 @@ pub(crate) fn run_with_clock<W: Write>(
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
     let adapter = adapters::select(agent_name, &args.command, &cfg)?;
+    // Issue #155 review finding C2: refused here, before anything is
+    // spawned, rather than left to silently never fire -- see
+    // `AgentAdapter::counts_tool_calls`'s own doc comment for why this
+    // adapter cannot enforce the flag at all.
+    if args.max_tool_calls.is_some() && !adapter.counts_tool_calls() {
+        return Err(format!(
+            "--max-tool-calls is not supported with the '{}' adapter: it has no verified way \
+             to count tool calls in its transcript, so the ceiling would never be enforced",
+            adapter.name()
+        )
+        .into());
+    }
     // Resolved once, since `adapter` never changes across a nudge/rot/park
     // restart within one `run_with` call: the operator's own choice
     // (`handoff.model`) if set, else the resolved adapter's own default
@@ -3145,6 +3157,79 @@ mod tests {
             3,
             "a real failure code must survive an over-budget final transcript"
         );
+    }
+
+    /// C2 (issue #155 review finding): the codex adapter's own
+    /// `parse_events` never emits `NormalizedEvent::ToolCall` (see its own
+    /// doc comment), so `--max-tool-calls` would otherwise be accepted for
+    /// a codex worker and then silently never fire. Refused up front,
+    /// before anything is spawned -- no fake agent, no transcript, nothing
+    /// to poll -- the same shape
+    /// `the_delegation_verb_refuses_an_agent_the_settings_file_disabled`
+    /// uses in `agent.rs` for a different early refusal.
+    #[test]
+    fn max_tool_calls_is_refused_up_front_for_the_codex_adapter() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = base_env(&tmp.path().join("state"));
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            session_id: Some("20202020-2222-4333-8444-555555555555".to_string()),
+            transcript: None,
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            max_tool_calls: Some(5),
+            timeout_secs: Some(30),
+            simple: false,
+            command: vec!["codex".to_string(), "exec".to_string()],
+        };
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("codex cannot count tool calls");
+        let msg = err.to_string();
+        assert!(msg.contains("--max-tool-calls"), "got {msg}");
+        assert!(msg.contains("codex"), "got {msg}");
+    }
+
+    /// The other half of C2: an adapter that CAN count tool calls (claude,
+    /// the default) must not be caught by the same refusal just because a
+    /// budget was configured at all.
+    #[test]
+    fn max_tool_calls_is_accepted_for_the_claude_adapter() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let session = "21212121-2222-4333-8444-555555555555";
+        let env = base_env(&tmp.path().join("state"));
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            budget_tokens: None,
+            // Comfortably above what `healthy` mode's fixed 12-turn
+            // transcript could ever produce (it has no tool calls to count
+            // either, but the point here is that the flag is accepted at
+            // all, not rejected before the child ever runs).
+            max_tool_calls: Some(1_000),
+            timeout_secs: Some(30),
+            simple: false,
+            command: fake_agent_command(session),
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+
+        assert_eq!(code.expect("runs"), 0);
     }
 
     #[cfg(unix)]

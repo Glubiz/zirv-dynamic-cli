@@ -1287,6 +1287,17 @@ impl AgentAdapter for CodexAdapter {
         true
     }
 
+    /// Issue #155 review finding C2: `parse_events` above never emits
+    /// `NormalizedEvent::ToolCall` -- deliberately, per its own doc comment,
+    /// since no verified rollout shape exists for a tool call at all -- so a
+    /// `--max-tool-calls` ceiling checked against this adapter's events
+    /// would never see a count above zero. `exec::run_with_clock` reads
+    /// this to refuse the flag outright rather than accept it and silently
+    /// never enforce it.
+    fn counts_tool_calls(&self) -> bool {
+        false
+    }
+
     fn compact_command(&self) -> Option<&'static str> {
         None
     }
@@ -1418,6 +1429,34 @@ mod tests {
     #[test]
     fn codex_now_reports_verified_event_parsing() {
         assert!(CodexAdapter::new(None).capabilities().events);
+    }
+
+    /// Issue #155 review finding C2: `events` above is true (codex derives
+    /// real `TurnStart`/`AssistantFinal` data), but `ToolCall` specifically
+    /// is never one of them -- see `parse_events`'s own doc comment. This
+    /// adapter must say so honestly through the narrower
+    /// `counts_tool_calls` capability rather than let `events: true` be
+    /// mistaken for "the whole normalized vocabulary is covered".
+    #[test]
+    fn codex_reports_it_cannot_count_tool_calls() {
+        assert!(!CodexAdapter::new(None).counts_tool_calls());
+    }
+
+    /// The other half of C2: no rollout line, healthy or otherwise, should
+    /// ever produce a `ToolCall` event -- the fixture below covers a normal
+    /// two-turn session, so this is the direct behavioral proof behind the
+    /// capability flag above, not just a label.
+    #[test]
+    fn parse_events_never_emits_a_tool_call_for_codex() {
+        let jsonl = fixture("codex-rollout-turn-events.jsonl");
+        let adapter = CodexAdapter::new(None);
+        let events = adapter.parse_events(&jsonl);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, NormalizedEvent::ToolCall { .. })),
+            "got {events:?}"
+        );
     }
 
     /// Issue #86: the exact normalized event sequence a recorded two-turn
