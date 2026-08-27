@@ -291,7 +291,12 @@ impl RotState {
         if !self.built_for(cfg) {
             return None;
         }
-        Some(score_from(self.signals(caps, cfg), self.last_tokens, cfg))
+        Some(score_from(
+            self.signals(caps, cfg),
+            self.last_tokens,
+            cfg,
+            caps,
+        ))
     }
 
     fn signals(&self, caps: Capabilities, cfg: &ScoreConfig) -> Signals {
@@ -369,11 +374,67 @@ pub fn repetition_component(max_repeat: usize, threshold: usize) -> f64 {
     (((max_repeat + 1 - threshold) as f64) / threshold as f64).clamp(0.0, 1.0)
 }
 
+/// The absolute thresholds zirv shipped before capacity was knowable. Still
+/// the answer whenever no capacity is available from anywhere -- codex today,
+/// and any adapter that cannot honestly state one.
+pub const FALLBACK_TOKEN_FLOOR: u64 = 100_000;
+pub const FALLBACK_TOKEN_CEILING: u64 = 160_000;
+
+/// The `(floor, ceiling)` this session's token gate actually uses.
+///
+/// Precedence, per field: an explicit `score.token_floor`/`token_ceiling`
+/// wins outright -- an operator who pins a number gets that number.
+/// Otherwise the ratio is applied to the resolved capacity:
+/// `score.model_context_tokens` if the operator set one (they know their
+/// seat; the adapter's default is a guess about it), else
+/// `caps.context_window_tokens`. With no capacity from anywhere, the
+/// absolute fallbacks apply, unchanged.
+///
+/// PURE, like everything else in this module: capacity arrives inside
+/// `Capabilities`, which `score_events` and `RotState::score` already
+/// receive, so no fs, clock, env or net access is added here.
+///
+/// The result is always ordered and non-zero: a ceiling at or below the
+/// floor would make `verdict_for`'s two-stage gate meaningless, and a
+/// misconfigured pair of ratios must degrade, never break rotation.
+pub fn token_gates(cfg: &ScoreConfig, caps: Capabilities) -> (u64, u64) {
+    let capacity = cfg.model_context_tokens.or(caps.context_window_tokens);
+    let scaled = |ratio: f64, fallback: u64| -> u64 {
+        match capacity {
+            Some(capacity) if ratio > 0.0 => {
+                ((capacity as f64) * ratio.clamp(0.0, 1.0)).round() as u64
+            }
+            _ => fallback,
+        }
+    };
+    let mut floor = cfg
+        .token_floor
+        .unwrap_or_else(|| scaled(cfg.token_floor_ratio, FALLBACK_TOKEN_FLOOR))
+        .max(1);
+    let mut ceiling = cfg
+        .token_ceiling
+        .unwrap_or_else(|| scaled(cfg.token_ceiling_ratio, FALLBACK_TOKEN_CEILING));
+    // Never inverted, never collapsed: `verdict_for`'s two-stage gate is
+    // meaningless if the ceiling is at or below the floor, and a
+    // misconfigured pair of ratios must degrade rather than break rotation.
+    // Only a DERIVED value is moved -- a number the operator typed is never
+    // silently rewritten, so a fully pinned inverted pair stands as written.
+    if ceiling <= floor {
+        match (cfg.token_floor, cfg.token_ceiling) {
+            (None, Some(_)) => floor = ceiling.saturating_sub(1).max(1),
+            (Some(_), None) | (None, None) => ceiling = floor.saturating_add(1),
+            (Some(_), Some(_)) => {}
+        }
+    }
+    (floor, ceiling)
+}
+
 /// The token gate is a gate, not a vote: below the floor nothing escalates, at
 /// or above the ceiling the verdict is at least `compact`, and at the ceiling a
 /// compact-level score becomes a restart.
-pub fn verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig) -> Verdict {
-    if tokens < cfg.token_floor {
+pub fn verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig, caps: Capabilities) -> Verdict {
+    let (floor, ceiling) = token_gates(cfg, caps);
+    if tokens < floor {
         return Verdict::Healthy;
     }
 
@@ -387,7 +448,7 @@ pub fn verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig) -> Verdict {
         Verdict::Healthy
     };
 
-    if tokens < cfg.token_ceiling {
+    if tokens < ceiling {
         return base;
     }
     if score >= cfg.compact_at {
@@ -397,12 +458,17 @@ pub fn verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig) -> Verdict {
 }
 
 pub fn score_events(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig) -> Score {
-    score_from(signals(events, caps, cfg), context_tokens(events), cfg)
+    score_from(
+        signals(events, caps, cfg),
+        context_tokens(events),
+        cfg,
+        caps,
+    )
 }
 
 /// The weighted sum and the gate, shared by the full-parse and incremental
 /// paths so the two can never drift apart.
-pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig) -> Score {
+pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig, caps: Capabilities) -> Score {
     let raw = cfg.weight_tool_failure * signals.tool_failure_rate
         + cfg.weight_repetition
             * repetition_component(signals.max_repeat, cfg.repetition_threshold)
@@ -411,7 +477,7 @@ pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig) -> Score {
 
     Score {
         score,
-        verdict: verdict_for(score, tokens, cfg),
+        verdict: verdict_for(score, tokens, cfg, caps),
         signals,
         context_tokens: tokens,
     }
@@ -824,24 +890,26 @@ mod tests {
     #[test]
     fn thresholds_map_scores_to_verdicts_above_the_floor() {
         let cfg = ScoreConfig::default();
+        let caps = Capabilities::default();
         let tokens = 120_000;
-        assert_eq!(verdict_for(0, tokens, &cfg), Verdict::Healthy);
-        assert_eq!(verdict_for(39, tokens, &cfg), Verdict::Healthy);
-        assert_eq!(verdict_for(40, tokens, &cfg), Verdict::Advise);
-        assert_eq!(verdict_for(59, tokens, &cfg), Verdict::Advise);
-        assert_eq!(verdict_for(60, tokens, &cfg), Verdict::Compact);
-        assert_eq!(verdict_for(79, tokens, &cfg), Verdict::Compact);
-        assert_eq!(verdict_for(80, tokens, &cfg), Verdict::Restart);
-        assert_eq!(verdict_for(100, tokens, &cfg), Verdict::Restart);
+        assert_eq!(verdict_for(0, tokens, &cfg, caps), Verdict::Healthy);
+        assert_eq!(verdict_for(39, tokens, &cfg, caps), Verdict::Healthy);
+        assert_eq!(verdict_for(40, tokens, &cfg, caps), Verdict::Advise);
+        assert_eq!(verdict_for(59, tokens, &cfg, caps), Verdict::Advise);
+        assert_eq!(verdict_for(60, tokens, &cfg, caps), Verdict::Compact);
+        assert_eq!(verdict_for(79, tokens, &cfg, caps), Verdict::Compact);
+        assert_eq!(verdict_for(80, tokens, &cfg, caps), Verdict::Restart);
+        assert_eq!(verdict_for(100, tokens, &cfg, caps), Verdict::Restart);
     }
 
     #[test]
     fn below_the_token_floor_the_verdict_is_always_healthy() {
         let cfg = ScoreConfig::default();
-        assert_eq!(verdict_for(100, 99_999, &cfg), Verdict::Healthy);
-        assert_eq!(verdict_for(0, 0, &cfg), Verdict::Healthy);
+        let caps = Capabilities::default();
+        assert_eq!(verdict_for(100, 99_999, &cfg, caps), Verdict::Healthy);
+        assert_eq!(verdict_for(0, 0, &cfg, caps), Verdict::Healthy);
         assert_eq!(
-            verdict_for(100, 100_000, &cfg),
+            verdict_for(100, 100_000, &cfg, caps),
             Verdict::Restart,
             "floor is inclusive"
         );
@@ -850,16 +918,149 @@ mod tests {
     #[test]
     fn at_the_ceiling_the_verdict_is_at_least_compact() {
         let cfg = ScoreConfig::default();
-        assert_eq!(verdict_for(0, 160_000, &cfg), Verdict::Compact);
-        assert_eq!(verdict_for(45, 200_000, &cfg), Verdict::Compact);
+        let caps = Capabilities::default();
+        assert_eq!(verdict_for(0, 160_000, &cfg, caps), Verdict::Compact);
+        assert_eq!(verdict_for(45, 200_000, &cfg, caps), Verdict::Compact);
     }
 
     #[test]
     fn at_the_ceiling_a_compact_level_score_escalates_to_restart() {
         let cfg = ScoreConfig::default();
-        assert_eq!(verdict_for(60, 160_000, &cfg), Verdict::Restart);
-        assert_eq!(verdict_for(70, 170_000, &cfg), Verdict::Restart);
-        assert_eq!(verdict_for(59, 170_000, &cfg), Verdict::Compact);
+        let caps = Capabilities::default();
+        assert_eq!(verdict_for(60, 160_000, &cfg, caps), Verdict::Restart);
+        assert_eq!(verdict_for(70, 170_000, &cfg, caps), Verdict::Restart);
+        assert_eq!(verdict_for(59, 170_000, &cfg, caps), Verdict::Compact);
+    }
+
+    /// Issue #155, Phase 6(b): with no capacity known, the gates are EXACTLY
+    /// today's absolute defaults. This is the compatibility floor: codex
+    /// reports no capacity, and its rotation behaviour must not move at all.
+    #[test]
+    fn an_unknown_capacity_keeps_todays_absolute_thresholds() {
+        let cfg = ScoreConfig::default();
+        let caps = Capabilities::default();
+        assert_eq!(
+            token_gates(&cfg, caps),
+            (FALLBACK_TOKEN_FLOOR, FALLBACK_TOKEN_CEILING)
+        );
+        assert_eq!(token_gates(&cfg, caps), (100_000, 160_000));
+    }
+
+    /// A known capacity makes the gates RATIOS of it. On a 1M seat the old
+    /// absolute ceiling fired at 16% of capacity and restarted a session with
+    /// 840k tokens of headroom -- discarding a warm cache to rebuild one,
+    /// which is the most expensive possible response to a size signal.
+    #[test]
+    fn a_known_capacity_scales_the_gates_to_it() {
+        let cfg = ScoreConfig::default();
+        let million = Capabilities {
+            context_window_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        assert_eq!(token_gates(&cfg, million), (500_000, 800_000));
+
+        let small = Capabilities {
+            context_window_tokens: Some(200_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            token_gates(&cfg, small),
+            (100_000, 160_000),
+            "the shipped ratios reproduce the old absolutes on a 200k seat"
+        );
+    }
+
+    /// An explicit absolute wins outright: an operator who pins a number gets
+    /// that number, capacity or not. Where ordering has to be repaired, the
+    /// DERIVED side moves -- zirv never silently rewrites a number the
+    /// operator typed.
+    #[test]
+    fn an_explicit_absolute_overrides_the_ratio() {
+        let million = Capabilities {
+            context_window_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+
+        let ceiling_only = ScoreConfig {
+            token_ceiling: Some(900_000),
+            ..ScoreConfig::default()
+        };
+        assert_eq!(token_gates(&ceiling_only, million), (500_000, 900_000));
+
+        let floor_only = ScoreConfig {
+            token_floor: Some(120_000),
+            ..ScoreConfig::default()
+        };
+        assert_eq!(token_gates(&floor_only, million), (120_000, 800_000));
+
+        let both = ScoreConfig {
+            token_floor: Some(10),
+            token_ceiling: Some(20),
+            ..ScoreConfig::default()
+        };
+        assert_eq!(
+            token_gates(&both, million),
+            (10, 20),
+            "a fully pinned pair is used verbatim"
+        );
+    }
+
+    /// The operator's own capacity override beats the adapter's reported
+    /// one: an adapter's conservative default is a guess about the seat, and
+    /// the operator knows their seat.
+    #[test]
+    fn the_configured_capacity_overrides_the_adapters_reported_one() {
+        let cfg = ScoreConfig {
+            model_context_tokens: Some(1_000_000),
+            ..ScoreConfig::default()
+        };
+        let conservative = Capabilities {
+            context_window_tokens: Some(200_000),
+            ..Default::default()
+        };
+        assert_eq!(token_gates(&cfg, conservative), (500_000, 800_000));
+    }
+
+    /// The gates must never invert or collapse, whatever ratios are
+    /// configured: a ceiling at or below the floor would make `verdict_for`'s
+    /// two-stage gate meaningless.
+    #[test]
+    fn the_gates_are_always_ordered_and_nonzero() {
+        let inverted = ScoreConfig {
+            token_floor_ratio: 0.9,
+            token_ceiling_ratio: 0.1,
+            ..ScoreConfig::default()
+        };
+        let caps = Capabilities {
+            context_window_tokens: Some(200_000),
+            ..Default::default()
+        };
+        let (floor, ceiling) = token_gates(&inverted, caps);
+        assert!(floor < ceiling, "got ({floor}, {ceiling})");
+
+        let zeroed = ScoreConfig {
+            token_floor_ratio: 0.0,
+            token_ceiling_ratio: 0.0,
+            ..ScoreConfig::default()
+        };
+        let (floor, ceiling) = token_gates(&zeroed, caps);
+        assert!(floor > 0 && ceiling > floor, "got ({floor}, {ceiling})");
+    }
+
+    /// And the gate still behaves the same way around those thresholds --
+    /// this is a change of WHERE the gate sits, never of what it does.
+    #[test]
+    fn the_verdict_gate_behaves_identically_at_the_scaled_thresholds() {
+        let cfg = ScoreConfig::default();
+        let million = Capabilities {
+            context_window_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        assert_eq!(verdict_for(100, 499_999, &cfg, million), Verdict::Healthy);
+        assert_eq!(verdict_for(100, 500_000, &cfg, million), Verdict::Restart);
+        assert_eq!(verdict_for(0, 800_000, &cfg, million), Verdict::Compact);
+        assert_eq!(verdict_for(60, 800_000, &cfg, million), Verdict::Restart);
+        assert_eq!(verdict_for(59, 850_000, &cfg, million), Verdict::Compact);
     }
 
     #[test]
