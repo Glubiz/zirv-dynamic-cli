@@ -3664,12 +3664,27 @@ fn builtin_escape_allow() -> Vec<Rule> {
         .collect()
 }
 
-/// Whether `command` is a `find` invocation whose first path argument is
-/// the filesystem root or the home directory -- an unbounded scan of
+/// Whether `command` is a `find` invocation whose starting-point argument
+/// is the filesystem root or the home directory -- an unbounded scan of
 /// everything readable, as opposed to a `find ./src -name '*.rs'` style
 /// search bounded to a subtree. Issue #147 amendment: `find *` is a seeded
 /// built-in escape-allow family, but a root-wide scan must never ride that
 /// seed to `Allow` just because its family matches.
+///
+/// Review round 2 (2026-08-27), CRITICAL: this used to trust a fixed
+/// `tokens[1]` outright, so a leading find OPTION (`-H`/`-L`/`-P`/...)
+/// ahead of the real starting-point shifted the root path clean out of the
+/// position this check looked at -- `find -H / -iname id_rsa` rode the
+/// seeded family straight to `Allow` with no root-wide screening at all.
+/// Mirrors [`is_risky_find_exec`]'s own stance a few hundred lines above:
+/// scan every token rather than trusting one fixed position. Also denies a
+/// starting-point built through an unquoted command substitution (`find
+/// $(echo /) -iname id_rsa`) -- a real shell could resolve that to `/` at
+/// execution time with no literal `/` ever appearing in this text-only
+/// screen's input, so it cannot be proven bounded. Root-wide-or-refuse,
+/// same `$`/backtick disqualification [`generated_path`] already applies
+/// for the identical reason; a legitimate substitution false-positives
+/// into `Ask`, never into a silent bypass.
 fn is_root_wide_find_scan(command: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
@@ -3681,8 +3696,9 @@ fn is_root_wide_find_scan(command: &str) -> bool {
         return false;
     }
     tokens
-        .get(1)
-        .is_some_and(|path| matches!(path.as_str(), "/" | "~" | "~/"))
+        .iter()
+        .skip(1)
+        .any(|token| matches!(token.as_str(), "/" | "~" | "~/") || token.contains(['$', '`']))
 }
 
 /// Issue #147 amendment: a family matching `escape_allow` (built-in or
@@ -6754,6 +6770,77 @@ mod tests {
         assert!(
             text.contains(r#""permissionDecision":"ask""#),
             "a root-wide find must never escape even though `find *` is seeded: got {text}"
+        );
+    }
+
+    /// SECURITY (review round 2, 2026-08-27, CRITICAL): `is_root_wide_
+    /// find_scan` used to trust a fixed `tokens[1]` outright, so a leading
+    /// find OPTION (`-H`/`-L`/`-P`/...) ahead of the real starting-point
+    /// argument shifted the root path clean out of the position this check
+    /// looked at -- `find -H / -iname id_rsa` rode the seeded `find *`
+    /// escape family straight to a silent, unauthenticated root-wide
+    /// credential scan with no prompt at all. Concrete PoC from the
+    /// finding.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_behind_a_leading_flag() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find -H / -iname id_rsa","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "a leading -H must not shift the root path past the scan gate: got {text}"
+        );
+    }
+
+    /// Companion to the test above: a leading flag ahead of a home-relative
+    /// root scan (`~`), plus an expression option trailing the path, must
+    /// still be screened.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_home_scan_behind_a_leading_flag() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find -L ~ -name x","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "a leading -L must not shift the home-relative root path past the scan gate: got {text}"
+        );
+    }
+
+    /// SECURITY (review round 2, 2026-08-27, CRITICAL): a starting-point
+    /// built through an unquoted command substitution can resolve to `/` at
+    /// real-shell-execution time without this text-only screen ever seeing
+    /// the literal string `/` anywhere in the command -- `find $(echo /)
+    /// -iname id_rsa` must not be provably bounded just because no token is
+    /// literally a root marker.
+    #[test]
+    fn a_seeded_find_never_escapes_a_root_wide_scan_built_through_a_command_substitution() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+
+        let stdin = r#"{"tool_name":"Bash","tool_input":{"command":"find $(echo /) -iname id_rsa","dangerouslyDisableSandbox":true},"permission_mode":"default"}"#;
+        let mut out = Vec::new();
+        run_check_hook_mode(&cfg, &mut out, stdin).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(r#""permissionDecision":"ask""#),
+            "an unquoted command substitution in the path position must not escape unproven: got {text}"
         );
     }
 
