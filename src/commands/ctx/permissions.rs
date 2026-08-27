@@ -1168,6 +1168,24 @@ fn transcripts_root(agent: AuditAgent) -> Option<PathBuf> {
     }
 }
 
+/// Codex has no per-command permission-hook contract zirv can pin the way
+/// claude's `PreToolUse` hook is (`safety.rs`'s own doc comment): a codex
+/// launch never consults `[safety]` at all (`CodexAdapter::default_sandbox_
+/// args`'s own `let _ = (sandbox, safety);`, and `policy_args` reads only
+/// `[policy]`, never `[safety]`). So while `permissions compile` still
+/// writes real `[safety] allow` entries for a codex audit -- they are the
+/// honest record of what a codex session actually asked for, and claude
+/// reads them -- those entries change nothing about how *codex itself*
+/// launches. Printed on every codex `audit`/`compile` run (including the
+/// default `--agent codex`, `AuditArgs`/`CompileArgs`'s own `default_value`)
+/// so an operator does not read "compiled" as "codex now enforces this".
+/// Upstream `exec_permission_approvals`/`request_permissions_tool` (a
+/// per-command hook codex itself would consult) are still in development,
+/// not yet something this codebase can pin against.
+const CODEX_SAFETY_NO_OP_CAVEAT: &str = "caveat: compiled [safety] allow entries do not change codex's own launch posture -- \
+     codex has no per-command approval hook zirv can pin (upstream exec_permission_approvals \
+     / request_permissions_tool are still in development)";
+
 pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
     let files = transcripts_root(args.agent)
         .map(|root| super::optimize::newest_transcripts(&root, args.sessions))
@@ -1180,6 +1198,9 @@ pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
             serde_json::to_string_pretty(&report).unwrap_or_default()
         )?;
     } else {
+        if args.agent == AuditAgent::Codex {
+            writeln!(w, "{CODEX_SAFETY_NO_OP_CAVEAT}")?;
+        }
         // Issue #147, design decision 7: claude only -- codex has no native
         // settings.json permission-rule analogue for this to conflict with.
         let native_rules = if matches!(args.agent, AuditAgent::Claude) {
@@ -1352,6 +1373,10 @@ pub fn run_compile<W: Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
 
     let (eligible_patterns, skipped_protected, skipped_too_generic) =
         compile_eligibility(&report.groups);
+
+    if args.agent == AuditAgent::Codex {
+        writeln!(w, "{CODEX_SAFETY_NO_OP_CAVEAT}")?;
+    }
 
     let home = crate::utils::home_dir()?;
     let existing = crate::commands::setup::read_home_safety_allow(&home).unwrap_or_default();
@@ -2753,6 +2778,68 @@ mod tests {
             .to_string(),
         )
         .expect("write fixture");
+    }
+
+    /// Issue "codex approval hell" (2026-08-26): compiled `[safety] allow`
+    /// entries never change codex's own launch posture (codex has no
+    /// per-command hook zirv can pin), so both audit verbs must say so for a
+    /// codex run -- including via the default agent -- and must not print
+    /// the same caveat for a claude run, where the compiled entries DO
+    /// change what the `PreToolUse` hook allows.
+    #[test]
+    fn run_audit_prints_the_codex_safety_no_op_caveat_only_for_codex() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        write_codex_rollout_fixture(home.path(), "gh issue create --title x");
+
+        let codex_args = AuditArgs {
+            agent: AuditAgent::Codex,
+            sessions: 5,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_audit(&codex_args, &mut out).expect("run_audit");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(CODEX_SAFETY_NO_OP_CAVEAT),
+            "codex audit must print the no-op caveat: {text}"
+        );
+
+        let claude_args = AuditArgs {
+            agent: AuditAgent::Claude,
+            sessions: 5,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_audit(&claude_args, &mut out).expect("run_audit");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains(CODEX_SAFETY_NO_OP_CAVEAT),
+            "claude audit must not print codex's no-op caveat: {text}"
+        );
+    }
+
+    /// The default `--agent` value is codex (`AuditArgs`/`CompileArgs`'s own
+    /// `default_value = "codex"`), so a caller who never passes `--agent` at
+    /// all must still see the caveat.
+    #[test]
+    fn run_compile_prints_the_codex_safety_no_op_caveat_by_default() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        write_codex_rollout_fixture(home.path(), "gh issue create --title x");
+
+        let args = CompileArgs {
+            agent: AuditAgent::Codex,
+            sessions: 5,
+            dry_run: true,
+        };
+        let mut out = Vec::new();
+        run_compile(&args, &mut out).expect("run_compile");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(CODEX_SAFETY_NO_OP_CAVEAT),
+            "compile with the default (codex) agent must print the no-op caveat: {text}"
+        );
     }
 
     #[test]

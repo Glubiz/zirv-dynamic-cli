@@ -177,6 +177,31 @@ impl LaunchMode {
 /// silently *withholding* zirv's own restriction rather than merely
 /// mis-ordering a model flag, so precision matters more than coverage.
 ///
+/// **Codex `-c`/`--config` overrides (2026-08-26, approval-posture round):**
+/// an operator may also pin codex's approval/sandbox posture via a raw
+/// config override -- `-c approval_policy=<value>`, `-c sandbox_mode=<value>`,
+/// or the long `--config` spelling of either -- rather than the dedicated
+/// `--ask-for-approval`/`--sandbox` flags above. Before this, that spelling
+/// was invisible to this function: `flags_pin_policy` returned `false`, so
+/// `policy_launch_args` still prepended zirv's own `-c approval_policy=...`
+/// (`CodexAdapter::approval_suppression_args`'s exec-probe fallback) *after*
+/// the operator's own override, and codex's config resolution is
+/// last-value-wins, so the operator's explicit choice was silently
+/// overridden by zirv's own. `CODEX_CONFIG_OVERRIDE_KEYS` below closes that
+/// gap for the split form (`-c`/`--config` followed by a `key=value` token,
+/// checked pairwise since the key lives in the *next* token, unlike every
+/// other flag this function recognises), the `=`-joined single-token form
+/// (`--config=approval_policy=...`), mirroring the existing `--sandbox=...`
+/// handling above, and (2026-08-26, correction round) codex's own attached
+/// short form -- `-cKEY=VALUE` with no space at all, verified accepted by
+/// codex-cli 0.149.1, mirroring the attached `-mvalue` form
+/// `classify_model_flag` already recognises for `--model`. All-or-nothing,
+/// same as every other flag this function recognises: pinning just one
+/// dimension (e.g. only `approval_policy`) withholds zirv's *entire*
+/// computed prefix, not only the approval half -- `policy_launch_args` has
+/// no partial-prefix concept, and this function's contract has always been
+/// "the operator's own flag pins policy outright".
+///
 /// Mirrors `agent.rs`'s own `flags_pin_model` in spirit: the operator's own
 /// explicit choice must demonstrably win over a zirv-computed default, not
 /// merely happen to survive because a CLI takes the last occurrence of a
@@ -193,10 +218,40 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
         "-a",
         "--approve-for-me",
     ];
-    flags.iter().any(|f| {
-        POLICY_FLAG_NAMES
+    const CODEX_CONFIG_OVERRIDE_KEYS: &[&str] = &["approval_policy", "sandbox_mode"];
+
+    let names_a_config_override_key = |value: &str| {
+        CODEX_CONFIG_OVERRIDE_KEYS
+            .iter()
+            .any(|key| value == *key || value.starts_with(&format!("{key}=")))
+    };
+
+    flags.iter().enumerate().any(|(i, f)| {
+        if POLICY_FLAG_NAMES
             .iter()
             .any(|name| f == name || f.starts_with(&format!("{name}=")))
+        {
+            return true;
+        }
+        if let Some(rest) = f.strip_prefix("--config=") {
+            return names_a_config_override_key(rest);
+        }
+        if f == "-c" || f == "--config" {
+            return flags
+                .get(i + 1)
+                .is_some_and(|next| names_a_config_override_key(next));
+        }
+        // Codex's attached short form (`-cKEY=VALUE`, no space) -- checked
+        // after the `f == "-c"` split form above so a bare `-c` still falls
+        // through to that pairwise check rather than being consumed here
+        // with an empty attached value.
+        if let Some(rest) = f.strip_prefix("-c")
+            && !rest.is_empty()
+            && names_a_config_override_key(rest)
+        {
+            return true;
+        }
+        false
     })
 }
 
@@ -1143,15 +1198,19 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// Default is empty: the same "nothing verified to guess" shape every
     /// other optional method on this trait uses, and also the *correct*
     /// answer for the shipped default -- `EffectivePolicy::default()` is
-    /// all-`Allow` (`Stance::Allow`'s own doc comment: "zirv declares no
-    /// restriction of its own"), so an operator who has set no `[policy]`
-    /// table at all gets byte-for-byte the same argv as before this method
-    /// existed, on every adapter. Anything more restrictive requires an
-    /// explicit `[policy]` stance, and anything more *permissive* than the
-    /// default cannot come from this method at all: there is no `Stance`
-    /// value that widens past `Allow`, and a repo checkout cannot set one
-    /// stricter than the operator's own layer either (`policy::resolve`'s
-    /// narrow-only fold -- see that module's doc comment).
+    /// `Allow` on every capability except `network` (`Stance::Allow`'s own
+    /// doc comment: "zirv declares no restriction of its own";
+    /// `EffectivePolicy`'s own doc comment covers `network`'s exception,
+    /// `Option<Stance>` defaulting to `None` -- "no operator layer has ever
+    /// named it" -- rather than a `Stance` this method would need to act
+    /// on), so an operator who has set no `[policy]` table at all gets
+    /// byte-for-byte the same argv as before this method existed, on every
+    /// adapter. Anything more restrictive requires an explicit `[policy]`
+    /// stance, and anything more *permissive* than the default cannot come
+    /// from this method at all: there is no `Stance` value that widens past
+    /// `Allow`, and a repo checkout cannot set one stricter than the
+    /// operator's own layer either (`policy::resolve`'s narrow-only fold --
+    /// see that module's doc comment).
     ///
     /// Only a capability this adapter also names `Enforced`/`Degraded` for in
     /// `policy_support` may ever change this launch's argv: `Ask`/`Allow`
@@ -1226,6 +1285,43 @@ pub trait AgentAdapter: std::fmt::Debug {
         mode: LaunchMode,
     ) -> Vec<String> {
         let _ = (sandbox, safety, mode);
+        Vec::new()
+    }
+
+    /// Extra writable-root argv for a launch whose working directory is
+    /// `cwd`, beyond `default_sandbox_args`'s own baseline sandbox flags.
+    ///
+    /// **Caller contract:** call only where both `cwd` and `mail_dir` are
+    /// already in hand for a launch that is actually happening -- today that
+    /// is `dash::worker_pane_extra_args` alone (see below), called
+    /// unconditionally for every dashboard-spawned worker pane, never
+    /// speculatively for a launch that may not occur. Added as a distinct
+    /// method (2026-08-26, codex approval-posture round)
+    /// rather than folded into `default_sandbox_args` itself, since neither
+    /// `cwd` nor `mail_dir` is available at that method's existing call site
+    /// (`policy_launch_args`) without threading them through all seven
+    /// launch seams that call it; this is called separately, only where a
+    /// caller already has both in hand (currently `dash::worker_pane_extra_
+    /// args`, the one seam issue #119's own evidence names).
+    ///
+    /// Two concrete gaps this closes for codex, neither addressed by
+    /// `default_sandbox_args`'s `--sandbox workspace-write`:
+    /// - a dashboard pane whose `cwd` is a linked `git worktree add` sibling
+    ///   (issue #119) shares its `.git` common dir with the main checkout,
+    ///   which sits OUTSIDE `cwd` and so outside the workspace-write
+    ///   sandbox -- every git object/ref write a worker makes there fails
+    ///   (headless) or escalates (interactive) with no mechanism to grant it.
+    /// - `zirv ctx send`'s report-back write lands under the state dir's
+    ///   `mail/` subtree, also outside `cwd`, so it is denied the same way.
+    ///
+    /// Default empty -- no verified per-run mechanism, matching every other
+    /// "no verified mechanism" trait default on this trait (`policy_args`,
+    /// `default_sandbox_args`); only `CodexAdapter` overrides it. `mail_dir`
+    /// is deliberately the mail subtree alone (`StateDir::mail()`), never the
+    /// whole state root: policy snapshots and the decision log must stay
+    /// unwritable by the workload even when this widens the mail path.
+    fn extra_writable_root_args(&self, cwd: &Path, mail_dir: &Path) -> Vec<String> {
+        let _ = (cwd, mail_dir);
         Vec::new()
     }
 
@@ -2486,9 +2582,161 @@ pub fn command_matches_adapter(
     agent_explicit || adapter.detect(command)
 }
 
+/// The canonicalised git "common dir" that owns `path` -- the shared `.git`
+/// directory a plain repo and every `git worktree add`-linked sibling of it
+/// all point back at -- or `None` if `git` is missing, `path` is not inside a
+/// git working tree, or the process exits non-zero. Best-effort and
+/// shell-out only, same precedent as `compile::changed_repo_paths`.
+///
+/// `git rev-parse --git-common-dir` prints a path RELATIVE to `path` for a
+/// main worktree (typically just `.git`) but an ABSOLUTE one for a linked
+/// worktree (it points back at the main checkout's `.git`). Both forms are
+/// resolved against `path` before canonicalising, so a main worktree and any
+/// of its linked siblings canonicalise to the exact same `PathBuf` even
+/// though git reports the two differently.
+///
+/// Code review (issue #119, round 2): this used to back an authorization
+/// check in `dash/mod.rs` alone (its answer decided whether a spawn request
+/// got to run a real agent), so it must not trust an inherited environment
+/// that a request's own process could have set. `GIT_DIR`/`GIT_COMMON_DIR`/
+/// `GIT_WORK_TREE` (and `GIT_INDEX_FILE`, for the same family of override)
+/// all redirect where `git` looks for repo state regardless of `-C`'s
+/// argument; left inherited, any one of them set in the calling process
+/// would make `git` resolve to the SAME overridden value for two genuinely
+/// unrelated paths. Stripped here, at the one seam that shells out to `git`
+/// for this decision, rather than trusted to already be absent from the
+/// caller's environment -- a property every caller inherits for free,
+/// including `CodexAdapter::extra_writable_root_args` below.
+///
+/// Moved here from `dash/mod.rs` (2026-08-26, codex approval-posture round):
+/// `dash` already imports `adapters` (`policy_launch_args`, `LaunchMode`,
+/// ...), so `adapters` calling back into `dash` would be a cycle -- this is
+/// the shared home the one-directional import graph demands, used by
+/// `dash::accepted_spawn_cwd`'s eligibility check (issue #119) and by
+/// `CodexAdapter::extra_writable_root_args`'s writable-root computation
+/// (same issue, the other half: eligibility says a linked worktree pane may
+/// run, this says its shared git dir must actually be writable once it does).
+pub(crate) fn git_common_dir(path: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(raw);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        path.join(candidate)
+    };
+    std::fs::canonicalize(&resolved).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue "codex approval hell" (2026-08-26): before this, `-c
+    /// approval_policy=...`/`-c sandbox_mode=...` were invisible to
+    /// `flags_pin_policy`, so zirv's own computed config-override fallback
+    /// (`CodexAdapter::approval_suppression_args`) still landed after an
+    /// operator's own override and won outright (codex's config resolution
+    /// is last-value-wins). Both the split (`-c`/`--config` plus a following
+    /// `key=value` token) and the `=`-joined single-token forms must pin.
+    #[test]
+    fn flags_pin_policy_recognizes_codex_config_overrides_of_approval_or_sandbox_mode() {
+        assert!(flags_pin_policy(&[
+            "-c".to_string(),
+            "approval_policy=on-request".to_string()
+        ]));
+        assert!(flags_pin_policy(&[
+            "-c".to_string(),
+            "sandbox_mode=read-only".to_string()
+        ]));
+        assert!(flags_pin_policy(&[
+            "--config".to_string(),
+            "approval_policy=never".to_string()
+        ]));
+        assert!(flags_pin_policy(&[
+            "--config".to_string(),
+            "sandbox_mode=workspace-write".to_string()
+        ]));
+        assert!(flags_pin_policy(&[
+            "--config=approval_policy=on-request".to_string()
+        ]));
+        assert!(flags_pin_policy(&[
+            "--config=sandbox_mode=danger-full-access".to_string()
+        ]));
+    }
+
+    /// The bug this round fixes: codex-cli 0.149.1 also accepts `-c`'s
+    /// argument attached to the flag itself with no space (`-cKEY=VALUE`),
+    /// mirroring the attached short form `classify_model_flag` already
+    /// recognises for `-m` (`-mopus`). Before this, only the split
+    /// (`-c`/`--config` plus a following token) and `--config=`-joined forms
+    /// were recognised, so an operator spelling their override as
+    /// `-capproval_policy=on-request` was invisible to `flags_pin_policy` and
+    /// zirv's own computed prefix still landed after it.
+    #[test]
+    fn flags_pin_policy_recognizes_codexs_attached_short_config_override_form() {
+        assert!(flags_pin_policy(&[
+            "-capproval_policy=on-request".to_string()
+        ]));
+        assert!(flags_pin_policy(&["-csandbox_mode=read-only".to_string()]));
+        // Precision still matters: an attached `-c` naming an unrelated key
+        // must not false-positive, and `-c` itself (no attached value) is the
+        // ordinary split form, already covered above.
+        assert!(!flags_pin_policy(&["-cmodel=gpt-5.6-sol".to_string()]));
+    }
+
+    /// A bare `-c`/`--config` with no following token, or one overriding an
+    /// unrelated key, must not false-positive: this function's whole
+    /// contract is precision over coverage (see its own doc comment), and a
+    /// false positive here means silently *withholding* zirv's restriction.
+    #[test]
+    fn flags_pin_policy_ignores_unrelated_or_dangling_config_overrides() {
+        assert!(!flags_pin_policy(&[
+            "-c".to_string(),
+            "model=gpt-5.6-sol".to_string()
+        ]));
+        assert!(!flags_pin_policy(&["-c".to_string()]));
+        assert!(!flags_pin_policy(&["--config".to_string()]));
+        assert!(!flags_pin_policy(&[]));
+    }
+
+    /// One dimension pins the whole prefix, the same all-or-nothing
+    /// granularity a bare operator `--sandbox`/`--ask-for-approval` flag
+    /// already has (see the function's own doc comment): a `-c
+    /// approval_policy=...` override alone, with no accompanying
+    /// `sandbox_mode` override, still withholds zirv's entire computed
+    /// prefix rather than just the approval half.
+    #[test]
+    fn flags_pin_policy_config_override_pins_the_whole_prefix_not_just_one_dimension() {
+        let flags = vec!["-c".to_string(), "approval_policy=on-request".to_string()];
+        assert!(flags_pin_policy(&flags));
+        let cfg = CtxConfig::default();
+        let codex = codex::CodexAdapter::new(None)
+            .with_on_request_approval_forced(true)
+            .with_exec_ask_for_approval_forced(true);
+        assert!(
+            policy_launch_args(&cfg, &codex, &flags, LaunchMode::Headless).is_empty(),
+            "an operator's own -c approval_policy=... override must suppress zirv's entire \
+             computed prefix, not just the approval flag"
+        );
+    }
 
     /// The interactive/headless seam itself (2026-08-24, cross-harness
     /// permissions): the enum every real-launch call site now has to answer
