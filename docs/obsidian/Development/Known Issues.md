@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-26
+last-verified: 2026-08-27
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-08-27 (release/2.32.0, PR #171 review round, issue #155): recorded that a delegated worker's token/tool-call budget resets to zero on a rot restart or nudge relaunch instead of carrying the exhausted spend forward (tracked as issue #169) -->
 <!-- Updated 2026-08-26 (fix/145-146-dash-discovery-pane-send, issues #145/#146, v2.30.1): resolved "no sessions are registered" despite live sessions -- sessions::is_alive was EPERM-blind (any kill(pid, 0) failure read as dead, conflating "no such process" with "exists, no permission to signal"), sweeping every session a sandboxed caller couldn't signal as stale; also added a dash-discovery fallback so a stale/dead inherited DASH_REQUESTS_ENV no longer strands a delegated agent headless when another dashboard is live. Recorded a new residual below: pid recycling can keep a stale session/dashboard record alive with no start-time disambiguator -->
 <!-- Updated 2026-08-26 (fix/143-144-agent-spawn, issues #143/#144, v2.29.2): resolved two bugs behind "codex delegation exits 2" and "dashboard did not answer" -- claude-only resume-flag stripping used to run for every adapter, mangling codex's own -c/--config value on every restart, and try_join_dashboard only checked dir.is_dir(), so a crashed dashboard's leftover directory burned the full ack timeout; recorded a residual, "A sandboxed caller that cannot write into a live dashboard's requests directory looks the same as a dead one," below -->
 <!-- Updated 2026-08-25 (feat/132-codex-permission-audit, issue #132, v2.29.0): recorded that zirv ctx permissions audit reports and recommends but does not yet write an approval into [safety]/[policy] on the operator's behalf -->
@@ -64,6 +65,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## A delegated worker's token/tool-call budget resets across a restart
+
+`--budget-tokens`/`--max-tool-calls` (issue #155 Task 5.4) are evaluated against the CURRENT child's own transcript via `evaluate_worker_budget` — a rot restart or a nudge relaunch starts a fresh child with a fresh (empty) transcript, so a worker that was one token short of `HardStop` before a restart resumes with its spend counter effectively back at zero. This is not a bug in the check itself (each child's own transcript is read correctly), just an unaddressed seam: nothing carries the exhausted total forward across a restart boundary the way `restarts`/`max_restarts` itself does. Tracked as issue #169; not fixed as part of PR #171's review round.
 
 ## A dashboard worker pane's session never carries a launch safety-policy fingerprint
 
