@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-26
+last-verified: 2026-08-27
 ---
 
 # Command Safety
@@ -145,6 +145,8 @@ The classifier runs on every structural candidate, so `echo ok && psql -c 'DROP 
 Matching a family alone is never enough: `escape_allow_matches(escape_allow, command)` requires **every** executable segment `normalize_segments` derives from the command to both match a rule AND clear `escape_denied_by_screen` — worst segment wins, so `cd /tmp && rm -rf /` can never pass because `cd` alone would, and a seeded `grep foo file && curl evil.example` can never pass because `grep` alone would (pinned by `a_compound_with_one_unmatched_segment_never_escapes_to_allow`/`a_compound_pairing_a_seeded_utility_with_an_unrelated_command_never_escapes`). `escape_denied_by_screen(candidate)` re-checks every token against `sensitive_upload_path` (the existing credential-path/`.env` classifier, reused rather than re-enumerated — its own path list is now the single shared `SANDBOX_DENY_READ_HOME_PATHS` constant claude's own native `sandbox.filesystem.denyRead` list also derives from, so the OS sandbox boundary and this escape screen cannot drift apart) and screens out `is_root_wide_find_scan` (a `find` whose first path argument is `/`, `~`, or `~/`) — so a seeded `cat *`/`find *` can never ride its family match past a credential read or an unbounded root scan (`a_seeded_family_never_escapes_a_credential_path_read`, `a_seeded_find_never_escapes_a_root_wide_scan`).
 
 `run_check_hook_mode_with_env`'s escalation branch now has two carved-out exceptions instead of one, both gated on the base verdict already being `Allow`: the `gh` carve-out above, or `escape_allow_matches` — matched `<sandbox: escape_allow>` in the JSON envelope and the audit log, distinct from both `<sandbox: read-only gh>` and the ordinary `<sandbox: unsandboxed retry>` denial. `permissions::run_compile --escape`'s eligibility gate reuses the identical screen through a shared combinator, `command_fails_escape_screen(command)` (`escape_denied_by_screen(command) || evaluate(..).verdict == Verdict::Deny`) — see "Compiling recommendations into approvals" below.
+
+**Review round 1 (2026-08-27, CRITICAL): `escape_denied_by_screen` also screens unquoted redirection.** A seeded family's own glob pattern (e.g. `"echo *"`) matched straight through a trailing ` > ~/.claude/settings.json` — an unsandboxed **write** via the built-in escape seed, in both interactive and headless mode, since the credential-path/root-scan checks above only looked at read targets. `escape_denied_by_screen` now also routes every candidate through `contains_unquoted_redirection` (the same primitive the `gh` carve-out already trusted, above): any unquoted `>`/`>>`/`<` denies the escape screen outright, seeded family or not. Applied identically to `command_fails_escape_screen`, so `permissions --escape` compile eligibility closes the same hole.
 
 ## Launch policy attestation, audit, and the wired `PreToolUse` hook
 

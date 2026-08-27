@@ -12028,6 +12028,15 @@ mod tests {
         let repo = tmp.path().to_path_buf();
 
         let cfg = CtxConfig {
+            // Same ABSOLUTE rule every other real-pty-spawn test in this
+            // module follows (see `spawn_restored_pane_restores_report_to_
+            // and_reminder_sent_from_the_roster`'s own doc comment): a bare
+            // `claude` is not guaranteed to resolve on a CI runner's PATH,
+            // so this only has to prove the pty spawn itself succeeds.
+            #[cfg(windows)]
+            agent_bin: Some("ping -n 3 127.0.0.1".to_string()),
+            #[cfg(unix)]
+            agent_bin: Some("sleep 3".to_string()),
             // Same reason as the shim-shape test above: no usage source
             // means no blind-pace notice muddying this test's own concerns.
             pace: crate::commands::ctx::config::PaceConfig {
