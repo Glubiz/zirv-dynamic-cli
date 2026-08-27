@@ -1973,6 +1973,20 @@ pub fn run_remember<W: Write>(args: &RememberArgs, w: &mut W) -> CtxResult<i32> 
     run_remember_with(args, w, &repo, &env, &mut std::io::stdin())
 }
 
+/// One recalled entry plus the bank it came from, for `zirv ctx recall
+/// --json` (issue #172). `scope` is derived from which bank `run_recall_with`
+/// actually read it from, never from the entry's own header fields -- a
+/// shared entry's `Source`/`Written-By` are themselves attacker-supplied
+/// repository content (see `MemoryScope::Shared`'s own doc comment), the same
+/// rule `memory_cli.rs`'s own `ScopedEntry` already follows for `zirv memory
+/// recall`.
+#[derive(Serialize)]
+struct RecallEntry<'a> {
+    #[serde(flatten)]
+    entry: &'a Entry,
+    scope: &'static str,
+}
+
 pub fn run_recall_with<W: Write>(
     args: &RecallArgs,
     w: &mut W,
@@ -1988,10 +2002,19 @@ pub fn run_recall_with<W: Write>(
 
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    let mut entries: Vec<Entry> = list(&state, &slug)?.into_iter().map(|(_, e)| e).collect();
+    let mut entries: Vec<(Entry, MemoryScope)> =
+        list_scoped(MemoryScope::Private, repo, &state, &slug, &cfg)?
+            .into_iter()
+            .map(|(_, e)| (e, MemoryScope::Private))
+            .collect();
+    entries.extend(
+        list_scoped(MemoryScope::Shared, repo, &state, &slug, &cfg)?
+            .into_iter()
+            .map(|(_, e)| (e, MemoryScope::Shared)),
+    );
 
     if let Some(key) = &args.key {
-        entries.retain(|entry| &entry.key == key);
+        entries.retain(|(entry, _)| &entry.key == key);
     }
     if let Some(days) = args.stale {
         // Saturating, not plain multiplication: `--stale` is an operator-typed
@@ -1999,20 +2022,32 @@ pub fn run_recall_with<W: Write>(
         // a debug build, a wrapped (tiny) threshold in a release one, which
         // silently reported every entry as fresh.
         let threshold = now_secs().saturating_sub(days.saturating_mul(86_400));
-        entries.retain(|entry| entry.verified < threshold);
+        entries.retain(|(entry, _)| entry.verified < threshold);
     }
 
-    for entry in &entries {
+    for (entry, scope) in &entries {
+        let label = match scope {
+            MemoryScope::Private => "local",
+            MemoryScope::Shared => "repo",
+        };
         if args.json {
-            writeln!(w, "{}", serde_json::to_string(entry)?)?;
+            let scoped = RecallEntry {
+                entry,
+                scope: label,
+            };
+            writeln!(w, "{}", serde_json::to_string(&scoped)?)?;
         } else {
             let now = now_secs();
             let written_days = now.saturating_sub(entry.written) / 86_400;
             let verified_days = now.saturating_sub(entry.verified) / 86_400;
+            let trust_note = match scope {
+                MemoryScope::Shared => " -- repo: repository-owned content, not operator-verified",
+                MemoryScope::Private => "",
+            };
             writeln!(
                 w,
-                "{} (written {}d ago, verified {}d ago)\n{}\n",
-                entry.key, written_days, verified_days, entry.body
+                "{} [{label}{trust_note}] (written {written_days}d ago, verified {verified_days}d ago)\n{}\n",
+                entry.key, entry.body
             )?;
         }
     }
@@ -2789,6 +2824,118 @@ This should not appear in the body.\n";
             run_recall_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("recall");
         assert_eq!(code, 0);
         assert!(out.is_empty(), "nothing to print: {out:?}");
+    }
+
+    #[test]
+    fn ctx_recall_merges_both_banks_and_labels_each_entrys_provenance() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        let mut local = sample("local-fact", 1);
+        local.body = "only ever lives on this machine".to_string();
+        remember(&state, &slug, &local, &cfg).expect("remember private");
+
+        let mut shared = sample("repo-fact", 2);
+        shared.body = "travels with the branch".to_string();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &shared,
+        )
+        .expect("upsert shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = RecallArgs {
+            key: None,
+            stale: None,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_recall_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("recall");
+        let text = String::from_utf8(out).expect("utf8");
+
+        let local_at = text.find("local-fact").expect("local entry present");
+        let repo_at = text.find("repo-fact").expect("repo entry present");
+        assert!(
+            local_at < repo_at,
+            "local entries are listed before repo ones: {text}"
+        );
+        assert!(text.contains("[local]"), "got {text}");
+        assert!(text.contains("[repo --"), "got {text}");
+    }
+
+    #[test]
+    fn ctx_recall_json_includes_a_scope_field_for_each_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("repo-fact", 1),
+        )
+        .expect("upsert shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = RecallArgs {
+            key: None,
+            stale: None,
+            json: true,
+        };
+        let mut out = Vec::new();
+        run_recall_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("recall");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("\"scope\":\"repo\""), "got {text}");
+    }
+
+    #[test]
+    fn ctx_recall_with_key_shows_the_local_entry_before_the_repo_entry_for_the_same_key() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        let mut local = sample("shared-key-name", 1);
+        local.body = "local version of the fact".to_string();
+        remember(&state, &slug, &local, &cfg).expect("remember private");
+
+        let mut shared = sample("shared-key-name", 2);
+        shared.body = "repo version of the fact".to_string();
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &shared,
+        )
+        .expect("upsert shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = RecallArgs {
+            key: Some("shared-key-name".to_string()),
+            stale: None,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_recall_with(&args, &mut out, repo.path(), &|k| env.get(k).cloned()).expect("recall");
+        let text = String::from_utf8(out).expect("utf8");
+        let local_at = text.find("local version").expect("local entry present");
+        let repo_at = text.find("repo version").expect("repo entry present");
+        assert!(local_at < repo_at, "local first: {text}");
     }
 
     #[test]
