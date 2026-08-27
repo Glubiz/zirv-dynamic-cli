@@ -164,6 +164,18 @@ pub fn exit_note(code: i32) -> Option<String> {
     matches!(code, exec::EXIT_ROT_EXHAUSTED | exec::EXIT_TIMEOUT).then(|| exec::describe_exit(code))
 }
 
+/// Which of the supervisor's outcomes this exit code represents. Mirrors
+/// `exit_note`'s own two special cases: those are zirv giving up, not the
+/// worker failing, and they cost very differently.
+fn delegation_outcome(code: i32) -> &'static str {
+    match code {
+        0 => "ok",
+        exec::EXIT_ROT_EXHAUSTED => "rot-exhausted",
+        exec::EXIT_TIMEOUT => "timeout",
+        _ => "failed",
+    }
+}
+
 /// How long a delegated run waits for the dashboard's own answer before
 /// giving up and running headless instead. Generous enough for a live
 /// dashboard's own event loop (50ms poll, plus a once-per-tick request
@@ -581,10 +593,15 @@ pub fn run_with<W: Write>(
     // passes the delegation target explicitly.
     let adapter = adapters::select(Some(&args.name), &[], &cfg)?;
     let command = worker_launch_flags(&cfg, &args.name, adapter.as_ref(), &args.flags);
+    // Read back out of the effective argv rather than re-deriving it: this
+    // is whichever of the operator's own `--model`/`-m` passthrough or the
+    // configured/default worker-model prepend actually won.
+    let model = adapters::last_model_flag(&command).map(str::to_string);
+    let worker_session = SessionId::new_v4().to_string();
 
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
-        session_id: Some(SessionId::new_v4().to_string()),
+        session_id: Some(worker_session.clone()),
         transcript: None,
         // Data, never argv: `run_with` builds the launch from the adapter
         // itself when the trailing command carries no program name, exactly
@@ -601,7 +618,9 @@ pub fn run_with<W: Write>(
     announcer.emit(&Event::DelegatedStart {
         agent: args.name.clone(),
     });
+    let started = std::time::Instant::now();
     let code = exec::run_with(&exec_args, w, repo, &env)?;
+    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     announcer.emit(&Event::DelegatedFinish {
         agent: args.name.clone(),
         meaning: exec::describe_exit(code),
@@ -609,6 +628,62 @@ pub fn run_with<W: Write>(
     if let Some(note) = exit_note(code) {
         eprintln!("zirv ctx agent: {note}");
     }
+
+    // Best effort throughout: a delegation that ran must never fail because
+    // its accounting could not be written (issue #155, Phase 2).
+    if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
+        let usage = std::fs::read_to_string(adapter.transcript_path(&super::event::SessionRef {
+            id: SessionId::parse(&worker_session),
+            cwd: repo.to_path_buf(),
+        }))
+        .ok()
+        .and_then(|body| adapter.transcript_usage(&body))
+        .unwrap_or_default();
+        let parent_session = super::mail::session_identity(&env).unwrap_or_default();
+        let outcome = delegation_outcome(code);
+        let detail = format!(
+            "{} ({}): {} in / {} cache-creation / {} cache-read / {} out in {}ms -- {}",
+            args.name,
+            model.as_deref().unwrap_or("default worker model"),
+            usage.input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+            usage.output_tokens,
+            wall_ms,
+            outcome,
+        );
+        let _ = super::log::append_delegation(
+            &state_dir,
+            &super::log::Delegation {
+                ts: super::state::now_secs(),
+                session: &worker_session,
+                parent_session: &parent_session,
+                work_group_id: None,
+                agent: &args.name,
+                model: model.as_deref(),
+                input_tokens: usage.input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+                output_tokens: usage.output_tokens,
+                wall_ms,
+                exit_code: code,
+                outcome,
+            },
+        );
+        let _ = super::log::append(
+            &state_dir,
+            &super::log::Decision {
+                ts: super::state::now_secs(),
+                session: &worker_session,
+                verb: "agent",
+                verdict: "n/a",
+                score: 0,
+                action: super::log::DELEGATION_ACTION,
+                detail: &detail,
+            },
+        );
+    }
+
     Ok(code)
 }
 
@@ -623,6 +698,21 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    /// The classifier half, testable without spawning anything: a completed
+    /// delegation's outcome label must distinguish the supervisor's own two
+    /// failure modes from an ordinary non-zero exit, because "the worker
+    /// failed" and "zirv gave up on the worker" cost very different things.
+    #[test]
+    fn a_delegation_outcome_names_the_supervisors_own_failures() {
+        assert_eq!(delegation_outcome(0), "ok");
+        assert_eq!(
+            delegation_outcome(exec::EXIT_ROT_EXHAUSTED),
+            "rot-exhausted"
+        );
+        assert_eq!(delegation_outcome(exec::EXIT_TIMEOUT), "timeout");
+        assert_eq!(delegation_outcome(1), "failed");
+    }
 
     // `worker_launch_flags`/`flags_pin_model`: pure, so these are testable
     // against a plain adapter without spawning anything.
@@ -1305,6 +1395,71 @@ mod tests {
             code.expect("runs"),
             0,
             "--quiet must not change the outcome"
+        );
+    }
+
+    /// Issue #155, Phase 2: the end-to-end write, against a real
+    /// `AgentAdapter` (`ClaudeAdapter`) and a real fake-agent transcript --
+    /// not just `log.rs`'s own isolated `append_delegation`/`tail_
+    /// delegations` round trip. A completed delegation must leave exactly
+    /// one `Delegation` record with a real (non-zero) cache-read count read
+    /// back off the worker's own transcript, and exactly one
+    /// `delegation-complete` line in the main decision log naming the same
+    /// verb.
+    #[test]
+    fn a_completed_delegation_writes_a_checkpoint_record() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let args = args_for("claude", "do the work");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let state = crate::commands::ctx::state::StateDir::resolve(&|k| env.get(k).cloned())
+            .expect("state resolves");
+        let delegations = crate::commands::ctx::log::tail_delegations(&state, 10).expect("tail");
+        assert_eq!(
+            delegations.len(),
+            1,
+            "exactly one checkpoint record per delegation: {delegations:?}"
+        );
+        let record: serde_json::Value = serde_json::from_str(&delegations[0]).expect("json");
+        assert_eq!(record["agent"], "claude");
+        // Pins the argv -> model field wiring end-to-end: no `--model` was
+        // passed, so `worker_launch_flags` prepends claude's own configured-
+        // or-default worker model (`ClaudeAdapter::default_worker_model`,
+        // "sonnet" with nothing configured), and `adapters::last_model_flag`
+        // must read that exact value back out of the effective argv.
+        assert_eq!(record["model"], "sonnet");
+        assert_eq!(record["exit_code"], 0);
+        assert_eq!(record["outcome"], "ok");
+        assert!(
+            record["cache_read_input_tokens"].as_u64().unwrap_or(0) > 0,
+            "must read real usage back off the worker's own transcript: {record}"
+        );
+        assert!(
+            !record["session"].as_str().unwrap_or("").is_empty(),
+            "must carry the worker's own session id: {record}"
+        );
+
+        let decisions = crate::commands::ctx::log::tail(&state, 10).expect("tail");
+        assert!(
+            decisions
+                .iter()
+                .any(|line| line.contains(crate::commands::ctx::log::DELEGATION_ACTION)),
+            "the main decision log must also get a one-line delegation-complete marker: \
+             {decisions:?}"
         );
     }
 

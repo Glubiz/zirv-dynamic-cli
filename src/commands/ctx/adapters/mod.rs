@@ -761,7 +761,12 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
 /// A: this feeds `seat_model_env`, and a codex-adapter launch built with a
 /// bare `-m <expensive>`/`-m=<expensive>`/`-m<expensive>` passthrough used
 /// to export no seat env at all, leaving the pretool guard blind to it.
-fn last_model_flag(flags: &[String]) -> Option<&str> {
+///
+/// `pub(crate)`: `agent::run_with` (issue #155, Phase 2) is a second caller,
+/// reading the model actually launched with back out of the effective argv
+/// for the delegation checkpoint record -- same scan, no reason for a
+/// second copy of it.
+pub(crate) fn last_model_flag(flags: &[String]) -> Option<&str> {
     let mut found = None;
     let mut i = 0;
     while i < flags.len() {

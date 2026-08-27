@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-23
+last-verified: 2026-08-27
 ---
 
 # Usage and Pacing
@@ -120,6 +120,20 @@ A second, active data source alongside the passive collector, consulted only whe
 5. **Always returns `0`.**
 
 This resilience is deliberate and load-bearing: Claude Code renders whatever the statusline command prints on every render tick, so a `tee` that errors out or prints nothing makes the terminal look broken. The same fallback path is reused one level up: `ctx/mod.rs`'s `dispatch` classifies a clap parse failure on `ctx usage tee ...` argv as `ParseFailure::Statusline` (as opposed to the generic `ParseFailure::Reject`, which exits `2`) and calls `usage::run_tee` with an empty command and no state, so even a malformed invocation of the tee itself still emits a fallback line and exits `0`.
+
+### `zirv ctx usage --sessions` — per-session raw token breakdown (2026-08-27, issue #155 Phase 2)
+
+A `--sessions` flag on the no-subcommand `zirv ctx usage` report prints one line per Claude Code transcript active in the trailing 24 hours, in the same four raw token classes [[Ctx Adapters]]'s `TranscriptUsage` now carries (`input`, `cache_creation`, `cache_read`, `output` — see the "Four raw token classes" note below), plus a computed cache-hit ratio and an in-window event count. This is a diagnostic surface for "which session/subagent is actually spending the account's budget," complementary to the aggregate collector/estimator windows above it, not a replacement for either.
+
+- **`window::SessionSpend { session, input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens, events, newest_at }`** and **`window::session_spend(projects_root, now, window_secs) -> Vec<SessionSpend>`** fold each transcript file separately instead of into one combined total. `session_spend` reuses `sum_transcripts`'s directory walk verbatim — including descending into `subagents/`, since a subagent's tokens are charged to the same account — but keeps each file's identity (`session` is the file stem) rather than summing across files. A file contributing no in-window assistant rows produces no entry at all, never a zeroed one. Per-row classification goes through `adapters::claude::usage_categories`, the same function `TranscriptUsage` itself is built from, so this reader and the adapter can never disagree about what a class is.
+- **`usage::render_sessions(w, spend)`** prints `session: input N | cache_creation N | cache_read N | output N | cache-hit X.X% | events N` per session, sorted by total spend (input + cache_creation + cache_read + output) descending by the caller. The cache-hit ratio's denominator is the raw input + cache_creation + cache_read sum — never the legacy combined `input_tokens` meaning — so it is a pure function of the same four numbers on the line. An empty result prints `"no session activity in this window."` rather than an empty section; the same "approximation, token class weighting undocumented" caveat the estimator carries is repeated here.
+- Wired into `usage::run_with`'s no-subcommand path only when `args.sessions` is set, best-effort: a failure to resolve `~/.claude/projects` degrades to the empty-result line rather than turning a working `zirv ctx usage` into an error. Fixed 24-hour window (`86_400` seconds), independent of the pacing windows above.
+
+### Four raw token classes, not a pre-summed total (2026-08-27, issue #155 Phase 2)
+
+`event::TranscriptUsage` (see [[Ctx Adapters]]) used to fold `input + cache_creation + cache_read` into one `input_tokens` field at the claude adapter boundary. As of 2.34.0 the three classes are kept apart on the struct, and `TranscriptUsage::context_total()` is the one place that recombines them into the same "real context size" number every existing caller (this page's estimator/rot's token gate/status display) already expected — every call site that wants a single context-size figure now calls `context_total()` instead of reading `input_tokens` directly, so nothing downstream of this page changed behavior. The reason to keep them apart at all: cache *creation* is expensive and written once per prompt-shape change, cache *read* is cheap and should dominate a healthy, well-cached session, and a cache-hit ratio — the one number that says whether prompt-shape work (this page's own truncation/dedup work, [[Ctx Subsystem]]'s context compiler) actually helped — is uncomputable once the three are folded together. `window::sum_transcripts`/`session_spend_of` both read the same raw classes; `sum_transcripts`'s own estimator budget math is unchanged (still `input + cache_creation_input + output`, `cache_read_input` excluded via `count_cache_reads` as before).
+
+`zirv ctx agent`'s one-shot delegations get their own cost ledger built on the same four classes: see [[Ctx Subsystem]]'s "One-shot delegation cost accounting" note for the `delegations.jsonl` record and how it differs from this page's aggregate windows (per-delegation, not per-account-window; written once per completed `zirv ctx agent` run, not polled/collected).
 
 ## Data Flow
 

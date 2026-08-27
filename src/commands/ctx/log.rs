@@ -7,6 +7,11 @@ use super::state::StateDir;
 
 pub const LOG_FILE: &str = "decisions.jsonl";
 pub const SAFETY_LOG_DIR: &str = "safety-decisions";
+pub const DELEGATION_FILE: &str = "delegations.jsonl";
+
+/// `Decision::action` for the one-line marker written into the MAIN decision
+/// log alongside every delegation record.
+pub const DELEGATION_ACTION: &str = "delegation-complete";
 
 #[derive(Debug, Serialize)]
 pub struct Decision<'a> {
@@ -38,11 +43,47 @@ pub struct SafetyDecision<'a> {
     pub platform: &'a str,
 }
 
+/// One completed `zirv ctx agent` delegation, with what it actually cost.
+///
+/// Its own file rather than a `Decision` variant (issue #155): the decision
+/// log is a rotation log keyed by verdict/score, and a cost record has
+/// neither. `Delegation` is what answers "was delegating this cheaper than
+/// doing it on the orchestrator seat", which is the question every later
+/// phase's design rests on.
+///
+/// Token classes are the four RAW ones (`event::TranscriptUsage`), never a
+/// pre-summed total: a delegated worker's cache-hit ratio is precisely how
+/// you tell a well-shaped worker prompt from a badly-shaped one.
+#[derive(Debug, Serialize)]
+pub struct Delegation<'a> {
+    pub ts: u64,
+    pub session: &'a str,
+    pub parent_session: &'a str,
+    pub work_group_id: Option<&'a str>,
+    pub agent: &'a str,
+    pub model: Option<&'a str>,
+    pub input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub output_tokens: u64,
+    pub wall_ms: u64,
+    pub exit_code: i32,
+    pub outcome: &'a str,
+}
+
 pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
     let dir = state.logs();
     super::state::create_private_dir_all(&dir)?;
     let mut file = super::state::open_private_append(&dir.join(LOG_FILE))?;
     writeln!(file, "{}", serde_json::to_string(decision)?)?;
+    Ok(())
+}
+
+pub fn append_delegation(state: &StateDir, record: &Delegation<'_>) -> CtxResult<()> {
+    let dir = state.logs();
+    super::state::create_private_dir_all(&dir)?;
+    let mut file = super::state::open_private_append(&dir.join(DELEGATION_FILE))?;
+    writeln!(file, "{}", serde_json::to_string(record)?)?;
     Ok(())
 }
 
@@ -125,6 +166,23 @@ pub fn read_safety_decisions(state: &StateDir) -> Vec<SafetyDecisionRecord> {
         }
     }
     out
+}
+
+/// Issue #155: no CLI surface reads `delegations.jsonl` back yet -- that is
+/// Phase 5's reporting work, once `work_group_id` gives it something to
+/// group by. This reader lands now so `append_delegation`'s own round-trip
+/// is testable today, the same "accessor lands ahead of its production
+/// caller" pattern `LaunchMode::label`/`is_interactive` used.
+#[allow(dead_code)]
+pub fn tail_delegations(state: &StateDir, count: usize) -> CtxResult<Vec<String>> {
+    let path = state.logs().join(DELEGATION_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let from = lines.len().saturating_sub(count);
+    Ok(lines[from..].to_vec())
 }
 
 #[cfg(test)]
@@ -283,6 +341,56 @@ mod tests {
         )
         .expect("append must create its directory");
         assert!(state.logs().join("decisions.jsonl").is_file());
+    }
+
+    /// Issue #155, Phase 2: a delegation checkpoint. Its own file, like
+    /// `SafetyDecision`'s own daily buckets -- the decision log is a rotation
+    /// log and mixing a per-delegation cost record into it would make both
+    /// harder to read. The main log still gets a one-line
+    /// `delegation-complete` decision so a reader who only looks there sees
+    /// that a delegation happened.
+    #[test]
+    fn a_delegation_record_appends_as_jsonl_with_all_four_token_classes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        append_delegation(
+            &state,
+            &Delegation {
+                ts: 1_700_000_000,
+                session: "sess-child",
+                parent_session: "sess-parent",
+                work_group_id: None,
+                agent: "codex",
+                model: Some("gpt-5-codex"),
+                input_tokens: 1_000,
+                cache_creation_input_tokens: 8_000,
+                cache_read_input_tokens: 91_000,
+                output_tokens: 500,
+                wall_ms: 42_000,
+                exit_code: 0,
+                outcome: "ok",
+            },
+        )
+        .expect("append");
+
+        let lines = tail_delegations(&state, 10).expect("tail");
+        assert_eq!(lines.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&lines[0]).expect("json");
+        assert_eq!(value["agent"], "codex");
+        assert_eq!(value["model"], "gpt-5-codex");
+        assert_eq!(value["cache_read_input_tokens"], 91_000);
+        assert_eq!(value["wall_ms"], 42_000);
+        assert_eq!(value["outcome"], "ok");
+        assert_eq!(value["exit_code"], 0);
+    }
+
+    /// An empty file (or none at all) is an empty list, never an error --
+    /// same contract `tail` already has for the decision log.
+    #[test]
+    fn tailing_delegations_before_any_exist_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(tail_delegations(&state, 10).expect("tail").is_empty());
     }
 
     #[test]

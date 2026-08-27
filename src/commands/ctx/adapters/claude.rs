@@ -105,17 +105,26 @@ fn text_of(message: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// The four raw token classes from one `message.usage` object. A missing
+/// field is `0`, the same tolerance `context_tokens_of` has always had.
+pub fn usage_categories(usage: &Value) -> TranscriptUsage {
+    let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    TranscriptUsage {
+        input_tokens: field("input_tokens"),
+        cache_creation_input_tokens: field("cache_creation_input_tokens"),
+        cache_read_input_tokens: field("cache_read_input_tokens"),
+        output_tokens: field("output_tokens"),
+    }
+}
+
 /// Real context size is `input_tokens` plus both cache fields; the bare
-/// `input_tokens` field is near zero once prompt caching kicks in.
+/// `input_tokens` field is near zero once prompt caching kicks in. Now a
+/// DERIVED helper over [`usage_categories`] rather than the only thing that
+/// survives the adapter boundary -- same signature, same value, so
+/// `parse_events`' `AssistantFinal { input_tokens }` (which feeds rot's
+/// context gate) is byte-for-byte unchanged.
 pub fn context_tokens_of(usage: &Value) -> u64 {
-    [
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    ]
-    .iter()
-    .filter_map(|key| usage.get(*key).and_then(Value::as_u64))
-    .sum()
+    usage_categories(usage).context_total()
 }
 
 pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
@@ -203,15 +212,21 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
     events
 }
 
-pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
+/// The shared fold behind [`transcript_usage`] and [`sidechain_transcript_usage`]:
+/// every assistant row whose `isSidechain` flag matches `want_sidechain`,
+/// summed into the four raw classes. One fold, two filters, so the main and
+/// sidechain readers can never drift on what counts as an assistant usage
+/// row.
+fn fold_assistant_usage(jsonl: &str, want_sidechain: bool) -> Option<TranscriptUsage> {
     let mut usage = TranscriptUsage::default();
     let mut observed = false;
     for line in jsonl.lines() {
         let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
+        let is_sidechain = row.get("isSidechain").and_then(Value::as_bool) == Some(true);
         if row.get("type").and_then(Value::as_str) != Some("assistant")
-            || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
+            || is_sidechain != want_sidechain
         {
             continue;
         }
@@ -219,17 +234,30 @@ pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
             continue;
         };
         observed = true;
-        usage.input_tokens = usage
-            .input_tokens
-            .saturating_add(context_tokens_of(current));
-        usage.output_tokens = usage.output_tokens.saturating_add(
-            current
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        );
+        let row = usage_categories(current);
+        usage.input_tokens = usage.input_tokens.saturating_add(row.input_tokens);
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .saturating_add(row.cache_creation_input_tokens);
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(row.cache_read_input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(row.output_tokens);
     }
     observed.then_some(usage)
+}
+
+pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
+    fold_assistant_usage(jsonl, false)
+}
+
+/// The same fold as [`transcript_usage`], over the rows it deliberately
+/// skips: `isSidechain == true` assistant turns, i.e. subagent work. `None`
+/// when the transcript has no sidechain rows at all -- an honest "no data",
+/// never a zeroed reading, the same distinction `transcript_usage`'s own
+/// `observed` flag draws.
+pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
+    fold_assistant_usage(jsonl, true)
 }
 
 const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
@@ -1503,14 +1531,89 @@ mod tests {
             "\n",
             r#"{"type":"assistant","message":{"usage":{"input_tokens":11,"output_tokens":13}}}"#,
         );
+        let usage = transcript_usage(jsonl).expect("usage");
         assert_eq!(
-            transcript_usage(jsonl),
-            Some(TranscriptUsage {
-                input_tokens: 21,
+            usage,
+            TranscriptUsage {
+                input_tokens: 13,
+                cache_creation_input_tokens: 3,
+                cache_read_input_tokens: 5,
                 output_tokens: 20,
-            })
+            }
         );
+        assert_eq!(usage.context_total(), 21, "the pre-2.34.0 combined number");
         assert_eq!(transcript_usage("not json"), None);
+    }
+
+    /// The adapter stops pre-summing. `context_tokens_of` keeps its exact old
+    /// meaning and value, because rot's context gate and every display path
+    /// still want one combined "real context size" number -- it is just no
+    /// longer the ONLY thing that survives the boundary.
+    #[test]
+    fn transcript_usage_reports_each_token_class_separately() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"#,
+            r#""cache_creation_input_tokens":200,"cache_read_input_tokens":3000,"#,
+            r#""output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"#,
+            r#""cache_creation_input_tokens":0,"cache_read_input_tokens":3100,"#,
+            r#""output_tokens":7}}}"#,
+        );
+        let usage = transcript_usage(jsonl).expect("usage");
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.cache_creation_input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 6_100);
+        assert_eq!(usage.output_tokens, 47);
+        assert_eq!(
+            usage.context_total(),
+            6_315,
+            "context_total must equal what the old pre-summed input_tokens was"
+        );
+    }
+
+    /// A sidechain row still does not reach the MAIN-session usage total:
+    /// Task 2.2 gives subagent spend its own bucket rather than folding it
+    /// into a number whose meaning is "this session's own context".
+    #[test]
+    fn transcript_usage_still_excludes_sidechain_rows_from_the_main_total() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":900,"#,
+            r#""cache_read_input_tokens":900,"output_tokens":900}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
+        let usage = transcript_usage(jsonl).expect("usage");
+        assert_eq!(usage.input_tokens, 1);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    /// Subagent turns live in `isSidechain` rows. They are charged to the
+    /// account (`window::sum_transcripts` walks `subagents/` too) but were
+    /// dropped from workflow accounting entirely. Counted separately here, so
+    /// the main-session number keeps meaning "this session's own context"
+    /// while the child spend stops being invisible.
+    #[test]
+    fn sidechain_usage_is_counted_separately_rather_than_dropped() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":900,"#,
+            r#""cache_read_input_tokens":12000,"output_tokens":90}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
+        let side = sidechain_transcript_usage(jsonl).expect("sidechain usage");
+        assert_eq!(side.input_tokens, 900);
+        assert_eq!(side.cache_read_input_tokens, 12_000);
+        assert_eq!(side.output_tokens, 90);
+
+        assert_eq!(
+            sidechain_transcript_usage(
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":1}}}"#
+            ),
+            None,
+            "no sidechain rows means None, not a zeroed reading"
+        );
     }
 
     #[test]
