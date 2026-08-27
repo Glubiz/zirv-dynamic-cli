@@ -239,12 +239,12 @@ pub struct OptimizeArgs {
     #[arg(long)]
     pub agent: Option<String>,
 }
+/// Thin, surface-local name for `MemoryScope::of` (issue #172 cross-review
+/// finding 6): the bool-to-scope mapping itself is centralized there rather
+/// than duplicated here, but every call site in this file reads more
+/// naturally as `scope_of(args.shared)` than `MemoryScope::of(args.shared)`.
 fn scope_of(shared: bool) -> MemoryScope {
-    if shared {
-        MemoryScope::Shared
-    } else {
-        MemoryScope::Private
-    }
+    MemoryScope::of(shared)
 }
 
 fn scope_label(scope: MemoryScope) -> &'static str {
@@ -357,24 +357,13 @@ pub fn run_init<W: Write>(args: &InitArgs, w: &mut W) -> CtxResult<i32> {
     run_init_with(args, w, &std::env::current_dir()?)
 }
 
-/// An `Entry` plus the scope it was read from, for JSON output. `scope` is
-/// derived from which directory the CLI actually read, never from the
-/// entry's own header fields -- a shared entry's `Source`/`Written-By` are
-/// attacker-supplied repository content (see `MemoryScope::Shared`'s own doc
-/// comment) and must never be the thing that tells a reader which bank an
-/// entry came from.
-#[derive(Serialize)]
-struct ScopedEntry<'a> {
-    #[serde(flatten)]
-    entry: &'a Entry,
-    scope: &'static str,
-}
-
 /// Renders entries already selected from one scope. Never trusts an entry's
-/// own header for its scope label (see `ScopedEntry`); a shared entry's
-/// human-readable line additionally carries an explicit untrusted-content
-/// note so a repo-committed `Source: explicit` can never read as if it were
-/// operator-verified.
+/// own header for its scope label (see `memory::ScopedEntry`, shared with
+/// `zirv ctx recall`'s own JSON output rather than each surface keeping its
+/// own identical copy -- issue #172 cross-review finding 6); a shared
+/// entry's human-readable line additionally carries an explicit
+/// untrusted-content note so a repo-committed `Source: explicit` can never
+/// read as if it were operator-verified.
 fn render_entries<W: Write>(
     w: &mut W,
     entries: &[Entry],
@@ -385,7 +374,7 @@ fn render_entries<W: Write>(
     let label = scope_label(scope);
     for entry in entries {
         if json {
-            let scoped = ScopedEntry {
+            let scoped = memory::ScopedEntry {
                 entry,
                 scope: label,
             };
@@ -409,8 +398,8 @@ fn render_entries<W: Write>(
 
 /// A ranked `Entry` plus its scope, score, and selection reasons -- the
 /// JSON shape `zirv memory recall --json` emits (issue #35). `scope`
-/// follows `ScopedEntry`'s own rule: derived from which directory was
-/// read, never from the entry's own header.
+/// follows `memory::ScopedEntry`'s own rule: derived from which directory
+/// was read, never from the entry's own header.
 #[derive(Serialize)]
 struct RankedEntry<'a> {
     #[serde(flatten)]
@@ -420,10 +409,10 @@ struct RankedEntry<'a> {
     reasons: &'a [String],
 }
 
-/// Renders a ranking's selected entries. Reuses `ScopedEntry`'s scope-
-/// labeling and the shared-scope trust note from `render_entries`, adding
-/// `score`/`reasons` -- the selection diagnostics issue #35 asks for -- to
-/// both the JSON and human-readable forms.
+/// Renders a ranking's selected entries. Reuses `memory::ScopedEntry`'s
+/// scope-labeling and the shared-scope trust note from `render_entries`,
+/// adding `score`/`reasons` -- the selection diagnostics issue #35 asks for
+/// -- to both the JSON and human-readable forms.
 fn render_ranked<W: Write>(
     w: &mut W,
     ranked: &[Ranked<'_>],

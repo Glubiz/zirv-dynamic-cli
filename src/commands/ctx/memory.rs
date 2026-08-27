@@ -285,6 +285,19 @@ pub enum MemoryScope {
 }
 
 impl MemoryScope {
+    /// Maps a scope-selecting CLI boolean to the scope it selects: `zirv ctx
+    /// remember`/`recall`/`forget`'s `--repo` and `zirv memory`'s `--shared`
+    /// both boil down to exactly this mapping (issue #172 cross-review
+    /// finding 6) -- centralized here, once, rather than each CLI surface
+    /// keeping its own identical `if flag { Shared } else { Private }`.
+    pub fn of(flag: bool) -> MemoryScope {
+        if flag {
+            MemoryScope::Shared
+        } else {
+            MemoryScope::Private
+        }
+    }
+
     /// Whether this scope may be used at all. `cfg.memory.enabled` is a
     /// MASTER switch: `false` disables both scopes outright, so an operator
     /// who turned memory off before the shared scope existed does not
@@ -328,6 +341,24 @@ impl MemoryScope {
             MemoryScope::Shared => safe_shared_dir(repo),
         }
     }
+}
+
+/// One entry plus the scope it was actually read from, for a scope-merging
+/// JSON surface (`zirv ctx recall --json`, `zirv memory list`/`recall
+/// --json`). `scope` must always be derived from which bank the caller read
+/// the entry from, never from the entry's own header fields -- a shared
+/// entry's `Source`/`Written-By` are themselves attacker-supplied repository
+/// content (see `MemoryScope::Shared`'s own doc comment above). Shared
+/// between both CLI surfaces (issue #172 cross-review finding 6) rather than
+/// each keeping its own identical copy; the two surfaces still use different
+/// label vocabularies at the call site (`"local"`/`"repo"` for `zirv ctx`,
+/// `"private"`/`"shared"` for `zirv memory`), so `scope` is filled in by the
+/// caller, not derived here.
+#[derive(Serialize)]
+pub(crate) struct ScopedEntry<'a> {
+    #[serde(flatten)]
+    pub(crate) entry: &'a Entry,
+    pub(crate) scope: &'static str,
 }
 
 /// `<repo>/.zirv/memory/`, refused (returned as `None`) if either it or
@@ -1962,12 +1993,8 @@ pub fn run_remember_with<W: Write>(
 
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    let scope = if args.repo {
-        MemoryScope::Shared
-    } else {
-        MemoryScope::Private
-    };
-    let bank_label = if args.repo { "repo" } else { "local" };
+    let scope = MemoryScope::of(args.repo);
+    let bank_label = ctx_scope_label(scope);
 
     match resolve_remember(args, stdin)? {
         RememberIntent::VerifyOnly => {
@@ -2033,18 +2060,29 @@ pub fn run_remember<W: Write>(args: &RememberArgs, w: &mut W) -> CtxResult<i32> 
     run_remember_with(args, w, &repo, &env, &mut std::io::stdin())
 }
 
-/// One recalled entry plus the bank it came from, for `zirv ctx recall
-/// --json` (issue #172). `scope` is derived from which bank `run_recall_with`
-/// actually read it from, never from the entry's own header fields -- a
-/// shared entry's `Source`/`Written-By` are themselves attacker-supplied
-/// repository content (see `MemoryScope::Shared`'s own doc comment), the same
-/// rule `memory_cli.rs`'s own `ScopedEntry` already follows for `zirv memory
-/// recall`.
-#[derive(Serialize)]
-struct RecallEntry<'a> {
-    #[serde(flatten)]
-    entry: &'a Entry,
-    scope: &'static str,
+/// Provenance label `zirv ctx remember`/`recall`/`forget` show for a scope
+/// -- `"local"`/`"repo"`, since those verbs name the flag `--repo`. A
+/// different vocabulary from `zirv memory`'s own `"private"`/`"shared"`
+/// (`memory_cli.rs`'s own `scope_label`, which names its flag `--shared`
+/// instead) -- centralizing `MemoryScope::of` (issue #172 cross-review
+/// finding 6) does not force the two surfaces to share wording, only the
+/// bool-to-scope mapping underneath it.
+fn ctx_scope_label(scope: MemoryScope) -> &'static str {
+    match scope {
+        MemoryScope::Private => "local",
+        MemoryScope::Shared => "repo",
+    }
+}
+
+/// The extra clause `zirv ctx recall` appends to a shared entry's
+/// human-readable line, warning that it is repository-owned, untrusted
+/// content rather than something this operator verified -- never shown for
+/// a private entry, which by definition never left this machine.
+fn ctx_scope_trust_note(scope: MemoryScope) -> &'static str {
+    match scope {
+        MemoryScope::Shared => " -- repo: repository-owned content, not operator-verified",
+        MemoryScope::Private => "",
+    }
 }
 
 pub fn run_recall_with<W: Write>(
@@ -2086,12 +2124,9 @@ pub fn run_recall_with<W: Write>(
     }
 
     for (entry, scope) in &entries {
-        let label = match scope {
-            MemoryScope::Private => "local",
-            MemoryScope::Shared => "repo",
-        };
+        let label = ctx_scope_label(*scope);
         if args.json {
-            let scoped = RecallEntry {
+            let scoped = ScopedEntry {
                 entry,
                 scope: label,
             };
@@ -2100,10 +2135,7 @@ pub fn run_recall_with<W: Write>(
             let now = now_secs();
             let written_days = now.saturating_sub(entry.written) / 86_400;
             let verified_days = now.saturating_sub(entry.verified) / 86_400;
-            let trust_note = match scope {
-                MemoryScope::Shared => " -- repo: repository-owned content, not operator-verified",
-                MemoryScope::Private => "",
-            };
+            let trust_note = ctx_scope_trust_note(*scope);
             writeln!(
                 w,
                 "{} [{label}{trust_note}] (written {written_days}d ago, verified {verified_days}d ago)\n{}\n",
@@ -2146,12 +2178,8 @@ pub fn run_forget_with<W: Write>(
     let Some(key) = &args.key else {
         return Err("zirv ctx forget: pass a key, or --all".into());
     };
-    let scope = if args.repo {
-        MemoryScope::Shared
-    } else {
-        MemoryScope::Private
-    };
-    let bank_label = if args.repo { "repo" } else { "local" };
+    let scope = MemoryScope::of(args.repo);
+    let bank_label = ctx_scope_label(scope);
     if forget_scoped(scope, repo, &state, &slug, key)? {
         writeln!(
             w,
