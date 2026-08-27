@@ -642,10 +642,11 @@ pub fn run_with<W: Write>(
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         let outcome = delegation_outcome(code);
         let detail = format!(
-            "{} ({}): {} in / {} cache-read / {} out in {}ms -- {}",
+            "{} ({}): {} in / {} cache-creation / {} cache-read / {} out in {}ms -- {}",
             args.name,
             model.as_deref().unwrap_or("default worker model"),
             usage.input_tokens,
+            usage.cache_creation_input_tokens,
             usage.cache_read_input_tokens,
             usage.output_tokens,
             wall_ms,

@@ -114,8 +114,11 @@ pub struct TelemetryEvent {
     /// `input_tokens` keeps its pre-2.34.0 meaning for events produced by the
     /// workflow engine: the COMBINED context total (raw input plus both cache
     /// classes -- see `engine.rs`'s `usage.context_total()`), not the raw
-    /// uncached class alone. These two fields are the ground truth for any
-    /// cache-hit-ratio math; do not assume `input_tokens` excludes them.
+    /// uncached class alone. `cache_read_input_tokens` is therefore a SUBSET
+    /// of `input_tokens`, not a third figure to add to it: a cache-hit ratio
+    /// is `cache_read_input_tokens / input_tokens` directly (see
+    /// `cache_hit_ratio()` below) -- summing `input_tokens` with the cache
+    /// classes double-counts them.
     #[serde(default)]
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
@@ -183,6 +186,25 @@ impl TelemetryEvent {
             parent_session_id: None,
             work_group_id: None,
         }
+    }
+
+    /// The fraction of `input_tokens` (the combined context total) served
+    /// from cache. `cache_read_input_tokens` is a SUBSET of `input_tokens`,
+    /// not a separate figure to add to it -- see the doc comment on that
+    /// field. `None` when either value is missing, or `input_tokens` is `0`
+    /// (no ratio to report, never a manufactured 0%).
+    ///
+    /// No CLI surface reads a `TelemetryEvent`'s ratio back yet (`usage.rs`'s
+    /// own `--sessions` cache-hit line works off `window::SessionSpend`, a
+    /// different type) -- this is the one correct formula for whichever
+    /// future reporting surface needs it, landed now so it is not
+    /// re-derived incorrectly a second time, the same "accessor lands ahead
+    /// of its production caller" pattern `log::tail_delegations` used.
+    #[allow(dead_code)]
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        let read = self.cache_read_input_tokens?;
+        let total = self.input_tokens?;
+        (total > 0).then(|| read as f64 / total as f64)
     }
 }
 
@@ -780,7 +802,10 @@ mod tests {
     #[test]
     fn a_telemetry_event_carries_raw_categories_and_session_lineage() {
         let mut event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
-        event.input_tokens = Some(1_000);
+        // `input_tokens` is the COMBINED total (raw input + both cache
+        // classes -- 1_000 + 8_000 + 91_000), not the raw uncached class
+        // alone: `cache_read_input_tokens` is a subset of it.
+        event.input_tokens = Some(100_000);
         event.cache_creation_input_tokens = Some(8_000);
         event.cache_read_input_tokens = Some(91_000);
         event.output_tokens = Some(500);
@@ -796,13 +821,24 @@ mod tests {
         let back: TelemetryEvent = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(back, event);
 
-        let cached = back.cache_read_input_tokens.unwrap_or(0) as f64;
-        let total = (back.input_tokens.unwrap_or(0)
-            + back.cache_creation_input_tokens.unwrap_or(0)
-            + back.cache_read_input_tokens.unwrap_or(0)) as f64;
         assert!(
-            (cached / total - 0.91).abs() < 1e-9,
-            "a cache-hit ratio must be computable from ONE event"
+            (back.cache_hit_ratio().expect("both values present") - 0.91).abs() < 1e-9,
+            "a cache-hit ratio must be computable from ONE event, dividing by the \
+             combined total rather than double-counting the cache classes"
+        );
+    }
+
+    #[test]
+    fn cache_hit_ratio_is_none_without_data_never_a_manufactured_zero() {
+        let mut event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        assert_eq!(event.cache_hit_ratio(), None, "no data at all");
+
+        event.input_tokens = Some(0);
+        event.cache_read_input_tokens = Some(0);
+        assert_eq!(
+            event.cache_hit_ratio(),
+            None,
+            "a zero total has no ratio to report"
         );
     }
 
