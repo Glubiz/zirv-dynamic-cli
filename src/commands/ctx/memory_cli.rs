@@ -556,6 +556,7 @@ pub fn run_remember_with<W: Write>(
             text: Some(args.text.clone()),
             text_file: None,
             verify: false,
+            repo: false,
             importance,
             confidence,
             tags: args.tags.clone(),

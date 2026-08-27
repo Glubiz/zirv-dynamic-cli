@@ -1703,6 +1703,15 @@ pub struct RememberArgs {
     /// stamp rather than requiring new text.
     #[arg(long, default_value_t = false)]
     pub verify: bool,
+    /// Write (or, with `--verify`, refresh) this fact in the shared,
+    /// repository-owned bank at `<repo>/.zirv/memory/<key>.md` instead of
+    /// the private, machine-local one (issue #172). Committed with the
+    /// repository, so it follows whichever branch it was written on until
+    /// that branch merges -- see `zirv ctx recall`'s `[local]`/`[repo]`
+    /// labels. Gated the same way `zirv memory remember --shared` already
+    /// is: `cfg.memory.enabled && cfg.memory.shared_enabled`.
+    #[arg(long, default_value_t = false)]
+    pub repo: bool,
     /// NOT a CLI flag on `zirv ctx remember` -- `#[arg(skip)]` always
     /// leaves this at its default (`None`) here. `zirv memory remember`'s
     /// private arm (`memory_cli.rs`, the only surface with `--importance`)
@@ -1789,14 +1798,28 @@ pub fn run_remember_with<W: Write>(
 
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
+    let scope = if args.repo {
+        MemoryScope::Shared
+    } else {
+        MemoryScope::Private
+    };
+    let bank_label = if args.repo { "repo" } else { "local" };
 
     match resolve_remember(args, stdin)? {
         RememberIntent::VerifyOnly => {
-            if verify(&state, &slug, &args.key)? {
-                writeln!(w, "zirv ctx remember: verified '{}'", args.key)?;
+            if verify_scoped(scope, repo, &state, &slug, &args.key)? {
+                writeln!(
+                    w,
+                    "zirv ctx remember: verified '{}' in the {bank_label} bank",
+                    args.key
+                )?;
                 Ok(0)
             } else {
-                Err(format!("zirv ctx remember: no entry for key '{}'", args.key).into())
+                Err(format!(
+                    "zirv ctx remember: no entry for key '{}' in the {bank_label} bank",
+                    args.key
+                )
+                .into())
             }
         }
         RememberIntent::Store(body) => {
@@ -1823,10 +1846,11 @@ pub fn run_remember_with<W: Write>(
                 // exists to set it yet.
                 paths: Vec::new(),
             };
-            let path = remember(&state, &slug, &entry, &cfg)?;
+            let path = upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)
+                .map_err(|e| format!("zirv ctx remember: {e}"))?;
             writeln!(
                 w,
-                "zirv ctx remember: stored '{}' at {}",
+                "zirv ctx remember: stored '{}' in the {bank_label} bank at {}",
                 args.key,
                 path.display()
             )?;
@@ -2674,6 +2698,7 @@ This should not appear in the body.\n";
             text: Some("cargo build --release".to_string()),
             text_file: None,
             verify: false,
+            repo: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2700,6 +2725,134 @@ This should not appear in the body.\n";
     }
 
     #[test]
+    fn ctx_remember_repo_writes_to_dot_zirv_memory_and_recall_shows_it_labeled_repo() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+
+        let args = RememberArgs {
+            key: "onboarding-doc".to_string(),
+            text: Some("see CONTRIBUTING.md for setup".to_string()),
+            text_file: None,
+            verify: false,
+            repo: true,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        run_remember_with(
+            &args,
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("remember --repo");
+
+        let path = repo.path().join(".zirv/memory/onboarding-doc.md");
+        assert!(path.is_file(), "expected {}", path.display());
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("see CONTRIBUTING.md for setup")
+        );
+    }
+
+    #[test]
+    fn ctx_remember_repo_refuses_when_shared_enabled_is_false() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let env = env_map(&[
+            (state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            ("ZIRV_CTX_MEMORY_SHARED", "false"),
+        ]);
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let args = RememberArgs {
+            key: "onboarding-doc".to_string(),
+            text: Some("see CONTRIBUTING.md for setup".to_string()),
+            text_file: None,
+            verify: false,
+            repo: true,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let err = run_remember_with(
+            &args,
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("shared_enabled = false must refuse the write");
+        assert!(err.to_string().contains("shared_enabled"), "got {err}");
+    }
+
+    #[test]
+    fn ctx_remember_verify_repo_refreshes_the_shared_entrys_stamp() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        let mut entry = sample("onboarding-doc", 1_700_000_000);
+        entry.verified = 1_700_000_000;
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &entry,
+        )
+        .expect("seed shared");
+
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = RememberArgs {
+            key: "onboarding-doc".to_string(),
+            text: None,
+            text_file: None,
+            verify: true,
+            repo: true,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        run_remember_with(
+            &args,
+            &mut out,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("verify-only remember --repo");
+
+        let refreshed = get_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            "onboarding-doc",
+        )
+        .expect("get")
+        .expect("present");
+        assert!(refreshed.verified > 1_700_000_000, "verified was refreshed");
+    }
+
+    #[test]
     fn remember_with_verify_and_no_text_only_refreshes_the_stamp() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
@@ -2718,6 +2871,7 @@ This should not appear in the body.\n";
             text: None,
             text_file: None,
             verify: true,
+            repo: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -2765,6 +2919,7 @@ This should not appear in the body.\n";
             text: Some("should not be stored".to_string()),
             text_file: None,
             verify: false,
+            repo: false,
             importance: None,
             confidence: None,
             tags: Vec::new(),
