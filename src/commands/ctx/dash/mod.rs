@@ -2912,6 +2912,21 @@ fn fulfill_spawn_request(
         );
     }
 
+    // Issue #155 review finding D2: the pane-side admission choke point for
+    // `child_limit`. `agent::run_with`'s own headless choke point
+    // (`resolve_worker_budget`) never runs for a request that reaches here
+    // -- `try_join_dashboard` is the fork point between the two forks of one
+    // delegation -- so this is the ONLY place a pane spawn is counted
+    // against its group. `SpawnRefusal::policy`, not `::channel`: a headless
+    // fallback would call the identical `admit_child` in `agent.rs` and get
+    // refused there too, so falling back gains nothing and the requester
+    // deserves the honest, non-retryable answer.
+    if let Some(group_id) = &req.work_group_id
+        && let Err(e) = super::group::admit_child(state, group_id)
+    {
+        return Err(SpawnRefusal::policy(e.to_string()));
+    }
+
     let session_id = SessionId::new_v4().to_string();
     let registry_short = sessions::short_id(&session_id);
     let slug = super::state::repo_slug(repo);
@@ -9780,6 +9795,64 @@ mod tests {
         assert!(
             reason.contains("repo-b"),
             "names the request's own repo: {reason}"
+        );
+    }
+
+    /// Issue #155 review finding D2: the pane-side admission choke point for
+    /// `child_limit` -- a request naming a group already at its limit is
+    /// refused before anything is spawned, the identical contract
+    /// `agent::resolve_worker_budget` enforces on the headless side.
+    #[test]
+    fn fulfill_spawn_request_refuses_once_the_work_group_child_limit_is_reached() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-full".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 1,
+            token_budget: None,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 1,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let mut req = spawn_request("do the work", &repo);
+        req.work_group_id = Some("wg-full".to_string());
+        let cfg = CtxConfig::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = Vec::new();
+        let err = fulfill_spawn_request(
+            &req,
+            false,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the group is already full");
+        assert!(err.reason.contains("wg-full"), "got {}", err.reason);
+        assert!(
+            !err.retryable,
+            "child_limit is a policy refusal, not retryable -- a headless fallback would hit the \
+             identical admit_child refusal in agent.rs"
+        );
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-full")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            1,
+            "a refused admission must not advance the count"
         );
     }
 

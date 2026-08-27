@@ -1909,6 +1909,7 @@ mod tests {
             completion_contract: "report by mail".to_string(),
             created_at: 1_700_000_000,
             closed_at: None,
+            admitted_children: 0,
         }
     }
 

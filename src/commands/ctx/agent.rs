@@ -198,6 +198,15 @@ pub(crate) fn spawn_blocked(gate: &pace::SpawnGate, force: bool) -> bool {
 /// it would let a mistyped `--group` run unbounded work a batch's own budget
 /// was meant to cap. `--max-tool-calls` has no group-level counterpart
 /// (`group::WorkGroup` carries no such field) and so is never clamped.
+///
+/// Issue #155 review finding D2: this is also the headless admission choke
+/// point for `child_limit` -- `group::admit_child` is called here, once,
+/// only on the path that actually runs the delegation headlessly. The
+/// dashboard-pane fork of the same request (`agent::try_join_dashboard`,
+/// tried BEFORE this function is ever reached -- see `run_with`) never
+/// admits here; `dash::fulfill_spawn_request` admits on that side instead,
+/// so a single `zirv ctx agent --group` invocation is counted exactly once
+/// regardless of which fork actually spawns.
 fn resolve_worker_budget(env: EnvLookup<'_>, args: &AgentArgs) -> CtxResult<WorkerBudget> {
     let group_token_budget = match &args.group {
         Some(id) => {
@@ -208,6 +217,7 @@ fn resolve_worker_budget(env: EnvLookup<'_>, args: &AgentArgs) -> CtxResult<Work
             if group.closed_at.is_some() {
                 return Err(format!("zirv ctx agent: work group '{id}' is closed").into());
             }
+            super::group::admit_child(&state, id).map_err(|e| format!("zirv ctx agent: {e}"))?;
             group.token_budget
         }
         None => None,
@@ -895,7 +905,13 @@ pub fn run_with<W: Write>(
                 ts: super::state::now_secs(),
                 session: &worker_session,
                 parent_session: &parent_session,
-                work_group_id: None,
+                // Issue #155 review finding D2: this used to be hardcoded
+                // `None`, so a completed headless delegation never recorded
+                // the group it actually ran under -- `zirv ctx status`'s
+                // group tree (`status::group_tree_lines`) renders every such
+                // delegation as ungrouped even though `--group` traveled all
+                // the way through `resolve_worker_budget` above.
+                work_group_id: args.group.as_deref(),
                 agent: &args.name,
                 model: model.as_deref(),
                 input_tokens: usage.input_tokens,
@@ -1085,6 +1101,77 @@ mod tests {
         assert_eq!(resolve_budget_tokens(group_budget, None), Some(100_000));
         assert_eq!(resolve_budget_tokens(None, Some(50_000)), Some(50_000));
         assert_eq!(resolve_budget_tokens(None, None), None);
+    }
+
+    fn sample_work_group(
+        id: &str,
+        child_limit: u32,
+        admitted: u32,
+    ) -> crate::commands::ctx::group::WorkGroup {
+        crate::commands::ctx::group::WorkGroup {
+            work_group_id: id.to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit,
+            token_budget: None,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: admitted,
+        }
+    }
+
+    /// Issue #155 review finding D2: `resolve_worker_budget` is the headless
+    /// admission choke point for `child_limit` -- a `--group` naming a group
+    /// already at its limit must be refused outright, the same "hard error,
+    /// not silent ignore" contract this function's own doc comment already
+    /// applies to an unknown or closed group.
+    #[test]
+    fn resolve_worker_budget_refuses_a_group_already_at_its_child_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 1, 1))
+            .expect("create");
+        let mut env = HashMap::new();
+        env.insert(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().display().to_string(),
+        );
+
+        let mut args = args_for("claude", "go");
+        args.group = Some("wg-1".to_string());
+        let err =
+            resolve_worker_budget(&|k| env.get(k).cloned(), &args).expect_err("group is full");
+        assert!(err.to_string().contains("wg-1"), "got {err}");
+    }
+
+    /// The same choke point admits a delegation cleanly under the limit, and
+    /// advances the group's own `admitted_children` count by exactly one.
+    #[test]
+    fn resolve_worker_budget_admits_a_delegation_under_the_child_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        crate::commands::ctx::group::create(&state, &sample_work_group("wg-1", 3, 1))
+            .expect("create");
+        let mut env = HashMap::new();
+        env.insert(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().display().to_string(),
+        );
+
+        let mut args = args_for("claude", "go");
+        args.group = Some("wg-1".to_string());
+        resolve_worker_budget(&|k| env.get(k).cloned(), &args).expect("admitted under the limit");
+
+        assert_eq!(
+            crate::commands::ctx::group::load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            2,
+            "the admission must advance the group's own count"
+        );
     }
 
     /// `--role` accepts exactly the two spellings the depth cap and
@@ -1851,6 +1938,57 @@ mod tests {
                 .any(|line| line.contains(crate::commands::ctx::log::DELEGATION_ACTION)),
             "the main decision log must also get a one-line delegation-complete marker: \
              {decisions:?}"
+        );
+    }
+
+    /// Issue #155 review finding D2: a completed headless delegation must
+    /// record the group it actually ran under -- before this fix `agent.rs`
+    /// hardcoded `work_group_id: None` on every completion log record, so
+    /// `zirv ctx status`'s group tree rendered every delegation as
+    /// ungrouped no matter what `--group` was passed.
+    #[test]
+    fn a_completed_delegation_records_its_own_work_group_id() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        let state = crate::commands::ctx::state::StateDir::from_root(state_dir.clone());
+        let group_id = crate::commands::ctx::group::run_create(
+            &state,
+            &mut Vec::new(),
+            &crate::commands::ctx::group::CreateArgs {
+                scope: "test batch".to_string(),
+                child_limit: 3,
+                token_budget: None,
+                deadline_secs: None,
+                completion_contract: "report by mail".to_string(),
+                parent_session: None,
+            },
+            1_700_000_000,
+        )
+        .expect("group create");
+
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+        let mut args = args_for("claude", "do the work");
+        args.group = Some(group_id.clone());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 0);
+
+        let delegations = crate::commands::ctx::log::tail_delegations(&state, 10).expect("tail");
+        assert_eq!(delegations.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(&delegations[0]).expect("json");
+        assert_eq!(
+            record["work_group_id"].as_str(),
+            Some(group_id.as_str()),
+            "the completion record must name the real group: {record}"
         );
     }
 

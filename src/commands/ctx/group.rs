@@ -27,10 +27,23 @@ pub struct WorkGroup {
     pub token_budget: Option<u64>,
     #[serde(default)]
     pub deadline_secs: Option<u64>,
+    /// Display-only (issue #155 review finding D2): the terms every child
+    /// must satisfy before the group can close, shown by `zirv ctx group
+    /// status` and nothing else. Nothing parses or enforces it -- there is
+    /// no verified, adapter-agnostic way to check a delegated worker's own
+    /// transcript against free text, so this stays exactly what an operator
+    /// or reviewing orchestrator reads, never a machine-checked gate.
     pub completion_contract: String,
     pub created_at: u64,
     #[serde(default)]
     pub closed_at: Option<u64>,
+    /// How many children this group has admitted so far (issue #155 review
+    /// finding D2). Monotonic -- a work group is a batch of at most
+    /// `child_limit` total delegated tasks, not a live concurrency count, so
+    /// this never decrements when a child finishes. Incremented by
+    /// [`admit_child`], the sole place any admission is granted.
+    #[serde(default)]
+    pub admitted_children: u32,
 }
 
 fn record_path(state: &StateDir, id: &str) -> PathBuf {
@@ -101,6 +114,50 @@ pub fn close(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
     Ok(())
 }
 
+/// Issue #155 review finding D2: the sole place a child is admitted into a
+/// group. `Err` -- naming both the group and its limit -- once
+/// `admitted_children` has already reached `child_limit`; otherwise the
+/// count is incremented and saved. Called at both real admission choke
+/// points: `agent::resolve_worker_budget` for a headless delegation, and
+/// `dash::fulfill_spawn_request` for a dashboard pane -- never both for the
+/// same request (a headless run that first tries to join a live dashboard
+/// admits nowhere in `agent.rs` itself; whichever side actually ends up
+/// spawning is the one that calls this).
+///
+/// Load-modify-write, like every other mutation in this file
+/// (`close` above) -- not a distributed lock. zirv's own callers are
+/// mostly-sequential orchestrator activity, not a tight concurrent loop, so
+/// a lost update in a genuine race would at worst admit one child past the
+/// limit, never wrongly refuse legitimate work.
+pub fn admit_child(state: &StateDir, id: &str) -> CtxResult<()> {
+    let Some(mut group) = load(state, id)? else {
+        return Err(format!("no work group '{id}'").into());
+    };
+    if group.admitted_children >= group.child_limit {
+        return Err(format!(
+            "work group '{id}' already has its full {} children admitted",
+            group.child_limit
+        )
+        .into());
+    }
+    group.admitted_children += 1;
+    create(state, &group)?;
+    Ok(())
+}
+
+/// Issue #155 review finding D2: `deadline_secs` is surfaced as an overdue
+/// marker, never enforced -- nothing here kills a session or a group. `now`
+/// is a parameter, not `state::now_secs()`, for the same testability reason
+/// `run_create`/`run_close` already take one. A closed group is never
+/// overdue: it is evidence of what a batch finished under, not a still-
+/// running one a deadline can still be missed by.
+pub fn is_overdue(group: &WorkGroup, now: u64) -> bool {
+    group.closed_at.is_none()
+        && group
+            .deadline_secs
+            .is_some_and(|deadline| now > group.created_at.saturating_add(deadline))
+}
+
 #[derive(Debug, clap::Args)]
 pub struct GroupArgs {
     #[command(subcommand)]
@@ -169,31 +226,50 @@ pub fn run_create<W: Write>(
         completion_contract: args.completion_contract.clone(),
         created_at: now,
         closed_at: None,
+        admitted_children: 0,
     };
     create(state, &group)?;
     writeln!(w, "work group {id} created (scope: {})", group.scope)?;
     Ok(id)
 }
 
-fn print_group<W: Write>(w: &mut W, group: &WorkGroup) -> CtxResult<()> {
+/// `now` is a parameter (not resolved here) so a caller can render a
+/// deterministic overdue marker in a test -- the same seam `run_create`/
+/// `run_close` already take one for.
+fn print_group<W: Write>(w: &mut W, group: &WorkGroup, now: u64) -> CtxResult<()> {
     let status = if group.closed_at.is_some() {
         "closed"
     } else {
         "open"
     };
-    writeln!(
+    write!(
         w,
-        "{} [{status}] scope=\"{}\" child_limit={} parent={}",
-        group.work_group_id, group.scope, group.child_limit, group.parent_session_id
+        "{} [{status}] scope=\"{}\" child_limit={} admitted={} parent={}",
+        group.work_group_id,
+        group.scope,
+        group.child_limit,
+        group.admitted_children,
+        group.parent_session_id
     )?;
+    // Issue #155 review finding D2: display-only -- see `is_overdue`'s own
+    // doc comment. Nothing here kills or restarts anything on account of it.
+    if is_overdue(group, now) {
+        write!(w, " OVERDUE")?;
+    }
+    writeln!(w)?;
     Ok(())
 }
 
-pub fn run_status<W: Write>(state: &StateDir, w: &mut W, args: &StatusArgs) -> CtxResult<i32> {
+pub fn run_status<W: Write>(
+    state: &StateDir,
+    w: &mut W,
+    args: &StatusArgs,
+    now: u64,
+) -> CtxResult<i32> {
     match &args.work_group_id {
         Some(id) => match load(state, id)? {
             Some(group) => {
-                print_group(w, &group)?;
+                print_group(w, &group, now)?;
                 Ok(0)
             }
             None => {
@@ -208,7 +284,7 @@ pub fn run_status<W: Write>(state: &StateDir, w: &mut W, args: &StatusArgs) -> C
                 return Ok(0);
             }
             for group in &groups {
-                print_group(w, group)?;
+                print_group(w, group, now)?;
             }
             Ok(0)
         }
@@ -235,7 +311,7 @@ pub fn run<W: Write>(args: &GroupArgs, w: &mut W) -> CtxResult<i32> {
             run_create(&state, w, a, now)?;
             Ok(0)
         }
-        GroupVerb::Status(a) => run_status(&state, w, a),
+        GroupVerb::Status(a) => run_status(&state, w, a, now),
         GroupVerb::Close(a) => run_close(&state, w, a, now),
     }
 }
@@ -255,6 +331,7 @@ mod tests {
             completion_contract: "every child reports a compact result by mail".to_string(),
             created_at: 1_700_000_000,
             closed_at: None,
+            admitted_children: 0,
         }
     }
 
@@ -277,6 +354,7 @@ mod tests {
             completion_contract: "every child reports a compact result by mail".to_string(),
             created_at: 1_700_000_000,
             closed_at: None,
+            admitted_children: 0,
         };
         create(&state, &group).expect("create");
 
@@ -348,5 +426,130 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains(&id), "the minted id must be printed: {text}");
         assert!(load(&state, &id).expect("load").is_some());
+    }
+
+    /// Issue #155 review finding D2: an admission under the limit succeeds
+    /// and advances the count by exactly one.
+    #[test]
+    fn admit_child_succeeds_and_advances_the_count_under_the_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-1")).expect("create"); // child_limit: 3
+
+        admit_child(&state, "wg-1").expect("first child admitted");
+        let group = load(&state, "wg-1").expect("load").expect("present");
+        assert_eq!(group.admitted_children, 1);
+
+        admit_child(&state, "wg-1").expect("second child admitted");
+        assert_eq!(
+            load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            2
+        );
+    }
+
+    /// Issue #155 review finding D2: the whole point -- a spawn/delegation
+    /// naming a full group must be refused rather than silently exceeding
+    /// the batch the operator sized. The error names both the group and its
+    /// limit, and the count is left unchanged by the refused attempt.
+    #[test]
+    fn admit_child_refuses_once_the_child_limit_is_reached() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut group = sample_group("wg-1");
+        group.child_limit = 1;
+        create(&state, &group).expect("create");
+
+        admit_child(&state, "wg-1").expect("the one allowed child is admitted");
+        let err = admit_child(&state, "wg-1").expect_err("the limit is reached");
+        assert!(err.to_string().contains("wg-1"), "got {err}");
+        assert!(err.to_string().contains('1'), "names the limit: {err}");
+        assert_eq!(
+            load(&state, "wg-1")
+                .expect("load")
+                .expect("present")
+                .admitted_children,
+            1,
+            "a refused admission must not advance the count"
+        );
+    }
+
+    #[test]
+    fn admit_child_errors_on_an_unknown_group() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let err = admit_child(&state, "nope").expect_err("no such group");
+        assert!(err.to_string().contains("nope"), "got {err}");
+    }
+
+    /// Issue #155 review finding D2: `deadline_secs` is a display-only
+    /// marker -- an open group past its deadline is overdue; the same group
+    /// before the deadline, or with none set at all, is not; and a CLOSED
+    /// group is never overdue no matter how long ago its deadline passed.
+    #[test]
+    fn is_overdue_marks_only_an_open_group_past_its_deadline() {
+        let mut group = sample_group("wg-1"); // created_at 1_700_000_000, deadline_secs 3_600
+        assert!(
+            !is_overdue(&group, 1_700_000_000 + 3_600),
+            "exactly at the deadline is not yet overdue"
+        );
+        assert!(
+            is_overdue(&group, 1_700_000_000 + 3_601),
+            "one second past the deadline is overdue"
+        );
+
+        group.closed_at = Some(1_700_000_000 + 3_700);
+        assert!(
+            !is_overdue(&group, 1_700_000_000 + 999_999),
+            "a closed group is never overdue"
+        );
+
+        let mut no_deadline = sample_group("wg-2");
+        no_deadline.deadline_secs = None;
+        assert!(
+            !is_overdue(&no_deadline, u64::MAX),
+            "no deadline set means never overdue"
+        );
+    }
+
+    /// End to end: `zirv ctx group status` prints the `OVERDUE` marker for a
+    /// group past its deadline, and omits it otherwise.
+    #[test]
+    fn group_status_prints_the_overdue_marker_past_the_deadline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        create(&state, &sample_group("wg-1")).expect("create"); // deadline_secs 3_600
+
+        let mut before = Vec::new();
+        run_status(
+            &state,
+            &mut before,
+            &StatusArgs {
+                work_group_id: Some("wg-1".to_string()),
+            },
+            1_700_000_000 + 100,
+        )
+        .expect("status runs");
+        assert!(
+            !String::from_utf8(before).expect("utf8").contains("OVERDUE"),
+            "well before the deadline"
+        );
+
+        let mut after = Vec::new();
+        run_status(
+            &state,
+            &mut after,
+            &StatusArgs {
+                work_group_id: Some("wg-1".to_string()),
+            },
+            1_700_000_000 + 999_999,
+        )
+        .expect("status runs");
+        assert!(
+            String::from_utf8(after).expect("utf8").contains("OVERDUE"),
+            "well past the deadline"
+        );
     }
 }
