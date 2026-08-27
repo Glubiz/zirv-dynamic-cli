@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-26
+last-verified: 2026-08-27
 ---
 
 # Decision Log
@@ -23,6 +23,20 @@ last-verified: 2026-08-26
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-08-27 — Dedupe proof is byte-exact against a fresh render, not the native file's self-declared header hash (issue #155, Phase 3, v2.35.0)
+**Context:** Independent review of the first `native_file_already_carries_canonical` (commit `90523d3`) found it compared the native file's OWN embedded `<!-- zirv:canonical-sha256:... -->` header claim against a hash of the current `.zirv/context/` sources — but never checked the native file's actual BODY against anything. A probe confirmed the exploit: generate `CLAUDE.md` correctly, then hand-edit only the body while leaving the marker/hash header lines untouched (no change to `.zirv/context/`) — the header's claim still matched the sources, dedupe fired, and the session received zero of the real canonical text.
+**Decision:** The header hash is now only a cheap pre-filter (skip the expensive path fast when the sources have plainly moved on). The actual proof is `native_text == context_cli::render_generated(common, harness)` — the native file's real, current, whole-file bytes compared to a fresh render, with no normalization: a CRLF conversion or trailing-whitespace-only edit is a real difference and falls back to full injection, a deliberate choice over silently tolerating "looks the same."
+**Rejected:** Hashing only the post-header body and comparing that hash to a hash of the expected body — equivalent in strength to full byte comparison here (both call `render_generated` and both are O(n)), so plain string equality was simpler and needed no new hashing code path.
+**Consequences:** `native_file_already_carries_canonical` now literally re-renders the expected file on every check. Cheap in practice (`.zirv/context/` files are capped at 4096 bytes each by the existing injection budget), so this was not treated as a perf concern. `context_status.rs`'s per-harness report also gained a `[DEDUPED]` marker (checked after `[TRUNCATED]`) — the prior code showed a deduped surface as "NB raw, 0B delivered" with no flag at all, indistinguishable from a bug.
+**Spec / link:** `src/commands/ctx/compile.rs`'s `native_file_already_carries_canonical`; `src/commands/ctx/context_status.rs`'s `render_per_harness_section`; [[Ctx Subsystem]]'s "The Context Compiler" section; issue #155.
+
+### 2026-08-27 — `context.dedupe_native` folds narrowing-only, not `REPO_FORBIDDEN` (issue #155, Phase 3, v2.35.0)
+**Context:** Task 3.2 wires Task 3.1's embedded canonical-content hash (`context_cli::render_generated`'s `<!-- zirv:canonical-sha256:... -->` line) into compose-time injection: when a harness's own native file (`CLAUDE.md`/`AGENTS.md`) provably already holds the current canonical bytes, `compile.rs` skips re-injecting them. The new `context.dedupe_native` switch sits right beside `context.max_common_bytes`/`max_harness_bytes`/`max_harness_roster_bytes` in `[context]`, all three `REPO_FORBIDDEN` because a repo checkout must never raise its own cap on its own untrusted content.
+**Decision:** `dedupe_native` is deliberately NOT added to `REPO_FORBIDDEN`. Setting it `true` only ever removes injected text a harness can already read natively; setting it `false` only ever adds MORE of the canonical layer back in — the same narrowing direction `pace.enabled`, `[policy]`, and `[safety]`'s `deny`/`ask` already treat as safe to leave repo-mergeable. `CtxConfig::load` lifts it out of both layers before the deep merge and folds it with the new `narrow_dedupe_bool` — the mirror of `narrow_pace_bool`, but with `false` (always inject) as the strict value instead of `true`, since this key's safe direction is the opposite of `pace.enabled`'s.
+**Rejected:** `REPO_FORBIDDEN`, matching its sibling byte caps — would also forbid a repo from ever setting `dedupe_native = false`, the one direction that is always safe; a checkout that, for its own reasons, wants every session to see the full canonical text verbatim rather than trust a native-file hash match would have no way to ask for that under outright rejection.
+**Consequences:** A repo layer may disable a dedupe skip an operator turned on, but a repo `true` can never re-enable a skip the operator explicitly turned off in `~/.zirv/ctx.toml` — the identical asymmetry `pace.enabled`'s narrowing fold already established, just inverted.
+**Spec / link:** `src/commands/ctx/config.rs`'s `narrow_dedupe_bool`; `src/commands/ctx/compile.rs`'s `native_file_already_carries_canonical`/`with_canonical_context_layer`; [[Ctx Subsystem]]'s "The Context Compiler" section; [[Untrusted Configuration]]; issue #155.
 
 ### 2026-08-26 — Memory becomes one deduped layer, moved to the composed-prompt tail (issue #155, v8, v2.33.0)
 **Context:** `prompt::compose` used to splice memory in early as two separate layers — core (private+shared bank) and retrieval (working-tree-relevant recall) — even though an entry selected by both rendered its whole `describe()` text twice, and because retrieval's own ranking reads changed working-tree paths, that early placement invalidated a provider's prompt cache for every layer composed after it on every turn a file changed.

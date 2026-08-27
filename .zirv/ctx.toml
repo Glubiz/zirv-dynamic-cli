@@ -119,10 +119,11 @@ model = "fable"
 # max_repo_bytes = 4096              # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_MAX_REPO_BYTES): cap on the untrusted repo layer. Default: 4096.
 # harnesses = true                   # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_HARNESSES): whether the derived harness roster is injected. Default: true.
 
-# [context]                          # every key below is REPO-FORBIDDEN -- the canonical .zirv/context/ layer the context compiler (issue #44) injects.
+# [context]                          # every key below is REPO-FORBIDDEN except dedupe_native -- the canonical .zirv/context/ layer the context compiler (issue #44) injects.
 # max_common_bytes = 4096            # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES): cap on .zirv/context/common.md. Default: 4096.
 # max_harness_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES): cap on .zirv/context/claude.md or codex.md. Default: 4096.
 # max_harness_roster_bytes = 4096    # REPO-FORBIDDEN (ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES): budget `zirv context status` measures the derived harness roster against. Default: 4096.
+# dedupe_native = true                # not REPO-FORBIDDEN (repo may only narrow to false, like pace.enabled but inverted): skip re-injecting the canonical layer when CLAUDE.md/AGENTS.md's embedded hash already matches it. Default: true.
 
 # [mail]
 # enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_MAIL): whether the mailbox is on at all. Default: true.
