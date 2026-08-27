@@ -85,6 +85,18 @@ pub fn is_heavy(command: &str, extra_patterns: &[String]) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermitRecord {
     pub pid: u32,
+    /// Finding B5: `pid` above is the script-runner (parent `zirv`) process
+    /// that called [`acquire`], not the actual heavy child it goes on to
+    /// spawn (`Command::invoke` acquires the permit before `TokioCommand`
+    /// spawns anything). If the parent dies first -- killed, or itself
+    /// supervised and restarted -- while the real heavy build keeps running,
+    /// the dead-owner sweep in [`live_records`] would free the slot while
+    /// the actual work it was guarding is still live. Set once the child
+    /// exists via [`HeavyPermit::set_child_pid`]; `#[serde(default)]` so a
+    /// record written before the child spawns (or by an older binary) still
+    /// deserializes as `None` rather than failing to parse.
+    #[serde(default)]
+    pub child_pid: Option<u32>,
     pub label: String,
     pub acquired_at: u64,
 }
@@ -146,6 +158,31 @@ impl Drop for HeavyPermit {
     }
 }
 
+impl HeavyPermit {
+    /// Records the spawned heavy child's own pid on this permit (finding
+    /// B5), once it exists, so [`live_records`]' dead-owner sweep can treat
+    /// the slot as still held if EITHER the parent (the script-runner
+    /// process that called [`acquire`]) or this child is alive -- a parent
+    /// that dies first must not free a slot the real heavy work is still
+    /// using. Best-effort and silent on any I/O or (de)serialization
+    /// failure, the same discipline every other write in this module holds:
+    /// if this permit's own file cannot be updated, the pre-existing
+    /// parent-pid liveness check still applies, so this can only ever make
+    /// the sweep MORE conservative, never less.
+    pub fn set_child_pid(&self, child_pid: u32) {
+        let Ok(contents) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+        let Ok(mut record) = serde_json::from_str::<PermitRecord>(&contents) else {
+            return;
+        };
+        record.child_pid = Some(child_pid);
+        if let Ok(json) = serde_json::to_string_pretty(&record) {
+            let _ = std::fs::write(&self.path, json);
+        }
+    }
+}
+
 /// Every heavy-operation permit currently held, sweeping (and never
 /// including) any entry whose owning pid is no longer alive -- reusing
 /// `sessions::is_alive`, the same liveness probe `sessions::list` sweeps
@@ -175,7 +212,15 @@ pub fn live_records(state: &StateDir) -> Vec<PermitRecord> {
         let Ok(record) = serde_json::from_str::<PermitRecord>(&contents) else {
             continue;
         };
-        if is_alive(record.pid) {
+        // Finding B5: live if EITHER the parent that acquired the permit or
+        // the heavy child it went on to spawn is alive -- a parent that
+        // exits (or is restarted by its own supervisor) first must not free
+        // a slot the real heavy work is still using. `child_pid` is `None`
+        // until `HeavyPermit::set_child_pid` runs, so a permit still in its
+        // brief pre-spawn window falls back to the parent-only check this
+        // always had.
+        let alive = is_alive(record.pid) || record.child_pid.is_some_and(is_alive);
+        if alive {
             found.push(record);
         } else {
             let _ = std::fs::remove_file(&path);
@@ -227,6 +272,7 @@ pub fn acquire(state: &StateDir, limit: usize, label: &str) -> Option<HeavyPermi
 
     let record = PermitRecord {
         pid: std::process::id(),
+        child_pid: None,
         label: label.to_string(),
         acquired_at: state::now_secs(),
     };
@@ -258,6 +304,7 @@ mod tests {
         state::create_private_dir_all(&dir).expect("mkdir");
         let record = PermitRecord {
             pid,
+            child_pid: None,
             label: label.to_string(),
             acquired_at: state::now_secs(),
         };
@@ -387,6 +434,58 @@ mod tests {
             "a dead owner's permit does not count"
         );
         assert!(acquire(&state, 1, "cargo build").is_some());
+    }
+
+    /// Finding B5: `pid` on a `PermitRecord` names the script-runner
+    /// (parent) process that called `acquire`, not the actual heavy child it
+    /// goes on to spawn. If the parent dies first while the real heavy child
+    /// is still running, the sweep must not free the slot just because the
+    /// PARENT is gone -- it must also check `child_pid`. Simulates that
+    /// exact shape: a dead recorded `pid` (the gone parent) alongside a
+    /// `child_pid` of this very test process (guaranteed alive for the
+    /// duration of the test).
+    #[test]
+    fn a_permit_stays_live_on_a_dead_parent_if_its_child_is_still_alive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dead_pid = crate::commands::ctx::testenv::dead_pid();
+        let dir = permits_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let record = PermitRecord {
+            pid: dead_pid,
+            child_pid: Some(std::process::id()),
+            label: "cargo build".to_string(),
+            acquired_at: state::now_secs(),
+        };
+        let json = serde_json::to_string_pretty(&record).expect("serialize");
+        state::write_private(&slot_path(&dir, 0), &json).expect("write");
+
+        assert_eq!(
+            live_count(&state),
+            1,
+            "a live child must keep the slot even though the recorded parent pid is dead"
+        );
+    }
+
+    /// `HeavyPermit::set_child_pid` is the only way `child_pid` is ever set
+    /// in production (`Command::invoke`, once the real child is spawned) --
+    /// proves it actually persists to the same file `live_records` reads
+    /// back, not just to an in-memory copy.
+    #[test]
+    fn set_child_pid_persists_to_the_permit_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let permit = acquire(&state, 1, "cargo build").expect("permit granted");
+
+        permit.set_child_pid(4242);
+
+        let records = live_records(&state);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].child_pid,
+            Some(4242),
+            "the child pid must be readable back through live_records, not just held in memory"
+        );
     }
 
     /// Issue #162: a refusal or a wait that cannot say WHO holds the budget

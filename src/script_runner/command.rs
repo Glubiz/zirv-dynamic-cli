@@ -125,10 +125,25 @@ impl Command {
         // directory that cannot be resolved must never stop a script from
         // running -- and the guard's `Drop` releases the slot when the child
         // exits, however it exits.
-        let _permit = heavy_permit_for(command, context.get("cwd").map(String::as_str)).await;
+        let permit = heavy_permit_for(command, context.get("cwd").map(String::as_str)).await;
 
         if let Some(var) = &self.capture {
-            let out = shell.output().await?;
+            // `Command::output()` would otherwise force these itself; set
+            // explicitly since spawning by hand (rather than through
+            // `output()`) is what lets us read the child's own pid below.
+            shell.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let child = shell.spawn()?;
+            // Finding B5: names the ACTUAL heavy child on the permit, not
+            // just the script-runner process that acquired it -- see
+            // `PermitRecord::child_pid`'s own doc comment for why the
+            // dead-owner sweep needs this. Best-effort: `permit` is `None`
+            // for an unclassified command or when the budget could not be
+            // resolved at all, and `child.id()` is `None` only if the child
+            // has already been waited on elsewhere, which never happens here.
+            if let (Some(permit), Some(pid)) = (permit.as_ref(), child.id()) {
+                permit.set_child_pid(pid);
+            }
+            let out = child.wait_with_output().await?;
             if !out.status.success() {
                 let code = out.status.code().unwrap_or(1);
                 return Err(format!("`{command}` failed with exit code {code}").into());
@@ -140,7 +155,11 @@ impl Command {
 
             Ok(())
         } else {
-            let status = shell.status().await?;
+            let mut child = shell.spawn()?;
+            if let (Some(permit), Some(pid)) = (permit.as_ref(), child.id()) {
+                permit.set_child_pid(pid);
+            }
+            let status = child.wait().await?;
 
             if !status.success() {
                 let code = status.code().unwrap_or(1);
