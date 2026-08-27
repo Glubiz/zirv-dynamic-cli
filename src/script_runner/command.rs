@@ -167,18 +167,32 @@ impl Command {
 /// Issue #155: resolves the state dir and config from the process
 /// environment and classifies `command` against the heavy-operation pattern
 /// set, returning `None` for anything that is not heavy -- or when the state
-/// directory or config cannot be resolved at all. Best-effort, the same as
-/// every other piece of state-dir housekeeping in this codebase: a script
-/// must never fail just because zirv's own supervision state could not be
-/// found. `cwd` mirrors `agent_command::resolve_repo`'s own preference for a
-/// script's own `cd`-tracked directory over the process's real one, since
-/// `Command`'s `cd` handling only ever updates `context["cwd"]` (see
-/// `execute`'s own handling), never `std::env::set_current_dir`.
+/// directory cannot be resolved at all (a state dir this far off the rails
+/// cannot record a permit either way, so there is nothing left to govern).
+/// Best-effort, the same as every other piece of state-dir housekeeping in
+/// this codebase: a script must never fail just because zirv's own
+/// supervision state could not be found. `cwd` mirrors `agent_command::
+/// resolve_repo`'s own preference for a script's own `cd`-tracked directory
+/// over the process's real one, since `Command`'s `cd` handling only ever
+/// updates `context["cwd"]` (see `execute`'s own handling), never
+/// `std::env::set_current_dir`.
+///
+/// Finding B3: a `CtxConfig::load` error (e.g. a repo `ctx.toml` committing a
+/// `REPO_FORBIDDEN` key, which is a hard error by design -- see that
+/// constant's own doc comment) used to fall straight through to `None` here,
+/// same as an unclassified command -- silently disabling the WHOLE permit
+/// system for every heavy command in that repo, exactly the ungoverned-
+/// concurrency incident (#133) this module exists to prevent. A config that
+/// fails to load is not evidence heavy commands are safe to run unbounded;
+/// it falls back to `SuperviseConfig::default()` (the built-in patterns,
+/// `max_heavy_operations` at its safe default of 1) instead, so a broken or
+/// hostile config narrows what this budget SEES, never whether it enforces
+/// anything at all.
 async fn heavy_permit_for(
     command: &str,
     cwd: Option<&str>,
 ) -> Option<crate::commands::ctx::permit::HeavyPermit> {
-    use crate::commands::ctx::config::{CtxConfig, env_from_process};
+    use crate::commands::ctx::config::{CtxConfig, SuperviseConfig, env_from_process};
     use crate::commands::ctx::permit;
     use crate::commands::ctx::state::StateDir;
 
@@ -187,13 +201,20 @@ async fn heavy_permit_for(
     let repo = cwd
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())?;
-    let cfg = CtxConfig::load(&repo, &env).ok()?;
 
-    if !permit::is_heavy(command, &cfg.supervise.heavy_command_patterns) {
+    let supervise = match CtxConfig::load(&repo, &env) {
+        Ok(cfg) => cfg.supervise,
+        Err(err) => {
+            warn_permit_config_load_failed_once(err.as_ref());
+            SuperviseConfig::default()
+        }
+    };
+
+    if !permit::is_heavy(command, &supervise.heavy_command_patterns) {
         return None;
     }
 
-    let limit = cfg.supervise.max_heavy_operations;
+    let limit = supervise.max_heavy_operations;
     let label = permit_label(&env, command);
     // Refuse-not-queue is right for a *spawn* (issue #133's own gate, now
     // `dash::fulfill_spawn_request`) but wrong for a command the operator
@@ -206,6 +227,24 @@ async fn heavy_permit_for(
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
     const MAX_WAIT: Duration = Duration::from_secs(600);
     wait_for_permit(&state, limit, &label, command, POLL_INTERVAL, MAX_WAIT).await
+}
+
+/// Emits a warning that `CtxConfig::load` failed and the heavy-operation
+/// budget is falling back to `SuperviseConfig::default()`, exactly once per
+/// process -- the same one-shot discipline `config::announce_unparsable_
+/// layers_once` and `poll.rs`'s `announce_keychain_prompt_once` already use
+/// for their own process-wide degradation notices, applied here because
+/// `heavy_permit_for` is called from every single heavy command a script
+/// runs and a config error does not go away between calls.
+fn warn_permit_config_load_failed_once(err: &dyn std::error::Error) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "zirv: WARNING: ctx config failed to load ({err}) -- the heavy-operation permit \
+             budget is falling back to its built-in defaults (max_heavy_operations=1, no extra \
+             heavy_command_patterns) rather than being disabled."
+        );
+    });
 }
 
 /// The actual wait loop `heavy_permit_for` drives with its own real
@@ -424,6 +463,51 @@ mod tests {
         let permit =
             heavy_permit_for("git status", Some(repo.path().to_str().expect("utf8 path"))).await;
         assert!(permit.is_none(), "a light command must not hold a permit");
+    }
+
+    /// Finding B3: a `CtxConfig::load` error used to fall straight through to
+    /// `None`, the same answer an unclassified command gets -- silently
+    /// disabling the whole permit system for a repo whose `ctx.toml` commits
+    /// a `REPO_FORBIDDEN` key (a hard error by design). Writes exactly that
+    /// (a repo layer setting `supervise.max_heavy_operations`, which only the
+    /// operator's home layer or the matching env var may set) and asserts
+    /// `heavy_permit_for` still classifies and gates `cargo build` at the
+    /// default policy rather than letting it run ungoverned.
+    #[tokio::test]
+    async fn heavy_permit_for_falls_back_to_default_policy_when_config_load_fails() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv").join("ctx.toml"),
+            "[supervise]\nmax_heavy_operations = 8\n",
+        )
+        .expect("write a REPO_FORBIDDEN key");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            crate::commands::ctx::state::STATE_ENV,
+            Some(state_dir.path().to_str().expect("utf8 path")),
+        )]);
+
+        // Sanity: this really does make `CtxConfig::load` fail -- otherwise
+        // this test would pass for the wrong reason.
+        let env = crate::commands::ctx::config::env_from_process();
+        assert!(
+            crate::commands::ctx::config::CtxConfig::load(repo.path(), &env).is_err(),
+            "a repo layer setting a REPO_FORBIDDEN key must make load fail"
+        );
+
+        let permit = heavy_permit_for(
+            "cargo build",
+            Some(repo.path().to_str().expect("utf8 path")),
+        )
+        .await;
+        assert!(
+            permit.is_some(),
+            "a heavy command must still be gated at the default policy even when \
+             the repo's own config fails to load, never left ungoverned"
+        );
     }
 
     /// Issue #162(a): the acceptance criterion is that a delegation dying
