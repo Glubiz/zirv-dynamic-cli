@@ -2832,6 +2832,7 @@ mod tests {
             agent: AuditAgent::Codex,
             sessions: 5,
             dry_run: true,
+            escape: false,
         };
         let mut out = Vec::new();
         run_compile(&args, &mut out).expect("run_compile");
