@@ -2413,24 +2413,54 @@ pub(crate) fn depth_refusal(
 /// a forged id with more privilege than this dashboard can actually verify.
 ///
 /// A `parent_session` naming no pane this dashboard tracks -- absent, or a
-/// value matching nothing live -- reads as `PromptRole::Orchestrator`: the
-/// same allowance a plain, un-dashboarded `zirv ctx agent` invocation (an
-/// operator typing at a bare terminal, which this dashboard cannot see at
-/// all) already has today. A forged value here cannot grant a KNOWN pane
-/// more than the cap already refuses it; it can only leave an unrelated
-/// request exactly as unrestricted as every request was before this cap
-/// existed -- narrowing only, never widening.
+/// value matching nothing live -- still reads as `PromptRole::Orchestrator`:
+/// a real operator process that used to be a pane of some OTHER dashboard
+/// that has since quit legitimately rejoins a different live one this way
+/// (`agent::live_join_target`'s own fallback search), and that rejoin must
+/// still be able to request a plain worker pane. A forged value here cannot
+/// grant a KNOWN pane more than the cap already refuses it (see above); it
+/// can only leave an unrelated request exactly as unrestricted as every
+/// request was before this cap existed for THAT allowance -- narrowing
+/// only, never widening.
+///
+/// I, security review (Finding 1): despite the name, this `Orchestrator`
+/// answer is never a VERIFIED one -- there is no live pane this process can
+/// ever observe as anything other than `Worker` (see above), so every
+/// `Orchestrator` this function ever returns means "unverified", not "known
+/// to be the operator's own top-level seat". Trusting it for a coordinator
+/// role (`sub-orchestrator`) would let exactly the attack this phase exists
+/// to close: a live Worker pane that simply omits or forges its own
+/// `parent_session` reads identically to a genuine rejoin, and could
+/// otherwise claim a sub-orchestrator spawn no real Worker may ever request.
+/// `fulfill_spawn_request` (the sole caller) therefore refuses a coordinator
+/// role outright the moment lineage is unverified, BEFORE `depth_refusal`
+/// ever sees this function's answer -- see `parent_lineage_verified`, right
+/// below, which both this function and that check share. A worker-role
+/// request rides the unverified `Orchestrator` reading unaffected: a forged
+/// or absent parent gets it no more than a genuine rejoin already could, and
+/// `depth_refusal(Orchestrator, Worker)` was always `None`.
 fn parent_role_for(req: &spawnreq::SpawnRequest, panes: &[Pane]) -> prompt::PromptRole {
-    let is_known_pane = req.parent_session.as_deref().is_some_and(|parent| {
-        panes
-            .iter()
-            .any(|pane| sessions::short_id(pane.session_id()) == parent)
-    });
-    if is_known_pane {
+    if parent_lineage_verified(req, panes) {
         prompt::PromptRole::Worker
     } else {
         prompt::PromptRole::Orchestrator
     }
+}
+
+/// Whether `req.parent_session` names one of this dashboard's own currently
+/// live panes -- the only lineage [`parent_role_for`] (and the coordinator
+/// refusal in `fulfill_spawn_request`, right where it calls both of these)
+/// ever trusts. `req.parent_session` is used only as a KEY into this
+/// dashboard's own live pane list, never as an assertion of role by itself
+/// -- mirrors `spawn_launch_mode_pin`'s own discipline (see its doc
+/// comment): a spawn request is untrusted JSON any process that can reach
+/// the requests directory can hand-write.
+fn parent_lineage_verified(req: &spawnreq::SpawnRequest, panes: &[Pane]) -> bool {
+    req.parent_session.as_deref().is_some_and(|parent| {
+        panes
+            .iter()
+            .any(|pane| sessions::short_id(pane.session_id()) == parent)
+    })
 }
 
 /// Whether the task-prompt fallback (`worker_task_prompt`, below) has
@@ -2802,7 +2832,31 @@ fn fulfill_spawn_request(
     // refusal here is policy, the same reasoning the pane cap and the agent
     // gate right below already apply.
     let parent_role = parent_role_for(req, panes);
-    if let Some(reason) = depth_refusal(parent_role, spawnreq::role_of(req)) {
+    let requested_role = spawnreq::role_of(req);
+    // Security review Finding 1: `parent_role_for`'s `Orchestrator` answer
+    // is never a VERIFIED one (see its own doc comment) -- it is what BOTH
+    // a legitimate rejoin from a pane whose own dashboard already quit, and
+    // a live Worker pane that simply omitted or forged `parent_session`,
+    // read as. Letting either claim a coordinator (`sub-orchestrator`) role
+    // on that unverified lineage is exactly how a Worker pane defeated the
+    // depth cap: request an unrecognised parent, ask for `sub-orchestrator`,
+    // pass `depth_refusal(Orchestrator, SubOrchestrator)` (`None`) even
+    // though its own real parent is a live, known `Worker`. A worker-role
+    // request rides the same unverified lineage unaffected -- that is the
+    // one allowance the rejoin case still needs, and a bounded single worker
+    // pane is no more than the pane cap, agent gate and spawn quota below
+    // already allow any unverified requester to obtain.
+    if !parent_lineage_verified(req, panes)
+        && matches!(requested_role, prompt::PromptRole::SubOrchestrator)
+    {
+        return Err(SpawnRefusal::policy(
+            "a request naming no live pane this dashboard tracks may not claim the \
+             sub-orchestrator role -- an operator who wants a coordinator seat runs `zirv ctx \
+             agent --role sub-orchestrator` directly, outside any dashboard pane"
+                .to_string(),
+        ));
+    }
+    if let Some(reason) = depth_refusal(parent_role, requested_role) {
         return Err(SpawnRefusal::policy(reason));
     }
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
@@ -9803,8 +9857,14 @@ mod tests {
     /// claims about its own lineage. An absent `parent_session`, and a
     /// forged one naming a session this dashboard has never spawned, must
     /// both read exactly the same way -- the "no known parent" default
-    /// (`PromptRole::Orchestrator`) -- because neither is distinguishable
-    /// from an operator's own direct `zirv ctx agent` invocation.
+    /// (`PromptRole::Orchestrator`). That reading is kept (a legitimate
+    /// rejoin from a pane whose own dashboard already quit needs it for a
+    /// plain worker spawn, see the function's own doc comment) but is never
+    /// trusted for a COORDINATOR role any more: see
+    /// `fulfill_spawn_request_refuses_a_sub_orchestrator_role_with_unverified_
+    /// lineage`, below, for the actual security property that closes Finding
+    /// 1 (a live Worker pane forging its own `parent_session` to claim
+    /// `sub-orchestrator`).
     #[test]
     fn parent_role_for_never_trusts_the_requests_own_claimed_lineage() {
         let panes: Vec<Pane> = Vec::new();
@@ -9932,6 +9992,64 @@ mod tests {
         assert!(
             !refusal.retryable,
             "must be a policy refusal -- a headless fallback would route around the cap"
+        );
+    }
+
+    /// Security review Finding 1: before this fix, a live Worker pane could
+    /// defeat the depth cap entirely just by omitting or forging its OWN
+    /// `parent_session` when it wrote its next request -- `parent_role_for`
+    /// answers `Orchestrator` for that unverified lineage (see its own doc
+    /// comment), and `depth_refusal(Orchestrator, SubOrchestrator)` is
+    /// `None`, so the forged request sailed straight through the depth cap
+    /// that a truthful `parent_session` naming the SAME live pane would have
+    /// refused (`fulfill_spawn_request_refuses_a_worker_panes_own_delegation_
+    /// via_the_depth_cap`, above). No pane needs to actually exist for this
+    /// -- the refusal fires purely off the request's own claimed lineage, no
+    /// live pane list at all.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_sub_orchestrator_role_with_unverified_lineage() {
+        let repo = std::env::current_dir().expect("cwd");
+        let cfg = CtxConfig::default();
+
+        let mut req = spawn_request("do the work", &repo);
+        req.role = Some("sub-orchestrator".to_string());
+        req.parent_session = None;
+        let reason = refusal_for(&req, &cfg, &repo);
+        assert!(
+            reason.contains("sub-orchestrator"),
+            "names the role it refused: {reason}"
+        );
+        assert!(
+            reason.contains("zirv ctx agent --role sub-orchestrator"),
+            "tells a real operator how to proceed instead: {reason}"
+        );
+
+        // A forged parent naming no pane this dashboard tracks reads exactly
+        // the same way as no lineage at all -- never more privileged.
+        req.parent_session = Some("deadbeef".to_string());
+        let reason = refusal_for(&req, &cfg, &repo);
+        assert!(reason.contains("sub-orchestrator"), "got {reason}");
+    }
+
+    /// The narrowing-only half of the same fix: a plain WORKER-role request
+    /// with the identical unverified lineage (no matching pane) must not be
+    /// caught by the new coordinator refusal -- it still reaches the very
+    /// next gate in sequence (the pane cap) and is refused for THAT reason
+    /// instead, proving nothing that worked before now fails for the wrong
+    /// reason.
+    #[test]
+    fn fulfill_spawn_request_permits_a_worker_role_with_unverified_lineage() {
+        let repo = std::env::current_dir().expect("cwd");
+        let mut cfg = CtxConfig::default();
+        cfg.dash.max_panes = 0;
+
+        let mut req = spawn_request("do the work", &repo);
+        req.parent_session = None; // role stays `None` -> `PromptRole::Worker`
+        let reason = refusal_for(&req, &cfg, &repo);
+        assert!(
+            reason.contains("pane limit reached"),
+            "a worker request with unverified lineage must reach the pane cap, not be refused \
+             for its lineage: {reason}"
         );
     }
 
