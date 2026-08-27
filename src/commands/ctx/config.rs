@@ -2072,6 +2072,16 @@ impl CtxConfig {
         // function's own doc comment for why the polarity is inverted.
         let home_context_dedupe_native =
             bool_at(take_nested(&mut merged, "context", "dedupe_native"));
+        // `supervise.heavy_command_patterns` gets the identical treatment as
+        // `sandbox.extra_deny` above, for the identical reason: the field's
+        // own doc comment promises a repo layer may only ADD patterns, never
+        // replace the operator's own list, but the ordinary `merge()` below
+        // would let a repo `heavy_command_patterns = []` (or any other
+        // array) silently clobber the home layer's entries instead of
+        // adding to them. Lifted out and unioned once both layers are in
+        // hand, same as `extra_deny`.
+        let home_heavy_patterns =
+            string_array(take_nested(&mut merged, "supervise", "heavy_command_patterns"));
 
         // Read on its own first: the repo layer is the one layer that comes
         // from a checkout rather than from the operator.
@@ -2102,6 +2112,11 @@ impl CtxConfig {
         let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
         let repo_context_dedupe_native =
             bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
+        let repo_heavy_patterns = string_array(take_nested(
+            &mut repo_layer,
+            "supervise",
+            "heavy_command_patterns",
+        ));
         merge(&mut merged, repo_layer);
 
         // Re-inserted after the merge, before env: env (below) must still be
@@ -2191,6 +2206,16 @@ impl CtxConfig {
         if let Some(raw) = env("ZIRV_CTX_SANDBOX_EXTRA_ALLOW") {
             cfg.sandbox.extra_allow = split_csv_list(&raw);
         }
+
+        // Same union as `extra_deny` above, for `heavy_command_patterns`: the
+        // operator's own home-layer patterns plus whatever the repo adds,
+        // never fewer than either -- a repo layer may only add a pattern
+        // (narrowing), never remove or replace the operator's own list. No
+        // env override exists for this key today, unlike `extra_deny`/
+        // `extra_allow`.
+        let mut heavy_patterns = home_heavy_patterns;
+        heavy_patterns.extend(repo_heavy_patterns);
+        cfg.supervise.heavy_command_patterns = heavy_patterns;
 
         // SECURITY (command-injection defense): `chat.model` is one of the few
         // keys a repo `ctx.toml` may set (see `REPO_FORBIDDEN`'s `chat.model`
@@ -4071,6 +4096,67 @@ mod tests {
                 .expect_err("a repo layer must be rejected");
             assert!(err.to_string().contains(key), "got {err}");
         }
+    }
+
+    /// Unlike `max_heavy_operations`, `heavy_command_patterns` is not
+    /// `REPO_FORBIDDEN`: a repo may ADD a pattern (only ever narrowing, per
+    /// the field's own doc comment), but a plain deep merge would let a
+    /// repo's array -- including an empty one -- silently REPLACE the
+    /// operator's home-layer list instead of adding to it. Proves the union,
+    /// end to end through `CtxConfig::load`, the same way
+    /// `sandbox_extra_deny_unions_the_operators_and_the_repos_own_entries`
+    /// proves it for `extra_deny`.
+    #[test]
+    fn repo_heavy_command_patterns_are_added_not_replaced() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nheavy_command_patterns = [\"npm run build*\"]\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nheavy_command_patterns = []\n",
+        )
+        .expect("write");
+
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            cfg.supervise
+                .heavy_command_patterns
+                .contains(&"npm run build*".to_string()),
+            "an empty repo array must not erase the operator's own pattern: {:?}",
+            cfg.supervise.heavy_command_patterns
+        );
+
+        let repo2 = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo2.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo2.path().join(".zirv").join(CTX_CONFIG_FILE),
+            "[supervise]\nheavy_command_patterns = [\"yarn build*\"]\n",
+        )
+        .expect("write");
+        let cfg2 = CtxConfig::load(repo2.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            cfg2.supervise
+                .heavy_command_patterns
+                .contains(&"npm run build*".to_string()),
+            "the operator's own pattern must survive: {:?}",
+            cfg2.supervise.heavy_command_patterns
+        );
+        assert!(
+            cfg2.supervise
+                .heavy_command_patterns
+                .contains(&"yarn build*".to_string()),
+            "the repo's own addition must land too: {:?}",
+            cfg2.supervise.heavy_command_patterns
+        );
     }
 
     /// S1-class boundary, same rationale as `prompt.max_repo_bytes` and
