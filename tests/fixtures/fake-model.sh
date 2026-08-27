@@ -13,6 +13,12 @@
 #           caller has finished sending the prompt looks from the outside
 #   harvest a well-formed set of `key: body` durable-fact lines, for
 #           memory::harvest_from_handoff tests
+#   harvest_with_credential  like `harvest`, but with one extra
+#           credential-shaped line mixed in among well-formed ones, for the
+#           skip-and-log path (issue #172 cross-review finding 5): the model
+#           itself can propose a credential-shaped fact, so the guard must
+#           catch it at the harvest boundary, not just on an explicit
+#           `remember`
 #   consolidate  echoes back exactly one `key: body` line, using the
 #           survivor key named in the prompt's "(KEEP THIS KEY)" marker,
 #           for memory_optimize::apply_consolidation tests (issue #38)
@@ -53,6 +59,11 @@ case "${FAKE_MODEL_MODE:-good}" in
   garbage) printf 'I had a look and things seem mostly fine.\n' ;;
   harvest)
     printf 'build-cmd: cargo build --release\n'
+    printf 'release-runbook: release runbook lives in the internal wiki under docs\n'
+    ;;
+  harvest_with_credential)
+    printf 'build-cmd: cargo build --release\n'
+    printf 'staging-db-creds: the staging DB creds live in 1Password\n'
     printf 'release-runbook: release runbook lives in the internal wiki under docs\n'
     ;;
   consolidate)

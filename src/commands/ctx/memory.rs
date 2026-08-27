@@ -4300,6 +4300,90 @@ This should not appear in the body.\n";
         );
     }
 
+    /// e2e (issue #172 cross-review finding 5): the skip-and-log path in
+    /// `write_durable` was, until this test, only exercised against
+    /// hand-built `Vec`s in `write_durable_skips_a_credential_shaped_
+    /// candidate_but_still_writes_the_rest`. This drives the same guard
+    /// through a real model call instead -- `fake-model.sh`'s
+    /// `harvest_with_credential` mode answers with a credential-shaped line
+    /// mixed in among two well-formed ones, the same shape a real model
+    /// could plausibly propose on its own -- so the harvest boundary itself,
+    /// not just the unit-level helper, is proven to skip it.
+    #[cfg(unix)]
+    #[test]
+    fn a_harvest_skips_a_credential_shaped_line_from_the_model_but_still_writes_the_rest() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+        let adapter = fake_model_adapter();
+
+        let _mode = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_MODEL_MODE",
+            Some("harvest_with_credential"),
+        )]);
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+
+        assert_eq!(count, 2, "the credential-shaped line is skipped: {count}");
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "build-cmd"
+            )
+            .expect("get")
+            .is_some(),
+            "the well-formed fact before the credential line still lands"
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "release-runbook"
+            )
+            .expect("get")
+            .is_some(),
+            "the well-formed fact after the credential line still lands"
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Shared,
+                repo.path(),
+                &state,
+                "-work-repo",
+                &cfg,
+                "staging-db-creds"
+            )
+            .expect("get")
+            .is_none(),
+            "the credential-shaped candidate must never be written"
+        );
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("harvest-skipped")
+                && log.contains("staging-db-creds")
+                && log.contains("credential"),
+            "the skip must be visible in the decision log: {log}"
+        );
+    }
+
     /// Issue #37's clean-session-end seam: `harvest_at_session_end` is
     /// gated exactly like `harvest_durable` itself, before either model call
     /// it can make is ever touched.
